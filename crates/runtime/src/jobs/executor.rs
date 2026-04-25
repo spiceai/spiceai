@@ -185,7 +185,8 @@ impl JobExecutor {
         }
 
         // Build and submit the query using Query::submit_distributed
-        let mut query_builder = QueryBuilder::new(&state.sql, Arc::clone(&df));
+        let mut query_builder =
+            QueryBuilder::new(&state.sql, Arc::clone(&df)).read_only(state.read_only);
 
         // Parse parameters if present
         if let Some(p) = state.parameters {

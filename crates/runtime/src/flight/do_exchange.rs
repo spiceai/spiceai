@@ -133,15 +133,22 @@ pub(crate) async fn handle(
                         let data_array = StructArray::from(batch.clone());
 
                         let new_schema = Arc::new(changes_schema(schema.as_ref()));
-                        let Ok(new_record_batch) = RecordBatch::try_new(
+                        let new_record_batch = match RecordBatch::try_new(
                             Arc::clone(&new_schema),
                             vec![
                                 Arc::new(op_array),
                                 Arc::new(primary_keys_array),
                                 Arc::new(data_array),
                             ],
-                        ) else {
-                            panic!("Unable to convert record batch into change event")
+                        ) {
+                            Ok(batch) => batch,
+                            Err(err) => {
+                                let output =
+                                    futures::stream::iter(vec![Err(Status::internal(format!(
+                                        "Unable to convert record batch into change event: {err}"
+                                    )))]);
+                                return Some((output, rx));
+                            }
                         };
 
                         if !schema_sent {
@@ -151,13 +158,19 @@ pub(crate) async fn handle(
                             )));
                             schema_sent = true;
                         }
-                        let Ok((flight_dictionaries, flight_batch)) = encoder.encode(
+                        let (flight_dictionaries, flight_batch) = match encoder.encode(
                             &new_record_batch,
                             &mut tracker,
                             &write_options,
                             &mut compression_context,
-                        ) else {
-                            panic!("Unable to encode batch")
+                        ) {
+                            Ok(encoded) => encoded,
+                            Err(err) => {
+                                let output = futures::stream::iter(vec![Err(Status::internal(
+                                    format!("Unable to encode batch: {err}"),
+                                ))]);
+                                return Some((output, rx));
+                            }
                         };
 
                         flights.extend(flight_dictionaries.into_iter().map(Into::into));
@@ -165,12 +178,17 @@ pub(crate) async fn handle(
                     }
 
                     metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
-                    let output = futures::stream::iter(flights.into_iter().map(Ok));
+                    let output = futures::stream::iter(
+                        flights
+                            .into_iter()
+                            .map(Ok)
+                            .collect::<Vec<Result<FlightData, Status>>>(),
+                    );
 
                     Some((output, rx))
                 }
                 Err(_e) => {
-                    let output = futures::stream::iter(vec![].into_iter().map(Ok));
+                    let output = futures::stream::iter(Vec::<Result<FlightData, Status>>::new());
                     Some((output, rx))
                 }
             }

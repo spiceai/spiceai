@@ -96,6 +96,9 @@ pub struct SubmitQueryRequest {
     /// Jobs with results larger than this will be failed with an error for exceeding the maximum size.
     #[serde(default)]
     pub maximum_size: Option<u64>,
+    /// Whether the submitted query must be limited to read-only SQL operations.
+    #[serde(default, skip_deserializing)]
+    pub read_only: bool,
 }
 
 /// Response for query submission.
@@ -287,8 +290,10 @@ pub struct StatusResponse {
 ))]
 pub(crate) async fn submit(
     Extension(rt): Extension<Arc<Runtime>>,
-    Json(request): Json<SubmitQueryRequest>,
+    Json(mut request): Json<SubmitQueryRequest>,
 ) -> Response {
+    request.read_only = super::current_principal_requires_read_only().await;
+
     let executor = match get_executor(&rt) {
         Ok(e) => e,
         Err(resp) => return resp,
@@ -617,6 +622,10 @@ pub(crate) async fn cancel(
     Extension(rt): Extension<Arc<Runtime>>,
     Path(query_id): Path<String>,
 ) -> Response {
+    if let Some(response) = super::require_write_access().await {
+        return response;
+    }
+
     let executor = match get_executor(&rt) {
         Ok(e) => e,
         Err(resp) => return resp,

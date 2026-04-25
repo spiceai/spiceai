@@ -135,6 +135,7 @@ impl JobStore {
         let mut state = JobState::new_pending(job_id, request.sql, request.parameters)
             .with_timeout_seconds(request.timeout_seconds)
             .with_maximum_size(request.maximum_size);
+        state.read_only = request.read_only;
         self.write_job_state(&mut state).await?;
         Ok(state)
     }
@@ -732,6 +733,7 @@ mod tests {
             parameters: None,
             timeout_seconds: None,
             maximum_size: None,
+            read_only: false,
         }
     }
 
@@ -1080,6 +1082,7 @@ mod tests {
                 parameters: None,
                 timeout_seconds: None,
                 maximum_size,
+                read_only: false,
             }
         }
 

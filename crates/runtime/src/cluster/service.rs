@@ -182,6 +182,7 @@ pub struct ClusterServiceImpl {
     executor_registry: Arc<ExecutorRegistry>,
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
+    allow_secret_expansion: bool,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
 }
@@ -197,6 +198,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        allow_secret_expansion: bool,
     ) -> Self {
         Self {
             app,
@@ -206,6 +208,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            allow_secret_expansion,
             executor_streams: ExecutorControlStreamRegistry::new(),
         }
     }
@@ -225,6 +228,7 @@ impl ClusterServiceImpl {
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
         executor_streams: ExecutorControlStreamRegistry,
+        allow_secret_expansion: bool,
     ) -> Self {
         Self {
             app,
@@ -234,6 +238,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            allow_secret_expansion,
 
             executor_streams,
         }
@@ -317,6 +322,17 @@ impl ClusterService for ClusterServiceImpl {
         request: Request<ExpandSecretRequest>,
     ) -> Result<Response<ExpandSecretResponse>, Status> {
         let request = request.into_inner();
+
+        if !self.allow_secret_expansion {
+            tracing::warn!(
+                executor_id = %request.executor_id,
+                key = %request.key,
+                "Denied cluster secret expansion without mTLS"
+            );
+            return Err(Status::permission_denied(
+                "Secret expansion requires cluster mTLS",
+            ));
+        }
 
         let span = tracing::span!(
             target: "task_history",

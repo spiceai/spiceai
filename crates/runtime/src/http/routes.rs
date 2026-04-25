@@ -65,7 +65,7 @@ use axum::{
     response::IntoResponse,
     routing::{Router, get, post},
 };
-use runtime_auth::layer::http::AuthLayer;
+use runtime_auth::{AuthRequestContext, layer::http::AuthLayer};
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -399,9 +399,13 @@ pub(crate) fn routes(
             "MCP request body size limit set to {} bytes",
             MCP_REQUEST_BODY_LIMIT
         );
+        let mcp_auth_required = auth_layer.is_some();
         let mcp_router = Router::new()
             .nest_service("/v1/mcp", mcp_service)
-            .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
+            .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT))
+            .route_layer(middleware::from_fn(move |req, next| {
+                require_auth_configured(mcp_auth_required, req, next)
+            }));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
@@ -442,7 +446,7 @@ async fn track_metrics(
     State(df): State<Arc<DataFusion>>,
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     headers: http::HeaderMap,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
     let app_lock = app.read().await;
@@ -460,6 +464,8 @@ async fn track_metrics(
             .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
             .build(),
     );
+    let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> = request_context.clone();
+    req.extensions_mut().insert(auth_request_context);
 
     let request_dimensions = request_context.to_dimensions();
 

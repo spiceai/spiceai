@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
 };
 use tokio::{
@@ -85,6 +85,9 @@ pub enum ArchiveError {
         expected_checksum: String,
         actual_checksum: String,
     },
+
+    #[snafu(display("Unsafe archive path {}: {reason}", path.display()))]
+    UnsafeArchivePath { path: PathBuf, reason: String },
 }
 
 type Result<T> = std::result::Result<T, ArchiveError>;
@@ -128,12 +131,20 @@ where
             let mut archive = Builder::new(&mut buffer);
 
             for (dir_path, archive_prefix) in &dirs {
-                if !dir_path.exists() {
+                let Ok(metadata) = std::fs::symlink_metadata(dir_path) else {
                     tracing::warn!("Directory {} does not exist, skipping", dir_path.display());
+                    continue;
+                };
+
+                if metadata.file_type().is_symlink() {
+                    tracing::warn!(
+                        "Directory {} is a symbolic link, skipping",
+                        dir_path.display()
+                    );
                     continue;
                 }
 
-                if !dir_path.is_dir() {
+                if !metadata.is_dir() {
                     tracing::warn!("{} is not a directory, skipping", dir_path.display());
                     continue;
                 }
@@ -314,18 +325,7 @@ where
             source,
         })?;
 
-        if options.skip_if_exists {
-            // Custom extraction that skips existing files with optional checksum verification
-            extract_with_skip_existing_and_verify(&mut archive, &target_dir, &options)?;
-        } else {
-            // Standard extraction that overwrites existing files
-            archive
-                .unpack(&target_dir)
-                .map_err(|source| ArchiveError::ExtractArchive {
-                    path: target_dir.clone(),
-                    source,
-                })?;
-        }
+        extract_with_skip_existing_and_verify(&mut archive, &target_dir, &options)?;
 
         Ok::<(), ArchiveError>(())
     })
@@ -385,11 +385,125 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// If `prefix_mappings` is provided and the entry path starts with one of the prefixes,
 /// the prefix is replaced with the corresponding target directory. Otherwise, the entry
 /// is extracted to `default_target_dir`.
+fn validate_archive_relative_path(path: &Path) -> Result<PathBuf> {
+    let mut sanitized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => sanitized.push(part),
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return Err(ArchiveError::UnsafeArchivePath {
+                    path: path.to_path_buf(),
+                    reason: "archive entries must be relative paths without parent components"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    if sanitized.as_os_str().is_empty() {
+        return Err(ArchiveError::UnsafeArchivePath {
+            path: path.to_path_buf(),
+            reason: "archive entry path is empty".to_string(),
+        });
+    }
+
+    Ok(sanitized)
+}
+
+fn safe_destination_path(target_dir: &Path, relative_path: &Path) -> Result<PathBuf> {
+    let relative_path = validate_archive_relative_path(relative_path)?;
+    let dest_path = target_dir.join(relative_path);
+    if !dest_path.starts_with(target_dir) {
+        return Err(ArchiveError::UnsafeArchivePath {
+            path: dest_path,
+            reason: format!(
+                "archive entry escapes target directory {}",
+                target_dir.display()
+            ),
+        });
+    }
+    Ok(dest_path)
+}
+
+fn ensure_no_symlink_ancestors(path: &Path, root: &Path) -> Result<()> {
+    use std::fs;
+
+    if !path.starts_with(root) {
+        return Err(ArchiveError::UnsafeArchivePath {
+            path: path.to_path_buf(),
+            reason: format!("path is outside target directory {}", root.display()),
+        });
+    }
+
+    let relative_path = path
+        .strip_prefix(root)
+        .map_err(|_| ArchiveError::UnsafeArchivePath {
+            path: path.to_path_buf(),
+            reason: format!("path is outside target directory {}", root.display()),
+        })?;
+
+    let mut current = root.to_path_buf();
+    if let Ok(metadata) = fs::symlink_metadata(&current)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(ArchiveError::UnsafeArchivePath {
+            path: current,
+            reason: "target directory is a symbolic link".to_string(),
+        });
+    }
+
+    for component in relative_path.components() {
+        current.push(component.as_os_str());
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ArchiveError::UnsafeArchivePath {
+                    path: current,
+                    reason: "archive extraction would traverse a symbolic link".to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(ArchiveError::ExtractArchive {
+                    path: current,
+                    source,
+                });
+            }
+        }
+
+        if current == path {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_existing_destination_is_safe(dest_path: &Path, target_dir: &Path) -> Result<()> {
+    use std::fs;
+
+    ensure_no_symlink_ancestors(dest_path, target_dir)?;
+    if let Ok(metadata) = fs::symlink_metadata(dest_path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(ArchiveError::UnsafeArchivePath {
+            path: dest_path.to_path_buf(),
+            reason: "archive extraction would overwrite or read through a symbolic link"
+                .to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 fn remap_entry_path(
     entry_path: &Path,
     default_target_dir: &Path,
     prefix_mappings: Option<&Vec<(String, PathBuf)>>,
-) -> PathBuf {
+) -> Result<(PathBuf, PathBuf)> {
     let entry_path_str = entry_path.to_string_lossy();
 
     if let Some(mappings) = prefix_mappings {
@@ -399,13 +513,15 @@ fn remap_entry_path(
                 let relative = entry_path_str
                     .strip_prefix(prefix)
                     .unwrap_or(&entry_path_str);
-                return target_dir.join(relative);
+                let dest_path = safe_destination_path(target_dir, Path::new(relative))?;
+                return Ok((dest_path, target_dir.clone()));
             }
         }
     }
 
     // No matching prefix, use default target directory
-    default_target_dir.join(entry_path)
+    let dest_path = safe_destination_path(default_target_dir, entry_path)?;
+    Ok((dest_path, default_target_dir.to_path_buf()))
 }
 
 /// Extract archive entries, skipping files that already exist with optional checksum verification.
@@ -429,13 +545,34 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
         let entry_path = entry
             .path()
             .map_err(|source| ArchiveError::ReadArchive { source })?;
-        let dest_path = remap_entry_path(&entry_path, target_dir, options.prefix_mappings.as_ref());
+        let (dest_path, dest_root) =
+            remap_entry_path(&entry_path, target_dir, options.prefix_mappings.as_ref())?;
 
         let entry_type = entry.header().entry_type();
 
+        if !entry_type.is_dir() && !entry_type.is_file() {
+            tracing::debug!(
+                "Skipping unsupported archive entry type: {}",
+                entry_path.display()
+            );
+            continue;
+        }
+
         // Handle existing files
         if dest_path.exists() {
-            if entry_type.is_file() && options.verify_existing_checksums {
+            ensure_existing_destination_is_safe(&dest_path, &dest_root)?;
+            if entry_type.is_dir() {
+                if !dest_path.is_dir() {
+                    return Err(ArchiveError::UnsafeArchivePath {
+                        path: dest_path,
+                        reason: "archive directory entry conflicts with an existing non-directory"
+                            .to_string(),
+                    });
+                }
+                continue;
+            }
+
+            if options.skip_if_exists && options.verify_existing_checksums {
                 // Read the archive entry contents to compute expected checksum
                 let mut archive_contents = Vec::new();
                 entry
@@ -465,16 +602,23 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                     &actual_checksum[..16] // Log first 16 chars of checksum
                 );
             } else {
-                tracing::debug!(
-                    "Skipping existing file during archive extraction: {}",
-                    dest_path.display()
-                );
+                if options.skip_if_exists {
+                    tracing::debug!(
+                        "Skipping existing file during archive extraction: {}",
+                        dest_path.display()
+                    );
+                    continue;
+                }
             }
-            continue;
+
+            if options.skip_if_exists {
+                continue;
+            }
         }
 
         // Create parent directories if needed
         if let Some(parent) = dest_path.parent() {
+            ensure_no_symlink_ancestors(parent, &dest_root)?;
             fs::create_dir_all(parent).map_err(|source| ArchiveError::ExtractArchive {
                 path: parent.to_path_buf(),
                 source,
@@ -483,6 +627,7 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
 
         // Handle by entry type
         if entry_type.is_dir() {
+            ensure_no_symlink_ancestors(&dest_path, &dest_root)?;
             fs::create_dir_all(&dest_path).map_err(|source| ArchiveError::ExtractArchive {
                 path: dest_path.clone(),
                 source,
@@ -495,15 +640,17 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                 .map_err(|source| ArchiveError::ReadArchive { source })?;
 
             // Write to file atomically by writing to temp file then renaming
-            let temp_path = dest_path.with_extension("tmp");
+            let temp_path = dest_path.with_extension(format!("{}.tmp", std::process::id()));
 
             {
-                let mut file = fs::File::create(&temp_path).map_err(|source| {
-                    ArchiveError::ExtractArchive {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp_path)
+                    .map_err(|source| ArchiveError::ExtractArchive {
                         path: temp_path.clone(),
                         source,
-                    }
-                })?;
+                    })?;
 
                 file.write_all(&contents)
                     .map_err(|source| ArchiveError::ExtractArchive {
@@ -544,7 +691,6 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                 contents.len()
             );
         }
-        // Skip other entry types (symlinks, etc.) for now
     }
 
     Ok(())
@@ -578,9 +724,18 @@ fn add_directory_to_archive<W: std::io::Write>(
                     PathBuf::from(archive_prefix).join(relative_path)
                 };
 
-                if path.is_dir() {
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() {
+                    tracing::debug!(
+                        "Skipping symbolic link during archive creation: {}",
+                        path.display()
+                    );
+                    continue;
+                }
+
+                if metadata.is_dir() {
                     visit_dirs(archive, &path, base_path, archive_prefix)?;
-                } else {
+                } else if metadata.is_file() {
                     archive.append_path_with_name(&path, &archive_path)?;
                 }
             }
@@ -594,8 +749,37 @@ fn add_directory_to_archive<W: std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
+    use tar::Header;
     use tempfile::TempDir;
+
+    fn archive_with_file(path: &str, contents: &[u8]) -> Vec<u8> {
+        let mut buffer = Vec::new();
+
+        let mut header = Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        let path_bytes = path.as_bytes();
+        assert!(
+            path_bytes.len() <= 100,
+            "test archive path must fit in tar name field"
+        );
+        header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+        header.set_cksum();
+
+        buffer
+            .write_all(header.as_bytes())
+            .expect("archive header should be written");
+        buffer
+            .write_all(contents)
+            .expect("archive contents should be written");
+        let padding_len = (512 - (contents.len() % 512)) % 512;
+        buffer.extend(std::iter::repeat_n(0, padding_len));
+        buffer.extend(std::iter::repeat_n(0, 1024));
+
+        buffer
+    }
 
     #[tokio::test]
     async fn test_archive_and_extract() -> Result<()> {
@@ -739,6 +923,97 @@ mod tests {
         assert!(!extract_dir.path().join("missing").exists());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extract_rejects_parent_path_traversal() {
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let extract_dir = test_dir.path().join("extract");
+        std::fs::create_dir_all(&extract_dir).expect("Failed to create extract dir");
+
+        let archive_buffer = archive_with_file("../outside.txt", b"owned");
+        let result = extract_archive(Cursor::new(archive_buffer), &extract_dir).await;
+
+        assert!(matches!(
+            result,
+            Err(ArchiveError::UnsafeArchivePath { .. })
+        ));
+        assert!(!test_dir.path().join("outside.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_extract_rejects_prefix_mapping_traversal() {
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let extract_dir = test_dir.path().join("extract");
+        let mapped_dir = test_dir.path().join("mapped");
+        std::fs::create_dir_all(&extract_dir).expect("Failed to create extract dir");
+        std::fs::create_dir_all(&mapped_dir).expect("Failed to create mapped dir");
+
+        let archive_buffer = archive_with_file("data/../outside.txt", b"owned");
+        let mut options = ExtractOptions::default();
+        options.prefix_mappings = Some(vec![("data/".to_string(), mapped_dir)]);
+
+        let result =
+            extract_archive_with_options(Cursor::new(archive_buffer), &extract_dir, options).await;
+
+        assert!(matches!(
+            result,
+            Err(ArchiveError::UnsafeArchivePath { .. })
+        ));
+        assert!(!test_dir.path().join("outside.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_archive_skips_symbolic_links() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let source_dir = test_dir.path().join("source");
+        let outside_dir = test_dir.path().join("outside");
+        std::fs::create_dir_all(&source_dir).expect("Failed to create source dir");
+        std::fs::create_dir_all(&outside_dir).expect("Failed to create outside dir");
+        std::fs::write(outside_dir.join("secret.txt"), b"secret")
+            .expect("Failed to write outside file");
+        symlink(&outside_dir, source_dir.join("linked_outside")).expect("Failed to create symlink");
+
+        let mut archive_buffer = Vec::new();
+        let dirs = vec![(source_dir, "data/".to_string())];
+        archive_directories(&dirs, Cursor::new(&mut archive_buffer)).await?;
+
+        let extract_dir = TempDir::new().expect("Failed to create extract dir");
+        extract_archive(Cursor::new(archive_buffer), extract_dir.path()).await?;
+
+        assert!(
+            !extract_dir
+                .path()
+                .join("data/linked_outside/secret.txt")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_extract_rejects_symlink_destination_directory() {
+        use std::os::unix::fs::symlink;
+
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let extract_dir = test_dir.path().join("extract");
+        let outside_dir = test_dir.path().join("outside");
+        std::fs::create_dir_all(&extract_dir).expect("Failed to create extract dir");
+        std::fs::create_dir_all(&outside_dir).expect("Failed to create outside dir");
+        symlink(&outside_dir, extract_dir.join("linked_outside"))
+            .expect("Failed to create symlink");
+
+        let archive_buffer = archive_with_file("linked_outside/secret.txt", b"secret");
+        let result = extract_archive(Cursor::new(archive_buffer), &extract_dir).await;
+
+        assert!(matches!(
+            result,
+            Err(ArchiveError::UnsafeArchivePath { .. })
+        ));
+        assert!(!outside_dir.join("secret.txt").exists());
     }
 
     #[tokio::test]

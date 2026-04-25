@@ -48,6 +48,7 @@ fn make_request(sql: impl Into<String>) -> SubmitQueryRequest {
         parameters: None,
         timeout_seconds: None,
         maximum_size: None,
+        read_only: false,
     }
 }
 
