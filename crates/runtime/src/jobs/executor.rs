@@ -76,7 +76,8 @@ impl JobExecutor {
     /// Submits a new query job for async execution.
     ///
     /// Returns the job state immediately. The query will be executed in the background.
-    pub async fn submit(&self, request: SubmitQueryRequest) -> Result<JobState> {
+    pub async fn submit(&self, mut request: SubmitQueryRequest) -> Result<JobState> {
+        request.read_only |= crate::http::v1::current_principal_requires_read_only().await;
         let state = self.job_store.create_job(request).await?;
         let job_id = state.job_id.clone();
 

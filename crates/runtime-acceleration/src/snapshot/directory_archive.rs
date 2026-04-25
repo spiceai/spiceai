@@ -547,6 +547,44 @@ fn ensure_existing_destination_is_safe(dest_path: &Path, target_dir: &Path) -> R
     Ok(())
 }
 
+fn create_new_temp_file(temp_path: &Path, target_dir: &Path) -> Result<std::fs::File> {
+    use std::fs;
+
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+    {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure_existing_destination_is_safe(temp_path, target_dir)?;
+            if temp_path.is_dir() {
+                return Err(ArchiveError::UnsafeArchivePath {
+                    path: temp_path.to_path_buf(),
+                    reason: "archive temporary path conflicts with an existing directory"
+                        .to_string(),
+                });
+            }
+            fs::remove_file(temp_path).map_err(|source| ArchiveError::ExtractArchive {
+                path: temp_path.to_path_buf(),
+                source,
+            })?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temp_path)
+                .map_err(|source| ArchiveError::ExtractArchive {
+                    path: temp_path.to_path_buf(),
+                    source,
+                })
+        }
+        Err(source) => Err(ArchiveError::ExtractArchive {
+            path: temp_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 fn remap_entry_path(
     entry_path: &Path,
     default_target_dir: &Path,
@@ -680,14 +718,7 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
             let bytes_written;
 
             {
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&temp_path)
-                    .map_err(|source| ArchiveError::ExtractArchive {
-                        path: temp_path.clone(),
-                        source,
-                    })?;
+                let mut file = create_new_temp_file(&temp_path, &dest_root)?;
 
                 bytes_written = copy_reader_to_writer(&mut entry, &mut file, &temp_path)?;
 
@@ -1499,6 +1530,37 @@ mod tests {
             content, "new_content",
             "File should be overwritten without skip_if_exists"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extract_removes_stale_temp_file() -> Result<()> {
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let data_dir = test_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+        std::fs::write(data_dir.join("file.txt"), b"archive_content")
+            .expect("Failed to write archive file");
+
+        let mut archive_buffer = Vec::new();
+        let dirs = vec![(data_dir, "data/".to_string())];
+        archive_directories(&dirs, Cursor::new(&mut archive_buffer)).await?;
+
+        let extract_dir = TempDir::new().expect("Failed to create extract dir");
+        let extract_data_dir = extract_dir.path().join("data");
+        std::fs::create_dir_all(&extract_data_dir).expect("create extract data dir");
+
+        let dest_path = extract_data_dir.join("file.txt");
+        std::fs::write(&dest_path, b"existing_content").expect("write existing destination");
+
+        let temp_path = dest_path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&temp_path, b"stale_temp_content").expect("write stale temp file");
+
+        extract_archive(Cursor::new(archive_buffer), extract_dir.path()).await?;
+
+        let content = std::fs::read_to_string(&dest_path).expect("read extracted file");
+        assert_eq!(content, "archive_content");
+        assert!(!temp_path.exists(), "stale temp file should be replaced");
 
         Ok(())
     }
