@@ -70,10 +70,7 @@ fn map_head_error(err: std::io::Error, path: String) -> object_store::Error {
 /// Check whether the destination exists for create-exclusive semantics.
 /// `Ok(true)` → exists; `Ok(false)` → confirmed not found; `Err` → head
 /// failed for some other reason and should be surfaced as a real error.
-async fn destination_exists(
-    share: &ShareSession,
-    key: &str,
-) -> object_store::Result<bool> {
+async fn destination_exists(share: &ShareSession, key: &str) -> object_store::Result<bool> {
     match share.head_object(key).await {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
