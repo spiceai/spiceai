@@ -173,8 +173,6 @@ impl TableProvider for IndexedTableProvider {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.underlying
-            .update(state, assignments, filters)
-            .await
+        self.underlying.update(state, assignments, filters).await
     }
 }
