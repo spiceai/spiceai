@@ -1236,7 +1236,21 @@ impl TableProvider for AcceleratedTable {
                 Ok(results)
             }
             ZeroResultsAction::UseSource => {
-                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+                // Even in UseSource mode, filters containing functions unsupported by the
+                // accelerator engine (e.g. json_get_str on DuckDB) must not be pushed down —
+                // the accelerator would receive SQL it can't execute. Mark those as Unsupported
+                // so DataFusion evaluates them itself after the scan.
+                let function_support = deny_spice_specific_functions();
+                Ok(filters
+                    .iter()
+                    .map(|f| {
+                        if function_support.supports(f) {
+                            TableProviderFilterPushDown::Inexact
+                        } else {
+                            TableProviderFilterPushDown::Unsupported
+                        }
+                    })
+                    .collect())
             }
         }
     }
