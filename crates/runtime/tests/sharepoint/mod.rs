@@ -36,8 +36,10 @@ limitations under the License.
 //! ```
 //!
 //! The tests write files under `{SHAREPOINT_TEST_DRIVE}/{SHAREPOINT_TEST_PREFIX}/`
-//! and clean up after themselves. Each file name is unique-per-run to avoid
-//! collisions.
+//! and attempt to clean up after themselves on the normal path. Cleanup is
+//! best-effort: a test that exits early on a timeout/INSERT/SELECT error may
+//! leave its file behind, so each file name is unique-per-run to avoid
+//! collisions if that happens.
 
 #![expect(
     clippy::doc_markdown,
