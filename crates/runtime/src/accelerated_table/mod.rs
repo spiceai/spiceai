@@ -1432,6 +1432,85 @@ impl TableProvider for AcceleratedTable {
             ),
         }
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => self.accelerator.delete_from(state, filters).await,
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.delete_from(state, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::delete_write_back(
+                    state,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::delete_write_through(
+                    state,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => {
+                self.accelerator.update(state, assignments, filters).await
+            }
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.update(state, assignments, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::update_write_back(
+                    state,
+                    assignments,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::update_write_through(
+                    state,
+                    assignments,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
+        }
+    }
 }
 
 /// Extends projection to include `fetched_at` column for cache freshness checking.

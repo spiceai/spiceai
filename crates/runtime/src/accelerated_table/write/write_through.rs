@@ -32,11 +32,14 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use cayenne::{CayenneStagedAppend, CayenneTableProvider};
+use data_components::delete::{DeletionExec, DeletionSink};
 use data_components::poly::PolyTableProvider;
+use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::MetricsSet;
@@ -558,5 +561,286 @@ async fn join_staged_task(
         Err(error) => Err(DataFusionError::Execution(format!(
             "Accelerator staged write task failed: {error}"
         ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write-through delete and update
+// ---------------------------------------------------------------------------
+
+/// Creates a `DeletionExec` plan for write-through deletes.
+///
+/// Federated delete runs first; if it succeeds the accelerator delete follows.
+/// Both must succeed — if the accelerator delete fails the error is surfaced so
+/// the caller knows the operation did not fully complete (the next refresh cycle
+/// will reconcile, but the caller should be aware).
+pub(crate) async fn delete_write_through(
+    state: &dyn Session,
+    filters: Vec<Expr>,
+    cayenne_target: &CayenneWriteTarget,
+    federated_provider: Arc<dyn TableProvider>,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    let accelerator = cayenne_target_as_provider(cayenne_target);
+    let federated_plan = federated_provider
+        .delete_from(state, filters.clone())
+        .await?;
+    let accelerator_plan = accelerator.delete_from(state, filters).await?;
+    Ok(Arc::new(DeletionExec::new(Arc::new(
+        WriteThroughDeletionSink {
+            federated_plan,
+            accelerator_plan,
+        },
+    ))))
+}
+
+struct WriteThroughDeletionSink {
+    federated_plan: Arc<dyn ExecutionPlan>,
+    accelerator_plan: Arc<dyn ExecutionPlan>,
+}
+
+#[async_trait]
+impl DeletionSink for WriteThroughDeletionSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let ctx = SessionContext::new();
+        let task_ctx = ctx.task_ctx();
+
+        let federated_batches = datafusion::physical_plan::collect(
+            Arc::clone(&self.federated_plan),
+            Arc::clone(&task_ctx),
+        )
+        .await?;
+        let count = super::write_back::extract_dml_count(&federated_batches);
+
+        datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), task_ctx).await?;
+
+        Ok(count)
+    }
+}
+
+/// Creates a `DeletionExec` plan for write-through updates.
+///
+/// Federated update runs first; if it succeeds the accelerator update follows.
+pub(crate) async fn update_write_through(
+    state: &dyn Session,
+    assignments: Vec<(String, Expr)>,
+    filters: Vec<Expr>,
+    cayenne_target: &CayenneWriteTarget,
+    federated_provider: Arc<dyn TableProvider>,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    let accelerator = cayenne_target_as_provider(cayenne_target);
+    let federated_plan = federated_provider
+        .update(state, assignments.clone(), filters.clone())
+        .await?;
+    let accelerator_plan = accelerator.update(state, assignments, filters).await?;
+    Ok(Arc::new(DeletionExec::new(Arc::new(
+        WriteThroughUpdateSink {
+            federated_plan,
+            accelerator_plan,
+        },
+    ))))
+}
+
+struct WriteThroughUpdateSink {
+    federated_plan: Arc<dyn ExecutionPlan>,
+    accelerator_plan: Arc<dyn ExecutionPlan>,
+}
+
+#[async_trait]
+impl DeletionSink for WriteThroughUpdateSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let ctx = SessionContext::new();
+        let task_ctx = ctx.task_ctx();
+
+        let federated_batches = datafusion::physical_plan::collect(
+            Arc::clone(&self.federated_plan),
+            Arc::clone(&task_ctx),
+        )
+        .await?;
+        let count = super::write_back::extract_dml_count(&federated_batches);
+
+        datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), task_ctx).await?;
+
+        Ok(count)
+    }
+}
+
+fn cayenne_target_as_provider(target: &CayenneWriteTarget) -> Arc<dyn TableProvider> {
+    match target {
+        CayenneWriteTarget::Staged(p) => Arc::new(p.clone_for_write_operations()),
+        CayenneWriteTarget::Partitioned(p) => Arc::clone(p),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WriteThroughDeletionSink, WriteThroughUpdateSink};
+    use arrow::array::UInt64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use data_components::delete::DeletionSink;
+    use datafusion::error::{DataFusionError, Result as DataFusionResult};
+    use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+    use datafusion::physical_expr::EquivalenceProperties;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+    };
+    use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_datasource::source::DataSourceExec;
+    use std::any::Any;
+    use std::sync::Arc;
+
+    fn count_exec(n: u64) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from(vec![n]))],
+        )
+        .unwrap();
+        let memory = MemorySourceConfig::try_new(&[vec![batch]], schema, None).unwrap();
+        Arc::new(DataSourceExec::new(Arc::new(memory)))
+    }
+
+    struct ErrorExec {
+        properties: PlanProperties,
+        message: String,
+    }
+
+    impl ErrorExec {
+        fn new_arc(message: impl Into<String>) -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "count",
+                DataType::UInt64,
+                false,
+            )]));
+            let properties = PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(&schema)),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            );
+            Arc::new(Self {
+                properties,
+                message: message.into(),
+            })
+        }
+    }
+
+    impl std::fmt::Debug for ErrorExec {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ErrorExec({})", self.message)
+        }
+    }
+
+    impl DisplayAs for ErrorExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "ErrorExec")
+        }
+    }
+
+    impl ExecutionPlan for ErrorExec {
+        fn name(&self) -> &'static str {
+            "ErrorExec"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn properties(&self) -> &PlanProperties {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            Err(DataFusionError::Execution(self.message.clone()))
+        }
+    }
+
+    // ── WriteThroughDeletionSink ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_through_deletion_count_comes_from_federated() {
+        let sink = WriteThroughDeletionSink {
+            federated_plan: count_exec(5),
+            accelerator_plan: count_exec(0),
+        };
+
+        let count = sink.delete_from().await.unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn write_through_deletion_federated_error_propagates() {
+        let sink = WriteThroughDeletionSink {
+            federated_plan: ErrorExec::new_arc("federated delete failed"),
+            accelerator_plan: count_exec(0),
+        };
+
+        let err = sink.delete_from().await.unwrap_err();
+        assert!(err.to_string().contains("federated delete failed"));
+    }
+
+    #[tokio::test]
+    async fn write_through_deletion_accelerator_error_propagates() {
+        let sink = WriteThroughDeletionSink {
+            federated_plan: count_exec(5),
+            accelerator_plan: ErrorExec::new_arc("accelerator delete failed"),
+        };
+
+        let err = sink.delete_from().await.unwrap_err();
+        assert!(err.to_string().contains("accelerator delete failed"));
+    }
+
+    // ── WriteThroughUpdateSink ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_through_update_count_comes_from_federated() {
+        let sink = WriteThroughUpdateSink {
+            federated_plan: count_exec(3),
+            accelerator_plan: count_exec(0),
+        };
+
+        let count = sink.delete_from().await.unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn write_through_update_federated_error_propagates() {
+        let sink = WriteThroughUpdateSink {
+            federated_plan: ErrorExec::new_arc("federated update failed"),
+            accelerator_plan: count_exec(0),
+        };
+
+        let err = sink.delete_from().await.unwrap_err();
+        assert!(err.to_string().contains("federated update failed"));
+    }
+
+    #[tokio::test]
+    async fn write_through_update_accelerator_error_propagates() {
+        let sink = WriteThroughUpdateSink {
+            federated_plan: count_exec(3),
+            accelerator_plan: ErrorExec::new_arc("accelerator update failed"),
+        };
+
+        let err = sink.delete_from().await.unwrap_err();
+        assert!(err.to_string().contains("accelerator update failed"));
     }
 }

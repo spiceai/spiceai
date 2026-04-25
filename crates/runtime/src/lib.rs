@@ -257,12 +257,12 @@ pub enum Error {
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
-        "An accelerated table for {dataset_name} was configured as read_write without setting replication.enabled: true, acceleration.on_conflict, or acceleration.refresh_mode: changes"
+        "An accelerated table was configured as read_write without setting replication.enabled: true, acceleration.on_conflict, acceleration.refresh_mode: changes, or acceleration.write_mode: write_back"
     ))]
     AcceleratedReadWriteTableWithoutReplication { dataset_name: String },
 
     #[snafu(display(
-        "An accelerated table for {dataset_name} cannot be configured with both 'on_conflict' and 'acceleration.write_mode: write_back'. 'on_conflict' declares the accelerator as the only write target with no source synchronization, while 'write_back' expects the federated source to be synchronized with accelerator writes. Remove one of these options."
+        "An accelerated table for {dataset_name} cannot be configured with both 'on_conflict' and 'acceleration.write_mode: write_back' without 'refresh_mode: changes'. Without CDC, 'on_conflict' forces writes to the accelerator only and there is no sync path back to the federated source. Add 'refresh_mode: changes' to enable CDC-based sync, or remove 'on_conflict'."
     ))]
     AcceleratedWriteBackWithOnConflict { dataset_name: String },
 

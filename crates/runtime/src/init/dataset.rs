@@ -922,19 +922,24 @@ impl Runtime {
         let accelerator_engine = acceleration_settings.engine;
 
         // Allow ReadWrite access when:
-        // 1. `replication.enabled` is set (user attestation that accelerator
-        //    writes are kept in sync with the federated source out-of-band), OR
-        // 2. on_conflict is configured (accelerator-only writes via upsert/drop, no source sync), OR
-        // 3. refresh_mode is `changes` (source->accelerator CDC/WAL stream keeps the accelerator
-        //    in sync with source-side changes)
+        // 1. Replication is enabled (changes are synced back to source), OR
+        // 2. on_conflict is configured (accelerator supports local writes via upsert/drop), OR
+        // 3. refresh_mode is `changes` (CDC/WAL stream replicates writes back to the accelerator), OR
+        // 4. write_mode is `write_back` or `write_through` (writes are forwarded to the federated source)
         let has_on_conflict = !acceleration_settings.on_conflict.is_empty();
         let has_changes_refresh = acceleration_settings
             .refresh_mode
             .is_some_and(|mode| matches!(mode, RefreshMode::Changes));
+        let has_write_back =
+            acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack;
+        let has_write_through =
+            acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteThrough;
         if ds.access() == AccessMode::ReadWrite
             && !replicate
             && !has_on_conflict
             && !has_changes_refresh
+            && !has_write_back
+            && !has_write_through
         {
             AcceleratedReadWriteTableWithoutReplicationSnafu {
                 dataset_name: ds.name.to_string(),
@@ -942,14 +947,12 @@ impl Runtime {
             .fail()?;
         }
 
-        // `on_conflict` declares the accelerator as the only write target
-        // with no source synchronization, which is incompatible with
-        // `write_mode: write_back` (which expects the federated source to
-        // be synchronized with accelerator writes). Reject the combination
-        // explicitly to prevent surprising partial writes.
-        if has_on_conflict
-            && acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack
-        {
+        // `on_conflict` forces writes to the accelerator only. When combined with
+        // `write_mode: write_back` and `refresh_mode: changes` (CDC), on_conflict acts
+        // as WAL UPDATE upsert routing only and write_back can coexist with it.
+        // Reject the combination of on_conflict + write_back without CDC, since there
+        // would be no path to sync the accelerator writes back to the federated source.
+        if has_on_conflict && has_write_back && !has_changes_refresh {
             crate::AcceleratedWriteBackWithOnConflictSnafu {
                 dataset_name: ds.name.to_string(),
             }
