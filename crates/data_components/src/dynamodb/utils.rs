@@ -105,14 +105,13 @@ pub fn scalar_to_attribute_value(
                 std::cmp::Ordering::Less => {
                     let abs_scale = u32::from(scale.unsigned_abs());
                     let multiplier = 10_i128.pow(abs_scale);
-                    match v.checked_mul(multiplier) {
-                        Some(result) => result.to_string(),
-                        None => {
-                            return Err(DataFusionError::Execution(format!(
-                                "Decimal128 value {v} with scale {scale} overflows when scaling to DynamoDB number"
-                            )));
-                        }
-                    }
+                    v.checked_mul(multiplier)
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(format!(
+                                "Decimal128 value {v} with scale {scale} overflows on multiplication"
+                            ))
+                        })?
+                        .to_string()
                 }
                 std::cmp::Ordering::Equal => v.to_string(),
             };
@@ -142,12 +141,11 @@ pub fn scalar_to_attribute_value(
                 std::cmp::Ordering::Less => {
                     let abs_scale = u32::from(scale.unsigned_abs());
                     let multiplier = arrow::datatypes::i256::from_i128(10_i128.pow(abs_scale));
-                    let result = v.wrapping_mul(multiplier);
-                    if abs_scale > 0 && result.wrapping_div(multiplier) != *v {
-                        return Err(DataFusionError::Execution(format!(
-                            "Decimal256 value with scale {scale} overflows when scaling to DynamoDB number"
-                        )));
-                    }
+                    let result = v.checked_mul(multiplier).ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Decimal256 value {v} with scale {scale} overflows on multiplication"
+                        ))
+                    })?;
                     format!("{result}")
                 }
                 std::cmp::Ordering::Equal => format!("{v}"),
@@ -456,6 +454,21 @@ mod tests {
         assert_number(&scalar, "12300");
     }
 
+    #[test]
+    fn decimal128_negative_scale_overflow_returns_error() {
+        let scalar = ScalarValue::Decimal128(Some(i128::MAX), 38, -2);
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
+        assert!(result.is_err(), "overflow should produce an error");
+    }
+
+    #[test]
+    fn decimal256_negative_scale_overflow_returns_error() {
+        let v = arrow::datatypes::i256::from_parts(u128::MAX, i128::MAX);
+        let scalar = ScalarValue::Decimal256(Some(v), 76, -2);
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
+        assert!(result.is_err(), "overflow should produce an error");
+    }
+
     // -----------------------------------------------------------------------
     // Date64 pre-epoch regression tests
     // -----------------------------------------------------------------------
@@ -559,16 +572,6 @@ mod tests {
         assert!(
             result.is_err(),
             "TimestampSecond near i64::MAX should fail on overflow"
-        );
-    }
-
-    #[test]
-    fn decimal128_negative_scale_overflow_returns_error() {
-        let scalar = ScalarValue::Decimal128(Some(i128::MAX), 38, -2);
-        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
-        assert!(
-            result.is_err(),
-            "Decimal128 overflow on negative scale should fail"
         );
     }
 
