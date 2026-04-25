@@ -44,7 +44,7 @@ use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::{ResultExt, Snafu};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Default grace period before expiry when we consider the token stale and
 /// eagerly re-exchange.
@@ -97,6 +97,10 @@ pub struct SamlBearerFlow {
     config: SamlBearerConfig,
     http: Client,
     cache: Arc<RwLock<Option<AcquiredToken>>>,
+    /// Serializes concurrent token refreshes so only one caller hits Azure
+    /// AD when the cache expires. The cache `RwLock` itself is never held
+    /// across the HTTP exchange, so it doesn't block readers during refresh.
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +136,7 @@ impl SamlBearerFlow {
             config,
             http: Client::new(),
             cache: Arc::new(RwLock::new(None)),
+            refresh_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -148,19 +153,24 @@ impl SamlBearerFlow {
                 return Ok(tok.clone());
             }
         }
-        // Contended / refresh path: acquire the write lock *before*
-        // `exchange_once()` so only one caller performs the HTTP
-        // round-trip. Other concurrent callers queue on the lock and
-        // pick up the freshly-exchanged token via the double-check
-        // below — no thundering herd against Azure AD.
-        let mut cache = self.cache.write().await;
-        if let Some(tok) = &*cache
-            && tok.is_fresh()
+        // Contended / refresh path: serialize on `refresh_lock` so only one
+        // caller hits Azure AD even if many callers see a stale cache at
+        // once (no thundering herd). The cache `RwLock` is dropped before
+        // `exchange_once()` and reacquired briefly to write, so concurrent
+        // readers never block on the network round-trip.
+        let _refresh_guard = self.refresh_lock.lock().await;
+        // Re-check: another caller may have refreshed while we were
+        // waiting on `refresh_lock`.
         {
-            return Ok(tok.clone());
+            let cached = self.cache.read().await;
+            if let Some(tok) = &*cached
+                && tok.is_fresh()
+            {
+                return Ok(tok.clone());
+            }
         }
         let fresh = self.exchange_once().await?;
-        *cache = Some(fresh.clone());
+        *self.cache.write().await = Some(fresh.clone());
         Ok(fresh)
     }
 
