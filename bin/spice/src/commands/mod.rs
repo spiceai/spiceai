@@ -40,5 +40,6 @@ pub mod sql;
 pub mod status;
 pub mod trace;
 pub mod upgrade;
+pub mod validate;
 pub mod version;
 pub mod workers;
