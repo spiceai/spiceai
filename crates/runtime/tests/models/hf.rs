@@ -553,6 +553,76 @@ async fn huggingface_test_gemma_chat_completion() -> Result<(), anyhow::Error> {
         .await
 }
 
+/// Live integration test for loading a Gemma 4 model from HuggingFace.
+///
+/// Verifies that the `gemma4` architecture (e.g. `google/gemma-4-E2B-it`) can be
+/// loaded and served via the HuggingFace model component.
+#[tokio::test]
+async fn huggingface_test_gemma4_chat_completion() -> Result<(), anyhow::Error> {
+    const HF_GEMMA_MODEL: &str = "google/gemma-4-E2B-it";
+    const HF_GEMMA_MODEL_TYPE: &str = "gemma4";
+
+    let _tracing = init_tracing(None);
+
+    if HF_TEST_MODEL_REQUIRES_HF_API_KEY {
+        verify_env_secret_exists("SPICE_HF_TOKEN")
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    test_request_context()
+        .scope_retry(3, || async {
+            let app = AppBuilder::new("gemma4-chat")
+                .with_dataset(get_taxi_trips_dataset())
+                .with_model(get_huggingface_model(
+                    HF_GEMMA_MODEL,
+                    HF_GEMMA_MODEL_TYPE,
+                    "gemma4_model",
+                ))
+                .build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            let _llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+
+            tokio::select! {
+                // increased timeout to download and load huggingface model
+                () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
+
+            let response = send_chat_completions_request(
+                http_base_url.as_str(),
+                vec![(
+                    "user".to_string(),
+                    "Reply with the single word 'hello'.".to_string(),
+                )],
+                "gemma4_model",
+                false,
+            )
+            .await?;
+
+            insta::assert_snapshot!(
+                "gemma4_chat_completion",
+                normalize_chat_completion_response(response, true)
+            );
+
+            Ok(())
+        })
+        .await
+}
+
 fn get_huggingface_model(
     model: impl Into<String>,
     model_type: impl Into<String>,

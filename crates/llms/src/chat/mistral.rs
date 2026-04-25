@@ -420,6 +420,8 @@ impl MistralLlama {
             return_raw_logits: false,
             model_id: None, // Not actually needed.
             truncate_sequence: false,
+            max_tool_rounds: None,
+            tool_dispatch_url: None,
         }))
     }
 
@@ -784,6 +786,7 @@ fn convert_named_tool(x: &ChatCompletionNamedToolChoice) -> Tool {
             description: None,
             name: x.function.name.clone(),
             parameters: None,
+            strict: None,
         },
     }
 }
@@ -800,6 +803,7 @@ fn convert_tool(x: &ChatCompletionTools) -> Tool {
                     .parameters
                     .clone()
                     .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
+                strict: None,
             },
         },
         ChatCompletionTools::Custom(_) => Tool {
@@ -808,6 +812,7 @@ fn convert_tool(x: &ChatCompletionTools) -> Tool {
                 description: None,
                 name: String::new(),
                 parameters: None,
+                strict: None,
             },
         },
     }
