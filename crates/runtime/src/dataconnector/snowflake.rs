@@ -37,7 +37,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to create Snowflake connection pool: {source}"))]
+    #[snafu(display(
+        "Failed to create Snowflake connection pool: {source}. Check your `account`, `warehouse`, `username`, and auth (`password` or `private_key`/`private_key_path`). Docs: https://spiceai.org/docs/components/data-connectors/snowflake"
+    ))]
     UnableToCreateSnowflakeConnectionPool {
         source: db_connection_pool::snowflakepool::Error,
     },
@@ -65,16 +67,49 @@ impl SnowflakeFactory {
     }
 }
 
+const SNOWFLAKE_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/snowflake";
+
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("username").secret(),
-    ParameterSpec::component("password").secret(),
-    ParameterSpec::component("private_key_path").secret(),
-    ParameterSpec::component("private_key").secret(),
-    ParameterSpec::component("private_key_passphrase").secret(),
-    ParameterSpec::component("account").secret(),
-    ParameterSpec::component("warehouse").secret(),
-    ParameterSpec::component("role").secret(),
-    ParameterSpec::component("auth_type"),
+    ParameterSpec::component("username")
+        .description("Snowflake username.")
+        .help_link(SNOWFLAKE_DOCS)
+        .secret(),
+    ParameterSpec::component("password")
+        .description("Snowflake password (when using password auth).")
+        .help_link(SNOWFLAKE_DOCS)
+        .secret(),
+    ParameterSpec::component("private_key_path")
+        .description("Path to an RSA private key file for keypair auth.")
+        .examples(&["/var/secrets/snowflake_rsa.p8"])
+        .help_link(SNOWFLAKE_DOCS)
+        .secret(),
+    ParameterSpec::component("private_key")
+        .description("PEM-encoded RSA private key contents for keypair auth.")
+        .help_link(SNOWFLAKE_DOCS)
+        .secret(),
+    ParameterSpec::component("private_key_passphrase")
+        .description("Passphrase for an encrypted RSA private key.")
+        .help_link(SNOWFLAKE_DOCS)
+        .secret(),
+    ParameterSpec::component("account")
+        .description("Snowflake account identifier.")
+        .examples(&["xy12345.us-east-1"])
+        .help_link(SNOWFLAKE_DOCS)
+        .secret(),
+    ParameterSpec::component("warehouse")
+        .description("Snowflake virtual warehouse to run queries against.")
+        .examples(&["COMPUTE_WH"])
+        .help_link(SNOWFLAKE_DOCS)
+        .secret(),
+    ParameterSpec::component("role")
+        .description("Snowflake role to use for the session.")
+        .examples(&["READ_ONLY"])
+        .help_link(SNOWFLAKE_DOCS)
+        .secret(),
+    ParameterSpec::component("auth_type")
+        .description("Authentication method: 'password' or 'snowflake_jwt' (keypair).")
+        .one_of(&["password", "snowflake_jwt"])
+        .help_link(SNOWFLAKE_DOCS),
 ];
 
 // https://github.com/apache/datafusion-sqlparser-rs/blob/87d190734c7b978e8252b110c9529d7a93a30cf0/src/keywords.rs#L1061
