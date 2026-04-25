@@ -52,20 +52,21 @@ fn check_target(target: Target) -> bool {
 /// Returns `true` when colored output should be emitted for the given stream.
 #[must_use]
 pub fn colors_enabled_for(target: Target) -> bool {
-    // Internal tests assert literal escape codes, so we force colors on under cfg(test).
-    // Downstream crates that want colors under their own test harness should call
-    // `set_colors_enabled(true)` from a test fixture before any use.
+    let cell = match target {
+        Target::Stdout => &STDOUT_COLORS,
+        Target::Stderr => &STDERR_COLORS,
+    };
+
+    // Internal tests assert literal escape codes, so under cfg(test) we default to
+    // colors enabled. Still respect an explicit override installed via
+    // `set_colors_enabled(...)` before the first use, so tests (here or downstream)
+    // can opt in to "no color" behavior.
     #[cfg(test)]
     {
-        let _ = target;
-        return true;
+        return cell.get().copied().unwrap_or(true);
     }
     #[cfg(not(test))]
     {
-        let cell = match target {
-            Target::Stdout => &STDOUT_COLORS,
-            Target::Stderr => &STDERR_COLORS,
-        };
         *cell.get_or_init(|| check_target(target))
     }
 }

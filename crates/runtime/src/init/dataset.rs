@@ -199,15 +199,18 @@ impl Runtime {
         }
 
         // Aggregate startup summary so users see "3/5 queued, 2 skipped at init" at a glance
-        // instead of having to piece that together from per-dataset warnings. Wording avoids
-        // the words "failed" / "error" so it doesn't trip quickstart CI checks that grep
-        // spice.log for those tokens as a sentinel for real failures.
+        // instead of having to piece that together from per-dataset warnings. `dispatched`
+        // is the number of spawned load tasks, which can be less than the number of
+        // datasets that will load because localpod datasets are chained behind their
+        // parent dataset's task. Wording avoids the words "failed" / "error" so it
+        // doesn't trip quickstart CI checks that grep spice.log for those tokens as a
+        // sentinel for real failures.
         let dispatched = spawned_tasks.len();
         let init_skipped = init_results.values().filter(|r| r.is_err()).count();
         let total = valid_datasets.len();
         if total > 0 {
             tracing::info!(
-                "Loading datasets: {dispatched} dispatched, {init_skipped} skipped at accelerator init (of {total} total)."
+                "Loading datasets: {dispatched} tasks dispatched, {init_skipped} skipped at accelerator init (of {total} total; localpod datasets may be chained)."
             );
         }
 
