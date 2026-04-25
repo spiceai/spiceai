@@ -93,8 +93,12 @@ impl Runtime {
         else {
             let catalog_name = &catalog.name;
             metrics::catalogs::LOAD_ERROR.add(1, &[]);
+            let suggestion = catalogconnector::suggest_catalog_connector(&source).await;
+            let available = catalogconnector::registered_catalog_names().await;
             let err = crate::Error::UnknownCatalogConnector {
                 catalog_connector: source,
+                suggestion,
+                available,
             };
             self.status.update_catalog(
                 catalog_name,

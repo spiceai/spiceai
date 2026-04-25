@@ -18,6 +18,7 @@ limitations under the License.
 
 use crate::Result;
 use crate::error::{ConfigIoSnafu, CreateDirectorySnafu, InvalidArgumentSnafu};
+use ansi_colors::Color;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
@@ -121,9 +122,10 @@ fn configure_dataset() -> Result<()> {
 
     // Warn about hyphens in dataset name
     if dataset_name.contains('-') {
-        println!(
-            "\x1b[33mDataset names containing hyphens (-) are deprecated and will no longer be supported starting with version 2.0.\nDataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"{dataset_name}\"\x1b[0m"
+        let warning = format!(
+            "Dataset names containing hyphens (-) are deprecated and will no longer be supported starting with version 2.0.\nDataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"{dataset_name}\""
         );
+        println!("{}", Color::Yellow.paint(warning));
     }
 
     // Get description
@@ -216,7 +218,10 @@ fn configure_dataset() -> Result<()> {
     // Update spicepod.yaml to reference the dataset
     update_spicepod_with_dataset(&dir_path)?;
 
-    println!("\x1b[32mSaved {}\x1b[0m", file_path.display());
+    println!(
+        "{}",
+        Color::Green.paint(format!("Saved {}", file_path.display()))
+    );
 
     Ok(())
 }

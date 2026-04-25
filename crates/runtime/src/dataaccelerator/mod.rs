@@ -137,7 +137,9 @@ pub enum Error {
     #[snafu(display("Invalid configuration: {msg}"))]
     InvalidConfiguration { msg: String },
 
-    #[snafu(display("Unknown engine: {engine}"))]
+    #[snafu(display(
+        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres, cayenne. Docs: https://spiceai.org/docs/components/data-accelerators"
+    ))]
     UnknownEngine { engine: Arc<str> },
 
     #[snafu(display("Acceleration creation failed: {source}"))]
