@@ -1073,7 +1073,7 @@ fn alias_value_to_match(
 /// Named args are those carrying a `spice.parameter_name` key in their
 /// [`FieldMetadata`] (set by  `name => value` SQL syntax). Returns `(positional, named)`
 /// where `named` maps parameter names to the corresponding expression.
-fn split_named_args<'a>(args: &'a [Expr]) -> (Vec<&'a Expr>, HashMap<&'a str, &'a Expr>) {
+fn split_named_args(args: &[Expr]) -> (Vec<&Expr>, HashMap<&str, &Expr>) {
     fn named_param(e: &Expr) -> Option<(&str, &Expr)> {
         match e {
             Expr::Literal(_, Some(meta)) => meta
@@ -1119,10 +1119,10 @@ fn resolve_positional_or_named<T>(
             "Duplicate '{name}' argument: provided both positionally and as a named argument."
         )));
     }
-    if positional.is_none() {
-        if let Some(expr) = named.get(name) {
-            return extract(expr);
-        }
+    if positional.is_none()
+        && let Some(expr) = named.get(name)
+    {
+        return extract(expr);
     }
     Ok(positional)
 }
@@ -1576,7 +1576,7 @@ mod tests {
             Expr::Literal(ScalarValue::Int64(Some(10)), None), // positional limit
             named_arg("limit", ScalarValue::Int64(Some(50))),  // named limit
         ];
-        let err = VectorSearchTableFunc::parse_args(&exprs)
+        let _err = VectorSearchTableFunc::parse_args(&exprs)
             .expect_err("Duplicate limit should be rejected");
     }
 
@@ -1587,7 +1587,7 @@ mod tests {
             lit_utf8("hello"),
             named_arg("limit", ScalarValue::Boolean(Some(true))),
         ];
-        let err = VectorSearchTableFunc::parse_args(&exprs)
+        let _err = VectorSearchTableFunc::parse_args(&exprs)
             .expect_err("Boolean limit should be rejected");
     }
 
@@ -1598,7 +1598,7 @@ mod tests {
             lit_utf8("hello"),
             named_arg("column", ScalarValue::Int64(Some(42))),
         ];
-        let err = VectorSearchTableFunc::parse_args(&exprs)
+        let _err = VectorSearchTableFunc::parse_args(&exprs)
             .expect_err("Integer column should be rejected");
     }
 }
