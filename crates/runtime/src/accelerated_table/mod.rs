@@ -1299,17 +1299,17 @@ impl TableProvider for AcceleratedTable {
         let scan_projection = extended_projection.as_ref().or(projection);
         // For UseSource mode, the scan is handled inside the match arm below (with filter
         // splitting). For all other modes, perform the accelerator scan upfront.
-        let input = if !matches!(
+        let input = if matches!(
             (is_caching_mode, &self.zero_results_action),
             (false, ZeroResultsAction::UseSource)
         ) {
+            None
+        } else {
             Some(
                 self.accelerator
                     .scan(state, scan_projection, filters, limit)
                     .await?,
             )
-        } else {
-            None
         };
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
@@ -1320,8 +1320,11 @@ impl TableProvider for AcceleratedTable {
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
                 // Caching mode: wrap with cache execution plan to handle staleness and background refresh
-                // SAFETY: input is always Some in caching mode (UseSource guard above excludes caching)
-                let input = input.expect("input is always computed in caching mode");
+                let input = input.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "accelerator scan input missing in caching mode".to_string(),
+                    )
+                })?;
 
                 // Check which filters the accelerator doesn't fully support and need to be re-applied.
                 // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
@@ -1355,10 +1358,11 @@ impl TableProvider for AcceleratedTable {
                     batch_write_tx,
                 ))
             }
-            (false, ZeroResultsAction::ReturnEmpty) => {
-                // SAFETY: input is always Some when not in UseSource mode
-                input.expect("input is always computed in ReturnEmpty mode")
-            }
+            (false, ZeroResultsAction::ReturnEmpty) => input.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "accelerator scan input missing in ReturnEmpty mode".to_string(),
+                )
+            })?,
             (false, ZeroResultsAction::UseSource) => {
                 // Split filters: only forward accelerator-supported ones into the accelerator
                 // scan, and apply denied-function filters locally via wrap_with_filter so they
