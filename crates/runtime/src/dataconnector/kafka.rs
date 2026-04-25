@@ -386,6 +386,42 @@ impl DataConnector for Kafka {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime_secrets::Secrets;
+    use secrecy::SecretString;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn kafka_security_protocol_accepts_uppercase_values() {
+        let factory = KafkaFactory::new();
+        let params = Parameters::try_new(
+            "connector kafka",
+            vec![
+                (
+                    "kafka_bootstrap_servers".to_string(),
+                    SecretString::new("localhost:19093".to_string().into()),
+                ),
+                (
+                    "kafka_security_protocol".to_string(),
+                    SecretString::new("SASL_PLAINTEXT".to_string().into()),
+                ),
+            ],
+            factory.prefix(),
+            Arc::new(RwLock::new(Secrets::new())),
+            factory.parameters(),
+        )
+        .await
+        .expect("Kafka security_protocol should accept librdkafka uppercase values");
+
+        assert_eq!(
+            params.get("security_protocol").expose().ok(),
+            Some("SASL_PLAINTEXT")
+        );
+    }
+}
+
 async fn init_kafka_consumer(
     dataset: &Dataset,
     topic: &str,
