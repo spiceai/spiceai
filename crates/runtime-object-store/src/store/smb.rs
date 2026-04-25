@@ -53,6 +53,34 @@ fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     generic_error(STORE_NAME, error)
 }
 
+/// Map an `io::Error` from a head/get/delete into an `object_store::Error`.
+/// `NotFound` → `object_store::Error::NotFound`; everything else → `Generic`.
+/// This keeps permission/timeout failures from being misreported as 404s.
+fn map_head_error(err: std::io::Error, path: String) -> object_store::Error {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        object_store::Error::NotFound {
+            path,
+            source: err.into(),
+        }
+    } else {
+        handle_error(err)
+    }
+}
+
+/// Check whether the destination exists for create-exclusive semantics.
+/// `Ok(true)` → exists; `Ok(false)` → confirmed not found; `Err` → head
+/// failed for some other reason and should be surfaced as a real error.
+async fn destination_exists(
+    share: &ShareSession,
+    key: &str,
+) -> object_store::Result<bool> {
+    match share.head_object(key).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(handle_error(e)),
+    }
+}
+
 fn unix_epoch_datetime() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0, 0)
         .unwrap_or_else(|| unreachable!("Unix epoch is always representable"))
@@ -357,7 +385,7 @@ impl ObjectStore for SMBObjectStore {
         // SMB has no atomic "create-exclusive" primitive that maps cleanly
         // across dialects; best-effort: head first, reject if the object
         // already exists. This is a TOCTOU race, same as `copy_if_not_exists`.
-        if matches!(opts.mode, PutMode::Create) && share.head_object(&key).await.is_ok() {
+        if matches!(opts.mode, PutMode::Create) && destination_exists(&share, &key).await? {
             return Err(object_store::Error::AlreadyExists {
                 path: location.to_string(),
                 source: "put_opts(Create): destination already exists".into(),
@@ -394,10 +422,7 @@ impl ObjectStore for SMBObjectStore {
         let meta = share
             .head_object(&key)
             .await
-            .map_err(|e| object_store::Error::NotFound {
-                path: location.to_string(),
-                source: e.into(),
-            })?;
+            .map_err(|e| map_head_error(e, location.to_string()))?;
 
         let (start, end, _to_read) = resolve_range(options.range.as_ref(), meta.size);
         guard_read_size(end.saturating_sub(start))?;
@@ -433,10 +458,7 @@ impl ObjectStore for SMBObjectStore {
         let meta = share
             .head_object(&key)
             .await
-            .map_err(|e| object_store::Error::NotFound {
-                path: location.to_string(),
-                source: e.into(),
-            })?;
+            .map_err(|e| map_head_error(e, location.to_string()))?;
 
         Ok(build_object_meta(
             location.clone(),
@@ -514,7 +536,7 @@ impl ObjectStore for SMBObjectStore {
         let share = self.get_share().await?;
         let dst_key = self.config().key_for(to);
 
-        if share.head_object(&dst_key).await.is_ok() {
+        if destination_exists(&share, &dst_key).await? {
             return Err(object_store::Error::AlreadyExists {
                 path: to.to_string(),
                 source: "copy_if_not_exists: destination already exists".into(),

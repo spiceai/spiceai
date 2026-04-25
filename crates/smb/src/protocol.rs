@@ -560,7 +560,14 @@ pub fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64,
     buf.put_u16_le(0); // WriteChannelInfoOffset
     buf.put_u16_le(0); // WriteChannelInfoLength
     buf.put_u32_le(0); // Flags
-    buf.put_slice(data);
+    // Spec mandates StructureSize=49 (one byte beyond the 48-byte fixed part).
+    // When `data` is empty we still need to emit one zero byte so stricter
+    // servers (and the SMB2 validator) accept the request.
+    if data.is_empty() {
+        buf.put_u8(0);
+    } else {
+        buf.put_slice(data);
+    }
 }
 
 #[must_use]
