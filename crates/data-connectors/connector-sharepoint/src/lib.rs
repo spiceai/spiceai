@@ -61,9 +61,10 @@ use runtime::parameters::{ParameterSpec, Parameters};
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::future::Future;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
 use url::Url;
@@ -115,12 +116,6 @@ pub struct Sharepoint {
     params: Parameters,
     tokio_io_runtime: tokio::runtime::Handle,
     runtime: Option<Runtime>,
-    /// Registry keys (`scheme://authority`) this connector instance has
-    /// already registered an [`SharepointObjectStore`] under, used to make
-    /// repeated registrations from the same connector idempotent and to
-    /// detect collisions with another connector instance trying to share
-    /// the key.
-    registered_keys: Arc<Mutex<HashSet<Url>>>,
 }
 
 impl fmt::Debug for Sharepoint {
@@ -150,7 +145,6 @@ impl Sharepoint {
             params,
             tokio_io_runtime,
             runtime,
-            registered_keys: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -268,56 +262,95 @@ fn registry_key_for(store_url: &Url) -> Url {
     }
 }
 
+/// Process-wide map of `(registry_key → fingerprint)` so concurrent SharePoint
+/// connector instances (the runtime instantiates one per dataset) can
+/// recognize when they're registering "the same logical store" under the
+/// same scheme+authority key. Without it, dataset B's registration would
+/// silently replace dataset A's entry — which is fine when the configs
+/// match, but a correctness/data-exposure risk when they don't.
+///
+/// The fingerprint is a hash of the connector's non-secret identity bits
+/// (tenant_id, client_id, scope, drive form, conflict_behavior,
+/// max_put_bytes). Hash collisions are theoretically possible but
+/// vanishingly unlikely for well-formed configs.
+static SHAREPOINT_STORE_FINGERPRINTS: LazyLock<Mutex<HashMap<Url, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Compute a fingerprint over the connector's effective identity for store
+/// deduplication. Includes tenant/client/scope/drive-form/write-config —
+/// every field that materially changes how the store would behave at
+/// runtime. The hash is process-local so it never leaks externally.
+fn store_fingerprint(
+    params: &Parameters,
+    drive_kind: Option<DriveKind>,
+    config: &SharepointObjectStoreConfig,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    params.get("tenant_id").expose().ok().hash(&mut h);
+    params.get("client_id").expose().ok().hash(&mut h);
+    params.get("scope").expose().ok().hash(&mut h);
+    drive_kind.map(|k| format!("{k:?}")).hash(&mut h);
+    config.conflict_behavior.hash(&mut h);
+    config.max_put_bytes.hash(&mut h);
+    h.finish()
+}
+
 /// Register a [`SharepointObjectStore`] on `runtime_env` under the
-/// canonical scheme+authority key. Repeated registrations from the same
-/// connector instance for the same key are no-ops — the architecture
-/// supports multiple datasets sharing one registered store. A collision
-/// from a *different* connector instance returns an
-/// [`InvalidConfiguration`] error: silently replacing the entry could
-/// route earlier datasets through the wrong `GraphClient`, which is a
-/// correctness and potential data-exposure risk.
+/// canonical scheme+authority key.
+///
+/// Behavior when an entry already exists at the key (per the process-wide
+/// [`SHAREPOINT_STORE_FINGERPRINTS`] tracker):
+/// - **Same fingerprint** → no-op. Two datasets that share auth/config
+///   produce the same fingerprint, so re-registration from a sibling
+///   connector instance is silent. This is the common case in clustered
+///   mode where every executor instantiates connectors per-dataset.
+/// - **Different fingerprint** → [`InvalidConfiguration`] error. Two
+///   datasets with different credentials or write config sharing the same
+///   scheme+authority key would silently route through the wrong
+///   `GraphClient`, which is a correctness and potential data-exposure
+///   risk. We surface that as a configuration error rather than a warning.
 ///
 /// [`InvalidConfiguration`]: DataConnectorError::InvalidConfiguration
 fn register_sharepoint_store(
     runtime_env: &Arc<RuntimeEnv>,
     store_url: &Url,
     store: Arc<SharepointObjectStore>,
-    registered_keys: &Mutex<HashSet<Url>>,
+    fingerprint: u64,
     dataset: &Dataset,
 ) -> DataConnectorResult<()> {
     let key_url = registry_key_for(store_url);
-    let mut keys = registered_keys
+    let mut fps = SHAREPOINT_STORE_FINGERPRINTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if keys.contains(&key_url) {
-        // Same connector instance re-registering for a key it already
-        // owns. No-op — the store already in the registry was put there
-        // by us with equivalent config.
-        return Ok(());
-    }
-    if runtime_env
-        .object_store_registry
-        .get_store(&key_url)
-        .is_ok()
-    {
-        return Err(DataConnectorError::InvalidConfiguration {
-            dataconnector: CONNECTOR_NAME.to_string(),
-            message: format!(
-                "Another SharePoint object store is already registered under '{key_url}'. \
-                 Two SharePoint connectors with different credentials or configuration cannot \
-                 share the same scheme+authority. Disambiguate by using a different drive form \
-                 (e.g. sharepoint://sites/{{site-id}} vs sharepoint://drives/{{drive-id}}) for \
-                 one of them, or consolidate the datasets under a single connector instance."
-            ),
-            connector_component: ConnectorComponent::from(dataset),
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("registry key '{key_url}' already taken"),
-            )),
-        });
+    match fps.get(&key_url) {
+        Some(existing) if *existing == fingerprint => {
+            // Same logical store — already registered by an earlier
+            // connector instance for the same dataset family. No-op.
+            return Ok(());
+        }
+        Some(_existing) => {
+            return Err(DataConnectorError::InvalidConfiguration {
+                dataconnector: CONNECTOR_NAME.to_string(),
+                message: format!(
+                    "A SharePoint object store with different credentials or configuration is \
+                     already registered under '{key_url}'. Two SharePoint connectors with \
+                     different effective config cannot share the same scheme+authority. \
+                     Disambiguate by using a different drive form (e.g. \
+                     sharepoint://sites/{{site-id}} vs sharepoint://drives/{{drive-id}}) for \
+                     one of them, or align the connector params (tenant_id, client_id, \
+                     conflict_behavior, max_put_bytes) across the datasets."
+                ),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("registry key '{key_url}' already taken with a different fingerprint"),
+                )),
+            });
+        }
+        None => {}
     }
     runtime_env.register_object_store(&key_url, store);
-    keys.insert(key_url);
+    fps.insert(key_url, fingerprint);
     Ok(())
 }
 
@@ -678,18 +711,13 @@ impl DataConnector for Sharepoint {
         // drive per store instance. `sharepoint://me` is the one special
         // case where the drive is fixed.
         let (store_url, kind, config) = parse_object_store_components(&self.params, dataset)?;
+        let fingerprint = store_fingerprint(&self.params, kind, &config);
         let store = Arc::new(SharepointObjectStore::new(
             Arc::clone(&self.client),
             kind,
             config,
         ));
-        register_sharepoint_store(
-            runtime_env,
-            &store_url,
-            store,
-            &self.registered_keys,
-            dataset,
-        )?;
+        register_sharepoint_store(runtime_env, &store_url, store, fingerprint, dataset)?;
         // Then defer to the listing connector for any additional setup.
         self.listing_connector(dataset)?
             .register_object_stores(dataset, runtime_env)

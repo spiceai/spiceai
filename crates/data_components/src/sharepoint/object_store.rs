@@ -69,7 +69,7 @@ const STORE_TAG: &str = "SharepointObjectStore";
 
 /// Controls what happens on write when a file with the same path exists.
 /// Maps to SharePoint's `@microsoft.graph.conflictBehavior` header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ConflictBehavior {
     /// Overwrite the existing file; SharePoint retains the prior content as a
     /// prior version. This is the default and matches SharePoint's standard
