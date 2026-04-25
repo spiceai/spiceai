@@ -134,12 +134,11 @@ mod tests {
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            match self.frames.next() {
-                Some(frame) => Poll::Ready(Some(Ok(frame))),
-                None => {
-                    self.end_stream = true;
-                    Poll::Ready(None)
-                }
+            if let Some(frame) = self.frames.next() {
+                Poll::Ready(Some(Ok(frame)))
+            } else {
+                self.end_stream = true;
+                Poll::Ready(None)
             }
         }
 
