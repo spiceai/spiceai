@@ -450,7 +450,7 @@ impl ObjectStore for SharepointObjectStore {
         let client = Arc::clone(&self.client);
         let kind = self.kind;
         let full_prefix = prefix.cloned().unwrap_or_else(|| Path::from(""));
-        let (parent, name_filter) = split_prefix(&full_prefix);
+        let (parent, name_filter) = split_prefix(&full_prefix, kind);
         Box::pin(async_stream::stream! {
             let mut queue: std::collections::VecDeque<(Path, Option<String>)> =
                 std::collections::VecDeque::new();
@@ -559,15 +559,28 @@ fn payload_to_bytes(payload: &PutPayload, max_put_bytes: usize) -> ObjectStoreRe
 /// Split an `ObjectStore::list` prefix into `(parent_folder, name_filter)`
 /// so the driver can walk the parent and apply a starts-with filter on
 /// the first-level children. Empty prefix returns `(root, None)`.
-fn split_prefix(prefix: &Path) -> (Path, Option<String>) {
-    let mut parts: Vec<String> = prefix.parts().map(|p| p.as_ref().to_string()).collect();
-    match parts.pop() {
-        None => (Path::from(""), None),
-        Some(last) => {
-            let parent: Path = parts.iter().map(String::as_str).collect();
-            (parent, Some(last))
-        }
+///
+/// For kinded stores (`DriveKind::Drives`/`Sites`/`Users`/`Groups`), the
+/// first path segment is the drive/site/etc. id — it's not a filterable
+/// name. Listing `Path::from("{drive-id}")` (a single segment that *is*
+/// the drive root) must yield `(parent="{drive-id}", filter=None)` so
+/// `resolve_static` can find the drive id; otherwise the drive root
+/// would resolve as "missing drive id".
+fn split_prefix(prefix: &Path, kind: Option<DriveKind>) -> (Path, Option<String>) {
+    let parts: Vec<String> = prefix.parts().map(|p| p.as_ref().to_string()).collect();
+    let reserved_segments = usize::from(kind.is_some());
+    if parts.len() <= reserved_segments {
+        // Prefix is at or above the drive-root level — list everything
+        // under that drive (or under root for `Me`).
+        let parent: Path = parts.iter().map(String::as_str).collect();
+        return (parent, None);
     }
+    let last = parts.last().expect("non-empty parts").clone();
+    let parent: Path = parts[..parts.len() - 1]
+        .iter()
+        .map(String::as_str)
+        .collect();
+    (parent, Some(last))
 }
 
 fn resolve_range(range: &GetRange, total_size: u64) -> std::ops::Range<u64> {

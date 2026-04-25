@@ -262,24 +262,46 @@ fn registry_key_for(store_url: &Url) -> Url {
     }
 }
 
-/// Process-wide map of `(registry_key → fingerprint)` so concurrent SharePoint
-/// connector instances (the runtime instantiates one per dataset) can
-/// recognize when they're registering "the same logical store" under the
-/// same scheme+authority key. Without it, dataset B's registration would
-/// silently replace dataset A's entry — which is fine when the configs
-/// match, but a correctness/data-exposure risk when they don't.
+/// Process-wide map of `((runtime_env_ptr, registry_key) → fingerprint)` so
+/// concurrent SharePoint connector instances (the runtime instantiates one
+/// per dataset) can recognize when they're registering "the same logical
+/// store" under the same scheme+authority key. Without it, dataset B's
+/// registration would silently replace dataset A's entry — which is fine
+/// when the configs match, but a correctness/data-exposure risk when they
+/// don't.
 ///
-/// The fingerprint is a hash of the connector's non-secret identity bits
-/// (tenant_id, client_id, scope, drive form, conflict_behavior,
-/// max_put_bytes). Hash collisions are theoretically possible but
-/// vanishingly unlikely for well-formed configs.
-static SHAREPOINT_STORE_FINGERPRINTS: LazyLock<Mutex<HashMap<Url, u64>>> =
+/// The map is keyed by `(Arc::as_ptr(runtime_env) as usize, registry_url)`
+/// so each `RuntimeEnv` carries its own state — multiple `RuntimeEnv`s
+/// alive simultaneously (e.g. tests, fresh per-query session contexts)
+/// don't false-positive against each other.
+///
+/// The fingerprint hashes the connector's identity bits — tenant_id,
+/// client_id, scope, drive form, conflict_behavior, max_put_bytes, AND a
+/// non-reversible hash of whichever auth secret is present
+/// (`client_secret`/`bearer_token`/`auth_code`/`refresh_token`/
+/// `device_code`/`saml_assertion`) — so rotated tokens / different
+/// credentials never collide silently.
+static SHAREPOINT_STORE_FINGERPRINTS: LazyLock<Mutex<HashMap<(usize, Url), u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Auth-flow params that materially change which SharePoint identity a
+/// connector authenticates as. Their values feed into the fingerprint
+/// (hashed; never stored or logged in plaintext).
+const AUTH_SECRET_PARAMS: &[&str] = &[
+    "client_secret",
+    "bearer_token",
+    "auth_code",
+    "refresh_token",
+    "device_code",
+    "saml_assertion",
+];
+
 /// Compute a fingerprint over the connector's effective identity for store
-/// deduplication. Includes tenant/client/scope/drive-form/write-config —
-/// every field that materially changes how the store would behave at
-/// runtime. The hash is process-local so it never leaks externally.
+/// deduplication. Hashes tenant/client/scope/drive-form/write-config plus
+/// the bytes of whichever auth secret is set — so two datasets that
+/// differ only in their bearer token (or have rotated client secrets)
+/// produce different fingerprints. The hash is process-local and never
+/// leaves the process.
 fn store_fingerprint(
     params: &Parameters,
     drive_kind: Option<DriveKind>,
@@ -292,14 +314,24 @@ fn store_fingerprint(
     drive_kind.map(|k| format!("{k:?}")).hash(&mut h);
     config.conflict_behavior.hash(&mut h);
     config.max_put_bytes.hash(&mut h);
+    for key in AUTH_SECRET_PARAMS {
+        let v = params.get(key).expose().ok();
+        // Discriminate "param absent" from "param present, empty value"
+        // so absence-vs-presence flips the fingerprint even before any
+        // value bytes contribute.
+        v.is_some().hash(&mut h);
+        if let Some(s) = v {
+            s.hash(&mut h);
+        }
+    }
     h.finish()
 }
 
 /// Register a [`SharepointObjectStore`] on `runtime_env` under the
 /// canonical scheme+authority key.
 ///
-/// Behavior when an entry already exists at the key (per the process-wide
-/// [`SHAREPOINT_STORE_FINGERPRINTS`] tracker):
+/// Behavior when an entry already exists at the key for this `runtime_env`
+/// (per the process-wide [`SHAREPOINT_STORE_FINGERPRINTS`] tracker):
 /// - **Same fingerprint** → no-op. Two datasets that share auth/config
 ///   produce the same fingerprint, so re-registration from a sibling
 ///   connector instance is silent. This is the common case in clustered
@@ -319,13 +351,16 @@ fn register_sharepoint_store(
     dataset: &Dataset,
 ) -> DataConnectorResult<()> {
     let key_url = registry_key_for(store_url);
+    let env_id = Arc::as_ptr(runtime_env) as usize;
+    let map_key = (env_id, key_url.clone());
     let mut fps = SHAREPOINT_STORE_FINGERPRINTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match fps.get(&key_url) {
+    match fps.get(&map_key) {
         Some(existing) if *existing == fingerprint => {
-            // Same logical store — already registered by an earlier
-            // connector instance for the same dataset family. No-op.
+            // Same logical store, same RuntimeEnv — already registered
+            // by an earlier connector instance for the same dataset
+            // family. No-op.
             return Ok(());
         }
         Some(_existing) => {
@@ -338,7 +373,7 @@ fn register_sharepoint_store(
                      Disambiguate by using a different drive form (e.g. \
                      sharepoint://sites/{{site-id}} vs sharepoint://drives/{{drive-id}}) for \
                      one of them, or align the connector params (tenant_id, client_id, \
-                     conflict_behavior, max_put_bytes) across the datasets."
+                     auth tokens, conflict_behavior, max_put_bytes) across the datasets."
                 ),
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(std::io::Error::new(
@@ -350,7 +385,7 @@ fn register_sharepoint_store(
         None => {}
     }
     runtime_env.register_object_store(&key_url, store);
-    fps.insert(key_url, fingerprint);
+    fps.insert(map_key, fingerprint);
     Ok(())
 }
 
