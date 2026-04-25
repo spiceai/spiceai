@@ -75,7 +75,7 @@ use tonic::{
 };
 
 use crate::cluster::{
-    executor_registry::{ExecutorRegistry, TablePartitions},
+    ExecutorRegistry, TablePartitions,
     {SchedulerPeers, partition::partition_value_to_bytes},
 };
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
@@ -596,9 +596,9 @@ impl ClusterService for ClusterServiceImpl {
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
         match create_executor_flight_client(&executor_url, tls_config_opt) {
             Ok(client) => {
-                let mut flight_client_registry =
-                    self.executor_registry.flight_sql_clients.write().await;
-                flight_client_registry.insert(executor_id.to_string(), client);
+                self.executor_registry
+                    .insert_flight_sql_client(executor_id.to_string(), client)
+                    .await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -609,7 +609,7 @@ impl ClusterService for ClusterServiceImpl {
 
         let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
 
-        let partition_manager = self.executor_registry().accelerations_partition_manager();
+        let partition_store = self.executor_registry().accelerations_partition_store();
         let app_guard = self.app.read().await;
         let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
@@ -628,7 +628,7 @@ impl ClusterService for ClusterServiceImpl {
                 }
                 let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
 
-                if partition_manager
+                if partition_store
                     .get_cached_table_metadata(table_ref)
                     .is_none()
                 {
@@ -637,7 +637,7 @@ impl ClusterService for ClusterServiceImpl {
                     );
                     continue;
                 }
-                match partition_manager
+                match partition_store
                     .allocate_partitions(table_ref, executor_id, remaining)
                     .await
                 {
@@ -652,7 +652,7 @@ impl ClusterService for ClusterServiceImpl {
                             match partition_value_to_bytes(
                                 partition.clone(),
                                 table_ref,
-                                &self.datafusion,
+                                self.datafusion.as_ref(),
                             )
                             .await
                             {
@@ -706,8 +706,9 @@ impl ClusterService for ClusterServiceImpl {
                 partition_map.entry(table_ref).or_default();
             }
 
-            let mut executor_partitions = self.executor_registry.partitions.write().await;
-            executor_partitions.insert(executor_id.to_string(), partition_map);
+            self.executor_registry
+                .set_executor_partitions(executor_id.to_string(), partition_map)
+                .await;
         }
 
         Ok(Response::new(AllocateInitialPartitionsResponse {

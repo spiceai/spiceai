@@ -7938,7 +7938,7 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
+ "windows-link 0.1.3",
  "windows-result 0.4.1",
 ]
 
@@ -12456,9 +12456,9 @@ dependencies = [
 
 [[package]]
 name = "openssl"
-version = "0.10.75"
+version = "0.10.78"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08838db121398ad17ab8531ce9de97b244589089e290a384c900cb9ff7434328"
+checksum = "f38c4372413cdaaf3cc79dd92d29d7d9f5ab09b51b10dded508fb90bb70b9222"
 dependencies = [
  "bitflags 2.10.0",
  "cfg-if",
@@ -12503,9 +12503,9 @@ dependencies = [
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.111"
+version = "0.9.114"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82cab2d520aa75e3c58898289429321eb788c3106963d0dc886ec7a5f4adc321"
+checksum = "13ce1245cd07fcc4cfdb438f7507b0c7e4f3849a69fd84d52374c66d83741bb6"
 dependencies = [
  "cc",
  "libc",
@@ -13301,7 +13301,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
  "arrayvec",
- "hashbrown 0.16.1",
+ "hashbrown 0.5.0",
  "parking_lot 0.12.5",
  "rand 0.8.5",
 ]
@@ -13787,7 +13787,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -15315,6 +15315,7 @@ dependencies = [
  "runtime-api-types",
  "runtime-async",
  "runtime-auth",
+ "runtime-cluster",
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
@@ -15453,6 +15454,45 @@ dependencies = [
  "tonic",
  "tower 0.5.3",
  "tracing",
+]
+
+[[package]]
+name = "runtime-cluster"
+version = "2.0.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow_tools",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "data_components",
+ "datafusion",
+ "datafusion-expr",
+ "datafusion-proto",
+ "flight_client",
+ "fundu",
+ "futures",
+ "object_store",
+ "object_store_occ",
+ "parking_lot 0.12.5",
+ "runtime-datafusion",
+ "runtime-proto",
+ "runtime-request-context",
+ "runtime-table-partition",
+ "serde",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "util",
+ "uuid 1.21.0",
 ]
 
 [[package]]
@@ -17043,7 +17083,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.114",

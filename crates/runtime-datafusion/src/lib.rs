@@ -25,6 +25,9 @@ pub mod schema_provider;
 pub mod url_table;
 use snafu::prelude::*;
 
+pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Invalid children count. Expected only one input, got {children_count}."))]
