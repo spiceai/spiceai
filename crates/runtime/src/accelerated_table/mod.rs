@@ -1236,21 +1236,12 @@ impl TableProvider for AcceleratedTable {
                 Ok(results)
             }
             ZeroResultsAction::UseSource => {
-                // Even in UseSource mode, filters containing functions unsupported by the
-                // accelerator engine (e.g. json_get_str on DuckDB) must not be pushed down —
-                // the accelerator would receive SQL it can't execute. Mark those as Unsupported
-                // so DataFusion evaluates them itself after the scan.
-                let function_support = deny_spice_specific_functions();
-                Ok(filters
-                    .iter()
-                    .map(|f| {
-                        if function_support.supports(f) {
-                            TableProviderFilterPushDown::Inexact
-                        } else {
-                            TableProviderFilterPushDown::Unsupported
-                        }
-                    })
-                    .collect())
+                // In UseSource mode, all filters must still flow into scan() so that
+                // FallbackOnZeroResultsScanExec receives the full predicate set and can make
+                // a correct fallback decision. Filters containing unsupported functions
+                // (e.g. json_get_str) are split inside scan() and applied locally via
+                // wrap_with_filter rather than being pushed into the accelerator SQL.
+                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
             }
         }
     }
@@ -1306,10 +1297,20 @@ impl TableProvider for AcceleratedTable {
             None
         };
         let scan_projection = extended_projection.as_ref().or(projection);
-        let input = self
-            .accelerator
-            .scan(state, scan_projection, filters, limit)
-            .await?;
+        // For UseSource mode, the scan is handled inside the match arm below (with filter
+        // splitting). For all other modes, perform the accelerator scan upfront.
+        let input = if !matches!(
+            (is_caching_mode, &self.zero_results_action),
+            (false, ZeroResultsAction::UseSource)
+        ) {
+            Some(
+                self.accelerator
+                    .scan(state, scan_projection, filters, limit)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
             let federated = Arc::clone(&federated);
@@ -1319,6 +1320,8 @@ impl TableProvider for AcceleratedTable {
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
                 // Caching mode: wrap with cache execution plan to handle staleness and background refresh
+                // SAFETY: input is always Some in caching mode (UseSource guard above excludes caching)
+                let input = input.expect("input is always computed in caching mode");
 
                 // Check which filters the accelerator doesn't fully support and need to be re-applied.
                 // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
@@ -1352,13 +1355,36 @@ impl TableProvider for AcceleratedTable {
                     batch_write_tx,
                 ))
             }
-            (false, ZeroResultsAction::ReturnEmpty) => input,
-            (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
-                self.dataset_name.clone(),
-                input,
-                fallback_fn,
-                TableScanParams::new(state, projection, filters, limit),
-            )),
+            (false, ZeroResultsAction::ReturnEmpty) => {
+                // SAFETY: input is always Some when not in UseSource mode
+                input.expect("input is always computed in ReturnEmpty mode")
+            }
+            (false, ZeroResultsAction::UseSource) => {
+                // Split filters: only forward accelerator-supported ones into the accelerator
+                // scan, and apply denied-function filters locally via wrap_with_filter so they
+                // participate in the zero-results decision without being pushed into accelerator SQL.
+                let function_support = deny_spice_specific_functions();
+                let (accelerator_filters, local_filters): (Vec<Expr>, Vec<Expr>) = filters
+                    .iter()
+                    .cloned()
+                    .partition(|f| function_support.supports(f));
+
+                let input = self
+                    .accelerator
+                    .scan(state, scan_projection, &accelerator_filters, limit)
+                    .await?;
+                let input = if local_filters.is_empty() {
+                    input
+                } else {
+                    wrap_with_filter(input, state, &local_filters)?
+                };
+                Arc::new(FallbackOnZeroResultsScanExec::new(
+                    self.dataset_name.clone(),
+                    input,
+                    fallback_fn,
+                    TableScanParams::new(state, projection, filters, limit),
+                ))
+            }
         };
 
         // Compute the target schema based on user's original projection.
