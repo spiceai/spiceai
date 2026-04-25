@@ -211,7 +211,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("security_protocol")
         .default("sasl_ssl")
         .description("Security protocol for Kafka connections. Default: 'sasl_ssl'.")
-        .one_of(&["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"])
+        .one_of_ignore_ascii_case(&["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"])
         .help_link(KAFKA_DOCS),
     ParameterSpec::component("sasl_mechanism")
         .default("SCRAM-SHA-512")

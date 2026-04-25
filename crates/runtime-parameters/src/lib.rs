@@ -190,7 +190,14 @@ impl Parameters {
             };
             if let Some((_, value_secret)) = params.iter().find(|p| p.0 == parameter.name) {
                 let value = value_secret.expose_secret();
-                if !one_of.contains(&value) {
+                let value_is_allowed = if parameter.one_of_ignore_ascii_case {
+                    one_of
+                        .iter()
+                        .any(|option| option.eq_ignore_ascii_case(value))
+                } else {
+                    one_of.contains(&value)
+                };
+                if !value_is_allowed {
                     return Err(Box::new(Error::InvalidConfigurationNoSource {
                         component: component_name.to_string(),
                         message: format!(
@@ -726,6 +733,53 @@ mod test {
                 "accelerator not_file"
             ),
             Some("file_format".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_is_case_sensitive_by_default() {
+        static SPECS: &[ParameterSpec] =
+            &[ParameterSpec::component("mode").one_of(&["enabled", "disabled"])];
+        let err = Parameters::try_new(
+            "connector test",
+            vec![(
+                "test_mode".to_string(),
+                SecretString::new("ENABLED".to_string().into()),
+            )],
+            "test",
+            Arc::new(RwLock::new(Secrets::new())),
+            SPECS,
+        )
+        .await
+        .expect_err("case-sensitive one_of should reject differently-cased values");
+
+        assert!(
+            err.to_string().contains(
+                "'test_mode' parameter must be one of: enabled, disabled. Found ENABLED."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_ignore_ascii_case_accepts_different_case() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("security_protocol")
+            .one_of_ignore_ascii_case(&["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"])];
+        let params = Parameters::try_new(
+            "connector kafka",
+            vec![(
+                "kafka_security_protocol".to_string(),
+                SecretString::new("SASL_PLAINTEXT".to_string().into()),
+            )],
+            "kafka",
+            Arc::new(RwLock::new(Secrets::new())),
+            SPECS,
+        )
+        .await
+        .expect("case-insensitive one_of should accept differently-cased values");
+
+        assert_eq!(
+            params.get("security_protocol").expose().ok(),
+            Some("SASL_PLAINTEXT")
         );
     }
 
