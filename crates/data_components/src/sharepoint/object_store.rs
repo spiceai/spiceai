@@ -1258,18 +1258,20 @@ mod tests {
     // Gated behind:
     //  - `sharepoint-mock-host` feature → enables `graph-rs-sdk/test-util` so
     //    `GraphClient::use_test_endpoint` accepts a localhost URL.
-    //  - `not(debug_assertions)` → debug builds of the full
-    //    graph-rs-sdk + reqwest + tokio + async-stream stack produce async
-    //    state machines that overflow tokio worker stacks; release builds
-    //    inline/elide those intermediate frames.
+    //
+    // Each `#[test]` is also `#[ignore]`-d because debug builds of the full
+    // graph-rs-sdk + reqwest + tokio + async-stream stack produce async state
+    // machines that overflow tokio worker stacks at runtime; release builds
+    // inline/elide those intermediate frames. We still typecheck this module
+    // in debug builds so refactors don't silently break the tests.
     //
     // Run via:
     //
     //     cargo test --release -p data_components \
     //         --features sharepoint,sharepoint-mock-host \
     //         --no-default-features \
-    //         sharepoint::object_store::tests::mock_http
-    #[cfg(all(feature = "sharepoint-mock-host", not(debug_assertions)))]
+    //         sharepoint::object_store::tests::mock_http -- --ignored
+    #[cfg(feature = "sharepoint-mock-host")]
     mod mock_http {
         use std::collections::VecDeque;
         use std::sync::atomic::{AtomicUsize, Ordering};

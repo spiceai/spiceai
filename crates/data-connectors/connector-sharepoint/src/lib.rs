@@ -240,16 +240,22 @@ fn url_extension(from: &str) -> Option<String> {
 /// (e.g. `sharepoint://drives/`), with the path stripped. Registering
 /// under the full dataset URL would prevent re-use across paths and
 /// cause lookups for the same authority+different path to miss.
+///
+/// DataFusion's registry replaces entries by URL key, so when multiple
+/// SharePoint datasets share the same scheme+authority but use different
+/// credentials or `SharepointObjectStoreConfig`, the second registration
+/// would silently take over and route earlier datasets through the wrong
+/// client. We can't detect "equivalence" of two stores without exposing
+/// internal config, so the best we can do is warn loudly when a store is
+/// already registered under the same key.
 fn register_sharepoint_store(
     runtime_env: &Arc<RuntimeEnv>,
     store_url: &Url,
     store: Arc<SharepointObjectStore>,
 ) {
     use datafusion::datasource::listing::ListingTableUrl;
-    match ListingTableUrl::parse(store_url.as_str()) {
-        Ok(ltu) => {
-            runtime_env.register_object_store(ltu.object_store().as_ref(), store);
-        }
+    let key_url: Url = match ListingTableUrl::parse(store_url.as_str()) {
+        Ok(ltu) => <_ as AsRef<Url>>::as_ref(&ltu.object_store()).clone(),
         Err(e) => {
             // `store_url` was already validated as a parseable URL upstream
             // (see `parse_object_store_components`), so this branch is a
@@ -260,9 +266,23 @@ fn register_sharepoint_store(
                 error = %e,
                 "Failed to derive ObjectStore registry key from SharePoint URL; registering under full URL"
             );
-            runtime_env.register_object_store(store_url, store);
+            store_url.clone()
         }
+    };
+    if runtime_env
+        .object_store_registry
+        .get_store(&key_url)
+        .is_ok()
+    {
+        tracing::warn!(
+            store_url = %store_url,
+            registry_key = %key_url,
+            "Replacing previously registered SharePoint object store for this URL key. \
+             If multiple SharePoint datasets share this scheme+authority but use \
+             different credentials or config, queries may run with the wrong client."
+        );
     }
+    runtime_env.register_object_store(&key_url, store);
 }
 
 /// Parse the dataset URL and connector params into the components needed to
