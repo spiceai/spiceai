@@ -133,13 +133,17 @@ mod tests {
     async fn missing_path_produces_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("does_not_exist.yaml");
-        assert!(load_pod(&missing).await.is_err());
+        load_pod(&missing)
+            .await
+            .expect_err("missing path should fail to load");
     }
 
     #[tokio::test]
     async fn invalid_yaml_produces_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_pod(&dir, "spicepod.yaml", "not: [valid, yaml: for: a spicepod");
-        assert!(load_pod(&path).await.is_err());
+        load_pod(&path)
+            .await
+            .expect_err("invalid yaml should fail to load");
     }
 }

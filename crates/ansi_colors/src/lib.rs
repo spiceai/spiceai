@@ -21,6 +21,7 @@ limitations under the License.
 //! per stream (stdout/stderr), so subsequent calls are a plain atomic load.
 
 use std::fmt::{self, Display};
+#[cfg(not(test))]
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 
@@ -36,6 +37,7 @@ pub enum Target {
     Stderr,
 }
 
+#[cfg(not(test))]
 fn check_target(target: Target) -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
@@ -63,7 +65,7 @@ pub fn colors_enabled_for(target: Target) -> bool {
     // can opt in to "no color" behavior.
     #[cfg(test)]
     {
-        return cell.get().copied().unwrap_or(true);
+        cell.get().copied().unwrap_or(true)
     }
     #[cfg(not(test))]
     {
