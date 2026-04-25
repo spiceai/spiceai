@@ -64,7 +64,8 @@ use std::any::Any;
 use std::fmt::{self, Display};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
 use url::Url;
 
 /// Name used to identify this connector in configuration (the `<name>:` prefix
@@ -114,6 +115,12 @@ pub struct Sharepoint {
     params: Parameters,
     tokio_io_runtime: tokio::runtime::Handle,
     runtime: Option<Runtime>,
+    /// Registry keys (`scheme://authority`) this connector instance has
+    /// already registered an [`SharepointObjectStore`] under, used to make
+    /// repeated registrations from the same connector idempotent and to
+    /// detect collisions with another connector instance trying to share
+    /// the key.
+    registered_keys: Arc<Mutex<HashSet<Url>>>,
 }
 
 impl fmt::Debug for Sharepoint {
@@ -143,6 +150,7 @@ impl Sharepoint {
             params,
             tokio_io_runtime,
             runtime,
+            registered_keys: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -233,55 +241,97 @@ fn url_extension(from: &str) -> Option<String> {
     Some(ext.to_ascii_lowercase())
 }
 
-/// Register a [`SharepointObjectStore`] on `runtime_env` under the
-/// scheme+authority key DataFusion's registry actually looks up.
+/// Compute the canonical registry key DataFusion uses to look up an
+/// `ObjectStore` for `store_url`.
 ///
-/// `ListingTableUrl::object_store()` returns the canonical registry key
-/// (e.g. `sharepoint://drives/`), with the path stripped. Registering
-/// under the full dataset URL would prevent re-use across paths and
-/// cause lookups for the same authority+different path to miss.
-///
-/// DataFusion's registry replaces entries by URL key, so when multiple
-/// SharePoint datasets share the same scheme+authority but use different
-/// credentials or `SharepointObjectStoreConfig`, the second registration
-/// would silently take over and route earlier datasets through the wrong
-/// client. We can't detect "equivalence" of two stores without exposing
-/// internal config, so the best we can do is warn loudly when a store is
-/// already registered under the same key.
-fn register_sharepoint_store(
-    runtime_env: &Arc<RuntimeEnv>,
-    store_url: &Url,
-    store: Arc<SharepointObjectStore>,
-) {
+/// `ListingTableUrl::object_store()` returns scheme+authority only — the
+/// path is stripped — so `sharepoint://drives/{id}/foo.parquet` and
+/// `sharepoint://drives/{other}/bar.parquet` collapse to the same key
+/// `sharepoint://drives/`. The connector's dispatch reads the drive ID
+/// from the path on every operation.
+fn registry_key_for(store_url: &Url) -> Url {
     use datafusion::datasource::listing::ListingTableUrl;
-    let key_url: Url = match ListingTableUrl::parse(store_url.as_str()) {
+    match ListingTableUrl::parse(store_url.as_str()) {
         Ok(ltu) => <_ as AsRef<Url>>::as_ref(&ltu.object_store()).clone(),
         Err(e) => {
             // `store_url` was already validated as a parseable URL upstream
             // (see `parse_object_store_components`), so this branch is a
-            // defensive fallback. Register under the full URL so the caller
-            // still gets a working store.
+            // defensive fallback. Use the full URL — still works for both
+            // register and lookup.
             tracing::warn!(
                 store_url = %store_url,
                 error = %e,
-                "Failed to derive ObjectStore registry key from SharePoint URL; registering under full URL"
+                "Failed to derive ObjectStore registry key from SharePoint URL; falling back to full URL"
             );
             store_url.clone()
         }
-    };
+    }
+}
+
+/// Register a [`SharepointObjectStore`] on `runtime_env` under the
+/// canonical scheme+authority key. Repeated registrations from the same
+/// connector instance for the same key are no-ops — the architecture
+/// supports multiple datasets sharing one registered store. A collision
+/// from a *different* connector instance returns an
+/// [`InvalidConfiguration`] error: silently replacing the entry could
+/// route earlier datasets through the wrong `GraphClient`, which is a
+/// correctness and potential data-exposure risk.
+///
+/// [`InvalidConfiguration`]: DataConnectorError::InvalidConfiguration
+fn register_sharepoint_store(
+    runtime_env: &Arc<RuntimeEnv>,
+    store_url: &Url,
+    store: Arc<SharepointObjectStore>,
+    registered_keys: &Mutex<HashSet<Url>>,
+    dataset: &Dataset,
+) -> DataConnectorResult<()> {
+    let key_url = registry_key_for(store_url);
+    let mut keys = registered_keys
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if keys.contains(&key_url) {
+        // Same connector instance re-registering for a key it already
+        // owns. No-op — the store already in the registry was put there
+        // by us with equivalent config.
+        return Ok(());
+    }
     if runtime_env
         .object_store_registry
         .get_store(&key_url)
         .is_ok()
     {
-        tracing::warn!(
-            store_url = %store_url,
-            registry_key = %key_url,
-            "Replacing previously registered SharePoint object store for this URL key. \
-             If multiple SharePoint datasets share this scheme+authority but use \
-             different credentials or config, queries may run with the wrong client."
-        );
+        return Err(DataConnectorError::InvalidConfiguration {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            message: format!(
+                "Another SharePoint object store is already registered under '{key_url}'. \
+                 Two SharePoint connectors with different credentials or configuration cannot \
+                 share the same scheme+authority. Disambiguate by using a different drive form \
+                 (e.g. sharepoint://sites/{{site-id}} vs sharepoint://drives/{{drive-id}}) for \
+                 one of them, or consolidate the datasets under a single connector instance."
+            ),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("registry key '{key_url}' already taken"),
+            )),
+        });
     }
+    runtime_env.register_object_store(&key_url, store);
+    keys.insert(key_url);
+    Ok(())
+}
+
+/// Register a [`SharepointObjectStore`] on a freshly built `runtime_env`
+/// (e.g. one returned by `default_runtime_env` for a per-query
+/// `SessionContext`). Skips the cross-instance collision check from
+/// [`register_sharepoint_store`] because the caller guarantees the
+/// registry has no pre-existing entry for the key.
+fn register_sharepoint_store_on_fresh(
+    runtime_env: &Arc<RuntimeEnv>,
+    store_url: &Url,
+    store: Arc<SharepointObjectStore>,
+) {
+    let key_url = registry_key_for(store_url);
     runtime_env.register_object_store(&key_url, store);
 }
 
@@ -633,7 +683,13 @@ impl DataConnector for Sharepoint {
             kind,
             config,
         ));
-        register_sharepoint_store(runtime_env, &store_url, store);
+        register_sharepoint_store(
+            runtime_env,
+            &store_url,
+            store,
+            &self.registered_keys,
+            dataset,
+        )?;
         // Then defer to the listing connector for any additional setup.
         self.listing_connector(dataset)?
             .register_object_stores(dataset, runtime_env)
@@ -711,14 +767,32 @@ impl ListingTableConnector for SharepointListingConnector {
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url_str = url.unwrap_or(dataset.from.as_str());
-        Url::parse(url_str).map_err(|e| DataConnectorError::InvalidConfiguration {
+        let parsed = Url::parse(url_str).map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: CONNECTOR_NAME.to_string(),
             message: format!(
                 "'{url_str}' is not a valid sharepoint:// URL. See https://spiceai.org/docs/components/data-connectors/sharepoint#from"
             ),
             connector_component: ConnectorComponent::from(dataset),
             source: Box::new(e),
-        })
+        })?;
+        if parsed.scheme() != "sharepoint" || parsed.host_str().is_none() {
+            return Err(DataConnectorError::InvalidConfiguration {
+                dataconnector: CONNECTOR_NAME.to_string(),
+                message: format!(
+                    "'{url_str}' is not a sharepoint:// URL. Expected scheme 'sharepoint' and a non-empty authority (e.g. sharepoint://me/Documents/file.parquet). See https://spiceai.org/docs/components/data-connectors/sharepoint#from"
+                ),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "scheme='{}', authority_present={}",
+                        parsed.scheme(),
+                        parsed.host_str().is_some()
+                    ),
+                )),
+            });
+        }
+        Ok(parsed)
     }
 
     /// Override the default to short-circuit the registry lookup — we
@@ -752,7 +826,7 @@ impl ListingTableConnector for SharepointListingConnector {
             config,
             default_runtime_env(self.tokio_io_runtime.clone()),
         );
-        register_sharepoint_store(
+        register_sharepoint_store_on_fresh(
             &ctx.runtime_env(),
             &self.store_url,
             self.build_object_store(),

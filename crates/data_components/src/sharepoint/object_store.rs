@@ -292,17 +292,7 @@ impl ObjectStore for SharepointObjectStore {
             }
         }
 
-        let total_bytes: usize = payload.iter().map(bytes::Bytes::len).sum();
-        if total_bytes > self.config.max_put_bytes {
-            return Err(object_store::Error::Generic {
-                store: STORE_TAG,
-                source: Box::new(std::io::Error::other(format!(
-                    "SharePoint put rejected: {total_bytes} bytes exceeds max_put_bytes={} (raise sharepoint_max_put_bytes or stage writes in smaller pieces)",
-                    self.config.max_put_bytes
-                ))),
-            });
-        }
-        let bytes = payload_to_bytes(&payload);
+        let bytes = payload_to_bytes(&payload, self.config.max_put_bytes)?;
 
         // Map `PutMode` to SharePoint conflict behavior without violating the
         // `ObjectStore` contract. The contract requires that a successful
@@ -535,13 +525,35 @@ impl ObjectStore for SharepointObjectStore {
     }
 }
 
-fn payload_to_bytes(payload: &PutPayload) -> Vec<u8> {
-    let total: usize = payload.iter().map(bytes::Bytes::len).sum();
+/// Concatenate a [`PutPayload`] into a single owned buffer, refusing
+/// payloads larger than `max_put_bytes`. Uses checked addition so a
+/// payload whose chunk lengths sum past `usize::MAX` is rejected up
+/// front rather than wrapping into an undersized allocation.
+fn payload_to_bytes(payload: &PutPayload, max_put_bytes: usize) -> ObjectStoreResult<Vec<u8>> {
+    let mut total: usize = 0;
+    for chunk in payload {
+        total = total
+            .checked_add(chunk.len())
+            .ok_or_else(|| object_store::Error::Generic {
+                store: STORE_TAG,
+                source: Box::new(std::io::Error::other(
+                    "SharePoint put rejected: payload size overflowed usize",
+                )),
+            })?;
+        if total > max_put_bytes {
+            return Err(object_store::Error::Generic {
+                store: STORE_TAG,
+                source: Box::new(std::io::Error::other(format!(
+                    "SharePoint put rejected: payload exceeds max_put_bytes={max_put_bytes} (raise sharepoint_max_put_bytes or stage writes in smaller pieces)"
+                ))),
+            });
+        }
+    }
     let mut buf = Vec::with_capacity(total);
     for chunk in payload {
         buf.extend_from_slice(chunk);
     }
-    buf
+    Ok(buf)
 }
 
 /// Split an `ObjectStore::list` prefix into `(parent_folder, name_filter)`
@@ -615,7 +627,7 @@ impl MultipartUpload for BufferedMultipart {
         let buffer = Arc::clone(&self.buffer);
         let max = self.max_put_bytes;
         Box::pin(async move {
-            let bytes = payload_to_bytes(&data);
+            let bytes = payload_to_bytes(&data, max)?;
             let mut buf = buffer.lock().await;
             if buf.len().saturating_add(bytes.len()) > max {
                 return Err(object_store::Error::Generic {
