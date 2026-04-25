@@ -47,7 +47,7 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
-use arrow::array::{Int64Array, RecordBatch};
+use arrow::array::{Int64Array, RecordBatch, UInt64Array};
 use data_components::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
 use futures::StreamExt;
 use object_store::ObjectStore;
@@ -167,14 +167,23 @@ fn count_from_batches(batches: &[RecordBatch]) -> Result<i64, anyhow::Error> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("no batches returned"))?;
     let col = batch.column(0);
-    let array = col
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow::anyhow!("expected Int64 count column, got {:?}", col.data_type()))?;
-    if array.is_empty() {
-        return Err(anyhow::anyhow!("count batch had zero rows"));
+    if let Some(array) = col.as_any().downcast_ref::<UInt64Array>() {
+        if array.is_empty() {
+            return Err(anyhow::anyhow!("count batch had zero rows"));
+        }
+        return i64::try_from(array.value(0))
+            .map_err(|_| anyhow::anyhow!("count value overflowed i64"));
     }
-    Ok(array.value(0))
+    if let Some(array) = col.as_any().downcast_ref::<Int64Array>() {
+        if array.is_empty() {
+            return Err(anyhow::anyhow!("count batch had zero rows"));
+        }
+        return Ok(array.value(0));
+    }
+    Err(anyhow::anyhow!(
+        "expected UInt64 or Int64 count column, got {:?}",
+        col.data_type()
+    ))
 }
 
 fn prefix_with(id: &str, p: &object_store::path::Path) -> object_store::path::Path {

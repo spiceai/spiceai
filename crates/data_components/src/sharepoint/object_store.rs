@@ -1006,6 +1006,15 @@ async fn get_content(
             )),
         });
     }
+    if !response.status().is_success() {
+        let status = response.status();
+        return Err(object_store::Error::Generic {
+            store: STORE_TAG,
+            source: Box::new(std::io::Error::other(format!(
+                "get content failed: HTTP {status}"
+            ))),
+        });
+    }
     let bytes = response
         .bytes()
         .await
@@ -1473,7 +1482,10 @@ mod tests {
                     .get_opts(&Path::from("Documents/file.csv"), GetOptions::default())
                     .await
                     .unwrap();
-                assert_eq!(result.meta.size, 42);
+                // get_opts uses the fetched payload length as the authoritative
+                // size, not the HEAD-reported size — Graph occasionally
+                // misreports `size`. Body is "hello, world" (12 bytes).
+                assert_eq!(result.meta.size, 12);
                 let bytes = match result.payload {
                     GetResultPayload::Stream(mut s) => {
                         let mut all = Vec::new();
