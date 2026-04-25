@@ -91,7 +91,10 @@ pub enum Format {
 }
 
 pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
-    principal.groups().contains(&"read_write")
+    principal
+        .groups()
+        .iter()
+        .any(|group| *group == "write" || *group == "read_write")
 }
 
 pub(crate) async fn current_principal_requires_read_only() -> bool {
@@ -102,7 +105,13 @@ pub(crate) async fn current_principal_requires_read_only() -> bool {
 
 pub(crate) async fn require_write_access() -> Option<Response> {
     if current_principal_requires_read_only().await {
-        Some((StatusCode::FORBIDDEN, "API key does not allow write access").into_response())
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({ "message": "API key does not allow write access" })),
+            )
+                .into_response(),
+        )
     } else {
         None
     }
