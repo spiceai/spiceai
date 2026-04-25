@@ -33,7 +33,8 @@ use object_store::{
     ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use smb::{ShareSession, SmbConfig, SmbPool, WalWriter};
-use tokio::sync::{Mutex, OnceCell};
+use std::sync::Mutex as StdMutex;
+use tokio::sync::OnceCell;
 
 use super::common::{
     DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
@@ -567,18 +568,22 @@ fn guard_read_size(size: u64) -> object_store::Result<()> {
 /// Parts are appended in order to a temp file on the SMB share. `complete`
 /// atomically renames the temp file into place.
 ///
-/// Interior mutability (`Arc<Mutex<...>>`) is required because `put_part`
-/// returns a boxed future that outlives the `&mut self` borrow.
+/// Uses a synchronous `std::sync::Mutex` (not `tokio::sync::Mutex`) so the
+/// guard is never held across `.await`. `put_part`/`complete`/`abort` each
+/// briefly lock to `take()` the `WalWriter`, do their async I/O without the
+/// lock held, then briefly lock again to put the writer back. The mutex is
+/// only required to share state with the `'static` future returned by
+/// `put_part`; `&mut self` already serializes concurrent calls.
 struct SMBMultipartUpload {
     share: Arc<ShareSession>,
-    writer: Arc<Mutex<Option<WalWriter>>>,
+    writer: Arc<StdMutex<Option<WalWriter>>>,
 }
 
 impl SMBMultipartUpload {
     fn new(share: Arc<ShareSession>, writer: WalWriter) -> Self {
         Self {
             share,
-            writer: Arc::new(Mutex::new(Some(writer))),
+            writer: Arc::new(StdMutex::new(Some(writer))),
         }
     }
 }
@@ -589,30 +594,58 @@ impl std::fmt::Debug for SMBMultipartUpload {
     }
 }
 
+fn upload_already_finalized() -> object_store::Error {
+    object_store::Error::Generic {
+        store: STORE_NAME,
+        source: "multipart upload already completed or aborted".into(),
+    }
+}
+
+/// Take the `WalWriter` out of the shared slot. Returns an error if the
+/// upload has already been completed/aborted or if the mutex was poisoned.
+fn take_writer(slot: &StdMutex<Option<WalWriter>>) -> object_store::Result<WalWriter> {
+    slot.lock()
+        .map_err(|_| object_store::Error::Generic {
+            store: STORE_NAME,
+            source: "multipart upload mutex poisoned".into(),
+        })?
+        .take()
+        .ok_or_else(upload_already_finalized)
+}
+
+/// Put the `WalWriter` back into the shared slot after async I/O.
+fn replace_writer(slot: &StdMutex<Option<WalWriter>>, writer: WalWriter) {
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(writer);
+    }
+}
+
 #[async_trait]
 impl MultipartUpload for SMBMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
-        let writer = Arc::clone(&self.writer);
+        let writer_slot = Arc::clone(&self.writer);
         Box::pin(async move {
-            let mut guard = writer.lock().await;
-            let w = guard.as_mut().ok_or_else(|| object_store::Error::Generic {
-                store: STORE_NAME,
-                source: "multipart upload already completed or aborted".into(),
-            })?;
+            let mut writer = take_writer(&writer_slot)?;
+            let mut io_result: Result<(), std::io::Error> = Ok(());
             for chunk in data.as_ref() {
-                w.write(chunk.as_ref()).await.map_err(handle_error)?;
+                if let Err(e) = writer.write(chunk.as_ref()).await {
+                    io_result = Err(e);
+                    break;
+                }
             }
-            Ok(())
+            // On error the writer is still valid for `abort()`; on success it
+            // is valid for the next `put_part()`/`complete()`.
+            replace_writer(&writer_slot, writer);
+            io_result.map_err(handle_error)
         })
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
-        let mut guard = self.writer.lock().await;
-        let w = guard.take().ok_or_else(|| object_store::Error::Generic {
-            store: STORE_NAME,
-            source: "multipart upload already completed or aborted".into(),
-        })?;
-        let meta = w.commit(self.share.as_ref()).await.map_err(handle_error)?;
+        let writer = take_writer(&self.writer)?;
+        let meta = writer
+            .commit(self.share.as_ref())
+            .await
+            .map_err(handle_error)?;
         Ok(PutResult {
             e_tag: Some(meta.etag),
             version: None,
@@ -620,8 +653,13 @@ impl MultipartUpload for SMBMultipartUpload {
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
-        let mut guard = self.writer.lock().await;
-        if let Some(w) = guard.take() {
+        // Take the writer out under the sync lock, then drop the lock before
+        // awaiting the asynchronous abort.
+        let writer = match self.writer.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => return Ok(()),
+        };
+        if let Some(w) = writer {
             w.abort().await;
         }
         Ok(())

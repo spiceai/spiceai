@@ -337,13 +337,15 @@ pub fn decode_session_setup_response(header: &Header, body: &[u8]) -> Option<Ses
     let security_buffer_offset = (&body[4..6]).get_u16_le() as usize;
     let security_buffer_length = (&body[6..8]).get_u16_le() as usize;
 
+    // Reject malformed responses where the declared security buffer extends
+    // past the body. Returning Some with an empty buffer would push the
+    // failure downstream (typically as an opaque NTLM parse error).
     let sec_start = security_buffer_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let sec_end = sec_start + security_buffer_length;
-    let security_buffer = if sec_end <= body.len() {
-        Bytes::copy_from_slice(&body[sec_start..sec_end])
-    } else {
-        Bytes::new()
-    };
+    let sec_end = sec_start.checked_add(security_buffer_length)?;
+    if sec_end > body.len() {
+        return None;
+    }
+    let security_buffer = Bytes::copy_from_slice(&body[sec_start..sec_end]);
 
     Some(SessionSetupResponse {
         session_id: header.session_id,

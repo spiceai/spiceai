@@ -138,6 +138,14 @@ impl SmbClient {
         self.poisoned.load(Ordering::Relaxed)
     }
 
+    /// Mark the connection as poisoned. Used when an early-exit error path
+    /// leaves unread response frames in the TCP stream — subsequent
+    /// operations would otherwise read those stale frames and corrupt
+    /// request/response framing.
+    fn poison(&self) {
+        self.poisoned.store(true, Ordering::Relaxed);
+    }
+
     fn next_message_id(&self) -> u64 {
         self.message_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -531,62 +539,77 @@ impl SmbClient {
         }
         stream.flush().await?;
 
+        // Any early exit from the receive loop leaves unread response frames
+        // in the TCP stream, so the connection is poisoned and the socket
+        // shut down to prevent future operations reading stale frames.
         let mut slots: Vec<Option<bytes::Bytes>> = (0..count).map(|_| None).collect();
         let mut received = 0usize;
         let mut eof_after = count;
+        let recv_result: io::Result<()> = async {
+            while received < count {
+                let mut len_buf = [0u8; 4];
+                self.read_exact_timeout(&mut stream, &mut len_buf).await?;
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-        while received < count {
-            let mut len_buf = [0u8; 4];
-            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
+                if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid SMB2 message length: {msg_len}"),
+                    ));
+                }
 
-            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid SMB2 message length: {msg_len}"),
-                ));
-            }
+                let mut msg = vec![0u8; msg_len];
+                self.read_exact_timeout(&mut stream, &mut msg).await?;
 
-            let mut msg = vec![0u8; msg_len];
-            self.read_exact_timeout(&mut stream, &mut msg).await?;
+                let header = Header::decode(&msg).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header")
+                })?;
 
-            let header = Header::decode(&msg)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
+                if header.status == STATUS_PENDING {
+                    continue;
+                }
 
-            if header.status == STATUS_PENDING {
-                continue;
-            }
+                let slot = (header.message_id.wrapping_sub(base_msg_id)) as usize;
+                if slot >= count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unexpected message_id {} (base={base_msg_id}, count={count})",
+                            header.message_id
+                        ),
+                    ));
+                }
 
-            let slot = (header.message_id.wrapping_sub(base_msg_id)) as usize;
-            if slot >= count {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "unexpected message_id {} (base={base_msg_id}, count={count})",
-                        header.message_id
-                    ),
-                ));
-            }
+                let status = NtStatus::from_u32(header.status);
+                if status == NtStatus::EndOfFile {
+                    eof_after = eof_after.min(slot);
+                    received += 1;
+                    continue;
+                }
+                if status.is_error() {
+                    return Err(io::Error::other(format!(
+                        "pipelined read failed: 0x{:08X}",
+                        header.status
+                    )));
+                }
 
-            let status = NtStatus::from_u32(header.status);
-            if status == NtStatus::EndOfFile {
-                eof_after = eof_after.min(slot);
+                // Move the body out of `msg` without copying, preserving the
+                // zero-copy intent of `decode_read_response_owned`.
+                let body = msg.split_off(SMB2_HEADER_SIZE);
+                let data = decode_read_response_owned(body).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
+                })?;
+                slots[slot] = Some(data);
                 received += 1;
-                continue;
             }
-            if status.is_error() {
-                return Err(io::Error::other(format!(
-                    "pipelined read failed: 0x{:08X}",
-                    header.status
-                )));
-            }
+            Ok(())
+        }
+        .await;
 
-            let body = msg[SMB2_HEADER_SIZE..].to_vec();
-            let data = decode_read_response_owned(body).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
-            })?;
-            slots[slot] = Some(data);
-            received += 1;
+        if let Err(e) = recv_result {
+            self.poison();
+            let _ = stream.shutdown().await;
+            return Err(e);
         }
 
         Ok(slots
@@ -631,10 +654,33 @@ impl SmbClient {
             )));
         }
 
-        decode_write_response(&resp_body).ok_or_else(|| {
-            tracing::warn!(target: "smb", "invalid write response");
-            io::Error::new(io::ErrorKind::InvalidData, "invalid write response")
-        })
+        decode_write_response(&resp_body)
+            .ok_or_else(|| {
+                tracing::warn!(target: "smb", "invalid write response");
+                io::Error::new(io::ErrorKind::InvalidData, "invalid write response")
+            })
+            .and_then(|written| {
+                // SMB2 WRITE replies can legally report a short count. Higher
+                // levels (put_object, WAL flush) rely on the full buffer being
+                // written; treat any mismatch as an error to avoid silent data
+                // corruption.
+                if usize::try_from(written).ok() == Some(data.len()) {
+                    Ok(written)
+                } else {
+                    tracing::warn!(
+                        target: "smb",
+                        "short write: offset={offset} expected={} written={written}",
+                        data.len()
+                    );
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!(
+                            "short SMB write: offset={offset} expected={} written={written}",
+                            data.len()
+                        ),
+                    ))
+                }
+            })
     }
 
     /// Pipelined write: send `chunks` write requests in a batch, then receive
@@ -680,43 +726,83 @@ impl SmbClient {
         }
         stream.flush().await?;
 
+        // Track per-slot expected length so we can detect short writes and
+        // out-of-batch responses.  Any early exit poisons the connection
+        // because remaining frames would otherwise desynchronize framing.
+        let expected: Vec<u32> = chunks
+            .iter()
+            .map(|c| u32::try_from(c.len()).unwrap_or(u32::MAX))
+            .collect();
+        let mut received = vec![false; n];
         let mut total_written = 0u64;
-        let mut received = 0usize;
-        while received < n {
-            let mut len_buf = [0u8; 4];
-            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
+        let mut count = 0usize;
+        let recv_result: io::Result<()> = async {
+            while count < n {
+                let mut len_buf = [0u8; 4];
+                self.read_exact_timeout(&mut stream, &mut len_buf).await?;
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid SMB2 message length: {msg_len}"),
-                ));
+                if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid SMB2 message length: {msg_len}"),
+                    ));
+                }
+
+                let mut msg = vec![0u8; msg_len];
+                self.read_exact_timeout(&mut stream, &mut msg).await?;
+
+                let header = Header::decode(&msg).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header")
+                })?;
+
+                if header.status == STATUS_PENDING {
+                    continue;
+                }
+
+                let slot = (header.message_id.wrapping_sub(base_msg_id)) as usize;
+                if slot >= n || received[slot] {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unexpected message_id {} (base={base_msg_id}, n={n})",
+                            header.message_id
+                        ),
+                    ));
+                }
+
+                if header.status & NT_STATUS_ERROR_MASK == NT_STATUS_ERROR_MASK {
+                    return Err(io::Error::other(format!(
+                        "pipelined write failed: 0x{:08X}",
+                        header.status
+                    )));
+                }
+
+                let body = &msg[SMB2_HEADER_SIZE..];
+                let written = decode_write_response(body).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid write response")
+                })?;
+                if written != expected[slot] {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!(
+                            "short pipelined write: slot={slot} expected={} written={written}",
+                            expected[slot]
+                        ),
+                    ));
+                }
+                total_written += u64::from(written);
+                received[slot] = true;
+                count += 1;
             }
+            Ok(())
+        }
+        .await;
 
-            let mut msg = vec![0u8; msg_len];
-            self.read_exact_timeout(&mut stream, &mut msg).await?;
-
-            let header = Header::decode(&msg)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
-
-            if header.status == STATUS_PENDING {
-                continue;
-            }
-
-            if header.status & NT_STATUS_ERROR_MASK == NT_STATUS_ERROR_MASK {
-                return Err(io::Error::other(format!(
-                    "pipelined write failed: 0x{:08X}",
-                    header.status
-                )));
-            }
-
-            let body = &msg[SMB2_HEADER_SIZE..];
-            let written = decode_write_response(body).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid write response")
-            })?;
-            total_written += u64::from(written);
-            received += 1;
+        if let Err(e) = recv_result {
+            self.poison();
+            let _ = stream.shutdown().await;
+            return Err(e);
         }
 
         Ok(total_written)

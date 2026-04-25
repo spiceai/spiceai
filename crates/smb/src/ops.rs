@@ -434,11 +434,29 @@ impl ShareSession {
         let mut offset = 0u64;
         let mut write_err: Option<io::Error> = None;
         for chunk in data.chunks(chunk_size) {
-            if let Err(e) = client.write(tree_id, &file.file_id, offset, chunk).await {
-                write_err = Some(e);
-                break;
+            // SmbClient::write returns an error on short writes, so a
+            // successful response means the full chunk was persisted.
+            // Advance `offset` by the server-reported byte count for an
+            // additional layer of defense against silent data corruption.
+            match client.write(tree_id, &file.file_id, offset, chunk).await {
+                Ok(bytes_written) => {
+                    if usize::try_from(bytes_written).ok() != Some(chunk.len()) {
+                        write_err = Some(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            format!(
+                                "short SMB write to {smb_path}: wrote {bytes_written} of {} bytes",
+                                chunk.len()
+                            ),
+                        ));
+                        break;
+                    }
+                    offset += u64::from(bytes_written);
+                }
+                Err(e) => {
+                    write_err = Some(e);
+                    break;
+                }
             }
-            offset += chunk.len() as u64;
         }
 
         // Always attempt to close, even on write failure, to release the
@@ -736,11 +754,21 @@ impl WalWriter {
             return Ok(());
         }
 
+        let expected = self.buf.len() as u64;
         let chunks: Vec<&[u8]> = self.buf.chunks(self.chunk_size).collect();
         let written = self
             .client
             .pipelined_write(self.tree_id, &self.file_id, self.offset, &chunks)
             .await?;
+        // `pipelined_write` already errors on per-chunk short writes, but
+        // verify the aggregate against the buffered byte count before
+        // discarding the buffer to guard against silent data loss.
+        if written != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("WAL flush short write: expected {expected} bytes but wrote {written}"),
+            ));
+        }
         self.offset += written;
         self.buf.clear();
         Ok(())
