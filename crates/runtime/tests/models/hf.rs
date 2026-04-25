@@ -489,8 +489,8 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
 /// test fails at model load with `missing field 'attention_bias'`.
 #[tokio::test]
 async fn huggingface_test_gemma_chat_completion() -> Result<(), anyhow::Error> {
-    const HF_GEMMA_MODEL: &str = "google/gemma-2-2b-it";
-    const HF_GEMMA_MODEL_TYPE: &str = "gemma2";
+    const HF_GEMMA_MODEL: &str = "google/gemma-4-E2B-it";
+    const HF_GEMMA_MODEL_TYPE: &str = "gemma4";
 
     let _tracing = init_tracing(None);
 
