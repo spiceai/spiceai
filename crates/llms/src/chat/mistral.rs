@@ -319,69 +319,70 @@ impl MistralLlama {
         let chat_template = chat_template_literal.map(ToString::to_string);
 
         // Loading the GGUF directly (as if it is a quantized model, although it need not be quantized).
-        let (loader, device_map_params): (Result<Box<dyn Loader>>, AutoDeviceMapParams) = if let Some(gguf) = gguf_filename {
-            (
-                Ok(GGUFLoaderBuilder::new(
-                    chat_template.clone(),
-                    None,
-                    model_parts[0].to_string(),
-                    vec![gguf.to_string_lossy().to_string()],
-                    GGUFSpecificConfig::default(),
-                    false,
-                    None,
-                )
-                .build()),
-                AutoDeviceMapParams::default_text(),
-            )
-        } else {
-            // Hardcoded model architecture can ensure correct loading type.
-            // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`).
-            // Try the text (Normal) loader types first; if the architecture is unknown to that
-            // enum, fall back to the multimodal loader (e.g. Gemma 4, Gemma 3, Qwen2-VL, ...).
-            let normal_loader_type = arch
-                .map(NormalLoaderType::from_str)
-                .transpose()
-                .ok()
-                .flatten();
-
-            if arch.is_some() && normal_loader_type.is_none() {
-                let multimodal_loader_type = arch
-                    .map(|a| {
-                        MultimodalLoaderType::from_str(a)
-                            .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
-                    })
-                    .transpose()?;
-
-                let builder = MultimodalLoaderBuilder::new(
-                    MultimodalSpecificConfig::default(),
-                    chat_template,
-                    None,
-                    Some(model_parts[0].to_string()),
-                    None,
-                );
-
+        let (loader, device_map_params): (Result<Box<dyn Loader>>, AutoDeviceMapParams) =
+            if let Some(gguf) = gguf_filename {
                 (
-                    Ok(builder.build(multimodal_loader_type)),
-                    AutoDeviceMapParams::default_multimodal(),
-                )
-            } else {
-                let builder = NormalLoaderBuilder::new(
-                    NormalSpecificConfig::default(),
-                    chat_template,
-                    None,
-                    Some(model_parts[0].to_string()),
-                    false,
-                    None,
-                );
-
-                (
-                    builder
-                        .build(normal_loader_type)
-                        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() }),
+                    Ok(GGUFLoaderBuilder::new(
+                        chat_template.clone(),
+                        None,
+                        model_parts[0].to_string(),
+                        vec![gguf.to_string_lossy().to_string()],
+                        GGUFSpecificConfig::default(),
+                        false,
+                        None,
+                    )
+                    .build()),
                     AutoDeviceMapParams::default_text(),
                 )
-            }
-        };
+            } else {
+                // Hardcoded model architecture can ensure correct loading type.
+                // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`).
+                // Try the text (Normal) loader types first; if the architecture is unknown to that
+                // enum, fall back to the multimodal loader (e.g. Gemma 4, Gemma 3, Qwen2-VL, ...).
+                let normal_loader_type = arch
+                    .map(NormalLoaderType::from_str)
+                    .transpose()
+                    .ok()
+                    .flatten();
+
+                if arch.is_some() && normal_loader_type.is_none() {
+                    let multimodal_loader_type = arch
+                        .map(|a| {
+                            MultimodalLoaderType::from_str(a)
+                                .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
+                        })
+                        .transpose()?;
+
+                    let builder = MultimodalLoaderBuilder::new(
+                        MultimodalSpecificConfig::default(),
+                        chat_template,
+                        None,
+                        Some(model_parts[0].to_string()),
+                        None,
+                    );
+
+                    (
+                        Ok(builder.build(multimodal_loader_type)),
+                        AutoDeviceMapParams::default_multimodal(),
+                    )
+                } else {
+                    let builder = NormalLoaderBuilder::new(
+                        NormalSpecificConfig::default(),
+                        chat_template,
+                        None,
+                        Some(model_parts[0].to_string()),
+                        false,
+                        None,
+                    );
+
+                    (
+                        builder
+                            .build(normal_loader_type)
+                            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() }),
+                        AutoDeviceMapParams::default_text(),
+                    )
+                }
+            };
 
         let device = Self::get_device();
         let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
