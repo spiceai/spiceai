@@ -100,45 +100,28 @@ impl AcceleratedTable {
         // state must NOT federate during initial load — it returns "Acceleration not ready".
         let fallback_during_initial_load = matches!(self.ready_state, ReadyState::OnSchemaResolved);
 
-        let table_source: Arc<dyn FederatedTableSource> = match fallback {
-            Some((fb_provider, fb_table_ref)) if fb_table_ref != accelerated_table_ref => {
-                // Federated source uses a different (typically fully-qualified) table reference.
-                // Use a dynamic table that presents the correct reference during each phase.
-                let dynamic_table: Arc<dyn SQLTable> = Arc::new(DynamicSQLTable {
-                    fallback_table_ref: fb_table_ref,
-                    accelerated_table_ref,
-                    schema: Arc::clone(&self.schema()),
-                    refresher: self.refresher(),
-                });
-                let fed_provider = Arc::new(AcceleratedTableFederationProvider::new(
-                    enabled,
-                    fallback_during_initial_load,
-                    Some(accelerated_table_federation_provider),
-                    Some(fb_provider),
-                    self.refresher(),
-                ));
-                Arc::new(SQLTableSource::new_with_table(
-                    fed_provider as Arc<_>,
-                    dynamic_table,
-                ))
-            }
-            fallback_same_ref => {
-                // No useful fallback source or same table reference — use the simple path.
-                let fb_provider = fallback_same_ref.map(|(p, _)| p);
-                let fed_provider = Arc::new(AcceleratedTableFederationProvider::new(
-                    enabled,
-                    fallback_during_initial_load,
-                    Some(accelerated_table_federation_provider),
-                    fb_provider,
-                    self.refresher(),
-                ));
-                Arc::new(SQLTableSource::new_with_schema(
-                    fed_provider as Arc<_>,
-                    accelerated_table_ref,
-                    Arc::clone(&self.schema()),
-                ))
-            }
+        let (fb_provider, fallback_table_ref) = match fallback {
+            Some((p, fb_ref)) => (Some(p), fb_ref),
+            None => (None, accelerated_table_ref.clone()),
         };
+
+        let dynamic_table: Arc<dyn SQLTable> = Arc::new(DynamicSQLTable {
+            fallback_table_ref,
+            accelerated_table_ref,
+            schema: Arc::clone(&self.schema()),
+            refresher: self.refresher(),
+        });
+        let fed_provider = Arc::new(AcceleratedTableFederationProvider::new(
+            enabled,
+            fallback_during_initial_load,
+            Some(accelerated_table_federation_provider),
+            fb_provider,
+            self.refresher(),
+        ));
+        let table_source: Arc<dyn FederatedTableSource> = Arc::new(SQLTableSource::new_with_table(
+            fed_provider as Arc<_>,
+            dynamic_table,
+        ));
 
         Some(table_source)
     }
