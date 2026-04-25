@@ -99,12 +99,15 @@ pub fn scalar_to_attribute_value(
                     format!("{sign}{whole}.{frac:0>width$}", width = scale_u32 as usize)
                 }
                 std::cmp::Ordering::Less => {
-                    // Negative scale means multiply by 10^|scale| (e.g. value 123
-                    // with scale -2 represents 12300).
                     let abs_scale = u32::from(scale.unsigned_abs());
                     let multiplier = 10_i128.pow(abs_scale);
                     v.checked_mul(multiplier)
-                        .map_or_else(|| v.to_string(), |result| result.to_string())
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(format!(
+                                "Decimal128 value {v} with scale {scale} overflows on multiplication"
+                            ))
+                        })?
+                        .to_string()
                 }
                 std::cmp::Ordering::Equal => v.to_string(),
             };
@@ -132,10 +135,13 @@ pub fn scalar_to_attribute_value(
                     )
                 }
                 std::cmp::Ordering::Less => {
-                    // Negative scale means multiply by 10^|scale|.
                     let abs_scale = u32::from(scale.unsigned_abs());
                     let multiplier = arrow::datatypes::i256::from_i128(10_i128.pow(abs_scale));
-                    let result = v.wrapping_mul(multiplier);
+                    let result = v.checked_mul(multiplier).ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Decimal256 value {v} with scale {scale} overflows on multiplication"
+                        ))
+                    })?;
                     format!("{result}")
                 }
                 std::cmp::Ordering::Equal => format!("{v}"),
@@ -436,6 +442,21 @@ mod tests {
         let v = arrow::datatypes::i256::from_i128(123);
         let scalar = ScalarValue::Decimal256(Some(v), 20, -2);
         assert_number(&scalar, "12300");
+    }
+
+    #[test]
+    fn decimal128_negative_scale_overflow_returns_error() {
+        let scalar = ScalarValue::Decimal128(Some(i128::MAX), 38, -2);
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
+        assert!(result.is_err(), "overflow should produce an error");
+    }
+
+    #[test]
+    fn decimal256_negative_scale_overflow_returns_error() {
+        let v = arrow::datatypes::i256::from_parts(u128::MAX, i128::MAX);
+        let scalar = ScalarValue::Decimal256(Some(v), 76, -2);
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
+        assert!(result.is_err(), "overflow should produce an error");
     }
 
     // -----------------------------------------------------------------------
