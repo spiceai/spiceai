@@ -38,6 +38,7 @@ use util::format_datafusion_error;
 use std::{any::Any, sync::Arc};
 pub mod connection_manager;
 mod convert;
+pub mod dialect;
 mod execution_plan;
 
 #[derive(Debug, Snafu)]

@@ -17,7 +17,7 @@ limitations under the License.
 use super::ClusterTlsConfig;
 use super::composite_flight_service::CompositeFlightService;
 use crate::auth::EndpointAuth;
-use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
 use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
 use crate::flight::{Error, Service as SpiceFlightService, is_address_in_use_error, session_auth};

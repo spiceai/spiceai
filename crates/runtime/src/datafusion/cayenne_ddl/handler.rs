@@ -35,7 +35,7 @@ use super::physical_plans::{
     DistributedCayenneCreateSchemaExec, DistributedCayenneCreateTableExec,
     DistributedCayenneDropTableExec,
 };
-use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::ExecutorRegistry;
 use cayenne::ddl::operations;
 
 /// Distributed Cayenne DDL handler.

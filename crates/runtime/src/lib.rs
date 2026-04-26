@@ -61,6 +61,7 @@ use futures::{
 };
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
+use llms::rerank::RerankerModelStore;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
@@ -74,7 +75,9 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
-use crate::cluster::{DistributedNode, PartitionManager, SchedulerPeers};
+use crate::cluster::{
+    ClusterStateStore, DistributedNode, PartitionStore, SchedulerHeartbeatStore, SchedulerPeers,
+};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
@@ -201,14 +204,26 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unknown data connector: {data_connector}. Specify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+        "Unknown data connector '{data_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/data-connectors",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownDataConnector { data_connector: String },
+    UnknownDataConnector {
+        data_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
-        "Unknown catalog connector: {catalog_connector}. Specify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+        "Unknown catalog connector '{catalog_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/catalogs",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownCatalogConnector { catalog_connector: String },
+    UnknownCatalogConnector {
+        catalog_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
         "The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
@@ -482,6 +497,11 @@ pub struct Runtime {
     // LLMs that support the OpenAI Responses API
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
+    /// Registered reranker models (native cross-encoders, reranker-API
+    /// providers). Consumed by the `rerank()` UDTF; may be empty when only
+    /// LLM-as-reranker usage is needed — chat models are resolved from
+    /// `completion_llms` as a fallback.
+    rerankers: Arc<RwLock<RerankerModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
@@ -576,6 +596,11 @@ impl Runtime {
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
         Arc::clone(&self.completion_llms)
+    }
+
+    #[must_use]
+    pub fn rerankers(&self) -> Arc<RwLock<RerankerModelStore>> {
+        Arc::clone(&self.rerankers)
     }
 
     #[must_use]
@@ -770,32 +795,21 @@ impl Runtime {
         Ok(())
     }
 
-    /// Returns the partition manager for accelerated table partition metadata (scheduler only).
+    /// Returns the partition store for accelerated table partition metadata (scheduler only).
     #[must_use]
-    pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
+    pub fn partition_store(&self) -> Option<Arc<PartitionStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
-                accelerations_partitions,
+                accelerations_partitions_store,
                 ..
-            }) => Some(Arc::clone(accelerations_partitions)),
+            }) => Some(Arc::clone(accelerations_partitions_store)),
             _ => None,
         }
     }
 
-    /// Returns the catalog/federated partition manager (scheduler only).
+    /// Returns the cluster state store (scheduler only).
     #[must_use]
-    pub fn catalog_partition_manager(&self) -> Option<Arc<PartitionManager>> {
-        match self.distributed.as_ref() {
-            Some(DistributedNode::Scheduler {
-                catalog_partitions, ..
-            }) => Some(Arc::clone(catalog_partitions)),
-            _ => None,
-        }
-    }
-
-    /// Returns the shared cluster state store (scheduler only).
-    #[must_use]
-    pub fn cluster_state(&self) -> Option<Arc<crate::cluster::ClusterStateStore>> {
+    pub fn cluster_state(&self) -> Option<Arc<ClusterStateStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { cluster_state, .. }) => {
                 Some(Arc::clone(cluster_state))
@@ -806,7 +820,7 @@ impl Runtime {
 
     /// Returns the scheduler heartbeat store (scheduler only).
     #[must_use]
-    pub fn scheduler_heartbeats(&self) -> Option<Arc<crate::cluster::SchedulerHeartbeatStore>> {
+    pub fn scheduler_heartbeats(&self) -> Option<Arc<SchedulerHeartbeatStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { heartbeats, .. }) => Some(Arc::clone(heartbeats)),
             _ => None,
@@ -1219,6 +1233,11 @@ impl Runtime {
                     .update_embedding(&embedding.name, ComponentStatus::Initializing);
             }
 
+            for reranker in &app.rerankers {
+                self.status
+                    .update_reranker(&reranker.name, ComponentStatus::Initializing);
+            }
+
             for model in &app.models {
                 self.status
                     .update_model(&model.name, ComponentStatus::Initializing);
@@ -1264,6 +1283,7 @@ impl Runtime {
 
         // Must be loaded before datasets
         self.load_embeddings().await;
+        self.load_rerankers().await;
 
         // Spawn each component load in its own task to run in parallel
         let task_history = tokio::spawn({

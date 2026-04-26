@@ -14,14 +14,37 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use runtime_parameter_spec::ParameterSpec;
 use secrecy::SecretString;
 
 use crate::SecretStore;
 
 const ENV_SECRET_PREFIX: &str = "SPICE_";
+
+/// Parameters accepted by the `env` secret store.
+pub const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_path")
+    .description("Path to a `.env` file to load secrets from. Defaults to `.env`.")
+    .examples(&[".env", "/etc/spice/secrets.env"])];
+
+/// Resolved configuration for the `env` secret store.
+#[derive(Debug, Clone, Default)]
+pub struct EnvConfig {
+    pub file_path: Option<String>,
+}
+
+impl EnvConfig {
+    /// Builds an [`EnvConfig`] from a validated parameter map.
+    #[must_use]
+    pub fn from_params(params: &HashMap<String, String>) -> Self {
+        Self {
+            file_path: params.get("file_path").cloned(),
+        }
+    }
+}
 
 pub struct EnvSecretStoreBuilder {
     path: Option<PathBuf>,

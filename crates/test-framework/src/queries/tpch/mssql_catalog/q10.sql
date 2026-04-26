@@ -8,10 +8,10 @@ select
     c_phone,
     c_comment
 from
-    mssql.public.customer,
-    mssql.public.orders,
-    mssql.public.lineitem,
-    mssql.public.nation
+    mssql.dbo.customer,
+    mssql.dbo.orders,
+    mssql.dbo.lineitem,
+    mssql.dbo.nation
 where
         c_custkey = o_custkey
   and l_orderkey = o_orderkey

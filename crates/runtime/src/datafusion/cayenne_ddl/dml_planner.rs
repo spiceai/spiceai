@@ -39,7 +39,7 @@ use super::physical_plans::{
     DistributedCayenneDeleteExec, DistributedCayenneInsertExec, DistributedCayenneMergeExec,
     DistributedCayenneUpdateExec,
 };
-use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::ExecutorRegistry;
 
 /// Walk the input plan to find the topmost `Filter` and return predicate
 /// expressions.

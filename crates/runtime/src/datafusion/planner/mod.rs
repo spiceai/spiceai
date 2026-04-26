@@ -93,7 +93,7 @@ pub struct PlannerContext {
     /// Executor registry, if running in a distributed cluster.
     /// Used by `CREATE TABLE ... LIKE` to resolve auto-generated partition
     /// labels (e.g. `expr0`) back to the original SQL expression.
-    pub executor_registry: Option<Arc<crate::cluster::executor_registry::ExecutorRegistry>>,
+    pub executor_registry: Option<Arc<crate::cluster::ExecutorRegistry>>,
 
     /// IO runtime handle used by the distributed Cayenne DML handler.
     pub io_runtime: Handle,

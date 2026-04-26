@@ -4,9 +4,9 @@ select
     o_orderdate,
     o_shippriority
 from
-    mssql.public.customer,
-    mssql.public.orders,
-    mssql.public.lineitem
+    mssql.dbo.customer,
+    mssql.dbo.orders,
+    mssql.dbo.lineitem
 where
       c_mktsegment = 'BUILDING'
   and c_custkey = o_custkey

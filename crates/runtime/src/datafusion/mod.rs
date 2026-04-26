@@ -54,6 +54,7 @@ use {
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
 
+use crate::cluster::partition::service::PartitionService;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
@@ -133,10 +134,10 @@ pub(crate) mod sql_validator;
 pub mod udf;
 pub mod udtf;
 
-pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 pub const SPICE_EVAL_SCHEMA: &str = "eval";
-pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 pub const SPICE_SCP_SCHEMA: &str = "scp";
 
@@ -408,6 +409,12 @@ pub enum Error {
         "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
     ))]
     UnsupportedAccelerationEngineForSnapshots,
+
+    #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {source}"))]
+    PreRefreshPartitionDiscoveryFailed {
+        table_name: String,
+        source: Box<crate::cluster::partition::service::Error>,
+    },
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -570,8 +577,8 @@ pub struct DataFusion {
     /// Registry of connected executor control streams for `PollNow` broadcasts.
     /// Only used in scheduler mode.
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
-    /// Executor registry for distributed write forwarding (scheduler mode only).
-    pub executor_registry: Option<Arc<ExecutorRegistry>>,
+    /// Partition service for discovering/assigning partitions (scheduler mode only).
+    pub(crate) partition_service: Option<Arc<PartitionService>>,
     #[cfg(not(windows))]
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
@@ -1002,7 +1009,7 @@ impl DataFusion {
         let catalog = self.resolve_catalog_provider(table_reference);
         resolve_table_partition_expr(
             catalog.as_deref(),
-            self.executor_registry.as_deref(),
+            self.executor_registry().map(Arc::as_ref),
             table_reference,
         )
         .await
@@ -2087,19 +2094,19 @@ impl DataFusion {
     }
 
     pub async fn refresh_table(
-        &self,
+        self: &Arc<Self>,
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
-        // If we're a scheduler with an executor registry, forward refresh to executors
+        // If we're a scheduler with a partition service, forward refresh to executors
         // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
         if matches!(
             self.cluster_config.effective_role(),
             Some(crate::config::ClusterRole::Scheduler)
-        ) && let Some(executor_registry) = &self.executor_registry
+        ) && let Some(partition_service) = &self.partition_service
         {
             return self
-                .forward_refresh_to_executors(executor_registry, dataset_name, overrides.as_ref())
+                .forward_refresh_to_executors(partition_service, dataset_name, overrides.as_ref())
                 .await;
         }
 
@@ -2124,12 +2131,32 @@ impl DataFusion {
 
     /// Forwards a dataset refresh command to all connected executors via the control stream.
     /// Returns `Ok(None)` because the scheduler does not have a local notifier for executor refreshes.
+    ///
+    /// Before forwarding the refresh, runs on-demand partition discovery to ensure new
+    /// partitions are assigned to executors. This prevents data loss when `spice refresh`
+    /// is triggered before the periodic partition management task discovers new partitions.
     async fn forward_refresh_to_executors(
-        &self,
-        executor_registry: &ExecutorRegistry,
+        self: &Arc<Self>,
+        partition_service: &PartitionService,
         dataset_name: &TableReference,
         overrides: Option<&RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
+        // Run on-demand partition discovery before forwarding the refresh command.
+        // This ensures that any new partition values in the source data are discovered,
+        // assigned to executors, and executors are notified -- before they receive the
+        // refresh command. Without this, the periodic partition management task might
+        // not have discovered new partitions yet, causing executors to ignore data from
+        // unassigned partitions. (fixes #10075)
+        partition_service
+            .reconcile_table(dataset_name, self.as_ref())
+            .await
+            .map_err(|source| Error::PreRefreshPartitionDiscoveryFailed {
+                table_name: dataset_name.to_string(),
+                source: Box::new(source),
+            })?;
+
+        let executor_registry = &partition_service.executor_registry;
+
         let overrides_json = match overrides {
             Some(o) => {
                 Some(
@@ -2752,8 +2779,7 @@ impl DataFusion {
             },
             cluster_role: self.cluster_config.effective_role(),
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
-            executor_registry: self.executor_registry.clone(),
-            io_runtime: self.io_runtime.clone(),
+            executor_registry: self.executor_registry().cloned(),
             ddl_handler: self.cayenne_ddl_handler.clone(),
         };
 
@@ -2834,6 +2860,13 @@ impl DataFusion {
         self.executor_stream_registry.read().ok()?.clone()
     }
 
+    #[must_use]
+    pub fn executor_registry(&self) -> Option<&Arc<ExecutorRegistry>> {
+        self.partition_service
+            .as_ref()
+            .map(|ps| &ps.executor_registry)
+    }
+
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
         let mut executor_handle = self
             .executor
@@ -2858,6 +2891,31 @@ impl DataFusion {
         };
         self.ctx
             .parse_sql_expr(expr, &tbl_provider.schema().to_dfschema()?)
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_cluster::context::PartitionExprResolver for DataFusion {
+    async fn try_parse_expr(
+        &self,
+        tbl: &TableReference,
+        expr: &str,
+    ) -> Result<Expr, DataFusionError> {
+        DataFusion::try_parse_expr(self, tbl, expr).await
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_cluster::context::PartitionDiscoverer for DataFusion {
+    async fn table_partition_values(
+        &self,
+        table: &TableReference,
+        partition_by: &[spicepod::partitioning::PartitionedBy],
+    ) -> Result<Vec<runtime_cluster::PartitionValue>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        crate::cluster::partition::discovery::query_source_partitions(table, partition_by, self)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }
 
@@ -2917,7 +2975,7 @@ async fn resolve_table_partition_expr(
     let Some(expr_string) = expr_string.or(provider_expr_string).or_else(|| {
         executor_registry.and_then(|registry| {
             registry
-                .federated_partition_manager()
+                .federated_partition_store()
                 .get_cached_table_metadata(table_reference)
                 .and_then(|metadata| metadata.partition_expressions.first().cloned())
         })
@@ -2929,7 +2987,7 @@ async fn resolve_table_partition_expr(
     if let Some(Ok(idx)) = expr_string.strip_prefix("expr").map(str::parse::<usize>)
         && let Some(executor_registry) = executor_registry
         && let Some(metadata) = executor_registry
-            .federated_partition_manager()
+            .federated_partition_store()
             .get_table_metadata(table_reference)
             .await
             .boxed()
