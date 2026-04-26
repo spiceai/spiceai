@@ -1732,8 +1732,8 @@ mod tests {
         let filters = vec![
             exact_filter.clone(),
             inexact_filter.clone(),
-            unsupported_filter.clone(),
-            denied_filter.clone(),
+            unsupported_filter,
+            denied_filter,
         ];
         let pushdown_support = vec![
             TableProviderFilterPushDown::Exact,
@@ -1744,7 +1744,7 @@ mod tests {
 
         let accelerator_filters = filters_for_accelerator_scan(&filters, &pushdown_support)
             .expect("filter split should succeed");
-        let expected_accelerator_filters = expr_strings(&[exact_filter, inexact_filter.clone()]);
+        let expected_accelerator_filters = expr_strings(&[exact_filter, inexact_filter]);
 
         assert_eq!(
             expr_strings(&accelerator_filters),
