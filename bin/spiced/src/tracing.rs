@@ -212,6 +212,10 @@ where
         .transpose()?
         .unwrap_or_default();
 
+    let redact_context = app
+        .as_ref()
+        .is_some_and(|app| app.runtime.task_history.redact_context);
+
     let min_sql_duration_ms = app
         .as_ref()
         .map(|app| app.runtime.task_history.min_sql_duration_as_millis())
@@ -240,6 +244,7 @@ where
     let task_history_exporter = task_history::otel_exporter::TaskHistoryExporter::new(
         df,
         captured_output,
+        redact_context,
         min_sql_duration_ms,
         captured_plan,
         min_plan_duration_ms,

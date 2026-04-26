@@ -163,6 +163,7 @@ pub(crate) fn init_tracing_with_task_history(
     let task_history_exporter = TaskHistoryExporter::new(
         rt.datafusion(),
         TaskHistoryCapturedOutput::Truncated,
+        false,
         None, // min_sql_duration_ms
         spicepod::component::runtime::TaskHistoryCapturedPlan::None,
         None, // min_plan_duration_ms

@@ -2,33 +2,33 @@
 source: crates/runtime/tests/models/mod.rs
 expression: response
 ---
-+------------------------+------------+
-| task                   | input      |
-+------------------------+------------+
-| nsql                   | [redacted] |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| sql_query              | truncated  |
-| tool_use::sample_data  | [redacted] |
-| tool_use::sample_data  | [redacted] |
-| tool_use::table_schema | [redacted] |
-+------------------------+------------+
++------------------------+------------------------------------------------------------------------------+
+| task                   | input                                                                        |
++------------------------+------------------------------------------------------------------------------+
+| nsql                   | how many records (as 'total_records') are in taxi_trips dataset?             |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
+| tool_use::sample_data  | DistinctColumns({"dataset":"spice.public.taxi_trips","limit":3,"cols":null}) |
+| tool_use::sample_data  | RandomSample({"dataset":"spice.public.taxi_trips","limit":3})                |
+| tool_use::table_schema | {"tables":["spice.public.taxi_trips"],"output":"full"}                       |
++------------------------+------------------------------------------------------------------------------+

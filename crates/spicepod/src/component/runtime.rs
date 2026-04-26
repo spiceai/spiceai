@@ -418,6 +418,8 @@ pub struct TaskHistory {
     #[serde(default = "default_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub captured_output: Arc<str>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub redact_context: bool,
     #[serde(default = "default_retention_period")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub retention_period: Arc<str>,
@@ -452,6 +454,7 @@ impl Default for TaskHistory {
         Self {
             enabled: true,
             captured_output: default_none(),
+            redact_context: false,
             retention_period: default_retention_period(),
             retention_check_interval: default_retention_check_interval(),
             min_sql_duration: None,
@@ -1244,6 +1247,7 @@ mod tests {
             let task_history = TaskHistory {
                 enabled: true,
                 captured_output: "none".into(),
+                redact_context: false,
                 retention_period: "8h".into(),
                 retention_check_interval: "15m".into(),
                 min_sql_duration: Some(duration_str.into()),
@@ -1265,6 +1269,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            redact_context: false,
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: Some("invalid".into()),
@@ -1305,6 +1310,15 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, None);
+        assert!(!runtime.task_history.redact_context);
+
+        let yaml = r"
+            task_history:
+                enabled: true
+                redact_context: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert!(runtime.task_history.redact_context);
     }
 
     #[test]
@@ -1323,6 +1337,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            redact_context: false,
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1338,6 +1353,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            redact_context: false,
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1353,6 +1369,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            redact_context: false,
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1368,6 +1385,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            redact_context: false,
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1405,6 +1423,7 @@ mod tests {
             let task_history = TaskHistory {
                 enabled: true,
                 captured_output: "none".into(),
+                redact_context: false,
                 retention_period: "8h".into(),
                 retention_check_interval: "15m".into(),
                 min_sql_duration: None,
@@ -1426,6 +1445,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            redact_context: false,
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
