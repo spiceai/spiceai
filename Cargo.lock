@@ -16238,6 +16238,7 @@ dependencies = [
  "datafusion-datasource",
  "datafusion-federation",
  "datafusion-optimizer-rules",
+ "datafusion-table-providers",
  "futures",
  "globset",
  "insta",

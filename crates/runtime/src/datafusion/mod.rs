@@ -115,7 +115,7 @@ pub mod builder;
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
 pub use runtime_datafusion::dialect;
-pub mod error;
+pub use runtime_datafusion::error;
 pub mod filter_converter;
 pub mod flight_session_extension;
 pub mod iceberg_ddl;
