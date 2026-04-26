@@ -36,12 +36,16 @@ use crate::{Read, RefreshableCatalogProvider};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to get connection from PostgreSQL pool: {source}"))]
+    #[snafu(display(
+        "Failed to get connection from PostgreSQL pool: {source}. Check `pg_host`/`pg_port`/`pg_user`/`pg_pass`/`pg_sslmode` in the dataset params and that the server is reachable. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+    ))]
     ConnectionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to execute PostgreSQL query: {source}"))]
+    #[snafu(display(
+        "PostgreSQL query failed: {source}. Check SQL syntax and that referenced tables exist. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+    ))]
     QueryFailed { source: tokio_postgres::Error },
 }
 

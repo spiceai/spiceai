@@ -25,11 +25,13 @@ use runtime_datafusion_index::Index;
 pub mod chunking;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
+pub mod native_vector;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 
 pub mod vector_table;
 use crate::index::chunking::ChunkedVectorIndex;
+pub use native_vector::NativeVectorIndex;
 pub use vector_table::VectorScanTableProvider;
 
 #[cfg(feature = "elasticsearch")]

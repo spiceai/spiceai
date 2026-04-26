@@ -26,13 +26,14 @@ use datafusion::common::cast::{
 };
 use datafusion::common::utils::coerced_fixed_size_list_to_list;
 use datafusion::logical_expr::ScalarFunctionArgs;
-use datafusion::scalar::ScalarValue;
 use datafusion::{
     common::{DataFusionError, Result as DataFusionResult, exec_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
 };
 use std::any::Any;
 use std::sync::Arc;
+
+use crate::vector_simd::make_scalar_function;
 
 pub static COSINE_DISTANCE_UDF_NAME: &str = "cosine_distance";
 
@@ -44,37 +45,6 @@ macro_rules! downcast_arg {
             )
         })?
     }};
-}
-
-/// array function wrapper that differentiates between scalar (length 1) and array.
-pub(crate) fn make_scalar_function<F>(
-    inner: F,
-) -> impl Fn(&[ColumnarValue]) -> DataFusionResult<ColumnarValue>
-where
-    F: Fn(&[ArrayRef]) -> DataFusionResult<ArrayRef>,
-{
-    move |args: &[ColumnarValue]| {
-        // first, identify if any of the arguments is an Array. If yes, store its `len`,
-        // as any scalar will need to be converted to an array of len `len`.
-        let len = args
-            .iter()
-            .fold(Option::<usize>::None, |acc, arg| match arg {
-                ColumnarValue::Scalar(_) => acc,
-                ColumnarValue::Array(a) => Some(a.len()),
-            });
-
-        let args = ColumnarValue::values_to_arrays(args)?;
-
-        let result = (inner)(&args);
-
-        // If all inputs are scalar, keeps output as scalar
-        if len.is_none() {
-            let result = result.and_then(|arr| ScalarValue::try_from_array(&arr, 0));
-            result.map(ColumnarValue::Scalar)
-        } else {
-            result.map(ColumnarValue::Array)
-        }
-    }
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
