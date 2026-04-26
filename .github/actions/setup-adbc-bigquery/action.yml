@@ -21,6 +21,7 @@ runs:
         cache: false
 
     - name: Ensure C compiler for cgo
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         if ! command -v gcc &>/dev/null; then
