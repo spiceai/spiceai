@@ -1248,6 +1248,11 @@ impl TableProvider for AcceleratedTable {
                 Ok(results)
             }
             ZeroResultsAction::UseSource => {
+                // In UseSource mode, all filters must still flow into scan() so that
+                // FallbackOnZeroResultsScanExec receives the full predicate set and can use
+                // its internal filter_plan to evaluate those predicates before making a
+                // correct fallback decision. Unsupported-function filters are therefore kept
+                // out of accelerator SQL pushdown, but still participate in the fallback check.
                 Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
             }
         }
@@ -1304,10 +1309,20 @@ impl TableProvider for AcceleratedTable {
             None
         };
         let scan_projection = extended_projection.as_ref().or(projection);
-        let input = self
-            .accelerator
-            .scan(state, scan_projection, filters, limit)
-            .await?;
+        // For UseSource mode, the scan is handled inside the match arm below (with filter
+        // splitting). For all other modes, perform the accelerator scan upfront.
+        let input = if matches!(
+            (is_caching_mode, &self.zero_results_action),
+            (false, ZeroResultsAction::UseSource)
+        ) {
+            None
+        } else {
+            Some(
+                self.accelerator
+                    .scan(state, scan_projection, filters, limit)
+                    .await?,
+            )
+        };
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
             let federated = Arc::clone(&federated);
@@ -1317,6 +1332,11 @@ impl TableProvider for AcceleratedTable {
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
                 // Caching mode: wrap with cache execution plan to handle staleness and background refresh
+                let input = input.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "accelerator scan input missing in caching mode".to_string(),
+                    )
+                })?;
 
                 // Check which filters the accelerator doesn't fully support and need to be re-applied.
                 // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
@@ -1350,13 +1370,37 @@ impl TableProvider for AcceleratedTable {
                     batch_write_tx,
                 ))
             }
-            (false, ZeroResultsAction::ReturnEmpty) => input,
-            (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
-                self.dataset_name.clone(),
-                input,
-                fallback_fn,
-                TableScanParams::new(state, projection, filters, limit),
-            )),
+            (false, ZeroResultsAction::ReturnEmpty) => input.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "accelerator scan input missing in ReturnEmpty mode".to_string(),
+                )
+            })?,
+            (false, ZeroResultsAction::UseSource) => {
+                let filter_refs: Vec<&Expr> = filters.iter().collect();
+                let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
+                let accelerator_filters = filters_for_accelerator_scan(filters, &pushdown_support)?;
+
+                let accelerator_limit = if accelerator_filters.len() == filters.len() {
+                    limit
+                } else {
+                    None
+                };
+                let input = self
+                    .accelerator
+                    .scan(
+                        state,
+                        scan_projection,
+                        &accelerator_filters,
+                        accelerator_limit,
+                    )
+                    .await?;
+                Arc::new(FallbackOnZeroResultsScanExec::new(
+                    self.dataset_name.clone(),
+                    input,
+                    fallback_fn,
+                    TableScanParams::new(state, projection, filters, limit),
+                ))
+            }
         };
 
         // Compute the target schema based on user's original projection.
@@ -1531,6 +1575,33 @@ fn extend_projection_for_caching(
     Some(extended)
 }
 
+fn filters_for_accelerator_scan(
+    filters: &[Expr],
+    pushdown_support: &[TableProviderFilterPushDown],
+) -> DataFusionResult<Vec<Expr>> {
+    if filters.len() != pushdown_support.len() {
+        return Err(DataFusionError::Internal(format!(
+            "accelerator filter support length mismatch: expected {}, got {}",
+            filters.len(),
+            pushdown_support.len()
+        )));
+    }
+
+    let function_support = deny_spice_specific_functions();
+    let mut accelerator_filters = Vec::with_capacity(filters.len());
+
+    for (filter, support) in filters.iter().zip(pushdown_support.iter()) {
+        let function_supported = function_support.supports(filter);
+        let can_run_in_accelerator =
+            function_supported && !matches!(support, TableProviderFilterPushDown::Unsupported);
+        if can_run_in_accelerator {
+            accelerator_filters.push(filter.clone());
+        }
+    }
+
+    Ok(accelerator_filters)
+}
+
 #[derive(Debug)]
 pub enum DataRetentionFilter {
     Time {
@@ -1692,6 +1763,9 @@ impl Retention {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::prelude::{col, lit};
+    use datafusion_functions_json::udfs::json_get_str_udf;
 
     fn schema_with_fetched_at() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1704,6 +1778,18 @@ mod tests {
                 true,
             ),
         ]))
+    }
+
+    fn expr_strings(filters: &[Expr]) -> Vec<String> {
+        filters.iter().map(ToString::to_string).collect()
+    }
+
+    fn json_get_str_filter() -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            json_get_str_udf(),
+            vec![col("content"), lit("key")],
+        ))
+        .eq(lit("needle"))
     }
 
     #[test]
@@ -1749,6 +1835,45 @@ mod tests {
             extended,
             vec![2, 3],
             "Should add fetched_at to single column"
+        );
+    }
+
+    #[test]
+    fn test_filters_for_accelerator_scan_excludes_local_only_filters() {
+        let exact_filter = col("id").eq(lit(42_i64));
+        let inexact_filter = col("name").eq(lit("espresso"));
+        let unsupported_filter = col("content").eq(lit("local only"));
+        let denied_filter = json_get_str_filter();
+        let filters = vec![
+            exact_filter.clone(),
+            inexact_filter.clone(),
+            unsupported_filter,
+            denied_filter,
+        ];
+        let pushdown_support = vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Unsupported,
+            TableProviderFilterPushDown::Exact,
+        ];
+
+        let accelerator_filters = filters_for_accelerator_scan(&filters, &pushdown_support)
+            .expect("filter split should succeed");
+        let expected_accelerator_filters = expr_strings(&[exact_filter, inexact_filter]);
+
+        assert_eq!(
+            expr_strings(&accelerator_filters),
+            expected_accelerator_filters
+        );
+    }
+
+    #[test]
+    fn test_filters_for_accelerator_scan_validates_support_length() {
+        let err = filters_for_accelerator_scan(&[col("id").eq(lit(42_i64))], &[])
+            .expect_err("mismatched filter support should fail");
+
+        assert!(
+            matches!(err, DataFusionError::Internal(message) if message.contains("accelerator filter support length mismatch"))
         );
     }
 }

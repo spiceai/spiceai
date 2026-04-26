@@ -2235,6 +2235,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "azure_identity"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c0c8cb8886f2bdabb3501476fa53f87fa9efea9d457ff991c5ce80052c4774"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "azure_core 0.31.0",
+ "futures",
+ "pin-project",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "azure_security_keyvault_secrets"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d05ce5c2df99dbbf15422d033a94c08f3cf4bc057a9d855e587eb6fffe1db079"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "azure_core 0.31.0",
+ "futures",
+ "rustc_version",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "azure_storage"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11363,7 +11398,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.8.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=32be7431769c53fac643c62702993eda2fc5b509#32be7431769c53fac643c62702993eda2fc5b509"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6e64b990543ef1571ce512ca77b8ae4bae52c4c5#6e64b990543ef1571ce512ca77b8ae4bae52c4c5"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -11390,7 +11425,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.8.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=32be7431769c53fac643c62702993eda2fc5b509#32be7431769c53fac643c62702993eda2fc5b509"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6e64b990543ef1571ce512ca77b8ae4bae52c4c5#6e64b990543ef1571ce512ca77b8ae4bae52c4c5"
 dependencies = [
  "anyhow",
  "apodize",
@@ -11401,7 +11436,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.8.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=32be7431769c53fac643c62702993eda2fc5b509#32be7431769c53fac643c62702993eda2fc5b509"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6e64b990543ef1571ce512ca77b8ae4bae52c4c5#6e64b990543ef1571ce512ca77b8ae4bae52c4c5"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -11500,7 +11535,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.8.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=32be7431769c53fac643c62702993eda2fc5b509#32be7431769c53fac643c62702993eda2fc5b509"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6e64b990543ef1571ce512ca77b8ae4bae52c4c5#6e64b990543ef1571ce512ca77b8ae4bae52c4c5"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -11511,7 +11546,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.8.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=32be7431769c53fac643c62702993eda2fc5b509#32be7431769c53fac643c62702993eda2fc5b509"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6e64b990543ef1571ce512ca77b8ae4bae52c4c5#6e64b990543ef1571ce512ca77b8ae4bae52c4c5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11531,7 +11566,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.8.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=32be7431769c53fac643c62702993eda2fc5b509#32be7431769c53fac643c62702993eda2fc5b509"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6e64b990543ef1571ce512ca77b8ae4bae52c4c5#6e64b990543ef1571ce512ca77b8ae4bae52c4c5"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -11548,7 +11583,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.8.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=32be7431769c53fac643c62702993eda2fc5b509#32be7431769c53fac643c62702993eda2fc5b509"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6e64b990543ef1571ce512ca77b8ae4bae52c4c5#6e64b990543ef1571ce512ca77b8ae4bae52c4c5"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -11578,7 +11613,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.8.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=32be7431769c53fac643c62702993eda2fc5b509#32be7431769c53fac643c62702993eda2fc5b509"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6e64b990543ef1571ce512ca77b8ae4bae52c4c5#6e64b990543ef1571ce512ca77b8ae4bae52c4c5"
 dependencies = [
  "candle-core",
  "image 0.25.9",
@@ -16399,6 +16434,9 @@ dependencies = [
  "aws-sdk-credential-bridge",
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
+ "azure_core 0.31.0",
+ "azure_identity",
+ "azure_security_keyvault_secrets",
  "base64 0.22.1",
  "dotenvy",
  "futures",
@@ -16416,6 +16454,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
