@@ -1787,7 +1787,11 @@ impl ClusterSecretExpanderImpl {
 
 #[async_trait::async_trait]
 impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
-    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String> {
+    async fn expand_secret(
+        &self,
+        executor_id: &str,
+        key: &str,
+    ) -> Result<secrecy::SecretString, String> {
         let request = runtime_proto::ExpandSecretRequest {
             executor_id: executor_id.to_string(),
             key: key.to_string(),
@@ -1800,7 +1804,9 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
             .await
             .map_err(|status| format!("Failed to expand secret from scheduler: {status}"))?;
 
-        Ok(response.into_inner().value)
+        // Wrap at the earliest point we own the plaintext so downstream code
+        // cannot accidentally stash it in a non-zeroizing buffer.
+        Ok(secrecy::SecretString::from(response.into_inner().value))
     }
 }
 
