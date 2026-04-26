@@ -1364,23 +1364,19 @@ impl TableProvider for AcceleratedTable {
                 )
             })?,
             (false, ZeroResultsAction::UseSource) => {
-                // Split filters: only forward accelerator-supported ones into the accelerator
-                // scan, and apply denied-function filters locally via wrap_with_filter so they
-                // participate in the zero-results decision without being pushed into accelerator SQL.
-                let function_support = deny_spice_specific_functions();
-                let (accelerator_filters, local_filters): (Vec<Expr>, Vec<Expr>) = filters
-                    .iter()
-                    .cloned()
-                    .partition(|f| function_support.supports(f));
+                let filter_refs: Vec<&Expr> = filters.iter().collect();
+                let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
+                let (accelerator_filters, filters_to_reapply) =
+                    split_filters_for_accelerator_scan(filters, &pushdown_support)?;
 
                 let input = self
                     .accelerator
                     .scan(state, scan_projection, &accelerator_filters, limit)
                     .await?;
-                let input = if local_filters.is_empty() {
+                let input = if filters_to_reapply.is_empty() {
                     input
                 } else {
-                    wrap_with_filter(input, state, &local_filters)?
+                    wrap_with_filter(input, state, &filters_to_reapply)?
                 };
                 Arc::new(FallbackOnZeroResultsScanExec::new(
                     self.dataset_name.clone(),
@@ -1468,6 +1464,43 @@ fn extend_projection_for_caching(
     let mut extended = proj.clone();
     extended.push(idx);
     Some(extended)
+}
+
+fn split_filters_for_accelerator_scan(
+    filters: &[Expr],
+    pushdown_support: &[TableProviderFilterPushDown],
+) -> DataFusionResult<(Vec<Expr>, Vec<Expr>)> {
+    if filters.len() != pushdown_support.len() {
+        return Err(DataFusionError::Internal(format!(
+            "accelerator filter support length mismatch: expected {}, got {}",
+            filters.len(),
+            pushdown_support.len()
+        )));
+    }
+
+    let function_support = deny_spice_specific_functions();
+    let mut accelerator_filters = Vec::with_capacity(filters.len());
+    let mut filters_to_reapply = Vec::new();
+
+    for (filter, support) in filters.iter().zip(pushdown_support.iter()) {
+        let function_supported = function_support.supports(filter);
+        let can_run_in_accelerator =
+            function_supported && !matches!(support, TableProviderFilterPushDown::Unsupported);
+        if can_run_in_accelerator {
+            accelerator_filters.push(filter.clone());
+        }
+
+        if !function_supported
+            || matches!(
+                support,
+                TableProviderFilterPushDown::Inexact | TableProviderFilterPushDown::Unsupported
+            )
+        {
+            filters_to_reapply.push(filter.clone());
+        }
+    }
+
+    Ok((accelerator_filters, filters_to_reapply))
 }
 
 #[derive(Debug)]
@@ -1631,6 +1664,9 @@ impl Retention {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::prelude::{col, lit};
+    use datafusion_functions_json::udfs::json_get_str_udf;
 
     fn schema_with_fetched_at() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1643,6 +1679,18 @@ mod tests {
                 true,
             ),
         ]))
+    }
+
+    fn expr_strings(filters: &[Expr]) -> Vec<String> {
+        filters.iter().map(ToString::to_string).collect()
+    }
+
+    fn json_get_str_filter() -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            json_get_str_udf(),
+            vec![col("content"), lit("key")],
+        ))
+        .eq(lit("needle"))
     }
 
     #[test]
@@ -1688,6 +1736,52 @@ mod tests {
             extended,
             vec![2, 3],
             "Should add fetched_at to single column"
+        );
+    }
+
+    #[test]
+    fn test_split_filters_for_accelerator_scan_reapplies_local_filters() {
+        let exact_filter = col("id").eq(lit(42_i64));
+        let inexact_filter = col("name").eq(lit("espresso"));
+        let unsupported_filter = col("content").eq(lit("local only"));
+        let denied_filter = json_get_str_filter();
+        let filters = vec![
+            exact_filter.clone(),
+            inexact_filter.clone(),
+            unsupported_filter.clone(),
+            denied_filter.clone(),
+        ];
+        let pushdown_support = vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Unsupported,
+            TableProviderFilterPushDown::Exact,
+        ];
+
+        let (accelerator_filters, filters_to_reapply) =
+            split_filters_for_accelerator_scan(&filters, &pushdown_support)
+                .expect("filter split should succeed");
+        let expected_accelerator_filters = expr_strings(&[exact_filter, inexact_filter.clone()]);
+        let expected_filters_to_reapply =
+            expr_strings(&[inexact_filter, unsupported_filter, denied_filter]);
+
+        assert_eq!(
+            expr_strings(&accelerator_filters),
+            expected_accelerator_filters
+        );
+        assert_eq!(
+            expr_strings(&filters_to_reapply),
+            expected_filters_to_reapply
+        );
+    }
+
+    #[test]
+    fn test_split_filters_for_accelerator_scan_validates_support_length() {
+        let err = split_filters_for_accelerator_scan(&[col("id").eq(lit(42_i64))], &[])
+            .expect_err("mismatched filter support should fail");
+
+        assert!(
+            matches!(err, DataFusionError::Internal(message) if message.contains("accelerator filter support length mismatch"))
         );
     }
 }
