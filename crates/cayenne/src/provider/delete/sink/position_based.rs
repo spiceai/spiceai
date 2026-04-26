@@ -668,7 +668,7 @@ impl CayenneDeletionSink {
                 .filter(|&&id| {
                     u32::try_from(id)
                         .ok()
-                        .map_or(true, |id32| !existing_bitmap.contains(id32))
+                        .is_none_or(|id32| !existing_bitmap.contains(id32))
                 })
                 .count();
             new_deletion_count += newly_added_for_file;
