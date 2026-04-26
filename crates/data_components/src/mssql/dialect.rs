@@ -60,7 +60,7 @@ impl Dialect for MsSqlDialect {
     }
 }
 
-/// Converts DataFusion's `substr(str, start[, len])` to T-SQL's `SUBSTRING(str, start, len)`.
+/// Converts `DataFusion`'s `substr(str, start[, len])` to T-SQL's `SUBSTRING(str, start, len)`.
 ///
 /// T-SQL `SUBSTRING` requires 3 arguments on SQL Server 2022 and earlier; the
 /// `length` parameter became optional only in SQL Server 2025+. For broad
