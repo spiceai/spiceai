@@ -131,9 +131,18 @@ where
             let mut archive = Builder::new(&mut buffer);
 
             for (dir_path, archive_prefix) in &dirs {
-                let Ok(metadata) = std::fs::symlink_metadata(dir_path) else {
-                    tracing::warn!("Directory {} does not exist, skipping", dir_path.display());
-                    continue;
+                let metadata = match std::fs::symlink_metadata(dir_path) {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::warn!("Directory {} does not exist, skipping", dir_path.display());
+                        continue;
+                    }
+                    Err(source) => {
+                        return Err(ArchiveError::CreateArchive {
+                            path: dir_path.clone(),
+                            source,
+                        });
+                    }
                 };
 
                 if metadata.file_type().is_symlink() {
@@ -665,7 +674,14 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
             }
 
             if options.skip_if_exists && options.verify_existing_checksums {
-                let expected_checksum = compute_reader_checksum(&mut entry)?;
+                let expected_checksum = options
+                    .expected_checksums
+                    .as_ref()
+                    .and_then(|expected_checksums| {
+                        expected_checksums.get(entry_path.to_string_lossy().as_ref())
+                    })
+                    .cloned()
+                    .map_or_else(|| compute_reader_checksum(&mut entry), Ok)?;
 
                 // Compute checksum of existing file
                 let actual_checksum = compute_file_checksum(&dest_path)?;

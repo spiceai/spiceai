@@ -117,6 +117,14 @@ pub(crate) async fn require_write_access() -> Option<Response> {
     }
 }
 
+fn status_for_sql_error(message: &str) -> StatusCode {
+    if message.contains("read-only SQL context") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
 #[cfg(feature = "openapi")]
 impl utoipa::IntoParams for Format {
     fn into_params(parameter_in_provider: impl Fn() -> Option<ParameterIn>) -> Vec<Parameter> {
@@ -237,8 +245,9 @@ pub async fn sql_to_http_response(
         match run_sql_with_read_only(df, sql, parameters, read_only).await {
             Ok((data, results_cache_status)) => (data, results_cache_status),
             Err(e) => {
-                tracing::debug!("Error executing query: {e}");
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                let message = e.to_string();
+                tracing::debug!("Error executing query: {message}");
+                return (status_for_sql_error(&message), message).into_response();
             }
         };
 

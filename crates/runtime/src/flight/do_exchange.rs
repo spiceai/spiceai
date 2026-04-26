@@ -199,7 +199,8 @@ pub(crate) async fn handle(
 
                     Some((output, rx))
                 }
-                Err(_e) => {
+                Err(broadcast::error::RecvError::Closed) => None,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
                     let output = flight_data_stream(Vec::new(), None);
                     Some((output, rx))
                 }
