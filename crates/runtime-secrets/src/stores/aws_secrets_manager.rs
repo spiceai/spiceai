@@ -695,16 +695,13 @@ impl SecretStore for AwsSecretsManager {
         // with other application secrets in the same AWS secret without
         // collisions, then fall back to the unprefixed key.
         //
-        // The cached values are already `SecretString`s, so the only
-        // plaintext copy made here is the fresh one we hand back to the
-        // caller (which owns its own zeroize-on-drop buffer).
+        // The cached values are already `SecretString`s, so clone the
+        // zeroize-on-drop wrapper directly instead of exposing plaintext.
         let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
         if let Some(value) = data.get(&prefixed_key) {
-            return Ok(Some(SecretString::from(value.expose_secret().to_string())));
+            return Ok(Some(value.clone()));
         }
-        Ok(data
-            .get(key)
-            .map(|v| SecretString::from(v.expose_secret().to_string())))
+        Ok(data.get(key).cloned())
     }
 }
 

@@ -948,13 +948,10 @@ fn validate_vault_url(input: &str) -> Result<String> {
         .fail();
     }
 
-    // Normalize to `https://host[:port]/` — strip any trailing slash the
-    // parser added beyond the root.
-    let host = parsed.host_str().unwrap_or("");
-    Ok(match parsed.port() {
-        Some(port) => format!("https://{host}:{port}/"),
-        None => format!("https://{host}/"),
-    })
+    // Normalize to `https://host[:port]/` using `url`'s serialized authority
+    // so IPv6 literals retain their required brackets.
+    let authority = &parsed[url::Position::BeforeScheme..url::Position::AfterPort];
+    Ok(format!("{authority}/"))
 }
 
 /// Resolves `AuthMethod::Default` against the supplied credentials.
@@ -1133,6 +1130,12 @@ mod tests {
         // Localstack-style setups may run on a non-default port.
         let url = resolve_vault_url("https://my-vault.vault.azure.net:8443", None).expect("valid");
         assert_eq!(url, "https://my-vault.vault.azure.net:8443/");
+    }
+
+    #[test]
+    fn preserves_ipv6_brackets_with_custom_port() {
+        let url = resolve_vault_url("https://[::1]:8443", None).expect("valid");
+        assert_eq!(url, "https://[::1]:8443/");
     }
 
     #[test]
