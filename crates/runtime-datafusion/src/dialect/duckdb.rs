@@ -415,7 +415,7 @@ mod tests {
         sql::{TableReference, unparser::Unparser},
     };
 
-    use super::new_duckdb_dialect;
+    use crate::dialect::new_duckdb_dialect;
 
     fn fixed_size_list_literal(values: Vec<f32>) -> Expr {
         let n = i32::try_from(values.len()).expect("values length fits in i32");
