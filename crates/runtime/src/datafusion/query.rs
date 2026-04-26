@@ -1787,6 +1787,7 @@ mod tests {
         buffer::Buffer,
         datatypes::{DataType, Field, Schema, UnionMode},
     };
+    use datafusion::logical_expr::Extension;
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
