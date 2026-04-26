@@ -108,6 +108,7 @@ runtime:
   task_history:
     enabled: true
     captured_output: truncated # none, truncated, full
+    redact_context: true
     retention_period: 24h
     retention_check_interval: 30m
     min_sql_duration: 100ms

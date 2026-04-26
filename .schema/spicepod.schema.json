@@ -933,6 +933,10 @@
           "type": "string",
           "default": "none"
         },
+        "redact_context": {
+          "type": "boolean",
+          "default": false
+        },
         "retention_period": {
           "type": "string",
           "default": "8h"
