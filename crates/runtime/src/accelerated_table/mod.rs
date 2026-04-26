@@ -1237,10 +1237,10 @@ impl TableProvider for AcceleratedTable {
             }
             ZeroResultsAction::UseSource => {
                 // In UseSource mode, all filters must still flow into scan() so that
-                // FallbackOnZeroResultsScanExec receives the full predicate set and can make
-                // a correct fallback decision. Filters containing unsupported functions
-                // (e.g. json_get_str) are split inside scan() and applied locally via
-                // wrap_with_filter rather than being pushed into the accelerator SQL.
+                // FallbackOnZeroResultsScanExec receives the full predicate set and can use
+                // its internal filter_plan to evaluate those predicates before making a
+                // correct fallback decision. Unsupported-function filters are therefore kept
+                // out of accelerator SQL pushdown, but still participate in the fallback check.
                 Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
             }
         }
