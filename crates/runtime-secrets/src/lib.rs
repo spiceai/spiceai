@@ -45,6 +45,12 @@ pub enum Error {
         source: Box<stores::aws_secrets_manager::Error>,
     },
 
+    #[cfg(feature = "azure-keyvault")]
+    #[snafu(display("Unable to initialize Azure Key Vault: {source}"))]
+    UnableToInitializeAzureKeyVault {
+        source: Box<stores::azure_keyvault::Error>,
+    },
+
     #[snafu(display("Unable to parse secret value"))]
     UnableToParseSecretValue,
 
@@ -83,6 +89,8 @@ pub fn known_secret_stores() -> Vec<&'static str> {
     stores.push("kubernetes");
     #[cfg(feature = "aws-secrets-manager")]
     stores.push("aws_secrets_manager");
+    #[cfg(feature = "azure-keyvault")]
+    stores.push("azure_keyvault");
     stores.push("scheduler_rpc");
     stores
 }
@@ -187,9 +195,16 @@ impl Secrets {
 
     pub async fn inject_secrets(&self, key: &str, param_str: ParamStr<'_>) -> SecretString {
         tracing::trace!("Injecting secrets for: {}", key);
-        let mut result = String::new();
+        let input = param_str.0;
+        // Preallocate so the builder rarely re-allocates. Any reallocation
+        // would free the old buffer (containing partial secret bytes) without
+        // zeroizing it — defense in depth, though the final wrap below does
+        // guarantee the last live buffer is scrubbed when the `SecretString`
+        // drops.
+        let mut result = String::with_capacity(input.len().saturating_add(256));
         let mut last_end = 0;
-        for secret_replacement in SecretReplacementMatcher::new(param_str.0) {
+        for secret_replacement in SecretReplacementMatcher::new(input) {
+            // Log only the store name + key, never the resolved value.
             tracing::debug!(
                 "Found secret replacement: Store name: {}, Key: {}, Span: {:?}",
                 secret_replacement.store_name,
@@ -197,28 +212,28 @@ impl Secrets {
                 secret_replacement.span,
             );
 
-            // Append text from last match to the start of the current match
-            result.push_str(&param_str.0[last_end..secret_replacement.span.start]);
+            result.push_str(&input[last_end..secret_replacement.span.start]);
 
-            // Get the secret value from the store
-            let secret = self
-                .get_store_secret(
-                    &param_str,
+            // Keep the value inside `SecretString` until we splice its bytes
+            // into `result`. Previously this path went through
+            // `expose_secret().to_string()` which allocates a plain String
+            // that is dropped without zeroizing — those bytes would linger
+            // in freed heap slots.
+            if let Some(secret) = self
+                .lookup_for_injection(
+                    input,
                     &secret_replacement.store_name,
                     &secret_replacement.key,
                 )
                 .await
-                .unwrap_or_default();
+            {
+                result.push_str(secret.expose_secret());
+            }
 
-            // Replace the token with the desired string
-            result.push_str(&secret);
-
-            // Update the last end to the end of the current match
             last_end = secret_replacement.span.end;
         }
 
-        // Append the remaining text after the last match
-        result.push_str(&param_str.0[last_end..]);
+        result.push_str(&input[last_end..]);
 
         SecretString::from(result)
     }
@@ -240,12 +255,15 @@ impl Secrets {
         Ok(None)
     }
 
-    async fn get_store_secret(
+    /// Internal helper for [`Self::inject_secrets`]. Returns the value
+    /// wrapped in a [`SecretString`] (never a plain `String`) so the caller
+    /// can splice the bytes without an intermediate non-zeroizing allocation.
+    async fn lookup_for_injection(
         &self,
-        param_str: &ParamStr<'_>,
+        param_str: &str,
         store_name: &str,
         key: &str,
-    ) -> Option<String> {
+    ) -> Option<SecretString> {
         // Substitution failures leave the parameter as the empty string, which the
         // component layer then reports as "missing required parameter" without any
         // back-reference to the failed secret lookup. Include enough context in the
@@ -254,55 +272,56 @@ impl Secrets {
         // in a tight loop for every `${...}` substitution, so we don't pay for it on
         // the hot (success) path.
         let configured_stores = || self.stores.keys().cloned().collect::<Vec<_>>().join(", ");
+
+        // Special case: the `secrets:` sentinel means "walk the registry in
+        // precedence order", which matches `get_secret`.
         if store_name == SECRETS {
-            match self.get_secret(key).await {
-                Ok(Some(secret)) => return Some(secret.expose_secret().to_string()),
+            return match self.get_secret(key).await {
+                Ok(Some(secret)) => Some(secret),
                 Ok(None) => {
                     tracing::error!(
                         "Secret `${{ secrets:{key} }}` (referenced by `{}`) not found in any configured secret store (searched: [{}]). The parameter will be empty, which typically surfaces later as a missing/invalid parameter. Docs: https://spiceai.org/docs/components/secret-stores",
-                        param_str.0,
+                        param_str,
                         configured_stores()
                     );
-                    return None;
+                    None
                 }
                 Err(e) => {
                     tracing::error!(
                         "Error looking up secret `${{ secrets:{key} }}` (referenced by `{}`): {e}",
-                        param_str.0
+                        param_str
                     );
-                    return None;
+                    None
                 }
-            }
+            };
         }
 
-        let secret = if let Some(store) = self.stores.get(store_name) {
-            match store.get_secret(key).await {
-                Ok(Some(secret)) => secret.expose_secret().to_string(),
-                Ok(None) => {
-                    tracing::error!(
-                        "Secret `${{ {store_name}:{key} }}` (referenced by `{}`) not found in secret store `{store_name}`. The parameter will be empty. Docs: https://spiceai.org/docs/components/secret-stores",
-                        param_str.0
-                    );
-                    return None;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Error looking up secret `${{ {store_name}:{key} }}` (referenced by `{}`): {e}",
-                        param_str.0
-                    );
-                    return None;
-                }
-            }
-        } else {
+        let Some(store) = self.stores.get(store_name) else {
             tracing::error!(
                 "Secret reference `${{ {store_name}:{key} }}` in `{}` uses an undefined store `{store_name}`. Configured stores: [{}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores. Docs: https://spiceai.org/docs/components/secret-stores",
-                param_str.0,
+                param_str,
                 configured_stores()
             );
             return None;
         };
 
-        Some(secret)
+        match store.get_secret(key).await {
+            Ok(Some(secret)) => Some(secret),
+            Ok(None) => {
+                tracing::error!(
+                    "Secret `${{ {store_name}:{key} }}` (referenced by `{}`) not found in secret store `{store_name}`. The parameter will be empty. Docs: https://spiceai.org/docs/components/secret-stores",
+                    param_str
+                );
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Error looking up secret `${{ {store_name}:{key} }}` (referenced by `{}`): {e}",
+                    param_str
+                );
+                None
+            }
+        }
     }
 }
 
@@ -353,6 +372,8 @@ pub enum SecretStoreType {
     Kubernetes(stores::kubernetes::KubernetesConfig),
     #[cfg(feature = "aws-secrets-manager")]
     AwsSecretsManager(stores::aws_secrets_manager::AwsSecretsManagerConfig),
+    #[cfg(feature = "azure-keyvault")]
+    AzureKeyVault(stores::azure_keyvault::AzureKeyVaultConfig),
     SchedulerRPC,
 }
 
@@ -440,6 +461,14 @@ async fn spicepod_secret_store_type(
                     secret_name,
                     &params,
                 ),
+            ))
+        }
+        #[cfg(feature = "azure-keyvault")]
+        "azure_keyvault" => {
+            let vault = require_selector(provider, selector)?;
+            let params = validate(stores::azure_keyvault::PARAMETERS)?;
+            Ok(SecretStoreType::AzureKeyVault(
+                stores::azure_keyvault::AzureKeyVaultConfig::from_params(vault, &params),
             ))
         }
         "scheduler_rpc" => {
@@ -542,6 +571,22 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
 
             Ok(Arc::new(secret_store) as Arc<dyn SecretStore>)
         },
+        #[cfg(feature = "azure-keyvault")]
+        SecretStoreType::AzureKeyVault(config) => {
+            let secret_store = stores::azure_keyvault::AzureKeyVault::from_config(config)
+                .map_err(|e| Error::UnableToInitializeAzureKeyVault {
+                    source: Box::new(e),
+                })?;
+
+            secret_store
+                .init()
+                .await
+                .map_err(|e| Error::UnableToInitializeAzureKeyVault {
+                    source: Box::new(e),
+                })?;
+
+            Ok(Arc::new(secret_store) as Arc<dyn SecretStore>)
+        },
         SecretStoreType::SchedulerRPC => {
             Err(Error::UnableToLoadSecrets {
                 source: "The `scheduler_rpc` is automatically configured for cluster mode, and should not be specified in the Spicepod.".into()
@@ -554,13 +599,37 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
 mod tests {
     use async_trait::async_trait;
     use secrecy::ExposeSecret;
+    use tokio::sync::{Mutex, MutexGuard};
+
+    /// Global lock serializing any test that mutates process environment
+    /// variables. Required because `std::env::set_var`/`remove_var` are
+    /// `unsafe` on Rust 2024 — they are not sound to call concurrently
+    /// with any other thread reading or writing env vars. `cargo test`
+    /// runs tests in parallel by default, so without this lock two env
+    /// tests could step on each other and trip the safety contract.
+    ///
+    /// `tokio::sync::Mutex` (rather than `std::sync::Mutex`) because the
+    /// guard is held across `.await`s in the async test bodies — holding
+    /// a sync mutex across await would block other tasks on the same
+    /// runtime thread and clippy flags it as `await_holding_lock`.
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    pub(super) async fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().await
+    }
 
     struct MockClusterSecretExpander;
 
     #[async_trait]
     impl super::ClusterSecretExpander for MockClusterSecretExpander {
-        async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String> {
-            Ok(format!("{executor_id}:{key}:expanded"))
+        async fn expand_secret(
+            &self,
+            executor_id: &str,
+            key: &str,
+        ) -> Result<secrecy::SecretString, String> {
+            Ok(secrecy::SecretString::from(format!(
+                "{executor_id}:{key}:expanded"
+            )))
         }
     }
 
@@ -684,6 +753,7 @@ mod tests {
         use spicepod::param::Params;
         use std::collections::HashMap;
 
+        let _env_guard = lock_env().await;
         // Unique env-var name keeps tests isolated when run in parallel.
         let var = format!("SPICE_TEST_BOOTSTRAP_REGION_{}", rand::random::<u64>());
         unsafe { std::env::set_var(&var, "ap-south-1") };
@@ -730,6 +800,7 @@ mod tests {
         use spicepod::param::Params;
         use std::collections::HashMap;
 
+        let _env_guard = lock_env().await;
         let var = format!("SPICE_TEST_DEFINITELY_UNSET_{}", rand::random::<u64>());
         // Defensive: ensure it's not set in case of a prior leak.
         unsafe { std::env::remove_var(&var) };
@@ -787,11 +858,239 @@ mod tests {
         match resolved {
             super::SecretStoreType::AwsSecretsManager(cfg) => {
                 assert_eq!(cfg.access_key_id.as_deref(), Some("AKIA_TEST"));
-                assert_eq!(cfg.secret_access_key.as_deref(), Some("shh"));
-                assert_eq!(cfg.session_token.as_deref(), Some("tok"));
+                assert_eq!(
+                    cfg.secret_access_key
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("shh".to_string())
+                );
+                assert_eq!(
+                    cfg.session_token
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("tok".to_string())
+                );
             }
             _ => panic!("expected AwsSecretsManager variant"),
         }
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_params_threaded_through() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let mut p = HashMap::new();
+        p.insert("auth_method".to_string(), "service_principal".to_string());
+        p.insert(
+            "tenant_id".to_string(),
+            "00000000-0000-0000-0000-000000000001".to_string(),
+        );
+        p.insert(
+            "client_id".to_string(),
+            "00000000-0000-0000-0000-000000000002".to_string(),
+        );
+        p.insert("client_secret".to_string(), "shh".to_string());
+        p.insert(
+            "endpoint".to_string(),
+            "vault.usgovcloudapi.net".to_string(),
+        );
+
+        let store = SpicepodSecret {
+            from: "azure_keyvault:my-vault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+        match resolved {
+            super::SecretStoreType::AzureKeyVault(cfg) => {
+                assert_eq!(cfg.vault, "my-vault");
+                assert_eq!(
+                    cfg.auth_method,
+                    super::stores::azure_keyvault::AuthMethod::ServicePrincipal
+                );
+                assert_eq!(
+                    cfg.tenant_id.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000001")
+                );
+                assert_eq!(
+                    cfg.client_id.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000002")
+                );
+                assert_eq!(
+                    cfg.client_secret
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("shh".to_string())
+                );
+                assert_eq!(cfg.endpoint.as_deref(), Some("vault.usgovcloudapi.net"));
+            }
+            _ => panic!("expected AzureKeyVault variant"),
+        }
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_unknown_param_is_rejected() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // A misspelled `tennant_id` must be rejected at load time rather
+        // than silently dropped — this is exactly the failure mode the
+        // ParameterSpec validation is meant to prevent.
+        let mut p = HashMap::new();
+        p.insert(
+            "tennant_id".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        );
+
+        let store = SpicepodSecret {
+            from: "azure_keyvault:my-vault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("unknown param should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("tennant_id"), "got {msg}");
+        assert!(
+            msg.contains("tenant_id"),
+            "error must list supported params; got {msg}"
+        );
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_env_bootstrap_resolves_client_secret() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let _env_guard = lock_env().await;
+        // The canonical path: client_secret (and tenant/client ids) are
+        // sourced from environment via `${ env:... }` references so they
+        // are never committed to the spicepod.
+        let tenant_var = format!("SPICE_TEST_AZURE_TENANT_{}", rand::random::<u64>());
+        let client_var = format!("SPICE_TEST_AZURE_CLIENT_{}", rand::random::<u64>());
+        let secret_var = format!("SPICE_TEST_AZURE_SECRET_{}", rand::random::<u64>());
+        unsafe {
+            std::env::set_var(&tenant_var, "tenant-xyz");
+            std::env::set_var(&client_var, "client-xyz");
+            std::env::set_var(&secret_var, "s3cret");
+        }
+
+        let mut p = HashMap::new();
+        p.insert("auth_method".to_string(), "service_principal".to_string());
+        p.insert("tenant_id".to_string(), format!("${{ env:{tenant_var} }}"));
+        p.insert("client_id".to_string(), format!("${{ env:{client_var} }}"));
+        p.insert(
+            "client_secret".to_string(),
+            format!("${{ secrets:{secret_var} }}"),
+        );
+
+        let store = SpicepodSecret {
+            from: "azure_keyvault:my-vault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+
+        unsafe {
+            std::env::remove_var(&tenant_var);
+            std::env::remove_var(&client_var);
+            std::env::remove_var(&secret_var);
+        }
+
+        match resolved {
+            super::SecretStoreType::AzureKeyVault(cfg) => {
+                assert_eq!(cfg.tenant_id.as_deref(), Some("tenant-xyz"));
+                assert_eq!(cfg.client_id.as_deref(), Some("client-xyz"));
+                assert_eq!(
+                    cfg.client_secret
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("s3cret".to_string())
+                );
+            }
+            _ => panic!("expected AzureKeyVault variant"),
+        }
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_rejects_invalid_auth_method() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // `one_of` enforcement: only the five documented values are allowed.
+        let mut p = HashMap::new();
+        p.insert("auth_method".to_string(), "oauth".to_string());
+
+        let store = SpicepodSecret {
+            from: "azure_keyvault:my-vault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("invalid auth_method should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("oauth"), "got {msg}");
+        assert!(
+            msg.contains("service_principal") && msg.contains("managed_identity"),
+            "error must list the allowed values; got {msg}"
+        );
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_selector_is_required() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // `from: azure_keyvault` with no selector must fail — there is no
+        // sensible default vault.
+        let store = SpicepodSecret {
+            from: "azure_keyvault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(HashMap::new())),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("missing selector should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("azure_keyvault"), "got {msg}");
+        assert!(
+            msg.contains("secret selector"),
+            "error should explain the selector requirement; got {msg}"
+        );
     }
 
     #[cfg(feature = "aws-secrets-manager")]
@@ -826,6 +1125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_secrets_env() {
+        let _env_guard = lock_env().await;
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
@@ -843,6 +1143,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_secrets_case_sensitive() {
+        let _env_guard = lock_env().await;
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
@@ -878,6 +1179,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_secrets_original_key_takes_precedence() {
+        let _env_guard = lock_env().await;
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
@@ -913,6 +1215,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_secrets_no_env() {
+        let _env_guard = lock_env().await;
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
