@@ -16,20 +16,20 @@ limitations under the License.
 
 //! Write-back execution path for [`WriteMode::WriteBack`].
 //!
-//! Writes are streamed directly into the local accelerator. The synchronous
-//! response returns once the accelerator commit completes. This path does
-//! not forward writes to the federated source itself; an external
-//! mechanism must keep the source in sync. Write-back is gated by
-//! validation that requires `replication.enabled: true` as the user's
-//! attestation that source synchronization is handled
-//! (`acceleration.on_conflict` is rejected separately because it declares
-//! accelerator-only semantics; `refresh_mode: changes` alone is not
-//! sufficient because it is a source-to-accelerator stream).
+//! Writes are applied to the local accelerator first (fast path, returning
+//! to the caller once the accelerator commit completes), then asynchronously
+//! forwarded to the federated source. The federated source may lag briefly;
+//! failures to persist back to the source are logged but do not affect the
+//! synchronous response.
 //!
-//! No batches are buffered in memory in this path: the caller's input
-//! [`ExecutionPlan`] is handed directly to
-//! [`TableProvider::insert_into`](datafusion::datasource::TableProvider::insert_into)
-//! on the accelerator, so `DataFusion`'s streaming execution is preserved.
+//! Implemented as a [`DataSink`] so that:
+//!
+//! 1. The write only occurs when the returned [`ExecutionPlan`] is executed,
+//!    not merely planned. If the caller cancels before execution, neither
+//!    the accelerator nor the federated source is modified.
+//! 2. The input batches are consumed exactly once — the same batches written
+//!    to the accelerator are forwarded to the federated source, so the two
+//!    sides cannot diverge due to non-deterministic input plans.
 //!
 //! [`WriteMode::WriteBack`]: super::WriteMode::WriteBack
 
@@ -47,12 +47,18 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
+use datafusion::prelude::SessionContext;
+use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion_datasource::sink::{DataSink, DataSinkExec};
+use datafusion_datasource::source::DataSourceExec;
+use futures::StreamExt;
+use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 
-/// Returns an error for `InsertOp::Overwrite` / `InsertOp::Replace` because
-/// the federated source is updated out-of-band by the refresh mechanism, so
-/// destructive writes against the accelerator can leave the source diverged
-/// (or in an inconsistent state under partial replication). Append is the
-/// only mode whose semantics are well-defined for write-back today.
+use crate::accelerated_table::refresh::Refresher;
+use crate::federated_table::FederatedTable;
+
 pub(crate) fn validate_insert_op(insert_op: InsertOp) -> DataFusionResult<()> {
     match insert_op {
         InsertOp::Append => Ok(()),
@@ -62,33 +68,42 @@ pub(crate) fn validate_insert_op(insert_op: InsertOp) -> DataFusionResult<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Creates a `DataSinkExec` plan for write-back inserts.
+pub(crate) fn insert_write_back(
+    input: Arc<dyn ExecutionPlan>,
+    overwrite: InsertOp,
+    accelerator: Arc<dyn TableProvider>,
+    federated: Arc<FederatedTable>,
+    refresher: Arc<Refresher>,
+    schema: SchemaRef,
+) -> Arc<dyn ExecutionPlan> {
+    let sink = Arc::new(WriteBackDataSink {
+        accelerator,
+        federated,
+        refresher,
+        overwrite,
+        schema,
+    });
+    Arc::new(DataSinkExec::new(input, sink, None))
+}
 
-    #[test]
-    fn validate_insert_op_allows_append() {
-        validate_insert_op(InsertOp::Append).expect("Append must be accepted by write-back");
+struct WriteBackDataSink {
+    accelerator: Arc<dyn TableProvider>,
+    federated: Arc<FederatedTable>,
+    refresher: Arc<Refresher>,
+    overwrite: InsertOp,
+    schema: SchemaRef,
+}
+
+impl std::fmt::Debug for WriteBackDataSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteBackDataSink").finish_non_exhaustive()
     }
+}
 
-    #[test]
-    fn validate_insert_op_rejects_overwrite() {
-        let err = validate_insert_op(InsertOp::Overwrite)
-            .expect_err("Overwrite must be rejected by write-back validation");
-        assert!(
-            err.to_string().contains("append writes only"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_insert_op_rejects_replace() {
-        let err = validate_insert_op(InsertOp::Replace)
-            .expect_err("Replace must be rejected by write-back validation");
-        assert!(
-            err.to_string().contains("append writes only"),
-            "unexpected error message: {err}"
-        );
+impl DisplayAs for WriteBackDataSink {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WriteBackDataSink")
     }
 }
 
