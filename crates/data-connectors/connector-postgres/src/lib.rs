@@ -352,14 +352,9 @@ impl DataConnector for Postgres {
         &self,
         federated_table: Arc<runtime::federated_table::FederatedTable>,
         dataset: &Dataset,
-        accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
         _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
     ) -> Option<data_components::cdc::ChangesStream> {
-        println!(
-            "changes_stream: {:?}",
-            accelerated_table_provider.constraints()
-        );
-
         Some(replication::build_changes_stream(
             &self.params,
             dataset,

@@ -49,7 +49,6 @@ use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
-use datafusion::prelude::SessionContext;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use datafusion_datasource::source::DataSourceExec;
@@ -70,21 +69,32 @@ pub(crate) fn validate_insert_op(insert_op: InsertOp) -> DataFusionResult<()> {
 
 /// Creates a `DataSinkExec` plan for write-back inserts.
 pub(crate) fn insert_write_back(
+    state: &dyn Session,
     input: Arc<dyn ExecutionPlan>,
     overwrite: InsertOp,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<FederatedTable>,
     refresher: Arc<Refresher>,
     schema: SchemaRef,
-) -> Arc<dyn ExecutionPlan> {
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let session_state = state
+        .as_any()
+        .downcast_ref::<SessionState>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(
+                "Session is not a SessionState in insert_write_back".to_string(),
+            )
+        })?
+        .clone();
     let sink = Arc::new(WriteBackDataSink {
         accelerator,
         federated,
         refresher,
         overwrite,
         schema,
+        session_state,
     });
-    Arc::new(DataSinkExec::new(input, sink, None))
+    Ok(Arc::new(DataSinkExec::new(input, sink, None)))
 }
 
 struct WriteBackDataSink {
@@ -93,6 +103,7 @@ struct WriteBackDataSink {
     refresher: Arc<Refresher>,
     overwrite: InsertOp,
     schema: SchemaRef,
+    session_state: SessionState,
 }
 
 impl std::fmt::Debug for WriteBackDataSink {
@@ -149,6 +160,7 @@ impl DataSink for WriteBackDataSink {
             Arc::clone(&input_schema),
             batches.clone(),
             self.overwrite,
+            &self.session_state,
             Some(Arc::clone(context)),
         )
         .await
@@ -165,10 +177,18 @@ impl DataSink for WriteBackDataSink {
         // response.
         let federated = Arc::clone(&self.federated);
         let overwrite = self.overwrite;
+        let session_state = self.session_state.clone();
         tokio::spawn(async move {
             let federated_provider = federated.table_provider().await;
-            if let Err(e) =
-                execute_insert(federated_provider, input_schema, batches, overwrite, None).await
+            if let Err(e) = execute_insert(
+                federated_provider,
+                input_schema,
+                batches,
+                overwrite,
+                &session_state,
+                None,
+            )
+            .await
             {
                 tracing::error!("Write-back: failed to persist write to federated source: {e}");
             }
@@ -219,10 +239,12 @@ struct WriteBackDeletionSink {
 #[async_trait]
 impl DeletionSink for WriteBackDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = SessionContext::new();
-        let batches =
-            datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), ctx.task_ctx())
-                .await?;
+        let task_ctx = self.session_state.task_ctx();
+        let batches = datafusion::physical_plan::collect(
+            Arc::clone(&self.accelerator_plan),
+            Arc::clone(&task_ctx),
+        )
+        .await?;
         let count = extract_dml_count(&batches);
 
         let federated = Arc::clone(&self.federated);
@@ -230,10 +252,11 @@ impl DeletionSink for WriteBackDeletionSink {
         let session_state = self.session_state.clone();
         tokio::spawn(async move {
             let provider = federated.table_provider().await;
-            let ctx = SessionContext::new();
             match provider.delete_from(&session_state, filters).await {
                 Ok(plan) => {
-                    if let Err(e) = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await {
+                    if let Err(e) =
+                        datafusion::physical_plan::collect(plan, session_state.task_ctx()).await
+                    {
                         tracing::error!(
                             "Write-back: failed to persist delete to federated source: {e}"
                         );
@@ -293,10 +316,12 @@ struct WriteBackUpdateSink {
 #[async_trait]
 impl DeletionSink for WriteBackUpdateSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = SessionContext::new();
-        let batches =
-            datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), ctx.task_ctx())
-                .await?;
+        let task_ctx = self.session_state.task_ctx();
+        let batches = datafusion::physical_plan::collect(
+            Arc::clone(&self.accelerator_plan),
+            Arc::clone(&task_ctx),
+        )
+        .await?;
         let count = extract_dml_count(&batches);
 
         let federated = Arc::clone(&self.federated);
@@ -305,10 +330,11 @@ impl DeletionSink for WriteBackUpdateSink {
         let session_state = self.session_state.clone();
         tokio::spawn(async move {
             let provider = federated.table_provider().await;
-            let ctx = SessionContext::new();
             match provider.update(&session_state, assignments, filters).await {
                 Ok(plan) => {
-                    if let Err(e) = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await {
+                    if let Err(e) =
+                        datafusion::physical_plan::collect(plan, session_state.task_ctx()).await
+                    {
                         tracing::error!(
                             "Write-back: failed to persist update to federated source: {e}"
                         );
@@ -642,15 +668,15 @@ async fn execute_insert(
     input_schema: SchemaRef,
     batches: Vec<RecordBatch>,
     overwrite: InsertOp,
+    session_state: &SessionState,
     task_context: Option<Arc<TaskContext>>,
 ) -> DataFusionResult<()> {
     let memory_source = MemorySourceConfig::try_new(&[batches], input_schema, None)?;
     let source: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(memory_source)));
     let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(source, table.schema()));
 
-    let ctx = SessionContext::new();
-    let plan = table.insert_into(&ctx.state(), input, overwrite).await?;
-    let task_ctx = task_context.unwrap_or_else(|| ctx.task_ctx());
+    let plan = table.insert_into(session_state, input, overwrite).await?;
+    let task_ctx = task_context.unwrap_or_else(|| session_state.task_ctx());
     let _ = datafusion::physical_plan::collect(plan, task_ctx).await?;
     Ok(())
 }

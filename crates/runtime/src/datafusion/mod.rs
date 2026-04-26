@@ -1884,7 +1884,9 @@ impl DataFusion {
                     // the write goes directly to the federated source and CDC propagates it back.
                     accelerated_table_builder.write_through();
                 }
-                _ => {} // FederatedOnly is the default — no additional builder call needed
+                spicepod::acceleration::WriteMode::WriteThrough => {
+                    // FederatedOnly is the default for non-Cayenne engines.
+                }
             }
         }
 

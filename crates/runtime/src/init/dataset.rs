@@ -22,21 +22,17 @@ use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::{
-    AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
-    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
-    PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnknownDataConnectorSnafu,
+    AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
+    AcceleratorInitializationFailedSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
+    LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
-    component::{
-        access::AccessMode,
-        dataset::{
-            Dataset,
-            acceleration::{Acceleration, RefreshMode},
-            builder::DatasetBuilder,
-        },
+    component::dataset::{
+        Dataset,
+        acceleration::{Acceleration, RefreshMode},
+        builder::DatasetBuilder,
     },
     dataaccelerator::{
         AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
@@ -994,31 +990,12 @@ impl Runtime {
                 })?;
         let accelerator_engine = acceleration_settings.engine;
 
-        // Allow ReadWrite access when:
-        // 1. Replication is enabled (changes are synced back to source), OR
-        // 2. on_conflict is configured (accelerator supports local writes via upsert/drop), OR
-        // 3. refresh_mode is `changes` (CDC/WAL stream replicates writes back to the accelerator), OR
-        // 4. write_mode is `write_back` or `write_through` (writes are forwarded to the federated source)
         let has_on_conflict = !acceleration_settings.on_conflict.is_empty();
         let has_changes_refresh = acceleration_settings
             .refresh_mode
             .is_some_and(|mode| matches!(mode, RefreshMode::Changes));
         let has_write_back =
             acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack;
-        let has_write_through =
-            acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteThrough;
-        if ds.access() == AccessMode::ReadWrite
-            && !replicate
-            && !has_on_conflict
-            && !has_changes_refresh
-            && !has_write_back
-            && !has_write_through
-        {
-            AcceleratedReadWriteTableWithoutReplicationSnafu {
-                dataset_name: ds.name.to_string(),
-            }
-            .fail()?;
-        }
 
         // `on_conflict` forces writes to the accelerator only. When combined with
         // `write_mode: write_back` and `refresh_mode: changes` (CDC), on_conflict acts
@@ -1032,12 +1009,11 @@ impl Runtime {
             .fail()?;
         }
 
-        // `write_mode: write_back` writes only to the local accelerator,
-        // so some external mechanism is required to keep the federated
-        // source in sync. `refresh_mode: changes` is a source->accelerator
-        // stream and cannot propagate accelerator writes back, so require
-        // `replication.enabled` as the user's explicit attestation that
-        // source synchronization is handled.
+        // `write_mode: write_back` commits to the local accelerator first and
+        // asynchronously forwards the same mutation to the federated source.
+        // Because the source commit is not part of the synchronous response,
+        // require `replication.enabled` as the user's explicit opt-in to those
+        // asynchronous source durability semantics.
         if acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack
             && !replicate
         {

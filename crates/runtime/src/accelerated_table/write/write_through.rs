@@ -38,7 +38,7 @@ use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::ExecutionProps;
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_expr::PhysicalExpr;
@@ -585,10 +585,20 @@ pub(crate) async fn delete_write_through(
         .delete_from(state, filters.clone())
         .await?;
     let accelerator_plan = accelerator.delete_from(state, filters).await?;
+    let session_state = state
+        .as_any()
+        .downcast_ref::<SessionState>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(
+                "Session is not a SessionState in delete_write_through".to_string(),
+            )
+        })?
+        .clone();
     Ok(Arc::new(DeletionExec::new(Arc::new(
         WriteThroughDeletionSink {
             federated_plan,
             accelerator_plan,
+            session_state,
         },
     ))))
 }
@@ -596,13 +606,13 @@ pub(crate) async fn delete_write_through(
 struct WriteThroughDeletionSink {
     federated_plan: Arc<dyn ExecutionPlan>,
     accelerator_plan: Arc<dyn ExecutionPlan>,
+    session_state: SessionState,
 }
 
 #[async_trait]
 impl DeletionSink for WriteThroughDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = SessionContext::new();
-        let task_ctx = ctx.task_ctx();
+        let task_ctx = self.session_state.task_ctx();
 
         let federated_batches = datafusion::physical_plan::collect(
             Arc::clone(&self.federated_plan),
@@ -632,10 +642,20 @@ pub(crate) async fn update_write_through(
         .update(state, assignments.clone(), filters.clone())
         .await?;
     let accelerator_plan = accelerator.update(state, assignments, filters).await?;
+    let session_state = state
+        .as_any()
+        .downcast_ref::<SessionState>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(
+                "Session is not a SessionState in update_write_through".to_string(),
+            )
+        })?
+        .clone();
     Ok(Arc::new(DeletionExec::new(Arc::new(
         WriteThroughUpdateSink {
             federated_plan,
             accelerator_plan,
+            session_state,
         },
     ))))
 }
@@ -643,13 +663,13 @@ pub(crate) async fn update_write_through(
 struct WriteThroughUpdateSink {
     federated_plan: Arc<dyn ExecutionPlan>,
     accelerator_plan: Arc<dyn ExecutionPlan>,
+    session_state: SessionState,
 }
 
 #[async_trait]
 impl DeletionSink for WriteThroughUpdateSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = SessionContext::new();
-        let task_ctx = ctx.task_ctx();
+        let task_ctx = self.session_state.task_ctx();
 
         let federated_batches = datafusion::physical_plan::collect(
             Arc::clone(&self.federated_plan),
@@ -685,6 +705,7 @@ mod tests {
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
     };
+    use datafusion::prelude::SessionContext;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
     use std::any::Any;
@@ -781,6 +802,7 @@ mod tests {
         let sink = WriteThroughDeletionSink {
             federated_plan: count_exec(5),
             accelerator_plan: count_exec(0),
+            session_state: SessionContext::new().state(),
         };
 
         let count = sink.delete_from().await.unwrap();
@@ -792,6 +814,7 @@ mod tests {
         let sink = WriteThroughDeletionSink {
             federated_plan: ErrorExec::new_arc("federated delete failed"),
             accelerator_plan: count_exec(0),
+            session_state: SessionContext::new().state(),
         };
 
         let err = sink.delete_from().await.unwrap_err();
@@ -803,6 +826,7 @@ mod tests {
         let sink = WriteThroughDeletionSink {
             federated_plan: count_exec(5),
             accelerator_plan: ErrorExec::new_arc("accelerator delete failed"),
+            session_state: SessionContext::new().state(),
         };
 
         let err = sink.delete_from().await.unwrap_err();
@@ -816,6 +840,7 @@ mod tests {
         let sink = WriteThroughUpdateSink {
             federated_plan: count_exec(3),
             accelerator_plan: count_exec(0),
+            session_state: SessionContext::new().state(),
         };
 
         let count = sink.delete_from().await.unwrap();
@@ -827,6 +852,7 @@ mod tests {
         let sink = WriteThroughUpdateSink {
             federated_plan: ErrorExec::new_arc("federated update failed"),
             accelerator_plan: count_exec(0),
+            session_state: SessionContext::new().state(),
         };
 
         let err = sink.delete_from().await.unwrap_err();
@@ -838,6 +864,7 @@ mod tests {
         let sink = WriteThroughUpdateSink {
             federated_plan: count_exec(3),
             accelerator_plan: ErrorExec::new_arc("accelerator update failed"),
+            session_state: SessionContext::new().state(),
         };
 
         let err = sink.delete_from().await.unwrap_err();

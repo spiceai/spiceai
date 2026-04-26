@@ -36,7 +36,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
 use datafusion::{assert_batches_eq, common::TableReference};
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::DbConnection;
 use futures::TryStreamExt;
 use secrecy::ExposeSecret;
 use spicepod::{
@@ -148,7 +148,10 @@ async fn pg_rows(
     pool: &datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool,
     table: &str,
 ) -> Result<Vec<arrow::array::RecordBatch>, anyhow::Error> {
-    let conn = pool.connect().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let async_conn = conn
         .as_async()
         .ok_or_else(|| anyhow::anyhow!("no async conn"))?;

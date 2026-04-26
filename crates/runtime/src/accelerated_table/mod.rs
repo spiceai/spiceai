@@ -452,9 +452,8 @@ impl Builder {
         self
     }
 
-    /// Enable write-back mode: writes go to the local accelerator only.
-    /// Source synchronization is not performed by this path; the caller
-    /// must arrange it out-of-band (attested by `replication.enabled`).
+    /// Enable write-back mode: writes commit to the local accelerator first,
+    /// then asynchronously persist to the federated source.
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
         self
@@ -1450,18 +1449,16 @@ impl TableProvider for AcceleratedTable {
                 federated_table.insert_into(state, input, overwrite).await
             }
             WriteMode::WriteBack => {
-                // Writes are streamed directly into the accelerator (no
-                // in-memory buffering of the input plan). This path does not
-                // forward writes to the federated source; validation requires
-                // `replication.enabled` so that source synchronization is an
-                // externally-attested responsibility of the caller.
                 write::write_back::validate_insert_op(overwrite)?;
-                let accelerated_insert_plan = self
-                    .accelerator
-                    .insert_into(state, input, overwrite)
-                    .await?;
-                self.refresher().set_initial_load_completed(true);
-                Ok(accelerated_insert_plan)
+                write::write_back::insert_write_back(
+                    state,
+                    input,
+                    overwrite,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                    Arc::clone(&self.refresher),
+                    self.schema(),
+                )
             }
             WriteMode::WriteThrough {
                 cayenne_target,
