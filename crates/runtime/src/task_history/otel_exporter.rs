@@ -19,7 +19,7 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tracing::Instrument;
 
 use opentelemetry::trace::SpanId;
@@ -40,6 +40,8 @@ use super::TaskSpan;
 /// plan capture spans always retain their output.
 const PLAN_CAPTURE_LABEL: &str = "plan_capture";
 const REDACTED_TASK_HISTORY_VALUE: &str = "[redacted]";
+static REDACTED_TASK_HISTORY_VALUE_ARC: LazyLock<Arc<str>> =
+    LazyLock::new(|| REDACTED_TASK_HISTORY_VALUE.into());
 const TRUNCATED_TASK_HISTORY_CONTEXT_CHARS: usize = 4096;
 const TRUNCATED_TASK_HISTORY_CONTEXT_SUFFIX: &str = "...[truncated]";
 
@@ -129,7 +131,7 @@ impl TaskHistoryExporter {
         }
 
         match captured_context {
-            TaskHistoryCapturedContext::Redacted => REDACTED_TASK_HISTORY_VALUE.into(),
+            TaskHistoryCapturedContext::Redacted => Arc::clone(&REDACTED_TASK_HISTORY_VALUE_ARC),
             TaskHistoryCapturedContext::Truncated => Self::truncate_context_payload(value),
             TaskHistoryCapturedContext::Full => value,
         }

@@ -327,7 +327,6 @@ impl ClusterService for ClusterServiceImpl {
         if !self.allow_secret_expansion {
             tracing::warn!(
                 executor_id = %request.executor_id,
-                key = %request.key,
                 "Denied cluster secret expansion without mTLS"
             );
             return Err(Status::permission_denied(
