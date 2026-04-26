@@ -1366,18 +1366,12 @@ impl TableProvider for AcceleratedTable {
             (false, ZeroResultsAction::UseSource) => {
                 let filter_refs: Vec<&Expr> = filters.iter().collect();
                 let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
-                let (accelerator_filters, filters_to_reapply) =
-                    split_filters_for_accelerator_scan(filters, &pushdown_support)?;
+                let accelerator_filters = filters_for_accelerator_scan(filters, &pushdown_support)?;
 
                 let input = self
                     .accelerator
                     .scan(state, scan_projection, &accelerator_filters, limit)
                     .await?;
-                let input = if filters_to_reapply.is_empty() {
-                    input
-                } else {
-                    wrap_with_filter(input, state, &filters_to_reapply)?
-                };
                 Arc::new(FallbackOnZeroResultsScanExec::new(
                     self.dataset_name.clone(),
                     input,
@@ -1466,10 +1460,10 @@ fn extend_projection_for_caching(
     Some(extended)
 }
 
-fn split_filters_for_accelerator_scan(
+fn filters_for_accelerator_scan(
     filters: &[Expr],
     pushdown_support: &[TableProviderFilterPushDown],
-) -> DataFusionResult<(Vec<Expr>, Vec<Expr>)> {
+) -> DataFusionResult<Vec<Expr>> {
     if filters.len() != pushdown_support.len() {
         return Err(DataFusionError::Internal(format!(
             "accelerator filter support length mismatch: expected {}, got {}",
@@ -1480,7 +1474,6 @@ fn split_filters_for_accelerator_scan(
 
     let function_support = deny_spice_specific_functions();
     let mut accelerator_filters = Vec::with_capacity(filters.len());
-    let mut filters_to_reapply = Vec::new();
 
     for (filter, support) in filters.iter().zip(pushdown_support.iter()) {
         let function_supported = function_support.supports(filter);
@@ -1489,18 +1482,9 @@ fn split_filters_for_accelerator_scan(
         if can_run_in_accelerator {
             accelerator_filters.push(filter.clone());
         }
-
-        if !function_supported
-            || matches!(
-                support,
-                TableProviderFilterPushDown::Inexact | TableProviderFilterPushDown::Unsupported
-            )
-        {
-            filters_to_reapply.push(filter.clone());
-        }
     }
 
-    Ok((accelerator_filters, filters_to_reapply))
+    Ok(accelerator_filters)
 }
 
 #[derive(Debug)]
@@ -1740,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn test_split_filters_for_accelerator_scan_reapplies_local_filters() {
+    fn test_filters_for_accelerator_scan_excludes_local_only_filters() {
         let exact_filter = col("id").eq(lit(42_i64));
         let inexact_filter = col("name").eq(lit("espresso"));
         let unsupported_filter = col("content").eq(lit("local only"));
@@ -1758,26 +1742,19 @@ mod tests {
             TableProviderFilterPushDown::Exact,
         ];
 
-        let (accelerator_filters, filters_to_reapply) =
-            split_filters_for_accelerator_scan(&filters, &pushdown_support)
-                .expect("filter split should succeed");
+        let accelerator_filters = filters_for_accelerator_scan(&filters, &pushdown_support)
+            .expect("filter split should succeed");
         let expected_accelerator_filters = expr_strings(&[exact_filter, inexact_filter.clone()]);
-        let expected_filters_to_reapply =
-            expr_strings(&[inexact_filter, unsupported_filter, denied_filter]);
 
         assert_eq!(
             expr_strings(&accelerator_filters),
             expected_accelerator_filters
         );
-        assert_eq!(
-            expr_strings(&filters_to_reapply),
-            expected_filters_to_reapply
-        );
     }
 
     #[test]
-    fn test_split_filters_for_accelerator_scan_validates_support_length() {
-        let err = split_filters_for_accelerator_scan(&[col("id").eq(lit(42_i64))], &[])
+    fn test_filters_for_accelerator_scan_validates_support_length() {
+        let err = filters_for_accelerator_scan(&[col("id").eq(lit(42_i64))], &[])
             .expect_err("mismatched filter support should fail");
 
         assert!(
