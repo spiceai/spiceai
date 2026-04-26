@@ -22,12 +22,12 @@ limitations under the License.
 //! - **Write-through (no acceleration)**: The dataset is backed directly by Postgres
 //!   with `access: ReadWrite`. DML goes straight to Postgres.
 //!
-//! - **Write-through with DuckDB acceleration**: The dataset has a DuckDB local
+//! - **Write-through with `DuckDB` acceleration**: The dataset has a `DuckDB` local
 //!   accelerator and `write_mode: WriteThrough`. For non-Cayenne engines this falls
 //!   through to `FederatedOnly` (DML to Postgres only); an explicit refresh re-syncs
-//!   the DuckDB accelerator afterward.
+//!   the `DuckDB` accelerator afterward.
 //!
-//! The key regression being tested: DataFusion's `PushDownFilter` optimizer moves
+//! The key regression being tested: `DataFusion`'s `PushDownFilter` optimizer moves
 //! `Filter` nodes into `TableScan.filters`. The Spice runtime's
 //! `CacheInvalidationExtensionPlanner` must extract those filters correctly so that
 //! DELETE/UPDATE WHERE clauses are not silently dropped.
@@ -66,7 +66,7 @@ fn write_through_dataset(port: usize, table: &str, name: &str) -> Dataset {
     ds
 }
 
-/// Build a Postgres-backed dataset with DuckDB acceleration, write-through mode,
+/// Build a Postgres-backed dataset with `DuckDB` acceleration, write-through mode,
 /// and upsert on the `id` primary key.
 #[cfg(feature = "duckdb")]
 fn write_through_duckdb_dataset(port: usize, table: &str, name: &str) -> Dataset {
@@ -170,8 +170,8 @@ async fn pg_rows(
 
 /// DELETE with a WHERE clause must remove only the matching row, not all rows.
 ///
-/// Regression: DataFusion's PushDownFilter moved the WHERE predicate into
-/// TableScan.filters. extract_dml_filters only checked Filter nodes, so the
+/// Regression: `DataFusion`'s `PushDownFilter` moved the WHERE predicate into
+/// TableScan.filters. `extract_dml_filters` only checked Filter nodes, so the
 /// WHERE clause was silently dropped and all rows were deleted.
 #[tokio::test]
 async fn test_postgres_write_through_delete_with_where() -> Result<(), anyhow::Error> {
@@ -339,9 +339,9 @@ async fn test_postgres_write_through_delete_all() -> Result<(), anyhow::Error> {
 
 /// DELETE with WHERE on a DuckDB-accelerated dataset with write-through mode.
 ///
-/// For DuckDB + Full refresh, `WriteThrough` falls through to `FederatedOnly`:
+/// For `DuckDB` + Full refresh, `WriteThrough` falls through to `FederatedOnly`:
 /// the DELETE is routed to Postgres only. A manual refresh is triggered to
-/// re-sync the DuckDB accelerator from the updated Postgres source, after
+/// re-sync the `DuckDB` accelerator from the updated Postgres source, after
 /// which queries through the runtime read the correct (post-delete) data.
 #[cfg(feature = "duckdb")]
 #[tokio::test]
@@ -408,8 +408,8 @@ async fn test_postgres_duckdb_accel_delete_with_where() -> Result<(), anyhow::Er
 
 /// UPDATE with WHERE on a DuckDB-accelerated dataset with write-through mode.
 ///
-/// Same FederatedOnly routing as the delete test: UPDATE goes to Postgres, then
-/// an explicit refresh re-syncs DuckDB.
+/// Same `FederatedOnly` routing as the delete test: UPDATE goes to Postgres, then
+/// an explicit refresh re-syncs `DuckDB`.
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn test_postgres_duckdb_accel_update_with_where() -> Result<(), anyhow::Error> {
@@ -481,8 +481,8 @@ async fn test_postgres_duckdb_accel_update_with_where() -> Result<(), anyhow::Er
 
 /// UPDATE without a WHERE clause must update all rows.
 ///
-/// Same FederatedOnly routing: UPDATE goes to Postgres, explicit refresh
-/// re-syncs DuckDB.
+/// Same `FederatedOnly` routing: UPDATE goes to Postgres, explicit refresh
+/// re-syncs `DuckDB`.
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn test_postgres_duckdb_accel_update_all() -> Result<(), anyhow::Error> {
