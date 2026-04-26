@@ -58,6 +58,7 @@ on:
           - 'postgres-catalog'
           - 'mysql-catalog'
           - 'mssql-catalog'
+          - 'oracle-catalog'
           - 'turso'
           - 'bigquery'
       ready_wait:
