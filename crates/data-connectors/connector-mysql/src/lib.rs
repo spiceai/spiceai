@@ -80,23 +80,53 @@ impl MySQLFactory {
     }
 }
 
+const MYSQL_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/mysql";
+
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("connection_string").secret(),
-    ParameterSpec::component("user").secret(),
-    ParameterSpec::component("pass").secret(),
-    ParameterSpec::component("host"),
-    ParameterSpec::component("tcp_port"),
-    ParameterSpec::component("db"),
-    ParameterSpec::component("sslmode"),
-    ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("connection_string")
+        .description("Full MySQL DSN. Overrides other connection params if set.")
+        .examples(&["mysql://app:secret@db.internal:3306/analytics"])
+        .help_link(MYSQL_DOCS)
+        .secret(),
+    ParameterSpec::component("user")
+        .description("MySQL username.")
+        .help_link(MYSQL_DOCS)
+        .secret(),
+    ParameterSpec::component("pass")
+        .description("MySQL password.")
+        .help_link(MYSQL_DOCS)
+        .secret(),
+    ParameterSpec::component("host")
+        .description("MySQL server hostname or IP.")
+        .examples(&["db.internal", "mysql.cluster"])
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("tcp_port")
+        .description("MySQL TCP port.")
+        .examples(&["3306"])
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("db")
+        .description("Database name.")
+        .examples(&["app", "analytics"])
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("sslmode")
+        .description(
+            "TLS mode for the connection. Common values: 'disabled', 'preferred', 'required'.",
+        )
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("sslrootcert")
+        .description("Path to a PEM-encoded CA certificate used to verify the server when TLS is enabled.")
+        .help_link(MYSQL_DOCS),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
-        .default("1"),
+        .default("1")
+        .help_link(MYSQL_DOCS),
     ParameterSpec::component("pool_max")
         .description("The maximum number of connections created in the connection pool.")
-        .default("5"),
+        .default("5")
+        .help_link(MYSQL_DOCS),
     ParameterSpec::component("time_zone")
-        .description("The time zone to use for the connection. Default is '+00:00' (UTC)."),
+        .description("The time zone to use for the connection. Default is '+00:00' (UTC).")
+        .help_link(MYSQL_DOCS),
 ];
 
 // https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs#L1053
