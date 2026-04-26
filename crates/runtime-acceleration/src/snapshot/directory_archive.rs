@@ -594,6 +594,17 @@ fn create_new_temp_file(temp_path: &Path, target_dir: &Path) -> Result<std::fs::
     }
 }
 
+#[cfg(unix)]
+fn set_archive_permissions(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = std::fs::Permissions::from_mode(mode & 0o7777);
+    std::fs::set_permissions(path, permissions).map_err(|source| ArchiveError::ExtractArchive {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 fn remap_entry_path(
     entry_path: &Path,
     default_target_dir: &Path,
@@ -643,6 +654,8 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
             remap_entry_path(&entry_path, target_dir, options.prefix_mappings.as_ref())?;
 
         let entry_type = entry.header().entry_type();
+        #[cfg(unix)]
+        let entry_mode = entry.header().mode().ok();
 
         if !entry_type.is_dir() && !entry_type.is_file() {
             tracing::debug!(
@@ -662,6 +675,12 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                         reason: "archive directory entry conflicts with an existing non-directory"
                             .to_string(),
                     });
+                }
+                #[cfg(unix)]
+                if !options.skip_if_exists
+                    && let Some(mode) = entry_mode
+                {
+                    set_archive_permissions(&dest_path, mode)?;
                 }
                 continue;
             }
@@ -728,6 +747,10 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                 path: dest_path.clone(),
                 source,
             })?;
+            #[cfg(unix)]
+            if let Some(mode) = entry_mode {
+                set_archive_permissions(&dest_path, mode)?;
+            }
         } else if entry_type.is_file() {
             // Write to file atomically by writing to temp file then renaming
             let temp_path = dest_path.with_extension(format!("{}.tmp", std::process::id()));
@@ -775,14 +798,9 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                 }
             })?;
 
-            // Preserve file permissions if available
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(mode) = entry.header().mode() {
-                    let permissions = fs::Permissions::from_mode(mode);
-                    let _ = fs::set_permissions(&dest_path, permissions);
-                }
+            if let Some(mode) = entry_mode {
+                set_archive_permissions(&dest_path, mode)?;
             }
 
             tracing::trace!(
@@ -854,11 +872,15 @@ mod tests {
     use tempfile::TempDir;
 
     fn archive_with_file(path: &str, contents: &[u8]) -> Vec<u8> {
+        archive_with_file_mode(path, contents, 0o644)
+    }
+
+    fn archive_with_file_mode(path: &str, contents: &[u8], mode: u32) -> Vec<u8> {
         let mut buffer = Vec::new();
 
         let mut header = Header::new_gnu();
         header.set_size(contents.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(mode);
         header.set_entry_type(tar::EntryType::Regular);
         let path_bytes = path.as_bytes();
         assert!(
@@ -879,6 +901,27 @@ mod tests {
         buffer.extend(std::iter::repeat_n(0, 1024));
 
         buffer
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_extract_preserves_file_permissions() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let archive_buffer = archive_with_file_mode("data/executable.sh", b"#!/bin/sh\n", 0o755);
+
+        extract_archive(Cursor::new(archive_buffer), test_dir.path()).await?;
+
+        let extracted_file = test_dir.path().join("data/executable.sh");
+        let mode = std::fs::metadata(&extracted_file)
+            .expect("extracted file metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+
+        Ok(())
     }
 
     #[tokio::test]

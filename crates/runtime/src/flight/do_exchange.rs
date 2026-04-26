@@ -200,8 +200,17 @@ pub(crate) async fn handle(
                     Some((output, rx))
                 }
                 Err(broadcast::error::RecvError::Closed) => None,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let output = flight_data_stream(Vec::new(), None);
+                Err(broadcast::error::RecvError::Lagged(skipped_messages)) => {
+                    tracing::warn!(
+                        skipped_messages,
+                        "DoExchange subscriber lagged and missed one or more updates"
+                    );
+                    let output = flight_data_stream(
+                        Vec::new(),
+                        Some(Status::resource_exhausted(format!(
+                            "DoExchange subscriber fell behind and missed {skipped_messages} update(s); resubscribe and reconcile state"
+                        ))),
+                    );
                     Some((output, rx))
                 }
             }
