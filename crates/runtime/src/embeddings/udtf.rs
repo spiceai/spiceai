@@ -51,7 +51,7 @@ use datafusion::{
 
 use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
-    binary_expr, col, ident,
+    binary_expr, ident,
 };
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use futures::FutureExt;
