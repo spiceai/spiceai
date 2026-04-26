@@ -55,8 +55,8 @@ use aws_sdk_credential_bridge::default_aws_config;
 use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
 use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
 use runtime_parameter_spec::ParameterSpec;
-use secrecy::SecretString;
 use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
@@ -106,14 +106,38 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 /// Resolved configuration for the `aws_secrets_manager` secret store.
-#[derive(Debug, Clone)]
+///
+/// `secret_access_key` and `session_token` are held as [`SecretString`] so
+/// they carry zeroize-on-drop semantics and so the manual `Debug` impl
+/// below can redact them — deriving `Debug` on plain `String` credentials
+/// would surface them via any `{:?}` print (panic dumps, log calls, etc.).
+#[derive(Clone)]
 pub struct AwsSecretsManagerConfig {
     pub secret_name: String,
     pub region: Option<String>,
     pub endpoint_url: Option<String>,
     pub access_key_id: Option<String>,
-    pub secret_access_key: Option<String>,
-    pub session_token: Option<String>,
+    pub secret_access_key: Option<SecretString>,
+    pub session_token: Option<SecretString>,
+}
+
+impl std::fmt::Debug for AwsSecretsManagerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsSecretsManagerConfig")
+            .field("secret_name", &self.secret_name)
+            .field("region", &self.region)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl AwsSecretsManagerConfig {
@@ -126,8 +150,8 @@ impl AwsSecretsManagerConfig {
             region: params.get("region").cloned(),
             endpoint_url: params.get("endpoint_url").cloned(),
             access_key_id: params.get("key").cloned(),
-            secret_access_key: params.get("secret").cloned(),
-            session_token: params.get("session_token").cloned(),
+            secret_access_key: params.get("secret").cloned().map(SecretString::from),
+            session_token: params.get("session_token").cloned().map(SecretString::from),
         }
     }
 }
@@ -218,11 +242,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// The parsed map is held behind an `Arc` so that readers share a single
 /// allocation and never clone the (potentially secret-bearing) map out of the
-/// cache. Memory is released (and zeroizing-sensitive buffers in the caller
-/// can take effect) once the final `Arc` reference is dropped.
+/// cache. Each value is a [`SecretString`]: when the final `Arc` reference
+/// drops (cache eviction, store shutdown), every value's backing buffer is
+/// zeroized via `secrecy`'s Drop impl. Previously this was a
+/// `HashMap<String, String>` whose freed allocations could linger in the
+/// heap until reuse overwrote them.
 struct CachedPayload {
     /// Parsed key/value map. Empty if the secret is missing or not a JSON object.
-    data: Arc<HashMap<String, String>>,
+    data: Arc<HashMap<String, SecretString>>,
     /// Monotonic timestamp at which this entry was captured.
     fetched_at: Instant,
     /// Effective TTL for this entry (shorter for negative results).
@@ -245,9 +272,11 @@ pub struct AwsSecretsManager {
     /// Optional static credentials sourced from the spicepod `params:`
     /// block. When `access_key_id` and `secret_access_key` are both set
     /// they take precedence over the SDK's default credential chain.
+    /// The secret half is held as a [`SecretString`] so its backing buffer
+    /// is zeroized on drop.
     access_key_id: Option<String>,
-    secret_access_key: Option<String>,
-    session_token: Option<String>,
+    secret_access_key: Option<SecretString>,
+    session_token: Option<SecretString>,
     /// Lazily-initialized, shared SDK configuration. Resolved exactly once per
     /// store instance and reused by both the STS pre-flight and the Secrets
     /// Manager client, so credential-provider resolution (including IMDS
@@ -396,7 +425,7 @@ impl AwsSecretsManager {
     /// strategy configured on the client.
     async fn fetch_payload(
         &self,
-    ) -> crate::AnyErrorResult<(Arc<HashMap<String, String>>, Duration)> {
+    ) -> crate::AnyErrorResult<(Arc<HashMap<String, SecretString>>, Duration)> {
         tracing::debug!(
             secret_name = %self.secret_name,
             "Fetching AWS secret payload"
@@ -503,56 +532,55 @@ impl AwsSecretsManager {
     /// - Cache hits take only an `RwLock` read and never serialize against
     ///   each other or against in-flight fetches.
     /// - On a miss, one task is elected winner via the `fetch_inflight`
-    ///   atomic (under a brief `fetch_mutex` critical section that contains
-    ///   no `.await` against the network). The mutex is dropped before the
-    ///   AWS round-trip so it is never held across an `.await`.
-    /// - Losing tasks `await` on `fetch_notify` and then re-check the cache.
+    ///   atomic under a brief `fetch_mutex` critical section. The mutex is
+    ///   dropped before any cache `RwLock` await or AWS round-trip.
+    /// - Losing tasks pre-register on `fetch_notify`, re-check the cache,
+    ///   then `await` the notification if needed.
     /// - The AWS SDK call is never made while any lock is held, so a
     ///   stalled endpoint cannot stall cache readers.
-    async fn payload(&self) -> crate::AnyErrorResult<Arc<HashMap<String, String>>> {
+    async fn payload(&self) -> crate::AnyErrorResult<Arc<HashMap<String, SecretString>>> {
         loop {
             // Fast path: fresh cache hit.
             if let Some(data) = self.try_cached().await {
                 return Ok(data);
             }
 
-            // Election: take the mutex only long enough to claim the
-            // in-flight slot or to observe that another task already holds
-            // it. No `.await` happens inside this block apart from the
-            // mutex acquisition itself, so the mutex is never held across
-            // the AWS network call.
-            let should_fetch = {
+            let waiter = {
                 let _fetch_guard = self.fetch_mutex.lock().await;
+                if self.fetch_inflight.load(Ordering::Acquire) {
+                    let mut notified = Box::pin(self.fetch_notify.notified());
+                    notified.as_mut().enable();
+                    Some(notified)
+                } else {
+                    self.fetch_inflight.store(true, Ordering::Release);
+                    None
+                }
+            };
 
-                // Another task may have refreshed the cache while we were
-                // waiting on the mutex; check again.
+            if let Some(notified) = waiter {
+                // Loser: wait for the winner to publish a result, then loop
+                // and re-check the cache. If the winner failed, the cache
+                // is still empty and we will try to become the new winner.
                 if let Some(data) = self.try_cached().await {
                     return Ok(data);
                 }
 
-                if self.fetch_inflight.load(Ordering::Acquire) {
-                    false
-                } else {
-                    self.fetch_inflight.store(true, Ordering::Release);
-                    true
-                }
-                // `_fetch_guard` is dropped here, before any await on the
-                // AWS round-trip below.
-            };
-
-            if !should_fetch {
-                // Loser: wait for the winner to publish a result, then loop
-                // and re-check the cache. If the winner failed, the cache
-                // is still empty and we will try to become the new winner.
-                self.fetch_notify.notified().await;
+                notified.await;
                 continue;
+            }
+
+            // Another task may have refreshed the cache while we were
+            // waiting to become the winner. Re-check outside `fetch_mutex`
+            // so the mutex is never held across the cache `RwLock` await.
+            if let Some(data) = self.try_cached().await {
+                self.finish_fetch().await;
+                return Ok(data);
             }
 
             // Winner: perform the network fetch with no locks held.
             // Always clear `fetch_inflight` and wake waiters, regardless of
             // success or failure, so they can make progress.
             let result = self.fetch_payload().await;
-            self.fetch_inflight.store(false, Ordering::Release);
             return match result {
                 Ok((data, ttl)) => {
                     let mut guard = self.cache.write().await;
@@ -562,19 +590,25 @@ impl AwsSecretsManager {
                         ttl,
                     });
                     drop(guard);
-                    self.fetch_notify.notify_waiters();
+                    self.finish_fetch().await;
                     Ok(data)
                 }
                 Err(err) => {
-                    self.fetch_notify.notify_waiters();
+                    self.finish_fetch().await;
                     Err(err)
                 }
             };
         }
     }
 
+    async fn finish_fetch(&self) {
+        let _fetch_guard = self.fetch_mutex.lock().await;
+        self.fetch_inflight.store(false, Ordering::Release);
+        self.fetch_notify.notify_waiters();
+    }
+
     /// Returns the cached payload if present and still fresh.
-    async fn try_cached(&self) -> Option<Arc<HashMap<String, String>>> {
+    async fn try_cached(&self) -> Option<Arc<HashMap<String, SecretString>>> {
         let guard = self.cache.read().await;
         guard
             .as_ref()
@@ -599,8 +633,8 @@ impl AwsSecretsManager {
 async fn build_aws_config(
     region: Option<String>,
     access_key_id: Option<String>,
-    secret_access_key: Option<String>,
-    session_token: Option<String>,
+    secret_access_key: Option<SecretString>,
+    session_token: Option<SecretString>,
 ) -> aws_config::SdkConfig {
     let mut builder = default_aws_config().timeout_config(
         TimeoutConfig::builder()
@@ -613,10 +647,15 @@ async fn build_aws_config(
     }
     match (access_key_id, secret_access_key) {
         (Some(key), Some(secret)) => {
+            // `Credentials::new` takes owned `String`s. We call
+            // `expose_secret().to_string()` exactly once, right at the SDK
+            // boundary — the allocation then lives inside
+            // `aws_credential_types::Credentials` (which has its own
+            // scrubbing behavior on drop) and is never re-exposed.
             let credentials = aws_credential_types::Credentials::new(
                 key,
-                secret,
-                session_token,
+                secret.expose_secret().to_string(),
+                session_token.map(|t| t.expose_secret().to_string()),
                 None,
                 "SpiceAwsSecretsManagerStore",
             );
@@ -655,25 +694,35 @@ impl SecretStore for AwsSecretsManager {
         // Prefer the Spice-prefixed key so that Spice-owned values can coexist
         // with other application secrets in the same AWS secret without
         // collisions, then fall back to the unprefixed key.
+        //
+        // The cached values are already `SecretString`s, so clone the
+        // zeroize-on-drop wrapper directly instead of exposing plaintext.
         let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
         if let Some(value) = data.get(&prefixed_key) {
-            return Ok(Some(SecretString::from(value.clone())));
+            return Ok(Some(value.clone()));
         }
-        Ok(data.get(key).cloned().map(SecretString::from))
+        Ok(data.get(key).cloned())
     }
 }
 
-/// Parses a JSON string into a `HashMap<String, String>`.
+/// Parses a JSON string into a `HashMap<String, SecretString>`.
 ///
 /// The input must be a JSON object. Primitive scalar values (strings, numbers,
 /// booleans) are coerced to their string representation; objects, arrays, and
 /// null values are skipped so that a partially-structured secret still yields
 /// the scalar keys it does contain.
 ///
+/// Every value is wrapped in [`SecretString`] so the parsed entries carry
+/// zeroize-on-drop semantics into the cache. Intermediate `serde_json::Value`
+/// allocations still exist briefly and are not themselves zeroized — that's
+/// a property of `serde_json`, not something we can fix here without a
+/// custom parser — but those allocations drop when this function returns,
+/// and the cached representation handed back to callers is secret-aware.
+///
 /// # Errors
 ///
 /// Returns an error if the input is not valid JSON or is not a JSON object.
-pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, String>> {
+pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, SecretString>> {
     let parsed: serde_json::Value =
         serde_json::from_str(json_str).context(UnableToParseJsonSnafu)?;
     let root = parsed.as_object().context(InvalidJsonFormatSnafu)?;
@@ -682,13 +731,13 @@ pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, String>> 
     for (key, value) in root {
         match value {
             serde_json::Value::String(s) => {
-                data.insert(key.clone(), s.clone());
+                data.insert(key.clone(), SecretString::from(s.clone()));
             }
             serde_json::Value::Number(n) => {
-                data.insert(key.clone(), n.to_string());
+                data.insert(key.clone(), SecretString::from(n.to_string()));
             }
             serde_json::Value::Bool(b) => {
-                data.insert(key.clone(), b.to_string());
+                data.insert(key.clone(), SecretString::from(b.to_string()));
             }
             // Skip null/object/array values – they cannot be injected as
             // strings into parameters, and silently coercing them risks
@@ -714,9 +763,9 @@ mod tests {
     fn parses_string_number_and_bool_values() {
         let json = r#"{"a": "hello", "b": 42, "c": true, "d": null, "e": [1,2], "f": {"x": 1}}"#;
         let map = parse_json_to_hashmap(json).expect("parse succeeds");
-        assert_eq!(map.get("a").map(String::as_str), Some("hello"));
-        assert_eq!(map.get("b").map(String::as_str), Some("42"));
-        assert_eq!(map.get("c").map(String::as_str), Some("true"));
+        assert_eq!(map.get("a").map(ExposeSecret::expose_secret), Some("hello"));
+        assert_eq!(map.get("b").map(ExposeSecret::expose_secret), Some("42"));
+        assert_eq!(map.get("c").map(ExposeSecret::expose_secret), Some("true"));
         // Null/array/object entries are intentionally skipped.
         assert!(!map.contains_key("d"));
         assert!(!map.contains_key("e"));
@@ -728,6 +777,33 @@ mod tests {
         let _ = parse_json_to_hashmap(r#"["a","b"]"#).expect_err("array is not an object");
         let _ = parse_json_to_hashmap(r#""just a string""#).expect_err("string is not an object");
         let _ = parse_json_to_hashmap("not json").expect_err("invalid JSON");
+    }
+
+    /// Ensures a `{:?}` print of the config never surfaces the raw
+    /// `secret_access_key` or `session_token`.
+    #[test]
+    fn config_debug_redacts_static_credentials() {
+        let cfg = AwsSecretsManagerConfig {
+            secret_name: "my-secret".to_string(),
+            region: Some("us-east-1".to_string()),
+            endpoint_url: None,
+            access_key_id: Some("AKIA_PUBLIC".to_string()),
+            secret_access_key: Some(SecretString::from("super-secret-value".to_string())),
+            session_token: Some(SecretString::from("SESSION_TOKEN_VALUE".to_string())),
+        };
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("super-secret-value"),
+            "Debug output must not include the secret_access_key; got: {debug}"
+        );
+        assert!(
+            !debug.contains("SESSION_TOKEN_VALUE"),
+            "Debug output must not include the session_token; got: {debug}"
+        );
+        assert!(debug.contains("<redacted>"), "got {debug}");
+        // access_key_id is not a secret — should still be visible for
+        // debugging.
+        assert!(debug.contains("AKIA_PUBLIC"), "got {debug}");
     }
 
     #[test]
@@ -754,10 +830,19 @@ mod tests {
     async fn prefers_spice_prefixed_keys_then_falls_back() {
         let store = AwsSecretsManager::new("test").expect("valid name");
 
-        let mut data = HashMap::new();
-        data.insert("spice_api_key".to_string(), "prefixed".to_string());
-        data.insert("api_key".to_string(), "plain".to_string());
-        data.insert("only_plain".to_string(), "plain-value".to_string());
+        let mut data: HashMap<String, SecretString> = HashMap::new();
+        data.insert(
+            "spice_api_key".to_string(),
+            SecretString::from("prefixed".to_string()),
+        );
+        data.insert(
+            "api_key".to_string(),
+            SecretString::from("plain".to_string()),
+        );
+        data.insert(
+            "only_plain".to_string(),
+            SecretString::from("plain-value".to_string()),
+        );
 
         *store.cache.write().await = Some(CachedPayload {
             data: Arc::new(data),
@@ -817,8 +902,8 @@ mod tests {
         // that `try_cached()` discards expired entries.
         let store = AwsSecretsManager::new("test").expect("valid name");
 
-        let mut data = HashMap::new();
-        data.insert("k".to_string(), "v".to_string());
+        let mut data: HashMap<String, SecretString> = HashMap::new();
+        data.insert("k".to_string(), SecretString::from("v".to_string()));
 
         *store.cache.write().await = Some(CachedPayload {
             data: Arc::new(data),
