@@ -1368,9 +1368,19 @@ impl TableProvider for AcceleratedTable {
                 let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
                 let accelerator_filters = filters_for_accelerator_scan(filters, &pushdown_support)?;
 
+                let accelerator_limit = if accelerator_filters.len() == filters.len() {
+                    limit
+                } else {
+                    None
+                };
                 let input = self
                     .accelerator
-                    .scan(state, scan_projection, &accelerator_filters, limit)
+                    .scan(
+                        state,
+                        scan_projection,
+                        &accelerator_filters,
+                        accelerator_limit,
+                    )
                     .await?;
                 Arc::new(FallbackOnZeroResultsScanExec::new(
                     self.dataset_name.clone(),
