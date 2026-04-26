@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -38,7 +38,8 @@ use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::datafusion::query::Query;
 use crate::dataupdate::{
-    DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
+    DataUpdate, DataUpdateBroadcaster, StreamingDataUpdate, StreamingDataUpdateExecutionPlan,
+    UpdateType,
 };
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
@@ -80,6 +81,7 @@ use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
+use futures::StreamExt;
 use itertools::Itertools;
 use query::QueryBuilder;
 use runtime_acceleration::snapshot::AccelerationEngine;
@@ -544,6 +546,7 @@ pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
+    data_update_broadcaster: DataUpdateBroadcaster,
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
@@ -613,6 +616,11 @@ impl DataFusion {
     #[must_use]
     pub fn caching(&self) -> Arc<Caching> {
         Arc::clone(&self.caching)
+    }
+
+    #[must_use]
+    pub fn data_update_broadcaster(&self) -> DataUpdateBroadcaster {
+        self.data_update_broadcaster.clone()
     }
 
     #[must_use]
@@ -1252,6 +1260,8 @@ impl DataFusion {
         )
         .context(SchemaMismatchSnafu)?;
 
+        let broadcast_update = data_update.clone();
+
         let overwrite = match data_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
@@ -1296,6 +1306,10 @@ impl DataFusion {
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
+        self.data_update_broadcaster
+            .publish(table_reference, broadcast_update)
+            .await;
+
         Ok(())
     }
 
@@ -1311,7 +1325,8 @@ impl DataFusion {
             .fail()?;
         }
 
-        let update_schema = streaming_update.data.schema();
+        let StreamingDataUpdate { data, update_type } = streaming_update;
+        let update_schema = data.schema();
 
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&update_schema))
             .await?;
@@ -1321,16 +1336,45 @@ impl DataFusion {
         verify_schema(table_provider.schema().fields(), update_schema.fields())
             .context(SchemaMismatchSnafu)?;
 
-        let overwrite = match streaming_update.update_type {
+        let overwrite = match update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
             UpdateType::Changes => InsertOp::Replace,
         };
 
+        let broadcast_batches = self
+            .data_update_broadcaster
+            .has_subscribers(table_reference)
+            .await
+            .then(|| Arc::new(StdMutex::new(Vec::new())));
+        let data = match broadcast_batches.as_ref() {
+            Some(batches) => {
+                let batches = Arc::clone(batches);
+                let stream = data.map(move |batch_result| {
+                    if let Ok(batch) = &batch_result {
+                        match batches.lock() {
+                            Ok(mut batches) => batches.push(batch.clone()),
+                            Err(err) => tracing::warn!(
+                                "Failed to record streaming data update for DoExchange subscribers: {err}"
+                            ),
+                        }
+                    }
+                    batch_result
+                });
+                Box::pin(
+                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        Arc::clone(&update_schema),
+                        Box::pin(stream),
+                    ),
+                )
+            }
+            None => data,
+        };
+
         let insert_plan = table_provider
             .insert_into(
                 &self.ctx.state(),
-                Arc::new(StreamingDataUpdateExecutionPlan::new(streaming_update.data)),
+                Arc::new(StreamingDataUpdateExecutionPlan::new(data)),
                 overwrite,
             )
             .await
@@ -1356,6 +1400,32 @@ impl DataFusion {
             tracing::warn!(
                 "Failed to invalidate caches for table {table_reference} after streaming write: {e}"
             );
+        }
+
+        self.runtime_status
+            .update_dataset(table_reference, status::ComponentStatus::Ready);
+
+        if let Some(batches) = broadcast_batches {
+            let broadcast_data = match batches.lock() {
+                Ok(batches) => Ok(batches.clone()),
+                Err(err) => Err(err.to_string()),
+            };
+
+            match broadcast_data {
+                Ok(data) => {
+                    let update = DataUpdate {
+                        schema: update_schema,
+                        data,
+                        update_type,
+                    };
+                    self.data_update_broadcaster
+                        .publish(table_reference, update)
+                        .await;
+                }
+                Err(err) => tracing::warn!(
+                    "Failed to publish streaming data update to DoExchange subscribers: {err}"
+                ),
+            }
         }
 
         Ok(())

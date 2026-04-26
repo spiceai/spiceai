@@ -16,16 +16,18 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder, make_builder};
+use arrow::array::{ArrayBuilder, ArrayRef, ListBuilder, RecordBatch, StringBuilder, make_builder};
 use arrow::array::{ListArray, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow_flight::{FlightData, SchemaAsIpc, flight_service_server::FlightService};
 use arrow_ipc::writer::{self, CompressionContext, DictionaryTracker, IpcDataGenerator};
+use async_stream::try_stream;
 use data_components::cdc::changes_schema;
 use datafusion::common::{Constraint, Constraints};
+use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use futures::{StreamExt, stream};
-use tokio::sync::broadcast;
+use futures::StreamExt;
+use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::datafusion::request_context_extension::get_current_datafusion;
@@ -80,140 +82,210 @@ pub(crate) async fn handle(
         )));
     };
 
-    let channel_map = Arc::clone(&flight_svc.channel_map);
-    let channel_map_read = channel_map.read().await;
-    let (tx, rx) = if let Some(channel) = channel_map_read.get(&data_path) {
-        (Arc::clone(channel), channel.subscribe())
-    } else {
-        drop(channel_map_read);
-        let mut channel_map_write = channel_map.write().await;
-        let (tx, rx) = broadcast::channel(100);
-        let tx = Arc::new(tx);
-        channel_map_write.insert(data_path.clone(), Arc::clone(&tx));
-        (tx, rx)
-    };
-
+    let mut rx = flight_svc
+        .data_update_broadcaster
+        .subscribe(&data_path)
+        .await;
     let table_provider_stream = Arc::clone(&table_provider);
-    let response_stream = stream::unfold(rx, move |mut rx| {
-        let encoder = IpcDataGenerator::default();
-        let mut tracker = DictionaryTracker::new(false);
-        let mut compression_context = CompressionContext::default();
-        let write_options = writer::IpcWriteOptions::default();
-        let table_provider = Arc::clone(&table_provider_stream);
-        async move {
+    let datafusion_stream = Arc::clone(&datafusion);
+
+    let response_stream = try_stream! {
+        let initial_update = initial_snapshot_update(&datafusion_stream, Arc::clone(&table_provider_stream)).await?;
+        for flight in encode_data_update(&table_provider_stream, &initial_update)? {
+            yield flight;
+        }
+
+        loop {
             match rx.recv().await {
                 Ok(data_update) => {
-                    let mut schema_sent: bool = false;
-
-                    let mut flights = vec![];
-
-                    for batch in &data_update.data {
-                        // Convert record batch to match change schema
-                        let schema = batch.schema();
-                        let row_count = batch.num_rows();
-
-                        // "r" stands for ChangeOperation::Read
-                        let op_data = vec!["r"; row_count];
-                        let op_array = StringArray::from(op_data);
-
-                        let primary_keys_opt =
-                            get_primary_keys_from_constraints(table_provider.constraints());
-
-                        let primary_keys_array = match primary_keys_opt {
-                            Some(pk) => {
-                                let primary_keys = get_primary_keys(&schema, pk[0]);
-                                get_primary_keys_array(&primary_keys, row_count)
-                            }
-                            None => ListArray::new_null(
-                                Arc::new(Field::new("item", DataType::Utf8, false)),
-                                row_count,
-                            ),
-                        };
-
-                        let data_array = StructArray::from(batch.clone());
-
-                        let new_schema = Arc::new(changes_schema(schema.as_ref()));
-                        let Ok(new_record_batch) = RecordBatch::try_new(
-                            Arc::clone(&new_schema),
-                            vec![
-                                Arc::new(op_array),
-                                Arc::new(primary_keys_array),
-                                Arc::new(data_array),
-                            ],
-                        ) else {
-                            panic!("Unable to convert record batch into change event")
-                        };
-
-                        if !schema_sent {
-                            flights.push(FlightData::from(SchemaAsIpc::new(
-                                &new_schema,
-                                &write_options,
-                            )));
-                            schema_sent = true;
-                        }
-                        let Ok((flight_dictionaries, flight_batch)) = encoder.encode(
-                            &new_record_batch,
-                            &mut tracker,
-                            &write_options,
-                            &mut compression_context,
-                        ) else {
-                            panic!("Unable to encode batch")
-                        };
-
-                        flights.extend(flight_dictionaries.into_iter().map(Into::into));
-                        flights.push(flight_batch.into());
+                    for flight in encode_data_update(&table_provider_stream, &data_update)? {
+                        yield flight;
                     }
-
-                    metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
-                    let output = futures::stream::iter(flights.into_iter().map(Ok));
-
-                    Some((output, rx))
                 }
-                Err(_e) => {
-                    let output = futures::stream::iter(vec![].into_iter().map(Ok));
-                    Some((output, rx))
+                Err(RecvError::Lagged(skipped)) => {
+                    Err(Status::data_loss(format!(
+                        "DoExchange subscriber lagged behind and missed {skipped} data updates for dataset {data_path}"
+                    )))?;
                 }
+                Err(RecvError::Closed) => break,
             }
         }
-    })
-    .flat_map(|x| x);
-
-    let table_provider = Arc::clone(&table_provider);
-    tokio::spawn(async move {
-        let Ok(df) = datafusion.ctx.read_table(table_provider) else {
-            return;
-        };
-        let Ok(results) = df.collect().await else {
-            return;
-        };
-        if results.is_empty() {
-            return;
-        }
-
-        for batch in &results {
-            let schema = batch.schema();
-            let data_update = DataUpdate {
-                data: vec![batch.clone()],
-                schema,
-                update_type: UpdateType::Append,
-            };
-            let _ = tx.send(data_update);
-        }
-    });
+    };
 
     Ok(Response::new(response_stream.boxed()))
 }
 
-fn get_primary_keys_from_constraints(
-    constraints: Option<&Constraints>,
-) -> Option<Vec<&Vec<usize>>> {
-    constraints.map(|c| {
-        c.iter()
-            .filter_map(|c| match c {
-                Constraint::PrimaryKey(pk) => Some(pk),
-                Constraint::Unique(_) => None,
-            })
-            .collect::<Vec<_>>()
+async fn initial_snapshot_update(
+    datafusion: &Arc<crate::datafusion::DataFusion>,
+    table_provider: Arc<dyn TableProvider>,
+) -> Result<DataUpdate, Status> {
+    let schema = table_provider.schema();
+    let df = datafusion
+        .ctx
+        .read_table(table_provider)
+        .map_err(|source| Status::internal(format!("Unable to read initial snapshot: {source}")))?;
+    let data = df.collect().await.map_err(|source| {
+        Status::internal(format!("Unable to collect initial snapshot: {source}"))
+    })?;
+
+    Ok(DataUpdate {
+        schema,
+        data,
+        update_type: UpdateType::Append,
+    })
+}
+
+fn encode_data_update(
+    table_provider: &Arc<dyn TableProvider>,
+    data_update: &DataUpdate,
+) -> Result<Vec<FlightData>, Status> {
+    let mut encoder = IpcDataGenerator::default();
+    let mut tracker = DictionaryTracker::new(false);
+    let mut compression_context = CompressionContext::default();
+    let write_options = writer::IpcWriteOptions::default();
+    let mut flights = vec![];
+    let mut schema_sent = false;
+
+    if data_update.data.is_empty() {
+        let (operation, empty_row_count) =
+            if matches!(data_update.update_type, UpdateType::Overwrite) {
+                ("t", 1)
+            } else {
+                (change_operation_for_update(&data_update.update_type), 0)
+            };
+        let change_batch = data_update_to_change_batch(
+            table_provider,
+            &data_update.schema,
+            None,
+            operation,
+            empty_row_count,
+        )?;
+        push_change_batch_flights(
+            &mut flights,
+            &mut schema_sent,
+            &mut encoder,
+            &mut tracker,
+            &mut compression_context,
+            &write_options,
+            &change_batch,
+        )?;
+    } else {
+        if matches!(data_update.update_type, UpdateType::Overwrite) {
+            let truncate_batch =
+                data_update_to_change_batch(table_provider, &data_update.schema, None, "t", 1)?;
+            push_change_batch_flights(
+                &mut flights,
+                &mut schema_sent,
+                &mut encoder,
+                &mut tracker,
+                &mut compression_context,
+                &write_options,
+                &truncate_batch,
+            )?;
+        }
+
+        for batch in &data_update.data {
+            let change_batch = data_update_to_change_batch(
+                table_provider,
+                &data_update.schema,
+                Some(batch),
+                change_operation_for_update(&data_update.update_type),
+                0,
+            )?;
+            push_change_batch_flights(
+                &mut flights,
+                &mut schema_sent,
+                &mut encoder,
+                &mut tracker,
+                &mut compression_context,
+                &write_options,
+                &change_batch,
+            )?;
+        }
+    }
+
+    metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
+    Ok(flights)
+}
+
+fn change_operation_for_update(update_type: &UpdateType) -> &'static str {
+    match update_type {
+        UpdateType::Append => "c",
+        UpdateType::Overwrite | UpdateType::Changes => "r",
+    }
+}
+
+fn data_update_to_change_batch(
+    table_provider: &Arc<dyn TableProvider>,
+    schema: &SchemaRef,
+    batch: Option<&RecordBatch>,
+    operation: &str,
+    empty_row_count: usize,
+) -> Result<RecordBatch, Status> {
+    let row_count = batch.map_or(empty_row_count, RecordBatch::num_rows);
+    let op_array = StringArray::from(vec![operation; row_count]);
+    let primary_keys = primary_keys_from_constraints(table_provider.constraints())
+        .map(|primary_key_idx| get_primary_keys(schema, primary_key_idx));
+    let primary_keys_array = get_primary_keys_array(primary_keys.as_deref(), row_count);
+    let data_array = match batch {
+        Some(batch) => StructArray::from(batch.clone()),
+        None => empty_struct_array(schema, row_count),
+    };
+
+    let new_schema = Arc::new(changes_schema(schema.as_ref()));
+    RecordBatch::try_new(
+        new_schema,
+        vec![
+            Arc::new(op_array),
+            Arc::new(primary_keys_array),
+            Arc::new(data_array),
+        ],
+    )
+    .map_err(|source| {
+        Status::internal(format!(
+            "Unable to convert data update into change event: {source}"
+        ))
+    })
+}
+
+fn empty_struct_array(schema: &SchemaRef, row_count: usize) -> StructArray {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| arrow::array::new_null_array(field.data_type(), row_count))
+        .collect::<Vec<ArrayRef>>();
+    StructArray::new(schema.fields().clone(), columns, None)
+}
+
+fn push_change_batch_flights(
+    flights: &mut Vec<FlightData>,
+    schema_sent: &mut bool,
+    encoder: &mut IpcDataGenerator,
+    tracker: &mut DictionaryTracker,
+    compression_context: &mut CompressionContext,
+    write_options: &writer::IpcWriteOptions,
+    change_batch: &RecordBatch,
+) -> Result<(), Status> {
+    if !*schema_sent {
+        flights.push(FlightData::from(SchemaAsIpc::new(
+            change_batch.schema().as_ref(),
+            write_options,
+        )));
+        *schema_sent = true;
+    }
+
+    let (flight_dictionaries, flight_batch) = encoder
+        .encode(change_batch, tracker, write_options, compression_context)
+        .map_err(|source| Status::internal(format!("Unable to encode change event: {source}")))?;
+    flights.extend(flight_dictionaries.into_iter().map(Into::into));
+    flights.push(flight_batch.into());
+    Ok(())
+}
+
+fn primary_keys_from_constraints(constraints: Option<&Constraints>) -> Option<&[usize]> {
+    constraints?.iter().find_map(|constraint| match constraint {
+        Constraint::PrimaryKey(primary_keys) => Some(primary_keys.as_slice()),
+        Constraint::Unique(_) => None,
     })
 }
 
@@ -224,7 +296,7 @@ fn get_primary_keys<'a>(schema: &'a SchemaRef, primary_key_idx: &[usize]) -> Vec
         .collect()
 }
 
-fn get_primary_keys_array(primary_keys: &[&str], row_count: usize) -> ListArray {
+fn get_primary_keys_array(primary_keys: Option<&[&str]>, row_count: usize) -> ListArray {
     let mut list_builder_generic = make_builder(
         &DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
         row_count,
@@ -239,8 +311,10 @@ fn get_primary_keys_array(primary_keys: &[&str], row_count: usize) -> ListArray 
             .as_any_mut()
             .downcast_mut::<StringBuilder>()
             .unwrap_or_else(|| unreachable!("created above as a string builder"));
-        for key in primary_keys {
-            str_builder.append_value(key);
+        if let Some(primary_keys) = primary_keys {
+            for key in primary_keys {
+                str_builder.append_value(key);
+            }
         }
         list_builder.append(true);
     }

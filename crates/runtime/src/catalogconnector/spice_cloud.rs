@@ -38,6 +38,9 @@ use iceberg::{CatalogBuilder, NamespaceIdent};
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use snafu::prelude::*;
+use spice_cloud_client::endpoints::{
+    LEGACY_DATA_ENDPOINT, data_endpoint as spice_cloud_data_endpoint,
+};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tonic::metadata::MetadataValue;
 
@@ -117,11 +120,7 @@ impl SpiceCloudPlatformCatalog {
     }
 
     async fn create_rest_catalog_client(&self) -> Result<RestCatalog, IcebergError> {
-        let endpoint = self
-            .params
-            .get("http_endpoint")
-            .expose()
-            .unwrap_or_else(|_| "https://data.spiceai.io");
+        let endpoint = self.http_endpoint();
         let mut props = HashMap::new();
         if let Some(api_key) = self.api_key() {
             props.insert("token".to_string(), api_key.to_string());
@@ -135,7 +134,7 @@ impl SpiceCloudPlatformCatalog {
             .build()
             .context(UnableToBuildCatalogClientSnafu)?;
 
-        props.insert(REST_CATALOG_PROP_URI.to_string(), endpoint.to_string());
+        props.insert(REST_CATALOG_PROP_URI.to_string(), endpoint);
         let iceberg_rest_catalog = RestCatalogBuilder::default()
             .with_client(client)
             .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
@@ -209,6 +208,10 @@ impl SpiceCloudPlatformCatalog {
             params.insert("spiceai_endpoint".to_string(), flight_endpoint.to_string());
         }
 
+        if let Some(region) = self.region() {
+            params.insert("spiceai_region".to_string(), region.to_string());
+        }
+
         if let Some(api_key) = self.api_key() {
             params.insert("spiceai_api_key".to_string(), api_key.to_string());
         }
@@ -225,6 +228,26 @@ impl SpiceCloudPlatformCatalog {
             self.params.get("flight_endpoint").expose()
         {
             return Some(flight_endpoint);
+        }
+
+        None
+    }
+
+    fn http_endpoint(&self) -> String {
+        if let ExposedParamLookup::Present(endpoint) = self.params.get("http_endpoint").expose() {
+            return endpoint.to_string();
+        }
+
+        if let Some(region) = self.region() {
+            return spice_cloud_data_endpoint(region);
+        }
+
+        LEGACY_DATA_ENDPOINT.to_string()
+    }
+
+    fn region(&self) -> Option<&str> {
+        if let ExposedParamLookup::Present(region) = self.params.get("region").expose() {
+            return Some(region);
         }
 
         None
@@ -287,6 +310,7 @@ impl SpiceCloudPlatformCatalog {
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("api_key").secret(),
     ParameterSpec::component("token").secret(),
+    ParameterSpec::component("region"),
     ParameterSpec::component("endpoint"),
     ParameterSpec::component("flight_endpoint"),
     ParameterSpec::component("http_endpoint"),

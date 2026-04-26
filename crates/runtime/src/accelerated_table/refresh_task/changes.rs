@@ -227,6 +227,13 @@ impl RefreshTask {
             );
         }
 
+        if row_indices
+            .first()
+            .is_some_and(|row| !change_batch.primary_keys(*row).is_empty())
+        {
+            self.process_delete_batch(change_batch, row_indices).await?;
+        }
+
         let indices_array = UInt32Array::from(
             row_indices
                 .iter()
@@ -564,6 +571,12 @@ mod tests {
     use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
     use datafusion::datasource::TableProvider;
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::logical_expr::dml::InsertOp;
+    use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::prelude::SessionContext;
+    use futures::stream;
 
     use std::sync::Arc;
 
@@ -887,6 +900,34 @@ mod tests {
         .build()
     }
 
+    async fn insert_test_batch(table: Arc<dyn TableProvider>, batch: RecordBatch) {
+        let ctx = SessionContext::new();
+        let schema = batch.schema();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            Box::pin(stream::once(async move { Ok(batch) })),
+        ));
+        let plan = Arc::new(StreamingDataUpdateExecutionPlan::new(stream));
+        let insert_plan = table
+            .insert_into(&ctx.state(), plan, InsertOp::Append)
+            .await
+            .expect("insert should be planned");
+        collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("insert should execute");
+    }
+
+    async fn collect_table(table: Arc<dyn TableProvider>) -> Vec<RecordBatch> {
+        let ctx = SessionContext::new();
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should be planned");
+        collect(scan, ctx.task_ctx())
+            .await
+            .expect("scan should execute")
+    }
+
     #[tokio::test]
     async fn test_write_change_upsert_returns_data_written() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
@@ -898,6 +939,44 @@ mod tests {
                 .expect("write_change should succeed"),
             WriteChangeResult::DataWritten
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_change_upsert_replaces_existing_primary_key_row() {
+        let table = make_mem_table() as Arc<dyn TableProvider>;
+        let initial_batch = RecordBatch::try_new(
+            Arc::new(create_test_data_schema()),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("Alice")])) as ArrayRef,
+            ],
+        )
+        .expect("initial batch should be valid");
+        insert_test_batch(Arc::clone(&table), initial_batch).await;
+
+        let task = make_refresh_task(Arc::clone(&table));
+        let change_batch =
+            create_test_change_batch(vec!["u"], &[vec!["id"]], vec![1], vec![Some("Alice_v2")]);
+        assert_eq!(
+            task.write_change(change_batch)
+                .await
+                .expect("write_change should succeed"),
+            WriteChangeResult::DataWritten
+        );
+
+        let results = collect_table(table).await;
+        let rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows, 1,
+            "upsert should replace the existing primary key row"
+        );
+        let name = results[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name should be a string array")
+            .value(0);
+        assert_eq!(name, "Alice_v2");
     }
 
     #[tokio::test]

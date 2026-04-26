@@ -161,6 +161,7 @@ serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
+spice-cloud-client.workspace = true
 spicepod = { path = "../spicepod" }
 sysinfo.workspace = true
 telemetry = { path = "../telemetry" }
