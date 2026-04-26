@@ -7,14 +7,14 @@ FROM (
         l_extendedprice * (1 - l_discount) AS volume,
         n2.n_name AS nation
     FROM
-        mysql.public.part,
-        mysql.public.supplier,
-        mysql.public.lineitem,
-        mysql.public.orders,
-        mysql.public.customer,
-        mysql.public.nation n1,
-        mysql.public.nation n2,
-        mysql.public.region
+        mysql.tpch_sf1.part,
+        mysql.tpch_sf1.supplier,
+        mysql.tpch_sf1.lineitem,
+        mysql.tpch_sf1.orders,
+        mysql.tpch_sf1.customer,
+        mysql.tpch_sf1.nation n1,
+        mysql.tpch_sf1.nation n2,
+        mysql.tpch_sf1.region
     WHERE
         p_partkey = l_partkey
         AND s_suppkey = l_suppkey

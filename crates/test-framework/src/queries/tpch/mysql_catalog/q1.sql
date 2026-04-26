@@ -10,7 +10,7 @@ SELECT
     AVG(l_discount) AS avg_disc,
     COUNT(*) AS count_order
 FROM
-    mysql.public.lineitem
+    mysql.tpch_sf1.lineitem
 WHERE
     l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
 GROUP BY
