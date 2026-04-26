@@ -22,6 +22,7 @@ use datafusion::sql::sqlparser::ast::{self, ExactNumberInfo, Ident, ObjectName};
 use datafusion::sql::sqlparser::tokenizer::Span;
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::Dialect;
+use datafusion::common::plan_err;
 
 /// Microsoft SQL Server dialect for T-SQL compatibility.
 ///
@@ -60,8 +61,12 @@ impl Dialect for MsSqlDialect {
 }
 
 /// Converts DataFusion's `substr(str, start[, len])` to T-SQL's `SUBSTRING(str, start, len)`.
+///
+/// T-SQL `SUBSTRING` always requires 3 arguments. When the 2-argument form is used
+/// (substring to end of string), we supply `LEN(str)` as the length argument which
+/// is safe because `SUBSTRING` clamps to the actual string length.
 fn substr_to_substring(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
-    let sql_args = args
+    let mut sql_args: Vec<ast::FunctionArg> = args
         .iter()
         .map(|arg| {
             Ok(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
@@ -69,6 +74,41 @@ fn substr_to_substring(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast:
             )))
         })
         .collect::<Result<Vec<_>>>()?;
+
+    match sql_args.len() {
+        2 => {
+            // Append LEN(str) as the third argument so SUBSTRING returns the rest of the string.
+            let str_expr = unparser.expr_to_sql(&args[0])?;
+            let len_expr = ast::Expr::Function(ast::Function {
+                name: ObjectName::from(vec![Ident {
+                    value: "LEN".to_string(),
+                    quote_style: None,
+                    span: Span::empty(),
+                }]),
+                args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                    duplicate_treatment: None,
+                    args: vec![ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                        str_expr,
+                    ))],
+                    clauses: vec![],
+                }),
+                filter: None,
+                null_treatment: None,
+                over: None,
+                within_group: vec![],
+                parameters: ast::FunctionArguments::None,
+                uses_odbc_syntax: false,
+            });
+            sql_args.push(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                len_expr,
+            )));
+        }
+        3 => {} // already has all three arguments
+        n => {
+            return plan_err!("substr expects 2 or 3 arguments, got {n}");
+        }
+    }
+
     Ok(Some(ast::Expr::Function(ast::Function {
         name: ObjectName::from(vec![Ident {
             value: "SUBSTRING".to_string(),
@@ -129,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_substr_two_args() -> Result<()> {
+    fn test_substr_two_args_appends_len() -> Result<()> {
         let dialect = create_dialect();
         let unparser = Unparser::new(&dialect);
 
@@ -139,7 +179,7 @@ mod tests {
             .expect("should return Some for substr");
 
         let sql = result.to_string();
-        assert_eq!(sql, "SUBSTRING(name, 2)");
+        assert_eq!(sql, "SUBSTRING(name, 2, LEN(name))");
         Ok(())
     }
 
