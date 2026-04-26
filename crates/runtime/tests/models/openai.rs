@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 use crate::DEFAULT_TRACING_MODELS;
-use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
+use crate::models::{sort_json_keys, sql_to_display};
 use crate::{
     init_tracing,
     models::{
@@ -1145,27 +1145,26 @@ async fn verify_sql_query_chat_completion(
         .expect("Failed to execute HTTP SQL query")
     );
 
-    let mut task_input = sql_to_single_json_value(
-        &rt,
-        format!(
-            "SELECT input
+    // The `input` for `ai_completion` tasks is redacted in the task_history exporter to
+    // avoid persisting prompt content. Verify the redacted marker is present.
+    insta::assert_snapshot!(
+        "chat_1_ai_completion_input",
+        sql_to_display(
+            &rt,
+            format!(
+                "SELECT input
         FROM runtime.task_history
         WHERE start_time >= '{}'
         AND task='ai_completion'
         ORDER BY start_time
         LIMIT 1;
     ",
-            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+            .as_str()
         )
-        .as_str(),
-    )
-    .await;
-
-    sort_json_keys(&mut task_input);
-
-    insta::assert_snapshot!(
-        "chat_1_ai_completion_input",
-        serde_json::to_string_pretty(&task_input).expect("Failed to serialize task_input")
+        .await
+        .expect("Failed to execute SQL query")
     );
 
     Ok(())
