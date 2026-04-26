@@ -30,7 +30,7 @@ Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and
   - Branch out of date with `trunk`? `git pull --rebase` or `git merge trunk`, then `git push` normally.
   - Want to fix history on a branch with open review? Add a follow-up commit and squash on merge — don't rewrite published commits.
   - Pre-commit hook failed and the commit didn't actually land? Re-stage, fix, create a *new* commit. Never `--amend` after pushing.
-- **Never bypass hooks** (`--no-verify`, `--no-gpg-sign`, etc.). If a hook fails, fix the underlying issue — these checks exist because earlier failures escaped review.
+- **Never bypass hooks** (`--no-verify`, etc.). If a hook fails, fix the underlying issue — these checks exist because earlier failures escaped review. Likewise, don't bypass required commit signing (e.g. `--no-gpg-sign`) just to get a commit through.
 - **Investigate before destroying**: unfamiliar files, branches, or lock files may represent in-progress work. Don't `git reset --hard`, `checkout --`, or `clean -f` to "make it go away" — find the root cause first.
 
 ### Runtime Architecture - Separate Tokio Runtimes
@@ -79,7 +79,7 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 - **Use `ensure!` macro**: Preferred over `if` + `return Err`
 - **Define `Result` type alias**: `pub type Result<T, E = Error> = std::result::Result<T, E>;`
 - **Don't use `assert!()` (or related) macros in non-test code**: Prefer proper error handling, or marking with `unreachable!()` if the assertion is truly unreachable. Alternatively, make the assertion a `debug_assert!()` assertion to only fire in debug builds instead of release builds. `assert!()` macros can have case-by-case exceptions, for example for compile-time assertions that would prevent a build from being released to begin with.
-- **Don't `#[allow(...)]` warnings in production code**. `#[allow(dead_code)]`, `#[allow(unused)]`, `#[allow(unused_imports)]`, `#[allow(unused_variables)]`, `#[allow(clippy::*)]` and friends paper over real issues that the project's lint denials (`-Dwarnings`, `unwrap_used`, `expect_used`, `clone_on_ref_ptr`, `pedantic`) exist to surface. Fix the underlying issue — delete unused code, drop unused imports, restructure to satisfy the lint — rather than suppressing the warning. Acceptable in **tests only**, and only when the alternative is meaningfully worse (e.g., a test fixture with intentionally unused fields).
+- **Don't `#[allow(...)]` warnings in production/library/runtime code**. `#[allow(dead_code)]`, `#[allow(unused)]`, `#[allow(unused_imports)]`, `#[allow(unused_variables)]`, `#[allow(clippy::*)]` and friends paper over real issues that the project's lint denials (`-Dwarnings`, `unwrap_used`, `expect_used`, `clone_on_ref_ptr`, `pedantic`) exist to surface. Fix the underlying issue — delete unused code, drop unused imports, restructure to satisfy the lint — rather than suppressing the warning. Well-justified `#[allow(...)]` (or preferably `#[expect(...)]`, which fails when the lint stops firing) is acceptable in **tests, benches, examples, and build scripts** when the alternative is meaningfully worse (e.g., a test fixture with intentionally unused fields, or a bench that intentionally calls `.expect()`).
 
 ```rust
 // GOOD
@@ -442,7 +442,7 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 ### VSCode Settings
 
-See `.vscode/settings.json` for the canonical config. Notable: `rust-analyzer.check.command = "clippy"` with `-Dwarnings`, `-Dclippy::pedantic`, plus denials on `unwrap_used`, `expect_used`, and `clone_on_ref_ptr` — i.e. clippy lints fail your local check, not just CI.
+`.vscode/settings.json` is gitignored; copy `.vscode/settings.json.template` (and see `CONTRIBUTING.md`) for the canonical config. Notable: rust-analyzer runs `clippy` with `-Dclippy::pedantic`, `-Dclippy::unwrap_used`, and `-Dclippy::clone_on_ref_ptr` (and `-Aclippy::module_name_repetitions`) — i.e. clippy lints fail your local check, not just CI.
 
 ### PR Process
 
