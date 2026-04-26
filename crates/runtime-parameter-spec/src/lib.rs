@@ -37,6 +37,7 @@ pub struct ParameterSpec {
     pub help_link: &'static str,
     pub examples: &'static [&'static str],
     pub one_of: Option<&'static [&'static str]>,
+    pub one_of_ignore_ascii_case: bool,
     pub deprecation_message: Option<&'static str>,
     pub r#type: ParameterType,
 }
@@ -57,6 +58,7 @@ impl ParameterSpec {
             deprecation_message: None,
             r#type: ParameterType::Component,
             one_of: None,
+            one_of_ignore_ascii_case: false,
         }
     }
 
@@ -75,6 +77,7 @@ impl ParameterSpec {
             deprecation_message: None,
             r#type: ParameterType::Runtime,
             one_of: None,
+            one_of_ignore_ascii_case: false,
         }
     }
 
@@ -123,6 +126,13 @@ impl ParameterSpec {
     #[must_use]
     pub const fn one_of(mut self, options: &'static [&'static str]) -> Self {
         self.one_of = Some(options);
+        self
+    }
+
+    #[must_use]
+    pub const fn one_of_ignore_ascii_case(mut self, options: &'static [&'static str]) -> Self {
+        self.one_of = Some(options);
+        self.one_of_ignore_ascii_case = true;
         self
     }
 
