@@ -27,7 +27,9 @@ use opentelemetry_sdk::{
     error::{OTelSdkError, OTelSdkResult},
     trace::{SpanData, SpanExporter},
 };
-use spicepod::component::runtime::{TaskHistoryCapturedOutput, TaskHistoryCapturedPlan};
+use spicepod::component::runtime::{
+    TaskHistoryCapturedContext, TaskHistoryCapturedOutput, TaskHistoryCapturedPlan,
+};
 
 use crate::datafusion::DataFusion;
 
@@ -38,6 +40,8 @@ use super::TaskSpan;
 /// plan capture spans always retain their output.
 const PLAN_CAPTURE_LABEL: &str = "plan_capture";
 const REDACTED_TASK_HISTORY_VALUE: &str = "[redacted]";
+const TRUNCATED_TASK_HISTORY_CONTEXT_CHARS: usize = 4096;
+const TRUNCATED_TASK_HISTORY_CONTEXT_SUFFIX: &str = "...[truncated]";
 
 macro_rules! extract_attr {
     ($span:expr, $key:expr) => {
@@ -55,7 +59,7 @@ macro_rules! extract_attr {
 pub struct TaskHistoryExporter {
     df: Arc<DataFusion>,
     captured_output: TaskHistoryCapturedOutput,
-    redact_context: bool,
+    captured_context: TaskHistoryCapturedContext,
     min_sql_duration_ms: Option<f64>,
     captured_plan: TaskHistoryCapturedPlan,
     min_plan_duration_ms: Option<f64>,
@@ -74,7 +78,7 @@ impl TaskHistoryExporter {
     pub fn new(
         df: Arc<DataFusion>,
         captured_output: TaskHistoryCapturedOutput,
-        redact_context: bool,
+        captured_context: TaskHistoryCapturedContext,
         min_sql_duration_ms: Option<f64>,
         captured_plan: TaskHistoryCapturedPlan,
         min_plan_duration_ms: Option<f64>,
@@ -83,7 +87,7 @@ impl TaskHistoryExporter {
         Self {
             df,
             captured_output,
-            redact_context,
+            captured_context,
             min_sql_duration_ms,
             captured_plan,
             min_plan_duration_ms,
@@ -102,7 +106,7 @@ impl TaskHistoryExporter {
         }
     }
 
-    fn should_redact_task_payload(task: &str) -> bool {
+    fn is_context_task(task: &str) -> bool {
         matches!(
             task,
             "ai_chat"
@@ -115,12 +119,32 @@ impl TaskHistoryExporter {
         ) || task.starts_with("tool_use::")
     }
 
-    fn redact_payload(redact_context: bool, task: &str, value: Arc<str>) -> Arc<str> {
-        if value.is_empty() || !redact_context || !Self::should_redact_task_payload(task) {
-            value
-        } else {
-            REDACTED_TASK_HISTORY_VALUE.into()
+    fn process_context_payload(
+        captured_context: &TaskHistoryCapturedContext,
+        task: &str,
+        value: Arc<str>,
+    ) -> Arc<str> {
+        if value.is_empty() || !Self::is_context_task(task) {
+            return value;
         }
+
+        match captured_context {
+            TaskHistoryCapturedContext::Redacted => REDACTED_TASK_HISTORY_VALUE.into(),
+            TaskHistoryCapturedContext::Truncated => Self::truncate_context_payload(value),
+            TaskHistoryCapturedContext::Full => value,
+        }
+    }
+
+    fn truncate_context_payload(value: Arc<str>) -> Arc<str> {
+        let Some((truncate_at, _)) = value
+            .char_indices()
+            .nth(TRUNCATED_TASK_HISTORY_CONTEXT_CHARS)
+        else {
+            return value;
+        };
+
+        let truncated_value = &value[..truncate_at];
+        format!("{truncated_value}{TRUNCATED_TASK_HISTORY_CONTEXT_SUFFIX}").into()
     }
 
     fn is_valid_span_id(span_id: &Arc<str>) -> bool {
@@ -224,8 +248,8 @@ impl TaskHistoryExporter {
             Some(span.parent_span_id.to_string().into())
         };
         let task: Arc<str> = extract_attr!(span, "task_override").unwrap_or(span.name.into());
-        let input: Arc<str> = Self::redact_payload(
-            self.redact_context,
+        let input: Arc<str> = Self::process_context_payload(
+            &self.captured_context,
             task.as_ref(),
             span.attributes
                 .iter()
@@ -307,7 +331,9 @@ impl TaskHistoryExporter {
 
         let captured_output: Option<Arc<str>> = extract_attr!(span, "captured_output")
             .map(|output| self.process_output(output, plan_capture))
-            .map(|output| Self::redact_payload(self.redact_context, task.as_ref(), output));
+            .map(|output| {
+                Self::process_context_payload(&self.captured_context, task.as_ref(), output)
+            });
 
         // Remove trace_id and parent_id from `labels`, if they exist (no issue if they don't).
         labels.remove(&Into::<Arc<str>>::into("trace_id"));
@@ -442,33 +468,68 @@ fn filter_event_keys(event_key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{REDACTED_TASK_HISTORY_VALUE, TaskHistoryExporter};
+    use super::{
+        REDACTED_TASK_HISTORY_VALUE, TRUNCATED_TASK_HISTORY_CONTEXT_CHARS,
+        TRUNCATED_TASK_HISTORY_CONTEXT_SUFFIX, TaskHistoryExporter,
+    };
+    use spicepod::component::runtime::TaskHistoryCapturedContext;
     use std::sync::Arc;
 
     #[test]
-    fn redact_payload_preserves_context_by_default() {
-        let payload: Arc<str> = "how many rows are in taxi_trips?".into();
+    fn process_context_payload_truncates_context_by_default() {
+        let payload: Arc<str> =
+            format!("{}z", "a".repeat(TRUNCATED_TASK_HISTORY_CONTEXT_CHARS)).into();
 
         assert_eq!(
-            TaskHistoryExporter::redact_payload(false, "nsql", Arc::clone(&payload)),
+            TaskHistoryExporter::process_context_payload(
+                &TaskHistoryCapturedContext::Truncated,
+                "nsql",
+                payload,
+            ),
+            Arc::<str>::from(format!(
+                "{}{TRUNCATED_TASK_HISTORY_CONTEXT_SUFFIX}",
+                "a".repeat(TRUNCATED_TASK_HISTORY_CONTEXT_CHARS)
+            ))
+        );
+    }
+
+    #[test]
+    fn process_context_payload_preserves_full_context() {
+        let payload: Arc<str> =
+            format!("{}z", "a".repeat(TRUNCATED_TASK_HISTORY_CONTEXT_CHARS)).into();
+
+        assert_eq!(
+            TaskHistoryExporter::process_context_payload(
+                &TaskHistoryCapturedContext::Full,
+                "nsql",
+                Arc::clone(&payload),
+            ),
             payload
         );
     }
 
     #[test]
-    fn redact_payload_redacts_context_when_enabled() {
+    fn process_context_payload_redacts_context_when_configured() {
         assert_eq!(
-            TaskHistoryExporter::redact_payload(true, "tool_use::table_schema", "{}".into()),
+            TaskHistoryExporter::process_context_payload(
+                &TaskHistoryCapturedContext::Redacted,
+                "tool_use::table_schema",
+                "{}".into(),
+            ),
             Arc::<str>::from(REDACTED_TASK_HISTORY_VALUE)
         );
     }
 
     #[test]
-    fn redact_payload_preserves_non_context_tasks_when_enabled() {
+    fn process_context_payload_preserves_non_context_tasks() {
         let payload: Arc<str> = "SELECT COUNT(*) FROM item".into();
 
         assert_eq!(
-            TaskHistoryExporter::redact_payload(true, "sql_query", Arc::clone(&payload)),
+            TaskHistoryExporter::process_context_payload(
+                &TaskHistoryCapturedContext::Redacted,
+                "sql_query",
+                Arc::clone(&payload),
+            ),
             payload
         );
     }

@@ -933,9 +933,14 @@
           "type": "string",
           "default": "none"
         },
-        "redact_context": {
-          "type": "boolean",
-          "default": false
+        "captured_context": {
+          "type": "string",
+          "enum": [
+            "redacted",
+            "truncated",
+            "full"
+          ],
+          "default": "truncated"
         },
         "retention_period": {
           "type": "string",
