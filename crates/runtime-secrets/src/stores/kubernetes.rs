@@ -112,6 +112,10 @@ fn secret_url(namespace: &str, secret_name: &str) -> String {
     format!("{KUBERNETES_API_SERVER}/api/v1/namespaces/{namespace}/secrets/{encoded_secret_name}")
 }
 
+fn trim_single_trailing_newline(value: &str) -> &str {
+    value.strip_suffix('\n').unwrap_or(value)
+}
+
 impl KubernetesClient {
     fn new(namespace_override: Option<String>) -> Self {
         Self {
@@ -223,7 +227,7 @@ impl KubernetesClient {
             // Trim a single trailing newline (common artifact of `echo | base64`)
             // via a string slice; avoids the intermediate plain-String
             // allocation that the previous `.to_string().trim()` path produced.
-            let trimmed = decoded_str.trim_end_matches('\n');
+            let trimmed = trim_single_trailing_newline(decoded_str);
             secret.insert(key.clone(), SecretString::from(trimmed.to_string()));
         }
 
@@ -284,7 +288,7 @@ impl SecretStore for KubernetesSecretStore {
 
 #[cfg(test)]
 mod tests {
-    use super::secret_url;
+    use super::{secret_url, trim_single_trailing_newline};
 
     #[test]
     fn secret_url_encodes_secret_name() {
@@ -296,5 +300,17 @@ mod tests {
     fn secret_url_handles_regular_name_without_changes() {
         let url = secret_url("default", "my-secret");
         assert!(url.ends_with("secrets/my-secret"));
+    }
+
+    #[test]
+    fn trim_single_trailing_newline_removes_one_newline() {
+        assert_eq!(trim_single_trailing_newline("secret\n"), "secret");
+        assert_eq!(trim_single_trailing_newline("secret\n\n"), "secret\n");
+    }
+
+    #[test]
+    fn trim_single_trailing_newline_preserves_other_whitespace() {
+        assert_eq!(trim_single_trailing_newline(" secret \t"), " secret \t");
+        assert_eq!(trim_single_trailing_newline("secret"), "secret");
     }
 }

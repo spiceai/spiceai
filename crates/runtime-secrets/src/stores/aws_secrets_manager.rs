@@ -532,10 +532,10 @@ impl AwsSecretsManager {
     /// - Cache hits take only an `RwLock` read and never serialize against
     ///   each other or against in-flight fetches.
     /// - On a miss, one task is elected winner via the `fetch_inflight`
-    ///   atomic (under a brief `fetch_mutex` critical section that contains
-    ///   no `.await` against the network). The mutex is dropped before the
-    ///   AWS round-trip so it is never held across an `.await`.
-    /// - Losing tasks `await` on `fetch_notify` and then re-check the cache.
+    ///   atomic under a brief `fetch_mutex` critical section. The mutex is
+    ///   dropped before any cache `RwLock` await or AWS round-trip.
+    /// - Losing tasks pre-register on `fetch_notify`, re-check the cache,
+    ///   then `await` the notification if needed.
     /// - The AWS SDK call is never made while any lock is held, so a
     ///   stalled endpoint cannot stall cache readers.
     async fn payload(&self) -> crate::AnyErrorResult<Arc<HashMap<String, SecretString>>> {
@@ -545,43 +545,42 @@ impl AwsSecretsManager {
                 return Ok(data);
             }
 
-            // Election: take the mutex only long enough to claim the
-            // in-flight slot or to observe that another task already holds
-            // it. No `.await` happens inside this block apart from the
-            // mutex acquisition itself, so the mutex is never held across
-            // the AWS network call.
-            let should_fetch = {
+            let waiter = {
                 let _fetch_guard = self.fetch_mutex.lock().await;
+                if self.fetch_inflight.load(Ordering::Acquire) {
+                    let mut notified = Box::pin(self.fetch_notify.notified());
+                    notified.as_mut().enable();
+                    Some(notified)
+                } else {
+                    self.fetch_inflight.store(true, Ordering::Release);
+                    None
+                }
+            };
 
-                // Another task may have refreshed the cache while we were
-                // waiting on the mutex; check again.
+            if let Some(notified) = waiter {
+                // Loser: wait for the winner to publish a result, then loop
+                // and re-check the cache. If the winner failed, the cache
+                // is still empty and we will try to become the new winner.
                 if let Some(data) = self.try_cached().await {
                     return Ok(data);
                 }
 
-                if self.fetch_inflight.load(Ordering::Acquire) {
-                    false
-                } else {
-                    self.fetch_inflight.store(true, Ordering::Release);
-                    true
-                }
-                // `_fetch_guard` is dropped here, before any await on the
-                // AWS round-trip below.
-            };
-
-            if !should_fetch {
-                // Loser: wait for the winner to publish a result, then loop
-                // and re-check the cache. If the winner failed, the cache
-                // is still empty and we will try to become the new winner.
-                self.fetch_notify.notified().await;
+                notified.await;
                 continue;
+            }
+
+            // Another task may have refreshed the cache while we were
+            // waiting to become the winner. Re-check outside `fetch_mutex`
+            // so the mutex is never held across the cache `RwLock` await.
+            if let Some(data) = self.try_cached().await {
+                self.finish_fetch().await;
+                return Ok(data);
             }
 
             // Winner: perform the network fetch with no locks held.
             // Always clear `fetch_inflight` and wake waiters, regardless of
             // success or failure, so they can make progress.
             let result = self.fetch_payload().await;
-            self.fetch_inflight.store(false, Ordering::Release);
             return match result {
                 Ok((data, ttl)) => {
                     let mut guard = self.cache.write().await;
@@ -591,15 +590,21 @@ impl AwsSecretsManager {
                         ttl,
                     });
                     drop(guard);
-                    self.fetch_notify.notify_waiters();
+                    self.finish_fetch().await;
                     Ok(data)
                 }
                 Err(err) => {
-                    self.fetch_notify.notify_waiters();
+                    self.finish_fetch().await;
                     Err(err)
                 }
             };
         }
+    }
+
+    async fn finish_fetch(&self) {
+        let _fetch_guard = self.fetch_mutex.lock().await;
+        self.fetch_inflight.store(false, Ordering::Release);
+        self.fetch_notify.notify_waiters();
     }
 
     /// Returns the cached payload if present and still fresh.
