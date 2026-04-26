@@ -49,6 +49,13 @@ use crate::param::Params;
 ///       region: ${ env:AWS_REGION }
 ///       key: ${ env:AWS_ACCESS_KEY_ID }
 ///       secret: ${ env:AWS_SECRET_ACCESS_KEY }
+///   - from: azure_keyvault:my-vault
+///     name: azure
+///     params:
+///       auth_method: service_principal
+///       tenant_id: ${ env:AZURE_TENANT_ID }
+///       client_id: ${ env:AZURE_CLIENT_ID }
+///       client_secret: ${ env:AZURE_CLIENT_SECRET }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
