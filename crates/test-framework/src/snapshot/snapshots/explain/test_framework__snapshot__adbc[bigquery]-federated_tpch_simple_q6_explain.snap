@@ -1,0 +1,19 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q6"
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                               |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                                                          |
+|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                           |
+|               |   Projection: c.key                                                                                                                                                                                                                |
+|               |     SubqueryAlias: c                                                                                                                                                                                                               |
+|               |       Projection: orders.o_orderkey + Int64(1) AS key                                                                                                                                                                              |
+|               |         TableScan: orders projection=[o_orderkey]                                                                                                                                                                                  |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                                                                 |
+|               |   CooperativeExec                                                                                                                                                                                                                  |
+|               |     BytesProcessedExec                                                                                                                                                                                                             |
+|               |       VirtualExecutionPlan name=adbc compute_context=de69e2e8a78269b25e483452df2f22cb5083f81f94ec7b76bdeaca5b5011da83 base_sql=SELECT `c`.`key` FROM (SELECT (`c`.`o_orderkey` + 1) AS `key` FROM `orders` AS `c`) AS `c` LIMIT 10 |
+|               |                                                                                                                                                                                                                                    |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
