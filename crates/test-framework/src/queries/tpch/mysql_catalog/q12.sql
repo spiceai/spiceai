@@ -11,8 +11,8 @@ SELECT
         ELSE 0
     END) AS low_line_count
 FROM
-    mysql.public.orders,
-    mysql.public.lineitem
+    mysql.tpch_sf1.orders,
+    mysql.tpch_sf1.lineitem
 WHERE
     o_orderkey = l_orderkey
     AND l_shipmode IN ('MAIL', 'SHIP')

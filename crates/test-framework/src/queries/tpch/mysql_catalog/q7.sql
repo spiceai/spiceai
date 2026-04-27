@@ -10,12 +10,12 @@ FROM (
         EXTRACT(YEAR FROM l_shipdate) AS l_year,
         l_extendedprice * (1 - l_discount) AS volume
     FROM
-        mysql.public.supplier,
-        mysql.public.lineitem,
-        mysql.public.orders,
-        mysql.public.customer,
-        mysql.public.nation n1,
-        mysql.public.nation n2
+        mysql.tpch_sf1.supplier,
+        mysql.tpch_sf1.lineitem,
+        mysql.tpch_sf1.orders,
+        mysql.tpch_sf1.customer,
+        mysql.tpch_sf1.nation n1,
+        mysql.tpch_sf1.nation n2
     WHERE
         s_suppkey = l_suppkey
         AND o_orderkey = l_orderkey
