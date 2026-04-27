@@ -26,7 +26,7 @@ use data_components::cdc::changes_schema;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -91,15 +91,17 @@ pub(crate) async fn handle(
 
     let response_stream = try_stream! {
         let initial_update = initial_snapshot_update(&datafusion_stream, Arc::clone(&table_provider_stream)).await?;
-        for flight in encode_data_update(&table_provider_stream, &initial_update)? {
-            yield flight;
+        let mut encoded_initial_update = Box::pin(encode_data_update(&table_provider_stream, &initial_update));
+        while let Some(flight) = encoded_initial_update.next().await {
+            yield flight?;
         }
 
         loop {
             match rx.recv().await {
                 Ok(data_update) => {
-                    for flight in encode_data_update(&table_provider_stream, &data_update)? {
-                        yield flight;
+                    let mut encoded_update = Box::pin(encode_data_update(&table_provider_stream, &data_update));
+                    while let Some(flight) = encoded_update.next().await {
+                        yield flight?;
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
@@ -138,74 +140,78 @@ async fn initial_snapshot_update(
 fn encode_data_update(
     table_provider: &Arc<dyn TableProvider>,
     data_update: &DataUpdate,
-) -> Result<Vec<FlightData>, Status> {
-    let mut encoder = IpcDataGenerator::default();
-    let mut tracker = DictionaryTracker::new(false);
-    let mut compression_context = CompressionContext::default();
-    let write_options = writer::IpcWriteOptions::default();
-    let mut flights = vec![];
-    let mut schema_sent = false;
+) -> impl Stream<Item = Result<FlightData, Status>> + '_ {
+    try_stream! {
+        let mut encoder = IpcDataGenerator::default();
+        let mut tracker = DictionaryTracker::new(false);
+        let mut compression_context = CompressionContext::default();
+        let write_options = writer::IpcWriteOptions::default();
+        let mut schema_sent = false;
 
-    if data_update.data.is_empty() {
-        let (operation, empty_row_count) =
-            if matches!(data_update.update_type, UpdateType::Overwrite) {
-                ("t", 1)
-            } else {
-                (change_operation_for_update(&data_update.update_type), 0)
-            };
-        let change_batch = data_update_to_change_batch(
-            table_provider,
-            &data_update.schema,
-            None,
-            operation,
-            empty_row_count,
-        )?;
-        push_change_batch_flights(
-            &mut flights,
-            &mut schema_sent,
-            &mut encoder,
-            &mut tracker,
-            &mut compression_context,
-            &write_options,
-            &change_batch,
-        )?;
-    } else {
-        if matches!(data_update.update_type, UpdateType::Overwrite) {
-            let truncate_batch =
-                data_update_to_change_batch(table_provider, &data_update.schema, None, "t", 1)?;
-            push_change_batch_flights(
-                &mut flights,
-                &mut schema_sent,
-                &mut encoder,
-                &mut tracker,
-                &mut compression_context,
-                &write_options,
-                &truncate_batch,
-            )?;
-        }
-
-        for batch in &data_update.data {
+        if data_update.data.is_empty() {
+            let (operation, empty_row_count) =
+                if matches!(data_update.update_type, UpdateType::Overwrite) {
+                    ("t", 1)
+                } else {
+                    (change_operation_for_update(&data_update.update_type), 0)
+                };
             let change_batch = data_update_to_change_batch(
                 table_provider,
                 &data_update.schema,
-                Some(batch),
-                change_operation_for_update(&data_update.update_type),
-                0,
+                None,
+                operation,
+                empty_row_count,
             )?;
-            push_change_batch_flights(
-                &mut flights,
+            for flight in encode_change_batch_flights(
                 &mut schema_sent,
                 &mut encoder,
                 &mut tracker,
                 &mut compression_context,
                 &write_options,
                 &change_batch,
-            )?;
+            )? {
+                metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(1, &[]);
+                yield flight;
+            }
+        } else {
+            if matches!(data_update.update_type, UpdateType::Overwrite) {
+                let truncate_batch =
+                    data_update_to_change_batch(table_provider, &data_update.schema, None, "t", 1)?;
+                for flight in encode_change_batch_flights(
+                    &mut schema_sent,
+                    &mut encoder,
+                    &mut tracker,
+                    &mut compression_context,
+                    &write_options,
+                    &truncate_batch,
+                )? {
+                    metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(1, &[]);
+                    yield flight;
+                }
+            }
+
+            for batch in &data_update.data {
+                let change_batch = data_update_to_change_batch(
+                    table_provider,
+                    &data_update.schema,
+                    Some(batch),
+                    change_operation_for_update(&data_update.update_type),
+                    0,
+                )?;
+                for flight in encode_change_batch_flights(
+                    &mut schema_sent,
+                    &mut encoder,
+                    &mut tracker,
+                    &mut compression_context,
+                    &write_options,
+                    &change_batch,
+                )? {
+                    metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(1, &[]);
+                    yield flight;
+                }
+            }
         }
     }
-
-    metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
-    Ok(flights)
 }
 
 fn change_operation_for_update(update_type: &UpdateType) -> &'static str {
@@ -257,15 +263,16 @@ fn empty_struct_array(schema: &SchemaRef, row_count: usize) -> StructArray {
     StructArray::new(schema.fields().clone(), columns, None)
 }
 
-fn push_change_batch_flights(
-    flights: &mut Vec<FlightData>,
+fn encode_change_batch_flights(
     schema_sent: &mut bool,
     encoder: &mut IpcDataGenerator,
     tracker: &mut DictionaryTracker,
     compression_context: &mut CompressionContext,
     write_options: &writer::IpcWriteOptions,
     change_batch: &RecordBatch,
-) -> Result<(), Status> {
+) -> Result<Vec<FlightData>, Status> {
+    let mut flights = Vec::new();
+
     if !*schema_sent {
         flights.push(FlightData::from(SchemaAsIpc::new(
             change_batch.schema().as_ref(),
@@ -279,7 +286,7 @@ fn push_change_batch_flights(
         .map_err(|source| Status::internal(format!("Unable to encode change event: {source}")))?;
     flights.extend(flight_dictionaries.into_iter().map(Into::into));
     flights.push(flight_batch.into());
-    Ok(())
+    Ok(flights)
 }
 
 fn primary_keys_from_constraints(constraints: Option<&Constraints>) -> Option<&[usize]> {

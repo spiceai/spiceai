@@ -227,11 +227,17 @@ impl RefreshTask {
             );
         }
 
-        if row_indices
-            .first()
-            .is_some_and(|row| !change_batch.primary_keys(*row).is_empty())
-        {
-            self.process_delete_batch(change_batch, row_indices).await?;
+        if let Some(delete_row_indices) = upsert_pre_delete_rows(change_batch, row_indices) {
+            if delete_row_indices.len() != row_indices.len() {
+                tracing::warn!(
+                    dataset_name = %dataset_name,
+                    skipped_rows = row_indices.len() - delete_row_indices.len(),
+                    "Skipping pre-delete for upsert rows without matching primary keys"
+                );
+            }
+
+            self.process_delete_batch(change_batch, &delete_row_indices)
+                .await?;
         }
 
         let indices_array = UInt32Array::from(
@@ -351,6 +357,21 @@ impl RefreshTask {
 
         Ok(())
     }
+}
+
+fn upsert_pre_delete_rows(change_batch: &ChangeBatch, row_indices: &[usize]) -> Option<Vec<usize>> {
+    let expected_primary_keys = row_indices
+        .iter()
+        .map(|row_idx| change_batch.primary_keys(*row_idx))
+        .find(|primary_keys| !primary_keys.is_empty())?;
+
+    Some(
+        row_indices
+            .iter()
+            .copied()
+            .filter(|row_idx| change_batch.primary_keys(*row_idx) == expected_primary_keys)
+            .collect(),
+    )
 }
 
 pub(crate) fn get_primary_key_value(
@@ -1049,5 +1070,47 @@ mod tests {
         assert_eq!(result[1].1.len(), 2);
         assert_eq!(result[2].0, ChangeOperationType::Upsert);
         assert_eq!(result[2].1.len(), 2);
+    }
+
+    #[test]
+    fn test_upsert_pre_delete_rows_skips_rows_without_primary_keys() {
+        let change_batch = create_test_change_batch(
+            vec!["c", "c", "c"],
+            &[vec!["id"], vec![], vec!["id"]],
+            vec![1, 2, 3],
+            vec![Some("a"), Some("b"), Some("c")],
+        );
+
+        let delete_rows =
+            upsert_pre_delete_rows(&change_batch, &[0, 1, 2]).expect("some rows have primary keys");
+
+        assert_eq!(delete_rows, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_upsert_pre_delete_rows_skips_rows_with_mismatched_primary_keys() {
+        let change_batch = create_test_change_batch(
+            vec!["c", "c", "c"],
+            &[vec!["id"], vec!["id", "name"], vec!["id"]],
+            vec![1, 2, 3],
+            vec![Some("a"), Some("b"), Some("c")],
+        );
+
+        let delete_rows =
+            upsert_pre_delete_rows(&change_batch, &[0, 1, 2]).expect("some rows have primary keys");
+
+        assert_eq!(delete_rows, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_upsert_pre_delete_rows_none_when_no_primary_keys() {
+        let change_batch = create_test_change_batch(
+            vec!["c", "c"],
+            &[vec![], vec![]],
+            vec![1, 2],
+            vec![Some("a"), Some("b")],
+        );
+
+        assert!(upsert_pre_delete_rows(&change_batch, &[0, 1]).is_none());
     }
 }

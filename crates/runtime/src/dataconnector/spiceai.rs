@@ -96,6 +96,11 @@ pub enum Error {
         "Spice Cloud endpoint region mismatch: endpoint {endpoint} does not match region {region}. Use the endpoint for the configured region or remove the endpoint parameter."
     ))]
     CloudEndpointRegionMismatch { endpoint: String, region: String },
+
+    #[snafu(display(
+        "Unsupported SpiceAI endpoint scheme in endpoint {endpoint}: grpc:// is not supported. Use http:// for plaintext Flight or grpc+tls:// for TLS."
+    ))]
+    UnsupportedEndpointScheme { endpoint: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -206,6 +211,17 @@ fn is_flight_endpoint_path(path: &str) -> bool {
         || path.starts_with("grpc+tls://")
 }
 
+fn ensure_supported_endpoint_scheme(endpoint: &str) -> Result<()> {
+    ensure!(
+        !endpoint.starts_with("grpc://"),
+        UnsupportedEndpointSchemeSnafu {
+            endpoint: endpoint.to_string()
+        }
+    );
+
+    Ok(())
+}
+
 fn get_region(params: &ConnectorParams) -> Result<Option<&str>> {
     let Some(region) = params.parameters.get("region").expose().ok() else {
         return Ok(None);
@@ -239,6 +255,8 @@ fn get_endpoint(params: &ConnectorParams) -> Result<Arc<str>> {
         })?;
         return Ok(spice_cloud_flight_endpoint(region).into());
     };
+
+    ensure_supported_endpoint_scheme(endpoint)?;
 
     if is_legacy_spice_cloud_endpoint(endpoint) {
         let region = region.ok_or_else(|| {
@@ -878,6 +896,10 @@ mod tests {
                 "spice.ai:https://remote.example.com:50051",
                 "https://remote.example.com:50051",
             ),
+            (
+                "spice.ai:grpc+tls://remote.example.com:50051",
+                "grpc+tls://remote.example.com:50051",
+            ),
         ] {
             let params = make_params_for_from(input, vec![]).await;
 
@@ -889,6 +911,34 @@ mod tests {
                 "failed for input: {input}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_rejects_grpc_from_endpoint() {
+        let params = make_params_for_from("spice.ai:grpc://localhost:50051", vec![]).await;
+
+        let error = get_endpoint(&params).expect_err("grpc endpoint should be rejected");
+        assert!(matches!(
+            error,
+            Error::UnsupportedEndpointScheme { endpoint }
+            if endpoint == "grpc://localhost:50051"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_rejects_grpc_endpoint_parameter() {
+        let params = make_params(vec![(
+            "spiceai_endpoint".to_string(),
+            "grpc://localhost:50051".to_string().into(),
+        )])
+        .await;
+
+        let error = get_endpoint(&params).expect_err("grpc endpoint should be rejected");
+        assert!(matches!(
+            error,
+            Error::UnsupportedEndpointScheme { endpoint }
+            if endpoint == "grpc://localhost:50051"
+        ));
     }
 
     #[tokio::test]
