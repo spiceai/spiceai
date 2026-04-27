@@ -4,8 +4,8 @@ SELECT
     p_size,
     COUNT(DISTINCT ps_suppkey) AS supplier_cnt
 FROM
-    mysql.public.partsupp,
-    mysql.public.part
+    mysql.tpch_sf1.partsupp,
+    mysql.tpch_sf1.part
 WHERE
     p_partkey = ps_partkey
     AND p_brand <> 'Brand#45'
@@ -15,7 +15,7 @@ WHERE
         SELECT
             s_suppkey
         FROM
-            mysql.public.supplier
+            mysql.tpch_sf1.supplier
         WHERE
             s_comment LIKE '%Customer%Complaints%'
     )
