@@ -33,7 +33,6 @@ use tonic::Status;
 use crate::datafusion::job_executor_context_extension::get_job_executor;
 use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
-use crate::http::v1::queries::SubmitQueryRequest;
 use crate::http::v1::{current_principal_requires_read_only, queries::SubmitQueryRequest};
 use crate::jobs::{JobErrorCode, JobState, JobStatus};
 use runtime_request_context::{AsyncMarker, RequestContext};
