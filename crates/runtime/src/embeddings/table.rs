@@ -992,6 +992,23 @@ impl TableProvider for EmbeddingTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.insert_into(state, input, overwrite).await
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.base_table.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.base_table.update(state, assignments, filters).await
+    }
 }
 
 #[cfg(test)]

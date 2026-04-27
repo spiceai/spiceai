@@ -13,9 +13,9 @@ select
             else 0
         end) as low_line_count
 from
-    mssql.public.lineitem
+    mssql.dbo.lineitem
         join
-    mssql.public.orders
+    mssql.dbo.orders
     on
             l_orderkey = o_orderkey
 where

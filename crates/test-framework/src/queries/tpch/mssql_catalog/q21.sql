@@ -2,10 +2,10 @@ select
     s_name,
     count(*) as numwait
 from
-    mssql.public.supplier,
-    mssql.public.lineitem l1,
-    mssql.public.orders,
-    mssql.public.nation
+    mssql.dbo.supplier,
+    mssql.dbo.lineitem l1,
+    mssql.dbo.orders,
+    mssql.dbo.nation
 where
         s_suppkey = l1.l_suppkey
   and o_orderkey = l1.l_orderkey
@@ -15,7 +15,7 @@ where
         select
             *
         from
-            mssql.public.lineitem l2
+            mssql.dbo.lineitem l2
         where
                 l2.l_orderkey = l1.l_orderkey
           and l2.l_suppkey <> l1.l_suppkey
@@ -24,7 +24,7 @@ where
         select
             *
         from
-            mssql.public.lineitem l3
+            mssql.dbo.lineitem l3
         where
                 l3.l_orderkey = l1.l_orderkey
           and l3.l_suppkey <> l1.l_suppkey

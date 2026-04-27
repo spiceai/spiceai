@@ -204,14 +204,26 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unknown data connector: {data_connector}. Specify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+        "Unknown data connector '{data_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/data-connectors",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownDataConnector { data_connector: String },
+    UnknownDataConnector {
+        data_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
-        "Unknown catalog connector: {catalog_connector}. Specify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+        "Unknown catalog connector '{catalog_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/catalogs",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownCatalogConnector { catalog_connector: String },
+    UnknownCatalogConnector {
+        catalog_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
         "The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
