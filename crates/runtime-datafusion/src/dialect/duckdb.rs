@@ -17,9 +17,10 @@ limitations under the License.
 use datafusion::error::DataFusionError;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::sqlparser::ast::{self, Function, FunctionArgExpr, Ident, ObjectName};
-use datafusion_expr::sqlparser;
-use datafusion_expr::sqlparser::ast::{Array, FunctionArg, ValueWithSpan};
+use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::{
+    self, Array, Function, FunctionArg, FunctionArgExpr, Ident, ObjectName, ValueWithSpan,
+};
 use itertools::Itertools;
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_matches";
@@ -306,7 +307,7 @@ impl DuckDBRegexpFunction {
         })
     }
 
-    fn postprocess_function(&self, mut ast_fn: ast::Expr) -> datafusion_expr::sqlparser::ast::Expr {
+    fn postprocess_function(&self, mut ast_fn: ast::Expr) -> ast::Expr {
         match self {
             DuckDBRegexpFunction::Match => {
                 // DuckDB ``regexp_extract`` returns a plain string
@@ -414,7 +415,7 @@ mod tests {
         sql::{TableReference, unparser::Unparser},
     };
 
-    use crate::datafusion::dialect::new_duckdb_dialect;
+    use crate::dialect::new_duckdb_dialect;
 
     fn fixed_size_list_literal(values: Vec<f32>) -> Expr {
         let n = i32::try_from(values.len()).expect("values length fits in i32");
