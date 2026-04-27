@@ -1012,7 +1012,21 @@ async fn head_drive_item(
             store: STORE_TAG,
             source: Box::new(e),
         })?;
-    raw.into_meta()
+    let meta = raw.into_meta()?;
+    // Treat folders as NotFound so callers (e.g. DataFusion's ListingTableUrl)
+    // fall back to listing the path as a collection rather than treating it as
+    // a 0-byte file — which would suppress the list() call and cause schema
+    // inference to find no files with the expected extension.
+    if meta.is_folder {
+        return Err(object_store::Error::NotFound {
+            path: item_path.to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "path is a folder, not a file",
+            )),
+        });
+    }
+    Ok(meta)
 }
 
 async fn get_content(
