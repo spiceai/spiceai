@@ -68,9 +68,9 @@ pub async fn initialize_partition_metadata(
     for (table, partitioning) in tables {
         // Fast path: if partition values can be resolved statically (e.g. bucket(N, col)),
         // seed the metadata synchronously — no Ballista job needed.
-        if super::discovery::try_static_partition_values(&partitioning).is_some() {
+        if let Some(values) = super::discovery::try_static_partition_values(&partitioning) {
             if let Err(e) = partition_service
-                .seed_table(&table, &partitioning, df.as_ref())
+                .seed_table(&table, &partitioning, values, df.as_ref())
                 .await
             {
                 tracing::warn!(

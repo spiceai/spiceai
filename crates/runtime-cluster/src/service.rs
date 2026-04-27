@@ -246,19 +246,14 @@ impl PartitionService {
         &self,
         table: &TableReference,
         partition_by: &[PartitionedBy],
+        values: Vec<PartitionValue>,
         ops: &dyn PartitionOperations,
     ) -> Result<()> {
-        let config = {
-            let app = self.app.read().await.clone();
-            app.as_deref()
-                .map_or_else(AssignmentConfig::default, Self::config_from_app)
-        };
         self.partition_store
             .refresh()
             .await
             .context(PartitionStoreRefreshSnafu)?;
-        self.discover_and_apply_blocking(table, partition_by, ops, &config)
-            .await?;
+        self.diff_and_apply(table, partition_by, values, ops).await?;
         Ok(())
     }
 
@@ -338,16 +333,17 @@ impl PartitionService {
             .await
             .context(PartitionStoreRefreshSnafu)?;
 
-        let tables: Vec<(TableReference, Vec<PartitionedBy>)> = {
+        // In the job-based discovery design, partition values are already in the
+        // store (seeded at startup for static tables, or written by
+        // `check_and_process_discovery_jobs` for dynamic tables). This step only
+        // assigns any pending unassigned partitions to executors.
+        let all_tables: Vec<TableReference> = {
             let ds = app.datasets.iter().filter_map(|ds| {
                 if let Some(acc) = &ds.acceleration
                     && acc.enabled
                     && !acc.partition_by.is_empty()
                 {
-                    Some((
-                        TableReference::parse_str(&ds.name),
-                        acc.partition_by.clone(),
-                    ))
+                    Some(TableReference::parse_str(&ds.name))
                 } else {
                     None
                 }
@@ -357,10 +353,7 @@ impl PartitionService {
                     && acc.enabled
                     && !acc.partition_by.is_empty()
                 {
-                    Some((
-                        TableReference::parse_str(&view.name),
-                        acc.partition_by.clone(),
-                    ))
+                    Some(TableReference::parse_str(&view.name))
                 } else {
                     None
                 }
@@ -368,27 +361,9 @@ impl PartitionService {
             ds.chain(views).collect()
         };
 
-        let mut reconciled_tables: Vec<TableReference> = Vec::new();
-        for (table, partition_by) in tables {
-            match self
-                .discover_and_apply_blocking(&table, &partition_by, ops, &config)
-                .await
-            {
-                Ok(_) => reconciled_tables.push(table),
-                Err(e) => {
-                    tracing::warn!(table = %table, error = %e, "Per-table diff failed, continuing");
-                }
-            }
-        }
-
-        if reconciled_tables.is_empty() {
+        if all_tables.is_empty() {
             return Ok(());
         }
-
-        self.partition_store
-            .refresh()
-            .await
-            .context(PartitionStoreRefreshSnafu)?;
 
         let executors = self.executor_registry.connected_executors().await;
         if executors.is_empty() {
@@ -396,13 +371,87 @@ impl PartitionService {
         }
 
         self.assign_pending(
-            &reconciled_tables,
+            &all_tables,
             &executors,
             ops,
             AssignmentLimit::PerCycleCap,
             &config,
         )
         .await
+    }
+
+    /// Apply pre-discovered partition values to the store.
+    ///
+    /// Diffs `values` against the current store state, then adds new partitions
+    /// and removes stale ones. Called by [`Self::seed_table`], [`Self::reconcile_table`],
+    /// and [`Self::check_and_process_discovery_jobs`].
+    async fn diff_and_apply(
+        &self,
+        table: &TableReference,
+        partition_by: &[PartitionedBy],
+        values: Vec<PartitionValue>,
+        ops: &dyn PartitionOperations,
+    ) -> Result<()> {
+        let existing_partitions: Vec<crate::PartitionMetadata> =
+            match self.partition_store.get_table_metadata(table).await {
+                Ok(Some(m)) => m.partitions,
+                Ok(None) => {
+                    tracing::debug!(
+                        table = %table,
+                        count = values.len(),
+                        "No partition metadata found, treating all source partitions as new"
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    return Err(Error::DiscoveryFailed {
+                        table: table.to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            };
+
+        let diff = compute_diff(&values, &existing_partitions);
+
+        if diff.is_empty() {
+            return Ok(());
+        }
+
+        if !diff.new.is_empty() {
+            tracing::info!(
+                table = %table,
+                count = diff.new.len(),
+                "Adding new partitions"
+            );
+            let partition_expressions: Vec<String> =
+                partition_by.iter().map(|p| p.expression.clone()).collect();
+            if let Err(e) = self
+                .partition_store
+                .initialize_metadata(table, partition_expressions)
+                .await
+            {
+                tracing::warn!(table = %table, error = %e, "Failed to initialize partition metadata");
+            }
+            add_partitions_with_retry(&self.partition_store, table, diff.new).await?;
+        }
+
+        if !diff.removed.is_empty() {
+            tracing::info!(
+                table = %table,
+                count = diff.removed.len(),
+                "Removing stale partitions"
+            );
+            remove_partitions_with_cleanup(
+                &self.partition_store,
+                &self.executor_registry,
+                ops,
+                table,
+                diff.removed,
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
     /// Step 2: find every unassigned partition across the given tables, assign
@@ -1661,6 +1710,69 @@ mod tests {
             &state,
             &store,
             &config,
+            AssignmentLimit::PerCycleCap,
+        );
+        assert_eq!(
+            assignments.len(),
+            2,
+            "Both new partitions should be assigned"
+        );
+
+        // Step 3: Commit assignments to the store.
+        let result = commit_assignments(&store, assignments)
+            .await
+            .expect("commit");
+        assert_eq!(result.committed.len(), 2);
+        assert!(result.failed.is_empty());
+
+        // Verify: all 4 partitions are now assigned in the store.
+        let metadata = store
+            .get_table_metadata(&table)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(metadata.partitions.len(), 4);
+        for p in &metadata.partitions {
+            assert!(
+                p.is_assigned(),
+                "Partition {:?} should be assigned",
+                p.partition_value
+            );
+        }
+    }
+
+    /// Verifies that adding partitions that already exist is a no-op (idempotent).
+    #[tokio::test]
+    async fn test_add_partitions_idempotent() {
+        let store = make_store().await;
+        setup_table(
+            &store,
+            "orders",
+            vec![assigned_partition("date", "2024-01-01", "exec1")],
+        )
+        .await;
+
+        let table = TableReference::parse_str("orders");
+
+        // Try to add the same partition again.
+        add_partitions_with_retry(&store, &table, vec![pv("date", "2024-01-01")])
+            .await
+            .expect("should succeed (idempotent)");
+
+        let metadata = store
+            .get_table_metadata(&table)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            metadata.partitions.len(),
+            1,
+            "Duplicate partition should not be added"
+        );
+        assert!(metadata.partitions[0].is_assigned_to("exec1"));
+    }
+}
+     &config,
             AssignmentLimit::PerCycleCap,
         );
         assert_eq!(
