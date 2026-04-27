@@ -53,9 +53,6 @@ pub struct FullTextDatabaseIndex {
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
 
-    // Retained for shared ownership across clones (e.g. `with_new_base`).
-    // Writes go through [`Self::writer`]; reads through [`Self::reader`].
-    pub index: Arc<Mutex<tantivy::Index>>,
     pub writer: Arc<Mutex<tantivy::IndexWriter>>,
     pub reader: tantivy::IndexReader,
 }
@@ -135,7 +132,6 @@ impl FullTextDatabaseIndex {
         Ok(Self {
             base_table: inner,
             search_fields,
-            index: Arc::new(Mutex::new(index)),
             writer: Arc::new(Mutex::new(writer)),
             primary_key: pks,
             reader,
@@ -297,7 +293,6 @@ impl FullTextDatabaseIndex {
         Self {
             search_fields: self.search_fields.clone(),
             primary_key: self.primary_key.clone(),
-            index: Arc::clone(&self.index),
             writer: Arc::clone(&self.writer),
             base_table,
             reader: self.reader.clone(),
