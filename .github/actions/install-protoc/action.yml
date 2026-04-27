@@ -18,10 +18,12 @@ runs:
         TMP=$(mktemp -d)
         curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v${{ inputs.version }}/protoc-${{ inputs.version }}-${P}.zip" -o "${TMP}/protoc.zip"
         unzip -q "${TMP}/protoc.zip" -d "${TMP}/protoc"
-        mkdir -p "${HOME}/.local/bin"
+        mkdir -p "${HOME}/.local/bin" "${HOME}/.local/include"
         cp "${TMP}/protoc/bin/protoc" "${HOME}/.local/bin/protoc"
         chmod +x "${HOME}/.local/bin/protoc"
+        cp -r "${TMP}/protoc/include/." "${HOME}/.local/include/"
         echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+        echo "PROTOC_INCLUDE=${HOME}/.local/include" >> "${GITHUB_ENV}"
 
     - name: Install protoc (macOS)
       if: runner.os == 'macOS'
@@ -31,10 +33,12 @@ runs:
         TMP=$(mktemp -d)
         curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v${{ inputs.version }}/protoc-${{ inputs.version }}-osx-universal_binary.zip" -o "${TMP}/protoc.zip"
         unzip -q "${TMP}/protoc.zip" -d "${TMP}/protoc"
-        mkdir -p "${HOME}/.local/bin"
+        mkdir -p "${HOME}/.local/bin" "${HOME}/.local/include"
         cp "${TMP}/protoc/bin/protoc" "${HOME}/.local/bin/protoc"
         chmod +x "${HOME}/.local/bin/protoc"
+        cp -r "${TMP}/protoc/include/." "${HOME}/.local/include/"
         echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+        echo "PROTOC_INCLUDE=${HOME}/.local/include" >> "${GITHUB_ENV}"
 
     - name: Install protoc (Windows)
       if: runner.os == 'Windows'
@@ -44,6 +48,9 @@ runs:
         Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v${{ inputs.version }}/protoc-${{ inputs.version }}-win64.zip" -OutFile "$tmp\protoc.zip"
         Expand-Archive -Path "$tmp\protoc.zip" -DestinationPath "$tmp\protoc"
         $bin = "$env:USERPROFILE\.local\bin"
-        New-Item -ItemType Directory -Force -Path $bin | Out-Null
+        $inc = "$env:USERPROFILE\.local\include"
+        New-Item -ItemType Directory -Force -Path $bin, $inc | Out-Null
         Copy-Item "$tmp\protoc\bin\protoc.exe" -Destination "$bin\protoc.exe"
+        Copy-Item "$tmp\protoc\include\*" -Destination $inc -Recurse -Force
         echo "$bin" >> $env:GITHUB_PATH
+        echo "PROTOC_INCLUDE=$inc" >> $env:GITHUB_ENV
