@@ -86,5 +86,5 @@ cluster_logs/
 # Insta snapshot artifacts
 *.pending-snap
 
-# Claude worktrees
-.claude/worktrees/
+# Claude local workspace (worktrees, eval results, scratch)
+.claude/
