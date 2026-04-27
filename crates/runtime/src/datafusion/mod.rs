@@ -1368,11 +1368,11 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn table_exists(&self, dataset_name: TableReference) -> bool {
-        let Some(catalog) = self.resolve_catalog_provider(&dataset_name) else {
+    pub fn table_exists(&self, dataset_name: &TableReference) -> bool {
+        let Some(catalog) = self.resolve_catalog_provider(dataset_name) else {
             return false;
         };
-        let Some(s) = Self::resolve_schema_provider(&catalog, &dataset_name) else {
+        let Some(s) = Self::resolve_schema_provider(&catalog, dataset_name) else {
             return false;
         };
         s.table_exist(dataset_name.table())
@@ -2421,7 +2421,7 @@ impl DataFusion {
                     break;
                 }
                 loop {
-                    if !df_ref.table_exists(dependent_table_name.clone()) {
+                    if !df_ref.table_exists(dependent_table_name) {
                         if Instant::now() >= deadline {
                             unresolved_dependent_table = Some(dependent_table_name.clone());
                             break;
