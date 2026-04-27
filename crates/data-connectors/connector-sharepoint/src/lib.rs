@@ -203,6 +203,46 @@ impl Sharepoint {
         {
             params.insert("file_format".to_string(), SecretString::from(ext));
         }
+
+        // Check for a fingerprint collision on the main runtime's RuntimeEnv early,
+        // before building the ListingTable. get_session_context() registers the store
+        // on the main RuntimeEnv (skipping the collision check because it can't return
+        // an error), so a second dataset with different credentials would silently use
+        // the first dataset's GraphClient. Fail here instead with a clear error.
+        //
+        // register_object_stores() is only called on the cluster path, not on the
+        // normal single-node dataset init path, so this is the only place where the
+        // collision is reliably caught in the standard runtime.
+        if let Some(rt) = &self.runtime {
+            let fingerprint = store_fingerprint(&self.params, kind, &config);
+            let key_url = registry_key_for(&store_url);
+            let env_id = Arc::as_ptr(&rt.datafusion().ctx.runtime_env()) as usize;
+            let map_key = (env_id, key_url.clone());
+            let fps = SHAREPOINT_STORE_FINGERPRINTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(existing) = fps.get(&map_key) {
+                if *existing != fingerprint {
+                    return Err(DataConnectorError::InvalidConfiguration {
+                        dataconnector: CONNECTOR_NAME.to_string(),
+                        message: format!(
+                            "A SharePoint object store with different credentials or configuration \
+                             is already registered under '{key_url}'. Two SharePoint datasets with \
+                             different effective config cannot share the same scheme+authority. \
+                             Disambiguate by using a different drive form (e.g. \
+                             sharepoint://sites/{{site-id}} vs sharepoint://drives/{{drive-id}}) \
+                             for one of them, or align the connector params across the datasets."
+                        ),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("registry key '{key_url}' already taken with a different fingerprint"),
+                        )),
+                    });
+                }
+            }
+        }
+
         Ok(SharepointListingConnector {
             client: Arc::clone(&self.client),
             store_url,
@@ -891,40 +931,17 @@ impl ListingTableConnector for SharepointListingConnector {
         // uses when executing queries against the registered ListingTable, so
         // the store lookup at scan time will succeed.
         //
-        // Use the fingerprinted registration (same as register_object_stores) so
-        // a second dataset with different credentials for the same scheme+authority
-        // is caught here rather than silently overwriting the first dataset's store.
+        // Fingerprint collision is checked earlier in listing_connector() which
+        // returns a DataConnectorError on mismatch — by the time we reach here
+        // the store is either already registered with matching config or not yet
+        // registered, so a plain registration is safe.
         if let Some(rt) = &self.runtime {
             let ctx = Arc::clone(&rt.datafusion().ctx);
-            let fingerprint = store_fingerprint(&self.params, self.kind, &self.config);
-            let key_url = registry_key_for(&self.store_url);
-            let env_id = Arc::as_ptr(&ctx.runtime_env()) as usize;
-            let map_key = (env_id, key_url.clone());
-            let mut fps = SHAREPOINT_STORE_FINGERPRINTS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match fps.get(&map_key) {
-                Some(existing) if *existing == fingerprint => {
-                    // Same store already registered — no-op.
-                }
-                Some(_) => {
-                    // Different credentials for same authority — log a warning and
-                    // skip the overwrite. The error will surface properly when
-                    // register_object_stores is called during dataset init.
-                    tracing::warn!(
-                        store_url = %self.store_url,
-                        "Skipping SharePoint object store registration in get_session_context: \
-                         a store with different credentials is already registered under '{key_url}'. \
-                         This conflict will be reported as an error during dataset initialization."
-                    );
-                }
-                None => {
-                    ctx.runtime_env()
-                        .register_object_store(&key_url, self.build_object_store());
-                    fps.insert(map_key, fingerprint);
-                }
-            }
-            drop(fps);
+            register_sharepoint_store_on_fresh(
+                &ctx.runtime_env(),
+                &self.store_url,
+                self.build_object_store(),
+            );
             return (*ctx).clone();
         }
 
