@@ -575,12 +575,15 @@ fn split_prefix(prefix: &Path, kind: Option<DriveKind>) -> (Path, Option<String>
         let parent: Path = parts.iter().map(String::as_str).collect();
         return (parent, None);
     }
-    let last = parts.last().expect("non-empty parts").clone();
-    let parent: Path = parts[..parts.len() - 1]
-        .iter()
-        .map(String::as_str)
-        .collect();
-    (parent, Some(last))
+    let Some((last, head)) = parts.split_last() else {
+        // Unreachable: `parts.len() > reserved_segments >= 0` above
+        // guarantees at least one element, but avoid `expect()` to
+        // satisfy `clippy::expect_used`.
+        let parent: Path = parts.iter().map(String::as_str).collect();
+        return (parent, None);
+    };
+    let parent: Path = head.iter().map(String::as_str).collect();
+    (parent, Some(last.clone()))
 }
 
 fn resolve_range(range: &GetRange, total_size: u64) -> std::ops::Range<u64> {
