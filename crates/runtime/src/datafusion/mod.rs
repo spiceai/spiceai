@@ -2421,7 +2421,7 @@ impl DataFusion {
                     break;
                 }
                 loop {
-                    if df_ref.table_exists(dependent_table_name.clone()) {
+                    if !df_ref.table_exists(dependent_table_name.clone()) {
                         if Instant::now() >= deadline {
                             unresolved_dependent_table = Some(dependent_table_name.clone());
                             break;
