@@ -48,7 +48,6 @@ fn make_request(sql: impl Into<String>) -> SubmitQueryRequest {
         parameters: None,
         timeout_seconds: None,
         maximum_size: None,
-        read_only: false,
     }
 }
 
@@ -228,9 +227,10 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
             );
 
             let result = job_executor
-                .submit(make_request(
-                    "SELECT id, name, age, city, score FROM names ORDER BY id",
-                ))
+                .submit(
+                    make_request("SELECT id, name, age, city, score FROM names ORDER BY id"),
+                    false,
+                )
                 .await
                 .expect("should submit job");
 
