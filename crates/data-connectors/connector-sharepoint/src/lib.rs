@@ -699,6 +699,20 @@ impl DataConnector for Sharepoint {
         )))
     }
 
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
+        if !Self::uses_object_store(dataset) {
+            return None;
+        }
+        let connector = match self.listing_connector(dataset) {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(connector.read_provider(dataset).await)
+    }
+
     async fn metadata_provider(
         &self,
         dataset: &Dataset,
