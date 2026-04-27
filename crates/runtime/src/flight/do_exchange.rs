@@ -137,10 +137,10 @@ async fn initial_snapshot_update(
     })
 }
 
-fn encode_data_update(
-    table_provider: &Arc<dyn TableProvider>,
-    data_update: &DataUpdate,
-) -> impl Stream<Item = Result<FlightData, Status>> + '_ {
+fn encode_data_update<'a>(
+    table_provider: &'a Arc<dyn TableProvider>,
+    data_update: &'a DataUpdate,
+) -> impl Stream<Item = Result<FlightData, Status>> + 'a {
     try_stream! {
         let mut encoder = IpcDataGenerator::default();
         let mut tracker = DictionaryTracker::new(false);
