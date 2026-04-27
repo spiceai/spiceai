@@ -416,7 +416,7 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "f9443aba33172331918845db9b4abcf1a9a3e1fd" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "f9443aba33172331918845db9b4abcf1a9a3e1fd" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "26773b1fcc8ddf416acc0e1202b1be29ced08522" } # spiceai-52
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "d7fae5f0167e2c7e1c7f34fd1e0c54c383c5a1b0" } # spiceai-52
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "e6bcc66785319e08f530b07c2e1fa029ff14a2db" }      # spiceai-52.5
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "e6bcc66785319e08f530b07c2e1fa029ff14a2db" } # spiceai-52.5
