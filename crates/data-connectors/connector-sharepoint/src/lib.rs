@@ -350,7 +350,21 @@ fn store_fingerprint(
     let mut h = DefaultHasher::new();
     params.get("tenant_id").expose().ok().hash(&mut h);
     params.get("client_id").expose().ok().hash(&mut h);
-    params.get("scope").expose().ok().hash(&mut h);
+    // Use the effective scope — same default applied by SharepointAuth — so
+    // a dataset with no scope param and one explicitly setting the default
+    // scope hash identically and are not rejected as a false-positive collision.
+    let effective_scope = params
+        .get("scope")
+        .expose()
+        .ok()
+        .map_or(data_components::sharepoint::auth::DEFAULT_SCOPE, |s| {
+            if s.is_empty() {
+                data_components::sharepoint::auth::DEFAULT_SCOPE
+            } else {
+                s
+            }
+        });
+    effective_scope.hash(&mut h);
     drive_kind.map(|k| format!("{k:?}")).hash(&mut h);
     config.conflict_behavior.hash(&mut h);
     config.max_put_bytes.hash(&mut h);
@@ -935,13 +949,24 @@ impl ListingTableConnector for SharepointListingConnector {
         // returns a DataConnectorError on mismatch — by the time we reach here
         // the store is either already registered with matching config or not yet
         // registered, so a plain registration is safe.
+        //
+        // Record the fingerprint after registering so that listing_connector()'s
+        // collision check can find it on the next dataset — without this the map
+        // stays empty on the single-node path and the check never fires.
         if let Some(rt) = &self.runtime {
             let ctx = Arc::clone(&rt.datafusion().ctx);
-            register_sharepoint_store_on_fresh(
-                &ctx.runtime_env(),
-                &self.store_url,
-                self.build_object_store(),
-            );
+            let key_url = registry_key_for(&self.store_url);
+            let fingerprint = store_fingerprint(&self.params, self.kind, &self.config);
+            let env_id = Arc::as_ptr(&ctx.runtime_env()) as usize;
+            let map_key = (env_id, key_url.clone());
+            let mut fps = SHAREPOINT_STORE_FINGERPRINTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !fps.contains_key(&map_key) {
+                ctx.runtime_env()
+                    .register_object_store(&key_url, self.build_object_store());
+                fps.insert(map_key, fingerprint);
+            }
             return (*ctx).clone();
         }
 
