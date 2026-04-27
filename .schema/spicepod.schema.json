@@ -933,6 +933,15 @@
           "type": "string",
           "default": "none"
         },
+        "captured_context": {
+          "type": "string",
+          "enum": [
+            "redacted",
+            "truncated",
+            "full"
+          ],
+          "default": "truncated"
+        },
         "retention_period": {
           "type": "string",
           "default": "8h"
