@@ -374,8 +374,8 @@ impl AnalyzerRule for DdlAnalyzerRule {
 /// that node. Because the handler is on the node itself, a single instance of
 /// this planner handles every registered catalog type (Cayenne, Iceberg, …).
 ///
-/// Install this alongside a [`CayenneDmlExtensionPlanner`] (or equivalent) for
-/// the full set of extension nodes the runtime produces.
+/// Install this alongside a [`datafusion_dml::DmlExtensionPlanner`] (or
+/// equivalent) for the full set of extension nodes the runtime produces.
 #[derive(Debug, Default)]
 pub struct DdlExtensionPlanner;
 

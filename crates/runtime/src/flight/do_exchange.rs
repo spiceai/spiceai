@@ -34,6 +34,18 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, metrics};
 
+fn flight_data_stream(
+    flights: Vec<FlightData>,
+    error: Option<Status>,
+) -> impl futures::Stream<Item = Result<FlightData, Status>> {
+    stream::iter(
+        flights
+            .into_iter()
+            .map(Ok::<_, Status>)
+            .chain(error.into_iter().map(Err)),
+    )
+}
+
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
@@ -133,15 +145,24 @@ pub(crate) async fn handle(
                         let data_array = StructArray::from(batch.clone());
 
                         let new_schema = Arc::new(changes_schema(schema.as_ref()));
-                        let Ok(new_record_batch) = RecordBatch::try_new(
+                        let new_record_batch = match RecordBatch::try_new(
                             Arc::clone(&new_schema),
                             vec![
                                 Arc::new(op_array),
                                 Arc::new(primary_keys_array),
                                 Arc::new(data_array),
                             ],
-                        ) else {
-                            panic!("Unable to convert record batch into change event")
+                        ) {
+                            Ok(batch) => batch,
+                            Err(err) => {
+                                let output = flight_data_stream(
+                                    Vec::new(),
+                                    Some(Status::internal(format!(
+                                        "Unable to convert record batch into change event: {err}"
+                                    ))),
+                                );
+                                return Some((output, rx));
+                            }
                         };
 
                         if !schema_sent {
@@ -151,13 +172,22 @@ pub(crate) async fn handle(
                             )));
                             schema_sent = true;
                         }
-                        let Ok((flight_dictionaries, flight_batch)) = encoder.encode(
+                        let (flight_dictionaries, flight_batch) = match encoder.encode(
                             &new_record_batch,
                             &mut tracker,
                             &write_options,
                             &mut compression_context,
-                        ) else {
-                            panic!("Unable to encode batch")
+                        ) {
+                            Ok(encoded_batch) => encoded_batch,
+                            Err(err) => {
+                                let output = flight_data_stream(
+                                    Vec::new(),
+                                    Some(Status::internal(format!(
+                                        "Unable to encode batch: {err}"
+                                    ))),
+                                );
+                                return Some((output, rx));
+                            }
                         };
 
                         flights.extend(flight_dictionaries.into_iter().map(Into::into));
@@ -165,12 +195,22 @@ pub(crate) async fn handle(
                     }
 
                     metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
-                    let output = futures::stream::iter(flights.into_iter().map(Ok));
+                    let output = flight_data_stream(flights, None);
 
                     Some((output, rx))
                 }
-                Err(_e) => {
-                    let output = futures::stream::iter(vec![].into_iter().map(Ok));
+                Err(broadcast::error::RecvError::Closed) => None,
+                Err(broadcast::error::RecvError::Lagged(skipped_messages)) => {
+                    tracing::warn!(
+                        skipped_messages,
+                        "DoExchange subscriber lagged and missed one or more updates"
+                    );
+                    let output = flight_data_stream(
+                        Vec::new(),
+                        Some(Status::resource_exhausted(format!(
+                            "DoExchange subscriber fell behind and missed {skipped_messages} update(s); resubscribe and reconcile state"
+                        ))),
+                    );
                     Some((output, rx))
                 }
             }
