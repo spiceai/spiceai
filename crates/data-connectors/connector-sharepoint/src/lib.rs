@@ -852,23 +852,17 @@ impl ListingTableConnector for SharepointListingConnector {
             connector_component: ConnectorComponent::from(dataset),
             source: Box::new(e),
         })?;
-        if parsed.scheme() != "sharepoint" || parsed.host_str().is_none() {
-            return Err(DataConnectorError::InvalidConfiguration {
+        // Validate scheme, authority kind, and structure via SharepointUrl::from_url
+        // so unsupported authority kinds (e.g. sharepoint://unknown/...) fail here
+        // with a clear error rather than later during store construction.
+        data_components::sharepoint::url::SharepointUrl::from_url(&parsed).map_err(|e| {
+            DataConnectorError::InvalidConfiguration {
                 dataconnector: CONNECTOR_NAME.to_string(),
-                message: format!(
-                    "'{url_str}' is not a sharepoint:// URL. Expected scheme 'sharepoint' and a non-empty authority (e.g. sharepoint://me/Documents/file.parquet). See https://spiceai.org/docs/components/data-connectors/sharepoint#from"
-                ),
+                message: format!("{e}"),
                 connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "scheme='{}', authority_present={}",
-                        parsed.scheme(),
-                        parsed.host_str().is_some()
-                    ),
-                )),
-            });
-        }
+                source: Box::new(std::io::Error::other(e.to_string())),
+            }
+        })?;
         Ok(parsed)
     }
 
@@ -896,13 +890,41 @@ impl ListingTableConnector for SharepointListingConnector {
         // SessionContext's RuntimeEnv. That is the same RuntimeEnv DataFusion
         // uses when executing queries against the registered ListingTable, so
         // the store lookup at scan time will succeed.
+        //
+        // Use the fingerprinted registration (same as register_object_stores) so
+        // a second dataset with different credentials for the same scheme+authority
+        // is caught here rather than silently overwriting the first dataset's store.
         if let Some(rt) = &self.runtime {
             let ctx = Arc::clone(&rt.datafusion().ctx);
-            register_sharepoint_store_on_fresh(
-                &ctx.runtime_env(),
-                &self.store_url,
-                self.build_object_store(),
-            );
+            let fingerprint = store_fingerprint(&self.params, self.kind, &self.config);
+            let key_url = registry_key_for(&self.store_url);
+            let env_id = Arc::as_ptr(&ctx.runtime_env()) as usize;
+            let map_key = (env_id, key_url.clone());
+            let mut fps = SHAREPOINT_STORE_FINGERPRINTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match fps.get(&map_key) {
+                Some(existing) if *existing == fingerprint => {
+                    // Same store already registered — no-op.
+                }
+                Some(_) => {
+                    // Different credentials for same authority — log a warning and
+                    // skip the overwrite. The error will surface properly when
+                    // register_object_stores is called during dataset init.
+                    tracing::warn!(
+                        store_url = %self.store_url,
+                        "Skipping SharePoint object store registration in get_session_context: \
+                         a store with different credentials is already registered under '{key_url}'. \
+                         This conflict will be reported as an error during dataset initialization."
+                    );
+                }
+                None => {
+                    ctx.runtime_env()
+                        .register_object_store(&key_url, self.build_object_store());
+                    fps.insert(map_key, fingerprint);
+                }
+            }
+            drop(fps);
             return (*ctx).clone();
         }
 

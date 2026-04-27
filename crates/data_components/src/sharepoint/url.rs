@@ -116,10 +116,18 @@ impl SharepointUrl {
             .path_segments()
             .map(|s| {
                 s.filter(|seg| !seg.is_empty())
-                    .map(|seg| percent_decode_str(seg).decode_utf8_lossy().into_owned())
-                    .collect()
+                    .map(|seg| {
+                        percent_decode_str(seg)
+                            .decode_utf8()
+                            .map(|s| s.into_owned())
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| Ok(vec![]))
+            .map_err(|_| Error::Malformed {
+                url: url.to_string(),
+                reason: "path segment contains invalid UTF-8 after percent-decoding".to_string(),
+            })?;
 
         let (drive, remaining) = match kind {
             "me" => (DriveRef::Me, path_segments.as_slice()),
