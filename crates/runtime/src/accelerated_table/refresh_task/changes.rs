@@ -38,7 +38,7 @@ use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use snafu::{OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -227,15 +227,9 @@ impl RefreshTask {
             );
         }
 
-        if let Some(delete_row_indices) = upsert_pre_delete_rows(change_batch, row_indices) {
-            if delete_row_indices.len() != row_indices.len() {
-                tracing::warn!(
-                    dataset_name = %dataset_name,
-                    skipped_rows = row_indices.len() - delete_row_indices.len(),
-                    "Skipping pre-delete for upsert rows without matching primary keys"
-                );
-            }
-
+        if let Some(delete_row_indices) =
+            upsert_pre_delete_rows(change_batch, row_indices, dataset_name)?
+        {
             self.process_delete_batch(change_batch, &delete_row_indices)
                 .await?;
         }
@@ -359,19 +353,39 @@ impl RefreshTask {
     }
 }
 
-fn upsert_pre_delete_rows(change_batch: &ChangeBatch, row_indices: &[usize]) -> Option<Vec<usize>> {
-    let expected_primary_keys = row_indices
-        .iter()
-        .map(|row_idx| change_batch.primary_keys(*row_idx))
-        .find(|primary_keys| !primary_keys.is_empty())?;
+fn upsert_pre_delete_rows(
+    change_batch: &ChangeBatch,
+    row_indices: &[usize],
+    dataset_name: &str,
+) -> crate::accelerated_table::Result<Option<Vec<usize>>> {
+    let Some(first_row_idx) = row_indices.first() else {
+        return Ok(None);
+    };
 
-    Some(
-        row_indices
-            .iter()
-            .copied()
-            .filter(|row_idx| change_batch.primary_keys(*row_idx) == expected_primary_keys)
-            .collect(),
-    )
+    let expected_primary_keys = change_batch.primary_keys(*first_row_idx);
+    let invalid_row_count = row_indices
+        .iter()
+        .filter(|row_idx| {
+            let primary_keys = change_batch.primary_keys(**row_idx);
+            primary_keys.is_empty() || primary_keys != expected_primary_keys
+        })
+        .count();
+
+    ensure!(
+        !expected_primary_keys.is_empty() && invalid_row_count == 0,
+        crate::accelerated_table::InvalidUpsertPrimaryKeysSnafu {
+            dataset_name: dataset_name.to_string(),
+            reason: if expected_primary_keys.is_empty() {
+                "no usable primary key metadata was available for the upsert rows, so applying append would break upsert semantics".to_string()
+            } else {
+                format!(
+                    "{invalid_row_count} row(s) have missing or inconsistent primary key metadata, so applying append would break upsert semantics"
+                )
+            },
+        }
+    );
+
+    Ok(Some(row_indices.to_vec()))
 }
 
 pub(crate) fn get_primary_key_value(
@@ -1073,7 +1087,23 @@ mod tests {
     }
 
     #[test]
-    fn test_upsert_pre_delete_rows_skips_rows_without_primary_keys() {
+    fn test_upsert_pre_delete_rows_accepts_matching_primary_keys() {
+        let change_batch = create_test_change_batch(
+            vec!["c", "c", "c"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 2, 3],
+            vec![Some("a"), Some("b"), Some("c")],
+        );
+
+        let delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], "test_dataset")
+            .expect("matching primary keys should be valid")
+            .expect("non-empty row indices should return delete rows");
+
+        assert_eq!(delete_rows, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_upsert_pre_delete_rows_rejects_rows_without_primary_keys() {
         let change_batch = create_test_change_batch(
             vec!["c", "c", "c"],
             &[vec!["id"], vec![], vec!["id"]],
@@ -1081,14 +1111,17 @@ mod tests {
             vec![Some("a"), Some("b"), Some("c")],
         );
 
-        let delete_rows =
-            upsert_pre_delete_rows(&change_batch, &[0, 1, 2]).expect("some rows have primary keys");
+        let err = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], "test_dataset")
+            .expect_err("missing primary keys should fail safely");
 
-        assert_eq!(delete_rows, vec![0, 2]);
+        assert!(
+            err.to_string()
+                .contains("1 row(s) have missing or inconsistent primary key metadata")
+        );
     }
 
     #[test]
-    fn test_upsert_pre_delete_rows_skips_rows_with_mismatched_primary_keys() {
+    fn test_upsert_pre_delete_rows_rejects_rows_with_mismatched_primary_keys() {
         let change_batch = create_test_change_batch(
             vec!["c", "c", "c"],
             &[vec!["id"], vec!["id", "name"], vec!["id"]],
@@ -1096,14 +1129,17 @@ mod tests {
             vec![Some("a"), Some("b"), Some("c")],
         );
 
-        let delete_rows =
-            upsert_pre_delete_rows(&change_batch, &[0, 1, 2]).expect("some rows have primary keys");
+        let err = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], "test_dataset")
+            .expect_err("mismatched primary keys should fail safely");
 
-        assert_eq!(delete_rows, vec![0, 2]);
+        assert!(
+            err.to_string()
+                .contains("1 row(s) have missing or inconsistent primary key metadata")
+        );
     }
 
     #[test]
-    fn test_upsert_pre_delete_rows_none_when_no_primary_keys() {
+    fn test_upsert_pre_delete_rows_rejects_batch_without_primary_keys() {
         let change_batch = create_test_change_batch(
             vec!["c", "c"],
             &[vec![], vec![]],
@@ -1111,6 +1147,9 @@ mod tests {
             vec![Some("a"), Some("b")],
         );
 
-        assert!(upsert_pre_delete_rows(&change_batch, &[0, 1]).is_none());
+        let err = upsert_pre_delete_rows(&change_batch, &[0, 1], "test_dataset")
+            .expect_err("upserts without primary keys should fail safely");
+
+        assert!(err.to_string().contains("no usable primary key metadata"));
     }
 }

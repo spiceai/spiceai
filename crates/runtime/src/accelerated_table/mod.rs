@@ -181,6 +181,12 @@ pub enum Error {
     #[snafu(display("Failed to construct data for the accelerated dataset: {source}"))]
     FailedToBuildRecordBatch { source: ArrowError },
 
+    #[snafu(display("Failed to process upsert batch for dataset {dataset_name}: {reason}"))]
+    InvalidUpsertPrimaryKeys {
+        dataset_name: String,
+        reason: String,
+    },
+
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
 }
