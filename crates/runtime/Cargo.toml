@@ -186,8 +186,9 @@ twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = ">=8.1.1", features = [
+utoipa-swagger-ui = { version = "9", features = [
     "axum",
+    "vendored",
 ], optional = true }
 
 gethostname.workspace = true
