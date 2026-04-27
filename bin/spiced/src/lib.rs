@@ -66,11 +66,32 @@ pub async fn register_external_connectors() {
     use runtime::dataconnector::register_connector_factory;
 
     // Always-compiled connectors (no feature gate)
+    register_connector_factory(connector_abfs::CONNECTOR_NAME, connector_abfs::factory()).await;
+    register_connector_factory(connector_file::CONNECTOR_NAME, connector_file::factory()).await;
+    register_connector_factory(connector_gcs::CONNECTOR_NAME, connector_gcs::factory()).await;
+    register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
+    register_connector_factory(
+        connector_github::CONNECTOR_NAME,
+        connector_github::factory(),
+    )
+    .await;
     register_connector_factory(
         connector_graphql::CONNECTOR_NAME,
         connector_graphql::factory(),
     )
     .await;
+    register_connector_factory(connector_https::CONNECTOR_NAME, connector_https::factory()).await;
+    register_connector_factory(
+        connector_iceberg::CONNECTOR_NAME,
+        connector_iceberg::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_memory::CONNECTOR_NAME,
+        connector_memory::factory(),
+    )
+    .await;
+    register_connector_factory(connector_s3::CONNECTOR_NAME, connector_s3::factory()).await;
 
     // Feature-gated connectors
     #[cfg(feature = "clickhouse")]
@@ -190,6 +211,13 @@ pub async fn register_external_connectors() {
 
     #[cfg(feature = "spark")]
     register_connector_factory(connector_spark::CONNECTOR_NAME, connector_spark::factory()).await;
+
+    #[cfg(feature = "cosmosdb")]
+    register_connector_factory(
+        connector_cosmosdb::CONNECTOR_NAME,
+        connector_cosmosdb::factory(),
+    )
+    .await;
 }
 
 #[derive(Debug, Snafu)]

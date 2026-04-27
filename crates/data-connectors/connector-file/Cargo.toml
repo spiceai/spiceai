@@ -1,0 +1,16 @@
+[package]
+name = "connector-file"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Local file system data connector for Spice.ai runtime"
+
+[dependencies]
+async-trait.workspace = true
+notify = "8.2.0"
+runtime = { path = "../../runtime" }
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true

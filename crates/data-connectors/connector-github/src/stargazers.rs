@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dataconnector::ConnectorComponent;
+use runtime::dataconnector::ConnectorComponent;
 
-use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use crate::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::graphql::{GraphQLContext, client::UnnestBehavior};
 use std::sync::Arc;

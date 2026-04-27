@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::github::{Error as GithubError, GithubRestClient};
 use datafusion::{
@@ -42,11 +41,12 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use futures::{TryFutureExt, TryStreamExt};
+use runtime::component::dataset::Dataset;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
-use super::ConnectorComponent;
+use runtime::dataconnector::ConnectorComponent;
 
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowRunFilters {
@@ -207,7 +207,7 @@ impl WorkflowRunsTableProvider {
         workflow_id: &str,
         fetch_logs: bool,
         dataset: &Dataset,
-    ) -> crate::dataconnector::DataConnectorResult<Self> {
+    ) -> runtime::dataconnector::DataConnectorResult<Self> {
         let mut fields = vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
@@ -267,7 +267,7 @@ impl WorkflowRunsTableProvider {
             if e.downcast_ref::<GithubError>()
                 .is_some_and(|err| matches!(err, GithubError::RateLimited { .. }))
             {
-                return Err(super::DataConnectorError::RateLimited {
+                return Err(runtime::dataconnector::DataConnectorError::RateLimited {
                     dataconnector: "github".to_string(),
                     connector_component: component,
                     source: e,
@@ -280,11 +280,13 @@ impl WorkflowRunsTableProvider {
                     "GitHub workflow runs provider initialization for {component} could not validate access because GitHub is temporarily unavailable: {e} The dataset will retry on the next query or refresh."
                 );
             } else {
-                return Err(super::DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: "github".to_string(),
-                    connector_component: component,
-                    source: e,
-                });
+                return Err(
+                    runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "github".to_string(),
+                        connector_component: component,
+                        source: e,
+                    },
+                );
             }
         }
 

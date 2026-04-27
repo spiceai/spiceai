@@ -14,13 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::ComponentType;
-use crate::component::dataset::Dataset;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
-use crate::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
-};
 use async_trait::async_trait;
 use data_components::git::{
     BackoffMethod, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILES,
@@ -30,6 +23,13 @@ use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use opentelemetry::KeyValue;
+use runtime::component::ComponentType;
+use runtime::component::dataset::Dataset;
+use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, ParameterSpec, Parameters,
+};
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -527,7 +527,7 @@ impl DataConnectorFactory for GitFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(Git::new(params.parameters)) as Arc<dyn DataConnector>) })
     }
 
@@ -634,4 +634,11 @@ impl RateLimiter for NoOpRateLimiter {
     }
 }
 
-register_data_connector!("git", GitFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "git";
+
+/// Returns a new instance of the `Git` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    GitFactory::new_arc()
+}

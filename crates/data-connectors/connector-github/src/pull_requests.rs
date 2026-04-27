@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
+use runtime::dataconnector::ConnectorComponent;
 
-use super::{
+use crate::{
     GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams, filter_pushdown, inject_parameters,
     search_inject_parameters,
 };
@@ -93,7 +93,7 @@ impl GraphQLContext for PullRequestTableArgs {
         }
 
         inject_parameters("search", search_inject_parameters, filters, query)
-            .map_err(find_datafusion_root)
+            .map_err(runtime::datafusion::error::find_datafusion_root)
     }
 
     fn error_checker(&self) -> Option<ErrorChecker> {
@@ -553,40 +553,20 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::{PullRequestCommentType, PullRequestTableArgs};
-    use crate::builder::RuntimeBuilder;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::ConnectorComponent;
-    use crate::dataconnector::github::GitHubQueryMode;
-    use app::AppBuilder;
-    use std::sync::{Arc, OnceLock};
-
-    /// Building a `ConnectorComponent` requires a full runtime + app
-    /// construction. Cache a single shared instance so the unit tests don't
-    /// spin up a tokio runtime per invocation.
-    fn shared_component() -> ConnectorComponent {
-        static COMPONENT: OnceLock<ConnectorComponent> = OnceLock::new();
-        COMPONENT
-            .get_or_init(|| {
-                let app = AppBuilder::new("test").build();
-                let runtime = tokio::runtime::Runtime::new().expect("to create tokio runtime");
-                let spice_runtime = runtime.block_on(async { RuntimeBuilder::new().build().await });
-                let dataset = DatasetBuilder::try_new("github".to_string(), "test.pulls")
-                    .expect("to create dataset builder")
-                    .with_app(Arc::new(app))
-                    .with_runtime(Arc::new(spice_runtime))
-                    .build()
-                    .expect("to create dataset");
-                ConnectorComponent::from(&dataset)
-            })
-            .clone()
-    }
+    use crate::GitHubQueryMode;
 
     fn args(include: PullRequestCommentType, max_comments: u32) -> PullRequestTableArgs {
+        use runtime::component::dataset::Dataset;
+        use runtime::dataconnector::ConnectorComponent;
+        let dataset = Dataset::new(
+            "github.com/spiceai/spiceai/pulls".to_string(),
+            "test.pulls".to_string(),
+        );
         PullRequestTableArgs {
             owner: "spiceai".to_string(),
             repo: "spiceai".to_string(),
             query_mode: GitHubQueryMode::Auto,
-            component: shared_component(),
+            component: ConnectorComponent::from(&dataset),
             include_comments: include,
             max_comments_fetched: max_comments,
         }

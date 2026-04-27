@@ -1,0 +1,10 @@
+[package]
+name = "connector-s3"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "S3 data connector for Spice.ai runtime"
+
+[dependencies]
+runtime = { path = "../../runtime" }

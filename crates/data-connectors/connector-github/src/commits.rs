@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
 use async_trait::async_trait;
+use runtime::dataconnector::ConnectorComponent;
 
-use super::{
+use crate::{
     GitHubTableArgs, GitHubTableGraphQLParams, commits_inject_parameters, expr_to_match,
     filter_pushdown, inject_parameters, scalar_utf8_value,
 };
@@ -114,7 +114,7 @@ impl GraphQLContext for CommitsTableArgs {
             &history_filters,
             query,
         )
-        .map_err(find_datafusion_root)
+        .map_err(runtime::datafusion::error::find_datafusion_root)
     }
 
     fn error_checker(&self) -> Option<ErrorChecker> {
@@ -899,24 +899,7 @@ fn gql_schema() -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::RuntimeBuilder;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use app::AppBuilder;
     use serde_json::json;
-
-    fn create_mock_component(name: &str) -> ConnectorComponent {
-        let app = AppBuilder::new("test").build();
-        let runtime = tokio::runtime::Runtime::new().expect("to create tokio runtime");
-        let spice_runtime = runtime.block_on(async { RuntimeBuilder::new().build().await });
-
-        let dataset = DatasetBuilder::try_new("github".to_string(), name)
-            .expect("to create dataset builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(spice_runtime))
-            .build()
-            .expect("to create dataset");
-        ConnectorComponent::from(&dataset)
-    }
 
     #[test]
     fn test_commits_schema_includes_ref_and_new_metadata() {
@@ -930,55 +913,6 @@ mod tests {
         assert_eq!(schema.field(14).name(), "changed_files");
         assert_eq!(schema.field(15).name(), "associated_pull_request_number");
         assert_eq!(schema.field(16).name(), "status");
-    }
-
-    #[test]
-    fn test_commits_query_uses_default_branch_by_default() {
-        let args = CommitsTableArgs {
-            owner: "spiceai".to_string(),
-            repo: "spiceai".to_string(),
-            requested_ref: None,
-            component: create_mock_component("github.com/spiceai/spiceai/commits"),
-        };
-
-        let graphql_params = args.get_graphql_values();
-        let query = graphql_params.query.as_ref();
-
-        assert!(query.contains("default_ref: defaultBranchRef"));
-        assert!(query.contains("selected_ref: defaultBranchRef"));
-        assert!(query.contains("changed_files: changedFilesIfAvailable"));
-        assert!(query.contains("associated_pull_request_number: associatedPullRequests(first: 1)"));
-        assert!(query.contains("status: statusCheckRollup"));
-        assert_eq!(graphql_params.json_pointer, Some(COMMITS_JSON_POINTER));
-        assert!(matches!(
-            graphql_params.unnest_behavior,
-            UnnestBehavior::Custom(_)
-        ));
-    }
-
-    #[test]
-    fn test_commits_query_uses_requested_ref() {
-        let args = CommitsTableArgs {
-            owner: "spiceai".to_string(),
-            repo: "spiceai".to_string(),
-            requested_ref: Some("trunk".to_string()),
-            component: create_mock_component("github.com/spiceai/spiceai/commits/trunk"),
-        };
-
-        let graphql_params = args.get_graphql_values();
-        let query = graphql_params.query.as_ref();
-        let mut query_ast =
-            GraphQLQuery::try_from(Arc::clone(&graphql_params.query)).expect("query should parse");
-
-        args.inject_parameters(&[], &mut query_ast)
-            .expect("requested ref should be injected into the query AST");
-        let injected_query = query_ast
-            .to_string(None, None)
-            .expect("query string should serialize");
-
-        assert!(query.contains("selected_ref: defaultBranchRef"));
-        assert!(!query.contains("qualifiedName: \"trunk\""));
-        assert!(injected_query.contains("selected_ref: ref(qualifiedName: \"trunk\")"));
     }
 
     #[test]

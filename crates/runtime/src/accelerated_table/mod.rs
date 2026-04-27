@@ -1044,6 +1044,11 @@ impl AcceleratedTable {
         }
     }
 
+    /// Registers a background task to be aborted when this table is dropped.
+    pub fn add_background_handler(&mut self, handle: JoinHandle<()>) {
+        self.handlers.push(handle);
+    }
+
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
         if let Some(refresh_trigger) = self.refresh_trigger() {
             refresh_trigger

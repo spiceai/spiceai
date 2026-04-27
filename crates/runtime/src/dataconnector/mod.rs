@@ -23,8 +23,8 @@ use crate::component::metrics::MetricsProvider;
 use crate::component::metrics::MetricsProviderComponent;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
-use crate::parameters::ParameterSpec;
-use crate::parameters::Parameters;
+pub use crate::parameters::ParameterSpec;
+pub use crate::parameters::Parameters;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
@@ -147,36 +147,26 @@ macro_rules! register_data_connector {
     };
 }
 
-pub mod abfs;
 #[cfg(feature = "adbc")]
 pub mod adbc;
-#[cfg(feature = "cosmosdb")]
-pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
-pub mod file;
-
-pub mod git;
-pub mod github;
-pub mod https;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod localpod;
-pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
-pub mod gcs;
 pub mod glue;
-pub mod iceberg;
 pub mod parameters;
 pub mod s3;
 pub mod sink;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum DataConnectorError {
     #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
     UnableToConnectInternal {

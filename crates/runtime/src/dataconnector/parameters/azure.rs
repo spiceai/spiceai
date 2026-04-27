@@ -50,7 +50,7 @@ pub enum Error {
 }
 
 /// Validates and normalizes Azure endpoint configuration.
-pub(crate) struct AzureEndpointValidator;
+pub struct AzureEndpointValidator;
 
 #[async_trait]
 impl Validator for AzureEndpointValidator {
@@ -86,7 +86,7 @@ impl Validator for AzureEndpointValidator {
 }
 
 /// Validates required Azure account parameter.
-pub(crate) struct AzureAccountValidator;
+pub struct AzureAccountValidator;
 
 #[async_trait]
 impl Validator for AzureAccountValidator {
@@ -110,7 +110,7 @@ impl Validator for AzureAccountValidator {
 
 /// Validates Azure authentication configuration.
 /// Ensures only one authentication method is used and validates completeness.
-pub(crate) struct AzureAuthValidator;
+pub struct AzureAuthValidator;
 
 #[async_trait]
 impl Validator for AzureAuthValidator {
@@ -209,7 +209,7 @@ impl Validator for AzureAuthValidator {
 }
 
 /// Normalizes SAS token by stripping leading '?' if present.
-pub(crate) struct AzureSasTokenNormalizer;
+pub struct AzureSasTokenNormalizer;
 
 #[async_trait]
 impl Validator for AzureSasTokenNormalizer {

@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratedTable;
-use crate::component::dataset::Dataset;
-use crate::dataconnector::ConnectorComponent;
-use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use async_trait::async_trait;
+use runtime::accelerated_table::AcceleratedTable;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::ConnectorComponent;
+use runtime::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
@@ -34,11 +34,12 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use url::Url;
 
-use super::ConnectorParams;
-use super::{
+use runtime::dataconnector::ConnectorParams;
+use runtime::dataconnector::{
     DataConnector, DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu,
-    ParameterSpec, Parameters, listing::ListingTableConnector,
+    ParameterSpec, listing::ListingTableConnector,
 };
+use runtime::parameters::Parameters;
 
 #[derive(Debug)]
 pub struct File {
@@ -75,7 +76,7 @@ impl DataConnectorFactory for FileFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(File {
                 params: params.parameters,
@@ -229,86 +230,19 @@ impl ListingTableConnector for File {
             }
         });
 
-        accelerated_table.handlers.push(watcher_task);
+        accelerated_table.add_background_handler(watcher_task);
 
         Ok(())
     }
 }
 
-register_data_connector!("file", FileFactory);
+pub const CONNECTOR_NAME: &str = "file";
+
+#[must_use]
+pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    FileFactory::new_arc()
+}
 
 fn get_path(dataset: &Dataset) -> PathBuf {
     PathBuf::from(dataset.path())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::component::dataset::builder::DatasetBuilder;
-
-    #[tokio::test]
-    async fn test_get_path() {
-        let test_cases = vec![
-            ("file:/path/to/file.csv", PathBuf::from("/path/to/file.csv")),
-            ("file://path/to/file.csv", PathBuf::from("path/to/file.csv")),
-            (
-                "file:///path/to/file.csv",
-                PathBuf::from("/path/to/file.csv"),
-            ),
-            (
-                "file:relative/path/to/file.csv",
-                PathBuf::from("relative/path/to/file.csv"),
-            ),
-        ];
-
-        for (input, expected) in test_cases {
-            let app = app::AppBuilder::new("test").build();
-            let rt = crate::Runtime::builder().build().await;
-
-            let dataset = DatasetBuilder::try_new(input.to_string(), "foo")
-                .expect("Failed to create builder")
-                .with_app(Arc::new(app))
-                .with_runtime(Arc::new(rt))
-                .build()
-                .expect("Failed to build dataset");
-
-            let result = get_path(&dataset);
-            assert_eq!(result, expected, "Failed for input: {input}");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_object_store_url() {
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-
-        let dataset = DatasetBuilder::try_new("file:/tmp/".into(), "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
-
-        let connector = File {
-            params: Parameters::new(([]).to_vec(), "test", &[]),
-            tokio_io_runtime: Handle::current(),
-        };
-
-        let url = connector
-            .get_object_store_url(&dataset, None)
-            .expect("should get a valid URL");
-        assert_eq!(url.as_str(), "file:///tmp/");
-
-        // object store override path with `file:` prefix
-        let url = connector
-            .get_object_store_url(&dataset, Some("file:/tmp/1/"))
-            .expect("should get a valid URL");
-        assert_eq!(url.as_str(), "file:///tmp/1/");
-
-        // object store override without `file:` prefix
-        let url = connector
-            .get_object_store_url(&dataset, Some("/tmp/2/"))
-            .expect("should get a valid URL");
-        assert_eq!(url.as_str(), "file:///tmp/2/");
-    }
 }

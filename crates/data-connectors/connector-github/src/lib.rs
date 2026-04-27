@@ -14,14 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dataconnector::github::pull_requests::PullRequestCommentType;
-use crate::token_providers::github_app_token::GitHubAppTokenProvider;
-use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
+use crate::commits::{CommitsTableArgs, CommitsTableProvider};
+use crate::issues::IssuesTableArgs;
+use crate::members::MembersTableArgs;
+use crate::projects::ProjectsTableArgs;
+use crate::pull_requests::PullRequestCommentType;
+use crate::pull_requests::PullRequestTableArgs;
+use crate::rate_limit::GitHubRateLimiter;
+use crate::stargazers::StargazersTableArgs;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
-use commits::{CommitsTableArgs, CommitsTableProvider};
 use data_components::graphql::client::UnnestBehavior;
 use data_components::{
     github::{self, GithubFilesTableProvider, GithubRestClient},
@@ -46,14 +50,11 @@ use governor::Quota;
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
-use issues::IssuesTableArgs;
-use projects::ProjectsTableArgs;
-use pull_requests::PullRequestTableArgs;
-use rate_limit::GitHubRateLimiter;
+use runtime::component::dataset::Dataset;
+use runtime::token_providers::github_app_token::GitHubAppTokenProvider;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerBuilder};
 use secrecy::ExposeSecret;
 use snafu::ResultExt;
-use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::LazyLock;
@@ -62,20 +63,20 @@ use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
 
-use super::{
+use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters,
 };
 
-mod commits;
-mod issues;
-mod members;
-mod projects;
-mod pull_requests;
-mod rate_limit;
-mod stargazers;
-mod workflow_runs;
-mod workflows;
+pub mod commits;
+pub mod issues;
+pub mod members;
+pub mod projects;
+pub mod pull_requests;
+pub mod rate_limit;
+pub mod stargazers;
+pub mod workflow_runs;
+pub mod workflows;
 
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -439,7 +440,7 @@ impl Github {
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         self.build_gql_table_provider(table_args, context, health_check_query_string)
             .await
             .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
@@ -450,11 +451,11 @@ impl Github {
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
-    ) -> super::DataConnectorResult<GraphQLTableProvider> {
+    ) -> runtime::dataconnector::DataConnectorResult<GraphQLTableProvider> {
         let connector_component_name = format!("{}", table_args.get_component());
         let graphql_values = table_args.get_graphql_values();
         let client = self.create_graphql_client(&table_args).await.context(
-            super::UnableToGetReadProviderSnafu {
+            runtime::dataconnector::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: table_args.get_component(),
             },
@@ -496,7 +497,7 @@ impl Github {
             );
 
             let fallback_client = self.create_graphql_client(&table_args).await.context(
-                super::UnableToGetReadProviderSnafu {
+                runtime::dataconnector::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: table_args.get_component(),
                 },
@@ -563,13 +564,13 @@ impl Github {
         repo: &str,
         requested_ref: Option<&str>,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = self
-            .create_rest_client()
-            .context(super::UnableToGetReadProviderSnafu {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
+        let client = self.create_rest_client().context(
+            runtime::dataconnector::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-            })?;
+            },
+        )?;
 
         let include = match self.params.get("include").expose().ok() {
             Some(pattern) => Some(parse_globs(&ConnectorComponent::from(dataset), pattern)?),
@@ -616,7 +617,7 @@ impl Github {
         repo: &str,
         requested_ref: Option<&str>,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_args = Arc::new(CommitsTableArgs {
             owner: owner.to_string(),
             repo: repo.to_string(),
@@ -637,12 +638,12 @@ impl Github {
         let client = delegate_provider.client();
         let delegate = Arc::new(delegate_provider) as Arc<dyn TableProvider>;
 
-        let rest_client =
-            self.create_rest_client()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "github".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
+        let rest_client = self.create_rest_client().context(
+            runtime::dataconnector::UnableToGetReadProviderSnafu {
+                dataconnector: "github".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        )?;
 
         Ok(Arc::new(CommitsTableProvider::new(
             delegate,
@@ -780,7 +781,7 @@ impl DataConnectorFactory for GithubFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         let token = params.parameters.get("token").ok().cloned();
         let client_id = params
             .parameters
@@ -865,8 +866,6 @@ impl DataConnectorFactory for GithubFactory {
         PARAMETERS
     }
 }
-
-register_data_connector!("github", GithubFactory);
 
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) enum GitHubQueryMode {
@@ -989,7 +988,7 @@ impl DataConnector for Github {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path().to_string();
 
         // Parse owner, repo, and resource type from the path for validation
@@ -1156,7 +1155,7 @@ impl DataConnector for Github {
             ("workflows", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "workflows", &component);
 
-                let client = self.create_rest_client().context(super::UnableToGetReadProviderSnafu {
+                let client = self.create_rest_client().context(runtime::dataconnector::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: component.clone(),
                 })?;
@@ -1281,28 +1280,30 @@ impl DataConnector for Github {
 pub fn parse_globs(
     component: &ConnectorComponent,
     input: &str,
-) -> super::DataConnectorResult<Arc<GlobSet>> {
+) -> runtime::dataconnector::DataConnectorResult<Arc<GlobSet>> {
     let patterns: Vec<&str> = input.split(&[',', ';'][..]).collect();
     let mut builder = GlobSetBuilder::new();
 
     for pattern in patterns {
         let trimmed_pattern = pattern.trim();
         if !trimmed_pattern.is_empty() {
-            builder.add(
-                Glob::new(trimmed_pattern).context(super::InvalidGlobPatternSnafu {
+            builder.add(Glob::new(trimmed_pattern).context(
+                runtime::dataconnector::InvalidGlobPatternSnafu {
                     pattern,
                     dataconnector: "github".to_string(),
                     connector_component: component.clone(),
-                })?,
-            );
+                },
+            )?);
         }
     }
 
-    let glob_set = builder.build().context(super::InvalidGlobPatternSnafu {
-        pattern: input,
-        dataconnector: "github".to_string(),
-        connector_component: component.clone(),
-    })?;
+    let glob_set = builder
+        .build()
+        .context(runtime::dataconnector::InvalidGlobPatternSnafu {
+            pattern: input,
+            dataconnector: "github".to_string(),
+            connector_component: component.clone(),
+        })?;
     Ok(Arc::new(glob_set))
 }
 
@@ -1807,4 +1808,13 @@ mod tests {
         assert_eq!(parsed.resource_type, "files");
         assert!(parsed.remaining.is_none());
     }
+}
+
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "github";
+
+/// Returns a new instance of the `Github` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    GithubFactory::new_arc()
 }

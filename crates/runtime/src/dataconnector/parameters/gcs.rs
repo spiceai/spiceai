@@ -29,7 +29,7 @@ pub enum Error {
 
 /// Validates GCS authentication configuration.
 /// Ensures only one authentication method is used.
-pub(crate) struct GcsAuthValidator;
+pub struct GcsAuthValidator;
 
 #[async_trait]
 impl Validator for GcsAuthValidator {

@@ -2,7 +2,7 @@
 Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this Https except in compliance with the License.
+you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
      https://www.apache.org/licenses/LICENSE-2.0
@@ -32,8 +32,8 @@ use util::concat_arrays;
 #[cfg(feature = "iceberg-write")]
 use iceberg::NamespaceIdent;
 
-use super::DataConnectorFactory;
-use crate::{
+use runtime::dataconnector::DataConnectorFactory;
+use runtime::{
     catalogconnector::iceberg::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
         parse_hadoop_table_url, parse_table_url, s3_scheme_from_url, verify_s3_endpoint,
@@ -75,7 +75,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     { HADOOP_PARAM_LEN + ICEBERG_PARAM_LEN },
 >(
     HADOOP_PARAMETERS,
-    crate::catalogconnector::iceberg::PARAMETERS,
+    runtime::catalogconnector::iceberg::PARAMETERS,
 );
 
 impl DataConnectorFactory for IcebergDataConnectorFactory {
@@ -86,7 +86,7 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let iceberg = IcebergDataConnector {
                 params: params.parameters,
@@ -131,7 +131,7 @@ impl IcebergDataConnector {
     async fn create_iceberg_table_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let parts = self.create_iceberg_table_parts(dataset).await?;
         Ok(parts.provider)
     }
@@ -141,7 +141,7 @@ impl IcebergDataConnector {
     async fn create_iceberg_table_parts(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<IcebergTableParts> {
+    ) -> runtime::dataconnector::DataConnectorResult<IcebergTableParts> {
         let source = dataset.path();
 
         let mut props = HashMap::new();
@@ -291,7 +291,7 @@ impl IcebergDataConnector {
         dataset: &Dataset,
         source: &str,
         metadata_mode: MetadataMode,
-    ) -> super::DataConnectorResult<IcebergTableParts> {
+    ) -> runtime::dataconnector::DataConnectorResult<IcebergTableParts> {
         let (base_uri, namespace, table_name) = parse_hadoop_table_url(source, None).map_err(|e| {
                 Error::InvalidConfiguration {
                     dataconnector: "iceberg".into(),
@@ -321,12 +321,14 @@ impl IcebergDataConnector {
         });
 
         // Build an opendal operator for directory listing (scoped to the warehouse root, not the table URL)
-        let operator = crate::catalogconnector::iceberg::build_opendal_operator(&base_uri, &props)
-            .map_err(|e| Error::UnableToGetReadProvider {
-                dataconnector: "iceberg".into(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: e,
-            })?;
+        let operator = runtime::catalogconnector::iceberg::build_opendal_operator(
+            &base_uri, &props,
+        )
+        .map_err(|e| Error::UnableToGetReadProvider {
+            dataconnector: "iceberg".into(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: e,
+        })?;
 
         let catalog_builder = HadoopCatalogBuilder::default()
             .with_warehouse_root(base_uri)
@@ -378,7 +380,7 @@ impl DataConnector for IcebergDataConnector {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         self.create_iceberg_table_provider(dataset).await
     }
 
@@ -386,7 +388,7 @@ impl DataConnector for IcebergDataConnector {
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Create the table parts which include catalog + identity for delete support
         let parts = match self.create_iceberg_table_parts(dataset).await {
             Ok(parts) => parts,
@@ -404,4 +406,9 @@ impl DataConnector for IcebergDataConnector {
     }
 }
 
-register_data_connector!("iceberg", IcebergDataConnectorFactory);
+pub const CONNECTOR_NAME: &str = "iceberg";
+
+#[must_use]
+pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    IcebergDataConnectorFactory::new_arc()
+}

@@ -39,15 +39,15 @@ use datafusion_table_providers::UnsupportedTypeAction as DFUnsupportedTypeAction
 use opentelemetry::KeyValue;
 use tokio::sync::Semaphore;
 
-use super::{
+use runtime::component::ComponentType;
+use runtime::component::dataset::Dataset;
+use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters,
 };
-use crate::component::ComponentType;
-use crate::component::dataset::Dataset;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime::parameters::ParameterSpec;
 
-const CONNECTOR_NAME: &str = "cosmosdb";
+pub const CONNECTOR_NAME: &str = "cosmosdb";
 
 /// Semaphore paired with the numeric limit it was constructed with, so
 /// mismatches across datasets targeting the same Cosmos account can be
@@ -152,7 +152,7 @@ impl MetricsProvider for CosmosDBMetricsProvider {
 
 #[derive(Debug)]
 pub struct CosmosDB {
-    params: Parameters,
+    params: runtime::parameters::Parameters,
     /// Drives the `inflight_operations` metric gauge. Instantiated per
     /// connector (one per dataset), so the exported value reflects in-flight
     /// operations for that dataset rather than a shared per-account budget —
@@ -220,7 +220,7 @@ impl DataConnectorFactory for CosmosDBFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         let unsupported_type_action = params.unsupported_type_action;
         Box::pin(async move {
             let conn = CosmosDB {
@@ -470,7 +470,10 @@ impl DataConnector for CosmosDB {
     }
 }
 
-register_data_connector!("cosmosdb", CosmosDBFactory);
+#[must_use]
+pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    CosmosDBFactory::new_arc()
+}
 
 #[cfg(test)]
 mod tests {

@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::listing::{ListingTableConnector, build_fragments};
-use super::{
+use runtime::dataconnector::listing::{ListingTableConnector, build_fragments};
+use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, ParameterSpec, Parameters,
     parameters::{
@@ -27,10 +27,10 @@ use super::{
     },
 };
 
-use crate::{
+use datafusion::parquet::arrow::async_reader::ObjectVersionType;
+use runtime::{
     Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
 };
-use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -44,7 +44,14 @@ use url::Url;
 static PREFIX: &str = "abfs";
 
 static VALIDATORS: LazyLock<
-    Vec<Box<dyn Validator<Error = super::parameters::azure::Error> + Send + Sync + 'static>>,
+    Vec<
+        Box<
+            dyn Validator<Error = runtime::dataconnector::parameters::azure::Error>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >,
 > = LazyLock::new(|| {
     vec![
         Box::new(AzureSasTokenNormalizer),
@@ -207,7 +214,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
     fn create(
         &self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         // Validate versioning parameter early
         if let Some(versioning) = params.parameters.get("versioning").expose().ok()
             && !matches!(versioning, "enabled" | "disabled")
@@ -281,7 +288,7 @@ impl ListingTableConnector for AzureBlobFS {
         let mut azure_url =
             Url::parse(url)
                 .boxed()
-                .context(super::InvalidConfigurationSnafu {
+                .context(runtime::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
@@ -386,109 +393,11 @@ impl ListingTableConnector for AzureBlobFS {
     }
 }
 
-register_data_connector!(
-    register_abfs_connector,
-    REGISTER_ABFS_CONNECTOR,
-    "abfs",
-    AzureBlobFSFactory
-);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "abfs";
 
-register_data_connector!(
-    register_abfss_connector,
-    REGISTER_ABFSS_CONNECTOR,
-    "abfss",
-    AzureBlobFSFactory
-);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dataconnector::listing::ListingTableConnector;
-    use crate::parameters::ParameterSpec;
-    use datafusion::parquet::arrow::async_reader::ObjectVersionType;
-    use datafusion_table_providers::util::secrets::to_secret_map;
-    use std::collections::HashMap;
-
-    const TEST_PARAMETERS: &[ParameterSpec] = &[
-        ParameterSpec::component("account").secret(),
-        ParameterSpec::component("versioning").default("disabled"),
-        ParameterSpec::component("use_cli").is_boolean(),
-        ParameterSpec::component("msi_endpoint").secret(),
-        ParameterSpec::component("client_id").secret(),
-        ParameterSpec::component("sas_string").secret(),
-    ];
-
-    fn create_test_connector(
-        params: HashMap<String, String>,
-        handle: tokio::runtime::Handle,
-    ) -> AzureBlobFS {
-        AzureBlobFS {
-            params: Parameters::new(
-                to_secret_map(params).into_iter().collect(),
-                "abfs",
-                TEST_PARAMETERS,
-            ),
-            runtime: None,
-            tokio_io_runtime: handle,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_object_versioning_type_disabled_by_default() {
-        let connector = create_test_connector(HashMap::new(), tokio::runtime::Handle::current());
-        assert!(connector.object_versioning_type().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_object_versioning_type_explicitly_disabled() {
-        let connector = create_test_connector(
-            [("versioning".to_string(), "disabled".to_string())].into(),
-            tokio::runtime::Handle::current(),
-        );
-        assert!(connector.object_versioning_type().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_object_versioning_type_enabled() {
-        let connector = create_test_connector(
-            [("versioning".to_string(), "enabled".to_string())].into(),
-            tokio::runtime::Handle::current(),
-        );
-        assert_eq!(
-            connector.object_versioning_type(),
-            Some(ObjectVersionType::Version)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_display_format() {
-        let connector = create_test_connector(HashMap::new(), tokio::runtime::Handle::current());
-        assert_eq!(format!("{connector}"), "abfs");
-    }
-
-    #[tokio::test]
-    async fn test_get_runtime_returns_none_when_not_set() {
-        let connector = create_test_connector(HashMap::new(), tokio::runtime::Handle::current());
-        assert!(connector.get_runtime().is_none());
-    }
-
-    #[test]
-    fn test_factory_prefix() {
-        let factory = AzureBlobFSFactory::new();
-        assert_eq!(factory.prefix(), "abfs");
-    }
-
-    #[test]
-    fn test_factory_parameters_includes_versioning() {
-        let factory = AzureBlobFSFactory::new();
-        let params = factory.parameters();
-        assert!(params.iter().any(|p| p.name == "versioning"));
-    }
-
-    #[test]
-    fn test_factory_parameters_includes_client_timeout() {
-        let factory = AzureBlobFSFactory::new();
-        let params = factory.parameters();
-        assert!(params.iter().any(|p| p.name == "client_timeout"));
-    }
+/// Returns a new instance of the `AzureBlobFS` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    AzureBlobFSFactory::new_arc()
 }

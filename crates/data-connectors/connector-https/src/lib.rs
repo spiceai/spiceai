@@ -2,7 +2,7 @@
 Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this Https except in compliance with the License.
+you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
      https://www.apache.org/licenses/LICENSE-2.0
@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
-use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
-use crate::dataconnector::listing::{
+use runtime::component::dataset::Dataset;
+use runtime::component::dataset::acceleration::RefreshMode;
+use runtime::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
+use runtime::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
 };
 
@@ -36,17 +36,17 @@ use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
 use url::Url;
 
-use super::{ConnectorComponent, ConnectorParams};
-use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult, ParameterSpec,
-    Parameters,
-};
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use reqwest::{
     Client,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
+use runtime::dataconnector::{ConnectorComponent, ConnectorParams};
+use runtime::dataconnector::{
+    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult,
+};
+use runtime::parameters::{ParameterSpec, Parameters};
 use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
@@ -1014,7 +1014,7 @@ impl DataConnectorFactory for HttpsFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(Https {
                 params: params.parameters,
@@ -1124,371 +1124,9 @@ impl ListingTableConnector for HttpListingConnector {
     }
 }
 
-register_data_connector!(
-    register_http_connector,
-    REGISTER_HTTP_CONNECTOR,
-    "http",
-    HttpsFactory
-);
-register_data_connector!(
-    register_https_connector,
-    REGISTER_HTTPS_CONNECTOR,
-    "https",
-    HttpsFactory
-);
+pub const CONNECTOR_NAME: &str = "https";
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::component::dataset::acceleration::Acceleration;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::parameters::Parameters;
-    use crate::secrets::Secrets;
-    use app::AppBuilder;
-    use secrecy::SecretString;
-    use tokio::sync::RwLock;
-
-    async fn test_connector(file_format: Option<&str>) -> Https {
-        let extra: Vec<(&str, &str)> = match file_format {
-            Some(f) => vec![("file_format", f)],
-            None => Vec::new(),
-        };
-        test_connector_with(&extra).await
-    }
-
-    async fn test_connector_with(extra: &[(&str, &str)]) -> Https {
-        let mut params: Vec<(String, SecretString)> = vec![
-            ("client_timeout".to_string(), "1".to_string().into()),
-            ("connect_timeout".to_string(), "1".to_string().into()),
-        ];
-
-        for (k, v) in extra {
-            params.push(((*k).to_string(), (*v).to_string().into()));
-        }
-
-        let params = Parameters::try_new(
-            "connector https",
-            params,
-            "http",
-            Arc::new(RwLock::new(Secrets::default())),
-            &PARAMETERS,
-        )
-        .await
-        .expect("test connector parameters should be valid");
-
-        Https { params }
-    }
-
-    async fn test_dataset(
-        from: &str,
-        refresh_mode: RefreshMode,
-        refresh_sql: Option<&str>,
-    ) -> Dataset {
-        let app = Arc::new(AppBuilder::new("test").build());
-        let runtime = Arc::new(crate::Runtime::builder().build().await);
-
-        let mut dataset = DatasetBuilder::try_new(from.to_string(), "http_test")
-            .expect("dataset builder should be created")
-            .with_app(app)
-            .with_runtime(runtime)
-            .build()
-            .expect("dataset should build");
-
-        dataset.acceleration = Some(Acceleration {
-            enabled: true,
-            refresh_mode: Some(refresh_mode),
-            refresh_sql: refresh_sql.map(std::string::ToString::to_string),
-            ..Default::default()
-        });
-
-        dataset
-    }
-
-    fn assert_invalid_url_error(error: DataConnectorError) {
-        match error {
-            DataConnectorError::InvalidConfiguration { message, .. } => {
-                assert!(
-                    message.contains("not a valid URL"),
-                    "expected invalid URL error, got: {message}"
-                );
-            }
-            other => panic!("expected invalid URL error, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_http_full_refresh_requires_refresh_sql_for_unstructured_endpoints() {
-        let connector = test_connector(None).await;
-        let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
-
-        let error = connector
-            .read_provider(&dataset)
-            .await
-            .expect_err("full refresh without refresh_sql should be rejected");
-
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("requires 'refresh_sql'"),
-                    "expected refresh_sql validation error, got: {message}"
-                );
-            }
-            other => panic!("expected refresh_sql validation error, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_http_append_refresh_without_refresh_sql_reaches_provider_validation() {
-        let connector = test_connector(None).await;
-        let dataset = test_dataset("not a url", RefreshMode::Append, None).await;
-
-        let error = connector
-            .read_provider(&dataset)
-            .await
-            .expect_err("append mode should continue to provider validation");
-
-        assert_invalid_url_error(error);
-    }
-
-    #[tokio::test]
-    async fn test_http_caching_refresh_without_refresh_sql_reaches_provider_validation() {
-        let connector = test_connector(None).await;
-        let dataset = test_dataset("not a url", RefreshMode::Caching, None).await;
-
-        let error = connector
-            .read_provider(&dataset)
-            .await
-            .expect_err("caching mode should continue to provider validation");
-
-        assert_invalid_url_error(error);
-    }
-
-    #[tokio::test]
-    async fn test_http_structured_full_refresh_without_refresh_sql_bypasses_json_validation() {
-        let connector = test_connector(Some("csv")).await;
-        let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
-
-        let error = connector
-            .read_provider(&dataset)
-            .await
-            .expect_err("structured formats should bypass JSON refresh_sql validation");
-
-        assert_invalid_url_error(error);
-    }
-
-    #[tokio::test]
-    async fn resolve_refresh_token_auth_returns_none_when_unset() {
-        let connector = test_connector(None).await;
-        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-
-        let result = connector
-            .resolve_refresh_token_auth(&dataset)
-            .expect("no auth params should yield Ok(None)");
-        assert!(
-            result.is_none(),
-            "expected None when no auth params are configured"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_refresh_token_auth_rejects_refresh_token_without_url() {
-        let connector = test_connector_with(&[("http_auth_refresh_token", "rt-only")]).await;
-        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-
-        let error = connector
-            .resolve_refresh_token_auth(&dataset)
-            .expect_err("refresh token without token URL should be rejected");
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("auth_token_url"),
-                    "expected error to mention auth_token_url, got: {message}"
-                );
-                assert!(
-                    message.contains("http_auth_refresh_token"),
-                    "error should reference the prefixed user-facing name, got: {message}"
-                );
-            }
-            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_refresh_token_auth_rejects_url_without_refresh_token() {
-        let connector =
-            test_connector_with(&[("auth_token_url", "https://example.com/oauth/token")]).await;
-        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-
-        let error = connector
-            .resolve_refresh_token_auth(&dataset)
-            .expect_err("token URL without refresh token should be rejected");
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("http_auth_refresh_token"),
-                    "expected error to mention http_auth_refresh_token, got: {message}"
-                );
-            }
-            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_refresh_token_auth_rejects_secret_without_client_id() {
-        let connector = test_connector_with(&[
-            ("auth_token_url", "https://example.com/oauth/token"),
-            ("http_auth_refresh_token", "rt"),
-            ("http_auth_client_secret", "csec"),
-        ])
-        .await;
-        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-
-        let error = connector
-            .resolve_refresh_token_auth(&dataset)
-            .expect_err("client_secret without client_id should be rejected");
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("http_auth_client_id"),
-                    "expected error to mention http_auth_client_id, got: {message}"
-                );
-                assert!(
-                    message.contains("http_auth_client_secret"),
-                    "expected error to mention http_auth_client_secret, got: {message}"
-                );
-            }
-            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_refresh_token_auth_parses_full_config() {
-        let connector = test_connector_with(&[
-            ("auth_token_url", "https://example.com/oauth/token"),
-            ("http_auth_refresh_token", "rt-seed"),
-            ("http_auth_client_id", "cid"),
-            ("http_auth_client_secret", "csec"),
-            ("auth_scopes", "read:data offline_access"),
-            ("auth_client_auth", "body"),
-        ])
-        .await;
-        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-
-        let (config, _refresh_token) = connector
-            .resolve_refresh_token_auth(&dataset)
-            .expect("full config should parse")
-            .expect("expected Some(config) when auth params are set");
-
-        assert_eq!(config.token_url, "https://example.com/oauth/token");
-        assert_eq!(config.client_id.as_deref(), Some("cid"));
-        assert!(config.client_secret.is_some());
-        assert_eq!(config.scopes.as_deref(), Some("read:data offline_access"));
-        assert_eq!(config.client_auth, ClientAuthMethod::Body);
-    }
-
-    fn column_with_marker(name: &str, marker: Value) -> Column {
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("json_object".to_string(), marker);
-        Column::new(name).with_metadata(metadata)
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_returns_none_when_no_marker() {
-        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        let result = parse_http_json_nesting(&dataset).expect("parse should succeed");
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_returns_none_when_columns_have_no_marker() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![Column::new("id"), Column::new("name")];
-        let result = parse_http_json_nesting(&dataset).expect("parse should succeed");
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_parses_valid_wildcard_marker() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![
-            Column::new("id"),
-            Column::new("name"),
-            column_with_marker("data", Value::String("*".to_string())),
-        ];
-        let nesting = parse_http_json_nesting(&dataset)
-            .expect("parse should succeed")
-            .expect("expected Some(nesting) when marker is present");
-        assert_eq!(nesting.json_field_name, "data");
-        assert_eq!(nesting.column_order, vec!["id", "name", "data"]);
-        assert!(nesting.static_fields.contains("id"));
-        assert!(nesting.static_fields.contains("name"));
-        assert!(!nesting.static_fields.contains("data"));
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_rejects_multiple_markers() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![
-            Column::new("id"),
-            column_with_marker("data", Value::String("*".to_string())),
-            column_with_marker("extra", Value::String("*".to_string())),
-        ];
-        let error =
-            parse_http_json_nesting(&dataset).expect_err("multiple markers should be rejected");
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("Multiple columns"),
-                    "expected multiple-columns error, got: {message}"
-                );
-                assert!(message.contains("data"), "error should list 'data'");
-                assert!(message.contains("extra"), "error should list 'extra'");
-            }
-            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_rejects_invalid_marker_value() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![
-            Column::new("id"),
-            column_with_marker("data", Value::String("not-a-wildcard".to_string())),
-        ];
-        let error =
-            parse_http_json_nesting(&dataset).expect_err("non-wildcard marker should be rejected");
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("invalid 'json_object' value"),
-                    "expected invalid-value error, got: {message}"
-                );
-                assert!(
-                    message.contains("Only '*' is supported"),
-                    "expected guidance mentioning '*', got: {message}"
-                );
-            }
-            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_rejects_non_string_marker_value() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![
-            Column::new("id"),
-            column_with_marker("data", Value::Bool(true)),
-        ];
-        let error =
-            parse_http_json_nesting(&dataset).expect_err("non-string marker should be rejected");
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("invalid 'json_object' value"),
-                    "expected invalid-value error, got: {message}"
-                );
-            }
-            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
-        }
-    }
+#[must_use]
+pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    HttpsFactory::new_arc()
 }

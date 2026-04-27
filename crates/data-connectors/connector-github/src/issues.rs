@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
+use runtime::dataconnector::ConnectorComponent;
 
-use super::{
+use crate::{
     GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams, filter_pushdown, inject_parameters,
     search_inject_parameters,
 };
@@ -66,7 +66,7 @@ impl GraphQLContext for IssuesTableArgs {
         }
 
         inject_parameters("search", search_inject_parameters, filters, query)
-            .map_err(find_datafusion_root)
+            .map_err(runtime::datafusion::error::find_datafusion_root)
     }
 
     fn error_checker(&self) -> Option<ErrorChecker> {

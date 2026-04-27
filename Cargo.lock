@@ -3982,6 +3982,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
+name = "connector-abfs"
+version = "2.0.0-unstable"
+dependencies = [
+ "datafusion",
+ "linkme",
+ "object_store",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "connector-clickhouse"
 version = "2.0.0-unstable"
 dependencies = [
@@ -3998,6 +4013,20 @@ dependencies = [
  "secrecy",
  "snafu",
  "url",
+]
+
+[[package]]
+name = "connector-cosmosdb"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "opentelemetry",
+ "runtime",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4092,6 +4121,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-file"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "notify",
+ "runtime",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "connector-flightsql"
 version = "2.0.0-unstable"
 dependencies = [
@@ -4120,6 +4162,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-gcs"
+version = "2.0.0-unstable"
+dependencies = [
+ "datafusion",
+ "linkme",
+ "object_store",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-git"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "globset",
+ "opentelemetry",
+ "reqwest 0.12.24",
+ "runtime",
+ "secrecy",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "connector-github"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "chrono",
+ "data_components",
+ "datafusion",
+ "futures",
+ "globset",
+ "governor",
+ "graphql-parser",
+ "http 1.4.0",
+ "reqwest 0.12.24",
+ "runtime",
+ "runtime-rate-control",
+ "secrecy",
+ "serde_json",
+ "snafu",
+ "token_provider",
+ "tokio",
+ "tracing",
+ "url",
+ "util",
+]
+
+[[package]]
 name = "connector-graphql"
 version = "2.0.0-unstable"
 dependencies = [
@@ -4136,6 +4237,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-https"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "fundu",
+ "reqwest 0.12.24",
+ "runtime",
+ "secrecy",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+ "url",
+ "util",
+]
+
+[[package]]
+name = "connector-iceberg"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-sdk-credential-bridge",
+ "data_components",
+ "datafusion",
+ "iceberg",
+ "iceberg-datafusion",
+ "iceberg-storage-opendal",
+ "runtime",
+ "secrecy",
+ "tracing",
+ "util",
+]
+
+[[package]]
 name = "connector-imap"
 version = "2.0.0-unstable"
 dependencies = [
@@ -4148,6 +4286,19 @@ dependencies = [
  "regex",
  "runtime",
  "secrecy",
+ "snafu",
+]
+
+[[package]]
+name = "connector-memory"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "futures",
+ "runtime",
  "snafu",
 ]
 
@@ -4259,6 +4410,13 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-postgres",
+]
+
+[[package]]
+name = "connector-s3"
+version = "2.0.0-unstable"
+dependencies = [
+ "runtime",
 ]
 
 [[package]]
@@ -18267,16 +18425,25 @@ version = "2.0.0-unstable"
 dependencies = [
  "app",
  "clap",
+ "connector-abfs",
  "connector-clickhouse",
+ "connector-cosmosdb",
  "connector-databricks",
  "connector-delta-lake",
  "connector-dremio",
  "connector-duckdb",
  "connector-elasticsearch",
+ "connector-file",
  "connector-flightsql",
  "connector-ftp",
+ "connector-gcs",
+ "connector-git",
+ "connector-github",
  "connector-graphql",
+ "connector-https",
+ "connector-iceberg",
  "connector-imap",
+ "connector-memory",
  "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
@@ -18284,6 +18451,7 @@ dependencies = [
  "connector-odbc",
  "connector-oracle",
  "connector-postgres",
+ "connector-s3",
  "connector-scylladb",
  "connector-sftp",
  "connector-sharepoint",

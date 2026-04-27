@@ -256,7 +256,7 @@ pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
 
 /// Returns the S3 scheme (`"s3a"` or `"s3"`) from a URL that is known to start with
 /// an S3-family scheme. Any non-`s3a://` prefix is treated as plain `"s3"`.
-pub(crate) fn s3_scheme_from_url(url: &str) -> String {
+pub fn s3_scheme_from_url(url: &str) -> String {
     if url.starts_with("s3a://") {
         "s3a".to_string()
     } else {
@@ -265,7 +265,7 @@ pub(crate) fn s3_scheme_from_url(url: &str) -> String {
 }
 
 /// Maps a Spice parameter name to an Iceberg property name.
-pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<String>> {
+pub fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<String>> {
     match param_name {
         "token" => Some(vec!["token".to_string()]),
         "oauth2_credential" => Some(vec!["credential".to_string()]),
@@ -435,7 +435,7 @@ impl CatalogConnector for IcebergCatalog {
     }
 }
 
-pub(crate) async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
+pub async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
     let url = Url::parse(endpoint).context(UrlParseSnafu)?;
     let host = url.host_str().context(MissingHostSnafu)?;
     let port = url.port().unwrap_or_else(|| {
@@ -798,7 +798,7 @@ pub fn parse_hadoop_table_url(
 }
 
 /// Builds an opendal `Operator` for directory listing operations from a warehouse URL and properties.
-pub(crate) fn build_opendal_operator(
+pub fn build_opendal_operator(
     warehouse_url: &str,
     props: &HashMap<String, String>,
 ) -> std::result::Result<Operator, Box<dyn std::error::Error + Send + Sync>> {

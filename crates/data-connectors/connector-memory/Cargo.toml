@@ -1,0 +1,16 @@
+[package]
+name = "connector-memory"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "In-memory data connector for Spice.ai runtime"
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+data_components = { path = "../../data_components" }
+datafusion.workspace = true
+futures.workspace = true
+runtime = { path = "../../runtime" }
+snafu.workspace = true

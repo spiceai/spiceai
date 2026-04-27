@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{
+use crate::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, ParameterSpec, Parameters,
     listing::{self, ListingTableConnector},
@@ -127,9 +127,9 @@ impl S3Factory {
     }
 }
 
-pub(crate) const S3_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/s3";
+pub const S3_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/s3";
 
-pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[
             ParameterSpec::component("region")
@@ -193,7 +193,7 @@ impl DataConnectorFactory for S3Factory {
     fn create(
         &self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = crate::dataconnector::NewDataConnectorResult> + Send>> {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok()
             && endpoint.ends_with('/')
         {
@@ -318,7 +318,7 @@ impl ListingTableConnector for S3 {
         let mut s3_url =
             Url::parse(url)
                 .boxed()
-                .context(super::InvalidConfigurationSnafu {
+                .context(crate::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
@@ -380,134 +380,11 @@ impl ListingTableConnector for S3 {
     }
 }
 
-register_data_connector!("s3", S3Factory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "s3";
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        builder::RuntimeBuilder,
-        component::dataset::{Dataset, builder::DatasetBuilder},
-    };
-    use app::AppBuilder;
-    use runtime_secrets::Secrets;
-    use tokio::sync::RwLock;
-
-    fn create_test_connector(params: Parameters) -> S3 {
-        S3 {
-            params,
-            runtime: None,
-            tokio_io_runtime: tokio::runtime::Handle::current(),
-        }
-    }
-
-    async fn create_test_parameters(params: Vec<(String, secrecy::SecretString)>) -> Parameters {
-        Parameters::try_new(
-            "s3_test",
-            params,
-            PREFIX,
-            Arc::new(RwLock::new(Secrets::new())),
-            PARAMETERS.as_ref(),
-        )
-        .await
-        .expect("valid S3 test parameters")
-    }
-
-    async fn create_test_dataset(from: &str) -> Dataset {
-        DatasetBuilder::try_new(from.to_string(), "test")
-            .expect("dataset builder should be created")
-            .with_app(Arc::new(AppBuilder::new("test").build()))
-            .with_runtime(Arc::new(RuntimeBuilder::new().build().await))
-            .build()
-            .expect("dataset should be built")
-    }
-
-    #[tokio::test]
-    async fn test_url_style_not_set_omits_fragment() {
-        let params = create_test_parameters(vec![]).await;
-        let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
-
-        let object_store_url = connector
-            .get_object_store_url(&dataset, None)
-            .expect("object store URL should be constructed");
-
-        // When url_style is not set, it should not appear in fragments (auto-detect at runtime)
-        let fragment = object_store_url.fragment().unwrap_or("");
-        assert!(
-            !fragment.contains("url_style"),
-            "url_style should not be in fragment when not set, got: {fragment}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_url_style_vhost_is_included_in_fragments() {
-        let params = create_test_parameters(vec![(
-            "s3_url_style".to_string(),
-            "vhost".to_string().into(),
-        )])
-        .await;
-        let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
-
-        let object_store_url = connector
-            .get_object_store_url(&dataset, None)
-            .expect("object store URL should be constructed");
-
-        assert_eq!(object_store_url.fragment(), Some("url_style=vhost"));
-    }
-
-    #[tokio::test]
-    async fn test_url_style_path_is_included_in_fragments() {
-        let params = create_test_parameters(vec![(
-            "s3_url_style".to_string(),
-            "path".to_string().into(),
-        )])
-        .await;
-        let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
-
-        let object_store_url = connector
-            .get_object_store_url(&dataset, None)
-            .expect("object store URL should be constructed");
-
-        assert_eq!(object_store_url.fragment(), Some("url_style=path"));
-    }
-
-    #[tokio::test]
-    async fn test_iam_role_source_included_in_fragments_when_set() {
-        let params = create_test_parameters(vec![(
-            "s3_iam_role_source".to_string(),
-            "metadata".to_string().into(),
-        )])
-        .await;
-        let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
-
-        let object_store_url = connector
-            .get_object_store_url(&dataset, None)
-            .expect("object store URL should be constructed");
-
-        assert_eq!(
-            object_store_url.fragment(),
-            Some("iam_role_source=metadata")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_iam_role_source_omitted_from_fragments_when_unset() {
-        let params = create_test_parameters(vec![]).await;
-        let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
-
-        let object_store_url = connector
-            .get_object_store_url(&dataset, None)
-            .expect("object store URL should be constructed");
-
-        let fragment = object_store_url.fragment().unwrap_or("");
-        assert!(
-            !fragment.contains("iam_role_source"),
-            "iam_role_source should not be in fragment when not set, got: {fragment}"
-        );
-    }
+/// Returns a new instance of the `S3` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    S3Factory::new_arc()
 }

@@ -21,11 +21,12 @@ use snafu::ResultExt;
 
 use std::{any::Any, pin::Pin, sync::Arc};
 
-use crate::{component::dataset::Dataset, tools::memory::MEMORY_TABLE_SCHEMA};
 use datafusion::datasource::TableProvider;
 use futures::Future;
+use runtime::component::dataset::Dataset;
+use runtime::tools::memory::MEMORY_TABLE_SCHEMA;
 
-use super::{
+use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
@@ -67,7 +68,7 @@ impl DataConnectorFactory for MemoryConnectorFactory {
     fn create(
         &self,
         _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(MemoryConnector::default()) as Arc<dyn DataConnector>) })
     }
 
@@ -89,7 +90,7 @@ impl DataConnector for MemoryConnector {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let Some(schema) = Self::schema_from_path(path) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
@@ -114,7 +115,7 @@ impl DataConnector for MemoryConnector {
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
         let path = dataset.path();
         let Some(schema) = Self::schema_from_path(path) else {
             return Some(Err(DataConnectorError::UnableToGetReadProvider {
@@ -137,4 +138,9 @@ impl DataConnector for MemoryConnector {
     }
 }
 
-register_data_connector!("memory", MemoryConnectorFactory);
+pub const CONNECTOR_NAME: &str = "memory";
+
+#[must_use]
+pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    MemoryConnectorFactory::new_arc()
+}
