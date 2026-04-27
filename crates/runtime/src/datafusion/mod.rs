@@ -1369,7 +1369,7 @@ impl DataFusion {
 
     #[must_use]
     pub fn table_exists(&self, dataset_name: TableReference) -> bool {
-        let Some(catalog) = self.resolve_catalog_provider(&table_reference) else {
+        let Some(catalog) = self.resolve_catalog_provider(&dataset_name) else {
             return false;
         };
         let Some(s) = Self::resolve_schema_provider(catalog, &dataset_name) else {
