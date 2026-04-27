@@ -32,6 +32,8 @@ use tokio::sync::RwLock;
 
 use crate::Runtime;
 
+use super::require_write_access;
+
 const DEFAULT_SNAPSHOTS_LIMIT: usize = 10;
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +218,10 @@ pub async fn set_current_snapshot(
     Path(dataset_name): Path<String>,
     Json(request): Json<api::SetCurrentSnapshotRequest>,
 ) -> Response {
+    if let Some(response) = require_write_access().await {
+        return response;
+    }
+
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {

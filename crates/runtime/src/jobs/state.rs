@@ -178,6 +178,9 @@ pub struct JobState {
     /// Optional maximum size of results for the job in bytes
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_size: Option<u64>,
+    /// Whether this job must execute only read-only SQL operations.
+    #[serde(default)]
+    pub read_only: bool,
     /// Object store version for conditional writes (e-tag tracking).
     /// This is not serialized - it's set after reading from object store.
     #[serde(skip)]
@@ -204,6 +207,7 @@ impl JobState {
             expires_at_ms: None,
             timeout_seconds: None,
             maximum_size: None,
+            read_only: false,
             version: None,
         }
     }
