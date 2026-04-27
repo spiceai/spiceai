@@ -1474,7 +1474,7 @@ impl TursoExec {
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("({ast})")))
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
@@ -1623,7 +1623,7 @@ impl DeletionSink for TursoDeletionSink {
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("({ast})")))
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };

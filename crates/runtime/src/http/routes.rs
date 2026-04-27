@@ -65,7 +65,7 @@ use axum::{
     response::IntoResponse,
     routing::{Router, get, post},
 };
-use runtime_auth::layer::http::AuthLayer;
+use runtime_auth::{AuthRequestContext, layer::http::AuthLayer};
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -324,13 +324,14 @@ pub(crate) fn routes(
         // relying on each tool to enforce its own safety posture. Configure
         // `runtime.auth.api_key` (or any future provider) to re-enable this surface.
         let tools_auth_required = auth_layer.is_some();
+        let tools_auth_message = "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
         let tools_router = Router::new()
             .route("/v1/tools", get(v1::tools::list))
             .route("/v1/tools/{*name}", post(v1::tools::post))
             // Deprecated, use /v1/tools/:name instead
             .route("/v1/tool/{name}", post(v1::tools::post))
             .route_layer(middleware::from_fn(move |req, next| {
-                require_auth_configured(tools_auth_required, req, next)
+                require_auth_configured(tools_auth_required, tools_auth_message, req, next)
             }));
 
         authenticated_router = authenticated_router
@@ -399,9 +400,14 @@ pub(crate) fn routes(
             "MCP request body size limit set to {} bytes",
             MCP_REQUEST_BODY_LIMIT
         );
+        let mcp_auth_required = auth_layer.is_some();
+        let mcp_auth_message = "MCP endpoint (/v1/mcp) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
         let mcp_router = Router::new()
             .nest_service("/v1/mcp", mcp_service)
-            .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
+            .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT))
+            .route_layer(middleware::from_fn(move |req, next| {
+                require_auth_configured(mcp_auth_required, mcp_auth_message, req, next)
+            }));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
@@ -442,7 +448,7 @@ async fn track_metrics(
     State(df): State<Arc<DataFusion>>,
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     headers: http::HeaderMap,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
     let app_lock = app.read().await;
@@ -460,6 +466,9 @@ async fn track_metrics(
             .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
             .build(),
     );
+    let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> =
+        Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>;
+    req.extensions_mut().insert(auth_request_context);
 
     let request_dimensions = request_context.to_dimensions();
 
@@ -554,6 +563,7 @@ async fn check_shutdown(
 /// `websearch` is equivalent to arbitrary query / outbound fetch).
 async fn require_auth_configured(
     auth_configured: bool,
+    message: &'static str,
     req: axum::http::Request<Body>,
     next: Next,
 ) -> axum::response::Response {
@@ -564,7 +574,7 @@ async fn require_auth_configured(
     (
         http::StatusCode::UNAUTHORIZED,
         axum::Json(serde_json::json!({
-            "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials."
+            "message": message
         })),
     )
         .into_response()
