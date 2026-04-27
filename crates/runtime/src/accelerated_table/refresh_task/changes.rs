@@ -228,7 +228,7 @@ impl RefreshTask {
         }
 
         if let Some(delete_row_indices) =
-            upsert_pre_delete_rows(change_batch, row_indices, dataset_name)?
+            upsert_pre_delete_rows(change_batch, row_indices, &dataset_name.to_string())?
         {
             self.process_delete_batch(change_batch, &delete_row_indices)
                 .await?;
