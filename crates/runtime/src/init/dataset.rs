@@ -30,7 +30,7 @@ use crate::{
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::dataset::{
-        Dataset,
+        Dataset, Load,
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
     },
@@ -104,6 +104,17 @@ impl Runtime {
             tracing::error!("{err}");
             return;
         }
+
+        let on_demand_count = valid_datasets
+            .iter()
+            .filter(|ds| ds.load == Load::OnDemand)
+            .count();
+        if on_demand_count > 0 {
+            tracing::info!(
+                "Configured {on_demand_count} datasets with load: on_demand; they will be loaded on first query or refresh."
+            );
+        }
+        let log_per_dataset = valid_datasets.len() <= 20;
 
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
@@ -188,7 +199,9 @@ impl Runtime {
 
         for (ds, dataset_load_future) in dataset_futures {
             let handle = tokio::spawn(async move {
-                tracing::info!("Dataset {ds} initializing...");
+                if log_per_dataset {
+                    tracing::info!("Dataset {ds} initializing...");
+                }
                 dataset_load_future.await;
             });
             spawned_tasks.push(handle);
@@ -500,79 +513,90 @@ impl Runtime {
             return Err(err);
         }
 
-        // In file_update mode, schema mismatches are handled by create_accelerated_table
-        // which detects changes and recreates the acceleration with the new schema.
-        let allow_schema_mismatch = ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|a| a.mode == Mode::FileUpdate);
-
-        // Test dataset connectivity by attempting to get a read provider.
-        // Acquire the load semaphore (if provided) to limit concurrent source queries.
-        let load_guard = if let Some(sem) = &load_semaphore {
-            let Ok(guard) = sem.acquire().await else {
-                unreachable!("Semaphore is never closed.");
-            };
-            Some(guard)
+        let federated_table = if let Some(deferred_connector) =
+            data_connector.as_any().downcast_ref::<DeferredConnector>()
+        {
+            tracing::debug!(
+                dataset = %ds.name,
+                "Dataset schema inference skipped because it is configured for on-demand loading"
+            );
+            FederatedTable::new_unchecked(Arc::new(deferred_connector.clone()))
         } else {
-            None
-        };
-        let schema_start = Instant::now();
-        let federated_table = match data_connector.read_provider(&ds).await {
-            Ok(provider) => {
-                FederatedTable::new(
-                    Arc::clone(&ds),
-                    provider,
-                    Arc::clone(&data_connector),
-                    self.status.shutdown_token(),
-                    allow_schema_mismatch,
-                )
-                .await
-            }
-            Err(err) => {
-                // We couldn't connect to the federated table. If the dataset has an existing
-                // accelerated table, we can defer the federated table creation.
-                if let Some(federated_table) = FederatedTable::new_deferred(
-                    Arc::clone(&ds),
-                    Arc::clone(&data_connector),
-                    self.status.shutdown_token(),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        "Failed to connect to the source for dataset {}. Serving data from the existing acceleration for {} while retrying the connection. {err}",
-                        ds.name,
-                        ds.name
-                    );
-                    federated_table
-                } else {
-                    self.status.update_dataset(
-                        &ds.name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
-                    );
-                    metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    if !err.is_retriable() {
-                        error_spaced!(spaced_tracer, "{}{err}", "");
-                        return PermanentDatasetFailureSnafu {
+            // In file_update mode, schema mismatches are handled by create_accelerated_table
+            // which detects changes and recreates the acceleration with the new schema.
+            let allow_schema_mismatch = ds
+                .acceleration
+                .as_ref()
+                .is_some_and(|a| a.mode == Mode::FileUpdate);
+
+            // Test dataset connectivity by attempting to get a read provider.
+            // Acquire the load semaphore (if provided) to limit concurrent source queries.
+            let load_guard = if let Some(sem) = &load_semaphore {
+                let Ok(guard) = sem.acquire().await else {
+                    unreachable!("Semaphore is never closed.");
+                };
+                Some(guard)
+            } else {
+                None
+            };
+            let schema_start = Instant::now();
+            let federated_table = match data_connector.read_provider(&ds).await {
+                Ok(provider) => {
+                    FederatedTable::new(
+                        Arc::clone(&ds),
+                        provider,
+                        Arc::clone(&data_connector),
+                        self.status.shutdown_token(),
+                        allow_schema_mismatch,
+                    )
+                    .await
+                }
+                Err(err) => {
+                    // We couldn't connect to the federated table. If the dataset has an existing
+                    // accelerated table, we can defer the federated table creation.
+                    if let Some(federated_table) = FederatedTable::new_deferred(
+                        Arc::clone(&ds),
+                        Arc::clone(&data_connector),
+                        self.status.shutdown_token(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to connect to the source for dataset {}. Serving data from the existing acceleration for {} while retrying the connection. {err}",
+                            ds.name,
+                            ds.name
+                        );
+                        federated_table
+                    } else {
+                        self.status.update_dataset(
+                            &ds.name,
+                            status::ComponentStatus::error_with_message(err.to_string()),
+                        );
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        if !err.is_retriable() {
+                            error_spaced!(spaced_tracer, "{}{err}", "");
+                            return PermanentDatasetFailureSnafu {
+                                dataset: ds.name.clone(),
+                                reason: err.to_string(),
+                            }
+                            .fail();
+                        }
+                        warn_spaced!(spaced_tracer, "{}{err}", "");
+                        return UnableToLoadDatasetConnectorSnafu {
                             dataset: ds.name.clone(),
-                            reason: err.to_string(),
                         }
                         .fail();
                     }
-                    warn_spaced!(spaced_tracer, "{}{err}", "");
-                    return UnableToLoadDatasetConnectorSnafu {
-                        dataset: ds.name.clone(),
-                    }
-                    .fail();
                 }
-            }
+            };
+
+            tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
+
+            // Release the load permit before registration so other datasets can
+            // begin their source-facing work while this one registers.
+            drop(load_guard);
+            federated_table
         };
-
-        tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
-
-        // Release the load permit before registration so other datasets can
-        // begin their source-facing work while this one registers.
-        drop(load_guard);
 
         let register_start = Instant::now();
         match Arc::clone(&self)
@@ -907,8 +931,15 @@ impl Runtime {
             data_connector = Arc::new(FullTextConnector::new(data_connector));
         }
 
-        if data_connector.initialization().is_on_trigger() {
-            data_connector = Arc::new(DeferredConnector::new(data_connector));
+        if data_connector.initialization().is_on_trigger() || ds.load == Load::OnDemand {
+            // Avoid double-wrapping when the connector itself already requires deferred init.
+            if data_connector
+                .as_any()
+                .downcast_ref::<DeferredConnector>()
+                .is_none()
+            {
+                data_connector = Arc::new(DeferredConnector::new(data_connector));
+            }
         }
 
         Ok(data_connector)

@@ -74,7 +74,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
-use datafusion::sql::parser::DFParser;
+use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
@@ -535,9 +535,18 @@ struct PendingSinkRegistration {
     secrets: Arc<TokioRwLock<Secrets>>,
 }
 
-struct DeferredTableRegistration {
-    dataset: Arc<Dataset>,
-    connector: Arc<dyn DataConnector>,
+enum DeferredTableRegistration {
+    Federated {
+        dataset: Arc<Dataset>,
+        connector: Arc<dyn DataConnector>,
+    },
+    Accelerated {
+        dataset: Arc<Dataset>,
+        source: Arc<dyn DataConnector>,
+        secrets: Arc<TokioRwLock<Secrets>>,
+        bootstrap_status: BootstrapStatus,
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
+    },
 }
 
 pub struct DataFusion {
@@ -593,6 +602,47 @@ impl std::fmt::Debug for DataFusion {
             .field("caching", &self.caching)
             .finish_non_exhaustive()
     }
+}
+
+fn matching_deferred_table_key<'a>(
+    deferred_keys: &'a [String],
+    table_reference: &TableReference,
+) -> Option<&'a str> {
+    let candidate = table_reference.to_string();
+    let bare = table_reference.table().to_string();
+
+    if let Some(exact_match) = deferred_keys
+        .iter()
+        .find(|key| key.eq_ignore_ascii_case(&candidate))
+    {
+        return Some(exact_match.as_str());
+    }
+
+    // Only fall back to bare-name matching for unqualified references such as
+    // `SELECT * FROM ds`. If the query references `schema2.ds`, don't
+    // accidentally load `schema1.ds` just because the bare names match.
+    if !candidate.eq_ignore_ascii_case(&bare) {
+        return None;
+    }
+
+    let mut bare_matches = deferred_keys.iter().filter(|key| {
+        key.eq_ignore_ascii_case(&bare)
+            || key
+                .split('.')
+                .next_back()
+                .is_some_and(|part| part.eq_ignore_ascii_case(&bare))
+    });
+
+    let first_match = bare_matches.next()?;
+    if bare_matches.next().is_some() {
+        tracing::debug!(
+            "Skipping lazy-loading for ambiguous unqualified table reference {}",
+            table_reference
+        );
+        return None;
+    }
+
+    Some(first_match.as_str())
 }
 
 impl DataFusion {
@@ -799,6 +849,26 @@ impl DataFusion {
                             secrets: Arc::clone(&secrets),
                         });
                     None
+                } else if let Some(deferred_connector) =
+                    source.as_any().downcast_ref::<DeferredConnector>()
+                {
+                    tracing::trace!(
+                        "Dataset {} is configured with load: on_demand; acceleration will start on first query or refresh.",
+                        dataset.name
+                    );
+                    self.runtime_status
+                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
+                    self.deferred_tables.write().await.insert(
+                        dataset.name.to_string(),
+                        DeferredTableRegistration::Accelerated {
+                            dataset: Arc::clone(&dataset),
+                            source: deferred_connector.source(),
+                            secrets: Arc::clone(&secrets),
+                            bootstrap_status,
+                            initial_partition_filters,
+                        },
+                    );
+                    None
                 } else {
                     self.register_accelerated_table(
                         dataset,
@@ -823,7 +893,7 @@ impl DataFusion {
 
                     self.deferred_tables.write().await.insert(
                         dataset.name.to_string(),
-                        DeferredTableRegistration {
+                        DeferredTableRegistration::Federated {
                             dataset: Arc::clone(&dataset),
                             connector: deferred_connector.source(),
                         },
@@ -1123,30 +1193,151 @@ impl DataFusion {
         Ok(table_provider)
     }
 
-    pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
+    /// Returns true if the named table is registered as an on-demand dataset
+    /// that has not yet been materialized.
+    pub async fn is_deferred_dataset(&self, table_reference: &TableReference) -> bool {
         let deferred_tables = self.deferred_tables.read().await;
-        if let Some(deferred_registration) = deferred_tables.get(&table_reference.to_string()) {
-            let read_provider = deferred_registration
-                .connector
-                .read_provider(&deferred_registration.dataset)
-                .await
-                .context(UnableToResolveTableProviderSnafu)?;
+        deferred_tables.contains_key(&table_reference.to_string())
+    }
 
-            let federated_table = FederatedTable::new_unchecked(read_provider);
-            self.register_federated_table(
-                &deferred_registration.dataset,
-                Arc::clone(&deferred_registration.connector),
-                federated_table,
-            )
-            .await?;
+    async fn has_deferred_tables(&self) -> bool {
+        !self.deferred_tables.read().await.is_empty()
+    }
 
-            drop(deferred_tables);
-
+    pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
+        let key = table_reference.to_string();
+        let registration = {
             let mut deferred_tables = self.deferred_tables.write().await;
-            deferred_tables.remove(&table_reference.to_string());
+            deferred_tables.remove(&key)
+        };
+
+        let Some(registration) = registration else {
+            return Ok(());
+        };
+
+        match registration {
+            DeferredTableRegistration::Federated { dataset, connector } => {
+                let read_provider = connector
+                    .read_provider(&dataset)
+                    .await
+                    .context(UnableToResolveTableProviderSnafu)?;
+
+                let federated_table = FederatedTable::new_unchecked(read_provider);
+                if let Err(err) = self
+                    .register_federated_table(&dataset, Arc::clone(&connector), federated_table)
+                    .await
+                {
+                    // Restore the entry so a subsequent retry can attempt to load it again.
+                    self.deferred_tables.write().await.insert(
+                        key,
+                        DeferredTableRegistration::Federated { dataset, connector },
+                    );
+                    return Err(err);
+                }
+            }
+            DeferredTableRegistration::Accelerated {
+                dataset,
+                source,
+                secrets,
+                bootstrap_status,
+                initial_partition_filters,
+            } => {
+                tracing::info!("Dataset {} loading data...", dataset.name);
+                let read_provider = match source
+                    .read_provider(&dataset)
+                    .await
+                    .context(UnableToResolveTableProviderSnafu)
+                {
+                    Ok(provider) => provider,
+                    Err(err) => {
+                        self.deferred_tables.write().await.insert(
+                            key,
+                            DeferredTableRegistration::Accelerated {
+                                dataset,
+                                source,
+                                secrets,
+                                bootstrap_status,
+                                initial_partition_filters,
+                            },
+                        );
+                        return Err(err);
+                    }
+                };
+                let federated_read_table = FederatedTable::new_unchecked(read_provider);
+
+                if let Err(err) = self
+                    .register_accelerated_table(
+                        Arc::clone(&dataset),
+                        Arc::clone(&source),
+                        federated_read_table,
+                        Arc::clone(&secrets),
+                        bootstrap_status.clone(),
+                        initial_partition_filters.clone(),
+                    )
+                    .await
+                {
+                    self.deferred_tables.write().await.insert(
+                        key,
+                        DeferredTableRegistration::Accelerated {
+                            dataset,
+                            source,
+                            secrets,
+                            bootstrap_status,
+                            initial_partition_filters,
+                        },
+                    );
+                    return Err(err);
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// Inspect the SQL statement and lazily load any on-demand datasets that it
+    /// references. Errors during loading are logged but not propagated; the
+    /// downstream planner will surface a clear "table not found" error if an
+    /// on-demand dataset fails to load.
+    pub async fn load_deferred_tables_for_statement(
+        &self,
+        session: &SessionState,
+        statement: &Statement,
+    ) {
+        // Fast path: nothing is currently deferred.
+        let deferred_keys: Vec<String> = {
+            let deferred = self.deferred_tables.read().await;
+            if deferred.is_empty() {
+                return;
+            }
+            deferred.keys().cloned().collect()
+        };
+
+        let Ok(table_refs) = session.resolve_table_references(statement) else {
+            tracing::trace!(
+                "Skipping on-demand dataset loading because table reference resolution failed"
+            );
+            return;
+        };
+
+        for tr in table_refs {
+            let matched = matching_deferred_table_key(&deferred_keys, &tr);
+
+            if let Some(matched_key) = matched {
+                let target = TableReference::parse_str(matched_key);
+                tracing::debug!(
+                    "Lazy-loading on-demand dataset {} for query referencing {}",
+                    target,
+                    tr
+                );
+                if let Err(err) = self.load_deferred_dataset(target.clone()).await {
+                    tracing::warn!(
+                        "Failed to lazy-load on-demand dataset {} for query: {}",
+                        target,
+                        err
+                    );
+                }
+            }
+        }
     }
 
     pub async fn load_deferred_catalog(&self, name: &str, access: &AccessMode) -> Result<()> {
@@ -2131,6 +2322,13 @@ impl DataFusion {
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
+        // If the dataset is configured for on-demand loading, lazily materialize
+        // it now. For non-accelerated on-demand datasets, this is the only
+        // loading step required to satisfy the refresh request.
+        if self.is_deferred_dataset(dataset_name).await {
+            self.load_deferred_dataset(dataset_name.clone()).await?;
+        }
+
         // If we're a scheduler with a partition service, forward refresh to executors
         // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
         if matches!(
@@ -2801,6 +2999,19 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
+        let dialect = session.config().options().sql_parser.dialect;
+        let statement = session.sql_to_statement(sql, &dialect)?;
+
+        // Lazily materialize any on-demand datasets that this SQL references
+        // before planning, so that the planner sees the real table provider
+        // (and its real schema) instead of the deferred placeholder.
+        if self.has_deferred_tables().await {
+            // Box::pin to keep the resulting future from inflating the caller's
+            // stack frame, but only pay the allocation cost when there are
+            // on-demand datasets to check.
+            Box::pin(self.load_deferred_tables_for_statement(session, &statement)).await;
+        }
+
         let ctx = planner::PlannerContext {
             catalog_mode: if self.has_cayenne_catalog() {
                 planner::CatalogMode::Cayenne
@@ -2814,7 +3025,7 @@ impl DataFusion {
             io_runtime: self.io_runtime.clone(),
         };
 
-        planner::create_logical_plan(sql, session, &ctx).await
+        planner::create_logical_plan_from_statement(sql, statement, session, &ctx).await
     }
 
     /// On Windows the `planner` module is not available, so delegate
@@ -2825,7 +3036,12 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        session.create_logical_plan(sql).await
+        let dialect = session.config().options().sql_parser.dialect;
+        let statement = session.sql_to_statement(sql, &dialect)?;
+        if self.has_deferred_tables().await {
+            Box::pin(self.load_deferred_tables_for_statement(session, &statement)).await;
+        }
+        session.statement_to_plan(statement).await
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
@@ -3297,6 +3513,44 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn matching_deferred_table_key_prefers_exact_match() {
+        let keys = vec!["schema1.ds".to_string(), "schema2.ds".to_string()];
+        let table_ref = TableReference::parse_str("schema2.ds");
+
+        assert_eq!(
+            matching_deferred_table_key(&keys, &table_ref),
+            Some("schema2.ds")
+        );
+    }
+
+    #[test]
+    fn matching_deferred_table_key_does_not_bare_match_qualified_reference() {
+        let keys = vec!["schema1.ds".to_string()];
+        let table_ref = TableReference::parse_str("schema2.ds");
+
+        assert_eq!(matching_deferred_table_key(&keys, &table_ref), None);
+    }
+
+    #[test]
+    fn matching_deferred_table_key_bare_match_requires_unqualified_reference() {
+        let keys = vec!["schema1.ds".to_string()];
+        let table_ref = TableReference::parse_str("ds");
+
+        assert_eq!(
+            matching_deferred_table_key(&keys, &table_ref),
+            Some("schema1.ds")
+        );
+    }
+
+    #[test]
+    fn matching_deferred_table_key_bare_match_must_be_unique() {
+        let keys = vec!["schema1.ds".to_string(), "schema2.ds".to_string()];
+        let table_ref = TableReference::parse_str("ds");
+
+        assert_eq!(matching_deferred_table_key(&keys, &table_ref), None);
+    }
+
     #[tokio::test]
     async fn test_get_or_create_logical_plan() {
         static SQL: &str = "SELECT 1";
@@ -3383,6 +3637,7 @@ mod tests {
                 runtime: Arc::new(runtime),
                 vectors: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
+                load: crate::component::dataset::Load::OnStartup,
             }
         }
 
