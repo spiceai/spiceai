@@ -36,33 +36,33 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.63",
+      "_score": "0.56",
       "data": {
-        "question": "Is $\\frac{7 \\text { erasers }}{12 \\text { pencils }}$ an example of a ratio or a rate?"
+        "question": "Evaluate the function \\( h(x) = -3x - 4 \\) at the given values:\na. \\( h(7) \\)\nb. \\( h(-4) \\)"
       },
       "dataset": "qs",
       "matches": {
         "answer": [
-          "This is an example of a $\\boxed{\\text{rate}}$ because it compares two unlike denominate numbers (erasers and pencils)."
+          "a. \\( h(7) = -3(7) - 4 = -21 - 4 = \\boxed{-25} \\)\nb. \\( h(-4) = -3(-4) - 4 = 12 - 4 = \\boxed{8} \\)"
         ]
       },
       "primary_key": {
-        "id": 543
+        "id": 255
       }
     },
     {
-      "_score": "0.63",
+      "_score": "0.55",
       "data": {
-        "question": "Write the decimal `2.3` in words and then express it as a fraction or mixed number."
+        "question": "Evaluate the function \\( G(x) = x - 1 \\) at the following values of \\( x \\):\na. \\( x = 3 \\)\nb. \\( x = -5 \\)\nc. \\( x = 0 \\)"
       },
       "dataset": "qs",
       "matches": {
         "answer": [
-          "1. In words: \"two and three tenths.\"  \n2. As a fraction: \\(\\boxed{\\dfrac{23}{10}}\\)."
+          "a. \\( G(3) = 3 - 1 = \\boxed{2} \\)\nb. \\( G(-5) = -5 - 1 = \\boxed{-6} \\)\nc. \\( G(0) = 0 - 1 = \\boxed{-1} \\)"
         ]
       },
       "primary_key": {
-        "id": 1318
+        "id": 251
       }
     }
   ]
