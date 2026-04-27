@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q10"
+---
++-----------+--------------------+-------------+-----------+----------------+-----------------------------------------+-----------------+----------------------------------------------------------------------------------------------------------------------+
+| c_custkey | c_name             | revenue     | c_acctbal | n_name         | c_address                               | c_phone         | c_comment                                                                                                            |
++-----------+--------------------+-------------+-----------+----------------+-----------------------------------------+-----------------+----------------------------------------------------------------------------------------------------------------------+
+| 7450894   | Customer#007450894 | 936768.8469 | 927.18    | ARGENTINA      | hxPXtdJ84fyOre7gMSCv2rzBvt cw5G3S4aivxm | 11-833-256-7879 | packages are inside the finally bold requests. final, ironic ideas doze slyly regular deposit                        |
+| 9739771   | Customer#009739771 | 842966.5285 | 1286.48   | JORDAN         | tC7c8bZ7 By6nEoHRL                      | 23-281-450-4794 | p furiously deposits? deposits affix furiously: pinto beans are blithely after the slyly final accounts. ca          |
+| 4571035   | Customer#004571035 | 838705.6168 | 6704.13   | UNITED KINGDOM | 20IDf0Fx1ahSqImFXAEMSopHx3ic,h8Lj       | 33-138-285-3770 | e carefully across the quickly ironic requests! fluffily close instructions cajole carefully. furious                |
+| 637855    | Customer#000637855 | 812034.3778 | 2674.86   | MOZAMBIQUE     | q5TskwlicGP                             | 26-852-120-2850 | al instructions sleep blithely. furiously final platelets nag across the ca                                          |
+| 10781974  | Customer#010781974 | 801735.5176 | 5079.77   | ROMANIA        | Cv2p,eRTt8C  WwJV61XTYA,6T4obB          | 29-651-722-6239 | egular notornis. requests wake alongsid                                                                              |
+| 11361613  | Customer#011361613 | 800558.4337 | 4644.71   | INDONESIA      | jWKghIqWp5Vzt2s                         | 19-344-539-9187 | latelets cajole slyly along the unusual accounts. dependencies use furiously ironic requests. enticingly iro         |
+| 1259743   | Customer#001259743 | 793274.7846 | 2592.74   | ETHIOPIA       | YVe ,jDra4xnKtfzS62bnoxpmGF2d8Kfi       | 15-733-636-6732 | eposits sleep according to the even pinto beans. carefully un                                                        |
+| 5154136   | Customer#005154136 | 787191.1959 | 1028.97   | MOROCCO        | Y,cjCdRGVz1j g8YQUGRMf5z3R              | 25-841-379-9394 | boost quickly slyly even deposits: slyly ironic theodolite                                                           |
+| 14986552  | Customer#014986552 | 781645.8638 | 2678.94   | ARGENTINA      | tl5yB8W1C0                              | 11-671-762-3613 | ual ideas sleep daringly after the carefully final pinto beans. furiously final accounts at th                       |
+| 2905816   | Customer#002905816 | 778729.4414 | 5085.53   | UNITED STATES  | bcLOp3b9PA                              | 34-217-584-5820 |  the furiously express foxes wake final, pending pinto beans. slyly silent ideas nag slyly. foxes sleep slyly accord |
++-----------+--------------------+-------------+-----------+----------------+-----------------------------------------+-----------------+----------------------------------------------------------------------------------------------------------------------+
