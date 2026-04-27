@@ -16,8 +16,8 @@ limitations under the License.
 
 use async_trait::async_trait;
 use rmcp::{
-    ServiceError,
     model::{CallToolResult, JsonObject},
+    service::ServiceError,
 };
 
 /// [`McpProxy`] is the minimal interface from [`mcp_client::McpClientTrait`] for tools that are fundamentally proxies around MCP tools.

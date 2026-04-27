@@ -74,10 +74,7 @@ pub fn validate_sql_query_operations(
                 }
 
                 // Fall back to per-table writable check
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
-                    // No catalog specified but default catalog is writable
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
@@ -104,10 +101,7 @@ pub fn validate_sql_query_operations(
                     return Ok(TreeNodeRecursion::Continue);
                 }
 
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
-                    // No catalog specified but default catalog is writable
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
@@ -123,23 +117,25 @@ pub fn validate_sql_query_operations(
                     );
                 }
 
-                if !df.is_path_catalog_writable(&dml.table_name) {
-                    return plan_err!(
-                        "UPDATE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                // Check if attempting to update a catalog table.
+                if let Some(catalog) = dml.table_name.catalog() && catalog != super::SPICE_DEFAULT_CATALOG {
+                    if !df.is_catalog_writable(catalog) {
+                        return plan_err!(
+                            "UPDATE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                            dml.table_name
+                        );
+                    }
+                    return Ok(TreeNodeRecursion::Continue);
+                }
+
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
+                    Ok(TreeNodeRecursion::Continue)
+                } else {
+                    plan_err!(
+                        "UPDATE operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
                         dml.table_name
-                    );
+                    )
                 }
-
-                if !df.is_cayenne_catalog(&dml.table_name) {
-                    let target_catalog = dml.table_name.catalog().unwrap_or(super::SPICE_DEFAULT_CATALOG);
-                    return plan_err!(
-                        "UPDATE operations are only supported on writable Cayenne catalog tables. Table '{}', catalog '{}' is not Cayenne-backed.",
-                        dml.table_name,
-                        target_catalog
-                    );
-                }
-
-                Ok(TreeNodeRecursion::Continue)
             } else { plan_err!("Operation is not allowed: {}", dml.name()) }
         }
         LogicalPlan::Copy(_) => {
@@ -497,7 +493,7 @@ mod tests {
     async fn test_validate_update_operation_blocked() {
         let df = create_test_datafusion();
 
-        let sql = "UPDATE tbl_writable SET name = 'updated' WHERE id = 1";
+        let sql = "UPDATE tbl_read_only SET name = 'updated' WHERE id = 1";
         let plan = df
             .ctx
             .state()
@@ -505,9 +501,12 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        // UPDATE operations should be blocked
+        // UPDATE on a read-only dataset should be blocked
         let result = validate_sql_query_operations(&plan, &df);
-        assert!(result.is_err(), "UPDATE operations should be blocked");
+        assert!(
+            result.is_err(),
+            "UPDATE operations should be blocked on read-only datasets"
+        );
     }
 
     #[tokio::test]

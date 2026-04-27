@@ -26,6 +26,7 @@ use crate::datafusion::udtf::json_properties::{
 use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, JsonTreeTableFunc};
 use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
 use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
+use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
@@ -44,6 +45,11 @@ use runtime_datafusion_udfs::{
     bucket::{BUCKET_SCALAR_UDF_NAME, Bucket},
     cosine_distance::{COSINE_DISTANCE_UDF_NAME, CosineDistance},
     digest_many::{DIGEST_UDF_NAME, INSTANCE},
+    inner_product::{INNER_PRODUCT_UDF_NAME, InnerProduct},
+    l2_distance::{
+        L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME, L2Distance, L2SquaredDistance,
+    },
+    l2_norm::{L2_NORM_UDF_NAME, L2Norm},
     truncate::{TRUNCATE_SCALAR_UDF_NAME, Truncate},
 };
 
@@ -55,6 +61,10 @@ pub fn register_core_scalar_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
     ctx.register_udf(Bucket::new().into());
     ctx.register_udf(CosineDistance::new().into());
+    ctx.register_udf(InnerProduct::new().into());
+    ctx.register_udf(L2Distance::new().into());
+    ctx.register_udf(L2SquaredDistance::new().into());
+    ctx.register_udf(L2Norm::new().into());
     ctx.register_udf(Truncate::new().into());
     ctx.register_udf(INSTANCE.clone());
 }
@@ -85,6 +95,31 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udtf(
         RRF_UDF_NAME,
         Arc::new(rrf::ReciprocalRankFusion::from_ctx(ctx)),
+    );
+
+    // `rerank(input, model => ..., document => ..., ...)` — reorders a
+    // scored result set using a reranker model. Registered as both a scalar
+    // UDF stub (so `rerank(...)` can appear nested inside another UDTF's arg
+    // list, same trick vector_search/text_search/rrf use) and a UDTF (the
+    // actual `FROM rerank(...)` implementation).
+    let session_ctx: Arc<SessionContext> = Arc::clone(ctx);
+    ctx.register_udf(
+        RerankTableFunc::new(
+            Arc::downgrade(&runtime.df),
+            Arc::clone(&session_ctx),
+            runtime.rerankers(),
+            runtime.completion_llms(),
+        )
+        .into(),
+    );
+    ctx.register_udtf(
+        RERANK_UDTF_NAME,
+        Arc::new(RerankTableFunc::new(
+            Arc::downgrade(&runtime.df),
+            session_ctx,
+            runtime.rerankers(),
+            runtime.completion_llms(),
+        )),
     );
 
     // `flatten_json_properties` / `flatten_json` / `json_tree` — JSON-Schema
@@ -120,6 +155,10 @@ static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(
         "rand",
         BUCKET_SCALAR_UDF_NAME,
         COSINE_DISTANCE_UDF_NAME,
+        INNER_PRODUCT_UDF_NAME,
+        L2_DISTANCE_UDF_NAME,
+        L2_SQUARED_DISTANCE_UDF_NAME,
+        L2_NORM_UDF_NAME,
         TRUNCATE_SCALAR_UDF_NAME,
         EMBED_UDF_NAME,
         #[cfg(feature = "models")]
@@ -128,6 +167,7 @@ static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(
         FLATTEN_JSON_PROPERTIES_UDTF_NAME,
         FLATTEN_JSON_UDTF_NAME,
         JSON_TREE_UDTF_NAME,
+        RERANK_UDTF_NAME,
     ];
 
     FunctionSupport::new(

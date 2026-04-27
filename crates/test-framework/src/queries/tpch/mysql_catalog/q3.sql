@@ -4,9 +4,9 @@ SELECT
     o_orderdate,
     o_shippriority
 FROM
-    mysql.public.customer,
-    mysql.public.orders,
-    mysql.public.lineitem
+    mysql.tpch_sf1.customer,
+    mysql.tpch_sf1.orders,
+    mysql.tpch_sf1.lineitem
 WHERE
     c_mktsegment = 'BUILDING'
     AND c_custkey = o_custkey

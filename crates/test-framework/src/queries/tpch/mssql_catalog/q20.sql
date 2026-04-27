@@ -2,20 +2,20 @@ select
     s_name,
     s_address
 from
-    mssql.public.supplier,
-    mssql.public.nation
+    mssql.dbo.supplier,
+    mssql.dbo.nation
 where
         s_suppkey in (
         select
             ps_suppkey
         from
-            mssql.public.partsupp
+            mssql.dbo.partsupp
         where
                 ps_partkey in (
                 select
                     p_partkey
                 from
-                    mssql.public.part
+                    mssql.dbo.part
                 where
                         p_name like 'forest%'
             )
@@ -23,7 +23,7 @@ where
             select
                     0.5 * sum(l_quantity)
             from
-                mssql.public.lineitem
+                mssql.dbo.lineitem
             where
                     l_partkey = ps_partkey
               and l_suppkey = ps_suppkey
