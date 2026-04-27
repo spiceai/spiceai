@@ -995,11 +995,13 @@ async fn head_drive_item(
         });
     }
     if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         return Err(object_store::Error::Generic {
             store: STORE_TAG,
             source: Box::new(std::io::Error::other(format!(
-                "head failed: HTTP {}",
-                response.status()
+                "head failed: HTTP {status}: {}",
+                sanitize_error_body(&body, 256)
             ))),
         });
     }
@@ -1036,10 +1038,12 @@ async fn get_content(
     }
     if !response.status().is_success() {
         let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         return Err(object_store::Error::Generic {
             store: STORE_TAG,
             source: Box::new(std::io::Error::other(format!(
-                "get content failed: HTTP {status}"
+                "get content failed: HTTP {status}: {}",
+                sanitize_error_body(&body, 256)
             ))),
         });
     }
@@ -1106,11 +1110,13 @@ async fn delete_item(
         });
     }
     if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         return Err(object_store::Error::Generic {
             store: STORE_TAG,
             source: Box::new(std::io::Error::other(format!(
-                "delete failed: HTTP {}",
-                response.status()
+                "delete failed: HTTP {status}: {}",
+                sanitize_error_body(&body, 256)
             ))),
         });
     }

@@ -619,9 +619,9 @@ impl SharepointFactory {
 
 static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut params = vec![
-        // Identity / tenant
-        ParameterSpec::component("client_id").secret().required(),
-        ParameterSpec::component("tenant_id").secret().required(),
+        // Identity / tenant — not required for bearer_token flow
+        ParameterSpec::component("client_id").secret(),
+        ParameterSpec::component("tenant_id").secret(),
         // Auth flows (exactly one of these should be set)
         ParameterSpec::component("client_secret").secret(),
         ParameterSpec::component("bearer_token").secret(),
@@ -753,10 +753,10 @@ impl DataConnector for Sharepoint {
             config,
         ));
         register_sharepoint_store(runtime_env, &store_url, store, fingerprint, dataset)?;
-        // Then defer to the listing connector for any additional setup.
-        self.listing_connector(dataset)?
-            .register_object_stores(dataset, runtime_env)
-            .await
+        // Skip the default ListingTableConnector::register_object_stores: it routes through
+        // SpiceObjectStoreRegistry::inner, which is a separate registry from runtime_env's
+        // own store map, so it can never find stores registered via runtime_env.register_object_store().
+        Ok(())
     }
 }
 
@@ -878,6 +878,23 @@ impl ListingTableConnector for SharepointListingConnector {
         use datafusion::execution::context::SessionContext;
         use runtime_object_store::registry::default_runtime_env;
 
+        // If the main Spice runtime is available, register the store on its
+        // SessionContext's RuntimeEnv. That is the same RuntimeEnv DataFusion
+        // uses when executing queries against the registered ListingTable, so
+        // the store lookup at scan time will succeed.
+        if let Some(rt) = &self.runtime {
+            let ctx = Arc::clone(&rt.datafusion().ctx);
+            register_sharepoint_store_on_fresh(
+                &ctx.runtime_env(),
+                &self.store_url,
+                self.build_object_store(),
+            );
+            return (*ctx).clone();
+        }
+
+        // Fallback for contexts where the runtime isn't wired in (e.g. tests,
+        // cluster schema-inference). Build a fresh session with a dedicated
+        // RuntimeEnv and register the store on that.
         let mut config = runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG
             .read()
             .map_or_else(|_| datafusion::prelude::SessionConfig::new(), |c| c.clone());
