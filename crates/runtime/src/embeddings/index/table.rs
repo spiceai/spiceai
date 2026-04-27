@@ -66,14 +66,16 @@ pub async fn wrap_table_as_index(
             );
         }
     }
+    #[cfg(not(feature = "s3_vectors"))]
+    let _ = ctx;
     #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch")))]
+    let _ = file_format;
+    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
     let _ = (
-        ctx,
         embedding_models,
         secrets,
         tbl,
         columns,
-        file_format,
         inner_table_provider.as_ref(),
     );
 
@@ -105,6 +107,18 @@ pub async fn wrap_table_as_index(
             )
             .await
         }
+        #[cfg(feature = "duckdb")]
+        Some("duckdb") => {
+            wrap_table_as_index_duckdb(
+                embedding_models,
+                secrets,
+                tbl,
+                columns,
+                inner_table_provider,
+                vector_store,
+            )
+            .await
+        }
         None => Err(Box::from(
             "No vector engine specified. Provide a vector engine under `.vectors.engine`."
                 .to_string(),
@@ -113,6 +127,66 @@ pub async fn wrap_table_as_index(
             "Unknown vector engine '.vectors.engine: {unknown_engine}'"
         ))),
     }
+}
+
+#[cfg(feature = "duckdb")]
+async fn wrap_table_as_index_duckdb(
+    embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+    secrets: &Arc<RwLock<Secrets>>,
+    tbl: &TableReference,
+    columns: &[Column],
+    inner_table_provider: Arc<dyn TableProvider + 'static>,
+    vector_store: &VectorStore,
+) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("DuckDB vector engine for table {tbl} initializing...");
+    let start = std::time::Instant::now();
+
+    let embedding_columns: Vec<_> = columns
+        .iter()
+        .filter_map(|c| {
+            c.embeddings
+                .first()
+                .map(|embed| (c.name.clone(), embed.clone()))
+        })
+        .collect();
+
+    let mut provider = if let Some(indexed) = inner_table_provider
+        .as_any()
+        .downcast_ref::<runtime_datafusion_index::IndexedTableProvider>(
+    ) {
+        indexed.clone()
+    } else {
+        runtime_datafusion_index::IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+    };
+
+    for (column, config) in embedding_columns {
+        let vector_index = super::duckdb::try_from_table(
+            tbl,
+            column,
+            config,
+            vector_store,
+            &inner_table_provider,
+            inner_table_provider.schema(),
+            Arc::clone(embedding_models),
+            Arc::clone(secrets),
+        )
+        .await?;
+
+        let idx = Arc::new(vector_index);
+        let vector_index = Arc::clone(&idx) as Arc<dyn search::index::VectorIndex>;
+
+        provider.underlying = Arc::new(
+            search::index::VectorScanTableProvider::try_new(provider.underlying, &vector_index)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+        ) as Arc<dyn TableProvider>;
+        provider = provider.add_index(Arc::clone(&idx) as Arc<dyn runtime_datafusion_index::Index>);
+    }
+
+    tracing::info!(
+        "DuckDB vector engine for table {tbl} initialized in {:?}",
+        start.elapsed()
+    );
+    Ok(Arc::new(provider))
 }
 
 #[cfg(feature = "s3_vectors")]

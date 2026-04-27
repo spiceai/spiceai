@@ -23,6 +23,8 @@ use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
 use runtime_datafusion_index::Index;
 
 pub mod chunking;
+#[cfg(feature = "duckdb")]
+pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 pub mod native_vector;
@@ -34,6 +36,8 @@ use crate::index::chunking::ChunkedVectorIndex;
 pub use native_vector::NativeVectorIndex;
 pub use vector_table::VectorScanTableProvider;
 
+#[cfg(feature = "duckdb")]
+use crate::index::duckdb::DuckDBVectorIndex;
 #[cfg(feature = "elasticsearch")]
 use crate::index::elasticsearch::ElasticsearchIndex;
 #[cfg(feature = "s3_vectors")]
@@ -80,6 +84,10 @@ pub fn derived_columns_from_vector_index(
 ) -> Option<Vec<String>> {
     #[cfg(feature = "elasticsearch")]
     if let Some(vec) = index.as_any().downcast_ref::<ElasticsearchIndex>() {
+        return Some(vec.derived_columns());
+    }
+    #[cfg(feature = "duckdb")]
+    if let Some(vec) = index.as_any().downcast_ref::<DuckDBVectorIndex>() {
         return Some(vec.derived_columns());
     }
     #[cfg(feature = "s3_vectors")]

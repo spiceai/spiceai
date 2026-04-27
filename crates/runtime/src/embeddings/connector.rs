@@ -18,6 +18,8 @@ use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
+#[cfg(feature = "duckdb")]
+use crate::component::dataset::acceleration::Engine;
 use crate::component::metrics::MetricsProvider;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::embeddings::execution_plan::{
@@ -93,6 +95,21 @@ impl EmbeddingConnector {
         if let Some(vector_engine) = &dataset.vectors
             && vector_engine.enabled
         {
+            #[cfg(feature = "duckdb")]
+            if vector_engine.engine.as_deref() == Some("duckdb")
+                && !dataset.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.engine.to_unpartitioned() == Engine::DuckDB
+                })
+            {
+                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                    dataconnector: dataset.source().to_string(),
+                    connector_component: dataset.into(),
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(
+                        "DuckDB vector engine requires DuckDB acceleration. Configure the dataset with `acceleration.engine: duckdb`.",
+                    ),
+                });
+            }
+
             return wrap_table_as_index(
                 &dataset.runtime().datafusion().ctx,
                 &self.embedding_models,
@@ -248,7 +265,28 @@ impl DataConnector for EmbeddingConnector {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
-            .await
+            .await?;
+
+        #[cfg(feature = "duckdb")]
+        if let Some(vector_engine) = &dataset.vectors
+            && vector_engine.enabled
+            && vector_engine.engine.as_deref() == Some("duckdb")
+        {
+            let accelerator = accelerated_table.get_accelerator();
+            let indexed_accelerator =
+                crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
+                    &dataset.name,
+                    &dataset.columns,
+                    vector_engine,
+                    accelerator,
+                    Arc::clone(&self.embedding_models),
+                    Arc::clone(&self.secrets),
+                )
+                .await?;
+            accelerated_table.set_accelerator(indexed_accelerator);
+        }
+
+        Ok(())
     }
 
     fn supports_changes_stream(&self) -> bool {

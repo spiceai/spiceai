@@ -17216,6 +17216,8 @@ dependencies = [
  "datafusion-expr",
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
+ "datafusion-table-providers",
+ "duckdb",
  "elasticsearch",
  "futures",
  "insta",
