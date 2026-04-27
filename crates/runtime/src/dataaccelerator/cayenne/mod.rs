@@ -1310,6 +1310,26 @@ impl DataAccelerator for CayenneAccelerator {
         PARAMETERS
     }
 
+    fn supports_snapshot_reload(&self) -> bool {
+        true
+    }
+
+    /// Reloads the Cayenne-backed table provider from the snapshot directory
+    /// that was just restored to the accelerator's primary location.
+    ///
+    /// Cayenne uses a per-dataset directory layout; dropping the previous
+    /// provider releases the cached `Vortex` segment/footer caches, and the
+    /// factory then reopens the directory tree from disk.
+    async fn reload_from_snapshot(
+        &self,
+        _source: &dyn AccelerationSource,
+        previous_provider: Arc<dyn TableProvider>,
+        provider_factory: super::ReloadProviderFactory,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        drop(previous_provider);
+        provider_factory().await
+    }
+
     async fn drop_table(
         &self,
         table_name: &str,
