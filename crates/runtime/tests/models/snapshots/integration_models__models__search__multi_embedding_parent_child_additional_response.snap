@@ -12,15 +12,15 @@ expression: "normalize_search_response_json(resp, true, round_scores)"
       },
       "dataset": "multiple_columns",
       "matches": {
-        "cp_department": [
-          "DEPARTMENT"
-        ],
-        "cp_description": [
-          "In general basic characters welcome. Clearly lively friends conv"
+         "cp_department": [
+           "DEPARTMENT"
+         ],
+         "cp_description": [
+          "Programmes receive just likely, key homes. Relevant,"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 11
       }
     },
     {
@@ -34,12 +34,12 @@ expression: "normalize_search_response_json(resp, true, round_scores)"
           "DEPARTMENT"
         ],
         "cp_description": [
-          "Programmes receive just likely, key homes. Relevant,"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 11
-      }
-    }
-  ]
-}
+           "In general basic characters welcome. Clearly lively friends conv"
+         ]
+       },
+       "primary_key": {
+         "cp_catalog_page_sk": 1
+       }
+     }
+   ]
+ }
