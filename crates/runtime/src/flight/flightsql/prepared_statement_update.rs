@@ -98,6 +98,12 @@ pub(crate) async fn do_get(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
+    if super::super::is_auth_read_only(&context) {
+        return Err(Status::permission_denied(
+            "Write access denied. Verify that authentication key used has write access and try again.",
+        ));
+    }
+
     tracing::trace!("do_get_prepared_statement_update: {query:?}");
 
     let PreparedStatement {

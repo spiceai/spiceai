@@ -47,7 +47,7 @@ use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
-use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
+use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -242,9 +242,11 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
         parameters: Option<ParamValues>,
+        read_only: bool,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
         let query_result = QueryBuilder::new(sql, Arc::clone(&datafusion))
             .parameters(parameters)
+            .read_only(read_only)
             .build()
             .run()
             .await
@@ -327,6 +329,19 @@ pub(crate) fn record_batches_to_flight_stream(
     FlightDataEncoderBuilder::new()
         .build(stream::iter(record_batches.into_iter().map(Ok)))
         .map_err(to_tonic_err)
+}
+
+/// Returns `true` when the request has an authenticated principal that
+/// lacks write permission (`"write"` or `"read_write"` group).
+/// Returns `false` when there is no principal (auth not configured)
+/// or the principal has write access.
+pub(crate) fn is_auth_read_only(context: &RequestContext) -> bool {
+    context.auth_principal().is_some_and(|principal| {
+        !principal
+            .groups()
+            .iter()
+            .any(|g| *g == "write" || *g == "read_write")
+    })
 }
 
 fn to_tonic_err<E>(e: E) -> Status

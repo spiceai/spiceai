@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 use tonic::Status;
 
 use crate::datafusion::job_executor_context_extension::get_job_executor;
+use crate::datafusion::request_context_extension::get_current_datafusion;
+use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::{JobErrorCode, JobState, JobStatus};
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -249,6 +251,23 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let request: SubmitQueryRequest = serde_json::from_slice(body).map_err(|e| {
         Status::invalid_argument(format!("Failed to parse SubmitQueryRequest: {e}"))
     })?;
+
+    // If the principal is read-only, validate that the SQL does not contain
+    // write operations before submitting to the background job executor.
+    if super::is_auth_read_only(&context) {
+        let datafusion = get_current_datafusion(&context);
+        let plan = datafusion
+            .ctx
+            .state()
+            .create_logical_plan(&request.sql)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("Failed to parse SQL: {e}")))?;
+        if let Err(e) = validate_sql_query_read_only(&plan) {
+            return Err(Status::permission_denied(format!(
+                "Write access denied. {e}"
+            )));
+        }
+    }
 
     let state = executor
         .submit(request)
