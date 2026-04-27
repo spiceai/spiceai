@@ -255,6 +255,61 @@ impl SqliteMetastore {
             PRIMARY KEY (table_id, snapshot_id)
         )
     ";
+
+    /// Schema for the `cayenne_table_statistics` table.
+    ///
+    /// Stores a single row per table holding a serialized Vortex `FileStatistics`
+    /// flatbuffer blob. The row is upserted on every write and currently reflects
+    /// the accumulator from the most recent write (min, max, null count) — a
+    /// last-write-wins snapshot, not an aggregate across every file. Consumers
+    /// must treat these values as optimization hints until cross-write merging
+    /// lands.
+    const TABLE_STATISTICS_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_table_statistics (
+            table_id TEXT NOT NULL PRIMARY KEY,
+            statistics_blob BLOB NOT NULL,
+            num_rows BIGINT NOT NULL DEFAULT 0,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    /// Schema for the `cayenne_inlined_data` table.
+    ///
+    /// Stores small batches of insert data as Arrow IPC blobs directly in the
+    /// metastore, avoiding the overhead of creating individual Vortex files for
+    /// each small write. A `CHECKPOINT` operation flushes accumulated inline data
+    /// to consolidated Vortex files.
+    const INLINED_DATA_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_inlined_data (
+            inlined_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
+            partition_key TEXT,
+            data_ipc BLOB NOT NULL,
+            record_count BIGINT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    /// Schema for the `cayenne_inlined_delete` table.
+    ///
+    /// Stores small batches of delete identifiers directly in the metastore.
+    /// Flushed to deletion vector files during checkpoint.
+    const INLINED_DELETE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_inlined_delete (
+            inlined_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
+            delete_ipc BLOB NOT NULL,
+            delete_count BIGINT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    const INLINED_DATA_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_data_table_seq ON cayenne_inlined_data(table_id, sequence_number)";
+    const INLINED_DELETE_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_table_seq ON cayenne_inlined_delete(table_id, sequence_number)";
 }
 
 /// `SQLite` row wrapper implementing `MetastoreRow`.
@@ -361,13 +416,16 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
                     Self::PARTITION_TABLE_DDL,
                     Self::INSERT_RECORD_TABLE_DDL,
-                    Self::SNAPSHOT_SEQUENCE_TABLE_DDL
+                    Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
+                    Self::TABLE_STATISTICS_DDL,
+                    Self::INLINED_DATA_TABLE_DDL,
+                    Self::INLINED_DELETE_TABLE_DDL
                 ))?;
 
                 // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)
@@ -389,6 +447,8 @@ impl MetastoreBackend for SqliteMetastore {
         guard
             .call(|conn| {
                 conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, [])?;
+                conn.execute(Self::INLINED_DATA_INDEX_DDL, [])?;
+                conn.execute(Self::INLINED_DELETE_INDEX_DDL, [])?;
                 Ok::<_, rusqlite::Error>(())
             })
             .await

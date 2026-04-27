@@ -4,8 +4,8 @@ select
     p_size,
     count(distinct ps_suppkey) as supplier_cnt
 from
-    mssql.public.partsupp,
-    mssql.public.part
+    mssql.dbo.partsupp,
+    mssql.dbo.part
 where
         p_partkey = ps_partkey
   and p_brand <> 'Brand#45'
@@ -15,7 +15,7 @@ where
     select
         s_suppkey
     from
-        mssql.public.supplier
+        mssql.dbo.supplier
     where
             s_comment like '%Customer%Complaints%'
 )

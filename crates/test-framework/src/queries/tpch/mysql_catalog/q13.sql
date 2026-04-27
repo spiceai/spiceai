@@ -6,8 +6,8 @@ FROM (
         c_custkey,
         COUNT(o_orderkey) AS c_count
     FROM
-        mysql.public.customer
-        LEFT OUTER JOIN mysql.public.orders ON
+        mysql.tpch_sf1.customer
+        LEFT OUTER JOIN mysql.tpch_sf1.orders ON
             c_custkey = o_custkey
             AND o_comment NOT LIKE '%special%requests%'
     GROUP BY

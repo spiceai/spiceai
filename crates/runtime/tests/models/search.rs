@@ -533,6 +533,8 @@ pub(crate) fn item_tpcds_dataset_w_embeddings(
             row_ids: primary_keys,
             chunking,
             vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
         }],
         description: None,
         full_text_search: None,
@@ -574,6 +576,8 @@ pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
             row_ids: primary_keys,
             chunking,
             vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
         }],
         description: None,
         full_text_search: None,
@@ -1201,31 +1205,31 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second')) order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(_fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second')) order by _fused_score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf_wrong_column",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(_score, 3) FROM rrf(vector_search(qs, 'second', answer), text_search(qs, 'second', answer)) order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(_score, 3) FROM rrf(vector_search(qs, 'second', answer), text_search(qs, 'second', answer)) order by _fused_score desc LIMIT 4",
                 ),
             ).should_fail(),
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf_explicit_join",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'id') order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(_fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'id') order by _fused_score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf_explicit_join_wrong_column",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'foobar') order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(_fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'foobar') order by _fused_score desc LIMIT 4",
                 ),
             ).should_fail(),
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf_one_subquery_fail",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second')) order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(_fused_score, 3) FROM rrf(vector_search(qs, 'second')) order by _fused_score desc LIMIT 4",
                 ),
             ).should_fail(),
         ],
@@ -1269,14 +1273,14 @@ async fn test_rrf_search_duckdb_acceleration() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "hybrid_rrf_duckdb_basic",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(text_search(qs, 'second'), vector_search(qs, 'second')) order by fused_score desc, id asc LIMIT 4",
+                    "SELECT id, question, trunc(_fused_score, 3) FROM rrf(text_search(qs, 'second'), vector_search(qs, 'second')) order by _fused_score desc, id asc LIMIT 4",
                 ),
             ),
             // Explicit join key with DuckDB acceleration
             SearchTestCase::new(
                 "hybrid_rrf_duckdb_explicit_join",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(text_search(qs, 'second'), vector_search(qs, 'second'), join_key => 'id') order by fused_score desc, id asc LIMIT 4",
+                    "SELECT id, question, trunc(_fused_score, 3) FROM rrf(text_search(qs, 'second'), vector_search(qs, 'second'), join_key => 'id') order by _fused_score desc, id asc LIMIT 4",
                 ),
             ),
         ],

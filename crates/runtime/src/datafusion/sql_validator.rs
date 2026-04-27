@@ -24,6 +24,12 @@ use datafusion::{
 
 use crate::datafusion::DataFusion;
 
+// Re-export the single-source-of-truth list of write-capable extension node
+// names. The `cache` crate owns this list so that both the read-only validator
+// below and the SQL results-cache eligibility check in `cache` stay in lockstep
+// — any write-capable extension must be non-cacheable AND blocked by read-only.
+pub(super) use cache::WRITE_CAPABLE_EXTENSION_NAMES;
+
 /// Validates that a logical plan only performs allowed operations on datasets.
 ///
 /// Reads (SELECT queries) are allowed on all tables.
@@ -68,10 +74,7 @@ pub fn validate_sql_query_operations(
                 }
 
                 // Fall back to per-table writable check
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
-                    // No catalog specified but default catalog is writable
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
@@ -98,10 +101,7 @@ pub fn validate_sql_query_operations(
                     return Ok(TreeNodeRecursion::Continue);
                 }
 
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
-                    // No catalog specified but default catalog is writable
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
@@ -117,23 +117,25 @@ pub fn validate_sql_query_operations(
                     );
                 }
 
-                if !df.is_path_catalog_writable(&dml.table_name) {
-                    return plan_err!(
-                        "UPDATE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                // Check if attempting to update a catalog table.
+                if let Some(catalog) = dml.table_name.catalog() && catalog != super::SPICE_DEFAULT_CATALOG {
+                    if !df.is_catalog_writable(catalog) {
+                        return plan_err!(
+                            "UPDATE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                            dml.table_name
+                        );
+                    }
+                    return Ok(TreeNodeRecursion::Continue);
+                }
+
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
+                    Ok(TreeNodeRecursion::Continue)
+                } else {
+                    plan_err!(
+                        "UPDATE operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
                         dml.table_name
-                    );
+                    )
                 }
-
-                if !df.is_cayenne_catalog(&dml.table_name) {
-                    let target_catalog = dml.table_name.catalog().unwrap_or(super::SPICE_DEFAULT_CATALOG);
-                    return plan_err!(
-                        "UPDATE operations are only supported on writable Cayenne catalog tables. Table '{}', catalog '{}' is not Cayenne-backed.",
-                        dml.table_name,
-                        target_catalog
-                    );
-                }
-
-                Ok(TreeNodeRecursion::Continue)
             } else { plan_err!("Operation is not allowed: {}", dml.name()) }
         }
         LogicalPlan::Copy(_) => {
@@ -213,6 +215,58 @@ fn validate_ddl_operation(
         "DDL operation '{}' is not allowed. DDL operations are only supported on catalogs configured with 'access: read_write_create'.",
         ddl.name()
     )
+}
+
+/// Strict read-only validator.
+///
+/// Rejects any plan containing DDL, DML, COPY, or any `LogicalPlan::Statement` node
+/// (including `PREPARE` / `EXECUTE` / `DEALLOCATE`). `EXECUTE` can indirectly invoke a
+/// prepared DDL/DML statement and `PREPARE` / `DEALLOCATE` mutate session state, so all
+/// three are disallowed on surfaces that must guarantee read-only execution — notably
+/// the built-in `sql` tool and the LLM-generated SQL path in `/v1/nsql`.
+///
+/// Spice's planner can also represent DDL/DML as [`LogicalPlan::Extension`] nodes
+/// (for example, `DdlExtensionNode` from `datafusion-ddl`, `DmlExtensionNode` from
+/// `datafusion-dml`, and the `DistributedCayenne{Insert,Update,Delete,Merge}` /
+/// `CayenneMerge` distributed DML nodes). Those nodes are matched here by their
+/// stable [`UserDefinedLogicalNodeCore::name`] so that write-capable plans produced
+/// by Spice's custom planner cannot bypass the read-only guarantee. Any new
+/// write-capable extension node type MUST be added to [`WRITE_CAPABLE_EXTENSION_NAMES`].
+///
+/// # Returns
+/// * `Ok(())` if the plan contains only read operations.
+/// * `Err(DataFusionError)` if the plan contains any write, schema-mutating, or
+///   session-mutating operation.
+pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusionError> {
+    plan.apply_with_subqueries(|node| match node {
+        LogicalPlan::Ddl(ddl) => plan_err!(
+            "DDL operation '{}' is not allowed in read-only SQL context.",
+            ddl.name()
+        ),
+        LogicalPlan::Dml(dml) => plan_err!(
+            "{} operations are not allowed in read-only SQL context.",
+            dml.name()
+        ),
+        LogicalPlan::Copy(_) => {
+            plan_err!("COPY operations are not allowed in read-only SQL context.")
+        }
+        LogicalPlan::Statement(stmt) => plan_err!(
+            "Statement '{}' is not allowed in read-only SQL context.",
+            stmt.name()
+        ),
+        LogicalPlan::Extension(ext) => {
+            let name = ext.node.name();
+            if WRITE_CAPABLE_EXTENSION_NAMES.contains(&name) {
+                plan_err!(
+                    "Write-capable extension plan '{name}' is not allowed in read-only SQL context."
+                )
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        }
+        _ => Ok(TreeNodeRecursion::Continue),
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -439,7 +493,7 @@ mod tests {
     async fn test_validate_update_operation_blocked() {
         let df = create_test_datafusion();
 
-        let sql = "UPDATE tbl_writable SET name = 'updated' WHERE id = 1";
+        let sql = "UPDATE tbl_read_only SET name = 'updated' WHERE id = 1";
         let plan = df
             .ctx
             .state()
@@ -447,9 +501,12 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        // UPDATE operations should be blocked
+        // UPDATE on a read-only dataset should be blocked
         let result = validate_sql_query_operations(&plan, &df);
-        assert!(result.is_err(), "UPDATE operations should be blocked");
+        assert!(
+            result.is_err(),
+            "UPDATE operations should be blocked on read-only datasets"
+        );
     }
 
     #[tokio::test]
@@ -834,5 +891,266 @@ mod tests {
             result.is_ok(),
             "INSERT should be allowed on table in writable default catalog"
         );
+    }
+
+    /// [`validate_sql_query_read_only`] must allow SELECT but reject every class of
+    /// write/schema-mutating plan, independent of per-catalog writability. This is the
+    /// contract that the built-in `sql` tool and `/v1/nsql` rely on to contain
+    /// LLM-generated SQL.
+    #[tokio::test]
+    async fn test_read_only_validator_allows_select() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("SELECT * FROM tbl_writable")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan).expect("SELECT must be allowed in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_insert_on_writable_dataset() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)")
+            .await
+            .expect("plan should be created");
+
+        let err = validate_sql_query_read_only(&plan)
+            .expect_err("INSERT must be rejected in read-only context");
+        assert!(
+            err.to_string().contains("read-only"),
+            "error should cite read-only context, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_delete_on_writable_dataset() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("DELETE FROM tbl_writable WHERE id = 1")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("DELETE must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_ddl() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("DROP TABLE IF EXISTS tbl_writable")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan).expect_err("DDL must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_copy() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("COPY tbl_writable TO '/tmp/out.parquet'")
+            .await
+            .expect("plan should be created");
+
+        let err = validate_sql_query_read_only(&plan)
+            .expect_err("COPY must be rejected in read-only context");
+        assert!(
+            err.to_string().contains("COPY"),
+            "error should cite COPY, got: {err}"
+        );
+    }
+
+    /// `PREPARE` mutates session state and the prepared statement could later be
+    /// `EXECUTE`d to run DDL/DML. The strict read-only validator must reject it.
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_prepare() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("PREPARE my_plan AS SELECT * FROM tbl_writable")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("PREPARE must be rejected in read-only context");
+    }
+
+    /// `EXECUTE` can invoke a prepared DDL/DML statement and must therefore be
+    /// rejected by the strict read-only validator.
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_execute() {
+        let df = create_test_datafusion();
+
+        // PREPARE first to get a prepared plan on the session, then verify EXECUTE
+        // is rejected. PREPARE itself is also rejected, so run it through the
+        // non-strict path by bypassing the validator.
+        df.ctx
+            .sql("PREPARE my_plan AS SELECT 1")
+            .await
+            .expect("prepare should succeed");
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("EXECUTE my_plan")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("EXECUTE must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_deallocate() {
+        let df = create_test_datafusion();
+
+        df.ctx
+            .sql("PREPARE my_plan AS SELECT 1")
+            .await
+            .expect("prepare should succeed");
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("DEALLOCATE my_plan")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("DEALLOCATE must be rejected in read-only context");
+    }
+
+    /// Spice's custom planner represents DDL/DML as [`LogicalPlan::Extension`]
+    /// nodes (e.g. `DdlExtensionNode`, `DmlExtensionNode`, `DistributedCayenne*Node`).
+    /// The strict read-only validator must reject those by
+    /// [`UserDefinedLogicalNodeCore::name`] so a write-capable plan cannot
+    /// bypass the check by being wrapped in an extension node.
+    ///
+    /// Constructing a real `DmlExtensionNode` requires a full catalog-handler
+    /// wiring, so this test uses a minimal stub extension node whose `.name()`
+    /// matches one of the names in [`WRITE_CAPABLE_EXTENSION_NAMES`] to
+    /// exercise the name-based deny directly.
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_write_capable_extension_node() {
+        use datafusion::{
+            common::{DFSchema, DFSchemaRef},
+            logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore},
+        };
+        use std::cmp::Ordering;
+        use std::fmt;
+
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        struct StubWriteExtension {
+            schema: DFSchemaRef,
+            name: &'static str,
+        }
+
+        impl PartialOrd for StubWriteExtension {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                self.name.partial_cmp(other.name)
+            }
+        }
+
+        impl UserDefinedLogicalNodeCore for StubWriteExtension {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            fn inputs(&self) -> Vec<&LogicalPlan> {
+                vec![]
+            }
+            fn schema(&self) -> &DFSchemaRef {
+                &self.schema
+            }
+            fn expressions(&self) -> Vec<Expr> {
+                vec![]
+            }
+            fn fmt_for_explain(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "StubWriteExtension({})", self.name)
+            }
+            fn with_exprs_and_inputs(
+                &self,
+                _exprs: Vec<Expr>,
+                _inputs: Vec<LogicalPlan>,
+            ) -> Result<Self, DataFusionError> {
+                Ok(self.clone())
+            }
+        }
+
+        let schema: DFSchemaRef = Arc::new(DFSchema::empty());
+
+        for banned_name in super::WRITE_CAPABLE_EXTENSION_NAMES {
+            let plan = LogicalPlan::Extension(Extension {
+                node: Arc::new(StubWriteExtension {
+                    schema: Arc::clone(&schema),
+                    name: banned_name,
+                }),
+            });
+            let err = validate_sql_query_read_only(&plan)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("extension '{banned_name}' must be rejected in read-only context")
+                });
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains(banned_name) && err_msg.contains("read-only"),
+                "error should cite '{banned_name}' and read-only, got: {err}"
+            );
+        }
+
+        // A benign (non-write) extension name must still be allowed so
+        // read-only optimizer extensions such as `IndexTableScanNode` and
+        // `DuckDBAggregatePushdownNode` are not blocked.
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(StubWriteExtension {
+                schema,
+                name: "IndexTableScanNode",
+            }),
+        });
+        validate_sql_query_read_only(&plan)
+            .expect("non-write extension must be allowed in read-only context");
+    }
+
+    /// Integration check: DDL/DML produced through Spice's planner wrapper
+    /// ([`DataFusion::create_logical_plan`]) — rather than `DataFusion`'s raw
+    /// planner — must still be rejected. This covers the statement-level
+    /// rewrites (`plan_distributed_dml`, `plan_create_table`, etc.) that can
+    /// emit `LogicalPlan::Extension` instead of `LogicalPlan::{Ddl,Dml}`.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_dml_via_spice_planner() {
+        let df = create_test_datafusion();
+        let session = df.ctx.state();
+
+        // INSERT is dispatched through Spice's `plan_distributed_dml`. Without a
+        // distributed cluster it returns a standard `LogicalPlan::Dml`, still
+        // covered by the read-only arm — but this exercises the Spice wrapper
+        // rather than `SessionState::create_logical_plan` directly.
+        let plan = df
+            .create_logical_plan(&session, "INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)")
+            .await
+            .expect("plan should be created via Spice planner");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("INSERT via Spice planner must be rejected in read-only context");
     }
 }

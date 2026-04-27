@@ -122,6 +122,8 @@ impl EmbeddingConnector {
                     chunking: e.chunking.clone(),
                     primary_keys: e.row_ids.clone(),
                     vector_size: e.vector_size,
+                    aggregation: e.aggregation,
+                    max_elements_per_row: e.max_elements_per_row,
                 })
             })
             .collect_vec();
@@ -219,6 +221,16 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
+    }
+
+    async fn register_object_stores(
+        &self,
+        dataset: &Dataset,
+        runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        self.inner_connector
+            .register_object_stores(dataset, runtime_env)
+            .await
     }
 
     fn initialization(&self) -> ComponentInitialization {

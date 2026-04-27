@@ -8,12 +8,12 @@ FROM (
         EXTRACT(YEAR FROM o_orderdate) AS o_year,
         l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount
     FROM
-        mysql.public.part,
-        mysql.public.supplier,
-        mysql.public.lineitem,
-        mysql.public.partsupp,
-        mysql.public.orders,
-        mysql.public.nation
+        mysql.tpch_sf1.part,
+        mysql.tpch_sf1.supplier,
+        mysql.tpch_sf1.lineitem,
+        mysql.tpch_sf1.partsupp,
+        mysql.tpch_sf1.orders,
+        mysql.tpch_sf1.nation
     WHERE
         s_suppkey = l_suppkey
         AND ps_suppkey = l_suppkey

@@ -229,7 +229,7 @@ impl CayenneTableProvider {
 
         self.clear_staging_dir().await?;
 
-        let (row_count, _writer_ops) = self
+        let (row_count, _writer_ops, _stats_acc) = self
             .write_to_snapshot(
                 prepared_stream,
                 self.target_file_size_bytes(),

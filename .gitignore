@@ -16,6 +16,7 @@ Makefile.local
 *.parquet
 spicepod.yaml
 !test/tpc-bench/tpch-spicepod/spicepod.yaml
+!examples/cosmosdb-connector/spicepod.yaml
 
 target/
 
@@ -85,5 +86,5 @@ cluster_logs/
 # Insta snapshot artifacts
 *.pending-snap
 
-# Claude worktrees
-.claude/worktrees/
+# Claude local workspace (worktrees, eval results, scratch)
+.claude/
