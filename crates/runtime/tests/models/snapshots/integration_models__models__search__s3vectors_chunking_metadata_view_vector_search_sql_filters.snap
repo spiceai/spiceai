@@ -11,16 +11,16 @@ expression: resp?
   {
     "id": 1015,
     "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content.",
+    "_score": 0.31
+  },
+  {
+    "id": 1035,
+    "answer": "The primary effect of α₁-adrenergic blockers is to decrease systemic vascular resistance (SVR) by causing vasodilation.",
     "_score": 0.3
   },
   {
     "id": 551,
     "answer": "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$",
-    "_score": 0.29
-  },
-  {
-    "id": 1035,
-    "answer": "The primary effect of α₁-adrenergic blockers is to decrease systemic vascular resistance (SVR) by causing vasodilation.",
     "_score": 0.29
   }
 ]

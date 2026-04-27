@@ -75,8 +75,12 @@ impl std::fmt::Debug for EmbeddingTableExec {
 }
 
 impl DisplayAs for EmbeddingTableExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "EmbeddingTable: inner={:?}", self.base_plan)
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "EmbeddingTableExec")?;
+        if matches!(t, DisplayFormatType::Verbose) {
+            write!(f, ": inner={:?}", self.base_plan)?;
+        }
+        Ok(())
     }
 }
 

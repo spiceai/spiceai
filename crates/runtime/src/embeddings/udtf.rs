@@ -50,7 +50,7 @@ use datafusion::{
 };
 
 use datafusion_expr::{
-    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
+    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, TableProviderFilterPushDown,
     binary_expr, col, ident,
 };
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
@@ -103,6 +103,74 @@ use search::index::elasticsearch::ElasticsearchIndex;
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
+
+/// A zero-argument scalar UDF that returns a precomputed embedding vector.
+///
+/// Using a named UDF instead of a raw `ScalarValue::FixedSizeList` literal
+/// keeps `EXPLAIN` output readable: the plan shows `query_vector()` rather
+/// than printing hundreds of raw float values inline.
+struct QueryVectorExpr {
+    vector: Arc<FixedSizeListArray>,
+    data_type: DataType,
+    signature: Signature,
+}
+
+impl PartialEq for QueryVectorExpr {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.vector, &other.vector)
+    }
+}
+
+impl Eq for QueryVectorExpr {}
+
+impl std::hash::Hash for QueryVectorExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.vector).hash(state);
+    }
+}
+
+impl QueryVectorExpr {
+    fn new(vector: FixedSizeListArray) -> Self {
+        let data_type = vector.data_type().clone();
+        Self {
+            vector: Arc::new(vector),
+            data_type,
+            // Marked `Volatile` so DataFusion does not constant-fold `query_vector()`
+            // back into a large `FixedSizeList` literal in `EXPLAIN` output.
+            signature: Signature::exact(vec![], Volatility::Volatile),
+        }
+    }
+}
+
+impl std::fmt::Debug for QueryVectorExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QueryVectorExpr(dims={})", self.vector.value_length())
+    }
+}
+
+impl ScalarUDFImpl for QueryVectorExpr {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &'static str {
+        "query_vector"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Ok(self.data_type.clone())
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(ScalarValue::FixedSizeList(
+            Arc::clone(&self.vector),
+        )))
+    }
+}
 
 /// Upper bound on the number of query strings accepted by `vector_search` when
 /// invoked in late-interaction (multi-query) mode. Each query produces its own
@@ -960,7 +1028,10 @@ impl TableProvider for VectorSearchUDTFProvider {
         // (higher == more similar) so the downstream `ORDER BY _score DESC` is correct.
         let metric = self.args.distance_metric.unwrap_or(DistanceMetric::Cosine);
         let embed_expr = ident(embedding_col!(embed_col));
-        let query_lit = lit(ScalarValue::FixedSizeList(Arc::new(query_vector)));
+        let query_lit = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(QueryVectorExpr::new(query_vector))),
+            args: vec![],
+        });
 
         let score_expr: Expr = match metric {
             DistanceMetric::Cosine => {
