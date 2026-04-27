@@ -36,6 +36,7 @@ members = [
     "crates/runtime-api-types",
     "crates/runtime-auth",
     "crates/runtime-async",
+    "crates/runtime-cluster",
     "crates/datafusion-flightsql",
     "crates/runtime-datafusion",
     "crates/runtime-datafusion-index",
@@ -271,7 +272,7 @@ regex = "1.12.3"
 # Pinned to 0.12.24 due to hf-hub content-range header issue with 0.12.25+ (tower-http decompression change)
 # See: https://github.com/seanmonstar/reqwest/pull/2840
 reqwest = { version = "=0.12.24", features = ["json", "rustls-tls", "gzip", "brotli", "zstd", "deflate"] }
-rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a66f66ae345a0fafde1e2ee496ec137d77aef82a" }
+rmcp = { version = "1.5.0", default-features = false }
 roaring = "0.11"
 rusqlite = { version = "0.37.0", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"

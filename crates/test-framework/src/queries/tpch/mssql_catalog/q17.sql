@@ -1,8 +1,8 @@
 select
         sum(l_extendedprice) / 7.0 as avg_yearly
 from
-    mssql.public.lineitem,
-    mssql.public.part
+    mssql.dbo.lineitem,
+    mssql.dbo.part
 where
         p_partkey = l_partkey
   and p_brand = 'Brand#23'
@@ -11,7 +11,7 @@ where
     select
             0.2 * avg(l_quantity)
     from
-        mssql.public.lineitem
+        mssql.dbo.lineitem
     where
             l_partkey = p_partkey
 );
