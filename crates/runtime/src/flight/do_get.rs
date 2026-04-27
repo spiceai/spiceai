@@ -159,10 +159,7 @@ async fn do_get_simple(
         Ok(sql) => {
             let read_only = super::is_auth_read_only(&context);
             let (output, cache_status) = Box::pin(Service::sql_to_flight_stream(
-                datafusion,
-                sql,
-                None,
-                read_only,
+                datafusion, sql, None, read_only,
             ))
             .await?;
 
