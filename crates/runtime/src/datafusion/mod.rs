@@ -1372,7 +1372,7 @@ impl DataFusion {
         let Some(catalog) = self.resolve_catalog_provider(&dataset_name) else {
             return false;
         };
-        let Some(s) = Self::resolve_schema_provider(catalog, &dataset_name) else {
+        let Some(s) = Self::resolve_schema_provider(&catalog, &dataset_name) else {
             return false;
         };
         s.table_exist(dataset_name.table())
