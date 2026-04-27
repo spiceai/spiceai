@@ -1,8 +1,8 @@
 select
     sum(l_extendedprice* (1 - l_discount)) as revenue
 from
-    mssql.public.lineitem,
-    mssql.public.part
+    mssql.dbo.lineitem,
+    mssql.dbo.part
 where
     (
                 p_partkey = l_partkey
