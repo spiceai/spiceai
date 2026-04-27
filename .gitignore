@@ -88,3 +88,6 @@ cluster_logs/
 
 # Claude worktrees
 .claude/worktrees/
+
+# Distributed helper script working directory
+.distributed/
