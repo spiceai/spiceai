@@ -124,21 +124,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
-        shell: bash
-        run: |
-          set -euo pipefail
-          PROTOC_VERSION="23.4"
-          case "$(uname -s)" in
-            Linux) [ "$(uname -m)" = "aarch64" ] && P="linux-aarch_64" || P="linux-x86_64" ;;
-            Darwin) P="osx-universal_binary" ;;
-          esac
-          TMP=$(mktemp -d)
-          curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${P}.zip" -o "${TMP}/protoc.zip"
-          unzip -q "${TMP}/protoc.zip" -d "${TMP}/protoc"
-          mkdir -p "${HOME}/.local/bin"
-          cp "${TMP}/protoc/bin/protoc" "${HOME}/.local/bin/protoc"
-          chmod +x "${HOME}/.local/bin/protoc"
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}" 
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -209,21 +195,7 @@ jobs:
           sudo apt-get install build-essential libssl-dev pkg-config cmake unzip -y
 
       - name: Install protoc
-        shell: bash
-        run: |
-          set -euo pipefail
-          PROTOC_VERSION="23.4"
-          case "$(uname -s)" in
-            Linux) [ "$(uname -m)" = "aarch64" ] && P="linux-aarch_64" || P="linux-x86_64" ;;
-            Darwin) P="osx-universal_binary" ;;
-          esac
-          TMP=$(mktemp -d)
-          curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${P}.zip" -o "${TMP}/protoc.zip"
-          unzip -q "${TMP}/protoc.zip" -d "${TMP}/protoc"
-          mkdir -p "${HOME}/.local/bin"
-          cp "${TMP}/protoc/bin/protoc" "${HOME}/.local/bin/protoc"
-          chmod +x "${HOME}/.local/bin/protoc"
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}" 
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -293,21 +265,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Install protoc
-        shell: bash
-        run: |
-          set -euo pipefail
-          PROTOC_VERSION="23.4"
-          case "$(uname -s)" in
-            Linux) [ "$(uname -m)" = "aarch64" ] && P="linux-aarch_64" || P="linux-x86_64" ;;
-            Darwin) P="osx-universal_binary" ;;
-          esac
-          TMP=$(mktemp -d)
-          curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${P}.zip" -o "${TMP}/protoc.zip"
-          unzip -q "${TMP}/protoc.zip" -d "${TMP}/protoc"
-          mkdir -p "${HOME}/.local/bin"
-          cp "${TMP}/protoc/bin/protoc" "${HOME}/.local/bin/protoc"
-          chmod +x "${HOME}/.local/bin/protoc"
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}" 
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced

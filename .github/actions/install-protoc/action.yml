@@ -1,0 +1,49 @@
+name: Install protoc
+description: 'Install the protoc compiler directly from GitHub releases, bypassing the API version lookup'
+
+inputs:
+  version:
+    description: 'Exact protoc version to install (no wildcards)'
+    default: '23.4'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install protoc (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        [ "$(uname -m)" = "aarch64" ] && P="linux-aarch_64" || P="linux-x86_64"
+        TMP=$(mktemp -d)
+        curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v${{ inputs.version }}/protoc-${{ inputs.version }}-${P}.zip" -o "${TMP}/protoc.zip"
+        unzip -q "${TMP}/protoc.zip" -d "${TMP}/protoc"
+        mkdir -p "${HOME}/.local/bin"
+        cp "${TMP}/protoc/bin/protoc" "${HOME}/.local/bin/protoc"
+        chmod +x "${HOME}/.local/bin/protoc"
+        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+    - name: Install protoc (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        TMP=$(mktemp -d)
+        curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v${{ inputs.version }}/protoc-${{ inputs.version }}-osx-universal_binary.zip" -o "${TMP}/protoc.zip"
+        unzip -q "${TMP}/protoc.zip" -d "${TMP}/protoc"
+        mkdir -p "${HOME}/.local/bin"
+        cp "${TMP}/protoc/bin/protoc" "${HOME}/.local/bin/protoc"
+        chmod +x "${HOME}/.local/bin/protoc"
+        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+    - name: Install protoc (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $tmp = New-TemporaryFile | ForEach-Object { Remove-Item $_; New-Item -ItemType Directory -Path "$_.d" }
+        Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v${{ inputs.version }}/protoc-${{ inputs.version }}-win64.zip" -OutFile "$tmp\protoc.zip"
+        Expand-Archive -Path "$tmp\protoc.zip" -DestinationPath "$tmp\protoc"
+        $bin = "$env:USERPROFILE\.local\bin"
+        New-Item -ItemType Directory -Force -Path $bin | Out-Null
+        Copy-Item "$tmp\protoc\bin\protoc.exe" -Destination "$bin\protoc.exe"
+        echo "$bin" >> $env:GITHUB_PATH
