@@ -128,6 +128,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
+          version: '26.x'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up make
@@ -225,6 +226,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
+          version: '26.x'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up make
@@ -338,6 +340,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
+          version: '26.x'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up make
