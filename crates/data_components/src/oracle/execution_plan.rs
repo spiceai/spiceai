@@ -115,7 +115,7 @@ impl OracleExecPlan {
                 .map(|f| {
                     Unparser::new(&dialect)
                         .expr_to_sql(f)
-                        .map(|e| e.to_string())
+                        .map(|e| format!("({e})"))
                 })
                 .collect::<DataFusionResult<Vec<String>>>()?
                 .join(" AND ");
