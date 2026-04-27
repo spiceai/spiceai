@@ -58,6 +58,7 @@ use {
 use crate::cluster::partition::service::PartitionService;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
+use arrow::record_batch::RecordBatch;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
@@ -142,6 +143,43 @@ pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 pub const SPICE_EVAL_SCHEMA: &str = "eval";
 pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 pub const SPICE_SCP_SCHEMA: &str = "scp";
+
+const MAX_STREAMING_BROADCAST_BATCHES: usize = 128;
+const MAX_STREAMING_BROADCAST_ROWS: usize = 1_000_000;
+
+#[derive(Default)]
+struct StreamingBroadcastBuffer {
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    limit_exceeded: bool,
+}
+
+impl StreamingBroadcastBuffer {
+    fn push(&mut self, batch: &RecordBatch) -> bool {
+        if self.limit_exceeded {
+            return false;
+        }
+
+        let next_batches = self.batches.len().saturating_add(1);
+        let next_rows = self.rows.saturating_add(batch.num_rows());
+        if next_batches > MAX_STREAMING_BROADCAST_BATCHES
+            || next_rows > MAX_STREAMING_BROADCAST_ROWS
+        {
+            self.batches.clear();
+            self.rows = 0;
+            self.limit_exceeded = true;
+            return true;
+        }
+
+        self.rows = next_rows;
+        self.batches.push(batch.clone());
+        false
+    }
+
+    fn batches(&self) -> Option<Vec<RecordBatch>> {
+        (!self.limit_exceeded).then(|| self.batches.clone())
+    }
+}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -1346,14 +1384,24 @@ impl DataFusion {
             .data_update_broadcaster
             .has_subscribers(table_reference)
             .await
-            .then(|| Arc::new(StdMutex::new(Vec::new())));
+            .then(|| Arc::new(StdMutex::new(StreamingBroadcastBuffer::default())));
         let data = match broadcast_batches.as_ref() {
             Some(batches) => {
                 let batches = Arc::clone(batches);
+                let table_reference = table_reference.to_string();
                 let stream = data.map(move |batch_result| {
                     if let Ok(batch) = &batch_result {
                         match batches.lock() {
-                            Ok(mut batches) => batches.push(batch.clone()),
+                            Ok(mut batches) => {
+                                if batches.push(batch) {
+                                    tracing::warn!(
+                                        dataset = %table_reference,
+                                        max_batches = MAX_STREAMING_BROADCAST_BATCHES,
+                                        max_rows = MAX_STREAMING_BROADCAST_ROWS,
+                                        "Disabling DoExchange broadcast for streaming write because buffered update exceeded limits"
+                                    );
+                                }
+                            }
                             Err(err) => tracing::warn!(
                                 "Failed to record streaming data update for DoExchange subscribers: {err}"
                             ),
@@ -1407,12 +1455,12 @@ impl DataFusion {
 
         if let Some(batches) = broadcast_batches {
             let broadcast_data = match batches.lock() {
-                Ok(batches) => Ok(batches.clone()),
+                Ok(batches) => Ok(batches.batches()),
                 Err(err) => Err(err.to_string()),
             };
 
             match broadcast_data {
-                Ok(data) => {
+                Ok(Some(data)) => {
                     let update = DataUpdate {
                         schema: update_schema,
                         data,
@@ -1422,6 +1470,10 @@ impl DataFusion {
                         .publish(table_reference, update)
                         .await;
                 }
+                Ok(None) => tracing::warn!(
+                    dataset = %table_reference,
+                    "Skipped publishing streaming data update to DoExchange subscribers because the buffered update exceeded limits; subscribers can reconnect to receive a fresh snapshot"
+                ),
                 Err(err) => tracing::warn!(
                     "Failed to publish streaming data update to DoExchange subscribers: {err}"
                 ),
@@ -3330,11 +3382,47 @@ async fn build_snapshot_creation_config(
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field};
     use cache::{SimpleCache, key::CacheKey};
 
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    fn streaming_broadcast_test_batch(value: i32) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![value])) as arrow::array::ArrayRef],
+        )
+        .expect("test record batch should be valid")
+    }
+
+    #[test]
+    fn test_streaming_broadcast_buffer_records_within_limit() {
+        let mut buffer = StreamingBroadcastBuffer::default();
+
+        assert!(!buffer.push(&streaming_broadcast_test_batch(1)));
+
+        let batches = buffer.batches().expect("buffer should be publishable");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn test_streaming_broadcast_buffer_disables_when_batch_limit_exceeded() {
+        let mut buffer = StreamingBroadcastBuffer::default();
+
+        for value in 0..MAX_STREAMING_BROADCAST_BATCHES {
+            assert!(!buffer.push(&streaming_broadcast_test_batch(
+                i32::try_from(value).expect("test value fits in i32")
+            )));
+        }
+
+        assert!(buffer.push(&streaming_broadcast_test_batch(999)));
+        assert!(buffer.batches().is_none());
+        assert!(!buffer.push(&streaming_broadcast_test_batch(1000)));
+    }
 
     #[tokio::test]
     async fn test_get_or_create_logical_plan() {

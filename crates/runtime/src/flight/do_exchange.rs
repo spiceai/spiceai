@@ -25,6 +25,7 @@ use async_stream::try_stream;
 use data_components::cdc::changes_schema;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use futures::{Stream, StreamExt};
 use tokio::sync::broadcast::error::RecvError;
@@ -90,8 +91,14 @@ pub(crate) async fn handle(
     let datafusion_stream = Arc::clone(&datafusion);
 
     let response_stream = try_stream! {
-        let initial_update = initial_snapshot_update(&datafusion_stream, Arc::clone(&table_provider_stream)).await?;
-        let mut encoded_initial_update = Box::pin(encode_data_update(&table_provider_stream, &initial_update));
+        let initial_snapshot_stream = initial_snapshot_stream(&datafusion_stream, Arc::clone(&table_provider_stream)).await?;
+        let initial_snapshot_schema = initial_snapshot_stream.schema();
+        let mut encoded_initial_update = Box::pin(encode_record_batch_stream(
+            &table_provider_stream,
+            initial_snapshot_schema,
+            initial_snapshot_stream,
+            UpdateType::Overwrite,
+        ));
         while let Some(flight) = encoded_initial_update.next().await {
             yield flight?;
         }
@@ -117,24 +124,71 @@ pub(crate) async fn handle(
     Ok(Response::new(response_stream.boxed()))
 }
 
-async fn initial_snapshot_update(
+async fn initial_snapshot_stream(
     datafusion: &Arc<crate::datafusion::DataFusion>,
     table_provider: Arc<dyn TableProvider>,
-) -> Result<DataUpdate, Status> {
-    let schema = table_provider.schema();
+) -> Result<SendableRecordBatchStream, Status> {
     let df = datafusion
         .ctx
         .read_table(table_provider)
         .map_err(|source| Status::internal(format!("Unable to read initial snapshot: {source}")))?;
-    let data = df.collect().await.map_err(|source| {
-        Status::internal(format!("Unable to collect initial snapshot: {source}"))
-    })?;
+    df.execute_stream()
+        .await
+        .map_err(|source| Status::internal(format!("Unable to stream initial snapshot: {source}")))
+}
 
-    Ok(DataUpdate {
-        schema,
-        data,
-        update_type: UpdateType::Append,
-    })
+fn encode_record_batch_stream<'a>(
+    table_provider: &'a Arc<dyn TableProvider>,
+    schema: SchemaRef,
+    mut data: SendableRecordBatchStream,
+    update_type: UpdateType,
+) -> impl Stream<Item = Result<FlightData, Status>> + 'a {
+    try_stream! {
+        let mut encoder = IpcDataGenerator::default();
+        let mut tracker = DictionaryTracker::new(false);
+        let mut compression_context = CompressionContext::default();
+        let write_options = writer::IpcWriteOptions::default();
+        let mut schema_sent = false;
+
+        if matches!(&update_type, UpdateType::Overwrite) {
+            let truncate_batch = data_update_to_change_batch(table_provider, &schema, None, "t", 1)?;
+            for flight in encode_change_batch_flights(
+                &mut schema_sent,
+                &mut encoder,
+                &mut tracker,
+                &mut compression_context,
+                &write_options,
+                &truncate_batch,
+            )? {
+                metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(1, &[]);
+                yield flight;
+            }
+        }
+
+        while let Some(batch) = data.next().await {
+            let batch = batch.map_err(|source| {
+                Status::internal(format!("Unable to read initial snapshot batch: {source}"))
+            })?;
+            let change_batch = data_update_to_change_batch(
+                table_provider,
+                &schema,
+                Some(&batch),
+                change_operation_for_update(&update_type),
+                0,
+            )?;
+            for flight in encode_change_batch_flights(
+                &mut schema_sent,
+                &mut encoder,
+                &mut tracker,
+                &mut compression_context,
+                &write_options,
+                &change_batch,
+            )? {
+                metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(1, &[]);
+                yield flight;
+            }
+        }
+    }
 }
 
 fn encode_data_update<'a>(
