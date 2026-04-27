@@ -1,7 +1,7 @@
 SELECT
     SUM(l_extendedprice * l_discount) AS revenue
 FROM
-    mysql.public.lineitem
+    mysql.tpch_sf1.lineitem
 WHERE
     l_shipdate >= DATE '1994-01-01'
     AND l_shipdate < DATE '1995-01-01'

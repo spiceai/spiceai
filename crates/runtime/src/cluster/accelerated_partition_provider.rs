@@ -1,0 +1,89 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Runtime-side wrapper that lifts `AcceleratedTable` downcasting out of the
+//! `runtime-cluster` crate — the trait impl must live here because both
+//! `TablePartitionProvider` and `ExecutorRegistry` are external to this crate
+//! (orphan rule).
+
+use std::sync::Arc;
+
+use arrow::datatypes::SchemaRef;
+use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
+use datafusion_expr::TableScan;
+use datafusion_federation::FederatedTableProviderAdaptor;
+use runtime_cluster::{ExecutorRegistry, PartitionValue};
+use runtime_datafusion::analyzer_rule::TablePartitionProvider;
+
+use crate::accelerated_table::AcceleratedTable;
+
+/// Wraps an [`ExecutorRegistry`] with the `AcceleratedTable`-specific
+/// `should_partition` logic so it can be installed as a `TablePartitionProvider`.
+#[derive(Debug)]
+pub struct AcceleratedPartitionProvider(Arc<ExecutorRegistry>);
+
+impl AcceleratedPartitionProvider {
+    #[must_use]
+    pub fn from_registry(registry: Arc<ExecutorRegistry>) -> Self {
+        Self(registry)
+    }
+}
+
+fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
+    if table_provider
+        .as_any()
+        .downcast_ref::<AcceleratedTable>()
+        .is_some()
+    {
+        return true;
+    }
+
+    if let Some(adaptor) = table_provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner_provider) = adaptor.table_provider.as_ref()
+    {
+        return inner_provider
+            .as_any()
+            .downcast_ref::<AcceleratedTable>()
+            .is_some();
+    }
+
+    false
+}
+
+impl TablePartitionProvider for AcceleratedPartitionProvider {
+    fn should_partition(&self, tbl: &TableScan) -> bool {
+        let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
+            return false;
+        };
+        is_accelerated_table_provider(&default.table_provider)
+    }
+
+    fn get_partitions(
+        &self,
+        table: &TableReference,
+        schema: &SchemaRef,
+    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
+        self.0
+            .resolve_accelerated_partitions(table, schema)
+            .into_iter()
+            // Executors only materialize data for their assigned partitions; bucket filters are
+            // redundant and expensive to evaluate per-row.
+            .map(|(provider, _)| (provider, vec![]))
+            .collect()
+    }
+}

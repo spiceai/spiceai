@@ -120,18 +120,17 @@ regex.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
     "client",
-    "reqwest",
     "server",
-    "transport-sse-server",
     "transport-io",
-    "transport-sse-client",
     "transport-child-process",
     "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
 ] }
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-auth = { path = "../runtime-auth" }
+runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
@@ -146,6 +145,7 @@ rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
+duration-parse = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
@@ -190,7 +190,7 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 ], optional = true }
 
 gethostname.workspace = true
-uuid = { workspace = true, features = ["v7"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
 
@@ -263,11 +263,12 @@ yaml = { path = "../yaml" }
 [features]
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "dep:sha2", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
+azure-keyvault = ["runtime-secrets/azure-keyvault"]
 bedrock = []
 clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
 cosmosdb = ["data_components/cosmosdb"]
 cuda = ["llms/cuda"]
-databricks = ["data_components/databricks"]
+databricks = ["data_components/databricks", "dep:duration-parse"]
 debezium = ["kafka", "data_components/debezium"]
 default = [
     "keyring-secret-store",
@@ -281,6 +282,7 @@ dremio = []
 elasticsearch = [
     "data_components/elasticsearch",
     "dep:elasticsearch",
+    "dep:duration-parse",
     "search/elasticsearch",
 ]
 duckdb = [

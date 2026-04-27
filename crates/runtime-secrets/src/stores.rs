@@ -16,6 +16,8 @@ limitations under the License.
 
 #[cfg(feature = "aws-secrets-manager")]
 pub mod aws_secrets_manager;
+#[cfg(feature = "azure-keyvault")]
+pub mod azure_keyvault;
 pub mod env;
 #[cfg(feature = "keyring-secret-store")]
 pub mod keyring;

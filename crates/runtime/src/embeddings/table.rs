@@ -843,6 +843,12 @@ impl TableProvider for EmbeddingTable {
             .flatten()
             .collect();
 
+        // Deduplicate: if the base table already stores the embedding column (e.g. after a
+        // refresh writes it to DuckDB while in_base_table was set to false at startup), skip
+        // re-appending it to avoid a duplicate field that corrupts column-index resolution.
+        let base_field_names: std::collections::HashSet<_> =
+            base_fields.iter().map(|f| f.name().clone()).collect();
+        embedding_fields.retain(|f| !base_field_names.contains(f.name()));
         base_fields.append(&mut embedding_fields);
 
         let mut schema = Schema::new(base_fields);
@@ -985,6 +991,23 @@ impl TableProvider for EmbeddingTable {
         overwrite: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.insert_into(state, input, overwrite).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.base_table.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.base_table.update(state, assignments, filters).await
     }
 }
 
@@ -1563,5 +1586,110 @@ mod tests {
         assert!(EmbeddingTable::base_table_has_embedding_column(
             &schema, "tags"
         ));
+    }
+
+    // ===== schema() dedup =====
+
+    #[test]
+    fn test_schema_no_duplicate_when_base_already_has_embedding_column() {
+        // Simulate the state after a DuckDB refresh writes the embedding column back to the
+        // accelerated base table while `in_base_table` was set to `false` at startup.
+        // `schema()` must not append the embedding field a second time.
+        let body_field = Arc::new(Field::new("body", DataType::Utf8, true));
+        let embedding_field = Arc::new(Field::new_fixed_size_list(
+            "body_embedding",
+            Field::new("item", DataType::Float32, false),
+            4,
+            true,
+        ));
+        // Base table already contains the embedding column.
+        let base_schema = Arc::new(Schema::new(vec![
+            Arc::clone(&body_field),
+            Arc::clone(&embedding_field),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("valid schema"),
+        );
+
+        let embedded_columns = HashMap::from([(
+            "body".to_string(),
+            EmbeddingColumnConfig {
+                model_name: "m".to_string(),
+                vector_size: 4,
+                // in_base_table was false at startup — the refresh later wrote it to DuckDB.
+                in_base_table: false,
+                chunker: None,
+                input_mode: EmbeddingInputMode::Scalar,
+            },
+        )]);
+
+        let table = EmbeddingTable {
+            base_table,
+            embedded_columns,
+            embedding_models: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let schema = table.schema();
+        let field_names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // body_embedding must appear exactly once.
+        assert_eq!(
+            field_names
+                .iter()
+                .filter(|&&n| n == "body_embedding")
+                .count(),
+            1,
+            "body_embedding appeared more than once in schema: {field_names:?}"
+        );
+        assert_eq!(
+            field_names,
+            vec!["body", "body_embedding"],
+            "unexpected field order: {field_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_schema_appends_embedding_column_when_not_in_base() {
+        // When the base table does not yet have the embedding column, `schema()` must append it.
+        let body_field = Arc::new(Field::new("body", DataType::Utf8, true));
+        let base_schema = Arc::new(Schema::new(vec![Arc::clone(&body_field)]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("valid schema"),
+        );
+
+        let embedded_columns = HashMap::from([(
+            "body".to_string(),
+            EmbeddingColumnConfig {
+                model_name: "m".to_string(),
+                vector_size: 4,
+                in_base_table: false,
+                chunker: None,
+                input_mode: EmbeddingInputMode::Scalar,
+            },
+        )]);
+
+        let table = EmbeddingTable {
+            base_table,
+            embedded_columns,
+            embedding_models: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let schema = table.schema();
+        let field_names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        assert!(
+            field_names.contains(&"body_embedding"),
+            "body_embedding missing from schema: {field_names:?}"
+        );
+        assert_eq!(
+            field_names
+                .iter()
+                .filter(|&&n| n == "body_embedding")
+                .count(),
+            1,
+            "body_embedding appeared more than once: {field_names:?}"
+        );
     }
 }

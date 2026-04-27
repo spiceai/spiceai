@@ -137,11 +137,15 @@ pub fn expand_views_schema(schema: &Schema) -> Schema {
                 DataType::BinaryView => DataType::LargeBinary,
                 t => t.clone(),
             };
-            Field::new(field.name(), new_type, field.is_nullable())
+            if &new_type == field.data_type() {
+                field.as_ref().clone()
+            } else {
+                field.as_ref().clone().with_data_type(new_type)
+            }
         })
         .collect();
 
-    Schema::new(transformed_fields)
+    Schema::new_with_metadata(transformed_fields, schema.metadata().clone())
 }
 
 /// Replaces Arrow `Dictionary`-encoded fields with the dictionary's value type.
@@ -869,5 +873,37 @@ mod tests {
             false,
         )]);
         assert!(!has_dictionary_types(&no_dict));
+    }
+
+    #[test]
+    fn test_expand_views_schema_preserves_metadata() {
+        let field_metadata: HashMap<String, String> =
+            [("logicalType".to_string(), "TEXT".to_string())]
+                .into_iter()
+                .collect();
+        let schema_metadata: HashMap<String, String> =
+            [("source".to_string(), "snowflake".to_string())]
+                .into_iter()
+                .collect();
+
+        let schema = Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8View, false).with_metadata(field_metadata.clone()),
+                Field::new("data", DataType::BinaryView, true),
+                Field::new("unchanged", DataType::Float64, false)
+                    .with_metadata(field_metadata.clone()),
+            ],
+            schema_metadata.clone(),
+        );
+
+        let expanded = expand_views_schema(&schema);
+
+        assert_eq!(*expanded.field(1).data_type(), DataType::LargeUtf8);
+        assert_eq!(expanded.field(1).metadata(), &field_metadata);
+        assert_eq!(*expanded.field(2).data_type(), DataType::LargeBinary);
+        assert_eq!(*expanded.field(3).data_type(), DataType::Float64);
+        assert_eq!(expanded.field(3).metadata(), &field_metadata);
+        assert_eq!(expanded.metadata(), &schema_metadata);
     }
 }
