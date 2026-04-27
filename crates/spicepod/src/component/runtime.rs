@@ -505,7 +505,7 @@ impl TaskHistory {
         }
 
         Err(format!(
-            r#"Expected "none" or "truncated" for "captured_output", but got: "{}""#,
+            "Expected \"none\" or \"truncated\" for \"captured_output\", but got: \"{}\"",
             self.captured_output
         )
         .into())
@@ -519,7 +519,7 @@ impl TaskHistory {
             "truncated" => Ok(TaskHistoryCapturedContext::Truncated),
             "full" => Ok(TaskHistoryCapturedContext::Full),
             _ => Err(format!(
-                r#"Expected "redacted", "truncated", or "full" for "captured_context", but got: "{}""#,
+                "Expected \"redacted\", \"truncated\", or \"full\" for \"captured_context\", but got: \"{}\"",
                 self.captured_context
             )
             .into()),

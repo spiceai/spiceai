@@ -403,28 +403,10 @@ fn copy_reader_to_writer<R: std::io::Read, W: std::io::Write>(
     writer: &mut W,
     write_path: &Path,
 ) -> Result<u64> {
-    let mut total_bytes = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-
-    loop {
-        let bytes_read = reader
-            .read(&mut buffer)
-            .map_err(|source| ArchiveError::ReadArchive { source })?;
-
-        if bytes_read == 0 {
-            break;
-        }
-
-        writer
-            .write_all(&buffer[..bytes_read])
-            .map_err(|source| ArchiveError::ExtractArchive {
-                path: write_path.to_path_buf(),
-                source,
-            })?;
-        total_bytes += bytes_read as u64;
-    }
-
-    Ok(total_bytes)
+    std::io::copy(reader, writer).map_err(|source| ArchiveError::ExtractArchive {
+        path: write_path.to_path_buf(),
+        source,
+    })
 }
 
 /// Encode bytes as lowercase hex string.
