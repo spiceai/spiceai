@@ -255,14 +255,24 @@ impl FullTextDatabaseIndex {
         for t in terms_to_delete {
             index_writer.delete_term(t);
         }
-        // Insertion.
-        for doc in docs {
-            index_writer.add_document(doc).context(IndexCreationSnafu)?;
+        // Insertion and commit. On failure, rollback to discard staged operations
+        // so they don't leak into the next batch's commit.
+        let commit_result = (|| {
+            for doc in docs {
+                index_writer.add_document(doc).context(IndexCreationSnafu)?;
+            }
+            index_writer
+                .commit()
+                .context(FailedToInsertDataIntoIndexSnafu)
+        })();
+        if let Err(e) = &commit_result {
+            tracing::warn!("Rolling back index writer after failed commit: {e}");
+            if let Err(rb_err) = index_writer.rollback() {
+                tracing::error!("Failed to rollback index writer: {rb_err}");
+            }
         }
-        index_writer
-            .commit()
-            .context(FailedToInsertDataIntoIndexSnafu)?;
         drop(index_writer);
+        commit_result?;
 
         self.reader.reload().boxed().context(InvalidIndexingSnafu {
             context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
