@@ -916,10 +916,6 @@ mod tests {
 
     #[test]
     fn array_wildcard_map_of_array_of_object_shape() {
-        // Mirrors the `flatten_json_properties` map-of-array-of-object
-        // example: a map whose values are arrays of objects. With
-        // `array_wildcard = true`, every element collapses onto a
-        // single `[*]` segment.
         let json = r#"{
             "identityMap": {
                 "EMAIL": [{"id":"a@b.com","primary":true}],
@@ -935,8 +931,6 @@ mod tests {
         assert!(paths.contains(&"identityMap.EMAIL[*].id"));
         assert!(paths.contains(&"identityMap.CRM[*].id"));
         assert!(paths.contains(&"identityMap.CRM[*].primary"));
-        // Three rows for `id` (EMAIL×1 + CRM×2) all collapsed onto two
-        // distinct wildcard paths (one per top-level map key).
         let id_rows = rows
             .iter()
             .filter(|r| {
@@ -1012,10 +1006,6 @@ mod tests {
             ..FlattenOptions::default()
         };
         let rows = flatten_with_options(json, &opts);
-        // Walker aborts past `max_depth`, so `d` is unreachable. The
-        // empty-container fallback surfaces the deepest container that
-        // *looks* empty after truncation so truncated subtrees don't
-        // vanish silently.
         let paths: Vec<_> = rows.iter().map(|r| r.path.as_str()).collect();
         assert!(!paths.contains(&"a.b.c.d"));
         assert!(paths.iter().any(|p| p.starts_with("a.b")));

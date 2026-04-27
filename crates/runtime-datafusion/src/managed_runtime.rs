@@ -48,6 +48,11 @@ impl<M> ManagedRecordBatchStream<M> {
 ///
 /// The future and the resulting stream are both driven by the supplied runtime handle. The resulting
 /// stream can be consumed from the caller's runtime without blocking the managed runtime.
+///
+/// # Errors
+///
+/// Returns [`ManagedRuntimeError::JoinError`] if the spawned task panics, or
+/// [`ManagedRuntimeError::ExecutionError`] if the future itself returns an error.
 pub async fn run_record_batch_stream_on_runtime<Fut, M, E>(
     runtime_handle: Handle,
     request_context: Arc<RequestContext>,
