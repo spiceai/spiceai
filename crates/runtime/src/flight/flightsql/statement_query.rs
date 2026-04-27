@@ -78,8 +78,13 @@ pub(crate) async fn do_get(
 
     tracing::trace!("do_get_statement: {:?}", cmd.query);
     let read_only = super::super::is_auth_read_only(&context);
-    let (output, from_cache) =
-        Box::pin(Service::sql_to_flight_stream(datafusion, &cmd.query, None, read_only)).await?;
+    let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
+        datafusion,
+        &cmd.query,
+        None,
+        read_only,
+    ))
+    .await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =

@@ -158,8 +158,13 @@ async fn do_get_simple(
     match std::str::from_utf8(&ticket.ticket) {
         Ok(sql) => {
             let read_only = super::is_auth_read_only(&context);
-            let (output, cache_status) =
-                Box::pin(Service::sql_to_flight_stream(datafusion, sql, None, read_only)).await?;
+            let (output, cache_status) = Box::pin(Service::sql_to_flight_stream(
+                datafusion,
+                sql,
+                None,
+                read_only,
+            ))
+            .await?;
 
             let timed_output = TimedStream::new(output, move || start);
 
