@@ -2781,6 +2781,7 @@ impl DataFusion {
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
             executor_registry: self.executor_registry().cloned(),
             ddl_handler: self.cayenne_ddl_handler.clone(),
+            io_runtime: self.io_runtime.clone(),
         };
 
         planner::create_logical_plan(sql, session, &ctx).await
