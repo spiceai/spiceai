@@ -79,7 +79,7 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
             Arc::clone(&rt).load_components().await;
 
             // Verify sink table exist after components are loaded.
-            if !rt.datafusion().table_exists("scp.task_history".into()) {
+            if !rt.datafusion().table_exists(&"scp.task_history".into()) {
                 return Err(anyhow::anyhow!("There is no 'scp.task_history' table created"));
             }
 

@@ -1239,6 +1239,77 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
 /// Regression test for <https://github.com/spiceai/spiceai/issues/9621>
 ///
 /// This test ensures that RRF queries work correctly with `DuckDB` acceleration.
+#[tokio::test]
+async fn test_rrf_recency_unboosting_disjoint_regression() -> Result<(), anyhow::Error> {
+    let left_path = format!(
+        "file:{}/tests/models/test_data/rrf_left_fruit.csv",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let right_path = format!(
+        "file:{}/tests/models/test_data/rrf_right_fruit.csv",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let mut left_ds = Dataset::new(left_path, "left_fruit");
+    left_ds.params = Some(Params::from_string_map(HashMap::from([
+        ("file_format".to_string(), "csv".to_string()),
+        ("csv_has_header".to_string(), "true".to_string()),
+    ])));
+    left_ds.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+    left_ds.columns = vec![
+        Column::new("content")
+            .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id")),
+    ];
+
+    let mut right_ds = Dataset::new(right_path, "right_fruit");
+    right_ds.params = Some(Params::from_string_map(HashMap::from([
+        ("file_format".to_string(), "csv".to_string()),
+        ("csv_has_header".to_string(), "true".to_string()),
+    ])));
+    right_ds.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+    right_ds.columns = vec![
+        Column::new("content")
+            .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id")),
+    ];
+
+    let app = AppBuilder::new("search_app")
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
+            "hf_minilm",
+        ))
+        .with_dataset(left_ds)
+        .with_dataset(right_ds)
+        .build();
+
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            let api_config = start_app(app).await?;
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+
+            let sql = "SELECT id, content, picked_at FROM rrf(vector_search(left_fruit, 'red crispy', content), vector_search(right_fruit, 'red crispy', content), join_key => 'id', k => 0, time_column => 'picked_at', decay_constant => 0.25) ORDER BY _fused_score DESC, id ASC LIMIT 3";
+            let resp = http_sql(http_base_url.as_str(), sql).await?;
+            insta::with_settings!({
+                description => sql
+            }, {
+                insta::assert_snapshot!("rrf_recency_unboosting_disjoint_regression", normalize_search_response(resp, true));
+            });
+
+            Ok(())
+        })
+        .await
+}
+
+/// Regression test for <https://github.com/spiceai/spiceai/issues/9621>
+///
+/// This test ensures that RRF queries work correctly with `DuckDB` acceleration.
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn test_rrf_search_duckdb_acceleration() -> Result<(), anyhow::Error> {
