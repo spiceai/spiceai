@@ -27,6 +27,7 @@ use async_stream::try_stream;
 use data_components::cdc::changes_schema;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -34,7 +35,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::datafusion::request_context_extension::get_current_datafusion;
-use crate::dataupdate::UpdateType;
+use crate::dataupdate::{DataUpdate, UpdateType};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, metrics};
@@ -145,31 +146,9 @@ pub(crate) async fn handle(
 
     let response_stream = try_stream! {
         let mut encoder = ChangeFlightEncoder::default();
-        macro_rules! yield_encoded_batch {
-            ($change_batch:expr) => {{
-                let flights = encoder.encode(&$change_batch)?;
-                metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
-                for flight in flights {
-                    yield flight;
-                }
-            }};
-        }
-        macro_rules! yield_data_update {
-            ($data_update:expr) => {{
-                let data_update = $data_update;
-                if data_update.update_type == UpdateType::Overwrite {
-                    let truncate_batch = truncate_change_batch(&data_update.schema)?;
-                    yield_encoded_batch!(truncate_batch);
-                }
-
-                for batch in &data_update.data {
-                    let change_batch = record_batch_to_change_batch(
-                        &table_provider_stream,
-                        batch,
-                    )?;
-                    yield_encoded_batch!(change_batch);
-                }
-            }};
+        enum InitialSnapshotEvent {
+            DataUpdate(Result<DataUpdate, RecvError>),
+            SnapshotBatch(Option<Result<RecordBatch, DataFusionError>>),
         }
 
         let mut initial_snapshot_stream = initial_snapshot_stream(
@@ -180,58 +159,63 @@ pub(crate) async fn handle(
         let snapshot_schema = initial_snapshot_stream.schema();
 
         let truncate_batch = truncate_change_batch(&snapshot_schema)?;
-        yield_encoded_batch!(truncate_batch);
+        let flights = encode_and_count(&mut encoder, &truncate_batch)?;
+        for flight in flights {
+            yield flight;
+        }
 
         let mut pending_updates = VecDeque::new();
         let mut pending_updates_overflowed = false;
         let mut updates_closed = false;
 
         loop {
-            tokio::select! {
-                update = rx.recv(), if !updates_closed => {
-                    match update {
-                        Ok(data_update) => {
-                            if pending_updates_overflowed {
-                                continue;
-                            }
+            let event = tokio::select! {
+                update = rx.recv(), if !updates_closed => InitialSnapshotEvent::DataUpdate(update),
+                batch = initial_snapshot_stream.next() => InitialSnapshotEvent::SnapshotBatch(batch),
+            };
 
-                            if pending_updates.len() >= MAX_PENDING_INITIAL_SNAPSHOT_UPDATES {
-                                pending_updates.clear();
-                                pending_updates_overflowed = true;
-                                tracing::warn!(
-                                    dataset = %data_path_stream,
-                                    max_pending_updates = MAX_PENDING_INITIAL_SNAPSHOT_UPDATES,
-                                    "DoExchange subscriber received too many updates while streaming initial snapshot"
-                                );
-                            } else {
-                                pending_updates.push_back(data_update);
-                            }
-                        }
-                        Err(RecvError::Lagged(skipped_messages)) => {
-                            pending_updates.clear();
-                            pending_updates_overflowed = true;
-                            tracing::warn!(
-                                dataset = %data_path_stream,
-                                skipped_messages,
-                                "DoExchange subscriber lagged while streaming initial snapshot"
-                            );
-                        }
-                        Err(RecvError::Closed) => updates_closed = true,
+            match event {
+                InitialSnapshotEvent::DataUpdate(Ok(data_update)) => {
+                    if pending_updates_overflowed {
+                        continue;
+                    }
+
+                    if pending_updates.len() >= MAX_PENDING_INITIAL_SNAPSHOT_UPDATES {
+                        pending_updates.clear();
+                        pending_updates_overflowed = true;
+                        tracing::warn!(
+                            dataset = %data_path_stream,
+                            max_pending_updates = MAX_PENDING_INITIAL_SNAPSHOT_UPDATES,
+                            "DoExchange subscriber received too many updates while streaming initial snapshot"
+                        );
+                    } else {
+                        pending_updates.push_back(data_update);
                     }
                 }
-                batch = initial_snapshot_stream.next() => {
-                    let Some(batch) = batch else {
-                        break;
-                    };
-                    let batch = batch.map_err(|source| {
-                        Status::internal(format!("Unable to stream initial snapshot: {source}"))
-                    })?;
+                InitialSnapshotEvent::DataUpdate(Err(RecvError::Lagged(skipped_messages))) => {
+                    pending_updates.clear();
+                    pending_updates_overflowed = true;
+                    tracing::warn!(
+                        dataset = %data_path_stream,
+                        skipped_messages,
+                        "DoExchange subscriber lagged while streaming initial snapshot"
+                    );
+                }
+                InitialSnapshotEvent::DataUpdate(Err(RecvError::Closed)) => updates_closed = true,
+                InitialSnapshotEvent::SnapshotBatch(Some(batch)) => {
+                    let batch = batch.map_err(|source| Status::internal(format!(
+                        "Unable to stream initial snapshot: {source}"
+                    )))?;
                     let change_batch = record_batch_to_change_batch(
                         &table_provider_stream,
                         &batch,
                     )?;
-                    yield_encoded_batch!(change_batch);
+                    let flights = encode_and_count(&mut encoder, &change_batch)?;
+                    for flight in flights {
+                        yield flight;
+                    }
                 }
+                InitialSnapshotEvent::SnapshotBatch(None) => break,
             }
         }
 
@@ -242,25 +226,64 @@ pub(crate) async fn handle(
         }
 
         while let Some(data_update) = pending_updates.pop_front() {
-            yield_data_update!(&data_update);
+            if data_update.update_type == UpdateType::Overwrite {
+                let truncate_batch = truncate_change_batch(&data_update.schema)?;
+                let flights = encode_and_count(&mut encoder, &truncate_batch)?;
+                for flight in flights {
+                    yield flight;
+                }
+            }
+
+            for batch in &data_update.data {
+                let change_batch = record_batch_to_change_batch(&table_provider_stream, batch)?;
+                let flights = encode_and_count(&mut encoder, &change_batch)?;
+                for flight in flights {
+                    yield flight;
+                }
+            }
         }
 
         if !updates_closed {
             loop {
-                match rx.recv().await {
-                    Ok(data_update) => yield_data_update!(&data_update),
+                let data_update = match rx.recv().await {
+                    Ok(data_update) => data_update,
                     Err(RecvError::Lagged(skipped_messages)) => {
                         Err(Status::data_loss(format!(
                             "DoExchange subscriber fell behind and missed {skipped_messages} update(s) for dataset {data_path_stream}; resubscribe and reconcile state"
-                        )))?;
+                        )))?
                     }
                     Err(RecvError::Closed) => break,
+                };
+
+                if data_update.update_type == UpdateType::Overwrite {
+                    let truncate_batch = truncate_change_batch(&data_update.schema)?;
+                    let flights = encode_and_count(&mut encoder, &truncate_batch)?;
+                    for flight in flights {
+                        yield flight;
+                    }
+                }
+
+                for batch in &data_update.data {
+                    let change_batch = record_batch_to_change_batch(&table_provider_stream, batch)?;
+                    let flights = encode_and_count(&mut encoder, &change_batch)?;
+                    for flight in flights {
+                        yield flight;
+                    }
                 }
             }
         }
     };
 
     Ok(Response::new(response_stream.boxed()))
+}
+
+fn encode_and_count(
+    encoder: &mut ChangeFlightEncoder,
+    record_batch: &RecordBatch,
+) -> Result<Vec<FlightData>, Status> {
+    let flights = encoder.encode(record_batch)?;
+    metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
+    Ok(flights)
 }
 
 async fn initial_snapshot_stream(
