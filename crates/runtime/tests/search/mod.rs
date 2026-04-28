@@ -181,6 +181,7 @@ impl AccelerationOptions {
 #[serde(rename_all = "snake_case")]
 enum VectorEngineOptions {
     NoVectorEngine,
+    DuckDb,
     S3Vectors,
 }
 
@@ -188,6 +189,7 @@ impl fmt::Display for VectorEngineOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             VectorEngineOptions::NoVectorEngine => "no_vector_engine",
+            VectorEngineOptions::DuckDb => "duckdb",
             VectorEngineOptions::S3Vectors => "s3_vectors",
         };
         write!(f, "{s}")
@@ -199,6 +201,11 @@ impl VectorEngineOptions {
         match self {
             VectorEngineOptions::NoVectorEngine => VectorStore {
                 enabled: false,
+                ..Default::default()
+            },
+            VectorEngineOptions::DuckDb => VectorStore {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
                 ..Default::default()
             },
             VectorEngineOptions::S3Vectors => VectorStore {
@@ -253,7 +260,11 @@ impl EmbeddingModels {
     ignore = "Extended test - run with --features extended_tests"
 )]
 async fn test_megascience_permutations(
-    #[values(VectorEngineOptions::NoVectorEngine, VectorEngineOptions::S3Vectors)]
+    #[values(
+        VectorEngineOptions::NoVectorEngine,
+        VectorEngineOptions::DuckDb,
+        VectorEngineOptions::S3Vectors
+    )]
     vector_engine: VectorEngineOptions,
     #[values(
         AccelerationOptions::NoAcceleration,
@@ -386,6 +397,17 @@ fn validate_combination(
     }
     if matches!(&acceleration_opt, AccelerationOptions::NoAcceleration) && column_config.is_fts() {
         return Err("Cannot have hybrid column with no acceleration".to_string());
+    }
+    if matches!(&vector_engine, VectorEngineOptions::DuckDb)
+        && !matches!(
+            &acceleration_opt,
+            AccelerationOptions::DuckDb | AccelerationOptions::DuckDbFile
+        )
+    {
+        return Err(
+            "DuckDB vector engine requires DuckDB acceleration (duckdb or duckdb_file)"
+                .to_string(),
+        );
     }
     if matches!(&vector_engine, VectorEngineOptions::S3Vectors)
         && !matches!(
