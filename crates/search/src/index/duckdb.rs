@@ -65,6 +65,7 @@ use crate::{
 static NEXT_TRANSIENT_INDEX_ID: AtomicU64 = AtomicU64::new(0);
 static VSS_INSTALLED: OnceLock<()> = OnceLock::new();
 static VSS_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+const DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DuckDBDistanceMetric {
@@ -698,10 +699,10 @@ fn duckdb_vector_sql(
     }
     let where_expr = format!(" WHERE {}", filter_exprs.join(" AND "));
 
-    let limit_expr = limit.map_or_else(String::new, |limit| format!(" LIMIT {limit}"));
+    let limit = limit.unwrap_or(DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT);
 
     Ok(format!(
-        "SELECT {select_exprs} FROM {}{where_expr} ORDER BY {distance_expr} ASC{limit_expr}",
+        "SELECT {select_exprs} FROM {}{where_expr} ORDER BY {distance_expr} ASC LIMIT {limit}",
         quote_identifier(table_name)
     ))
 }
@@ -968,5 +969,21 @@ mod tests {
         let projected = project_schema(&schema, Some(&projection)).expect("schema should project");
 
         assert!(projected.fields().is_empty());
+    }
+
+    #[test]
+    fn duckdb_vector_sql_applies_default_limit() {
+        let sql = duckdb_vector_sql(
+            "docs",
+            "body_embedding",
+            &["id".to_string()],
+            &[],
+            None,
+            &DuckDBHnswOptions::default(),
+            "[1.0, 0.0]::FLOAT[2]",
+        )
+        .expect("SQL should build");
+
+        assert!(sql.ends_with(" LIMIT 1000"));
     }
 }
