@@ -253,27 +253,6 @@ impl DuckDBVectorIndex {
         )))
     }
 
-    fn list_result_schema(&self) -> Result<SchemaRef, DataFusionError> {
-        let mut fields = self
-            .primary_key
-            .iter()
-            .cloned()
-            .map(Arc::new)
-            .collect::<Vec<_>>();
-        let embedding_col = embedding_col(&self.embedded_column);
-        let field = self
-            .source_schema
-            .field_with_name(&embedding_col)
-            .map_err(|_| {
-                DataFusionError::Plan(format!(
-                    "DuckDB vector index for column '{}' requires embedding column '{embedding_col}' in the table schema.",
-                    self.embedded_column
-                ))
-            })?
-            .clone();
-        fields.push(Arc::new(field));
-        Ok(Arc::new(Schema::new(fields)))
-    }
 }
 
 #[async_trait]
@@ -326,16 +305,11 @@ impl SearchIndex for DuckDBVectorIndex {
 
 impl VectorIndex for DuckDBVectorIndex {
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
-        let schema = self.list_result_schema()?;
-        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
-        let mem_table = datafusion::catalog::MemTable::try_new(schema, vec![vec![empty_batch]])?;
-
-        LogicalPlanBuilder::scan(
-            "tbl",
-            Arc::new(DefaultTableSource::new(Arc::new(mem_table))),
-            None,
-        )?
-        .build()
+        Err(DataFusionError::NotImplemented(
+            "DuckDBVectorIndex does not maintain a separate vector store — \
+             embeddings are written into the DuckDB-accelerated table directly"
+                .to_string(),
+        ))
     }
 
     fn dimension(&self) -> i32 {
