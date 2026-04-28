@@ -17,8 +17,8 @@ ifdef RUST_PROFILE
     OPT_LEVEL = --profile $(RUST_PROFILE)
 endif
 
-ifdef SPICED_TARGET_DIR
-	TARGET_DIR := $(SPICED_TARGET_DIR)
+ifdef CARGO_TARGET_DIR
+	TARGET_DIR := $(CARGO_TARGET_DIR)
 else
 	TARGET_DIR := ../../target
 endif
