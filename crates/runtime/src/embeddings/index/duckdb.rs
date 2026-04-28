@@ -26,6 +26,7 @@ use datafusion_table_providers::{
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use search::{generation::util::get_primary_keys, index::duckdb::DuckDBVectorIndex};
+use snafu::prelude::*;
 use spicepod::{param::Params, semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
 use tokio::sync::RwLock;
 
@@ -35,6 +36,64 @@ use crate::{
 };
 
 use search::index::duckdb::{DuckDBDistanceMetric, DuckDBHnswOptions};
+
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Chunking is not yet supported for the DuckDB vector engine."))]
+    ChunkingNotSupported,
+
+    #[snafu(display("Failed to resolve primary key columns for dataset {dataset}: {source}"))]
+    GetPrimaryKeys {
+        dataset: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Failed to resolve primary key columns for dataset {dataset}: no primary key columns were configured or derived."
+    ))]
+    NoPrimaryKeys { dataset: String },
+
+    #[snafu(display("Failed to load vector store parameters: {source}"))]
+    GetStoreParams {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("`partition_by` is not yet supported for the DuckDB vector engine."))]
+    PartitionByNotSupported,
+
+    #[snafu(display("`spill_writes` is not supported for the DuckDB vector engine."))]
+    SpillWritesNotSupported,
+
+    #[snafu(display(
+        "Cannot create DuckDB vector index for table '{table}'. No embedding model named: '{model}'."
+    ))]
+    EmbeddingModelNotFound { table: String, model: String },
+
+    #[snafu(display("Failed to determine embedding dimensions: {source}"))]
+    GetEmbeddingDimensions {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Failed to configure primary key for dataset {dataset}: column '{column}' does not exist in the dataset schema."
+    ))]
+    PrimaryKeyColumnMissing { dataset: String, column: String },
+
+    #[snafu(display("Invalid distance metric '{metric}': {source}"))]
+    InvalidDistanceMetric {
+        metric: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Invalid value for DuckDB vector parameter '{key}': '{value}': {source}"))]
+    InvalidParameter {
+        key: String,
+        value: String,
+        source: std::num::ParseIntError,
+    },
+}
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("distance_metric")
@@ -66,56 +125,55 @@ pub(crate) async fn try_from_table(
     index_schema: SchemaRef,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     secrets: Arc<RwLock<Secrets>>,
-) -> Result<DuckDBVectorIndex, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<DuckDBVectorIndex> {
     if config
         .chunking
         .as_ref()
         .is_some_and(|chunking| chunking.enabled)
     {
-        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-            "Chunking is not yet supported for the DuckDB vector engine.",
-        ));
+        return ChunkingNotSupportedSnafu.fail();
     }
 
     let primary_keys: Vec<String> = match config.row_ids.clone() {
         Some(row_ids) => row_ids,
         None => get_primary_keys(inner_table_provider)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+            .boxed()
+            .context(GetPrimaryKeysSnafu {
+                dataset: ds_name.to_string(),
+            })?,
     };
 
     if primary_keys.is_empty() {
-        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-            "Failed to resolve primary key columns for dataset {ds_name}: no primary key columns were configured or derived."
-        )));
+        return NoPrimaryKeysSnafu {
+            dataset: ds_name.to_string(),
+        }
+        .fail();
     }
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
     if partition_by_configured(&params, vector_store_config) {
-        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-            "`partition_by` is not yet supported for the DuckDB vector engine.",
-        ));
+        return PartitionByNotSupportedSnafu.fail();
     }
     if spill_writes_enabled(&params) {
-        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-            "`spill_writes` is not supported for the DuckDB vector engine.",
-        ));
+        return SpillWritesNotSupportedSnafu.fail();
     }
 
     let model = {
         let model_read = embedding_models.read().await;
         let Some(model) = model_read.get(&config.model) else {
-            return Err(Box::from(format!(
-                "Cannot create DuckDB vector index for table '{}'. No embedding model named: '{}'.",
-                ds_name, config.model
-            )));
+            return EmbeddingModelNotFoundSnafu {
+                table: ds_name.to_string(),
+                model: config.model.clone(),
+            }
+            .fail();
         };
         Arc::clone(model)
     };
 
     let dims = llms::embeddings::get_or_infer_size(&model)
         .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-        as i32;
+        .boxed()
+        .context(GetEmbeddingDimensionsSnafu)? as i32;
 
     let source_schema = schema_with_embedding_column(index_schema, &column, dims);
     let primary_key: Vec<_> = primary_keys
@@ -124,13 +182,12 @@ pub(crate) async fn try_from_table(
             source_schema
                 .field_with_name(pk)
                 .cloned()
-                .map_err(|_| {
-                    Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                        "Failed to configure primary key for dataset {ds_name}: column '{pk}' does not exist in the dataset schema."
-                    ))
+                .map_err(|_| Error::PrimaryKeyColumnMissing {
+                    dataset: ds_name.to_string(),
+                    column: pk.clone(),
                 })
         })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     let hnsw = parse_hnsw_options(&params)?;
 
@@ -257,16 +314,16 @@ fn schema_with_embedding_column(schema: SchemaRef, column: &str, dims: i32) -> S
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-fn parse_hnsw_options(
-    params: &Parameters,
-) -> Result<DuckDBHnswOptions, Box<dyn std::error::Error + Send + Sync>> {
+fn parse_hnsw_options(params: &Parameters) -> Result<DuckDBHnswOptions> {
     let mut options = DuckDBHnswOptions::default();
 
     if let Some(metric) = string_from_params(params, "distance_metric")
         .or_else(|| string_from_params(params, "metric"))
     {
-        options.metric = DuckDBDistanceMetric::try_from(metric)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        options.metric =
+            DuckDBDistanceMetric::try_from(metric).context(InvalidDistanceMetricSnafu {
+                metric: metric.to_string(),
+            })?;
     }
 
     options.hnsw_m = parse_u32_param(params, "hnsw_m")?;
@@ -286,16 +343,17 @@ fn spill_writes_enabled(params: &Parameters) -> bool {
         .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
 }
 
-fn parse_u32_param(
-    params: &Parameters,
-    key: &str,
-) -> Result<Option<u32>, Box<dyn std::error::Error + Send + Sync>> {
+fn parse_u32_param(params: &Parameters, key: &str) -> Result<Option<u32>> {
     let Some(s) = string_from_params(params, key) else {
         return Ok(None);
     };
-    s.parse::<u32>().map(Some).map_err(|e| {
-        format!("Invalid value for DuckDB vector parameter '{key}': '{s}': {e}").into()
-    })
+    s.parse::<u32>()
+        .map(Some)
+        .map_err(|source| Error::InvalidParameter {
+            key: key.to_string(),
+            value: s.to_string(),
+            source,
+        })
 }
 
 fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
@@ -305,7 +363,7 @@ fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
 async fn get_store_params(
     vector_store_config: &VectorStore,
     secrets: Arc<RwLock<Secrets>>,
-) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Parameters> {
     let params = vector_store_config
         .params
         .as_ref()
@@ -314,16 +372,15 @@ async fn get_store_params(
 
     let params_with_secrets = get_params_with_secrets(Arc::clone(&secrets), &params).await;
 
-    let params = Parameters::try_new(
+    Parameters::try_new(
         "DuckDB vector store",
         params_with_secrets.into_iter().collect(),
         "duckdb",
         Arc::clone(&secrets),
         PARAMETERS,
     )
-    .await?;
-
-    Ok(params)
+    .await
+    .context(GetStoreParamsSnafu)
 }
 
 #[cfg(test)]
