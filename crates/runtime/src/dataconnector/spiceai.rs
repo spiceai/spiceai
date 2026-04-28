@@ -222,11 +222,17 @@ fn ensure_supported_endpoint_scheme(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-fn get_region(params: &ConnectorParams) -> Result<Option<&str>> {
-    let Some(region) = params.parameters.get("region").expose().ok() else {
-        return Ok(None);
-    };
+fn get_region(params: &ConnectorParams) -> Option<&str> {
+    params.parameters.get("region").expose().ok()
+}
 
+fn require_valid_region<'a>(region: Option<&'a str>) -> Result<&'a str> {
+    let region = region.ok_or_else(|| {
+        MissingRequiredParameterSnafu {
+            parameter: "region".to_string(),
+        }
+        .build()
+    })?;
     ensure!(
         !region.is_empty(),
         MissingRequiredParameterSnafu {
@@ -240,41 +246,26 @@ fn get_region(params: &ConnectorParams) -> Result<Option<&str>> {
         }
     );
 
-    Ok(Some(region))
+    Ok(region)
 }
 
 fn get_endpoint(params: &ConnectorParams) -> Result<Arc<str>> {
-    let region = get_region(params)?;
+    let region = get_region(params);
 
     let Some(endpoint) = get_explicit_endpoint(params).or_else(|| get_from_endpoint(params)) else {
-        let region = region.ok_or_else(|| {
-            MissingRequiredParameterSnafu {
-                parameter: "region".to_string(),
-            }
-            .build()
-        })?;
+        let region = require_valid_region(region)?;
         return Ok(spice_cloud_flight_endpoint(region).into());
     };
 
     ensure_supported_endpoint_scheme(endpoint)?;
 
     if is_legacy_spice_cloud_endpoint(endpoint) {
-        let region = region.ok_or_else(|| {
-            MissingRequiredParameterSnafu {
-                parameter: "region".to_string(),
-            }
-            .build()
-        })?;
+        let region = require_valid_region(region)?;
         return Ok(spice_cloud_flight_endpoint(region).into());
     }
 
     if let Some(endpoint_region) = spice_cloud_endpoint_region(endpoint) {
-        let region = region.ok_or_else(|| {
-            MissingRequiredParameterSnafu {
-                parameter: "region".to_string(),
-            }
-            .build()
-        })?;
+        let region = require_valid_region(region)?;
         ensure!(
             endpoint_region == region,
             CloudEndpointRegionMismatchSnafu {
@@ -911,6 +902,28 @@ mod tests {
                 "failed for input: {input}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_does_not_validate_region_for_self_hosted_endpoint() {
+        let params = make_params(vec![
+            (
+                "spiceai_endpoint".to_string(),
+                "http://localhost:50051".to_string().into(),
+            ),
+            (
+                "spiceai_region".to_string(),
+                "self-hosted".to_string().into(),
+            ),
+        ])
+        .await;
+
+        assert_eq!(
+            get_endpoint(&params)
+                .expect("custom endpoint should not validate unrelated region")
+                .as_ref(),
+            "http://localhost:50051"
+        );
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -84,6 +84,7 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
 use futures::StreamExt;
 use itertools::Itertools;
+use parking_lot::Mutex as ParkingMutex;
 use query::QueryBuilder;
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
@@ -1298,7 +1299,11 @@ impl DataFusion {
         )
         .context(SchemaMismatchSnafu)?;
 
-        let broadcast_update = data_update.clone();
+        let broadcast_update = self
+            .data_update_broadcaster
+            .has_subscribers(table_reference)
+            .await
+            .then(|| data_update.clone());
 
         let overwrite = match data_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
@@ -1344,9 +1349,11 @@ impl DataFusion {
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
-        self.data_update_broadcaster
-            .publish(table_reference, broadcast_update)
-            .await;
+        if let Some(broadcast_update) = broadcast_update {
+            self.data_update_broadcaster
+                .publish(table_reference, broadcast_update)
+                .await;
+        }
 
         Ok(())
     }
@@ -1384,27 +1391,21 @@ impl DataFusion {
             .data_update_broadcaster
             .has_subscribers(table_reference)
             .await
-            .then(|| Arc::new(StdMutex::new(StreamingBroadcastBuffer::default())));
+            .then(|| Arc::new(ParkingMutex::new(StreamingBroadcastBuffer::default())));
         let data = match broadcast_batches.as_ref() {
             Some(batches) => {
                 let batches = Arc::clone(batches);
                 let table_reference = table_reference.to_string();
                 let stream = data.map(move |batch_result| {
                     if let Ok(batch) = &batch_result {
-                        match batches.lock() {
-                            Ok(mut batches) => {
-                                if batches.push(batch) {
-                                    tracing::warn!(
-                                        dataset = %table_reference,
-                                        max_batches = MAX_STREAMING_BROADCAST_BATCHES,
-                                        max_rows = MAX_STREAMING_BROADCAST_ROWS,
-                                        "Disabling DoExchange broadcast for streaming write because buffered update exceeded limits"
-                                    );
-                                }
-                            }
-                            Err(err) => tracing::warn!(
-                                "Failed to record streaming data update for DoExchange subscribers: {err}"
-                            ),
+                        let mut batches = batches.lock();
+                        if batches.push(batch) {
+                            tracing::warn!(
+                                dataset = %table_reference,
+                                max_batches = MAX_STREAMING_BROADCAST_BATCHES,
+                                max_rows = MAX_STREAMING_BROADCAST_ROWS,
+                                "Disabling DoExchange broadcast for streaming write because buffered update exceeded limits"
+                            );
                         }
                     }
                     batch_result
@@ -1454,13 +1455,10 @@ impl DataFusion {
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
         if let Some(batches) = broadcast_batches {
-            let broadcast_data = match batches.lock() {
-                Ok(batches) => Ok(batches.batches()),
-                Err(err) => Err(err.to_string()),
-            };
+            let broadcast_data = batches.lock().batches();
 
             match broadcast_data {
-                Ok(Some(data)) => {
+                Some(data) => {
                     let update = DataUpdate {
                         schema: update_schema,
                         data,
@@ -1470,12 +1468,9 @@ impl DataFusion {
                         .publish(table_reference, update)
                         .await;
                 }
-                Ok(None) => tracing::warn!(
+                None => tracing::warn!(
                     dataset = %table_reference,
                     "Skipped publishing streaming data update to DoExchange subscribers because the buffered update exceeded limits; subscribers can reconnect to receive a fresh snapshot"
-                ),
-                Err(err) => tracing::warn!(
-                    "Failed to publish streaming data update to DoExchange subscribers: {err}"
                 ),
             }
         }
