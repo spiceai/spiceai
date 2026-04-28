@@ -255,7 +255,8 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     // If the principal is read-only, validate that the SQL does not contain
     // write operations before submitting to the background job executor.
     //
-    // Note: Although request might have parameters, since we aren't using the `LogicalPlan` output, it is not needed to check read only.
+    // Note: Even if `request` has parameters, since we aren't using the `LogicalPlan` output from
+    // `check_read_only_sql`, it is not needed to check read only.
     let datafusion = get_current_datafusion(&context);
     let _ = super::check_read_only_sql(&context, &datafusion, &request.sql, None).await?;
 

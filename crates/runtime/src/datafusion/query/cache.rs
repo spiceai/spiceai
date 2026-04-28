@@ -163,8 +163,7 @@ impl Query {
         let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(df));
         let plan: Box<LogicalPlan> = if let Some(plan) = pre_parsed_plan {
             // Reuse the pre-parsed plan to avoid re-parsing. Parameters are
-            // already bound — check_read_only_sql calls with_param_values before
-            // returning the plan, matching what get_plan does below.
+            // already bound from `check_read_only_sql`.
             plan
         } else {
             match Self::get_plan(df, session, sql, &sql_raw_cache_key, parameters).await {
