@@ -109,7 +109,7 @@ impl Query {
     /// filters the classic DDL/DML/Copy/Statement plan variants and does not
     /// cover Spice's write-capable [`LogicalPlan::Extension`] nodes (e.g.
     /// `DmlExtension`, `DistributedCayenneInsert`).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) async fn get_plan_or_cached(
         df: &Arc<DataFusion>,
         session: &SessionState,
