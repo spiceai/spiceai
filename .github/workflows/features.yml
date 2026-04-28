@@ -106,6 +106,13 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Check snapshots feature
+        run: cargo check --no-default-features --features snapshots --profile lint
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
       - name: Show sccache stats
         if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != ''
         run: sccache --show-stats
