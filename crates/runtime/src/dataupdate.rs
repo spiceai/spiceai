@@ -64,11 +64,16 @@ impl DataUpdateBroadcaster {
     }
 
     pub async fn has_subscribers(&self, table_reference: &TableReference) -> bool {
-        self.channels
-            .read()
-            .await
-            .get(table_reference)
-            .is_some_and(|sender| sender.receiver_count() > 0)
+        let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
+            return false;
+        };
+
+        if channel.receiver_count() > 0 {
+            return true;
+        }
+
+        self.remove_if_idle(table_reference, &channel).await;
+        false
     }
 
     pub async fn publish(&self, table_reference: &TableReference, update: DataUpdate) {
@@ -77,6 +82,7 @@ impl DataUpdateBroadcaster {
         };
 
         if channel.receiver_count() == 0 {
+            self.remove_if_idle(table_reference, &channel).await;
             return;
         }
 
@@ -85,6 +91,20 @@ impl DataUpdateBroadcaster {
                 dataset = %table_reference,
                 "No active DoExchange subscribers received data update: {err}"
             );
+        }
+    }
+
+    async fn remove_if_idle(
+        &self,
+        table_reference: &TableReference,
+        channel: &Arc<broadcast::Sender<DataUpdate>>,
+    ) {
+        let mut channels = self.channels.write().await;
+        let should_remove = channels
+            .get(table_reference)
+            .is_some_and(|current| Arc::ptr_eq(current, channel) && current.receiver_count() == 0);
+        if should_remove {
+            channels.remove(table_reference);
         }
     }
 }
@@ -264,5 +284,30 @@ mod tests {
             .expect("published update should be received");
         assert_eq!(update.schema, schema);
         assert!(matches!(update.update_type, UpdateType::Append));
+    }
+
+    #[tokio::test]
+    async fn data_update_broadcaster_prunes_idle_channels() {
+        let broadcaster = DataUpdateBroadcaster::new();
+        let table_reference = TableReference::bare("cdc_table");
+        let receiver = broadcaster.subscribe(&table_reference).await;
+
+        assert!(
+            broadcaster
+                .channels
+                .read()
+                .await
+                .contains_key(&table_reference)
+        );
+        drop(receiver);
+
+        assert!(!broadcaster.has_subscribers(&table_reference).await);
+        assert!(
+            !broadcaster
+                .channels
+                .read()
+                .await
+                .contains_key(&table_reference)
+        );
     }
 }

@@ -259,13 +259,11 @@ fn get_endpoint(params: &ConnectorParams) -> Result<Arc<str>> {
     ensure_supported_endpoint_scheme(endpoint)?;
 
     if is_legacy_spice_cloud_endpoint(endpoint) {
-        let region = region.ok_or_else(|| {
-            MissingRequiredParameterSnafu {
-                parameter: "region".to_string(),
-            }
-            .build()
-        })?;
-        return Ok(spice_cloud_flight_endpoint(region).into());
+        if let Some(region) = region {
+            return Ok(spice_cloud_flight_endpoint(region).into());
+        }
+
+        return Ok(endpoint.into());
     }
 
     if let Some(endpoint_region) = spice_cloud_endpoint_region(endpoint) {
@@ -969,6 +967,22 @@ mod tests {
                 .expect("legacy endpoint should be replaced by regional cloud endpoint")
                 .as_ref(),
             "https://us-west-2-prod-aws-flight.spiceai.io"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_keeps_legacy_cloud_endpoint_without_region() {
+        let params = make_params(vec![(
+            "spiceai_endpoint".to_string(),
+            "https://flight.spiceai.io".to_string().into(),
+        )])
+        .await;
+
+        assert_eq!(
+            get_endpoint(&params)
+                .expect("legacy endpoint without region should be used as configured")
+                .as_ref(),
+            "https://flight.spiceai.io"
         );
     }
 

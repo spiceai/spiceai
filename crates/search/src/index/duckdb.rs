@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     any::Any,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -181,6 +181,7 @@ impl DuckDBHnswOptions {
 pub struct DuckDBVectorQueryContext {
     pub pool: Arc<DuckDbConnectionPool>,
     pub table_definition: Arc<TableDefinition>,
+    vss_installed: Arc<OnceLock<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +225,7 @@ impl DuckDBVectorIndex {
         self.query_context = Some(DuckDBVectorQueryContext {
             pool,
             table_definition,
+            vss_installed: Arc::new(OnceLock::new()),
         });
         self
     }
@@ -242,7 +244,7 @@ impl DuckDBVectorIndex {
         let mut fields = self.source_schema.fields().to_vec();
         fields.push(Arc::new(Field::new(
             SEARCH_SCORE_COLUMN_NAME,
-            DataType::Float32,
+            DataType::Float64,
             false,
         )));
         Ok(Arc::new(Schema::new_with_metadata(
@@ -578,8 +580,11 @@ fn run_duckdb_vector_query(
     let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_execution_error)?;
     let conn = &duckdb_conn.conn;
 
-    conn.execute("INSTALL vss", [])
-        .map_err(to_execution_error)?;
+    if context.vss_installed.get().is_none() {
+        conn.execute("INSTALL vss", [])
+            .map_err(to_execution_error)?;
+        let _ = context.vss_installed.set(());
+    }
     conn.execute("LOAD vss", []).map_err(to_execution_error)?;
     if let Some(ef_search) = exec.hnsw.hnsw_ef_search {
         conn.execute(&format!("SET hnsw_ef_search = {ef_search}"), [])
@@ -605,7 +610,13 @@ fn run_duckdb_vector_query(
 
     let query_result = (|| -> DataFusionResult<Vec<RecordBatch>> {
         let sql = exec.sql(&table_name, query_vector)?;
-        tracing::debug!("DuckDB vector query SQL: {sql}");
+        tracing::debug!(
+            table_name = %table_name,
+            embedded_column = %exec.embedded_column,
+            query_vector_dimension = query_vector.len(),
+            "Executing DuckDB vector query"
+        );
+        tracing::trace!("DuckDB vector query SQL: {sql}");
         let mut stmt = conn.prepare(&sql).map_err(to_execution_error)?;
         let result = stmt.query_arrow([]).map_err(to_execution_error)?;
         Ok(result.collect::<Vec<_>>())
@@ -672,7 +683,7 @@ fn duckdb_vector_sql(
         .map(|column| {
             if column == SEARCH_SCORE_COLUMN_NAME {
                 format!(
-                    "{score_expr} AS {}",
+                    "CAST({score_expr} AS DOUBLE) AS {}",
                     quote_identifier(SEARCH_SCORE_COLUMN_NAME)
                 )
             } else {
@@ -955,7 +966,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT id, 1.0 - array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS _score FROM docs WHERE body_embedding IS NOT NULL ORDER BY array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) ASC LIMIT 10"
+            "SELECT id, CAST(1.0 - array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS DOUBLE) AS _score FROM docs WHERE body_embedding IS NOT NULL ORDER BY array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) ASC LIMIT 10"
         );
     }
 }
