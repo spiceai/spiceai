@@ -201,6 +201,136 @@ impl CayenneDeletionSink {
             .await
     }
 
+    /// Delete rows by hash-probing key columns against a set of matched keys.
+    ///
+    /// This is the fast path for `MERGE INTO` on `PositionBased` tables. Instead of
+    /// building an O(N) filter expression and pushing it into every file scan, this
+    /// method scans each file once and performs an O(1) `HashSet` lookup per row.
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - Session context for object store access
+    /// * `tables` - Listing tables to scan (main + protected snapshots)
+    /// * `matched_keys` - Key tuples from the MERGE join output
+    /// * `key_columns` - Column names for the ON keys
+    ///
+    /// # Returns
+    ///
+    /// The total number of newly deleted rows.
+    pub(crate) async fn delete_by_key_hash_probe(
+        &self,
+        ctx: &SessionContext,
+        tables: &[Arc<ListingTable>],
+        matched_keys: std::collections::HashSet<Vec<datafusion_common::ScalarValue>>,
+        key_columns: &[String],
+    ) -> crate::provider::Result<u64> {
+        let table_name = &self.table_metadata.table_name;
+
+        if matched_keys.is_empty() {
+            return Ok(0);
+        }
+
+        let mut per_file_row_ids: HashMap<String, Vec<u64>> = HashMap::new();
+
+        for table in tables {
+            let table_scan_start = std::time::Instant::now();
+
+            let partition_filters: &[Expr] = &[];
+            let list_result = table
+                .list_files_for_scan(&ctx.state(), partition_filters, None)
+                .await?;
+            let file_groups = list_result.file_groups;
+
+            let object_store_url = table
+                .table_paths()
+                .first()
+                .map(datafusion_datasource::ListingTableUrl::object_store)
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: "Table has no paths".to_string(),
+                })?;
+
+            let object_store = ctx
+                .runtime_env()
+                .object_store_registry
+                .get_store(object_store_url.as_ref())?;
+
+            let vortex_session = VortexSession::default();
+
+            // Build futures with owned values to avoid lifetime issues from
+            // nested iterator adapters over `FileGroup::iter()`.
+            let mut scan_futures = Vec::new();
+            for fg in &file_groups {
+                for pf in fg.iter() {
+                    let file_path = pf.path().to_string();
+                    let vortex_session = vortex_session.clone();
+                    let object_store = Arc::clone(&object_store);
+                    let matched_keys = &matched_keys;
+                    scan_futures.push(async move {
+                        let result = self
+                            .scan_file_for_key_matches(
+                                &file_path,
+                                &vortex_session,
+                                &object_store,
+                                matched_keys,
+                                key_columns,
+                            )
+                            .await;
+                        (file_path, result)
+                    });
+                }
+            }
+            let mut stream =
+                futures::stream::iter(scan_futures).buffer_unordered(*MAX_CONCURRENT_FILE_SCANS);
+
+            let mut table_rows_matched: usize = 0;
+            let mut table_files_scanned: usize = 0;
+
+            while let Some((file_path, result)) = stream.next().await {
+                let row_ids = result?;
+
+                table_files_scanned += 1;
+                table_rows_matched += row_ids.len();
+
+                if !row_ids.is_empty() {
+                    tracing::trace!(
+                        file_path = %file_path,
+                        new_deletions = row_ids.len(),
+                        "File has rows matching key-probe deletion"
+                    );
+                    per_file_row_ids
+                        .entry(file_path)
+                        .or_default()
+                        .extend(row_ids);
+                }
+            }
+
+            tracing::debug!(
+                table_path = %table.table_paths().first().map_or("unknown", datafusion_datasource::ListingTableUrl::as_str),
+                files_scanned = table_files_scanned,
+                rows_matched = table_rows_matched,
+                elapsed = ?table_scan_start.elapsed(),
+                "Key-probe deletion scan completed for table"
+            );
+        }
+
+        if per_file_row_ids.is_empty() {
+            tracing::debug!("No deletions found via key-probe scan");
+            return Ok(0);
+        }
+
+        let total_new_deletions: usize = per_file_row_ids.values().map(std::vec::Vec::len).sum();
+        tracing::debug!(
+            table = %table_name,
+            total_new_deletions,
+            files_with_deletions = per_file_row_ids.len(),
+            "Key-probe delete: persisting deletions"
+        );
+
+        self.persist_position_based_deletions(per_file_row_ids)
+            .await
+    }
+
     /// Scan a single Vortex file for rows matching the deletion filter.
     ///
     /// Uses Vortex's `row_idx()` expression to project **only row indices** (no data columns),
@@ -320,6 +450,149 @@ impl CayenneDeletionSink {
         Ok(new_row_ids)
     }
 
+    /// Scan a single Vortex file and find rows whose key columns match `matched_keys`.
+    ///
+    /// Unlike [`scan_file_for_new_deletions`] which pushes a Vortex filter expression,
+    /// this method reads data and performs an O(1) `HashSet` probe per row. This is
+    /// dramatically faster when the number of matched keys (N) is large, because the
+    /// filter-based path evaluates O(N) comparisons per chunk.
+    ///
+    /// The scan reads **all columns** (no projection) because Vortex's `with_projection`
+    /// API takes a single `Expression` and may not support mixed `data+row_idx` projections.
+    /// File-local row positions are tracked with a manual row counter, and positions that are
+    /// already deleted (from the position-based cache) are skipped so this method returns only
+    /// candidates for NEW deletions.
+    ///
+    /// # Returns
+    ///
+    /// Vector of file-local row indices whose key columns are in `matched_keys`.
+    async fn scan_file_for_key_matches(
+        &self,
+        file_path: &str,
+        vortex_session: &VortexSession,
+        object_store: &Arc<dyn ObjectStore>,
+        matched_keys: &std::collections::HashSet<Vec<datafusion_common::ScalarValue>>,
+        key_columns: &[String],
+    ) -> crate::provider::Result<Vec<u64>> {
+        let table_name = &self.table_metadata.table_name;
+
+        // Snapshot already-deleted positions for this file from the cache.
+        let already_deleted_bitmap: Option<RoaringBitmap> = {
+            let cache = self
+                .pk_deletion_strategy
+                .position_based_cache()
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message:
+                        "scan_file_for_key_matches called with incompatible PkDeletionStrategy"
+                            .to_string(),
+                })?;
+            let guard = cache.read().map_err(|_| Error::LockPoisoned {
+                table: table_name.clone(),
+                lock: DELETION_CACHE_LOCK_POISONED,
+            })?;
+            guard.get(file_path).cloned()
+        };
+
+        // Open the Vortex file directly.
+        let vxf = vortex_session
+            .open_options()
+            .open_object_store(object_store, file_path)
+            .await
+            .map_err(|e| Error::Vortex {
+                operation: "open vortex file for key-match scan",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+
+        // Scan without projection or filter — read all data.
+        let scan_builder = vxf.scan().map_err(|e| Error::Vortex {
+            operation: "build vortex scan for key-match",
+            table: table_name.clone(),
+            source: Box::new(e),
+        })?;
+
+        let mut stream = scan_builder.into_stream().map_err(|e| Error::Vortex {
+            operation: "start vortex scan stream for key-match",
+            table: table_name.clone(),
+            source: Box::new(e),
+        })?;
+
+        let mut matching_positions: Vec<u64> = Vec::new();
+        let mut row_position: u64 = 0;
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| Error::Vortex {
+                operation: "read vortex chunk for key-match",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+
+            let arrow_array = chunk.into_arrow_preferred().map_err(|e| Error::Vortex {
+                operation: "convert vortex chunk to arrow for key-match",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+
+            if arrow_array.is_empty() {
+                continue;
+            }
+
+            // Without projection, Vortex returns a StructArray representing the full row.
+            let struct_array = arrow_array
+                .as_any()
+                .downcast_ref::<arrow::array::StructArray>()
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: "Vortex scan without projection did not return StructArray"
+                        .to_string(),
+                })?;
+            let batch = arrow::record_batch::RecordBatch::from(struct_array);
+
+            // Resolve key column indices (once per chunk — schema is stable across chunks).
+            let key_indices: Vec<usize> = key_columns
+                .iter()
+                .map(|col_name| {
+                    batch
+                        .schema()
+                        .index_of(col_name)
+                        .map_err(|_| Error::Internal {
+                            table: table_name.clone(),
+                            message: format!(
+                                "Key column '{col_name}' not found in Vortex file schema"
+                            ),
+                        })
+                })
+                .collect::<crate::provider::Result<Vec<_>>>()?;
+
+            for row_idx in 0..batch.num_rows() {
+                let key: Vec<datafusion_common::ScalarValue> = key_indices
+                    .iter()
+                    .map(|&idx| {
+                        datafusion_common::ScalarValue::try_from_array(batch.column(idx), row_idx)
+                            .map_err(|e| Error::Internal {
+                                table: table_name.clone(),
+                                message: format!("Failed to extract key value: {e}"),
+                            })
+                    })
+                    .collect::<crate::provider::Result<Vec<_>>>()?;
+
+                let is_already_deleted = u32::try_from(row_position).ok().is_some_and(|pos| {
+                    already_deleted_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.contains(pos))
+                });
+
+                if matched_keys.contains(&key) && !is_already_deleted {
+                    matching_positions.push(row_position);
+                }
+                row_position += 1;
+            }
+        }
+
+        Ok(matching_positions)
+    }
+
     /// Persist per-file position-based deletions.
     ///
     /// Each entry in `row_ids` maps a source data file path to the
@@ -339,7 +612,7 @@ impl CayenneDeletionSink {
     /// # Returns
     ///
     /// The total number of **newly** deleted rows (not counting already-deleted).
-    pub(super) async fn persist_position_based_deletions(
+    pub(crate) async fn persist_position_based_deletions(
         &self,
         row_ids: HashMap<String, Vec<u64>>,
     ) -> crate::provider::Result<u64> {
@@ -373,29 +646,52 @@ impl CayenneDeletionSink {
 
         let writer = DeletionVectorWriter::new(&self.table_metadata);
 
-        // Track new deletion count for return value
-        let new_deletion_count: usize = row_ids.values().map(Vec::len).sum();
+        // Build write specs and precompute cache updates while counting TRUE new deletions
+        // (set difference between incoming row_ids and existing cache per file).
+        let mut new_deletion_count: usize = 0;
+        let mut specs: Vec<DeletionVectorWriteSpec> = Vec::new();
+        let mut cache_updates: HashMap<String, RoaringBitmap> = HashMap::new();
 
-        // Create one DeletionVectorWriteSpec per file with MERGED deletions
-        // (existing from cache + new from this operation)
-        let specs: Vec<DeletionVectorWriteSpec> = row_ids
-            .iter()
-            .filter(|(_, row_ids)| !row_ids.is_empty())
-            .map(|(file_path, new_row_ids)| {
-                // Start with existing deletions for this file (if any)
-                let mut combined_ids: Vec<u64> =
-                    if let Some(existing_bitmap) = existing_deletions.get(file_path) {
-                        existing_bitmap.iter().map(u64::from).collect()
-                    } else {
-                        Vec::new()
-                    };
+        for (file_path, incoming_row_ids) in row_ids.iter().filter(|(_, ids)| !ids.is_empty()) {
+            let existing_bitmap = existing_deletions
+                .get(file_path)
+                .cloned()
+                .unwrap_or_default();
 
-                // Add new deletions
-                combined_ids.extend(new_row_ids.iter().copied());
+            // Deduplicate incoming row IDs first to avoid over-counting and redundant writes.
+            let mut unique_new_row_ids = incoming_row_ids.clone();
+            unique_new_row_ids.sort_unstable();
+            unique_new_row_ids.dedup();
 
-                DeletionVectorWriteSpec::new_position_based(file_path.clone(), combined_ids)
-            })
-            .collect();
+            let newly_added_for_file = unique_new_row_ids
+                .iter()
+                .filter(|&&id| {
+                    u32::try_from(id)
+                        .ok()
+                        .is_none_or(|id32| !existing_bitmap.contains(id32))
+                })
+                .count();
+            new_deletion_count += newly_added_for_file;
+
+            // Deletion vector must contain ALL deleted positions (existing + new).
+            let mut combined_ids: Vec<u64> = existing_bitmap.iter().map(u64::from).collect();
+            combined_ids.extend(unique_new_row_ids.iter().copied());
+            combined_ids.sort_unstable();
+            combined_ids.dedup();
+            specs.push(DeletionVectorWriteSpec::new_position_based(
+                file_path.clone(),
+                combined_ids,
+            ));
+
+            // Pre-build updated cache bitmap (u32 representable positions only).
+            let mut updated_bitmap = existing_bitmap;
+            updated_bitmap.extend(
+                unique_new_row_ids
+                    .iter()
+                    .filter_map(|&id| u32::try_from(id).ok()),
+            );
+            cache_updates.insert(file_path.clone(), updated_bitmap);
+        }
 
         if specs.is_empty() {
             return Ok(0);
@@ -414,19 +710,6 @@ impl CayenneDeletionSink {
                 });
             }
         }
-
-        // Pre-build updated bitmaps OUTSIDE the write lock to minimize lock hold time.
-        let cache_updates: HashMap<String, RoaringBitmap> = row_ids
-            .iter()
-            .map(|(file_path, row_ids)| {
-                let mut bitmap = existing_deletions
-                    .get(file_path)
-                    .cloned()
-                    .unwrap_or_default();
-                bitmap.extend(row_ids.iter().filter_map(|&id| u32::try_from(id).ok()));
-                (file_path.clone(), bitmap)
-            })
-            .collect();
 
         // Quick write lock - just insert pre-built entries
         {

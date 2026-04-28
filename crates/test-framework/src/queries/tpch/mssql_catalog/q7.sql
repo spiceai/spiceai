@@ -11,12 +11,12 @@ from
             extract(year from l_shipdate) as l_year,
             l_extendedprice * (1 - l_discount) as volume
         from
-            mssql.public.supplier,
-            mssql.public.lineitem,
-            mssql.public.orders,
-            mssql.public.customer,
-            mssql.public.nation n1,
-            mssql.public.nation n2
+            mssql.dbo.supplier,
+            mssql.dbo.lineitem,
+            mssql.dbo.orders,
+            mssql.dbo.customer,
+            mssql.dbo.nation n1,
+            mssql.dbo.nation n2
         where
                 s_suppkey = l_suppkey
           and o_orderkey = l_orderkey

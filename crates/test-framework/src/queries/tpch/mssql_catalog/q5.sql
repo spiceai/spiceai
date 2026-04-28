@@ -2,12 +2,12 @@ select
     n_name,
     sum(l_extendedprice * (1 - l_discount)) as revenue
 from
-    mssql.public.customer,
-    mssql.public.orders,
-    mssql.public.lineitem,
-    mssql.public.supplier,
-    mssql.public.nation,
-    mssql.public.region
+    mssql.dbo.customer,
+    mssql.dbo.orders,
+    mssql.dbo.lineitem,
+    mssql.dbo.supplier,
+    mssql.dbo.nation,
+    mssql.dbo.region
 where
         c_custkey = o_custkey
   and l_orderkey = o_orderkey

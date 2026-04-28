@@ -2,9 +2,9 @@ select
     ps_partkey,
     sum(ps_supplycost * ps_availqty) as value
 from
-    mssql.public.partsupp,
-    mssql.public.supplier,
-    mssql.public.nation
+    mssql.dbo.partsupp,
+    mssql.dbo.supplier,
+    mssql.dbo.nation
 where
     ps_suppkey = s_suppkey
   and s_nationkey = n_nationkey
@@ -15,9 +15,9 @@ group by
     select
     sum(ps_supplycost * ps_availqty) * 0.0001
     from
-    mssql.public.partsupp,
-    mssql.public.supplier,
-    mssql.public.nation
+    mssql.dbo.partsupp,
+    mssql.dbo.supplier,
+    mssql.dbo.nation
     where
     ps_suppkey = s_suppkey
                   and s_nationkey = n_nationkey

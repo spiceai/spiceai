@@ -14,24 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! [`CayenneDmlExtensionPlanner`] — stateless extension planner for local
-//! (single-node) Cayenne MERGE.
+//! Local Cayenne DML handler plus MERGE logical-input preparation helpers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::datasource::provider_as_source;
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::LogicalPlanBuilder;
-use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::execution::SessionState;
+use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::{Column, Expr, JoinType, col};
+use datafusion::sql::TableReference;
 use datafusion_common::ResolvedTableReference;
 use datafusion_dml::{CatalogDmlHandler, MergeParams};
 
-use super::logical_nodes::CayenneMergeNode;
 use super::physical_plans::CayenneMergeExec;
 
 /// Catalog DML handler for local (single-node) Cayenne operations.
@@ -67,7 +65,7 @@ impl CatalogDmlHandler for CayenneDmlHandler {
         &self,
         params: MergeParams,
         physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
-        session_state: &datafusion::execution::SessionState,
+        session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let [join_physical] = physical_inputs.as_slice() else {
             return Err(DataFusionError::Internal(
@@ -102,83 +100,51 @@ impl CatalogDmlHandler for CayenneDmlHandler {
     }
 }
 
-/// Stateless extension planner for local (single-node) Cayenne MERGE.
-///
-/// Handles [`CayenneMergeNode`] by building the joined/projection physical
-/// input and delegating final execution-plan construction to
-/// [`CayenneDmlHandler`].
+/// Prepared local MERGE input for the generic [`datafusion_dml::DmlExtensionNode`].
 #[derive(Debug)]
-pub struct CayenneDmlExtensionPlanner {
-    handler: Arc<CayenneDmlHandler>,
+pub struct LocalMergePlanInput {
+    /// Typed MERGE metadata consumed by the generic DML extension pipeline.
+    pub params: MergeParams,
+    /// Joined and projected logical input whose rows match the target schema.
+    pub projected_input: LogicalPlan,
 }
 
-impl CayenneDmlExtensionPlanner {
-    /// Creates a [`CayenneDmlExtensionPlanner`] that assumes [`TableReference`] that are not fully
-    /// resolved have `default_catalog` and `default_schema`.
-    #[must_use]
-    pub fn new(default_catalog: &'static str, default_schema: &'static str) -> Self {
-        Self {
-            handler: Arc::new(CayenneDmlHandler::new(default_catalog, default_schema)),
-        }
-    }
-}
-
-#[async_trait]
-impl ExtensionPlanner for CayenneDmlExtensionPlanner {
-    async fn plan_extension(
-        &self,
-        _planner: &dyn PhysicalPlanner,
-        node: &dyn UserDefinedLogicalNode,
-        _logical_inputs: &[&LogicalPlan],
-        _physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &datafusion::execution::SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        let Some(merge) = node.as_any().downcast_ref::<CayenneMergeNode>() else {
-            return Ok(None);
-        };
-
-        let (params, join_physical) =
-            build_local_merge_input(merge, session_state, self.handler.as_ref()).await?;
-
-        self.handler
-            .merge_exec(params, vec![join_physical], session_state)
+/// Build the typed [`MergeParams`] and joined/projected logical input used by
+/// the generic DML extension pipeline for local Cayenne `MERGE`.
+///
+/// The returned `projected_input` yields rows shaped like the target table,
+/// with `SET` expressions already applied. The local [`CayenneDmlHandler`]
+/// consumes the corresponding physical plan and executes delete + insert.
+///
+/// # Errors
+///
+/// Returns an error when either table cannot be resolved, an assignment targets
+/// a missing column, or an assignment expression fails to parse against the
+/// joined target/source schema.
+#[expect(clippy::too_many_arguments)]
+pub async fn build_local_merge_plan_input(
+    session_state: &SessionState,
+    default_catalog: &str,
+    default_schema: &str,
+    target_table: &TableReference,
+    source_table: &TableReference,
+    target_qualifier: &str,
+    source_qualifier: &str,
+    on_keys: &[(String, String)],
+    assignment_sql: &[(String, String)],
+) -> DFResult<LocalMergePlanInput> {
+    let target_provider =
+        resolve_table(session_state, target_table, default_catalog, default_schema)
             .await
-            .map(Some)
-    }
-}
-
-/// Build the joined+projected physical input and typed params for a local
-/// [`CayenneMergeNode`].
-async fn build_local_merge_input(
-    merge: &CayenneMergeNode,
-    session_state: &datafusion::execution::SessionState,
-    handler: &CayenneDmlHandler,
-) -> DFResult<(MergeParams, Arc<dyn ExecutionPlan>)> {
-    let target_provider = resolve_table(
-        session_state,
-        &merge.target_table,
-        handler.default_catalog,
-        handler.default_schema,
-    )
-    .await
-    .ok_or(DataFusionError::Plan(format!(
-        "Table {} not found",
-        merge.target_table
-    )))?;
-    let source_provider = resolve_table(
-        session_state,
-        &merge.source_table,
-        handler.default_catalog,
-        handler.default_schema,
-    )
-    .await
-    .ok_or(DataFusionError::Plan(format!(
-        "Table {} not found",
-        merge.source_table
-    )))?;
-
-    let target_qualifier = merge.target_qualifier.as_str();
-    let source_qualifier = merge.source_qualifier.as_str();
+            .ok_or(DataFusionError::Plan(format!(
+                "Table {target_table} not found"
+            )))?;
+    let source_provider =
+        resolve_table(session_state, source_table, default_catalog, default_schema)
+            .await
+            .ok_or(DataFusionError::Plan(format!(
+                "Table {source_table} not found"
+            )))?;
 
     let target_scan = LogicalPlanBuilder::scan(
         target_qualifier,
@@ -193,8 +159,7 @@ async fn build_local_merge_input(
     )?
     .build()?;
 
-    let (left_keys, right_keys): (Vec<Column>, Vec<Column>) = merge
-        .on_keys
+    let (left_keys, right_keys): (Vec<Column>, Vec<Column>) = on_keys
         .iter()
         .map(|(target, source)| {
             (
@@ -209,13 +174,13 @@ async fn build_local_merge_input(
         .build()?;
 
     let target_schema = target_provider.schema();
-    let target_field_names: std::collections::HashSet<&str> = target_schema
+    let target_field_names: HashSet<&str> = target_schema
         .fields()
         .iter()
-        .map(|f| f.name().as_str())
+        .map(|field| field.name().as_str())
         .collect();
 
-    for (column_name, _) in &merge.assignments {
+    for (column_name, _) in assignment_sql {
         if !target_field_names.contains(column_name.as_str()) {
             return Err(DataFusionError::Plan(format!(
                 "MERGE SET column '{column_name}' does not exist in target table"
@@ -224,8 +189,7 @@ async fn build_local_merge_input(
     }
 
     let joined_schema = joined.schema();
-    let assignments: Vec<(String, Expr)> = merge
-        .assignments
+    let assignments: Vec<(String, Expr)> = assignment_sql
         .iter()
         .map(|(column, value_sql)| {
             let expr = session_state.create_logical_expr(value_sql, joined_schema)?;
@@ -252,28 +216,27 @@ async fn build_local_merge_input(
         })
         .collect::<DFResult<Vec<_>>>()?;
 
-    let projected = LogicalPlanBuilder::from(joined)
+    let projected_input = LogicalPlanBuilder::from(joined)
         .project(project_exprs)?
         .build()?;
 
-    let join_physical = session_state.create_physical_plan(&projected).await?;
-
-    let params = MergeParams {
-        target_table: merge.target_table.clone(),
-        source_table: merge.source_table.clone(),
-        target_qualifier: merge.target_qualifier.clone(),
-        source_qualifier: merge.source_qualifier.clone(),
-        on_keys: merge.on_keys.clone(),
-        assignments,
-        original_sql: None,
-    };
-
-    Ok((params, join_physical))
+    Ok(LocalMergePlanInput {
+        params: MergeParams {
+            target_table: target_table.clone(),
+            source_table: source_table.clone(),
+            target_qualifier: target_qualifier.to_string(),
+            source_qualifier: source_qualifier.to_string(),
+            on_keys: on_keys.to_vec(),
+            assignments,
+            original_sql: None,
+        },
+        projected_input,
+    })
 }
 
 async fn resolve_table(
-    session_state: &datafusion::execution::SessionState,
-    table_ref: &datafusion::sql::TableReference,
+    session_state: &SessionState,
+    table_ref: &TableReference,
     default_catalog: &str,
     default_schema: &str,
 ) -> Option<Arc<dyn datafusion::datasource::TableProvider>> {
