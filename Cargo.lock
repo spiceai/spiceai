@@ -2365,7 +2365,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e6bcc66785319e08f530b07c2e1fa029ff14a2db#e6bcc66785319e08f530b07c2e1fa029ff14a2db"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=383e165a080d648c313a2530a3a53eae6077fdba#383e165a080d648c313a2530a3a53eae6077fdba"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2406,7 +2406,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e6bcc66785319e08f530b07c2e1fa029ff14a2db#e6bcc66785319e08f530b07c2e1fa029ff14a2db"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=383e165a080d648c313a2530a3a53eae6077fdba#383e165a080d648c313a2530a3a53eae6077fdba"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2439,7 +2439,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e6bcc66785319e08f530b07c2e1fa029ff14a2db#e6bcc66785319e08f530b07c2e1fa029ff14a2db"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=383e165a080d648c313a2530a3a53eae6077fdba#383e165a080d648c313a2530a3a53eae6077fdba"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -5778,7 +5778,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=42245bdd58ee3d7da8276e83d85fb1c52aec916e#42245bdd58ee3d7da8276e83d85fb1c52aec916e"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=a4fce79433e5c2fe779427c0bfce6a599193e300#a4fce79433e5c2fe779427c0bfce6a599193e300"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -6244,7 +6244,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=5790adcfac5578331a9cadfe1e2e88d1eb8f0565#5790adcfac5578331a9cadfe1e2e88d1eb8f0565"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=d7fae5f0167e2c7e1c7f34fd1e0c54c383c5a1b0#d7fae5f0167e2c7e1c7f34fd1e0c54c383c5a1b0"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",

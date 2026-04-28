@@ -1490,8 +1490,14 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn table_exists(&self, dataset_name: TableReference) -> bool {
-        self.ctx.table_exist(dataset_name).unwrap_or(false)
+    pub fn table_exists(&self, dataset_name: &TableReference) -> bool {
+        let Some(catalog) = self.resolve_catalog_provider(dataset_name) else {
+            return false;
+        };
+        let Some(s) = Self::resolve_schema_provider(&catalog, dataset_name) else {
+            return false;
+        };
+        s.table_exist(dataset_name.table())
     }
 
     #[must_use]
@@ -2537,10 +2543,7 @@ impl DataFusion {
                     break;
                 }
                 loop {
-                    if !ctx
-                        .table_exist(dependent_table_name.clone())
-                        .unwrap_or(false)
-                    {
+                    if !df_ref.table_exists(dependent_table_name) {
                         if Instant::now() >= deadline {
                             unresolved_dependent_table = Some(dependent_table_name.clone());
                             break;
@@ -2903,6 +2906,7 @@ impl DataFusion {
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
             executor_registry: self.executor_registry().cloned(),
             ddl_handler: self.cayenne_ddl_handler.clone(),
+            io_runtime: self.io_runtime.clone(),
         };
 
         planner::create_logical_plan(sql, session, &ctx).await

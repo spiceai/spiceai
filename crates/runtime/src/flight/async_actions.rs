@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use tonic::Status;
 
 use crate::datafusion::job_executor_context_extension::get_job_executor;
-use crate::http::v1::queries::SubmitQueryRequest;
+use crate::http::v1::{current_principal_requires_read_only, queries::SubmitQueryRequest};
 use crate::jobs::{JobErrorCode, JobState, JobStatus};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -249,9 +249,10 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let request: SubmitQueryRequest = serde_json::from_slice(body).map_err(|e| {
         Status::invalid_argument(format!("Failed to parse SubmitQueryRequest: {e}"))
     })?;
+    let read_only = current_principal_requires_read_only().await;
 
     let state = executor
-        .submit(request)
+        .submit(request, read_only)
         .await
         .map_err(|e| Status::internal(format!("Failed to submit query: {e}")))?;
 

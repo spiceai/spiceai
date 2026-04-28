@@ -51,8 +51,9 @@ impl CustomizeConnection<Arc<Connection>, bb8_oracle::Error> for SetTimezoneCust
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), bb8_oracle::Error>> + Send + 'a>> {
         let sql = format!("ALTER SESSION SET TIME_ZONE = '{}'", self.timezone);
         Box::pin(async move {
-            let _ = conn.execute(&sql, &[]);
-            Ok(())
+            conn.execute(&sql, &[])
+                .map(|_| ())
+                .map_err(bb8_oracle::Error::Database)
         })
     }
 }

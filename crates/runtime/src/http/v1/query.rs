@@ -27,7 +27,7 @@ use serde::Deserialize;
 use crate::datafusion::{param_utils, request_context_extension::get_current_datafusion};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-use super::{ResponseMimeType, sql_to_http_response};
+use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_response};
 
 /// SQL Query
 ///
@@ -229,6 +229,7 @@ pub(crate) async fn post(
         &sql,
         parameters,
         ResponseMimeType::from_accept_header(accept.as_ref()),
+        current_principal_requires_read_only().await,
     )
     .await
 }

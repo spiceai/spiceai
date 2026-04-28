@@ -659,33 +659,20 @@ pub(crate) fn runtime_env(
 }
 
 pub(crate) fn default_extension_planners(
-    executor_registry: Option<Arc<ExecutorRegistry>>,
-    io_runtime: tokio::runtime::Handle,
+    _executor_registry: Option<Arc<ExecutorRegistry>>,
+    _io_runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
-    let mut planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
+    let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
         // One stateless DDL planner handles all DdlExtensionNodes from any handler.
         Arc::new(datafusion_ddl::DdlExtensionPlanner),
+        // One stateless DML planner handles all DmlExtensionNodes from any handler.
+        Arc::new(datafusion_dml::DmlExtensionPlanner),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ];
-    // Cayenne DML (DELETE, UPDATE, INSERT, MERGE forwarding): either single or distributed.
-    #[cfg(not(windows))]
-    if let Some(registry) = executor_registry {
-        planners.push(Arc::new(
-            super::cayenne_ddl::DistributedCayenneDmlExtensionPlanner::new(
-                registry,
-                Some(io_runtime),
-            ),
-        ));
-    } else {
-        planners.push(Arc::new(cayenne::ddl::CayenneDmlExtensionPlanner::new(
-            super::SPICE_DEFAULT_CATALOG,
-            super::SPICE_DEFAULT_SCHEMA,
-        )));
-    };
     planners
 }
 
