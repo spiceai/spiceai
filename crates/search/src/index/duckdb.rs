@@ -700,9 +700,7 @@ fn duckdb_vector_sql(
                 .iter()
                 .map(|filter| expr::to_sql_with_engine(filter, Some(Engine::DuckDB)))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DataFusionError::Plan(e.to_string()))?
-                .into_iter()
-                .map(|sql| sql.to_string()),
+                .map_err(|e| DataFusionError::Plan(e.to_string()))?,
         );
     }
     let where_expr = format!(" WHERE {}", filter_exprs.join(" AND "));
@@ -729,7 +727,7 @@ fn vector_literal(vector: &[f32], dims: i32) -> DataFusionResult<String> {
     validate_vector(vector, dims, "query")?;
     let values = vector
         .iter()
-        .map(|value| value.to_string())
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!("[{values}]::FLOAT[{dims}]"))

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::poly::PolyTableProvider;
@@ -26,11 +26,7 @@ use datafusion_table_providers::{
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use search::{generation::util::get_primary_keys, index::duckdb::DuckDBVectorIndex};
-use spicepod::{
-    param::Params,
-    semantic::{Column, ColumnLevelEmbeddingConfig},
-    vector::VectorStore,
-};
+use spicepod::{param::Params, semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
 use tokio::sync::RwLock;
 
 use crate::{
@@ -101,16 +97,12 @@ pub(crate) async fn try_from_table(
     }
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
-    if string_from_params(&params, "partition_by").is_some()
-        || !vector_store_config.partition_by.is_empty()
-    {
+    if partition_by_configured(&params, vector_store_config) {
         return Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "`partition_by` is not yet supported for the DuckDB vector engine.",
         ));
     }
-    if string_from_params(&params, "spill_writes")
-        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-    {
+    if spill_writes_enabled(&params) {
         return Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "`spill_writes` is not supported for the DuckDB vector engine.",
         ));
@@ -161,7 +153,7 @@ pub(crate) async fn try_from_table(
 
 pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
     tbl: &TableReference,
-    columns: &[Column],
+    embedding_columns: Vec<(String, ColumnLevelEmbeddingConfig)>,
     vector_store: &VectorStore,
     accelerator_provider: Arc<dyn TableProvider>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
@@ -172,15 +164,6 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
             "DuckDB vector engine for table {tbl} requires a DuckDB accelerator provider."
         )));
     };
-
-    let embedding_columns: Vec<_> = columns
-        .iter()
-        .filter_map(|c| {
-            c.embeddings
-                .first()
-                .map(|embed| (c.name.clone(), embed.clone()))
-        })
-        .collect();
 
     let mut provider = if let Some(indexed) = accelerator_provider
         .as_any()
@@ -209,6 +192,48 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
     }
 
     Ok(Arc::new(provider))
+}
+
+#[must_use]
+pub(crate) fn vector_store_from_embedding_params(
+    params: &HashMap<String, String>,
+) -> Option<VectorStore> {
+    let hnsw_params = params
+        .iter()
+        .filter_map(|(key, value)| {
+            normalized_duckdb_vector_param_name(key)
+                .map(|normalized| (format!("duckdb_{normalized}"), value.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+
+    if hnsw_params.is_empty() {
+        return None;
+    }
+
+    Some(VectorStore {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        partition_by: Vec::new(),
+        params: Some(Params::from_string_map(hnsw_params)),
+    })
+}
+
+fn normalized_duckdb_vector_param_name(key: &str) -> Option<&'static str> {
+    match key.strip_prefix("duckdb_").unwrap_or(key) {
+        "distance_metric" => Some("distance_metric"),
+        "metric" => Some("metric"),
+        "hnsw_m" => Some("hnsw_m"),
+        "m" => Some("m"),
+        "hnsw_ef_construction" => Some("hnsw_ef_construction"),
+        "ef_construction" => Some("ef_construction"),
+        "hnsw_ef_search" => Some("hnsw_ef_search"),
+        "ef_search" => Some("ef_search"),
+        "index_name" => Some("index_name"),
+        "install_vss" => Some("install_vss"),
+        "partition_by" => Some("partition_by"),
+        "spill_writes" => Some("spill_writes"),
+        _ => None,
+    }
 }
 
 fn duckdb_writer_context(
@@ -269,6 +294,16 @@ fn parse_hnsw_options(
     Ok(options)
 }
 
+fn partition_by_configured(params: &Parameters, vector_store_config: &VectorStore) -> bool {
+    string_from_params(params, "partition_by").is_some()
+        || !vector_store_config.partition_by.is_empty()
+}
+
+fn spill_writes_enabled(params: &Parameters) -> bool {
+    string_from_params(params, "spill_writes")
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+}
+
 fn parse_u32_param(
     params: &Parameters,
     key: &str,
@@ -321,4 +356,131 @@ async fn get_store_params(
     .await?;
 
     Ok(params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::SecretString;
+
+    async fn duckdb_params(values: &[(&str, &str)]) -> Parameters {
+        Parameters::try_new(
+            "DuckDB vector store",
+            values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), SecretString::from((*value).to_string())))
+                .collect(),
+            "duckdb",
+            Arc::new(RwLock::new(Secrets::default())),
+            PARAMETERS,
+        )
+        .await
+        .expect("DuckDB vector parameters should be valid")
+    }
+
+    #[tokio::test]
+    async fn parse_hnsw_options_accepts_aliases() {
+        let params = duckdb_params(&[
+            ("duckdb_metric", "ip"),
+            ("duckdb_m", "16"),
+            ("duckdb_ef_construction", "64"),
+            ("duckdb_ef_search", "20"),
+            ("duckdb_index_name", "custom_idx"),
+            ("duckdb_install_vss", "false"),
+        ])
+        .await;
+
+        let options = parse_hnsw_options(&params).expect("HNSW options should parse");
+
+        assert_eq!(options.metric, DuckDBDistanceMetric::InnerProduct);
+        assert_eq!(options.hnsw_m, Some(16));
+        assert_eq!(options.hnsw_ef_construction, Some(64));
+        assert_eq!(options.hnsw_ef_search, Some(20));
+        assert_eq!(options.index_name.as_deref(), Some("custom_idx"));
+        assert!(!options.install_vss);
+    }
+
+    #[tokio::test]
+    async fn parse_hnsw_options_prefers_canonical_names() {
+        let params = duckdb_params(&[
+            ("duckdb_distance_metric", "l2"),
+            ("duckdb_metric", "inner_product"),
+            ("duckdb_hnsw_m", "32"),
+            ("duckdb_m", "16"),
+            ("duckdb_hnsw_ef_construction", "128"),
+            ("duckdb_ef_construction", "64"),
+            ("duckdb_hnsw_ef_search", "40"),
+            ("duckdb_ef_search", "20"),
+        ])
+        .await;
+
+        let options = parse_hnsw_options(&params).expect("HNSW options should parse");
+
+        assert_eq!(options.metric, DuckDBDistanceMetric::L2);
+        assert_eq!(options.hnsw_m, Some(32));
+        assert_eq!(options.hnsw_ef_construction, Some(128));
+        assert_eq!(options.hnsw_ef_search, Some(40));
+    }
+
+    #[tokio::test]
+    async fn parse_hnsw_options_rejects_invalid_numeric_and_bool_values() {
+        let params = duckdb_params(&[("duckdb_hnsw_m", "large")]).await;
+        let err = parse_hnsw_options(&params).expect_err("invalid hnsw_m should be rejected");
+        assert!(
+            err.to_string()
+                .contains("Invalid value for DuckDB vector parameter 'hnsw_m'")
+        );
+
+        let params = duckdb_params(&[("duckdb_install_vss", "sometimes")]).await;
+        let err = parse_hnsw_options(&params).expect_err("invalid install_vss should be rejected");
+        assert!(
+            err.to_string()
+                .contains("Invalid value for DuckDB vector parameter 'install_vss'")
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_options_are_detected() {
+        let params = duckdb_params(&[
+            ("duckdb_partition_by", "bucket(10, id)"),
+            ("duckdb_spill_writes", "yes"),
+        ])
+        .await;
+
+        assert!(partition_by_configured(&params, &VectorStore::default()));
+        assert!(spill_writes_enabled(&params));
+    }
+
+    #[test]
+    fn vector_store_from_embedding_params_keeps_hnsw_params() {
+        let store = vector_store_from_embedding_params(&HashMap::from([
+            ("duckdb_hnsw_m".to_string(), "32".to_string()),
+            ("hnsw_ef_search".to_string(), "20".to_string()),
+            ("duckdb_file".to_string(), "data.duckdb".to_string()),
+        ]))
+        .expect("HNSW params should create a DuckDB vector store config");
+
+        assert_eq!(store.engine.as_deref(), Some("duckdb"));
+        let params = store
+            .params
+            .expect("DuckDB vector store config should include params")
+            .as_string_map();
+        assert_eq!(params.get("duckdb_hnsw_m").map(String::as_str), Some("32"));
+        assert_eq!(
+            params.get("duckdb_hnsw_ef_search").map(String::as_str),
+            Some("20")
+        );
+        assert!(!params.contains_key("duckdb_file"));
+    }
+
+    #[test]
+    fn vector_store_from_embedding_params_ignores_unrelated_params() {
+        assert!(
+            vector_store_from_embedding_params(&HashMap::from([(
+                "duckdb_file".to_string(),
+                "data.duckdb".to_string()
+            )]))
+            .is_none()
+        );
+    }
 }
