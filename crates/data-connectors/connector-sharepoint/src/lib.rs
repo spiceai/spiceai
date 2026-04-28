@@ -280,28 +280,26 @@ fn url_extension(from: &str) -> Option<String> {
 /// Compute the canonical registry key DataFusion uses to look up an
 /// `ObjectStore` for `store_url`.
 ///
-/// `ListingTableUrl::object_store()` returns scheme+authority only — the
-/// path is stripped — so `sharepoint://drives/{id}/foo.parquet` and
-/// `sharepoint://drives/{other}/bar.parquet` collapse to the same key
+/// DataFusion's registry keys on scheme+authority only (path is stripped),
+/// matching what `ListingTableUrl::object_store()` returns. For example,
+/// `sharepoint://drives/{id}/foo.parquet` and
+/// `sharepoint://drives/{other}/bar.parquet` both resolve to the key
 /// `sharepoint://drives/`. The connector's dispatch reads the drive ID
 /// from the path on every operation.
+///
+/// We construct the key directly from the URL components rather than
+/// round-tripping through `ListingTableUrl::parse`, so there is no
+/// fallback to the full URL (which would never match DataFusion's
+/// scheme+authority-only lookup and produce silent registration mismatches).
 fn registry_key_for(store_url: &Url) -> Url {
-    use datafusion::datasource::listing::ListingTableUrl;
-    match ListingTableUrl::parse(store_url.as_str()) {
-        Ok(ltu) => <_ as AsRef<Url>>::as_ref(&ltu.object_store()).clone(),
-        Err(e) => {
-            // `store_url` was already validated as a parseable URL upstream
-            // (see `parse_object_store_components`), so this branch is a
-            // defensive fallback. Use the full URL — still works for both
-            // register and lookup.
-            tracing::warn!(
-                store_url = %store_url,
-                error = %e,
-                "Failed to derive ObjectStore registry key from SharePoint URL; falling back to full URL"
-            );
-            store_url.clone()
-        }
-    }
+    // Build scheme://authority/ explicitly. `store_url` is always a valid
+    // `sharepoint://` URL at this point (validated by
+    // `parse_object_store_components`), so `has_host` holds.
+    let mut key = store_url.clone();
+    key.set_path("/");
+    key.set_query(None);
+    key.set_fragment(None);
+    key
 }
 
 /// Process-wide map of `((runtime_env_ptr, registry_key) → fingerprint)` so
