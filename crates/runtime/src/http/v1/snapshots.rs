@@ -36,6 +36,34 @@ use super::require_write_access;
 
 const DEFAULT_SNAPSHOTS_LIMIT: usize = 10;
 
+#[cfg(feature = "snapshots")]
+fn snapshots_feature_response() -> Option<Response> {
+    None
+}
+
+#[cfg(not(feature = "snapshots"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "mirrors the snapshots-on impl which returns Option"
+)]
+fn snapshots_feature_response() -> Option<Response> {
+    /// Message shown when the snapshots feature is not compiled into this build.
+    ///
+    /// In OSS default builds the `snapshots` cargo feature is disabled and snapshot
+    /// support is shipped only in the Spice.ai enterprise build.
+    const SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE: &str = "Snapshots are an enterprise-only feature and are not available in this build of Spice. Learn more or upgrade at https://spice.ai/pricing.";
+
+    Some(
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(MessageResponse {
+                message: SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE.to_string(),
+            }),
+        )
+            .into_response(),
+    )
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListSnapshotsQuery {
     pub limit: Option<usize>,
@@ -55,6 +83,9 @@ pub async fn list_snapshots(
     Path(dataset_name): Path<String>,
     Query(query): Query<ListSnapshotsQuery>,
 ) -> Response {
+    if let Some(resp) = snapshots_feature_response() {
+        return resp;
+    }
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
@@ -137,6 +168,9 @@ pub async fn get_snapshot(
     Extension(rt): Extension<Arc<Runtime>>,
     Path((dataset_name, snapshot_id)): Path<(String, u64)>,
 ) -> Response {
+    if let Some(resp) = snapshots_feature_response() {
+        return resp;
+    }
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
@@ -218,6 +252,9 @@ pub async fn set_current_snapshot(
     Path(dataset_name): Path<String>,
     Json(request): Json<api::SetCurrentSnapshotRequest>,
 ) -> Response {
+    if let Some(resp) = snapshots_feature_response() {
+        return resp;
+    }
     if let Some(response) = require_write_access().await {
         return response;
     }

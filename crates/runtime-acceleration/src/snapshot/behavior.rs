@@ -18,6 +18,13 @@ use std::sync::{Arc, Weak};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
+/// Message shown when a user has configured snapshots but the feature is not
+/// compiled into this build of Spice.
+///
+/// In OSS default builds the `snapshots` cargo feature is disabled and snapshot
+/// support is shipped only in the Spice.ai enterprise build.
+const SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE: &str = "Snapshots are an enterprise-only feature and are not available in this build of Spice. Learn more or upgrade at https://spice.ai/pricing.";
+
 #[cfg(feature = "snapshots")]
 const SNAPSHOTS_ENABLED: bool = true;
 #[cfg(not(feature = "snapshots"))]
@@ -83,9 +90,7 @@ impl SnapshotBehavior {
     ) -> Self {
         // Snapshot support must be compiled in for bootstrapping to be possible.
         if !SNAPSHOTS_ENABLED {
-            tracing::trace!(
-                "Snapshot bootstrapping is not enabled because snapshot support is not compiled in."
-            );
+            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
             return SnapshotBehavior::Disabled;
         }
 
@@ -104,9 +109,7 @@ impl SnapshotBehavior {
     ) -> Self {
         // Snapshot support must be compiled in for bootstrapping to be possible.
         if !SNAPSHOTS_ENABLED {
-            tracing::trace!(
-                "Snapshot bootstrapping is not enabled because snapshot support is not compiled in."
-            );
+            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
             return SnapshotBehavior::Disabled;
         }
 
@@ -126,9 +129,7 @@ impl SnapshotBehavior {
     ) -> Self {
         // Snapshot support must be compiled in for snapshot creation to be possible.
         if !SNAPSHOTS_ENABLED {
-            tracing::trace!(
-                "Snapshot creation is not enabled because snapshot support is not compiled in."
-            );
+            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
             return SnapshotBehavior::Disabled;
         }
 
@@ -163,17 +164,24 @@ impl SnapshotBehavior {
         io_runtime: Handle,
         compaction: spicepod_acceleration::SnapshotsCompaction,
     ) -> Self {
-        // Snapshot support must be compiled in for snapshot creation to be possible.
-        if !SNAPSHOTS_ENABLED {
-            tracing::trace!(
-                "Snapshot creation is not enabled because snapshot support is not compiled in."
-            );
+        // If the dataset has not opted into snapshots there is nothing to do.
+        if matches!(
+            snapshot_behavior,
+            spicepod_acceleration::SnapshotBehavior::Disabled
+        ) {
             return SnapshotBehavior::Disabled;
         }
 
         let Some(snapshots) = snapshots else {
             return SnapshotBehavior::Disabled;
         };
+
+        // The user opted into snapshots. If the feature is not compiled in,
+        // surface a clear enterprise-only message and disable the feature.
+        if !SNAPSHOTS_ENABLED {
+            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
+            return SnapshotBehavior::Disabled;
+        }
 
         match snapshot_behavior {
             spicepod_acceleration::SnapshotBehavior::Disabled => SnapshotBehavior::Disabled,

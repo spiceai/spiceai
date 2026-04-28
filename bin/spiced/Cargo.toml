@@ -92,7 +92,8 @@ default = [
     "clickhouse",
     "cosmosdb",
     "sharepoint",
-    "snapshots",
+    # "snapshots" is intentionally excluded from OSS default builds — it is
+    # enabled in the enterprise build of spiced (spicehq/spiceai).
     "snowflake",
     "spark",
     "ftp",
