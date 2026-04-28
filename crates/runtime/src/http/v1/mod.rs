@@ -226,7 +226,7 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     }
 
     // Fallback: if not in runtime status, check if table exists
-    if df.table_exists(ds.name.clone()) {
+    if df.table_exists(&ds.name) {
         ComponentStatus::Ready
     } else {
         ComponentStatus::error()
