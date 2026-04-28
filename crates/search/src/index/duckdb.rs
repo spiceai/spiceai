@@ -252,41 +252,6 @@ impl DuckDBVectorIndex {
             self.source_schema.metadata().clone(),
         )))
     }
-
-    pub fn empty_embedding_table_plan(&self) -> Result<LogicalPlan, DataFusionError> {
-        let schema = self.embedding_table_schema()?;
-        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
-        let mem_table = datafusion::catalog::MemTable::try_new(schema, vec![vec![empty_batch]])?;
-
-        LogicalPlanBuilder::scan(
-            "tbl",
-            Arc::new(DefaultTableSource::new(Arc::new(mem_table))),
-            None,
-        )?
-        .build()
-    }
-
-    fn embedding_table_schema(&self) -> Result<SchemaRef, DataFusionError> {
-        let mut fields = self
-            .primary_key
-            .iter()
-            .cloned()
-            .map(Arc::new)
-            .collect::<Vec<_>>();
-        let embedding_col = embedding_col(&self.embedded_column);
-        let field = self
-            .source_schema
-            .field_with_name(&embedding_col)
-            .map_err(|_| {
-                DataFusionError::Plan(format!(
-                    "DuckDB vector index for column '{}' requires embedding column '{embedding_col}' in the table schema.",
-                    self.embedded_column
-                ))
-            })?
-            .clone();
-        fields.push(Arc::new(field));
-        Ok(Arc::new(Schema::new(fields)))
-    }
 }
 
 #[async_trait]
@@ -429,11 +394,11 @@ impl TableProvider for DuckDBVectorQueryTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let projected_schema = project_schema(&self.schema, projection)?;
         let projected_columns = match projection {
-            Some(projection) if !projection.is_empty() => projection
+            Some(projection) => projection
                 .iter()
                 .map(|idx| self.schema.field(*idx).name().clone())
                 .collect(),
-            _ => self
+            None => self
                 .schema
                 .fields()
                 .iter()
@@ -590,10 +555,14 @@ fn run_duckdb_vector_query(
 
     install_vss_once(conn)?;
     conn.execute("LOAD vss", []).map_err(to_execution_error)?;
-    if let Some(ef_search) = exec.hnsw.hnsw_ef_search {
-        conn.execute(&format!("SET hnsw_ef_search = {ef_search}"), [])
-            .map_err(to_execution_error)?;
-    }
+    match exec.hnsw.hnsw_ef_search {
+        Some(ef_search) => conn
+            .execute(&format!("SET hnsw_ef_search = {ef_search}"), [])
+            .map_err(to_execution_error)?,
+        None => conn
+            .execute("RESET hnsw_ef_search", [])
+            .map_err(to_execution_error)?,
+    };
 
     let table_name = resolve_current_table_name(&context.table_definition, conn)?;
     let index_name = format!(
@@ -742,8 +711,8 @@ fn project_schema(
     projection: Option<&Vec<usize>>,
 ) -> DataFusionResult<SchemaRef> {
     match projection {
-        Some(columns) if !columns.is_empty() => Ok(Arc::new(schema.project(columns)?)),
-        _ => Ok(Arc::clone(schema)),
+        Some(columns) => Ok(Arc::new(schema.project(columns)?)),
+        None => Ok(Arc::clone(schema)),
     }
 }
 
@@ -989,5 +958,15 @@ mod tests {
             sql,
             "SELECT id, CAST(1.0 - array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS DOUBLE) AS _score FROM docs WHERE body_embedding IS NOT NULL ORDER BY array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) ASC LIMIT 10"
         );
+    }
+
+    #[test]
+    fn project_schema_honors_empty_projection() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let projection = Vec::new();
+
+        let projected = project_schema(&schema, Some(&projection)).expect("schema should project");
+
+        assert!(projected.fields().is_empty());
     }
 }

@@ -25,6 +25,9 @@ use tokio::sync::RwLock;
 
 use spicepod::semantic::Column;
 
+#[cfg(feature = "duckdb")]
+use spicepod::component::embeddings::ColumnEmbeddingConfig;
+
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use {
     crate::embeddings::construct_chunker,
@@ -68,8 +71,10 @@ pub async fn wrap_table_as_index(
     }
     #[cfg(not(feature = "s3_vectors"))]
     let _ = ctx;
-    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch")))]
+    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
     let _ = file_format;
+    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch")))]
+    let _ = secrets;
     #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
     let _ = (
         embedding_models,
@@ -111,11 +116,10 @@ pub async fn wrap_table_as_index(
         Some("duckdb") => {
             wrap_table_as_index_duckdb(
                 embedding_models,
-                secrets,
                 tbl,
                 columns,
+                file_format,
                 inner_table_provider,
-                vector_store,
             )
             .await
         }
@@ -132,70 +136,46 @@ pub async fn wrap_table_as_index(
 #[cfg(feature = "duckdb")]
 async fn wrap_table_as_index_duckdb(
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
-    secrets: &Arc<RwLock<Secrets>>,
     tbl: &TableReference,
     columns: &[Column],
+    file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider + 'static>,
-    vector_store: &VectorStore,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("DuckDB vector engine for table {tbl} initializing...");
     let start = std::time::Instant::now();
 
-    let embedding_columns: Vec<_> = columns
+    let embeddings = columns
         .iter()
-        .filter_map(|c| {
-            c.embeddings
-                .first()
-                .map(|embed| (c.name.clone(), embed.clone()))
+        .flat_map(|column| {
+            column
+                .embeddings
+                .iter()
+                .map(|embedding| ColumnEmbeddingConfig {
+                    column: column.name.clone(),
+                    model: embedding.model.clone(),
+                    chunking: embedding.chunking.clone(),
+                    primary_keys: embedding.row_ids.clone(),
+                    vector_size: embedding.vector_size,
+                    aggregation: embedding.aggregation,
+                    max_elements_per_row: embedding.max_elements_per_row,
+                })
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    let mut provider = if let Some(indexed) = inner_table_provider
-        .as_any()
-        .downcast_ref::<runtime_datafusion_index::IndexedTableProvider>(
-    ) {
-        indexed.clone()
-    } else {
-        runtime_datafusion_index::IndexedTableProvider::new(Arc::clone(&inner_table_provider))
-    };
-
-    for (column, config) in embedding_columns {
-        let vector_index = super::duckdb::try_from_table(
-            tbl,
-            column,
-            config,
-            vector_store,
-            &inner_table_provider,
-            inner_table_provider.schema(),
-            Arc::clone(embedding_models),
-            Arc::clone(secrets),
-        )
-        .await?;
-
-        let primary_key = vector_index
-            .primary_key
-            .iter()
-            .map(|field| field.name().clone())
-            .collect();
-        let vector_index_list = vector_index
-            .empty_embedding_table_plan()
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-        provider.underlying = Arc::new(
-            search::index::VectorScanTableProvider::new_from_vector_index_list(
-                provider.underlying,
-                primary_key,
-                vector_index_list,
-            ),
-        ) as Arc<dyn TableProvider>;
-        provider =
-            provider.add_index(Arc::new(vector_index) as Arc<dyn runtime_datafusion_index::Index>);
-    }
+    let provider = crate::embeddings::table::EmbeddingTable::from_spicepod_columns(
+        inner_table_provider,
+        embeddings,
+        embedding_models,
+        file_format,
+    )
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
     tracing::info!(
         "DuckDB vector engine for table {tbl} initialized in {:?}",
         start.elapsed()
     );
-    Ok(Arc::new(provider))
+    Ok(provider)
 }
 
 #[cfg(feature = "s3_vectors")]
