@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     any::Any,
+    collections::HashSet,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -23,8 +24,8 @@ use std::{
 };
 
 use arrow::array::{
-    Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray,
+    Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, RecordBatchOptions,
+    StringArray, StringViewArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -66,6 +67,7 @@ static NEXT_TRANSIENT_INDEX_ID: AtomicU64 = AtomicU64::new(0);
 static VSS_INSTALLED: OnceLock<()> = OnceLock::new();
 static VSS_INSTALL_LOCK: Mutex<()> = Mutex::new(());
 const DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT: usize = 1000;
+const EMPTY_PROJECTION_ROW_COLUMN: &str = "__spice_empty_projection_row";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DuckDBDistanceMetric {
@@ -377,12 +379,7 @@ impl TableProvider for DuckDBVectorQueryTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         Ok(filters
             .iter()
-            .map(
-                |filter| match expr::to_sql_with_engine(filter, Some(Engine::DuckDB)) {
-                    Ok(_) => TableProviderFilterPushDown::Exact,
-                    Err(_) => TableProviderFilterPushDown::Unsupported,
-                },
-            )
+            .map(|filter| duckdb_filter_pushdown(&self.schema, filter))
             .collect())
     }
 
@@ -593,7 +590,17 @@ fn run_duckdb_vector_query(
         tracing::trace!("DuckDB vector query SQL: {sql}");
         let mut stmt = conn.prepare(&sql).map_err(to_execution_error)?;
         let result = stmt.query_arrow([]).map_err(to_execution_error)?;
-        Ok(result.collect::<Vec<_>>())
+        let batches = result.collect::<Vec<_>>();
+        if exec.projected_columns.is_empty() {
+            batches
+                .into_iter()
+                .map(|batch| {
+                    empty_projected_batch(Arc::clone(&exec.projected_schema), batch.num_rows())
+                })
+                .collect()
+        } else {
+            Ok(batches)
+        }
     })();
 
     if let Err(error) = conn.execute(&drop_index_sql, []) {
@@ -669,20 +676,24 @@ fn duckdb_vector_sql(
     let score_expr = hnsw.metric.score_expr(embedding_column, vector_literal);
     let distance_expr = hnsw.metric.distance_expr(embedding_column, vector_literal);
 
-    let select_exprs = projected_columns
-        .iter()
-        .map(|column| {
-            if column == SEARCH_SCORE_COLUMN_NAME {
-                format!(
-                    "CAST({score_expr} AS DOUBLE) AS {}",
-                    quote_identifier(SEARCH_SCORE_COLUMN_NAME)
-                )
-            } else {
-                quote_identifier(column).to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let select_exprs = if projected_columns.is_empty() {
+        format!("1 AS {}", quote_identifier(EMPTY_PROJECTION_ROW_COLUMN))
+    } else {
+        projected_columns
+            .iter()
+            .map(|column| {
+                if column == SEARCH_SCORE_COLUMN_NAME {
+                    format!(
+                        "CAST({score_expr} AS DOUBLE) AS {}",
+                        quote_identifier(SEARCH_SCORE_COLUMN_NAME)
+                    )
+                } else {
+                    quote_identifier(column).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
 
     let mut filter_exprs = vec![format!(
         "{} IS NOT NULL",
@@ -705,6 +716,37 @@ fn duckdb_vector_sql(
         "SELECT {select_exprs} FROM {}{where_expr} ORDER BY {distance_expr} ASC LIMIT {limit}",
         quote_identifier(table_name)
     ))
+}
+
+fn duckdb_filter_pushdown(schema: &SchemaRef, filter: &Expr) -> TableProviderFilterPushDown {
+    let pushdownable_columns: HashSet<&str> = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .filter(|name| *name != SEARCH_SCORE_COLUMN_NAME)
+        .collect();
+
+    if !filter
+        .column_refs()
+        .iter()
+        .all(|column| pushdownable_columns.contains(column.name()))
+    {
+        return TableProviderFilterPushDown::Unsupported;
+    }
+
+    match expr::to_sql_with_engine(filter, Some(Engine::DuckDB)) {
+        Ok(_) => TableProviderFilterPushDown::Exact,
+        Err(_) => TableProviderFilterPushDown::Unsupported,
+    }
+}
+
+fn empty_projected_batch(schema: SchemaRef, row_count: usize) -> DataFusionResult<RecordBatch> {
+    RecordBatch::try_new_with_options(
+        schema,
+        Vec::new(),
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 fn project_schema(
@@ -926,6 +968,7 @@ fn to_execution_error(error: impl std::fmt::Display) -> DataFusionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::prelude::{col, lit};
 
     #[test]
     fn hnsw_create_index_sql_includes_configured_options() {
@@ -969,6 +1012,78 @@ mod tests {
         let projected = project_schema(&schema, Some(&projection)).expect("schema should project");
 
         assert!(projected.fields().is_empty());
+    }
+
+    #[test]
+    fn duckdb_vector_sql_handles_empty_projection() {
+        let sql = duckdb_vector_sql(
+            "docs",
+            "body_embedding",
+            &[],
+            &[],
+            Some(10),
+            &DuckDBHnswOptions::default(),
+            "[1.0, 0.0]::FLOAT[2]",
+        )
+        .expect("SQL should build");
+
+        assert_eq!(
+            sql,
+            "SELECT 1 AS __spice_empty_projection_row FROM docs WHERE body_embedding IS NOT NULL ORDER BY array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) ASC LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn empty_projected_batch_preserves_row_count() {
+        let schema = Arc::new(Schema::empty());
+        let batch = empty_projected_batch(schema, 3).expect("batch should build");
+
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[test]
+    fn duckdb_filter_pushdown_rejects_score_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+        ]));
+        let filter = col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5));
+
+        assert_eq!(
+            duckdb_filter_pushdown(&schema, &filter),
+            TableProviderFilterPushDown::Unsupported
+        );
+    }
+
+    #[test]
+    fn duckdb_filter_pushdown_allows_base_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+        ]));
+        let filter = col("id").gt(lit(10_i64));
+
+        assert_eq!(
+            duckdb_filter_pushdown(&schema, &filter),
+            TableProviderFilterPushDown::Exact
+        );
+    }
+
+    #[test]
+    fn duckdb_filter_pushdown_rejects_mixed_score_filter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+        ]));
+        let filter = col("id")
+            .gt(lit(10_i64))
+            .and(col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5)));
+
+        assert_eq!(
+            duckdb_filter_pushdown(&schema, &filter),
+            TableProviderFilterPushDown::Unsupported
+        );
     }
 
     #[test]
