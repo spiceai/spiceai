@@ -86,7 +86,7 @@ pub struct Service {
 }
 
 impl Service {
-    /// Creates a new Service with pre-allocated channel map capacity
+    /// Creates a new Flight service using the shared data update broadcaster.
     #[must_use]
     pub fn new(
         basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,

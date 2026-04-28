@@ -1293,32 +1293,36 @@ impl DataFusion {
 
         let table_provider = self.get_table_provider(table_reference).await?;
 
-        verify_schema(
-            table_provider.schema().fields(),
-            data_update.schema.fields(),
-        )
-        .context(SchemaMismatchSnafu)?;
+        let DataUpdate {
+            schema: update_schema,
+            data: update_data,
+            update_type,
+        } = data_update;
+        let update_data = Arc::new(update_data);
 
-        let broadcast_update = self
-            .data_update_broadcaster
-            .has_subscribers(table_reference)
-            .await
-            .then(|| data_update.clone());
+        verify_schema(table_provider.schema().fields(), update_schema.fields())
+            .context(SchemaMismatchSnafu)?;
 
-        let overwrite = match data_update.update_type {
+        let overwrite = match &update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
             UpdateType::Changes => InsertOp::Replace,
         };
 
-        let streaming_update = StreamingDataUpdate::try_from(data_update)
-            .map_err(find_datafusion_root)
-            .context(UnableToCreateStreamingUpdateSnafu)?;
+        let insert_data = Arc::clone(&update_data);
+        let insert_stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                Arc::clone(&update_schema),
+                Box::pin(futures::stream::iter((0..insert_data.len()).map(
+                    move |batch_index| Ok::<_, DataFusionError>(insert_data[batch_index].clone()),
+                ))),
+            ),
+        );
 
         let insert_plan = table_provider
             .insert_into(
                 &self.ctx.state(),
-                Arc::new(StreamingDataUpdateExecutionPlan::new(streaming_update.data)),
+                Arc::new(StreamingDataUpdateExecutionPlan::new(insert_stream)),
                 overwrite,
             )
             .await
@@ -1349,9 +1353,21 @@ impl DataFusion {
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
-        if let Some(broadcast_update) = broadcast_update {
+        if self
+            .data_update_broadcaster
+            .has_subscribers(table_reference)
+            .await
+        {
+            let data = Arc::try_unwrap(update_data).unwrap_or_else(|data| data.as_ref().clone());
             self.data_update_broadcaster
-                .publish(table_reference, broadcast_update)
+                .publish(
+                    table_reference,
+                    DataUpdate {
+                        schema: update_schema,
+                        data,
+                        update_type,
+                    },
+                )
                 .await;
         }
 
@@ -1387,38 +1403,20 @@ impl DataFusion {
             UpdateType::Changes => InsertOp::Replace,
         };
 
-        let broadcast_batches = self
-            .data_update_broadcaster
-            .has_subscribers(table_reference)
-            .await
-            .then(|| Arc::new(ParkingMutex::new(StreamingBroadcastBuffer::default())));
-        let data = match broadcast_batches.as_ref() {
-            Some(batches) => {
-                let batches = Arc::clone(batches);
-                let table_reference = table_reference.to_string();
-                let stream = data.map(move |batch_result| {
-                    if let Ok(batch) = &batch_result {
-                        let mut batches = batches.lock();
-                        if batches.push(batch) {
-                            tracing::warn!(
-                                dataset = %table_reference,
-                                max_batches = MAX_STREAMING_BROADCAST_BATCHES,
-                                max_rows = MAX_STREAMING_BROADCAST_ROWS,
-                                "Disabling DoExchange broadcast for streaming write because buffered update exceeded limits"
-                            );
-                        }
-                    }
-                    batch_result
-                });
-                Box::pin(
-                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                        Arc::clone(&update_schema),
-                        Box::pin(stream),
-                    ),
-                )
+        let broadcast_batches = Arc::new(ParkingMutex::new(StreamingBroadcastBuffer::default()));
+        let batches = Arc::clone(&broadcast_batches);
+        let stream = data.map(move |batch_result| {
+            if let Ok(batch) = &batch_result {
+                batches.lock().push(batch);
             }
-            None => data,
-        };
+            batch_result
+        });
+        let data = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                Arc::clone(&update_schema),
+                Box::pin(stream),
+            ),
+        );
 
         let insert_plan = table_provider
             .insert_into(
@@ -1454,21 +1452,28 @@ impl DataFusion {
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
-        if let Some(batches) = broadcast_batches {
-            let broadcast_data = batches.lock().batches();
-
+        let broadcast_data = broadcast_batches.lock().batches();
+        if self
+            .data_update_broadcaster
+            .has_subscribers(table_reference)
+            .await
+        {
             if let Some(data) = broadcast_data {
-                let update = DataUpdate {
-                    schema: update_schema,
-                    data,
-                    update_type,
-                };
                 self.data_update_broadcaster
-                    .publish(table_reference, update)
+                    .publish(
+                        table_reference,
+                        DataUpdate {
+                            schema: update_schema,
+                            data,
+                            update_type,
+                        },
+                    )
                     .await;
             } else {
                 tracing::warn!(
                     dataset = %table_reference,
+                    max_batches = MAX_STREAMING_BROADCAST_BATCHES,
+                    max_rows = MAX_STREAMING_BROADCAST_ROWS,
                     "Skipped publishing streaming data update to DoExchange subscribers because the buffered update exceeded limits; subscribers can reconnect to receive a fresh snapshot"
                 );
             }
