@@ -71,9 +71,7 @@ jobs:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Set up cc
         uses: ./.github/actions/setup-cc
@@ -142,9 +140,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Set up make
         uses: ./.github/actions/setup-make
