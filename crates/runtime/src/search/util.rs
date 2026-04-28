@@ -90,7 +90,8 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
 pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
-    if let Some(accelerated_table) = tbl.as_any().downcast_ref::<AcceleratedTable>()
+    // `AcceleratedTable` is a concrete TableProvider underneath `FederatedTableProviderAdaptor`.
+    if let Some(accelerated_table) = find_concrete_table_provider::<AcceleratedTable>(tbl)
         && let Some(indexes) =
             find_index_in_table_provider::<T>(accelerated_table.get_accelerator_ref())
     {
