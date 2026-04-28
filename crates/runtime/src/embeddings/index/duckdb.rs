@@ -46,17 +46,12 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .description("Alias for distance_metric. One of: cosine | l2 | inner_product."),
     ParameterSpec::component("hnsw_m")
         .description("DuckDB VSS HNSW graph parameter m (links per node)."),
-    ParameterSpec::component("m").description("Alias for hnsw_m."),
     ParameterSpec::component("hnsw_ef_construction")
         .description("DuckDB VSS HNSW build parameter ef_construction."),
     ParameterSpec::component("ef_construction").description("Alias for hnsw_ef_construction."),
     ParameterSpec::component("hnsw_ef_search")
         .description("DuckDB VSS query-time ef_search setting."),
     ParameterSpec::component("ef_search").description("Alias for hnsw_ef_search."),
-    ParameterSpec::component("index_name")
-        .description("Optional DuckDB VSS index name to use for transient HNSW searches."),
-    ParameterSpec::component("install_vss")
-        .description("Whether Spice should run INSTALL vss before LOAD vss. Default: true."),
     ParameterSpec::component("partition_by")
         .description("Not yet supported for the DuckDB vector engine."),
     ParameterSpec::component("spill_writes")
@@ -223,13 +218,10 @@ fn normalized_duckdb_vector_param_name(key: &str) -> Option<&'static str> {
         "distance_metric" => Some("distance_metric"),
         "metric" => Some("metric"),
         "hnsw_m" => Some("hnsw_m"),
-        "m" => Some("m"),
         "hnsw_ef_construction" => Some("hnsw_ef_construction"),
         "ef_construction" => Some("ef_construction"),
         "hnsw_ef_search" => Some("hnsw_ef_search"),
         "ef_search" => Some("ef_search"),
-        "index_name" => Some("index_name"),
-        "install_vss" => Some("install_vss"),
         "partition_by" => Some("partition_by"),
         "spill_writes" => Some("spill_writes"),
         _ => None,
@@ -281,15 +273,11 @@ fn parse_hnsw_options(
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     }
 
-    options.hnsw_m = parse_u32_param(params, "hnsw_m")?.or(parse_u32_param(params, "m")?);
+    options.hnsw_m = parse_u32_param(params, "hnsw_m")?;
     options.hnsw_ef_construction = parse_u32_param(params, "hnsw_ef_construction")?
         .or(parse_u32_param(params, "ef_construction")?);
     options.hnsw_ef_search =
         parse_u32_param(params, "hnsw_ef_search")?.or(parse_u32_param(params, "ef_search")?);
-    options.index_name = string_from_params(params, "index_name").map(ToString::to_string);
-    if let Some(install_vss) = string_from_params(params, "install_vss") {
-        options.install_vss = parse_bool_param("install_vss", install_vss)?;
-    }
 
     Ok(options)
 }
@@ -314,20 +302,6 @@ fn parse_u32_param(
     s.parse::<u32>().map(Some).map_err(|e| {
         format!("Invalid value for DuckDB vector parameter '{key}': '{s}': {e}").into()
     })
-}
-
-fn parse_bool_param(
-    key: &str,
-    value: &str,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        _ => Err(format!(
-            "Invalid value for DuckDB vector parameter '{key}': '{value}'. Expected true or false."
-        )
-        .into()),
-    }
 }
 
 fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
@@ -382,11 +356,9 @@ mod tests {
     async fn parse_hnsw_options_accepts_aliases() {
         let params = duckdb_params(&[
             ("duckdb_metric", "ip"),
-            ("duckdb_m", "16"),
+            ("duckdb_hnsw_m", "16"),
             ("duckdb_ef_construction", "64"),
             ("duckdb_ef_search", "20"),
-            ("duckdb_index_name", "custom_idx"),
-            ("duckdb_install_vss", "false"),
         ])
         .await;
 
@@ -396,8 +368,6 @@ mod tests {
         assert_eq!(options.hnsw_m, Some(16));
         assert_eq!(options.hnsw_ef_construction, Some(64));
         assert_eq!(options.hnsw_ef_search, Some(20));
-        assert_eq!(options.index_name.as_deref(), Some("custom_idx"));
-        assert!(!options.install_vss);
     }
 
     #[tokio::test]
@@ -406,7 +376,6 @@ mod tests {
             ("duckdb_distance_metric", "l2"),
             ("duckdb_metric", "inner_product"),
             ("duckdb_hnsw_m", "32"),
-            ("duckdb_m", "16"),
             ("duckdb_hnsw_ef_construction", "128"),
             ("duckdb_ef_construction", "64"),
             ("duckdb_hnsw_ef_search", "40"),
@@ -423,19 +392,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_hnsw_options_rejects_invalid_numeric_and_bool_values() {
+    async fn parse_hnsw_options_rejects_invalid_numeric_values() {
         let params = duckdb_params(&[("duckdb_hnsw_m", "large")]).await;
         let err = parse_hnsw_options(&params).expect_err("invalid hnsw_m should be rejected");
         assert!(
             err.to_string()
                 .contains("Invalid value for DuckDB vector parameter 'hnsw_m'")
-        );
-
-        let params = duckdb_params(&[("duckdb_install_vss", "sometimes")]).await;
-        let err = parse_hnsw_options(&params).expect_err("invalid install_vss should be rejected");
-        assert!(
-            err.to_string()
-                .contains("Invalid value for DuckDB vector parameter 'install_vss'")
         );
     }
 

@@ -124,38 +124,32 @@ impl TryFrom<&str> for DuckDBDistanceMetric {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuckDBHnswOptions {
     pub metric: DuckDBDistanceMetric,
-    pub index_name: Option<String>,
     pub hnsw_m: Option<u32>,
     pub hnsw_ef_construction: Option<u32>,
     pub hnsw_ef_search: Option<u32>,
-    pub install_vss: bool,
 }
 
 impl Default for DuckDBHnswOptions {
     fn default() -> Self {
         Self {
             metric: DuckDBDistanceMetric::Cosine,
-            index_name: None,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
-            install_vss: true,
         }
     }
 }
 
 impl DuckDBHnswOptions {
     #[must_use]
-    pub fn index_name_for(&self, table_name: &str, embedding_column: &str) -> String {
-        self.index_name.clone().unwrap_or_else(|| {
-            let mut raw = format!("__spice_vss_{table_name}_{embedding_column}");
-            raw.retain(|c| c.is_ascii_alphanumeric() || c == '_');
-            if raw.is_empty() {
-                "__spice_vss_index".to_string()
-            } else {
-                raw
-            }
-        })
+    pub fn index_name_for(table_name: &str, embedding_column: &str) -> String {
+        let mut raw = format!("__spice_vss_{table_name}_{embedding_column}");
+        raw.retain(|c| c.is_ascii_alphanumeric() || c == '_');
+        if raw.is_empty() {
+            "__spice_vss_index".to_string()
+        } else {
+            raw
+        }
     }
 
     #[must_use]
@@ -584,10 +578,8 @@ fn run_duckdb_vector_query(
     let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_execution_error)?;
     let conn = &duckdb_conn.conn;
 
-    if exec.hnsw.install_vss {
-        conn.execute("INSTALL vss", [])
-            .map_err(to_execution_error)?;
-    }
+    conn.execute("INSTALL vss", [])
+        .map_err(to_execution_error)?;
     conn.execute("LOAD vss", []).map_err(to_execution_error)?;
     if let Some(ef_search) = exec.hnsw.hnsw_ef_search {
         conn.execute(&format!("SET hnsw_ef_search = {ef_search}"), [])
@@ -597,7 +589,7 @@ fn run_duckdb_vector_query(
     let table_name = resolve_current_table_name(&context.table_definition, conn)?;
     let index_name = format!(
         "{}_{}",
-        exec.hnsw.index_name_for(&table_name, &exec.embedded_column),
+        DuckDBHnswOptions::index_name_for(&table_name, &exec.embedded_column),
         NEXT_TRANSIENT_INDEX_ID.fetch_add(1, Ordering::Relaxed)
     );
     let drop_index_sql = format!("DROP INDEX IF EXISTS {}", quote_identifier(&index_name));
@@ -940,8 +932,6 @@ mod tests {
             hnsw_m: Some(24),
             hnsw_ef_construction: Some(96),
             hnsw_ef_search: Some(40),
-            index_name: Some("idx_docs_embedding".to_string()),
-            install_vss: true,
         };
 
         assert_eq!(
