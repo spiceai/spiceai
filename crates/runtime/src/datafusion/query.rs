@@ -960,8 +960,8 @@ impl Query {
         };
 
         let plan = match self.sql {
-            QueryMethod::Plan(ref plan) => plan.clone(),
-            QueryMethod::Text {
+            QueryMethod::Plan(ref plan)
+            | QueryMethod::Text {
                 pre_parsed_plan: Some(ref plan),
                 ..
             } => plan.clone(),
