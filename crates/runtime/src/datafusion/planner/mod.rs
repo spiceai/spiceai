@@ -233,6 +233,9 @@ async fn plan_distributed_dml(
         WriteOp::Ctas => Err(DataFusionError::Internal(
             "CTAS should not reach DML planner".to_string(),
         )),
+        WriteOp::Truncate => Err(DataFusionError::Internal(
+            "TRUNCATE should not reach DML planner".to_string(),
+        )),
     }
 }
 
