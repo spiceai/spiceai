@@ -117,6 +117,7 @@ impl Query {
         parameters: Option<ParamValues>,
         tracker: Option<QueryTracker>,
         read_only: bool,
+        pre_parsed_plan: Option<Box<LogicalPlan>>,
     ) -> super::Result<PlanOrCached> {
         let cache_control = request_context.cache_control();
         let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
@@ -160,18 +161,25 @@ impl Query {
         };
 
         let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(df));
-        let plan = match Self::get_plan(df, session, sql, &sql_raw_cache_key, parameters).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                if let super::Error::UnableToExecuteQuery { source } = e {
-                    let code = ErrorCode::from(&source);
-                    let snafu_err = super::Error::UnableToExecuteQuery { source };
-                    if let Some(t) = tracker {
-                        t.finish_with_error(&request_context, snafu_err.to_string(), code);
+        let plan: Box<LogicalPlan> = if let Some(plan) = pre_parsed_plan {
+            // Reuse the pre-parsed plan to avoid re-parsing. Parameters are
+            // already bound — check_read_only_sql calls with_param_values before
+            // returning the plan, matching what get_plan does below.
+            plan
+        } else {
+            match Self::get_plan(df, session, sql, &sql_raw_cache_key, parameters).await {
+                Ok(plan) => Box::new(plan),
+                Err(e) => {
+                    if let super::Error::UnableToExecuteQuery { source } = e {
+                        let code = ErrorCode::from(&source);
+                        let snafu_err = super::Error::UnableToExecuteQuery { source };
+                        if let Some(t) = tracker {
+                            t.finish_with_error(&request_context, snafu_err.to_string(), code);
+                        }
+                        return Err(snafu_err);
                     }
-                    return Err(snafu_err);
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
 
@@ -224,7 +232,7 @@ impl Query {
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(
-            Box::new(plan),
+            plan,
             tracker,
             RequestCacheManager::new(cache_status, request_raw_cache_key),
         ))

@@ -356,7 +356,13 @@ pub(crate) async fn do_get(
 
     // Use the standard flow with the (possibly rewritten) SQL
     // Ensure the query execution happens within the request context scope
-    let read_only = super::super::is_auth_read_only(&context);
+    let pre_parsed_plan = super::super::check_read_only_sql(
+        &context,
+        &datafusion,
+        &sql_to_execute,
+        param_values.as_ref(),
+    )
+    .await?;
     let context_clone = Arc::clone(&context);
     let (output, from_cache) = context_clone
         .scope(async {
@@ -364,7 +370,7 @@ pub(crate) async fn do_get(
                 datafusion,
                 &sql_to_execute,
                 param_values,
-                read_only,
+                pre_parsed_plan,
             ))
             .await
         })

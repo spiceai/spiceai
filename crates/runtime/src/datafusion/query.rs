@@ -169,6 +169,8 @@ impl Error {
 }
 
 pub enum QueryMethod {
+    /// A pre-parsed logical plan with no associated SQL. The cache key is
+    /// derived from the plan hash. Used by [`Query::from_logical_plan`].
     Plan(Box<LogicalPlan>),
     Text {
         sql: Arc<str>,
@@ -176,6 +178,11 @@ pub enum QueryMethod {
 
         /// An optional allowlist of tables that can be accessed by this query. When [`Option::is_some`], no SQL results caching is performed. [`LogicalPlan`] caching can still occur (since allowlisting is done post-plan).
         table_allowlist: Option<ResolvedTableAwareAllowlist>,
+
+        /// A pre-parsed logical plan to use instead of re-parsing `sql`.
+        /// The SQL string is still used for results-cache key computation so
+        /// cached entries are shared with equivalent plain `Text` executions.
+        pre_parsed_plan: Option<Box<LogicalPlan>>,
     },
 }
 
@@ -314,7 +321,10 @@ impl Query {
         // Get logical plan and cache key, reusing existing cache infrastructure
         let (plan, mut tracker, cache_key) = match &self.sql {
             QueryMethod::Text {
-                sql, parameters, ..
+                sql,
+                parameters,
+                pre_parsed_plan,
+                ..
             } => {
                 // Use the existing get_plan_or_cached which handles all cache control,
                 // stale-while-revalidate, and query tracking. `read_only` is
@@ -328,6 +338,7 @@ impl Query {
                     parameters.clone(),
                     tracker,
                     self.read_only,
+                    pre_parsed_plan.clone(),
                 )
                 .await?
                 {
@@ -548,34 +559,39 @@ impl Query {
                         sql,
                         parameters,
                         table_allowlist: Some(allowlist),
+                        pre_parsed_plan,
                     } => {
                         let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
                             .as_raw_key(Query::plan_hasher(&ctx.df));
-                        let plan = match Self::get_plan(
-                            &ctx.df,
-                            &session,
-                            sql,
-                            &raw_cache_key,
-                            parameters.clone(),
-                        )
-                        .await
-                        {
-                            Ok(plan) => plan,
-                            Err(e) => match e {
-                                Error::UnableToExecuteQuery { source } => {
-                                    let code = ErrorCode::from(&source);
-                                    let snafu_err = Error::UnableToExecuteQuery { source };
-                                    if let Some(t) = tracker {
-                                        t.finish_with_error(
-                                            &request_context,
-                                            snafu_err.to_string(),
-                                            code,
-                                        );
+                        let plan = if let Some(plan) = pre_parsed_plan {
+                            plan.clone()
+                        } else {
+                            match Self::get_plan(
+                                &ctx.df,
+                                &session,
+                                sql,
+                                &raw_cache_key,
+                                parameters.clone(),
+                            )
+                            .await
+                            {
+                                Ok(plan) => Box::new(plan),
+                                Err(e) => match e {
+                                    Error::UnableToExecuteQuery { source } => {
+                                        let code = ErrorCode::from(&source);
+                                        let snafu_err = Error::UnableToExecuteQuery { source };
+                                        if let Some(t) = tracker {
+                                            t.finish_with_error(
+                                                &request_context,
+                                                snafu_err.to_string(),
+                                                code,
+                                            );
+                                        }
+                                        return Err(snafu_err);
                                     }
-                                    return Err(snafu_err);
-                                }
-                                _ => return Err(e),
-                            },
+                                    _ => return Err(e),
+                                },
+                            }
                         };
                         let tables_referenced = plan.as_table_refs();
                         if let Some(disallowed_table) = tables_referenced
@@ -588,7 +604,7 @@ impl Query {
                         }
 
                         (
-                            Box::new(plan),
+                            plan,
                             tracker,
                             RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
                         )
@@ -597,6 +613,7 @@ impl Query {
                         sql,
                         parameters,
                         table_allowlist: None,
+                        pre_parsed_plan,
                     } => {
                         match Self::get_plan_or_cached(
                             &ctx.df,
@@ -606,6 +623,7 @@ impl Query {
                             parameters.clone(),
                             tracker,
                             ctx.read_only,
+                            pre_parsed_plan.clone(),
                         )
                         .await?
                         {
@@ -943,6 +961,10 @@ impl Query {
 
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
+            QueryMethod::Text {
+                pre_parsed_plan: Some(ref plan),
+                ..
+            } => plan.clone(),
             QueryMethod::Text { ref sql, .. } => {
                 match self.df.create_logical_plan(&session, sql).await {
                     Ok(plan) => Box::new(plan),
