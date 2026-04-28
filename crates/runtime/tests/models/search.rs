@@ -46,7 +46,6 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Instant;
-use vortex::array::normalize;
 
 use super::{get_tpcds_dataset, sort_json_keys};
 
