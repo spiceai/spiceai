@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -22,23 +22,11 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "qs",
       "matches": {
         "question": [
-          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+          "\\((-6) \\div (-2)\\)"
         ]
       },
       "primary_key": {
-        "id": 361
-      }
-    },
-    {
-      "_score": "0.01",
-      "dataset": "qs",
-      "matches": {
-        "question": [
-          "How many groups of 2 are in 14?"
-        ]
-      },
-      "primary_key": {
-        "id": 462
+        "id": 1324
       }
     },
     {
@@ -51,6 +39,18 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "id": 349
+      }
+    },
+    {
+      "_score": "0.01",
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "Yasenia is 3 years older than Xavier. How old is Yasenia when Xavier is 18 years old?"
+        ]
+      },
+      "primary_key": {
+        "id": 1323
       }
     }
   ]
