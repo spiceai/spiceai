@@ -124,9 +124,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -197,9 +195,7 @@ jobs:
           sudo apt-get install build-essential libssl-dev pkg-config cmake unzip -y
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -269,9 +265,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
