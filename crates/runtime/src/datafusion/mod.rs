@@ -131,6 +131,7 @@ pub mod schema;
 pub mod secrets_context_extension;
 pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
+pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
 

@@ -17,7 +17,8 @@ limitations under the License.
 use catalog::SpiceToolCatalog;
 use factory::default_catalog_names;
 use std::{borrow::Cow, sync::Arc};
-use tools::{SpiceModelTool, rename::with_name};
+pub use tools::SpiceModelTool;
+use tools::rename::with_name;
 
 pub mod builtin;
 pub mod catalog;

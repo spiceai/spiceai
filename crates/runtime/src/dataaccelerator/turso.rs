@@ -661,7 +661,7 @@ impl DataAccelerator for TursoAccelerator {
 
         let turso_provider = Arc::new(
             TursoTableProvider::new(schema, table_name, pool)
-                .with_function_support(deny_spice_specific_functions().clone()),
+                .with_function_support(deny_spice_specific_functions()),
         );
 
         // Wrap in PolyTableProvider for proper read/write separation
