@@ -37,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Check new commits since latest nightly build
@@ -69,6 +70,8 @@ jobs:
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Set Nightly REL_VERSION from current timestamp
         run: python3 ./.github/scripts/get_release_version.py
@@ -98,6 +101,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Add nightly postfix to version in Cargo.toml
         env:
@@ -169,6 +174,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Add nightly postfix to version in Cargo.toml
         env:
@@ -240,6 +247,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Add nightly postfix to version in Cargo.toml
         env:
@@ -310,6 +319,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Download spiced binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -374,6 +385,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Download spiced binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -420,6 +433,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       # Download Docker image artifacts
