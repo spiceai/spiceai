@@ -273,7 +273,9 @@ async fn initial_snapshot_stream(
         .map_err(|source| Status::internal(format!("Unable to read initial snapshot: {source}")))?;
 
     df.execute_stream().await.map_err(|source| {
-        Status::internal(format!("Unable to execute initial snapshot stream: {source}"))
+        Status::internal(format!(
+            "Unable to execute initial snapshot stream: {source}"
+        ))
     })
 }
 
@@ -313,10 +315,8 @@ fn record_batch_to_change_batch(
 fn truncate_change_batch(schema: &SchemaRef) -> Result<RecordBatch, Status> {
     let change_schema = Arc::new(changes_schema(schema.as_ref()));
     let op_array = StringArray::from(vec!["t"]);
-    let primary_keys_array = ListArray::new_null(
-        Arc::new(Field::new("item", DataType::Utf8, false)),
-        1,
-    );
+    let primary_keys_array =
+        ListArray::new_null(Arc::new(Field::new("item", DataType::Utf8, false)), 1);
     let data_array = new_null_array(&DataType::Struct(schema.fields().clone()), 1);
 
     RecordBatch::try_new(
