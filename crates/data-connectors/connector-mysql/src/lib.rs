@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
+use datafusion_table_providers::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
 use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError, dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
@@ -127,6 +128,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("time_zone")
         .description("The time zone to use for the connection. Default is '+00:00' (UTC).")
         .help_link(MYSQL_DOCS),
+    ParameterSpec::component("zero_date_behavior")
+        .description(
+            "How to handle the MySQL '0000-00-00' / '0000-00-00 00:00:00' zero-date sentinel for DATE/DATETIME/TIMESTAMP columns. \
+             'null' (default) coerces zero dates to NULL and reports such columns as nullable in the Arrow schema. \
+             'error' fails the scan when a zero date is encountered and honors the source NOT NULL constraint exactly.",
+        )
+        .default("null")
+        .one_of_ignore_ascii_case(&["null", "error"])
+        .help_link(MYSQL_DOCS),
 ];
 
 // https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs#L1053
@@ -179,6 +189,19 @@ impl DataConnectorFactory for MySQLFactory {
                 );
             }
 
+            let zero_date_behavior = match params
+                .parameters
+                .get("zero_date_behavior")
+                .ok()
+                .map(|s| s.expose_secret().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("error") => MysqlZeroDateBehavior::Error,
+                // `one_of_ignore_ascii_case` validation has already rejected anything other
+                // than "null" / "error"; default + any other value falls through to Null.
+                _ => MysqlZeroDateBehavior::Null,
+            };
+
             if let Some(time_zone) = params.parameters.get("time_zone").expose().ok() {
                 // "LOCAL_SYSTEM" value must be replaced with the actual system time zone information.
                 if time_zone.to_uppercase() == "LOCAL_SYSTEM" {
@@ -199,7 +222,7 @@ impl DataConnectorFactory for MySQLFactory {
             }
 
             let pool = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
-                Ok(pool) => Arc::new(pool),
+                Ok(pool) => Arc::new(pool.with_zero_date_behavior(zero_date_behavior)),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword => {
                         return Err(
