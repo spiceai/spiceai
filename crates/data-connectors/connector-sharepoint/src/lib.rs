@@ -236,7 +236,9 @@ impl Sharepoint {
                         connector_component: ConnectorComponent::from(dataset),
                         source: Box::new(std::io::Error::new(
                             std::io::ErrorKind::AlreadyExists,
-                            format!("registry key '{key_url}' already taken with a different fingerprint"),
+                            format!(
+                                "registry key '{key_url}' already taken with a different fingerprint"
+                            ),
                         )),
                     });
                 }
@@ -353,17 +355,16 @@ fn store_fingerprint(
     // Use the effective scope — same default applied by SharepointAuth — so
     // a dataset with no scope param and one explicitly setting the default
     // scope hash identically and are not rejected as a false-positive collision.
-    let effective_scope = params
-        .get("scope")
-        .expose()
-        .ok()
-        .map_or(data_components::sharepoint::auth::DEFAULT_SCOPE, |s| {
+    let effective_scope = params.get("scope").expose().ok().map_or(
+        data_components::sharepoint::auth::DEFAULT_SCOPE,
+        |s| {
             if s.is_empty() {
                 data_components::sharepoint::auth::DEFAULT_SCOPE
             } else {
                 s
             }
-        });
+        },
+    );
     effective_scope.hash(&mut h);
     drive_kind.map(|k| format!("{k:?}")).hash(&mut h);
     config.conflict_behavior.hash(&mut h);
