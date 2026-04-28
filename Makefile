@@ -251,6 +251,14 @@ display-deps:
 ################################################################################
 # Target: install                                                              #
 ################################################################################
+# Honour CARGO_TARGET_DIR if set (e.g. for custom build directories / sccache setups),
+# otherwise fall back to the default Cargo output directory.
+ifdef CARGO_TARGET_DIR
+	TARGET_DIR := $(CARGO_TARGET_DIR)
+else
+	TARGET_DIR := target
+endif
+
 # Default install includes models. Use -data suffix variants to build without models.
 # Data-only features (default features minus models)
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
@@ -259,14 +267,14 @@ SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,de
 .PHONY: install
 install: build
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
-	install -m 755 target/release/spiced ~/.spice/bin/spiced
+	install -m 755 $(TARGET_DIR)/release/spice ~/.spice/bin/spice
+	install -m 755 $(TARGET_DIR)/release/spiced ~/.spice/bin/spiced
 
 .PHONY: install-dev
 install-dev: build-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/spice ~/.spice/bin/spice
-	install -m 755 target/debug/spiced ~/.spice/bin/spiced
+	install -m 755 $(TARGET_DIR)/debug/spice ~/.spice/bin/spice
+	install -m 755 $(TARGET_DIR)/debug/spiced ~/.spice/bin/spiced
 
 # Data-only variants (without models)
 .PHONY: install-data-only
@@ -327,47 +335,47 @@ install-build:
 .PHONY: install-testoperator-dev
 install-testoperator-dev: build-testoperator-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/testoperator ~/.spice/bin/testoperator
+	install -m 755 $(TARGET_DIR)/debug/testoperator ~/.spice/bin/testoperator
 
 .PHONY: install-testoperator
 install-testoperator: build-testoperator
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
+	install -m 755 $(TARGET_DIR)/release/testoperator ~/.spice/bin/testoperator
 
 .PHONY: install-spidapter-dev
 install-spidapter-dev: build-spidapter-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/spidapter ~/.spice/bin/spidapter
+	install -m 755 $(TARGET_DIR)/debug/spidapter ~/.spice/bin/spidapter
 
 .PHONY: install-spidapter
 install-spidapter: build-spidapter
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spidapter ~/.spice/bin/spidapter
+	install -m 755 $(TARGET_DIR)/release/spidapter ~/.spice/bin/spidapter
 
 .PHONY: install-cayenne-flightsql-dev
 install-cayenne-flightsql-dev: build-cayenne-flightsql-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
+	install -m 755 $(TARGET_DIR)/debug/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
 
 .PHONY: install-cayenne-flightsql
 install-cayenne-flightsql: build-cayenne-flightsql
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
+	install -m 755 $(TARGET_DIR)/release/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
 
 .PHONY: install-cli
 install-cli: build-cli
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 $(TARGET_DIR)/release/spice ~/.spice/bin/spice
 
 .PHONY: install-runtime
 install-runtime: build-runtime
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spiced ~/.spice/bin/spiced
+	install -m 755 $(TARGET_DIR)/release/spiced ~/.spice/bin/spiced
 
 .PHONY: install-cli-dev
 install-cli-dev: build-cli-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/spice ~/.spice/bin/spice
+	install -m 755 $(TARGET_DIR)/debug/spice ~/.spice/bin/spice
 
 ################################################################################
 # Target: distributed                                                          #
