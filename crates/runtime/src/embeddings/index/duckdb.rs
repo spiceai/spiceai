@@ -48,7 +48,6 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .description("DuckDB VSS HNSW graph parameter m (links per node)."),
     ParameterSpec::component("hnsw_ef_construction")
         .description("DuckDB VSS HNSW build parameter ef_construction."),
-    ParameterSpec::component("ef_construction").description("Alias for hnsw_ef_construction."),
     ParameterSpec::component("hnsw_ef_search")
         .description("DuckDB VSS query-time ef_search setting."),
     ParameterSpec::component("partition_by")
@@ -218,7 +217,6 @@ fn normalized_duckdb_vector_param_name(key: &str) -> Option<&'static str> {
         "metric" => Some("metric"),
         "hnsw_m" => Some("hnsw_m"),
         "hnsw_ef_construction" => Some("hnsw_ef_construction"),
-        "ef_construction" => Some("ef_construction"),
         "hnsw_ef_search" => Some("hnsw_ef_search"),
         "partition_by" => Some("partition_by"),
         "spill_writes" => Some("spill_writes"),
@@ -272,8 +270,7 @@ fn parse_hnsw_options(
     }
 
     options.hnsw_m = parse_u32_param(params, "hnsw_m")?;
-    options.hnsw_ef_construction = parse_u32_param(params, "hnsw_ef_construction")?
-        .or(parse_u32_param(params, "ef_construction")?);
+    options.hnsw_ef_construction = parse_u32_param(params, "hnsw_ef_construction")?;
     options.hnsw_ef_search = parse_u32_param(params, "hnsw_ef_search")?;
 
     Ok(options)
@@ -354,7 +351,7 @@ mod tests {
         let params = duckdb_params(&[
             ("duckdb_metric", "ip"),
             ("duckdb_hnsw_m", "16"),
-            ("duckdb_ef_construction", "64"),
+            ("duckdb_hnsw_ef_construction", "64"),
             ("duckdb_hnsw_ef_search", "20"),
         ])
         .await;
@@ -374,7 +371,6 @@ mod tests {
             ("duckdb_metric", "inner_product"),
             ("duckdb_hnsw_m", "32"),
             ("duckdb_hnsw_ef_construction", "128"),
-            ("duckdb_ef_construction", "64"),
             ("duckdb_hnsw_ef_search", "40"),
         ])
         .await;
