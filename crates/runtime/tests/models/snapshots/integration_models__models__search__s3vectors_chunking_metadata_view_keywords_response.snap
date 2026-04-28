@@ -14,15 +14,15 @@ expression: "normalize_search_response(resp, round_scores)"
         ]
       },
       "primary_key": {
-         "id": 1277
-       }
-     },
-     {
-      "_score": "0.53",
-       "dataset": "qs_view",
-       "matches": {
-         "answer": [
-           " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
+        "id": 1277
+      }
+    },
+    {
+      "_score": "0.54",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
         ]
       },
       "primary_key": {
@@ -38,15 +38,15 @@ expression: "normalize_search_response(resp, round_scores)"
         ]
       },
       "primary_key": {
-         "id": 450
-       }
-     },
-     {
-      "_score": "0.51",
-       "dataset": "qs_view",
-       "matches": {
-         "answer": [
-           "Since there are 50 equal numbers, each number is equal to \\("
+        "id": 450
+      }
+    },
+    {
+      "_score": "0.52",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "Since there are 50 equal numbers, each number is equal to \\("
         ]
       },
       "primary_key": {

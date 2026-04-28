@@ -1,57 +1,57 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
- {
-   "duration_ms": "duration_ms_val",
-   "results": [
-     {
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
       "_score": "0.01",
-       "dataset": "qs",
-       "matches": {
-         "question": [
-           "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
-         ]
-       },
-       "primary_key": {
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
+      },
+      "primary_key": {
         "id": 361
       }
     },
     {
-       "_score": "0.01",
-       "dataset": "qs",
-       "matches": {
-         "question": [
+      "_score": "0.01",
+      "dataset": "qs",
+      "matches": {
+        "question": [
           "\\((-6) \\div (-2)\\)"
-         ]
-       },
-       "primary_key": {
+        ]
+      },
+      "primary_key": {
         "id": 1324
-       }
-     },
-     {
-       "_score": "0.01",
-       "dataset": "qs",
-       "matches": {
-         "question": [
+      }
+    },
+    {
+      "_score": "0.01",
+      "dataset": "qs",
+      "matches": {
+        "question": [
           "Yasenia is 3 years older than Xavier. How old is Yasenia when Xavier is 18 years old?"
-         ]
-       },
-       "primary_key": {
+        ]
+      },
+      "primary_key": {
         "id": 1323
-       }
-     },
-     {
-       "_score": "0.01",
-       "dataset": "qs",
-       "matches": {
-         "question": [
+      }
+    },
+    {
+      "_score": "0.01",
+      "dataset": "qs",
+      "matches": {
+        "question": [
           "\\((-9) \\div (-3)\\)"
-         ]
-       },
-       "primary_key": {
+        ]
+      },
+      "primary_key": {
         "id": 1325
-       }
-     }
-   ]
- }
+      }
+    }
+  ]
+}
