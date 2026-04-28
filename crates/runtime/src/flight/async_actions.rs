@@ -257,10 +257,9 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     // write operations before submitting to the background job executor.
     if read_only {
         let datafusion = get_current_datafusion(&context);
+        let session = datafusion.ctx.state();
         let plan = datafusion
-            .ctx
-            .state()
-            .create_logical_plan(&request.sql)
+            .create_logical_plan(&session, &request.sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("Failed to parse SQL: {e}")))?;
         if let Err(e) = validate_sql_query_read_only(&plan) {
