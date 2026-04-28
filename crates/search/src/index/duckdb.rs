@@ -553,6 +553,8 @@ fn run_duckdb_vector_query(
 
     install_vss_once(conn)?;
     conn.execute("LOAD vss", []).map_err(to_execution_error)?;
+    conn.execute("SET hnsw_enable_experimental_persistence = true", [])
+        .map_err(to_execution_error)?;
     match exec.hnsw.hnsw_ef_search {
         Some(ef_search) => conn
             .execute(&format!("SET hnsw_ef_search = {ef_search}"), [])
@@ -599,7 +601,10 @@ fn run_duckdb_vector_query(
                 })
                 .collect()
         } else {
-            Ok(batches)
+            batches
+                .into_iter()
+                .map(normalize_fixed_size_list_field_names)
+                .collect()
         }
     })();
 
@@ -959,6 +964,47 @@ fn create_embedding_array(
     }
 
     Ok(Arc::new(builder.finish()))
+}
+
+/// Re-cast a batch's schema to match `target_schema`.
+///
+/// DuckDB serializes `FLOAT[N]` columns with an empty inner field name (`field: ''`),
+/// whereas Arrow conventionally uses `"item"`. This restores the `"item"` name on any
+/// `FixedSizeList` column whose inner field came back with an empty name.
+fn normalize_fixed_size_list_field_names(batch: RecordBatch) -> DataFusionResult<RecordBatch> {
+    let schema = batch.schema();
+    let needs_fix = schema.fields().iter().any(
+        |f| matches!(f.data_type(), DataType::FixedSizeList(inner, _) if inner.name().is_empty()),
+    );
+    if !needs_fix {
+        return Ok(batch);
+    }
+
+    let new_fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::FixedSizeList(inner, size) if inner.name().is_empty() => {
+                let fixed_inner = Arc::new(Field::new(
+                    "item",
+                    inner.data_type().clone(),
+                    inner.is_nullable(),
+                ));
+                Arc::new(Field::new(
+                    f.name(),
+                    DataType::FixedSizeList(fixed_inner, *size),
+                    f.is_nullable(),
+                ))
+            }
+            _ => Arc::clone(f),
+        })
+        .collect();
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, batch.columns().to_vec())
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 fn to_execution_error(error: impl std::fmt::Display) -> DataFusionError {

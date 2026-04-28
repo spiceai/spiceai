@@ -474,7 +474,8 @@ fn duckdb_embedding_columns(dataset: &Dataset) -> Vec<(String, ColumnLevelEmbedd
         .collect::<Vec<_>>();
 
     for column in &dataset.columns {
-        let Some(embedding) = column.embeddings.first() else {
+        // Must be `last()` to mimic what model `EmbeddingTable`'s HashMap ends up with.
+        let Some(embedding) = column.embeddings.last() else {
             continue;
         };
 
