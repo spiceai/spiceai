@@ -172,14 +172,23 @@ async fn wrap_table_as_index_duckdb(
         )
         .await?;
 
-        let idx = Arc::new(vector_index);
-        let vector_index = Arc::clone(&idx) as Arc<dyn search::index::VectorIndex>;
-
+        let primary_key = vector_index
+            .primary_key
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let vector_index_list = vector_index
+            .empty_embedding_table_plan()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
         provider.underlying = Arc::new(
-            search::index::VectorScanTableProvider::try_new(provider.underlying, &vector_index)
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+            search::index::VectorScanTableProvider::new_from_vector_index_list(
+                provider.underlying,
+                primary_key,
+                vector_index_list,
+            ),
         ) as Arc<dyn TableProvider>;
-        provider = provider.add_index(Arc::clone(&idx) as Arc<dyn runtime_datafusion_index::Index>);
+        provider =
+            provider.add_index(Arc::new(vector_index) as Arc<dyn runtime_datafusion_index::Index>);
     }
 
     tracing::info!(

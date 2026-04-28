@@ -51,19 +51,32 @@ pub struct VectorScanTableProvider {
 }
 
 impl VectorScanTableProvider {
+    #[must_use]
+    pub fn new_from_vector_index_list(
+        table_provider: Arc<dyn TableProvider>,
+        primary_key: Vec<String>,
+        vector_index_list: LogicalPlan,
+    ) -> Self {
+        Self {
+            table_provider,
+            primary_key,
+            vector_index_list: vector_index_list.into(),
+        }
+    }
+
     pub fn try_new(
         table_provider: Arc<dyn TableProvider>,
         index: &Arc<dyn VectorIndex>,
     ) -> Result<Self, DataFusionError> {
-        Ok(Self {
+        Ok(Self::new_from_vector_index_list(
             table_provider,
-            primary_key: index
+            index
                 .primary_fields()
                 .iter()
                 .map(|f| f.name().clone())
                 .collect(),
-            vector_index_list: index.list_table_provider()?.into(),
-        })
+            index.list_table_provider()?,
+        ))
     }
 
     fn schema_is_sufficient(

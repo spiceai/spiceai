@@ -253,7 +253,20 @@ impl DuckDBVectorIndex {
         )))
     }
 
-    fn list_result_schema(&self) -> Result<SchemaRef, DataFusionError> {
+    pub fn empty_embedding_table_plan(&self) -> Result<LogicalPlan, DataFusionError> {
+        let schema = self.embedding_table_schema()?;
+        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let mem_table = datafusion::catalog::MemTable::try_new(schema, vec![vec![empty_batch]])?;
+
+        LogicalPlanBuilder::scan(
+            "tbl",
+            Arc::new(DefaultTableSource::new(Arc::new(mem_table))),
+            None,
+        )?
+        .build()
+    }
+
+    fn embedding_table_schema(&self) -> Result<SchemaRef, DataFusionError> {
         let mut fields = self
             .primary_key
             .iter()
@@ -326,16 +339,11 @@ impl SearchIndex for DuckDBVectorIndex {
 
 impl VectorIndex for DuckDBVectorIndex {
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
-        let schema = self.list_result_schema()?;
-        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
-        let mem_table = datafusion::catalog::MemTable::try_new(schema, vec![vec![empty_batch]])?;
-
-        LogicalPlanBuilder::scan(
-            "tbl",
-            Arc::new(DefaultTableSource::new(Arc::new(mem_table))),
-            None,
-        )?
-        .build()
+        Err(DataFusionError::NotImplemented(
+            "DuckDBVectorIndex does not maintain a separate vector store — \
+             embeddings are written into the DuckDB-accelerated table directly"
+                .to_string(),
+        ))
     }
 
     fn dimension(&self) -> i32 {
