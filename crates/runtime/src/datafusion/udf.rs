@@ -188,7 +188,7 @@ static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(
 });
 
 /// DuckDB-specific deny list — same as the default but allows `cosine_distance`
-/// (DuckDB natively supports it via `array_cosine_distance` and the dialect
+/// (`DuckDB` natively supports it via `array_cosine_distance` and the dialect
 /// already translates the call).
 static DENY_SPICE_FUNCTIONS_DUCKDB: LazyLock<FunctionSupport> = LazyLock::new(|| {
     let names: Vec<String> = denied_spice_function_names()
@@ -204,10 +204,10 @@ pub fn deny_spice_specific_functions() -> &'static FunctionSupport {
     &DENY_SPICE_SPECIFIC_FUNCTIONS
 }
 
-/// Return the cached [`FunctionSupport`] for DuckDB accelerators.
+/// Return the cached [`FunctionSupport`] for `DuckDB` accelerators.
 ///
 /// Identical to [`deny_spice_specific_functions`] except `cosine_distance` is
-/// allowed (DuckDB translates it to `array_cosine_distance`).
+/// allowed (`DuckDB` translates it to `array_cosine_distance`).
 #[must_use]
 pub fn deny_spice_functions_for_duckdb() -> &'static FunctionSupport {
     &DENY_SPICE_FUNCTIONS_DUCKDB
