@@ -16116,7 +16116,6 @@ dependencies = [
  "snafu",
  "snowflake-api",
  "spice-cloud",
- "spice-cloud-client",
  "spiceai",
  "spicepod",
  "sysinfo 0.38.4",
@@ -18292,7 +18291,6 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
- "url",
 ]
 
 [[package]]

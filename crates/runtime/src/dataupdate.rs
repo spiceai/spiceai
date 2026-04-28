@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{any::Any, fmt, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_stream::stream;
@@ -28,86 +28,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::{StreamExt, TryStreamExt};
-use tokio::sync::{Mutex, RwLock, broadcast};
-
-use datafusion::sql::TableReference;
-
-const DATA_UPDATE_BROADCAST_CAPACITY: usize = 100;
-
-#[derive(Clone, Debug, Default)]
-pub struct DataUpdateBroadcaster {
-    channels: Arc<RwLock<HashMap<TableReference, Arc<broadcast::Sender<DataUpdate>>>>>,
-}
-
-impl DataUpdateBroadcaster {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub async fn subscribe(
-        &self,
-        table_reference: &TableReference,
-    ) -> broadcast::Receiver<DataUpdate> {
-        if let Some(channel) = self.channels.read().await.get(table_reference) {
-            return channel.subscribe();
-        }
-
-        let mut channels = self.channels.write().await;
-        channels
-            .entry(table_reference.clone())
-            .or_insert_with(|| {
-                let (sender, _) = broadcast::channel(DATA_UPDATE_BROADCAST_CAPACITY);
-                Arc::new(sender)
-            })
-            .subscribe()
-    }
-
-    pub async fn has_subscribers(&self, table_reference: &TableReference) -> bool {
-        let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
-            return false;
-        };
-
-        if channel.receiver_count() > 0 {
-            return true;
-        }
-
-        self.remove_if_idle(table_reference, &channel).await;
-        false
-    }
-
-    pub async fn publish(&self, table_reference: &TableReference, update: DataUpdate) {
-        let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
-            return;
-        };
-
-        if channel.receiver_count() == 0 {
-            self.remove_if_idle(table_reference, &channel).await;
-            return;
-        }
-
-        if let Err(err) = channel.send(update) {
-            tracing::debug!(
-                dataset = %table_reference,
-                "No active DoExchange subscribers received data update: {err}"
-            );
-        }
-    }
-
-    async fn remove_if_idle(
-        &self,
-        table_reference: &TableReference,
-        channel: &Arc<broadcast::Sender<DataUpdate>>,
-    ) {
-        let mut channels = self.channels.write().await;
-        let should_remove = channels
-            .get(table_reference)
-            .is_some_and(|current| Arc::ptr_eq(current, channel) && current.receiver_count() == 0);
-        if should_remove {
-            channels.remove(table_reference);
-        }
-    }
-}
+use tokio::sync::Mutex;
 
 use crate::datafusion::error::find_datafusion_root;
 
@@ -251,63 +172,5 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
             }
         });
         Ok(Box::pin(stream))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::sql::TableReference;
-
-    #[tokio::test]
-    async fn data_update_broadcaster_delivers_published_updates() {
-        let broadcaster = DataUpdateBroadcaster::new();
-        let table_reference = TableReference::bare("cdc_table");
-        let mut receiver = broadcaster.subscribe(&table_reference).await;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        broadcaster
-            .publish(
-                &table_reference,
-                DataUpdate {
-                    schema: Arc::clone(&schema),
-                    data: vec![],
-                    update_type: UpdateType::Append,
-                },
-            )
-            .await;
-
-        let update = receiver
-            .recv()
-            .await
-            .expect("published update should be received");
-        assert_eq!(update.schema, schema);
-        assert!(matches!(update.update_type, UpdateType::Append));
-    }
-
-    #[tokio::test]
-    async fn data_update_broadcaster_prunes_idle_channels() {
-        let broadcaster = DataUpdateBroadcaster::new();
-        let table_reference = TableReference::bare("cdc_table");
-        let receiver = broadcaster.subscribe(&table_reference).await;
-
-        assert!(
-            broadcaster
-                .channels
-                .read()
-                .await
-                .contains_key(&table_reference)
-        );
-        drop(receiver);
-
-        assert!(!broadcaster.has_subscribers(&table_reference).await);
-        assert!(
-            !broadcaster
-                .channels
-                .read()
-                .await
-                .contains_key(&table_reference)
-        );
     }
 }

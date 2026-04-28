@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -38,8 +38,7 @@ use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::datafusion::query::Query;
 use crate::dataupdate::{
-    DataUpdate, DataUpdateBroadcaster, StreamingDataUpdate, StreamingDataUpdateExecutionPlan,
-    UpdateType,
+    DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
@@ -58,7 +57,6 @@ use {
 use crate::cluster::partition::service::PartitionService;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
-use arrow::record_batch::RecordBatch;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
@@ -82,7 +80,6 @@ use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
-use futures::StreamExt;
 use itertools::Itertools;
 use query::QueryBuilder;
 use runtime_acceleration::snapshot::AccelerationEngine;
@@ -143,43 +140,6 @@ pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 pub const SPICE_EVAL_SCHEMA: &str = "eval";
 pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 pub const SPICE_SCP_SCHEMA: &str = "scp";
-
-const MAX_STREAMING_BROADCAST_BATCHES: usize = 128;
-const MAX_STREAMING_BROADCAST_ROWS: usize = 1_000_000;
-
-#[derive(Default)]
-struct StreamingBroadcastBuffer {
-    batches: Vec<RecordBatch>,
-    rows: usize,
-    limit_exceeded: bool,
-}
-
-impl StreamingBroadcastBuffer {
-    fn push(&mut self, batch: &RecordBatch) -> bool {
-        if self.limit_exceeded {
-            return false;
-        }
-
-        let next_batches = self.batches.len().saturating_add(1);
-        let next_rows = self.rows.saturating_add(batch.num_rows());
-        if next_batches > MAX_STREAMING_BROADCAST_BATCHES
-            || next_rows > MAX_STREAMING_BROADCAST_ROWS
-        {
-            self.batches.clear();
-            self.rows = 0;
-            self.limit_exceeded = true;
-            return true;
-        }
-
-        self.rows = next_rows;
-        self.batches.push(batch.clone());
-        false
-    }
-
-    fn batches(&self) -> Option<Vec<RecordBatch>> {
-        (!self.limit_exceeded).then(|| self.batches.clone())
-    }
-}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -584,7 +544,6 @@ pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
-    data_update_broadcaster: DataUpdateBroadcaster,
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
@@ -654,11 +613,6 @@ impl DataFusion {
     #[must_use]
     pub fn caching(&self) -> Arc<Caching> {
         Arc::clone(&self.caching)
-    }
-
-    #[must_use]
-    pub fn data_update_broadcaster(&self) -> DataUpdateBroadcaster {
-        self.data_update_broadcaster.clone()
     }
 
     #[must_use]
@@ -1298,8 +1252,6 @@ impl DataFusion {
         )
         .context(SchemaMismatchSnafu)?;
 
-        let broadcast_update = data_update.clone();
-
         let overwrite = match data_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
@@ -1344,10 +1296,6 @@ impl DataFusion {
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
-        self.data_update_broadcaster
-            .publish(table_reference, broadcast_update)
-            .await;
-
         Ok(())
     }
 
@@ -1363,8 +1311,7 @@ impl DataFusion {
             .fail()?;
         }
 
-        let StreamingDataUpdate { data, update_type } = streaming_update;
-        let update_schema = data.schema();
+        let update_schema = streaming_update.data.schema();
 
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&update_schema))
             .await?;
@@ -1374,55 +1321,16 @@ impl DataFusion {
         verify_schema(table_provider.schema().fields(), update_schema.fields())
             .context(SchemaMismatchSnafu)?;
 
-        let overwrite = match update_type {
+        let overwrite = match streaming_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
             UpdateType::Changes => InsertOp::Replace,
         };
 
-        let broadcast_batches = self
-            .data_update_broadcaster
-            .has_subscribers(table_reference)
-            .await
-            .then(|| Arc::new(StdMutex::new(StreamingBroadcastBuffer::default())));
-        let data = match broadcast_batches.as_ref() {
-            Some(batches) => {
-                let batches = Arc::clone(batches);
-                let table_reference = table_reference.to_string();
-                let stream = data.map(move |batch_result| {
-                    if let Ok(batch) = &batch_result {
-                        match batches.lock() {
-                            Ok(mut batches) => {
-                                if batches.push(batch) {
-                                    tracing::warn!(
-                                        dataset = %table_reference,
-                                        max_batches = MAX_STREAMING_BROADCAST_BATCHES,
-                                        max_rows = MAX_STREAMING_BROADCAST_ROWS,
-                                        "Disabling DoExchange broadcast for streaming write because buffered update exceeded limits"
-                                    );
-                                }
-                            }
-                            Err(err) => tracing::warn!(
-                                "Failed to record streaming data update for DoExchange subscribers: {err}"
-                            ),
-                        }
-                    }
-                    batch_result
-                });
-                Box::pin(
-                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                        Arc::clone(&update_schema),
-                        Box::pin(stream),
-                    ),
-                )
-            }
-            None => data,
-        };
-
         let insert_plan = table_provider
             .insert_into(
                 &self.ctx.state(),
-                Arc::new(StreamingDataUpdateExecutionPlan::new(data)),
+                Arc::new(StreamingDataUpdateExecutionPlan::new(streaming_update.data)),
                 overwrite,
             )
             .await
@@ -1448,36 +1356,6 @@ impl DataFusion {
             tracing::warn!(
                 "Failed to invalidate caches for table {table_reference} after streaming write: {e}"
             );
-        }
-
-        self.runtime_status
-            .update_dataset(table_reference, status::ComponentStatus::Ready);
-
-        if let Some(batches) = broadcast_batches {
-            let broadcast_data = match batches.lock() {
-                Ok(batches) => Ok(batches.batches()),
-                Err(err) => Err(err.to_string()),
-            };
-
-            match broadcast_data {
-                Ok(Some(data)) => {
-                    let update = DataUpdate {
-                        schema: update_schema,
-                        data,
-                        update_type,
-                    };
-                    self.data_update_broadcaster
-                        .publish(table_reference, update)
-                        .await;
-                }
-                Ok(None) => tracing::warn!(
-                    dataset = %table_reference,
-                    "Skipped publishing streaming data update to DoExchange subscribers because the buffered update exceeded limits; subscribers can reconnect to receive a fresh snapshot"
-                ),
-                Err(err) => tracing::warn!(
-                    "Failed to publish streaming data update to DoExchange subscribers: {err}"
-                ),
-            }
         }
 
         Ok(())
@@ -3383,47 +3261,11 @@ async fn build_snapshot_creation_config(
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::Int32Array;
-    use arrow::datatypes::{DataType, Field};
     use cache::{SimpleCache, key::CacheKey};
 
     use crate::builder::RuntimeBuilder;
 
     use super::*;
-
-    fn streaming_broadcast_test_batch(value: i32) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-            vec![Arc::new(Int32Array::from(vec![value])) as arrow::array::ArrayRef],
-        )
-        .expect("test record batch should be valid")
-    }
-
-    #[test]
-    fn test_streaming_broadcast_buffer_records_within_limit() {
-        let mut buffer = StreamingBroadcastBuffer::default();
-
-        assert!(!buffer.push(&streaming_broadcast_test_batch(1)));
-
-        let batches = buffer.batches().expect("buffer should be publishable");
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 1);
-    }
-
-    #[test]
-    fn test_streaming_broadcast_buffer_disables_when_batch_limit_exceeded() {
-        let mut buffer = StreamingBroadcastBuffer::default();
-
-        for value in 0..MAX_STREAMING_BROADCAST_BATCHES {
-            assert!(!buffer.push(&streaming_broadcast_test_batch(
-                i32::try_from(value).expect("test value fits in i32")
-            )));
-        }
-
-        assert!(buffer.push(&streaming_broadcast_test_batch(999)));
-        assert!(buffer.batches().is_none());
-        assert!(!buffer.push(&streaming_broadcast_test_batch(1000)));
-    }
 
     #[tokio::test]
     async fn test_get_or_create_logical_plan() {

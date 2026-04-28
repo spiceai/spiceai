@@ -18,7 +18,7 @@ use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
-use crate::dataupdate::DataUpdateBroadcaster;
+use crate::dataupdate::DataUpdate;
 use crate::opentelemetry::create_metrics_service;
 use crate::tls::{TlsConfig, server_with_tls_config};
 use crate::{Runtime, metrics as runtime_metrics};
@@ -39,6 +39,7 @@ use bytes::Bytes;
 use cache::result::CacheStatus;
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
+use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::parser::ParserError;
 use flight_client::Error as FlightClientError;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -49,9 +50,12 @@ use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::RwLock;
+use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -80,7 +84,7 @@ pub use session::SessionStore;
 pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
 
 pub struct Service {
-    data_update_broadcaster: DataUpdateBroadcaster,
+    channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     session_store: SessionStore,
 }
@@ -88,12 +92,10 @@ pub struct Service {
 impl Service {
     /// Creates a new `Service` with the provided Flight authentication and data update broadcaster.
     #[must_use]
-    pub fn new(
-        basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
-        data_update_broadcaster: DataUpdateBroadcaster,
-    ) -> Self {
+    pub fn new(basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>) -> Self {
         Self {
-            data_update_broadcaster,
+            // Pre-allocate for typical workloads (avoid reallocation)
+            channel_map: Arc::new(RwLock::new(HashMap::with_capacity(64))),
             basic_auth,
             session_store: SessionStore::new(),
         }
@@ -500,10 +502,7 @@ pub async fn start(
         });
     }
 
-    let service = Service::new(
-        endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
-        rt.datafusion().data_update_broadcaster(),
-    );
+    let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
     let session_store = service.session_store.clone();
 
     let flight_message_size = app

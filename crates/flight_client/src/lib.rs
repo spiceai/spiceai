@@ -309,28 +309,6 @@ impl FlightClient {
         self
     }
 
-    fn apply_request_metadata<T>(
-        &self,
-        req: &mut tonic::Request<T>,
-        token: Option<&Token>,
-    ) -> Result<()> {
-        if let Some(token) = token {
-            let auth_header_value = token.to_string().parse().context(InvalidMetadataSnafu)?;
-            req.metadata_mut()
-                .insert("authorization", auth_header_value);
-        }
-
-        if let Some(metadata) = &self.metadata {
-            for key_and_value in metadata.iter() {
-                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
-                    req.metadata_mut().insert(key, value.clone());
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Queries the flight service for the schema of the path.
     ///
     /// # Arguments
@@ -345,7 +323,22 @@ impl FlightClient {
 
         let descriptor = FlightDescriptor::new_path(path);
         let mut req = tonic::Request::new(descriptor);
-        self.apply_request_metadata(&mut req, token.as_ref())?;
+
+        let auth_header_value = match &token {
+            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
+            None => {
+                return UnauthorizedSnafu.fail();
+            }
+        };
+        req.metadata_mut()
+            .insert("authorization", auth_header_value);
+        if let Some(metadata) = &self.metadata {
+            for key_and_value in metadata.iter() {
+                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                    req.metadata_mut().insert(key, value.clone());
+                }
+            }
+        }
 
         let schema_result = self
             .client
@@ -372,7 +365,22 @@ impl FlightClient {
 
         let descriptor = FlightDescriptor::new_cmd(sql.into_owned());
         let mut req = descriptor.into_request();
-        self.apply_request_metadata(&mut req, token.as_ref())?;
+
+        let auth_header_value = match &token {
+            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
+            None => {
+                return UnauthorizedSnafu.fail();
+            }
+        };
+        req.metadata_mut()
+            .insert("authorization", auth_header_value);
+        if let Some(metadata) = &self.metadata {
+            for key_and_value in metadata.iter() {
+                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                    req.metadata_mut().insert(key, value.clone());
+                }
+            }
+        }
 
         let schema_result = self
             .client
@@ -399,7 +407,22 @@ impl FlightClient {
 
         let descriptor = FlightDescriptor::new_cmd(query.to_string());
         let mut req = descriptor.into_request();
-        self.apply_request_metadata(&mut req, token.as_ref())?;
+
+        let auth_header_value = match &token {
+            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
+            None => {
+                return UnauthorizedSnafu.fail();
+            }
+        };
+        req.metadata_mut()
+            .insert("authorization", auth_header_value);
+        if let Some(metadata) = &self.metadata {
+            for key_and_value in metadata.iter() {
+                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                    req.metadata_mut().insert(key, value.clone());
+                }
+            }
+        }
 
         let info = self
             .client
@@ -412,7 +435,21 @@ impl FlightClient {
         let ep = info.endpoint[0].clone();
         if let Some(ticket) = ep.ticket {
             let mut req = ticket.into_request();
-            self.apply_request_metadata(&mut req, token.as_ref())?;
+            let auth_header_value = match token {
+                Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
+                None => {
+                    return UnauthorizedSnafu.fail();
+                }
+            };
+            req.metadata_mut()
+                .insert("authorization", auth_header_value);
+            if let Some(metadata) = &self.metadata {
+                for key_and_value in metadata.iter() {
+                    if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                        req.metadata_mut().insert(key, value.clone());
+                    }
+                }
+            }
 
             let (md, response_stream, _ext) = self
                 .client
@@ -448,7 +485,21 @@ impl FlightClient {
             stream::iter(vec![FlightData::new().with_descriptor(flight_descriptor)].into_iter());
 
         let mut req = subscription_request.into_streaming_request();
-        self.apply_request_metadata(&mut req, token.as_ref())?;
+        let auth_header_value = match token {
+            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
+            None => {
+                return UnauthorizedSnafu.fail();
+            }
+        };
+        req.metadata_mut()
+            .insert("authorization", auth_header_value);
+        if let Some(metadata) = &self.metadata {
+            for key_and_value in metadata.iter() {
+                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                    req.metadata_mut().insert(key, value.clone());
+                }
+            }
+        }
 
         let (_md, response_stream, _ext) = self
             .client
@@ -509,7 +560,13 @@ impl FlightClient {
         });
 
         let mut publish_request = request_stream.into_streaming_request();
-        self.apply_request_metadata(&mut publish_request, token.as_ref())?;
+        if let Some(token) = token {
+            let auth_header_value = token.to_string().parse().context(InvalidMetadataSnafu)?;
+
+            publish_request
+                .metadata_mut()
+                .insert("authorization", auth_header_value);
+        }
 
         let resp = match self.client.clone().do_put(publish_request).await {
             Ok(resp) => resp,
