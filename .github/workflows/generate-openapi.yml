@@ -90,8 +90,7 @@ jobs:
           else
             git add .schema/openapi.json
             git commit -m "Update openapi.json"
-            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}"
-            git push origin openapi/${GITHUB_RUN_ID}
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:openapi/${GITHUB_RUN_ID}
             gh pr create \
               --title "Update openapi.json" \
               --body $'Updated OpenAPI specification\n\n**Remember**\n- [ ] Updated in [spiceai/docs](https://github.com/spiceai/docs).' \

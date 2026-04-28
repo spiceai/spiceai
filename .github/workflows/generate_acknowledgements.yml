@@ -41,8 +41,7 @@ jobs:
           if [[ $(git diff --exit-code acknowledgements.md) ]]; then
             git add acknowledgements.md
             git commit -m "Update acknowledgements"
-            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}"
-            git push origin acknowledgements/${GITHUB_RUN_ID}
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:acknowledgements/${GITHUB_RUN_ID}
             gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
           else
             echo "No changes detected"

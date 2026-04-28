@@ -1881,6 +1881,7 @@ jobs:
       - name: Install DuckDB CLI
         run: |
           curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
+          echo "b5bad3ec8bf689885f8270ebd8e0f507e4f671f37dabf6127c09b19960389f96  duckdb_cli.zip" | sha256sum -c
           unzip duckdb_cli.zip
           chmod +x ./duckdb
           echo "$PWD" >> $GITHUB_PATH
