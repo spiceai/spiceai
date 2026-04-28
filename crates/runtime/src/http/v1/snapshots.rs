@@ -51,7 +51,7 @@ fn snapshots_feature_response() -> Option<Response> {
     ///
     /// In OSS default builds the `snapshots` cargo feature is disabled and snapshot
     /// support is shipped only in the Spice.ai enterprise build.
-    const SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE: &str = "Acceleration Snapshots are included in the Enterprise distribution of Spice. Learn more at https://docs.spice.ai/docs/enterprise";
+    const SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE: &str = "Acceleration Snapshots are included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise";
 
     Some(
         (
