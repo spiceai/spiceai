@@ -228,7 +228,7 @@ impl RefreshTask {
         }
 
         if let Some(delete_row_indices) =
-            upsert_pre_delete_rows(change_batch, row_indices, &dataset_name.to_string())?
+            upsert_pre_delete_rows(change_batch, row_indices, dataset_name)?
         {
             self.process_delete_batch(change_batch, &delete_row_indices)
                 .await?;
@@ -356,7 +356,7 @@ impl RefreshTask {
 fn upsert_pre_delete_rows(
     change_batch: &ChangeBatch,
     row_indices: &[usize],
-    dataset_name: &str,
+    dataset_name: &TableReference,
 ) -> crate::accelerated_table::Result<Option<Vec<usize>>> {
     let Some(first_row_idx) = row_indices.first() else {
         return Ok(None);
@@ -1095,7 +1095,8 @@ mod tests {
             vec![Some("a"), Some("b"), Some("c")],
         );
 
-        let delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], "test_dataset")
+        let dataset_name = TableReference::bare("test_dataset");
+        let delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], &dataset_name)
             .expect("matching primary keys should be valid")
             .expect("non-empty row indices should return delete rows");
 
@@ -1111,7 +1112,8 @@ mod tests {
             vec![Some("a"), Some("b"), Some("c")],
         );
 
-        let err = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], "test_dataset")
+        let dataset_name = TableReference::bare("test_dataset");
+        let err = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], &dataset_name)
             .expect_err("missing primary keys should fail safely");
 
         assert!(
@@ -1129,7 +1131,8 @@ mod tests {
             vec![Some("a"), Some("b"), Some("c")],
         );
 
-        let err = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], "test_dataset")
+        let dataset_name = TableReference::bare("test_dataset");
+        let err = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], &dataset_name)
             .expect_err("mismatched primary keys should fail safely");
 
         assert!(
@@ -1147,7 +1150,8 @@ mod tests {
             vec![Some("a"), Some("b")],
         );
 
-        let err = upsert_pre_delete_rows(&change_batch, &[0, 1], "test_dataset")
+        let dataset_name = TableReference::bare("test_dataset");
+        let err = upsert_pre_delete_rows(&change_batch, &[0, 1], &dataset_name)
             .expect_err("upserts without primary keys should fail safely");
 
         assert!(err.to_string().contains("no usable primary key metadata"));
