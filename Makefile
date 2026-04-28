@@ -253,11 +253,7 @@ display-deps:
 ################################################################################
 # Honour CARGO_TARGET_DIR if set (e.g. for custom build directories / sccache setups),
 # otherwise fall back to the default Cargo output directory.
-ifdef CARGO_TARGET_DIR
-	TARGET_DIR := $(CARGO_TARGET_DIR)
-else
-	TARGET_DIR := target
-endif
+TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 
 # Default install includes models. Use -data suffix variants to build without models.
 # Data-only features (default features minus models)
