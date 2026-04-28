@@ -226,7 +226,7 @@ fn get_region(params: &ConnectorParams) -> Option<&str> {
     params.parameters.get("region").expose().ok()
 }
 
-fn require_valid_region<'a>(region: Option<&'a str>) -> Result<&'a str> {
+fn require_valid_region(region: Option<&str>) -> Result<&str> {
     let region = region.ok_or_else(|| {
         MissingRequiredParameterSnafu {
             parameter: "region".to_string(),

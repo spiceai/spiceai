@@ -1457,21 +1457,20 @@ impl DataFusion {
         if let Some(batches) = broadcast_batches {
             let broadcast_data = batches.lock().batches();
 
-            match broadcast_data {
-                Some(data) => {
-                    let update = DataUpdate {
-                        schema: update_schema,
-                        data,
-                        update_type,
-                    };
-                    self.data_update_broadcaster
-                        .publish(table_reference, update)
-                        .await;
-                }
-                None => tracing::warn!(
+            if let Some(data) = broadcast_data {
+                let update = DataUpdate {
+                    schema: update_schema,
+                    data,
+                    update_type,
+                };
+                self.data_update_broadcaster
+                    .publish(table_reference, update)
+                    .await;
+            } else {
+                tracing::warn!(
                     dataset = %table_reference,
                     "Skipped publishing streaming data update to DoExchange subscribers because the buffered update exceeded limits; subscribers can reconnect to receive a fresh snapshot"
-                ),
+                );
             }
         }
 
