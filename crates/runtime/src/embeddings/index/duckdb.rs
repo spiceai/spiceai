@@ -81,11 +81,8 @@ pub enum Error {
     ))]
     PrimaryKeyColumnMissing { dataset: String, column: String },
 
-    #[snafu(display("Invalid distance metric '{metric}': {source}"))]
-    InvalidDistanceMetric {
-        metric: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    #[snafu(display("Invalid distance metric '{metric}': {reason}"))]
+    InvalidDistanceMetric { metric: String, reason: String },
 
     #[snafu(display("Invalid value for DuckDB vector parameter '{key}': '{value}': {source}"))]
     InvalidParameter {
@@ -320,10 +317,12 @@ fn parse_hnsw_options(params: &Parameters) -> Result<DuckDBHnswOptions> {
     if let Some(metric) = string_from_params(params, "distance_metric")
         .or_else(|| string_from_params(params, "metric"))
     {
-        options.metric =
-            DuckDBDistanceMetric::try_from(metric).context(InvalidDistanceMetricSnafu {
+        options.metric = DuckDBDistanceMetric::try_from(metric).map_err(|reason| {
+            Error::InvalidDistanceMetric {
                 metric: metric.to_string(),
-            })?;
+                reason,
+            }
+        })?;
     }
 
     options.hnsw_m = parse_u32_param(params, "hnsw_m")?;

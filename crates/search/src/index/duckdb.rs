@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     any::Any,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -63,6 +63,8 @@ use crate::{
 };
 
 static NEXT_TRANSIENT_INDEX_ID: AtomicU64 = AtomicU64::new(0);
+static VSS_INSTALLED: OnceLock<()> = OnceLock::new();
+static VSS_INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DuckDBDistanceMetric {
@@ -181,7 +183,6 @@ impl DuckDBHnswOptions {
 pub struct DuckDBVectorQueryContext {
     pub pool: Arc<DuckDbConnectionPool>,
     pub table_definition: Arc<TableDefinition>,
-    vss_installed: Arc<OnceLock<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,7 +226,6 @@ impl DuckDBVectorIndex {
         self.query_context = Some(DuckDBVectorQueryContext {
             pool,
             table_definition,
-            vss_installed: Arc::new(OnceLock::new()),
         });
         self
     }
@@ -580,11 +580,7 @@ fn run_duckdb_vector_query(
     let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_execution_error)?;
     let conn = &duckdb_conn.conn;
 
-    if context.vss_installed.get().is_none() {
-        conn.execute("INSTALL vss", [])
-            .map_err(to_execution_error)?;
-        let _ = context.vss_installed.set(());
-    }
+    install_vss_once(conn)?;
     conn.execute("LOAD vss", []).map_err(to_execution_error)?;
     if let Some(ef_search) = exec.hnsw.hnsw_ef_search {
         conn.execute(&format!("SET hnsw_ef_search = {ef_search}"), [])
@@ -629,17 +625,34 @@ fn run_duckdb_vector_query(
     query_result
 }
 
+fn install_vss_once(conn: &duckdb::Connection) -> DataFusionResult<()> {
+    if VSS_INSTALLED.get().is_some() {
+        return Ok(());
+    }
+
+    let _install_guard = VSS_INSTALL_LOCK.lock().map_err(|error| {
+        DataFusionError::Execution(format!("Failed to lock DuckDB VSS install guard: {error}"))
+    })?;
+    if VSS_INSTALLED.get().is_none() {
+        conn.execute("INSTALL vss", [])
+            .map_err(to_execution_error)?;
+        let _ = VSS_INSTALLED.set(());
+    }
+
+    Ok(())
+}
+
 fn resolve_current_table_name(
     table_definition: &TableDefinition,
     conn: &duckdb::Connection,
 ) -> DataFusionResult<String> {
     let definition_name = table_definition.name().to_string();
-    let pattern = format!("__data_{definition_name}%");
+    let prefix = format!("__data_{definition_name}_");
     let mut stmt = conn
-        .prepare("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE ?")
+        .prepare("SELECT table_name FROM duckdb_tables() WHERE starts_with(table_name, ?)")
         .map_err(to_execution_error)?;
     let rows = stmt
-        .query_map([pattern], |row| row.get::<usize, String>(0))
+        .query_map([prefix], |row| row.get::<usize, String>(0))
         .map_err(to_execution_error)?;
 
     let mut internal_tables = Vec::new();
