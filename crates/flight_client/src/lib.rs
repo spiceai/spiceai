@@ -621,6 +621,8 @@ impl FlightClient {
             }
         })?;
 
+        let mut token: Option<Token> = None;
+
         // Consume the response stream before reading the metadata
         let stream = resp.get_mut();
         while let Some(data) = stream.next().await {
@@ -643,11 +645,10 @@ impl FlightClient {
             let auth = auth
                 .to_str()
                 .context(UnableToConvertMetadataToStringSnafu)?;
-            let token = auth.strip_prefix("Bearer ").unwrap_or(auth);
-            return Ok(Some(Token::new(token, true)));
+            token = Some(Token::new(&auth["Bearer ".len()..], true));
         }
 
-        UnauthorizedSnafu.fail()
+        Ok(token)
     }
 
     pub fn url(&self) -> &str {
