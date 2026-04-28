@@ -321,11 +321,10 @@ fn parse_hnsw_options(params: &Parameters) -> Result<DuckDBHnswOptions> {
         .or_else(|| string_from_params(params, "metric"))
     {
         options.metric =
-            DuckDBDistanceMetric::try_from(metric)
-                .boxed()
-                .context(InvalidDistanceMetricSnafu {
-                    metric: metric.to_string(),
-                })?;
+            DuckDBDistanceMetric::try_from(metric).map_err(|e| Error::InvalidDistanceMetric {
+                metric: metric.to_string(),
+                source: Box::from(e) as Box<dyn std::error::Error + Send + Sync>,
+            })?;
     }
 
     options.hnsw_m = parse_u32_param(params, "hnsw_m")?;
