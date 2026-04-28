@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 ///
 /// In OSS default builds the `snapshots` cargo feature is disabled and snapshot
 /// support is shipped only in the Spice.ai enterprise build.
-const SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE: &str = "Snapshots are an enterprise-only feature and are not available in this build of Spice. Learn more or upgrade at https://spice.ai/pricing.";
+const SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE: &str = "Acceleration Snapshots are included in the Enterprise distribution of Spice and are not available in this build. Learn more at https://docs.spice.ai/docs/enterprise";
 
 #[cfg(feature = "snapshots")]
 const SNAPSHOTS_ENABLED: bool = true;
