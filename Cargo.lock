@@ -6244,7 +6244,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/Jeadie/datafusion-table-providers.git?rev=167a4810df6ea8a45346fd10105d89700edf1d7f#167a4810df6ea8a45346fd10105d89700edf1d7f"
+source = "git+https://github.com/Jeadie/datafusion-table-providers.git?rev=662c9a5820c93ac6e60f6da43485ef907f900424#662c9a5820c93ac6e60f6da43485ef907f900424"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -8310,8 +8310,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
+ "windows-link 0.1.3",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -9445,7 +9445,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
