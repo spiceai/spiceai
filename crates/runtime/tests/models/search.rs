@@ -24,7 +24,7 @@ use crate::models::{
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use app::{App, AppBuilder};
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
