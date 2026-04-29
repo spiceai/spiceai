@@ -308,7 +308,7 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value) {
             insta::assert_snapshot!(
                 format!("{test_name}_response"),
                 serde_json::to_string_pretty(&normalize_search_response_json(resp, true))
-                    .unwrap_or_default()
+                    .expect("search response snapshot serialization should succeed")
             );
         }
     }
