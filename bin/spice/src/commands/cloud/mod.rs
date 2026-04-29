@@ -23,8 +23,8 @@ use crate::context::RuntimeContext;
 use crate::error::{InvalidArgumentSnafu, Result};
 use crate::output::{OutputFormat, TableOutput, write_json};
 use clap::{Args, Subcommand};
-use std::fmt;
 use snafu::ResultExt;
+use std::fmt;
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
