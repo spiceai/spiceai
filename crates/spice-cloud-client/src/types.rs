@@ -353,14 +353,16 @@ pub struct AuthExchangeResponse {
     pub access_denied: bool,
 }
 
-#[derive(Debug, Serialize)]
+// Debug is intentionally not derived: client_secret must not appear in logs or error output.
+#[derive(Serialize)]
 pub struct OAuthTokenRequest {
     pub client_id: String,
     pub client_secret: String,
     pub grant_type: String,
 }
 
-#[derive(Debug, Deserialize)]
+// Debug is intentionally not derived: access_token must not appear in logs or error output.
+#[derive(Deserialize)]
 pub struct OAuthTokenResponse {
     pub access_token: String,
     pub token_type: String,
