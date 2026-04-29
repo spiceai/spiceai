@@ -451,10 +451,7 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
                 && let Some(score) = n.as_f64()
             {
                 let rounded = (100.0 * score).round() / 100.0;
-                obj.insert(
-                    "_score".to_string(),
-                    Value::String(format!("{rounded:.2}")),
-                );
+                obj.insert("_score".to_string(), Value::String(format!("{rounded:.2}")));
             }
         }
     }
