@@ -1007,13 +1007,11 @@ jobs:
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
         run: |
-          CLICKHOUSE_VERSION="26.3.9.8-lts"
-          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}/clickhouse-linux-amd64" -o clickhouse-linux-amd64
-          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}/clickhouse-linux-amd64.sha512" -o clickhouse-linux-amd64.sha512
-          sha512sum -c clickhouse-linux-amd64.sha512
-          mv clickhouse-linux-amd64 clickhouse
-          chmod +x clickhouse
-          sudo ./clickhouse install
+          CLICKHOUSE_VERSION="26.3.9.8"
+          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}-lts/clickhouse-common-static_${CLICKHOUSE_VERSION}_amd64.deb" -o clickhouse-common-static.deb
+          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}-lts/clickhouse-server_${CLICKHOUSE_VERSION}_amd64.deb" -o clickhouse-server.deb
+          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}-lts/clickhouse-client_${CLICKHOUSE_VERSION}_amd64.deb" -o clickhouse-client.deb
+          sudo dpkg -i clickhouse-common-static.deb clickhouse-server.deb clickhouse-client.deb
           sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
@@ -1023,11 +1021,8 @@ jobs:
       - name: Install Clickhouse
         if: matrix.target.target_os == 'darwin'
         run: |
-          CLICKHOUSE_VERSION="26.3.9.8-lts"
-          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
-          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}/clickhouse-macos-aarch64.sha512" -o clickhouse-macos-aarch64.sha512
-          shasum -a 512 -c clickhouse-macos-aarch64.sha512
-          mv clickhouse-macos-aarch64 clickhouse
+          CLICKHOUSE_VERSION="26.3.9.8"
+          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}-lts/clickhouse-macos-aarch64" -o clickhouse
           chmod +x clickhouse
           sudo ./clickhouse install
           sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
