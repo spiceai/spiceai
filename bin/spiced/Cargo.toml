@@ -92,7 +92,6 @@ default = [
     "clickhouse",
     "cosmosdb",
     "sharepoint",
-    "snapshots",
     "snowflake",
     "spark",
     "ftp",

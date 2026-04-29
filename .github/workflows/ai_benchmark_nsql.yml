@@ -30,6 +30,8 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
@@ -44,6 +46,8 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -100,6 +104,8 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Download testoperator
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

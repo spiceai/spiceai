@@ -11,9 +11,8 @@ description: "Query: tpch_simple_q6"
 |               |       TableScan: orders projection=[o_orderkey], fetch=10               |
 | physical_plan | ProjectionExec: expr=[CAST(o_orderkey@0 AS Int64) + 1 as key]           |
 |               |   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
-|               |     GlobalLimitExec: skip=0, fetch=10                                   |
-|               |       CooperativeExec                                                   |
-|               |         BytesProcessedExec                                              |
-|               |           SqlServerExec sql=SELECT TOP 10 o_orderkey FROM orders        |
+|               |     CooperativeExec                                                     |
+|               |       BytesProcessedExec                                                |
+|               |         SqlServerExec sql=SELECT TOP 10 o_orderkey FROM orders          |
 |               |                                                                         |
 +---------------+-------------------------------------------------------------------------+

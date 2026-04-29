@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use tonic::Status;
 
 use crate::datafusion::job_executor_context_extension::get_job_executor;
+use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::http::v1::{current_principal_requires_read_only, queries::SubmitQueryRequest};
 use crate::jobs::{JobErrorCode, JobState, JobStatus};
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -250,6 +251,14 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
         Status::invalid_argument(format!("Failed to parse SubmitQueryRequest: {e}"))
     })?;
     let read_only = current_principal_requires_read_only().await;
+
+    // If the principal is read-only, validate that the SQL does not contain
+    // write operations before submitting to the background job executor.
+    //
+    // Note: Even if `request` has parameters, since we aren't using the `LogicalPlan` output from
+    // `check_read_only_sql`, it is not needed to check read only.
+    let datafusion = get_current_datafusion(&context);
+    let _ = super::check_read_only_sql(&context, &datafusion, &request.sql, None).await?;
 
     let state = executor
         .submit(request, read_only)

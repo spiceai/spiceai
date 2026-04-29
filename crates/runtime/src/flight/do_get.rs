@@ -157,8 +157,15 @@ async fn do_get_simple(
     tracing::trace!("do_get_simple: {ticket:?}");
     match std::str::from_utf8(&ticket.ticket) {
         Ok(sql) => {
-            let (output, cache_status) =
-                Box::pin(Service::sql_to_flight_stream(datafusion, sql, None)).await?;
+            let pre_parsed_plan =
+                super::check_read_only_sql(&context, &datafusion, sql, None).await?;
+            let (output, cache_status) = Box::pin(Service::sql_to_flight_stream(
+                datafusion,
+                sql,
+                None,
+                pre_parsed_plan,
+            ))
+            .await?;
 
             let timed_output = TimedStream::new(output, move || start);
 
