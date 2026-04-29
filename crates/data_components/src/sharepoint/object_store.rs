@@ -59,7 +59,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use super::url::DriveRef;
-use crate::resilient_http::sanitize_error_body;
+use crate::resilient_http::read_bounded_error_body;
 
 /// SharePoint cap on a single `PUT /content` is 4 MiB. We use a slightly lower
 /// threshold to leave headroom for request headers/overhead.
@@ -942,12 +942,11 @@ async fn resumable_put(
 async fn parse_put_response(response: reqwest::Response) -> ObjectStoreResult<PutOutcome> {
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_bounded_error_body(response, 256).await;
         return Err(object_store::Error::Generic {
             store: STORE_TAG,
             source: Box::new(std::io::Error::other(format!(
-                "SharePoint upload failed: HTTP {status}: {}",
-                sanitize_error_body(&body, 256)
+                "SharePoint upload failed: HTTP {status}: {body}"
             ))),
         });
     }
@@ -996,12 +995,11 @@ async fn head_drive_item(
     }
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_bounded_error_body(response, 256).await;
         return Err(object_store::Error::Generic {
             store: STORE_TAG,
             source: Box::new(std::io::Error::other(format!(
-                "head failed: HTTP {status}: {}",
-                sanitize_error_body(&body, 256)
+                "head failed: HTTP {status}: {body}"
             ))),
         });
     }
@@ -1052,12 +1050,11 @@ async fn get_content(
     }
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_bounded_error_body(response, 256).await;
         return Err(object_store::Error::Generic {
             store: STORE_TAG,
             source: Box::new(std::io::Error::other(format!(
-                "get content failed: HTTP {status}: {}",
-                sanitize_error_body(&body, 256)
+                "get content failed: HTTP {status}: {body}"
             ))),
         });
     }
@@ -1125,12 +1122,11 @@ async fn delete_item(
     }
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_bounded_error_body(response, 256).await;
         return Err(object_store::Error::Generic {
             store: STORE_TAG,
             source: Box::new(std::io::Error::other(format!(
-                "delete failed: HTTP {status}: {}",
-                sanitize_error_body(&body, 256)
+                "delete failed: HTTP {status}: {body}"
             ))),
         });
     }
