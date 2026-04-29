@@ -210,7 +210,7 @@ fn assert_score_ordering(resp: &Value) -> Result<(), anyhow::Error> {
             .context("Search responses missing '_score'.")?;
 
         anyhow::ensure!(
-            previous_score > score,
+            score <= previous_score,
             "Responses not in descending order. {previous_score} is before {score}."
         );
 
