@@ -138,11 +138,11 @@ pub struct LoginArgs {
     #[arg(long)]
     pub no_browser: bool,
 
-    /// OAuth2 client ID (env: SPICE_CLIENT_ID)
+    /// `OAuth2` client ID (env: `SPICE_CLIENT_ID`)
     #[arg(long, env = "SPICE_CLIENT_ID")]
     pub client_id: Option<String>,
 
-    /// OAuth2 client secret (env: SPICE_CLIENT_SECRET)
+    /// `OAuth2` client secret (env: `SPICE_CLIENT_SECRET`)
     #[arg(long, env = "SPICE_CLIENT_SECRET")]
     pub client_secret: Option<String>,
 }
