@@ -54,7 +54,10 @@ runs:
           arm64)   ARCH_SUFFIX="aarch_64" ;;
           s390x)   ARCH_SUFFIX="s390_64" ;;
           ppc64le) ARCH_SUFFIX="ppcle_64" ;;
-          *)       ARCH_SUFFIX="x86_32" ;;
+          *)
+            echo "Unsupported architecture for protoc release asset selection: ${ARCH}" >&2
+            exit 1
+            ;;
         esac
 
         FILENAME="protoc-${FILE_VERSION}-${OS_NAME}-${ARCH_SUFFIX}.zip"
