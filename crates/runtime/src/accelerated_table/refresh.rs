@@ -422,6 +422,14 @@ impl Refresh {
             // 1. On-demand through cache misses (primary)
             // 2. Periodic background refresh of stale data (if refresh_check_interval is set)
             RefreshMode::Caching => {
+                // refresh_on_startup: always triggers an immediate load regardless of
+                // whether a check_interval is configured.
+                if refresh_on_startup == RefreshOnStartup::Always {
+                    tracing::info!(
+                        "Caching mode with refresh_on_startup=always - triggering immediate refresh on startup"
+                    );
+                    return NextRefresh::WaitFor(Duration::ZERO);
+                }
                 // If refresh_check_interval is set, enable periodic refresh for stale data
                 if let Some(check_interval) = self.check_interval {
                     tracing::info!(
