@@ -17,9 +17,7 @@ limitations under the License.
 use std::{
     any::Any,
     collections::HashSet,
-    sync::{
-        Arc, Mutex, OnceLock,
-    },
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use arrow::array::{
@@ -243,10 +241,11 @@ impl DuckDBVectorIndex {
         conn.execute("LOAD vss", []).map_err(to_execution_error)?;
         conn.execute("SET hnsw_enable_experimental_persistence = true", [])
             .map_err(to_execution_error)?;
-        let index_name =
-            DuckDBHnswOptions::index_name_for(table_name, &embedding_column);
+        let index_name = DuckDBHnswOptions::index_name_for(table_name, &embedding_column);
         conn.execute(
-            &self.hnsw.create_index_sql(table_name, &embedding_column, &index_name),
+            &self
+                .hnsw
+                .create_index_sql(table_name, &embedding_column, &index_name),
             [],
         )
         .map_err(to_execution_error)?;
@@ -381,8 +380,7 @@ impl Index for DuckDBVectorIndex {
                 .connect_sync()
                 .map_err(to_execution_error)?;
             let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_execution_error)?;
-            let table_name =
-                resolve_current_table_name(&ctx.table_definition, &duckdb_conn.conn)?;
+            let table_name = resolve_current_table_name(&ctx.table_definition, &duckdb_conn.conn)?;
             index.create_hnsw_index_on_table(&table_name, &duckdb_conn.conn)
         })
         .await
