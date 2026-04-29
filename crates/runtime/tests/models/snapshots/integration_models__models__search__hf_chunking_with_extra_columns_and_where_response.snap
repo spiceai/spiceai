@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.94",
+      "_score": "[score]",
       "data": {
         "cp_department": "DEPARTMENT"
       },

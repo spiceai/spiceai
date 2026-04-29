@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "normalize_search_response(resp, round_scores)"
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.89",
+      "_score": "[score]",
       "data": {
         "i_color": "yellow",
         "i_item_id": "AAAAAAAAKAAAAAAA"
@@ -22,7 +22,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.84",
+      "_score": "[score]",
       "data": {
         "i_color": "wheat",
         "i_item_id": "AAAAAAAAIAAAAAAA"

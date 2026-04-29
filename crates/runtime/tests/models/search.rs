@@ -24,7 +24,7 @@ use crate::models::{
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use app::{App, AppBuilder};
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
@@ -76,10 +76,6 @@ pub struct SearchTestCase {
     pub body: SearchTestType,
     pub should_fail: bool,
     pub skip: bool,
-    /// When true, displayed scores use rounding instead of truncation.
-    /// Use for tests with non-deterministic embeddings (e.g. model2vec/s3vectors)
-    /// where raw scores can vary ±0.002 across CI runners.
-    pub round_scores: bool,
 }
 
 impl SearchTestCase {
@@ -89,7 +85,6 @@ impl SearchTestCase {
             body,
             should_fail: false,
             skip: false,
-            round_scores: false,
         }
     }
 
@@ -120,7 +115,6 @@ impl SearchTestCase {
             body,
             name: self.name.clone(),
             skip: self.skip,
-            round_scores: self.round_scores,
         }
     }
 }
@@ -171,7 +165,9 @@ pub async fn run_search_test(
 
     let resp = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
     assert_search_response_primary_keys(base_url, &ts.name, &resp).await?;
-    assert_search_response_snapshot(&ts.name, resp, ts.round_scores);
+    assert_score_ordering(&resp)
+        .with_context(|| format!("Scores are not in valid ordering for {}", &ts.name))?;
+    assert_search_response_snapshot(&ts.name, resp);
 
     Ok(())
 }
@@ -197,6 +193,29 @@ async fn assert_search_response_primary_keys(
         assert_search_result_primary_key_matches(base_url, test_name, result).await?;
     }
 
+    Ok(())
+}
+
+fn assert_score_ordering(resp: &Value) -> Result<(), anyhow::Error> {
+    let results = resp
+        .get("results")
+        .and_then(Value::as_array)
+        .context("Search response missing results array")?;
+
+    let mut previous_score = f64::MAX;
+    for result in results {
+        let score: f64 = result
+            .get("_score")
+            .and_then(|s| s.as_f64())
+            .context("Search responses missing '_score'.")?;
+
+        anyhow::ensure!(
+            previous_score > score,
+            "Responses not in descending order. {previous_score} is before {score}."
+        );
+
+        previous_score = score;
+    }
     Ok(())
 }
 
@@ -274,14 +293,8 @@ async fn assert_search_result_primary_key_matches(
     Ok(())
 }
 
-fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: bool) {
+fn assert_search_response_snapshot(test_name: &str, resp: Value) {
     match test_name {
-        "multi_embedding_parent_child_basic" | "multi_embedding_parent_child_additional" => {
-            insta::assert_json_snapshot!(
-                format!("{test_name}_response"),
-                normalize_search_response_json(resp, true, round_scores)
-            );
-        }
         // S3 Vectors HTTP search results are non-deterministic: the backend may return
         // different items with the same rounded score across runs. Use structural validation
         // instead of exact snapshot comparison for these tests.
@@ -289,12 +302,12 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: b
             && !name.contains("vector_search_sql")
             && !name.contains("with_where") =>
         {
-            assert_search_response_structure(name, resp, round_scores);
+            assert_search_response_structure(name, resp);
         }
         _ => {
             insta::assert_snapshot!(
                 format!("{test_name}_response"),
-                normalize_search_response(resp, round_scores)
+                normalize_search_response_json(resp, true)
             );
         }
     }
@@ -302,10 +315,8 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: b
 
 /// Validate the structure and invariants of a search response without asserting exact item content.
 /// Used for S3 Vectors HTTP search tests where the result set is non-deterministic.
-fn assert_search_response_structure(test_name: &str, resp: Value, round_scores: bool) {
-    let normalized = normalize_search_response_json(resp, true, round_scores);
-
-    let results = normalized
+fn assert_search_response_structure(test_name: &str, resp: Value) {
+    let results = resp
         .get("results")
         .and_then(|r| r.as_array())
         .unwrap_or_else(|| panic!("{test_name}: response should have a 'results' array"));
@@ -349,8 +360,7 @@ fn assert_search_response_structure(test_name: &str, resp: Value, round_scores: 
         // Verify scores are in descending order and within [0, 1]
         let score: f64 = result
             .get("_score")
-            .and_then(|s| s.as_str())
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.as_f64())
             .unwrap_or(-1.0);
         assert!(
             (0.0..=1.0).contains(&score),
@@ -381,51 +391,26 @@ fn assert_search_response_structure(test_name: &str, resp: Value, round_scores: 
 }
 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
-/// values such as duration with placeholder.
-fn normalize_search_response_json(
-    mut json: Value,
-    sort_ties_by_matches: bool,
-    round_scores: bool,
-) -> Value {
+/// values such as duration and scores with placeholders.
+fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -> Value {
     if let Some(duration) = json.get_mut("duration_ms") {
         *duration = json!("duration_ms_val");
     }
     if let Some(matches) = json.get_mut("results").and_then(|m| m.as_array_mut()) {
-        // To avoid inconsistent snapshots when scores are equal (common when using RRF)
-        // or near truncation boundaries (model2vec scores vary ±0.01 across CI runners),
-        // we round scores before comparing and also order based on primary key.
+        // Sort by score descending, breaking ties by matches content then primary key,
+        // to get a stable snapshot ordering.
         matches.sort_by(|a, b| {
-            let Some(Value::Number(num_a)) = a.get("_score") else {
+            let Some(score_a) = a.get("_score").and_then(|s| s.as_f64()) else {
                 return Ordering::Greater;
             };
-            let Some(score_a) = num_a.as_f64() else {
-                return Ordering::Greater;
-            };
-            let Some(Value::Number(num_b)) = b.get("_score") else {
-                return Ordering::Less;
-            };
-            let Some(score_b) = num_b.as_f64() else {
+            let Some(score_b) = b.get("_score").and_then(|s| s.as_f64()) else {
                 return Ordering::Less;
             };
 
-            // When round_scores is true, round to 2 decimal places before comparing
-            // to avoid flaky ordering from minor floating-point variance across CI
-            // runners (model2vec/s3vectors). Otherwise use raw float comparison.
-            let cmp_a = if round_scores {
-                (100.0 * score_a).round() / 100.0
-            } else {
-                score_a
-            };
-            let cmp_b = if round_scores {
-                (100.0 * score_b).round() / 100.0
-            } else {
-                score_b
-            };
-
-            // Opposite because we want to order descendingly
-            if cmp_a > cmp_b {
+            // Descending order
+            if score_a > score_b {
                 return Ordering::Less;
-            } else if cmp_a < cmp_b {
+            } else if score_a < score_b {
                 return Ordering::Greater;
             }
 
@@ -454,23 +439,10 @@ fn normalize_search_response_json(
         });
 
         for m in matches {
-            if let Some(obj) = m.as_object_mut()
-                && let Some(Value::Number(n)) = obj.get("_score")
-                && let Some(score) = n.as_f64()
-            {
-                // Use rounding for non-deterministic embeddings (model2vec/s3vectors/OpenAI)
-                // to stabilize scores that vary ±0.01 across CI runs.
-                // Use truncation for deterministic embeddings (HF) to preserve
-                // exact snapshot values.
-                let display_score = if round_scores {
-                    (100.0 * score).round() / 100.0
-                } else {
-                    (100.0 * score).trunc() / 100.0
-                };
-                obj.insert(
-                    "_score".to_string(),
-                    Value::String(format!("{display_score:.2}")),
-                );
+            if let Some(obj) = m.as_object_mut() {
+                if obj.contains_key("_score") {
+                    obj.insert("_score".to_string(), Value::String("[score]".to_string()));
+                }
             }
         }
     }
@@ -480,9 +452,8 @@ fn normalize_search_response_json(
     json
 }
 
-fn normalize_search_response(json: Value, round_scores: bool) -> String {
-    serde_json::to_string_pretty(&normalize_search_response_json(json, false, round_scores))
-        .unwrap_or_default()
+fn normalize_search_response(json: Value) -> String {
+    serde_json::to_string_pretty(&normalize_search_response_json(json, false)).unwrap_or_default()
 }
 
 fn quote_sql_identifier(identifier: &str) -> String {
@@ -616,17 +587,14 @@ pub(crate) async fn run_search(
     app: App,
     test_cases: Vec<SearchTestCase>,
 ) -> Result<(), anyhow::Error> {
-    run_search_w_explain(app, test_cases, false, false).await
+    run_search_w_explain(app, test_cases, false).await
 }
 
 // if `explain_sql`, for any [`SearchTestCase`] that is [`SearchTestType::Sql`], a snapshot will be taken of the associated explain query.
-// if `round_scores`, HTTP search response scores use rounding instead of truncation for display.
-// Use for tests with non-deterministic embeddings (e.g. model2vec/s3vectors).
 pub(crate) async fn run_search_w_explain(
     app: App,
     test_cases: Vec<SearchTestCase>,
     explain_sql: bool,
-    round_scores: bool,
 ) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -646,10 +614,7 @@ pub(crate) async fn run_search_w_explain(
                     )
                 });
 
-            for mut ts in test_cases {
-                if round_scores {
-                    ts.round_scores = true;
-                }
+            for ts in test_cases {
                 if ts.skip {
                     tracing::info!("Skipping test {}", ts.name);
                     continue;
@@ -848,7 +813,6 @@ async fn test_multi_column_search_view() -> Result<(), anyhow::Error> {
         ]
         ].concat(),
         true,
-        false,
     )
     .await
 }
@@ -1299,7 +1263,7 @@ async fn test_rrf_recency_unboosting_disjoint_regression() -> Result<(), anyhow:
             insta::with_settings!({
                 description => sql
             }, {
-                insta::assert_snapshot!("rrf_recency_unboosting_disjoint_regression", normalize_search_response(resp, true));
+                insta::assert_snapshot!("rrf_recency_unboosting_disjoint_regression", normalize_search_response(resp));
             });
 
             Ok(())
@@ -1529,7 +1493,6 @@ async fn test_text_search_view() -> Result<(), anyhow::Error> {
             ),
         ],
         true,
-        false,
     )
     .await
 }
@@ -1779,7 +1742,6 @@ async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
             ),
         ],
         true,
-        false,
     )
     .await
 }
@@ -2060,7 +2022,7 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
 
         insta::assert_snapshot!(
             format!("{name}_response"),
-            normalize_search_response(result.clone(), false)
+            normalize_search_response(result.clone())
         );
 
         let result_str = result

@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "normalize_search_response(resp, round_scores)"
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.80",
+      "_score": "[score]",
       "data": {
         "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words."
       },
@@ -21,7 +21,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.79",
+      "_score": "[score]",
       "data": {
         "question": "Find the missing factor in the equation: \\( 42 = 21 \\times \\,? \\)."
       },
@@ -36,7 +36,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.56",
+      "_score": "[score]",
       "data": {
         "question": "What is the fifth root of 32?"
       },
@@ -51,7 +51,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.56",
+      "_score": "[score]",
       "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },

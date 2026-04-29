@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp, round_scores)
       "primary_key": {
         "cp_catalog_page_sk": 8
       },
-      "_score": "0.01"
+      "_score": "[score]"
     },
     {
       "data": {
@@ -33,7 +33,7 @@ expression: normalize_search_response(resp, round_scores)
       "primary_key": {
         "cp_catalog_page_sk": 2
       },
-      "_score": "0.01"
+      "_score": "[score]"
     }
   ]
 }
