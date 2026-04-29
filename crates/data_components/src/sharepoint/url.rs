@@ -121,14 +121,15 @@ impl SharepointUrl {
         let (drive, remaining_encoded) = match kind {
             "me" => (DriveRef::Me, path_segments.as_slice()),
             "drives" | "sites" | "users" | "groups" => {
-                let (id_encoded, rest) = path_segments
-                    .split_first()
-                    .ok_or_else(|| Error::Malformed {
-                        url: url.to_string(),
-                        reason: format!(
-                            "missing {kind} ID (expected 'sharepoint://{kind}/{{id}}/...')"
-                        ),
-                    })?;
+                let (id_encoded, rest) =
+                    path_segments
+                        .split_first()
+                        .ok_or_else(|| Error::Malformed {
+                            url: url.to_string(),
+                            reason: format!(
+                                "missing {kind} ID (expected 'sharepoint://{kind}/{{id}}/...')"
+                            ),
+                        })?;
                 // Decode the ID segment (e.g. site IDs with commas encoded as %2C).
                 let id = percent_encoding::percent_decode_str(id_encoded)
                     .decode_utf8()
