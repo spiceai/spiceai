@@ -33,9 +33,9 @@ runs:
         # Strip leading 'v' for filename
         FILE_VERSION="${VERSION#v}"
 
-        # Handle rc releases (e.g. 28.0rc1 -> 28.0-rc-1)
+        # Handle rc releases (e.g. 28.0rc1 or 28.0-rc1 -> 28.0-rc-1)
         if [[ "${FILE_VERSION}" == *rc* ]]; then
-          FILE_VERSION=$(echo "${FILE_VERSION}" | sed 's/rc/-rc-/')
+          FILE_VERSION=$(echo "${FILE_VERSION}" | sed -E 's/-?rc([0-9]+)$/-rc-\1/')
         fi
 
         # Determine OS
