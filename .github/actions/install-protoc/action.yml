@@ -113,10 +113,19 @@ runs:
 
         # Determine architecture
         $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLower()
-        if ($Arch -eq "x64") {
-          $ArchSuffix = "64"
-        } else {
-          $ArchSuffix = "32"
+        switch ($Arch) {
+          "x64" {
+            $ArchSuffix = "64"
+          }
+          "x86" {
+            $ArchSuffix = "32"
+          }
+          "arm64" {
+            throw "Failed to install protoc for Windows architecture '${Arch}': No supported protoc release asset is configured for this architecture. Use an x64 Windows runner or update this action to map arm64 to a verified upstream asset."
+          }
+          default {
+            throw "Failed to install protoc for Windows architecture '${Arch}': Unsupported architecture. Supported Windows architectures are x64 and x86."
+          }
         }
 
         $Filename = "protoc-${FileVersion}-win${ArchSuffix}.zip"
