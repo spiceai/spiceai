@@ -33,6 +33,7 @@ limitations under the License.
 )]
 
 use object_store::path::Path;
+use percent_encoding::percent_decode_str;
 use snafu::Snafu;
 use url::Url;
 
@@ -109,12 +110,24 @@ impl SharepointUrl {
             reason: "missing authority".to_string(),
         })?;
 
-        // `url::Url::path_segments()` already yields percent-decoded UTF-8 strings,
-        // so no further decoding is needed.
-        let path_segments: Vec<&str> = url
+        // URL segments are percent-encoded; decode them so IDs containing
+        // `,` (site IDs) and paths containing spaces round-trip correctly.
+        let path_segments: Vec<String> = url
             .path_segments()
-            .map(|s| s.filter(|seg| !seg.is_empty()).collect())
-            .unwrap_or_default();
+            .map(|s| {
+                s.filter(|seg| !seg.is_empty())
+                    .map(|seg| {
+                        percent_decode_str(seg)
+                            .decode_utf8()
+                            .map(|s| s.into_owned())
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .unwrap_or_else(|| Ok(vec![]))
+            .map_err(|_| Error::Malformed {
+                url: url.to_string(),
+                reason: "path segment contains invalid UTF-8 after percent-decoding".to_string(),
+            })?;
 
         let (drive, remaining) = match kind {
             "me" => (DriveRef::Me, path_segments.as_slice()),
@@ -128,10 +141,10 @@ impl SharepointUrl {
                         ),
                     })?;
                 let drive = match kind {
-                    "drives" => DriveRef::Drive((*id).to_string()),
-                    "sites" => DriveRef::Site((*id).to_string()),
-                    "users" => DriveRef::User((*id).to_string()),
-                    "groups" => DriveRef::Group((*id).to_string()),
+                    "drives" => DriveRef::Drive(id.clone()),
+                    "sites" => DriveRef::Site(id.clone()),
+                    "users" => DriveRef::User(id.clone()),
+                    "groups" => DriveRef::Group(id.clone()),
                     _ => unreachable!(),
                 };
                 (drive, rest)
@@ -149,7 +162,7 @@ impl SharepointUrl {
         let item_path = if remaining.is_empty() {
             Path::from("")
         } else {
-            remaining.iter().copied().collect::<Path>()
+            remaining.iter().map(String::as_str).collect::<Path>()
         };
 
         Ok(Self { drive, item_path })
