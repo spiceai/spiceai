@@ -33,7 +33,6 @@ limitations under the License.
 )]
 
 use object_store::path::Path;
-use percent_encoding::percent_decode_str;
 use snafu::Snafu;
 use url::Url;
 
@@ -110,29 +109,19 @@ impl SharepointUrl {
             reason: "missing authority".to_string(),
         })?;
 
-        // URL segments are percent-encoded; decode them so IDs containing
-        // `,` (site IDs) and paths containing spaces round-trip correctly.
-        let path_segments: Vec<String> = url
+        // `path_segments()` yields raw percent-encoded strings. We need the
+        // ID segment decoded (site IDs contain commas that are percent-encoded
+        // in the URL) but the item path is built via `Path::from_url_path`
+        // which handles decoding correctly without double-encoding.
+        let path_segments: Vec<&str> = url
             .path_segments()
-            .map(|s| {
-                s.filter(|seg| !seg.is_empty())
-                    .map(|seg| {
-                        percent_decode_str(seg)
-                            .decode_utf8()
-                            .map(|s| s.into_owned())
-                    })
-                    .collect::<std::result::Result<Vec<_>, _>>()
-            })
-            .unwrap_or_else(|| Ok(vec![]))
-            .map_err(|_| Error::Malformed {
-                url: url.to_string(),
-                reason: "path segment contains invalid UTF-8 after percent-decoding".to_string(),
-            })?;
+            .map(|s| s.filter(|seg| !seg.is_empty()).collect())
+            .unwrap_or_default();
 
-        let (drive, remaining) = match kind {
+        let (drive, remaining_encoded) = match kind {
             "me" => (DriveRef::Me, path_segments.as_slice()),
             "drives" | "sites" | "users" | "groups" => {
-                let (id, rest) = path_segments
+                let (id_encoded, rest) = path_segments
                     .split_first()
                     .ok_or_else(|| Error::Malformed {
                         url: url.to_string(),
@@ -140,11 +129,20 @@ impl SharepointUrl {
                             "missing {kind} ID (expected 'sharepoint://{kind}/{{id}}/...')"
                         ),
                     })?;
+                // Decode the ID segment (e.g. site IDs with commas encoded as %2C).
+                let id = percent_encoding::percent_decode_str(id_encoded)
+                    .decode_utf8()
+                    .map_err(|_| Error::Malformed {
+                        url: url.to_string(),
+                        reason: "drive ID contains invalid UTF-8 after percent-decoding"
+                            .to_string(),
+                    })?
+                    .into_owned();
                 let drive = match kind {
-                    "drives" => DriveRef::Drive(id.clone()),
-                    "sites" => DriveRef::Site(id.clone()),
-                    "users" => DriveRef::User(id.clone()),
-                    "groups" => DriveRef::Group(id.clone()),
+                    "drives" => DriveRef::Drive(id),
+                    "sites" => DriveRef::Site(id),
+                    "users" => DriveRef::User(id),
+                    "groups" => DriveRef::Group(id),
                     _ => unreachable!(),
                 };
                 (drive, rest)
@@ -159,10 +157,19 @@ impl SharepointUrl {
             }
         };
 
-        let item_path = if remaining.is_empty() {
+        // Build the item path from the raw percent-encoded segments joined by '/'.
+        // `Path::from_url_path` decodes percent-encoding into the raw field so
+        // that `as_ref()` returns the decoded string (e.g. "Shared Documents/..."),
+        // avoiding the double-encode that would occur if we decoded first and then
+        // collected into a `Path` via `FromIterator`.
+        let item_path = if remaining_encoded.is_empty() {
             Path::from("")
         } else {
-            remaining.iter().map(String::as_str).collect::<Path>()
+            let joined = remaining_encoded.join("/");
+            Path::from_url_path(&joined).map_err(|e| Error::Malformed {
+                url: url.to_string(),
+                reason: format!("invalid item path: {e}"),
+            })?
         };
 
         Ok(Self { drive, item_path })
