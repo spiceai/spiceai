@@ -2,7 +2,7 @@
 import os
 import sys
 import unittest
-from unittest import mock
+import unittest.mock
 
 # github_release exits at import time if GITHUB_TOKEN is missing.
 os.environ.setdefault("GITHUB_TOKEN", "test-token")
@@ -25,20 +25,20 @@ class FakeResponse:
 
 
 class GetReleaseByTagTests(unittest.TestCase):
-    @mock.patch("github_release.requests.get")
+    @unittest.mock.patch("github_release.requests.get")
     def test_returns_release_dict_on_200(self, mock_get):
         release = {"id": 1, "assets": [], "upload_url": "https://example/{?name,label}"}
         mock_get.return_value = FakeResponse(200, release)
 
         self.assertEqual(github_release.getReleaseByTag("o", "r", "v1.0"), release)
 
-    @mock.patch("github_release.requests.get")
+    @unittest.mock.patch("github_release.requests.get")
     def test_returns_none_on_404(self, mock_get):
         mock_get.return_value = FakeResponse(404, {"message": "Not Found"})
 
         self.assertIsNone(github_release.getReleaseByTag("o", "r", "v1.0"))
 
-    @mock.patch("github_release.requests.get")
+    @unittest.mock.patch("github_release.requests.get")
     def test_returns_none_on_5xx(self, mock_get):
         # Regression for #6566: a 5xx response previously fell through to
         # callers, which would then crash on KeyError("assets").
@@ -46,13 +46,13 @@ class GetReleaseByTagTests(unittest.TestCase):
 
         self.assertIsNone(github_release.getReleaseByTag("o", "r", "v1.0"))
 
-    @mock.patch("github_release.requests.get")
+    @unittest.mock.patch("github_release.requests.get")
     def test_returns_none_on_rate_limit(self, mock_get):
         mock_get.return_value = FakeResponse(403, {"message": "rate limit exceeded"})
 
         self.assertIsNone(github_release.getReleaseByTag("o", "r", "v1.0"))
 
-    @mock.patch("github_release.requests.get")
+    @unittest.mock.patch("github_release.requests.get")
     def test_returns_none_when_error_body_is_not_json(self, mock_get):
         mock_get.return_value = FakeResponse(502, json_data=None, text="Bad Gateway")
 
@@ -61,15 +61,15 @@ class GetReleaseByTagTests(unittest.TestCase):
 
 class ActionDeleteTests(unittest.TestCase):
     def _args(self, artifacts=None):
-        return mock.Mock(
+        return unittest.mock.Mock(
             owner="o",
             repo="r",
             tag="v1.0",
             artifact=artifacts or ["./release/x.tar.gz"],
         )
 
-    @mock.patch("github_release.deleteAsset")
-    @mock.patch("github_release.getReleaseByTag")
+    @unittest.mock.patch("github_release.deleteAsset")
+    @unittest.mock.patch("github_release.getReleaseByTag")
     def test_no_release_skips_silently(self, mock_get, mock_delete):
         mock_get.return_value = None
 
@@ -77,8 +77,8 @@ class ActionDeleteTests(unittest.TestCase):
 
         mock_delete.assert_not_called()
 
-    @mock.patch("github_release.deleteAsset")
-    @mock.patch("github_release.getReleaseByTag")
+    @unittest.mock.patch("github_release.deleteAsset")
+    @unittest.mock.patch("github_release.getReleaseByTag")
     def test_release_without_assets_key_does_not_raise(self, mock_get, mock_delete):
         # Regression for #6566: the release payload occasionally arrives
         # without an "assets" key, which previously raised KeyError mid-loop
@@ -89,8 +89,8 @@ class ActionDeleteTests(unittest.TestCase):
 
         mock_delete.assert_not_called()
 
-    @mock.patch("github_release.deleteAsset")
-    @mock.patch("github_release.getReleaseByTag")
+    @unittest.mock.patch("github_release.deleteAsset")
+    @unittest.mock.patch("github_release.getReleaseByTag")
     def test_release_with_empty_assets(self, mock_get, mock_delete):
         mock_get.return_value = {"id": 1, "assets": []}
 
@@ -98,8 +98,8 @@ class ActionDeleteTests(unittest.TestCase):
 
         mock_delete.assert_not_called()
 
-    @mock.patch("github_release.deleteAsset")
-    @mock.patch("github_release.getReleaseByTag")
+    @unittest.mock.patch("github_release.deleteAsset")
+    @unittest.mock.patch("github_release.getReleaseByTag")
     def test_release_with_matching_asset_is_deleted(self, mock_get, mock_delete):
         mock_get.return_value = {
             "id": 1,
@@ -113,8 +113,8 @@ class ActionDeleteTests(unittest.TestCase):
 
         mock_delete.assert_called_once_with("o", "r", 100)
 
-    @mock.patch("github_release.deleteAsset")
-    @mock.patch("github_release.getReleaseByTag")
+    @unittest.mock.patch("github_release.deleteAsset")
+    @unittest.mock.patch("github_release.getReleaseByTag")
     def test_release_with_no_matching_asset_does_not_delete(self, mock_get, mock_delete):
         mock_get.return_value = {
             "id": 1,
