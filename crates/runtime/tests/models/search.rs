@@ -307,7 +307,8 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value) {
         _ => {
             insta::assert_snapshot!(
                 format!("{test_name}_response"),
-                normalize_search_response_json(resp, true)
+                serde_json::to_string_pretty(&normalize_search_response_json(resp, true))
+                    .unwrap_or_default()
             );
         }
     }
