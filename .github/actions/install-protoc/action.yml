@@ -20,7 +20,7 @@ runs:
 
         # Determine version
         if [ -z "${INPUT_VERSION}" ]; then
-          VERSION=$(curl -fsSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest | grep '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
+          VERSION=$(curl -fsSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest | jq -r '.tag_name')
         else
           VERSION="${INPUT_VERSION}"
         fi
