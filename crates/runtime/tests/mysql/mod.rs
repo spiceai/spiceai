@@ -596,14 +596,14 @@ async fn init_mysql_zero_date_db(port: u16) -> Result<(), anyhow::Error> {
 
 /// Validates the new `mysql_zero_date_behavior` connector parameter for both modes.
 ///
-/// Regression coverage for the customer-reported failure on Aurora MySQL tables that have
+/// Regression coverage for the customer-reported failure on Aurora `MySQL` tables that have
 /// `TIMESTAMP NOT NULL DEFAULT '0000-00-00 00:00:00'` columns containing zero-date rows:
 ///
 /// * Default (`null`) — zero dates coerce to Arrow NULL; the schema reports the temporal
 ///   columns as nullable so `RecordBatch` validation passes.
 /// * `error` — the scan fails with a clear, column-named error referencing the parameter.
 /// * `error` + a predicate that filters out the zero-date row succeeds (predicate pushdown
-///   into MySQL means the bad row never reaches the row decoder).
+///   into `MySQL` means the bad row never reaches the row decoder).
 #[tokio::test]
 async fn mysql_zero_date_test() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -670,7 +670,10 @@ async fn mysql_zero_date_test() -> Result<(), String> {
                 Some(Box::new(
                     |result_batches: Vec<arrow::array::RecordBatch>| {
                         assert_eq!(
-                            result_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                            result_batches
+                                .iter()
+                                .map(arrow::array::RecordBatch::num_rows)
+                                .sum::<usize>(),
                             3,
                             "null mode should return all 3 rows"
                         );
@@ -680,19 +683,22 @@ async fn mysql_zero_date_test() -> Result<(), String> {
                         assert!(
                             schema
                                 .field_with_name("date_created")
-                                .unwrap()
+                                .expect("date_created field exists in result schema")
                                 .is_nullable(),
                             "date_created should be nullable in null mode"
                         );
                         assert!(
                             schema
                                 .field_with_name("date_modified")
-                                .unwrap()
+                                .expect("date_modified field exists in result schema")
                                 .is_nullable(),
                             "date_modified should be nullable in null mode"
                         );
                         assert!(
-                            !schema.field_with_name("name").unwrap().is_nullable(),
+                            !schema
+                                .field_with_name("name")
+                                .expect("name field exists in result schema")
+                                .is_nullable(),
                             "non-temporal NOT NULL columns must NOT be widened"
                         );
 
@@ -757,7 +763,10 @@ async fn mysql_zero_date_test() -> Result<(), String> {
                 Some(Box::new(
                     |result_batches: Vec<arrow::array::RecordBatch>| {
                         assert_eq!(
-                            result_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                            result_batches
+                                .iter()
+                                .map(arrow::array::RecordBatch::num_rows)
+                                .sum::<usize>(),
                             2,
                             "error-mode + predicate-pushdown should return the 2 non-zero rows"
                         );
@@ -766,14 +775,14 @@ async fn mysql_zero_date_test() -> Result<(), String> {
                         assert!(
                             !schema
                                 .field_with_name("date_created")
-                                .unwrap()
+                                .expect("date_created field exists in result schema")
                                 .is_nullable(),
                             "date_created should NOT be widened in error mode"
                         );
                         assert!(
                             !schema
                                 .field_with_name("date_modified")
-                                .unwrap()
+                                .expect("date_modified field exists in result schema")
                                 .is_nullable(),
                             "date_modified should NOT be widened in error mode"
                         );
