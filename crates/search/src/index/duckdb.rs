@@ -604,7 +604,7 @@ fn run_duckdb_vector_query(
 
     let table_name = resolve_current_table_name(&context.table_definition, conn)?;
 
-    let query_result = (|| -> DataFusionResult<Vec<RecordBatch>> {
+    (|| -> DataFusionResult<Vec<RecordBatch>> {
         let sql = exec.sql(&table_name, query_vector)?;
         tracing::debug!(
             table_name = %table_name,
@@ -629,9 +629,7 @@ fn run_duckdb_vector_query(
                 .map(normalize_fixed_size_list_field_names)
                 .collect()
         }
-    })();
-
-    query_result
+    })()
 }
 
 fn install_vss_once(conn: &duckdb::Connection) -> DataFusionResult<()> {
