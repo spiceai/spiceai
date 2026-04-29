@@ -63,11 +63,5 @@ pub async fn perform_index_maintenance(
         return Ok(true);
     }
 
-    // Add additional concrete types here as they implement IndexMaintenanceProvider
-    // if let Some(provider) = any.downcast_ref::<SomeOtherType>() {
-    //     provider.perform_maintenance().await?;
-    //     return Ok(true);
-    // }
-
     Ok(false)
 }

@@ -49,5 +49,16 @@ pub trait Index: Debug + Send + Sync + 'static {
         Ok(batches)
     }
 
+    /// Called after data has been written via the [`TableSink`] path (full refresh or append).
+    ///
+    /// Default is a no-op. Implementations use this to create or verify persistent structures
+    /// (e.g. a vector HNSW index) after each write. Using `IF NOT EXISTS` semantics makes it
+    /// safe to call on both overwrite (recreates on new table) and append (no-op if index
+    /// already exists). Not called for CDC writes — those maintain indexes automatically via
+    /// DuckDB VSS on each insert.
+    async fn on_write_complete(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn Any;
 }

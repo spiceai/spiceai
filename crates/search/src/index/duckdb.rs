@@ -19,7 +19,6 @@ use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -63,7 +62,6 @@ use crate::{
     index::{SearchIndex, VectorIndex, embedding_col},
 };
 
-static NEXT_TRANSIENT_INDEX_ID: AtomicU64 = AtomicU64::new(0);
 static VSS_INSTALLED: OnceLock<()> = OnceLock::new();
 static VSS_INSTALL_LOCK: Mutex<()> = Mutex::new(());
 const DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT: usize = 1000;
@@ -173,7 +171,7 @@ impl DuckDBHnswOptions {
         }
 
         format!(
-            "CREATE INDEX {} ON {} USING HNSW ({}) WITH ({})",
+            "CREATE INDEX IF NOT EXISTS {} ON {} USING HNSW ({}) WITH ({})",
             quote_identifier(index_name),
             quote_identifier(table_name),
             quote_identifier(embedding_column),
@@ -231,6 +229,28 @@ impl DuckDBVectorIndex {
             table_definition,
         });
         self
+    }
+
+    /// Creates (or no-ops if already present) the HNSW index for this vector column on
+    /// the given DuckDB table. Loads and installs VSS as needed.
+    fn create_hnsw_index_on_table(
+        &self,
+        table_name: &str,
+        conn: &duckdb::Connection,
+    ) -> DataFusionResult<()> {
+        let embedding_column = embedding_col(&self.embedded_column);
+        install_vss_once(conn)?;
+        conn.execute("LOAD vss", []).map_err(to_execution_error)?;
+        conn.execute("SET hnsw_enable_experimental_persistence = true", [])
+            .map_err(to_execution_error)?;
+        let index_name =
+            DuckDBHnswOptions::index_name_for(table_name, &embedding_column);
+        conn.execute(
+            &self.hnsw.create_index_sql(table_name, &embedding_column, &index_name),
+            [],
+        )
+        .map_err(to_execution_error)?;
+        Ok(())
     }
 
     fn query_result_schema(&self) -> Result<SchemaRef, DataFusionError> {
@@ -345,6 +365,28 @@ impl Index for DuckDBVectorIndex {
             .into_iter()
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
+    }
+
+    /// Creates (or verifies existence of) the HNSW index on the current underlying table
+    /// after a full refresh completes. For CDC/append datasets the index is created once at
+    /// init time; DuckDB VSS maintains it automatically on subsequent inserts.
+    async fn on_write_complete(&self) -> DataFusionResult<()> {
+        let Some(ctx) = &self.query_context else {
+            return Ok(());
+        };
+        let index = self.clone();
+        let ctx = ctx.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut db_conn = Arc::clone(&ctx.pool)
+                .connect_sync()
+                .map_err(to_execution_error)?;
+            let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_execution_error)?;
+            let table_name =
+                resolve_current_table_name(&ctx.table_definition, &duckdb_conn.conn)?;
+            index.create_hnsw_index_on_table(&table_name, &duckdb_conn.conn)
+        })
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("HNSW index creation task failed: {e}")))?
     }
 }
 
@@ -553,8 +595,6 @@ fn run_duckdb_vector_query(
 
     install_vss_once(conn)?;
     conn.execute("LOAD vss", []).map_err(to_execution_error)?;
-    conn.execute("SET hnsw_enable_experimental_persistence = true", [])
-        .map_err(to_execution_error)?;
     match exec.hnsw.hnsw_ef_search {
         Some(ef_search) => conn
             .execute(&format!("SET hnsw_ef_search = {ef_search}"), [])
@@ -565,21 +605,6 @@ fn run_duckdb_vector_query(
     };
 
     let table_name = resolve_current_table_name(&context.table_definition, conn)?;
-    let index_name = format!(
-        "{}_{}",
-        DuckDBHnswOptions::index_name_for(&table_name, &exec.embedded_column),
-        NEXT_TRANSIENT_INDEX_ID.fetch_add(1, Ordering::Relaxed)
-    );
-    let drop_index_sql = format!("DROP INDEX IF EXISTS {}", quote_identifier(&index_name));
-    conn.execute(&drop_index_sql, [])
-        .map_err(to_execution_error)?;
-    conn.execute(
-        &exec
-            .hnsw
-            .create_index_sql(&table_name, &exec.embedded_column, &index_name),
-        [],
-    )
-    .map_err(to_execution_error)?;
 
     let query_result = (|| -> DataFusionResult<Vec<RecordBatch>> {
         let sql = exec.sql(&table_name, query_vector)?;
@@ -607,10 +632,6 @@ fn run_duckdb_vector_query(
                 .collect()
         }
     })();
-
-    if let Err(error) = conn.execute(&drop_index_sql, []) {
-        tracing::warn!("Failed to drop transient DuckDB VSS index '{index_name}': {error}");
-    }
 
     query_result
 }
@@ -1027,7 +1048,7 @@ mod tests {
 
         assert_eq!(
             options.create_index_sql("docs", "body_embedding", "idx_docs_embedding"),
-            "CREATE INDEX idx_docs_embedding ON docs USING HNSW (body_embedding) WITH (metric = 'l2sq', m = 24, ef_construction = 96)"
+            "CREATE INDEX IF NOT EXISTS idx_docs_embedding ON docs USING HNSW (body_embedding) WITH (metric = 'l2sq', m = 24, ef_construction = 96)"
         );
     }
 

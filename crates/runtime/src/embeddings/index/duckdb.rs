@@ -212,6 +212,11 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
         )));
     };
 
+    // Exclude Spice-managed HNSW indexes from the DuckDB writer's index drift check.
+    // These indexes are created externally (after each refresh) and are not registered
+    // in the TableDefinition configuration.
+    table_definition.add_ignored_index_prefix("__spice_vss_");
+
     let mut provider = if let Some(indexed) = accelerator_provider
         .as_any()
         .downcast_ref::<IndexedTableProvider>()
@@ -234,6 +239,18 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
         )
         .await?
         .with_query_context(Arc::clone(&pool), Arc::clone(&table_definition));
+
+        // For CDC/append datasets the HNSW index is created here at init time so it exists
+        // before any CDC writes arrive. DuckDB VSS then auto-maintains it on each insert.
+        // For full-refresh (overwrite) datasets this may be a no-op (the table may be empty
+        // or not yet exist); the index is (re)created after each refresh via `on_write_complete`.
+        if let Err(e) = vector_index.on_write_complete().await {
+            tracing::debug!(
+                table = %tbl,
+                column = %vector_index.embedded_column,
+                "HNSW index not created at init time: {e}. Will be created after the first refresh."
+            );
+        }
 
         provider = provider.add_index(Arc::new(vector_index) as Arc<dyn Index>);
     }
