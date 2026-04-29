@@ -23,6 +23,7 @@ use crate::context::RuntimeContext;
 use crate::error::{InvalidArgumentSnafu, Result};
 use crate::output::{OutputFormat, TableOutput, write_json};
 use clap::{Args, Subcommand};
+use std::fmt;
 use snafu::ResultExt;
 
 pub use client::CloudClient;
@@ -131,7 +132,7 @@ pub struct RegionsArgs {
     pub output: OutputFormat,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct LoginArgs {
     /// Skip opening the browser and print the auth URL instead
     #[arg(long)]
@@ -144,6 +145,19 @@ pub struct LoginArgs {
     /// OAuth2 client secret (env: SPICE_CLIENT_SECRET)
     #[arg(long, env = "SPICE_CLIENT_SECRET")]
     pub client_secret: Option<String>,
+}
+
+impl fmt::Debug for LoginArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoginArgs")
+            .field("no_browser", &self.no_browser)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_deref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Args, Debug)]

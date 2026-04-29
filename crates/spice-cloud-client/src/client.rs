@@ -106,7 +106,7 @@ impl CloudClient {
     pub fn get_auth_url(&self, auth_code: &str) -> String {
         format!(
             "{}/v1/auth/device?code={}",
-            self.base_url.replace("api.", ""),
+            self.oauth_base_url(),
             auth_code
         )
     }
@@ -143,13 +143,24 @@ impl CloudClient {
         Ok(Some(body))
     }
 
-    /// Exchange OAuth2 client credentials for an access token.
+    /// Returns the base URL for OAuth endpoints by stripping the `api.` subdomain.
+    /// For example, `https://api.spice.ai` → `https://spice.ai`,
+    /// and `https://dev-api.spice.ai` → `https://dev.spice.ai`.
+    fn oauth_base_url(&self) -> String {
+        if self.base_url.contains("//api.") {
+            self.base_url.replacen("//api.", "//", 1)
+        } else {
+            self.base_url.replacen("-api.", ".", 1)
+        }
+    }
+
+    /// Exchange `OAuth2` client credentials for an access token.
     pub async fn exchange_client_credentials(
         &self,
         client_id: &str,
         client_secret: &str,
     ) -> Result<OAuthTokenResponse> {
-        let url = format!("{}/api/oauth/token", self.base_url.replace("api.", ""));
+        let url = format!("{}/api/oauth/token", self.oauth_base_url());
         let body = OAuthTokenRequest {
             client_id: client_id.to_string(),
             client_secret: client_secret.to_string(),
