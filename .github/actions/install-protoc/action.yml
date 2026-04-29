@@ -1,20 +1,136 @@
 name: Install protoc
-description: 'Install the protoc compiler via system package manager'
+description: 'Install the protoc compiler from GitHub releases for consistent versions across platforms'
+
+inputs:
+  version:
+    description: 'Version of protoc to install (e.g. "v29.3"). If empty, installs the latest release.'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
   steps:
-    - name: Install protoc (Linux)
-      if: runner.os == 'Linux'
+    - name: Determine version and download protoc (Linux/macOS)
+      if: runner.os != 'Windows'
       shell: bash
-      run: sudo apt-get install -y protobuf-compiler
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
 
-    - name: Install protoc (macOS)
-      if: runner.os == 'macOS'
-      shell: bash
-      run: brew install protobuf
+        # Determine version
+        if [ -z "${INPUT_VERSION}" ]; then
+          VERSION=$(curl -fsSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest | grep '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
+        else
+          VERSION="${INPUT_VERSION}"
+        fi
 
-    - name: Install protoc (Windows)
+        # Ensure version starts with 'v'
+        if [[ ! "${VERSION}" =~ ^v ]]; then
+          VERSION="v${VERSION}"
+        fi
+
+        # Strip leading 'v' for filename
+        FILE_VERSION="${VERSION#v}"
+
+        # Handle rc releases (e.g. 28.0rc1 -> 28.0-rc-1)
+        if [[ "${FILE_VERSION}" == *rc* ]]; then
+          FILE_VERSION=$(echo "${FILE_VERSION}" | sed 's/rc/-rc-/')
+        fi
+
+        # Determine OS
+        OS="$(uname -s)"
+        case "${OS}" in
+          Linux)  OS_NAME="linux" ;;
+          Darwin) OS_NAME="osx" ;;
+          *)      echo "Unsupported OS: ${OS}" && exit 1 ;;
+        esac
+
+        # Determine architecture
+        ARCH="$(uname -m)"
+        case "${ARCH}" in
+          x86_64)  ARCH_SUFFIX="x86_64" ;;
+          aarch64) ARCH_SUFFIX="aarch_64" ;;
+          arm64)   ARCH_SUFFIX="aarch_64" ;;
+          s390x)   ARCH_SUFFIX="s390_64" ;;
+          ppc64le) ARCH_SUFFIX="ppcle_64" ;;
+          *)       ARCH_SUFFIX="x86_32" ;;
+        esac
+
+        FILENAME="protoc-${FILE_VERSION}-${OS_NAME}-${ARCH_SUFFIX}.zip"
+        DOWNLOAD_URL="https://github.com/protocolbuffers/protobuf/releases/download/${VERSION}/${FILENAME}"
+
+        echo "Downloading protoc ${VERSION}: ${DOWNLOAD_URL}"
+
+        INSTALL_DIR="${HOME}/.local"
+        mkdir -p "${INSTALL_DIR}"
+
+        TEMP_ZIP="$(mktemp)"
+        curl -fsSL -o "${TEMP_ZIP}" "${DOWNLOAD_URL}"
+        unzip -q -o "${TEMP_ZIP}" -d "${INSTALL_DIR}"
+        rm -f "${TEMP_ZIP}"
+
+        # Ensure the binary is executable
+        chmod +x "${INSTALL_DIR}/bin/protoc"
+
+        # Add to PATH for subsequent steps
+        echo "${INSTALL_DIR}/bin" >> "${GITHUB_PATH}"
+
+        echo "protoc installed: ${INSTALL_DIR}/bin/protoc (${VERSION})"
+        "${INSTALL_DIR}/bin/protoc" --version
+
+    - name: Determine version and download protoc (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
-      run: choco install protobuf -y
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        # Determine version
+        if ([string]::IsNullOrEmpty($env:INPUT_VERSION)) {
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/latest"
+          $Version = $release.tag_name
+        } else {
+          $Version = $env:INPUT_VERSION
+        }
+
+        # Ensure version starts with 'v'
+        if (-not $Version.StartsWith("v")) {
+          $Version = "v$Version"
+        }
+
+        # Strip leading 'v' for filename
+        $FileVersion = $Version.TrimStart("v")
+
+        # Handle rc releases
+        if ($FileVersion -match "rc") {
+          $FileVersion = $FileVersion -replace "rc", "-rc-"
+        }
+
+        # Determine architecture
+        $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLower()
+        if ($Arch -eq "x64") {
+          $ArchSuffix = "64"
+        } else {
+          $ArchSuffix = "32"
+        }
+
+        $Filename = "protoc-${FileVersion}-win${ArchSuffix}.zip"
+        $DownloadUrl = "https://github.com/protocolbuffers/protobuf/releases/download/${Version}/${Filename}"
+
+        Write-Host "Downloading protoc ${Version}: ${DownloadUrl}"
+
+        $InstallDir = "$env:USERPROFILE\.local\protoc"
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+        $TempZip = [System.IO.Path]::GetTempFileName() + ".zip"
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip
+        Expand-Archive -Path $TempZip -DestinationPath $InstallDir -Force
+        Remove-Item -Force $TempZip
+
+        # Add to PATH for subsequent steps
+        "$InstallDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+        Write-Host "protoc installed: $InstallDir\bin\protoc.exe ($Version)"
+        & "$InstallDir\bin\protoc.exe" --version
