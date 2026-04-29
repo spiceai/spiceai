@@ -221,9 +221,10 @@ impl Sharepoint {
             let fps = SHAREPOINT_STORE_FINGERPRINTS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(existing) = fps.get(&map_key) {
-                if *existing != fingerprint {
-                    return Err(DataConnectorError::InvalidConfiguration {
+            if let Some(existing) = fps.get(&map_key)
+                && *existing != fingerprint
+            {
+                return Err(DataConnectorError::InvalidConfiguration {
                         dataconnector: CONNECTOR_NAME.to_string(),
                         message: format!(
                             "A SharePoint object store with different credentials or configuration \
@@ -241,7 +242,6 @@ impl Sharepoint {
                             ),
                         )),
                     });
-                }
             }
         }
 
@@ -961,11 +961,11 @@ impl ListingTableConnector for SharepointListingConnector {
             let mut fps = SHAREPOINT_STORE_FINGERPRINTS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !fps.contains_key(&map_key) {
+            fps.entry(map_key).or_insert_with(|| {
                 ctx.runtime_env()
                     .register_object_store(&key_url, self.build_object_store());
-                fps.insert(map_key, fingerprint);
-            }
+                fingerprint
+            });
             return (*ctx).clone();
         }
 
