@@ -25,8 +25,9 @@ use crate::error::{self, HttpRequestSnafu, Result};
 use crate::types::{
     ApiKeysResponse, App, AppsResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
     CreateAppRequest, CreateDeploymentRequest, Deployment, DeploymentsResponse, LogsResponse,
-    MetricsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse,
-    RollbackRequest, Secret, SecretsResponse, SetSecretRequest, UpdateAppRequest,
+    MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, RegenerateApiKeyRequest,
+    RegenerateApiKeyResponse, RegionsResponse, RollbackRequest, Secret, SecretsResponse,
+    SetSecretRequest, UpdateAppRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -140,6 +141,29 @@ impl CloudClient {
 
         let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;
         Ok(Some(body))
+    }
+
+    /// Exchange OAuth2 client credentials for an access token.
+    pub async fn exchange_client_credentials(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<OAuthTokenResponse> {
+        let url = format!("{}/api/oauth/token", self.base_url.replace("api.", ""));
+        let body = OAuthTokenRequest {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+            grant_type: "client_credentials".to_string(),
+        };
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
     }
 
     /// Get the authentication context for the current token.

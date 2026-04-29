@@ -68,6 +68,19 @@ impl CloudClient {
         self.inner.exchange_code(auth_code).await.map_err(into_cli)
     }
 
+    /// Exchange OAuth2 client credentials for an access token.
+    pub async fn exchange_client_credentials(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<String> {
+        self.inner
+            .exchange_client_credentials(client_id, client_secret)
+            .await
+            .map(|r| r.access_token)
+            .map_err(into_cli)
+    }
+
     /// Get the auth context for the current user.
     pub async fn get_auth_context(&self) -> Result<AuthContext> {
         self.inner.get_auth_context().await.map_err(into_cli)

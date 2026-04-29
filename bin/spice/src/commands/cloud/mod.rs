@@ -136,6 +136,14 @@ pub struct LoginArgs {
     /// Skip opening the browser and print the auth URL instead
     #[arg(long)]
     pub no_browser: bool,
+
+    /// OAuth2 client ID (env: SPICE_CLIENT_ID)
+    #[arg(long, env = "SPICE_CLIENT_ID")]
+    pub client_id: Option<String>,
+
+    /// OAuth2 client secret (env: SPICE_CLIENT_SECRET)
+    #[arg(long, env = "SPICE_CLIENT_SECRET")]
+    pub client_secret: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -530,6 +538,51 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
 // ============================================================================
 
 async fn execute_login(args: &LoginArgs) -> Result<()> {
+    match (&args.client_id, &args.client_secret) {
+        (Some(client_id), Some(client_secret)) => {
+            execute_login_client_credentials(client_id, client_secret).await
+        }
+        (Some(_), None) => InvalidArgumentSnafu {
+            message: "--client-secret is required when --client-id is provided",
+        }
+        .fail(),
+        (None, Some(_)) => InvalidArgumentSnafu {
+            message: "--client-id is required when --client-secret is provided",
+        }
+        .fail(),
+        (None, None) => execute_login_device_flow(args).await,
+    }
+}
+
+async fn execute_login_client_credentials(client_id: &str, client_secret: &str) -> Result<()> {
+    use crate::commands::login::merge_auth_config;
+
+    let client = CloudClient::new_unauthenticated()?;
+    let token = client
+        .exchange_client_credentials(client_id, client_secret)
+        .await?;
+
+    merge_auth_config("SPICEAI", &[("TOKEN", &token)])?;
+
+    let authed_client = CloudClient::new()?;
+    if let Ok(context) = authed_client.get_auth_context().await {
+        if let Some(api_key) = context.app_api_key {
+            merge_auth_config("SPICEAI", &[("API_KEY", &api_key)])?;
+        }
+        println!();
+        println!(
+            "\x1b[32m✓ Successfully logged in to Spice Cloud as {} ({})\x1b[0m",
+            context.username, context.email
+        );
+    } else {
+        println!("\n\x1b[32m✓ Successfully logged in to Spice Cloud\x1b[0m");
+    }
+
+    print_post_login_help();
+    Ok(())
+}
+
+async fn execute_login_device_flow(args: &LoginArgs) -> Result<()> {
     use crate::commands::login::merge_auth_config;
     use rand::RngExt;
 
@@ -584,10 +637,8 @@ async fn execute_login(args: &LoginArgs) -> Result<()> {
             }
 
             if let Some(token) = response.access_token {
-                // Save the token
                 merge_auth_config("SPICEAI", &[("TOKEN", &token)])?;
 
-                // Get user info
                 let authed_client = CloudClient::new()?;
                 if let Ok(context) = authed_client.get_auth_context().await {
                     if let Some(api_key) = context.app_api_key {
@@ -602,20 +653,22 @@ async fn execute_login(args: &LoginArgs) -> Result<()> {
                     println!("\n\x1b[32m✓ Successfully logged in to Spice Cloud\x1b[0m");
                 }
 
-                println!();
-                println!(
-                    "You can now use 'spice cloud' commands to manage your apps and deployments."
-                );
-                println!();
-                println!("Quick start:");
-                println!("  spice cloud apps              - List your apps");
-                println!("  spice cloud create app <name> - Create a new app");
-                println!("  spice cloud deploy --app <org/app> - Deploy your app");
-
+                print_post_login_help();
                 return Ok(());
             }
         }
     }
+}
+
+fn print_post_login_help() {
+    println!();
+    println!("You can now use 'spice cloud' commands to manage your apps and deployments.");
+    println!();
+    println!("Quick start:");
+    println!("  spice cloud apps              - List your apps");
+    println!("  spice cloud create app <name> - Create a new app");
+    println!("  spice cloud deploy --app <org/app> - Deploy your app");
+    println!();
 }
 
 fn execute_logout() -> Result<()> {

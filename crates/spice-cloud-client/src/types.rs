@@ -353,6 +353,19 @@ pub struct AuthExchangeResponse {
     pub access_denied: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct OAuthTokenRequest {
+    pub client_id: String,
+    pub client_secret: String,
+    pub grant_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OAuthTokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuthContext {
     pub username: String,
