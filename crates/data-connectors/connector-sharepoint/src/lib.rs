@@ -225,23 +225,23 @@ impl Sharepoint {
                 && *existing != fingerprint
             {
                 return Err(DataConnectorError::InvalidConfiguration {
-                        dataconnector: CONNECTOR_NAME.to_string(),
-                        message: format!(
-                            "A SharePoint object store with different credentials or configuration \
-                             is already registered under '{key_url}'. Two SharePoint datasets with \
-                             different effective config cannot share the same scheme+authority. \
-                             Disambiguate by using a different drive form (e.g. \
-                             sharepoint://sites/{{site-id}} vs sharepoint://drives/{{drive-id}}) \
-                             for one of them, or align the connector params across the datasets."
+                    dataconnector: CONNECTOR_NAME.to_string(),
+                    message: format!(
+                        "A SharePoint object store with different credentials or configuration \
+                         is already registered under '{key_url}'. Two SharePoint datasets with \
+                         different effective config cannot share the same scheme+authority. \
+                         Disambiguate by using a different drive form (e.g. \
+                         sharepoint://sites/{{site-id}} vs sharepoint://drives/{{drive-id}}) \
+                         for one of them, or align the connector params across the datasets."
+                    ),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "registry key '{key_url}' already taken with a different fingerprint"
                         ),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!(
-                                "registry key '{key_url}' already taken with a different fingerprint"
-                            ),
-                        )),
-                    });
+                    )),
+                });
             }
         }
 
