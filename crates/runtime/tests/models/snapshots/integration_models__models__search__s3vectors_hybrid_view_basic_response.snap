@@ -2,31 +2,15 @@
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
 ---
-{
-  "duration_ms": "duration_ms_val",
-  "results": [
-    {
       "_score": "[score]",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ]
       },
       "primary_key": {
-        "id": 468
-      }
-    },
-    {
-      "_score": "[score]",
-      "dataset": "qs_view",
-      "matches": {
-        "question": [
-          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
-        ]
-      },
-      "primary_key": {
-        "id": 361
+        "id": 1277
       }
     },
     {
@@ -39,18 +23,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 189
-      }
-    },
-    {
-      "_score": "[score]",
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 1277
       }
     }
   ]

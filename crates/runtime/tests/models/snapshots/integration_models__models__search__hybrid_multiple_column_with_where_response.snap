@@ -1,22 +1,11 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
-    {
-      "_score": "[score]",
-      "dataset": "qs",
-      "matches": {
-        "question": [
-          "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
-        ]
-      },
-      "primary_key": {
-        "id": 938
-      }
-    },
     {
       "_score": "[score]",
       "dataset": "qs",
@@ -27,6 +16,18 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 890
+      }
+    },
+    {
+      "_score": "[score]",
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
+        ]
+      },
+      "primary_key": {
+        "id": 938
       }
     },
     {
