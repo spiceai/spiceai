@@ -55,7 +55,7 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// (e.g. a vector HNSW index) after each write. Using `IF NOT EXISTS` semantics makes it
     /// safe to call on both overwrite (recreates on new table) and append (no-op if index
     /// already exists). Not called for CDC writes — those maintain indexes automatically via
-    /// DuckDB VSS on each insert.
+    /// `DuckDB` VSS on each insert.
     async fn on_write_complete(&self) -> Result<()> {
         Ok(())
     }
