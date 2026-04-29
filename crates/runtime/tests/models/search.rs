@@ -446,12 +446,10 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
         });
 
         for m in matches {
-            if let Some(obj) = m.as_object_mut()
-                && let Some(Value::Number(n)) = obj.get("_score")
-                && let Some(score) = n.as_f64()
-            {
-                let rounded = (100.0 * score).round() / 100.0;
-                obj.insert("_score".to_string(), Value::String(format!("{rounded:.2}")));
+            if let Some(obj) = m.as_object_mut() {
+                if obj.contains_key("_score") {
+                    obj.insert("_score".to_string(), Value::String("[score]".to_string()));
+                }
             }
         }
     }
