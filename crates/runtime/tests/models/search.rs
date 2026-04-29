@@ -400,6 +400,9 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
     if let Some(matches) = json.get_mut("results").and_then(|m| m.as_array_mut()) {
         // Sort by score descending, breaking ties by matches content then primary key,
         // to get a stable snapshot ordering.
+        // Scores are rounded to 2 decimal places before comparing to absorb ±0.01
+        // variance from non-deterministic embeddings (model2vec/s3vectors/OpenAI)
+        // across CI runners, matching the previous round_scores behaviour.
         matches.sort_by(|a, b| {
             let Some(score_a) = a.get("_score").and_then(|s| s.as_f64()) else {
                 return Ordering::Greater;
@@ -407,6 +410,9 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
             let Some(score_b) = b.get("_score").and_then(|s| s.as_f64()) else {
                 return Ordering::Less;
             };
+
+            let score_a = (100.0 * score_a).round() / 100.0;
+            let score_b = (100.0 * score_b).round() / 100.0;
 
             // Descending order
             if score_a > score_b {
