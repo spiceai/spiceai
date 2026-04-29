@@ -151,9 +151,7 @@ runs:
         $FileVersion = $Version.TrimStart("v")
 
         # Handle rc releases
-        if ($FileVersion -match "rc") {
-          $FileVersion = $FileVersion -replace "rc", "-rc-"
-        }
+        $FileVersion = $FileVersion -replace "-?rc(\d+)$", "-rc-`$1"
 
         # Determine architecture
         $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLower()
