@@ -18,11 +18,21 @@ runs:
       run: |
         set -euo pipefail
 
-        # Determine version
+        # Fetch release metadata
         if [ -z "${INPUT_VERSION}" ]; then
-          VERSION=$(curl -fsSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest | jq -r '.tag_name')
+          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest)
         else
-          VERSION="${INPUT_VERSION}"
+          QUERY_VERSION="${INPUT_VERSION}"
+          if [[ ! "${QUERY_VERSION}" =~ ^v ]]; then
+            QUERY_VERSION="v${QUERY_VERSION}"
+          fi
+          RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/${QUERY_VERSION}")
+        fi
+
+        VERSION=$(echo "${RELEASE_JSON}" | jq -r '.tag_name')
+        if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
+          echo "Failed to determine protoc version from release metadata" >&2
+          exit 1
         fi
 
         # Ensure version starts with 'v'
@@ -63,13 +73,39 @@ runs:
         FILENAME="protoc-${FILE_VERSION}-${OS_NAME}-${ARCH_SUFFIX}.zip"
         DOWNLOAD_URL="https://github.com/protocolbuffers/protobuf/releases/download/${VERSION}/${FILENAME}"
 
+        # Extract expected SHA256 from release metadata
+        EXPECTED_SHA256=$(echo "${RELEASE_JSON}" | jq -r --arg name "${FILENAME}" '.assets[] | select(.name == $name) | .digest' | sed 's/^sha256://')
+        if [ -z "${EXPECTED_SHA256}" ] || [ "${EXPECTED_SHA256}" = "null" ]; then
+          echo "Failed to find SHA256 digest for asset '${FILENAME}' in release metadata" >&2
+          exit 1
+        fi
+
         echo "Downloading protoc ${VERSION}: ${DOWNLOAD_URL}"
+        echo "Expected SHA256: ${EXPECTED_SHA256}"
 
         INSTALL_DIR="${HOME}/.local"
         mkdir -p "${INSTALL_DIR}"
 
         TEMP_ZIP="$(mktemp)"
         curl -fsSL -o "${TEMP_ZIP}" "${DOWNLOAD_URL}"
+
+        # Validate SHA256
+        if command -v sha256sum &>/dev/null; then
+          ACTUAL_SHA256=$(sha256sum "${TEMP_ZIP}" | awk '{print $1}')
+        else
+          # macOS uses shasum
+          ACTUAL_SHA256=$(shasum -a 256 "${TEMP_ZIP}" | awk '{print $1}')
+        fi
+
+        if [ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]; then
+          echo "SHA256 mismatch for ${FILENAME}" >&2
+          echo "  Expected: ${EXPECTED_SHA256}" >&2
+          echo "  Actual:   ${ACTUAL_SHA256}" >&2
+          rm -f "${TEMP_ZIP}"
+          exit 1
+        fi
+        echo "SHA256 verified: ${ACTUAL_SHA256}"
+
         unzip -q -o "${TEMP_ZIP}" -d "${INSTALL_DIR}"
         rm -f "${TEMP_ZIP}"
 
@@ -90,12 +126,20 @@ runs:
       run: |
         $ErrorActionPreference = "Stop"
 
-        # Determine version
+        # Fetch release metadata
         if ([string]::IsNullOrEmpty($env:INPUT_VERSION)) {
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/latest"
-          $Version = $release.tag_name
         } else {
-          $Version = $env:INPUT_VERSION
+          $QueryVersion = $env:INPUT_VERSION
+          if (-not $QueryVersion.StartsWith("v")) {
+            $QueryVersion = "v$QueryVersion"
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/$QueryVersion"
+        }
+
+        $Version = $release.tag_name
+        if ([string]::IsNullOrEmpty($Version)) {
+          throw "Failed to determine protoc version from release metadata"
         }
 
         # Ensure version starts with 'v'
@@ -131,13 +175,30 @@ runs:
         $Filename = "protoc-${FileVersion}-win${ArchSuffix}.zip"
         $DownloadUrl = "https://github.com/protocolbuffers/protobuf/releases/download/${Version}/${Filename}"
 
+        # Extract expected SHA256 from release metadata
+        $asset = $release.assets | Where-Object { $_.name -eq $Filename }
+        if (-not $asset -or [string]::IsNullOrEmpty($asset.digest)) {
+          throw "Failed to find SHA256 digest for asset '${Filename}' in release metadata"
+        }
+        $ExpectedSha256 = $asset.digest -replace '^sha256:', ''
+
         Write-Host "Downloading protoc ${Version}: ${DownloadUrl}"
+        Write-Host "Expected SHA256: ${ExpectedSha256}"
 
         $InstallDir = "$env:USERPROFILE\.local\protoc"
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
         $TempZip = [System.IO.Path]::GetTempFileName() + ".zip"
         Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip
+
+        # Validate SHA256
+        $ActualSha256 = (Get-FileHash -Path $TempZip -Algorithm SHA256).Hash.ToLower()
+        if ($ActualSha256 -ne $ExpectedSha256) {
+          Remove-Item -Force $TempZip
+          throw "SHA256 mismatch for ${Filename}: expected ${ExpectedSha256}, got ${ActualSha256}"
+        }
+        Write-Host "SHA256 verified: ${ActualSha256}"
+
         Expand-Archive -Path $TempZip -DestinationPath $InstallDir -Force
         Remove-Item -Force $TempZip
 
