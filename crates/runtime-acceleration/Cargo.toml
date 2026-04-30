@@ -2,7 +2,8 @@
 description = "Acceleration support for the Spice runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
+publish.workspace = true
 name = "runtime-acceleration"
 repository.workspace = true
 rust-version.workspace = true

@@ -3,7 +3,8 @@ name = "datafusion-flightsql"
 version = "0.1.0"
 edition.workspace = true
 rust-version = "1.94.1"
-license = "Apache-2.0"
+license-file.workspace = true
+publish.workspace = true
 description = "Arrow Flight SQL service backed by an arbitrary DataFusion SessionContext"
 
 [dependencies]

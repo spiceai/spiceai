@@ -2,7 +2,8 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
+publish.workspace = true
 name = "token_provider"
 repository.workspace = true
 rust-version.workspace = true

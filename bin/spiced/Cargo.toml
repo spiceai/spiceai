@@ -2,7 +2,8 @@
 description = "Spice OSS"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
+publish.workspace = true
 name = "spiced"
 repository.workspace = true
 rust-version.workspace = true

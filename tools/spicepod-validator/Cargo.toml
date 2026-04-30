@@ -1,7 +1,8 @@
 [package]
 description = "Validates spicepod.yaml files using the Spice runtime validation logic"
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
+publish.workspace = true
 name = "spicepod-validator"
 version.workspace = true
 

@@ -2,7 +2,8 @@
 description = "Stream events as they are emitted from a span"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
+publish.workspace = true
 name = "event_stream"
 repository.workspace = true
 rust-version.workspace = true

@@ -2,7 +2,8 @@
 name = "object_store_occ"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license-file.workspace = true
+publish.workspace = true
 description = "Type-safe object storage with optimistic concurrency control"
 
 [dependencies]
