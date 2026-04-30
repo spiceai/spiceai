@@ -1298,10 +1298,15 @@ impl DataFusion {
             data: update_data,
             update_type,
         } = data_update;
-        let update_data = Arc::new(update_data);
 
         verify_schema(table_provider.schema().fields(), update_schema.fields())
             .context(SchemaMismatchSnafu)?;
+        for batch in &update_data {
+            verify_schema(update_schema.fields(), batch.schema().fields())
+                .context(SchemaMismatchSnafu)?;
+        }
+
+        let update_data = Arc::new(update_data);
 
         let overwrite = match &update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
@@ -1403,20 +1408,34 @@ impl DataFusion {
             UpdateType::Changes => InsertOp::Replace,
         };
 
-        let broadcast_batches = Arc::new(ParkingMutex::new(StreamingBroadcastBuffer::default()));
-        let batches = Arc::clone(&broadcast_batches);
-        let stream = data.map(move |batch_result| {
-            if let Ok(batch) = &batch_result {
-                batches.lock().push(batch);
-            }
-            batch_result
-        });
-        let data = Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                Arc::clone(&update_schema),
-                Box::pin(stream),
-            ),
-        );
+        let broadcast_batches = if self
+            .data_update_broadcaster
+            .has_subscribers(table_reference)
+            .await
+        {
+            let broadcast_batches =
+                Arc::new(ParkingMutex::new(StreamingBroadcastBuffer::default()));
+            let batches = Arc::clone(&broadcast_batches);
+            let stream = data.map(move |batch_result| {
+                if let Ok(batch) = &batch_result {
+                    batches.lock().push(batch);
+                }
+                batch_result
+            });
+            let data = Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    Arc::clone(&update_schema),
+                    Box::pin(stream),
+                ),
+            );
+            Some((broadcast_batches, data))
+        } else {
+            None
+        };
+        let (broadcast_batches, data) = match broadcast_batches {
+            Some((broadcast_batches, data)) => (Some(broadcast_batches), data),
+            None => (None, data),
+        };
 
         let insert_plan = table_provider
             .insert_into(
@@ -1452,12 +1471,13 @@ impl DataFusion {
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
-        let broadcast_data = broadcast_batches.lock().batches();
-        if self
-            .data_update_broadcaster
-            .has_subscribers(table_reference)
-            .await
+        if let Some(broadcast_batches) = broadcast_batches
+            && self
+                .data_update_broadcaster
+                .has_subscribers(table_reference)
+                .await
         {
+            let broadcast_data = broadcast_batches.lock().batches();
             if let Some(data) = broadcast_data {
                 self.data_update_broadcaster
                     .publish(

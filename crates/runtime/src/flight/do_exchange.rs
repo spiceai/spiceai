@@ -41,6 +41,71 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use super::{Service, metrics};
 
 const MAX_PENDING_INITIAL_SNAPSHOT_UPDATES: usize = 1_024;
+const MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BATCHES: usize = 128;
+const MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_ROWS: usize = 1_000_000;
+const MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+struct PendingInitialSnapshotUpdates {
+    updates: VecDeque<DataUpdate>,
+    batches: usize,
+    rows: usize,
+    bytes: usize,
+}
+
+impl PendingInitialSnapshotUpdates {
+    fn push_back(&mut self, update: DataUpdate) -> bool {
+        let (update_batches, update_rows, update_bytes) = update_stats(&update);
+        let next_updates = self.updates.len().saturating_add(1);
+        let next_batches = self.batches.saturating_add(update_batches);
+        let next_rows = self.rows.saturating_add(update_rows);
+        let next_bytes = self.bytes.saturating_add(update_bytes);
+
+        if next_updates > MAX_PENDING_INITIAL_SNAPSHOT_UPDATES
+            || next_batches > MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BATCHES
+            || next_rows > MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_ROWS
+            || next_bytes > MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BYTES
+        {
+            self.clear();
+            return false;
+        }
+
+        self.batches = next_batches;
+        self.rows = next_rows;
+        self.bytes = next_bytes;
+        self.updates.push_back(update);
+        true
+    }
+
+    fn pop_front(&mut self) -> Option<DataUpdate> {
+        let update = self.updates.pop_front()?;
+        let (update_batches, update_rows, update_bytes) = update_stats(&update);
+        self.batches = self.batches.saturating_sub(update_batches);
+        self.rows = self.rows.saturating_sub(update_rows);
+        self.bytes = self.bytes.saturating_sub(update_bytes);
+        Some(update)
+    }
+
+    fn clear(&mut self) {
+        self.updates.clear();
+        self.batches = 0;
+        self.rows = 0;
+        self.bytes = 0;
+    }
+}
+
+fn update_stats(update: &DataUpdate) -> (usize, usize, usize) {
+    update.data.iter().fold(
+        (0usize, 0usize, 0usize),
+        |(batch_count, row_count, byte_count), batch| {
+            (
+                batch_count.saturating_add(1),
+                row_count.saturating_add(batch.num_rows()),
+                byte_count.saturating_add(batch.get_array_memory_size()),
+            )
+        },
+    )
+}
 
 struct ChangeFlightEncoder {
     encoder: IpcDataGenerator,
@@ -164,7 +229,7 @@ pub(crate) async fn handle(
             yield flight;
         }
 
-        let mut pending_updates = VecDeque::new();
+        let mut pending_updates = PendingInitialSnapshotUpdates::default();
         let mut pending_updates_overflowed = false;
         let mut updates_closed = false;
 
@@ -180,16 +245,16 @@ pub(crate) async fn handle(
                         continue;
                     }
 
-                    if pending_updates.len() >= MAX_PENDING_INITIAL_SNAPSHOT_UPDATES {
-                        pending_updates.clear();
+                    if !pending_updates.push_back(data_update) {
                         pending_updates_overflowed = true;
                         tracing::warn!(
                             dataset = %data_path_stream,
                             max_pending_updates = MAX_PENDING_INITIAL_SNAPSHOT_UPDATES,
-                            "DoExchange subscriber received too many updates while streaming initial snapshot"
+                            max_pending_batches = MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BATCHES,
+                            max_pending_rows = MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_ROWS,
+                            max_pending_bytes = MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BYTES,
+                            "DoExchange subscriber received too much buffered update data while streaming initial snapshot"
                         );
-                    } else {
-                        pending_updates.push_back(data_update);
                     }
                 }
                 InitialSnapshotEvent::DataUpdate(Err(RecvError::Lagged(skipped_messages))) => {
