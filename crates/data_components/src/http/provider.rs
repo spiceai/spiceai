@@ -229,16 +229,28 @@ impl CachedResponse {
     }
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum RequestFilterKind {
+    Path,
+    Query,
+    Body,
+    Headers,
+}
+
 #[derive(Default)]
 struct PartitionAccumulator {
     paths: HashSet<String>,
     queries: Vec<Option<String>>,
     bodies: Vec<Option<String>>,
     headers: Vec<Option<String>>,
-    has_path_filter: bool,
-    has_query_filter: bool,
-    has_body_filter: bool,
-    has_header_filter: bool,
+    seen_filters: HashSet<RequestFilterKind>,
+}
+
+struct PartitionValues {
+    paths: Vec<String>,
+    queries: Vec<Option<String>>,
+    bodies: Vec<Option<String>>,
+    headers: Vec<Option<String>>,
 }
 
 impl PartitionAccumulator {
@@ -246,9 +258,13 @@ impl PartitionAccumulator {
         Self::default()
     }
 
+    fn has_filter(&self, kind: RequestFilterKind) -> bool {
+        self.seen_filters.contains(&kind)
+    }
+
     fn record_path(&mut self, value: String) {
         self.paths.insert(value);
-        self.has_path_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Path);
     }
 
     fn record_query(&mut self, value: String) {
@@ -256,7 +272,7 @@ impl PartitionAccumulator {
         if !self.queries.contains(&entry) {
             self.queries.push(entry);
         }
-        self.has_query_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Query);
     }
 
     fn record_body(&mut self, value: String) {
@@ -264,7 +280,7 @@ impl PartitionAccumulator {
         if !self.bodies.contains(&entry) {
             self.bodies.push(entry);
         }
-        self.has_body_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Body);
     }
 
     fn record_headers(&mut self, value: String) {
@@ -272,18 +288,16 @@ impl PartitionAccumulator {
         if !self.headers.contains(&entry) {
             self.headers.push(entry);
         }
-        self.has_header_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Headers);
     }
 
-    fn finalize(
-        mut self,
-    ) -> (
-        Vec<String>,
-        Vec<Option<String>>,
-        Vec<Option<String>>,
-        Vec<Option<String>>,
-    ) {
-        let mut paths: Vec<String> = if self.has_path_filter {
+    fn finalize(mut self) -> PartitionValues {
+        let has_path_filter = self.has_filter(RequestFilterKind::Path);
+        let has_query_filter = self.has_filter(RequestFilterKind::Query);
+        let has_body_filter = self.has_filter(RequestFilterKind::Body);
+        let has_header_filter = self.has_filter(RequestFilterKind::Headers);
+
+        let mut paths: Vec<String> = if has_path_filter {
             self.paths.into_iter().collect()
         } else {
             vec![String::new()]
@@ -291,16 +305,52 @@ impl PartitionAccumulator {
         // Sort paths for deterministic ordering
         paths.sort();
 
-        if !self.has_query_filter {
+        if !has_query_filter {
             self.queries.push(None);
         }
-        if !self.has_body_filter {
+        if !has_body_filter {
             self.bodies.push(None);
         }
-        if !self.has_header_filter {
+        if !has_header_filter {
             self.headers.push(None);
         }
-        (paths, self.queries, self.bodies, self.headers)
+        PartitionValues {
+            paths,
+            queries: self.queries,
+            bodies: self.bodies,
+            headers: self.headers,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequestFilterOptions {
+    enabled_filters: HashSet<RequestFilterKind>,
+    max_query_length: usize,
+    max_body_bytes: usize,
+    max_headers_length: usize,
+    allowed_headers: HashSet<HeaderName>,
+}
+
+impl Default for RequestFilterOptions {
+    fn default() -> Self {
+        Self {
+            enabled_filters: HashSet::new(),
+            max_query_length: DEFAULT_MAX_QUERY_LENGTH,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_headers_length: DEFAULT_MAX_HEADERS_LENGTH,
+            allowed_headers: HashSet::new(),
+        }
+    }
+}
+
+impl RequestFilterOptions {
+    fn enable(&mut self, kind: RequestFilterKind) {
+        self.enabled_filters.insert(kind);
+    }
+
+    fn is_enabled(&self, kind: RequestFilterKind) -> bool {
+        self.enabled_filters.contains(&kind)
     }
 }
 
@@ -366,13 +416,7 @@ pub struct HttpTableProvider {
     content_type: Option<String>,
     custom_headers: HeaderMap,
     allowed_paths: Option<(GlobSet, Vec<String>)>,
-    allow_query_filters: bool,
-    max_query_length: usize,
-    allow_body_filters: bool,
-    max_body_bytes: usize,
-    allow_header_filters: bool,
-    max_headers_length: usize,
-    allowed_headers: HashSet<HeaderName>,
+    request_filter_options: RequestFilterOptions,
     max_request_partitions: Option<usize>,
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
@@ -420,13 +464,7 @@ impl HttpTableProvider {
             content_type: None,
             custom_headers: HeaderMap::new(),
             allowed_paths: None,
-            allow_query_filters: false,
-            max_query_length: DEFAULT_MAX_QUERY_LENGTH,
-            allow_body_filters: false,
-            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            allow_header_filters: false,
-            max_headers_length: DEFAULT_MAX_HEADERS_LENGTH,
-            allowed_headers: HashSet::new(),
+            request_filter_options: RequestFilterOptions::default(),
             max_request_partitions: None,
             health_probe: None,
             pagination: None,
@@ -504,15 +542,15 @@ impl HttpTableProvider {
 
     #[must_use]
     pub fn enable_query_filters(mut self, max_length: usize) -> Self {
-        self.allow_query_filters = true;
-        self.max_query_length = max_length.min(DEFAULT_MAX_QUERY_LENGTH * 4);
+        self.request_filter_options.enable(RequestFilterKind::Query);
+        self.request_filter_options.max_query_length = max_length.min(DEFAULT_MAX_QUERY_LENGTH * 4);
         self
     }
 
     #[must_use]
     pub fn enable_body_filters(mut self, max_bytes: usize) -> Self {
-        self.allow_body_filters = true;
-        self.max_body_bytes = max_bytes.min(DEFAULT_MAX_BODY_BYTES * 4);
+        self.request_filter_options.enable(RequestFilterKind::Body);
+        self.request_filter_options.max_body_bytes = max_bytes.min(DEFAULT_MAX_BODY_BYTES * 4);
         self
     }
 
@@ -549,9 +587,11 @@ impl HttpTableProvider {
             }
         );
 
-        self.allow_header_filters = true;
-        self.max_headers_length = max_length.min(DEFAULT_MAX_HEADERS_LENGTH * 4);
-        self.allowed_headers = allowed_headers;
+        self.request_filter_options
+            .enable(RequestFilterKind::Headers);
+        self.request_filter_options.max_headers_length =
+            max_length.min(DEFAULT_MAX_HEADERS_LENGTH * 4);
+        self.request_filter_options.allowed_headers = allowed_headers;
         Ok(self)
     }
 
@@ -2415,9 +2455,12 @@ impl HttpTableProvider {
             "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}, allow_header_filters={}",
             filters.len(),
             self.allowed_paths,
-            self.allow_query_filters,
-            self.allow_body_filters,
-            self.allow_header_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Query),
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Body),
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Headers)
         );
 
         let mut accumulator = PartitionAccumulator::new();
@@ -2429,34 +2472,34 @@ impl HttpTableProvider {
 
         tracing::trace!(
             "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}, has_header_filter={}",
-            accumulator.has_path_filter,
-            accumulator.has_query_filter,
-            accumulator.has_body_filter,
-            accumulator.has_header_filter
+            accumulator.has_filter(RequestFilterKind::Path),
+            accumulator.has_filter(RequestFilterKind::Query),
+            accumulator.has_filter(RequestFilterKind::Body),
+            accumulator.has_filter(RequestFilterKind::Headers)
         );
 
-        let (paths, queries, bodies, headers) = accumulator.finalize();
+        let partition_values = accumulator.finalize();
 
         tracing::trace!(
             "After finalize: paths={:?}, queries={:?}, bodies={:?}, headers_count={}",
-            paths,
-            queries,
-            bodies,
-            headers.len()
+            partition_values.paths,
+            partition_values.queries,
+            partition_values.bodies,
+            partition_values.headers.len()
         );
 
         self.ensure_request_partition_count(
-            paths.len(),
-            queries.len(),
-            bodies.len(),
-            headers.len(),
+            partition_values.paths.len(),
+            partition_values.queries.len(),
+            partition_values.bodies.len(),
+            partition_values.headers.len(),
         )?;
 
         let mut partitions = vec![];
-        for p in &paths {
-            for q in &queries {
-                for b in &bodies {
-                    for h in &headers {
+        for p in &partition_values.paths {
+            for q in &partition_values.queries {
+                for b in &partition_values.bodies {
+                    for h in &partition_values.headers {
                         partitions.push((
                             if p.is_empty() { None } else { Some(p.clone()) },
                             q.clone(),
@@ -2683,22 +2726,26 @@ impl HttpTableProvider {
         tracing::debug!(
             "ensure_allowed_query called with raw={}, allow_query_filters={}",
             raw,
-            self.allow_query_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Query)
         );
 
-        if !self.allow_query_filters {
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Query)
+        {
             tracing::warn!("Query filter attempted but allow_query_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_query' because query filtering is disabled for this dataset. To enable, set the 'request_query_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
-        if raw.len() > self.max_query_length {
+        if raw.len() > self.request_filter_options.max_query_length {
             return Err(Error::FilterRejected {
                 message: format!(
                     "The 'request_query' value is too long ({} characters). Maximum allowed length is {} characters. You can increase this limit using the 'max_request_query_length' parameter.",
                     raw.len(),
-                    self.max_query_length
+                    self.request_filter_options.max_query_length
                 ),
             });
         }
@@ -2722,22 +2769,26 @@ impl HttpTableProvider {
         tracing::debug!(
             "ensure_allowed_body called with raw={}, allow_body_filters={}",
             raw,
-            self.allow_body_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Body)
         );
 
-        if !self.allow_body_filters {
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Body)
+        {
             tracing::warn!("Body filter attempted but allow_body_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_body' because body filtering is disabled for this dataset. To enable, set the 'request_body_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
-        if raw.len() > self.max_body_bytes {
+        if raw.len() > self.request_filter_options.max_body_bytes {
             return Err(Error::FilterRejected {
                 message: format!(
                     "The 'request_body' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_body_bytes' parameter.",
                     raw.len(),
-                    self.max_body_bytes
+                    self.request_filter_options.max_body_bytes
                 ),
             });
         }
@@ -2748,11 +2799,15 @@ impl HttpTableProvider {
     fn ensure_allowed_headers(&self, raw: &str) -> Result<String> {
         tracing::debug!(
             "ensure_allowed_headers called with allow_header_filters={}, bytes={}",
-            self.allow_header_filters,
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Headers),
             raw.len()
         );
 
-        if !self.allow_header_filters {
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Headers)
+        {
             tracing::warn!("Header filter attempted but allow_header_filters is false");
             return Err(Error::FilterRejected {
                 message:
@@ -2760,12 +2815,12 @@ impl HttpTableProvider {
                         .to_string(),
             });
         }
-        if raw.len() > self.max_headers_length {
+        if raw.len() > self.request_filter_options.max_headers_length {
             return Err(Error::FilterRejected {
                 message: format!(
                     "The 'request_headers' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_headers_length' parameter.",
                     raw.len(),
-                    self.max_headers_length
+                    self.request_filter_options.max_headers_length
                 ),
             });
         }
@@ -2799,7 +2854,11 @@ impl HttpTableProvider {
                 }
             })?;
 
-            if !self.allowed_headers.contains(&header_name) {
+            if !self
+                .request_filter_options
+                .allowed_headers
+                .contains(&header_name)
+            {
                 return Err(Error::FilterRejected {
                     message: format!(
                         "The 'request_headers' object contains header '{name}', which is not in request_header_allowlist. Add '{name}' to request_header_allowlist or remove it from the filter."
