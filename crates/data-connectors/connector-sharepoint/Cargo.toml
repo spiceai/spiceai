@@ -3,7 +3,7 @@ name = "connector-sharepoint"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "SharePoint data connector for Spice.ai runtime"
 
 [dependencies]

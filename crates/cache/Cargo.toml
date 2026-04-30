@@ -2,7 +2,7 @@
 description = "Spice cache"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "cache"
 repository.workspace = true
 rust-version.workspace = true
