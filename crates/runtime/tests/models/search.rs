@@ -359,10 +359,7 @@ fn assert_search_response_structure(test_name: &str, resp: &Value) {
         );
 
         // Verify scores are in descending order and within [0, 1]
-        let score: f64 = result
-            .get("_score")
-            .and_then(Value::as_f64)
-            .unwrap_or(-1.0);
+        let score: f64 = result.get("_score").and_then(Value::as_f64).unwrap_or(-1.0);
         assert!(
             (0.0..=1.0).contains(&score),
             "{test_name}: result[{i}] score {score} not in [0, 1]"
