@@ -294,6 +294,7 @@ duckdb = [
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
+    "search/duckdb",
 ]
 dynamodb = [
     "dep:aws-sdk-dynamodb",

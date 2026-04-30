@@ -181,6 +181,12 @@ pub enum Error {
     #[snafu(display("Failed to construct data for the accelerated dataset: {source}"))]
     FailedToBuildRecordBatch { source: ArrowError },
 
+    #[snafu(display("Failed to process upsert batch for dataset {dataset_name}: {reason}"))]
+    InvalidUpsertPrimaryKeys {
+        dataset_name: String,
+        reason: String,
+    },
+
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
 }
@@ -1081,6 +1087,15 @@ impl AcceleratedTable {
     #[must_use]
     pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.accelerator)
+    }
+
+    #[must_use]
+    pub(crate) fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.accelerator
+    }
+
+    pub(crate) fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        self.accelerator = accelerator;
     }
 
     /// Add a child accelerator that should receive cached data when this parent stores new cache entries.

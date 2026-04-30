@@ -18,6 +18,8 @@ use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
+#[cfg(feature = "duckdb")]
+use crate::component::dataset::acceleration::Engine;
 use crate::component::metrics::MetricsProvider;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::embeddings::execution_plan::{
@@ -37,6 +39,8 @@ use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::VectorScanTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
+#[cfg(feature = "duckdb")]
+use spicepod::{semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
 use std::any::Any;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -93,6 +97,21 @@ impl EmbeddingConnector {
         if let Some(vector_engine) = &dataset.vectors
             && vector_engine.enabled
         {
+            #[cfg(feature = "duckdb")]
+            if vector_engine.engine.as_deref() == Some("duckdb")
+                && !dataset.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.engine.to_unpartitioned() == Engine::DuckDB
+                })
+            {
+                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                    dataconnector: dataset.source().to_string(),
+                    connector_component: dataset.into(),
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(
+                        "DuckDB vector engine requires DuckDB acceleration. Configure the dataset with `acceleration.engine: duckdb`.",
+                    ),
+                });
+            }
+
             return wrap_table_as_index(
                 &dataset.runtime().datafusion().ctx,
                 &self.embedding_models,
@@ -248,7 +267,30 @@ impl DataConnector for EmbeddingConnector {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
-            .await
+            .await?;
+
+        #[cfg(feature = "duckdb")]
+        if let Some(vector_engine) = duckdb_vector_store_for_accelerated_table(dataset) {
+            let embedding_columns = duckdb_embedding_columns(dataset);
+            if embedding_columns.is_empty() {
+                return Ok(());
+            }
+
+            let accelerator = accelerated_table.get_accelerator();
+            let indexed_accelerator =
+                crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
+                    &dataset.name,
+                    embedding_columns,
+                    &vector_engine,
+                    accelerator,
+                    Arc::clone(&self.embedding_models),
+                    Arc::clone(&self.secrets),
+                )
+                .await?;
+            accelerated_table.set_accelerator(indexed_accelerator);
+        }
+
+        Ok(())
     }
 
     fn supports_changes_stream(&self) -> bool {
@@ -387,6 +429,67 @@ impl DataConnector for EmbeddingConnector {
 
         Some(stream)
     }
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_vector_store_for_accelerated_table(dataset: &Dataset) -> Option<VectorStore> {
+    if let Some(vector_engine) = &dataset.vectors
+        && vector_engine.enabled
+        && vector_engine.engine.as_deref() == Some("duckdb")
+    {
+        return Some(vector_engine.clone());
+    }
+
+    if !dataset.has_embeddings()
+        || !dataset
+            .acceleration
+            .as_ref()
+            .is_some_and(|acceleration| acceleration.engine.to_unpartitioned() == Engine::DuckDB)
+    {
+        return None;
+    }
+
+    let acceleration = dataset.acceleration.as_ref()?;
+    crate::embeddings::index::duckdb::vector_store_from_embedding_params(&acceleration.params)
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_embedding_columns(dataset: &Dataset) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
+    let mut embedding_columns = dataset
+        .embeddings
+        .iter()
+        .map(|embedding| {
+            (
+                embedding.column.clone(),
+                ColumnLevelEmbeddingConfig {
+                    model: embedding.model.clone(),
+                    chunking: embedding.chunking.clone(),
+                    row_ids: embedding.primary_keys.clone(),
+                    vector_size: embedding.vector_size,
+                    aggregation: embedding.aggregation,
+                    max_elements_per_row: embedding.max_elements_per_row,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for column in &dataset.columns {
+        // Must be `last()` to mimic what model `EmbeddingTable`'s HashMap ends up with.
+        let Some(embedding) = column.embeddings.last() else {
+            continue;
+        };
+
+        if let Some((_, existing)) = embedding_columns
+            .iter_mut()
+            .find(|(column_name, _)| column_name == &column.name)
+        {
+            *existing = embedding.clone();
+        } else {
+            embedding_columns.push((column.name.clone(), embedding.clone()));
+        }
+    }
+
+    embedding_columns
 }
 
 fn underlying_federated_table_for_indexed_table(
