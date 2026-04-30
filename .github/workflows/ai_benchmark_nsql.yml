@@ -27,7 +27,7 @@ concurrency:
 jobs:
   build-testoperator:
     name: Build testoperator
-    runs-on: 'spiceai-macos'
+    runs-on: 'blacksmith-6vcpu-macos-15'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -43,7 +43,7 @@ jobs:
 
   build-spiced:
     name: Build spiced
-    runs-on: 'spiceai-macos'
+    runs-on: 'blacksmith-6vcpu-macos-15'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -63,7 +63,7 @@ jobs:
 
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -96,7 +96,7 @@ jobs:
       - build-testoperator
       - build-spiced
       - setup-matrix
-    runs-on: 'spiceai-macos'
+    runs-on: 'blacksmith-6vcpu-macos-15'
     strategy:
       max-parallel: 1
       fail-fast: false

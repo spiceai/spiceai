@@ -10,7 +10,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: 'Linux x64'
+          - name: 'blacksmith-4vcpu-ubuntu-2404'
             runner: 'spiceai-dev-runners'
             target_os: 'linux'
             target_arch: 'x86_64'
@@ -83,7 +83,7 @@ jobs:
           ]
         target:
           - name: 'Linux x64'
-            runner: 'ubuntu-24.04'
+            runner: 'blacksmith-4vcpu-ubuntu-2404'
             target_os: 'linux'
             target_arch: 'x86_64'
     steps:

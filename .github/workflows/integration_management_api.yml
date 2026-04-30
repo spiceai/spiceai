@@ -31,7 +31,7 @@ env:
 jobs:
   test-management-api:
     name: Test Management API Integration
-    runs-on: 'spiceai-macos'
+    runs-on: 'blacksmith-6vcpu-macos-15'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:

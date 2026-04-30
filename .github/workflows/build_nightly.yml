@@ -30,7 +30,7 @@ env:
 
 jobs:
   check_commits:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
 
@@ -63,7 +63,7 @@ jobs:
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
@@ -91,7 +91,7 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       CARGO_TERM_COLOR: always
@@ -162,7 +162,7 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: hosted-linux-arm-runner
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       CARGO_TERM_COLOR: always
@@ -233,7 +233,7 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: spiceai-macos
+    runs-on: blacksmith-6vcpu-macos-15
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       CARGO_TERM_COLOR: always
@@ -306,7 +306,7 @@ jobs:
     needs: [check_commits, setup, build-linux-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: hosted-linux-arm-runner
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -343,18 +343,16 @@ jobs:
         run: |
           sudo chown $USER /var/run/docker.sock
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Build ARM64 Docker image
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: Dockerfile.local
           platforms: linux/arm64
           outputs: type=docker,name=localhost:5000/spiceai:default-arm64,dest=/tmp/image-arm64-default.tar
-          cache-from: type=gha,scope=build-docker-arm64
-          cache-to: type=gha,scope=build-docker-arm64,mode=max
 
       - name: Upload ARM64 Docker image
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -367,7 +365,7 @@ jobs:
     needs: [check_commits, setup, build-linux-x64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -385,18 +383,16 @@ jobs:
           mv spiced .spiced-local-tmp
           ./.spiced-local-tmp --version
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Build AMD64 Docker image
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: Dockerfile.local
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai:default-amd64,dest=/tmp/image-amd64-default.tar
-          cache-from: type=gha,scope=build-docker-amd64
-          cache-to: type=gha,scope=build-docker-amd64,mode=max
 
       - name: Upload AMD64 Docker image
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -409,7 +405,7 @@ jobs:
     needs: [check_commits, setup, build-docker-amd64, build-docker-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -429,8 +425,8 @@ jobs:
           echo "Docker images:"
           ls -l /tmp
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Start local registry
         run: |

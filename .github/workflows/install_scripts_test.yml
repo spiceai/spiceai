@@ -45,10 +45,10 @@ jobs:
             shell: sh
           # Linux ARM64
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
             shell: bash
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
             shell: zsh
           # macOS ARM64 (Apple Silicon)
           - os: macos-arm64
@@ -90,7 +90,7 @@ jobs:
             shell: zsh
           # Linux ARM64
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
             shell: bash
           # macOS ARM64
           - os: macos-arm64
@@ -176,7 +176,7 @@ jobs:
           - os: linux-x64
             runner: ubuntu-24.04
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
           - os: macos-arm64
             runner: macos-latest
     steps:
@@ -229,17 +229,17 @@ jobs:
         include:
           # Linux x86_64 variants
           - os: linux-x64
-            runner: ubuntu-24.04
+            runner: blacksmith-4vcpu-ubuntu-2404
             variant: ''
           - os: linux-x64
-            runner: ubuntu-24.04
+            runner: blacksmith-4vcpu-ubuntu-2404
             variant: models
           # Linux ARM64 variants
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404
             variant: ''
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404
             variant: models
           # macOS ARM64 variants
           - os: macos-arm64
@@ -278,7 +278,7 @@ jobs:
           - os: linux-x64
             runner: ubuntu-24.04
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
           - os: macos-arm64
             runner: macos-latest
     steps:
@@ -317,7 +317,7 @@ jobs:
   # Test HTTP client fallback (curl vs wget)
   test-http-clients:
     name: HTTP Client (${{ matrix.client }})
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       fail-fast: false
       matrix:
@@ -366,7 +366,7 @@ jobs:
   # Test error handling
   test-error-handling:
     name: Error Handling
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -407,7 +407,7 @@ jobs:
   # Test on Windows with WSL
   test-windows-wsl:
     name: Windows WSL (${{ matrix.distro }})
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     strategy:
       fail-fast: false
       matrix:
@@ -464,7 +464,7 @@ jobs:
   # Test native Windows with PowerShell
   test-windows-native:
     name: Windows Native (PowerShell)
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -503,7 +503,7 @@ jobs:
   # Test Windows PowerShell with custom directory
   test-windows-custom-dir:
     name: Windows Custom Dir (PowerShell)
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -539,7 +539,7 @@ jobs:
   # Test Windows PowerShell error handling
   test-windows-errors:
     name: Windows Error Handling (PowerShell)
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -583,7 +583,7 @@ jobs:
   # Validate scripts with shellcheck
   shellcheck:
     name: Shellcheck
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6

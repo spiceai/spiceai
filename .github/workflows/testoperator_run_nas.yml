@@ -26,7 +26,7 @@ on:
 jobs:
   run-nas-bench:
     name: Run network-attached storage benchmark tests
-    runs-on: spiceai-macos
+    runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6

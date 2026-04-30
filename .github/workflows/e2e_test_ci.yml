@@ -65,7 +65,7 @@ env:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -158,7 +158,7 @@ jobs:
 
   setup-model-matrix:
     name: Setup model strategy matrix
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
     steps:

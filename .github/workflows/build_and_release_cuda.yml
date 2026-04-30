@@ -62,7 +62,7 @@ on:
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -185,7 +185,7 @@ jobs:
 
   publish-minio:
     name: Publish linux-x86_64 CUDA binaries to Minio
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build
     env:
       ARTIFACT_DIR: ./release
@@ -234,7 +234,7 @@ jobs:
       ARTIFACT_DIR: ./release
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 

@@ -27,7 +27,7 @@ jobs:
           - target_os: windows
             target_arch: x86_64
 
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       ARTIFACT_DIR: ./release
 

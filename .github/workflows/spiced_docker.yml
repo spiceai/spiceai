@@ -71,7 +71,7 @@ jobs:
           && github.event.changes.make_latest.to == 'true'
         )
       }}
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
@@ -207,7 +207,7 @@ jobs:
 
   build-amd64:
     needs: setup
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Skip AMD64 build
         if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
@@ -216,9 +216,8 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: default
         run: |
@@ -228,14 +227,12 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: Dockerfile-release
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-amd64
-          cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
@@ -251,7 +248,7 @@ jobs:
 
   build-arm64:
     needs: setup
-    runs-on: hosted-linux-arm-runner
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     steps:
       - name: Skip ARM64 build
         if: ${{ needs.setup.outputs.run_arm64 != 'true' }}
@@ -282,9 +279,8 @@ jobs:
           sudo chown $USER /var/run/docker.sock
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: default
         run: |
@@ -294,14 +290,12 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: Dockerfile-release
           platforms: linux/arm64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-arm64
-          cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
@@ -318,7 +312,7 @@ jobs:
 
   build-cuda:
     needs: setup
-    runs-on: 'spiceai-dev-runners'
+    runs-on: 'blacksmith-4vcpu-ubuntu-2404'
     env:
       CUDA_COMPUTE_CAP: 80
     steps:
@@ -329,9 +323,8 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Configure CUDA build
         run: |
@@ -341,14 +334,12 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Package CUDA image
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: Dockerfile-cuda-release
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/images-amd64-cuda.tar
-          cache-from: type=gha,scope=build-cuda
-          cache-to: type=gha,scope=build-cuda,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
@@ -366,7 +357,7 @@ jobs:
   publish:
     if: ${{ needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true' }}
     needs: [setup, build-amd64, build-arm64]
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
@@ -392,8 +383,8 @@ jobs:
         run: |
           ls -l /tmp
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Start local registry
         run: |
@@ -482,7 +473,7 @@ jobs:
   publish-cuda:
     needs: [setup, build-cuda]
     if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
@@ -498,8 +489,8 @@ jobs:
         run: |
           ls -l /tmp
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Start local registry
         run: |

@@ -54,7 +54,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a success when skipped).
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -71,7 +71,7 @@ jobs:
   build:
     name: Build Test Binary
     needs: check_changes
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -209,7 +209,7 @@ jobs:
     needs: [build, check_changes]
     permissions:
       contents: write
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       fail-fast: false
       matrix:
@@ -371,7 +371,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -417,7 +417,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -458,7 +458,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -503,7 +503,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -534,7 +534,7 @@ jobs:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:

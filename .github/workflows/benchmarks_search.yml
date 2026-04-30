@@ -39,7 +39,7 @@ jobs:
   # We'll incrementally switch to testoperator dispatch as more configurations are added.
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -80,7 +80,7 @@ jobs:
   run-bench:
     name: Run ${{ matrix.target.name }}
     timeout-minutes: 60
-    runs-on: spiceai-dev-runners
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs:
       - setup-matrix
     strategy:

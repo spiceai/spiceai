@@ -15,7 +15,7 @@ env:
 
 jobs:
   generate_openapi:
-    runs-on: self-hosted
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     steps:
       - name: Check out repository

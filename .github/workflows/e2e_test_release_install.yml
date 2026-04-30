@@ -247,7 +247,7 @@ jobs:
   # Test Windows with WSL - runtime runs in WSL, not native Windows
   test-install-windows-wsl:
     name: install on Windows x64 (WSL)
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - name: checkout code
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6

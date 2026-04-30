@@ -27,7 +27,7 @@ env:
 jobs:
   check_changes:
     name: Check for code changes
-    runs-on: spiceai-macos
+    runs-on: blacksmith-6vcpu-macos-15
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -44,7 +44,7 @@ jobs:
     name: Rust Lint
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    runs-on: spiceai-macos
+    runs-on: blacksmith-6vcpu-macos-15
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
@@ -112,7 +112,7 @@ jobs:
     name: Build and Test
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    runs-on: spiceai-macos
+    runs-on: blacksmith-6vcpu-macos-15
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
