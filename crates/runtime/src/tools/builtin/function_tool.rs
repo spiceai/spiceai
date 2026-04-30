@@ -40,6 +40,7 @@ use std::sync::Weak;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::utils::quote_identifier;
 use futures::TryStreamExt;
 use serde_json::{Map, Value};
 use spicepod::component::function::{Function, FunctionArg};
@@ -162,7 +163,7 @@ impl SpiceModelTool for FunctionAsTool {
             literals.push(json_to_sql_literal(v, &a.arrow_type)?);
         }
 
-        let sql = format!("SELECT {}({}) AS result", self.name, literals.join(", "));
+        let sql = function_call_sql(&self.name, &literals);
 
         let df = self.df.upgrade().ok_or_else(|| {
             Box::<dyn std::error::Error + Send + Sync>::from(
@@ -187,6 +188,14 @@ impl SpiceModelTool for FunctionAsTool {
 
         extract_single_cell_as_json(&batches)
     }
+}
+
+fn function_call_sql(function_name: &str, literals: &[String]) -> String {
+    format!(
+        "SELECT {}({}) AS result",
+        quote_identifier(function_name),
+        literals.join(", ")
+    )
 }
 
 fn extract_single_cell_as_json(
@@ -365,6 +374,18 @@ mod tests {
         assert_eq!(
             json_to_sql_literal(&Value::Bool(false), "boolean").expect("ok"),
             "FALSE"
+        );
+    }
+
+    #[test]
+    fn function_call_sql_quotes_function_name() {
+        let sql = function_call_sql(
+            "fn_name); SELECT secret FROM secrets; --",
+            &["1".to_string()],
+        );
+        assert_eq!(
+            sql,
+            "SELECT \"fn_name); SELECT secret FROM secrets; --\"(1) AS result"
         );
     }
 

@@ -71,7 +71,7 @@ impl ListUDFTable {
     pub fn new(udf_names: Vec<String>, user_infos: Vec<UserFunctionInfo>) -> Self {
         let user_infos_by_name = user_infos
             .into_iter()
-            .map(|i| (i.name.clone(), i))
+            .map(|i| (i.name.to_ascii_lowercase(), i))
             .collect::<HashMap<_, _>>();
         Self {
             schema: Arc::new(Schema::new(vec![
@@ -85,6 +85,10 @@ impl ListUDFTable {
             udf_names,
             user_infos_by_name,
         }
+    }
+
+    fn user_info_for_name(&self, name: &str) -> Option<&UserFunctionInfo> {
+        self.user_infos_by_name.get(&name.to_ascii_lowercase())
     }
 }
 
@@ -117,7 +121,7 @@ impl TableProvider for ListUDFTable {
         let mut descriptions: Vec<Option<String>> = Vec::with_capacity(self.udf_names.len());
 
         for n in &self.udf_names {
-            if let Some(info) = self.user_infos_by_name.get(n) {
+            if let Some(info) = self.user_info_for_name(n) {
                 names.push(info.name.clone());
                 sources.push("user".to_string());
                 kinds.push(Some(info.kind.clone()));
@@ -162,5 +166,29 @@ impl TableProvider for ListUDFTable {
         let udtf_exec = UdtfExec::new(UdtfArgs::list_udfs(), inner_exec);
 
         Ok(Arc::new(udtf_exec))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_info_lookup_is_case_insensitive() {
+        let table = ListUDFTable::new(
+            vec!["MIXED_FN".to_string()],
+            vec![UserFunctionInfo {
+                name: "mixed_fn".to_string(),
+                kind: "scalar".to_string(),
+                volatility: "immutable".to_string(),
+                from: "sql".to_string(),
+                description: None,
+            }],
+        );
+
+        let info = table
+            .user_info_for_name("MIXED_FN")
+            .expect("case-insensitive lookup should find user function metadata");
+        assert_eq!(info.name, "mixed_fn");
     }
 }

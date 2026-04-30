@@ -142,7 +142,7 @@ pub fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
         .context(PlanExpressionSnafu)?;
     if !types_compatible(&actual_return, &declared_return) {
         return Err(SqlBuildError::ReturnTypeMismatch {
-            expected: declared_return.clone(),
+            expected: declared_return,
             actual: actual_return,
         });
     }
