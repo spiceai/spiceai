@@ -52,6 +52,8 @@ use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
 use yaml::Value;
 
+const TELEMETRY_CANNOT_BE_DISABLED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated and cannot be disabled in Spice.ai Open Source. To disable telemetry, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
+
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
@@ -851,7 +853,8 @@ fn create_otel_reader(
 async fn start_anonymous_telemetry(
     telemetry_enabled: Option<bool>,
     telemetry_config: Arc<SetOnce<TelemetryConfig>>,
-    spicepod_name: Option<&String>,
+    #[cfg(feature = "anonymous_telemetry")] spicepod_name: Option<&String>,
+    #[cfg(not(feature = "anonymous_telemetry"))] _spicepod_name: Option<&String>,
 ) {
     // Always log hardware info at debug level regardless of telemetry settings
     // Use async version to avoid blocking the async runtime
@@ -870,10 +873,11 @@ async fn start_anonymous_telemetry(
     // set once the app definition is fetched from the scheduler.
     let config = telemetry_config.wait().await;
 
-    if telemetry_enabled != Some(true) && !config.enabled {
-        return;
+    if should_warn_spicepod_telemetry_disabled(telemetry_enabled, &config) {
+        tracing::warn!("{TELEMETRY_CANNOT_BE_DISABLED_MESSAGE}");
     }
 
+    #[cfg(feature = "anonymous_telemetry")]
     let telemetry_properties: Vec<KeyValue> = config
         .properties
         .iter()
@@ -886,6 +890,13 @@ async fn start_anonymous_telemetry(
         telemetry_properties,
     )
     .await;
+}
+
+fn should_warn_spicepod_telemetry_disabled(
+    telemetry_enabled: Option<bool>,
+    config: &TelemetryConfig,
+) -> bool {
+    telemetry_enabled != Some(true) && !config.enabled
 }
 
 fn parse_set_string(s: &str) -> Result<(String, String), String> {
@@ -993,4 +1004,49 @@ fn apply_override(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warns_when_spicepod_disables_telemetry_without_cli_override() {
+        let config = TelemetryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert!(should_warn_spicepod_telemetry_disabled(None, &config));
+    }
+
+    #[test]
+    fn does_not_warn_when_spicepod_enables_telemetry() {
+        let config = TelemetryConfig::default();
+
+        assert!(!should_warn_spicepod_telemetry_disabled(None, &config));
+    }
+
+    #[test]
+    fn does_not_warn_when_cli_enables_telemetry() {
+        let config = TelemetryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert!(!should_warn_spicepod_telemetry_disabled(
+            Some(true),
+            &config
+        ));
+    }
+
+    #[test]
+    fn telemetry_disabled_message_mentions_enterprise() {
+        assert!(TELEMETRY_CANNOT_BE_DISABLED_MESSAGE.contains("anonymous and aggregated"));
+        assert!(
+            TELEMETRY_CANNOT_BE_DISABLED_MESSAGE
+                .contains("cannot be disabled in Spice.ai Open Source")
+        );
+        assert!(TELEMETRY_CANNOT_BE_DISABLED_MESSAGE.contains("Spice.ai Enterprise"));
+    }
 }
