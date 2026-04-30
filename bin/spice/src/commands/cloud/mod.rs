@@ -632,12 +632,7 @@ async fn execute_login(args: &LoginArgs) -> Result<()> {
 }
 
 async fn execute_login_with_chooser() -> Result<()> {
-    if !std::io::stdin().is_terminal() {
-        return InvalidArgumentSnafu {
-            message: "Choose a login type explicitly when running non-interactively: 'spice cloud login subscription', 'spice cloud login subscription --device', 'spice cloud login pat', or 'spice cloud login api'",
-        }
-        .fail();
-    }
+    ensure_login_chooser_tty(std::io::stdin().is_terminal())?;
 
     let items = [
         "Subscription Login (browser)",
@@ -670,6 +665,17 @@ async fn execute_login_with_chooser() -> Result<()> {
         }
         .fail(),
     }
+}
+
+fn ensure_login_chooser_tty(is_terminal: bool) -> Result<()> {
+    if !is_terminal {
+        return InvalidArgumentSnafu {
+            message: "Choose a login type explicitly when running non-interactively: 'spice cloud login subscription', 'spice cloud login subscription --device', 'spice cloud login pat', or 'spice cloud login api'",
+        }
+        .fail();
+    }
+
+    Ok(())
 }
 
 async fn execute_login_pat(args: &PatLoginArgs) -> Result<()> {
@@ -719,13 +725,38 @@ fn resolve_string_or_prompt(
     prompt: &str,
     secret: bool,
 ) -> Result<String> {
-    if let Some(value) = value
-        && !value.is_empty()
-    {
+    resolve_string_or_prompt_with_terminal(
+        value,
+        label,
+        flag,
+        env_var,
+        prompt,
+        secret,
+        std::io::stdin().is_terminal(),
+    )
+}
+
+fn resolve_string_or_prompt_with_terminal(
+    value: Option<&str>,
+    label: &str,
+    flag: &str,
+    env_var: &str,
+    prompt: &str,
+    secret: bool,
+    is_terminal: bool,
+) -> Result<String> {
+    if let Some(value) = value {
+        if value.is_empty() {
+            return InvalidArgumentSnafu {
+                message: format!("{label} cannot be empty."),
+            }
+            .fail();
+        }
+
         return Ok(value.to_string());
     }
 
-    if !std::io::stdin().is_terminal() {
+    if !is_terminal {
         return InvalidArgumentSnafu {
             message: format!("{label} is required. Provide {flag} or set {env_var}."),
         }
@@ -1593,4 +1624,76 @@ fn require_app(flag_value: Option<&str>) -> Result<String> {
         message: "App name is required. Use --app <org/app> or run 'spice cloud link' to link an app",
     }
     .fail()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_chooser_requires_tty() {
+        let err = ensure_login_chooser_tty(false).expect_err("non-TTY chooser should fail");
+
+        assert!(
+            err.to_string()
+                .contains("Choose a login type explicitly when running non-interactively"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_uses_non_empty_value() {
+        let value = resolve_string_or_prompt_with_terminal(
+            Some("client-id"),
+            "OAuth client ID",
+            "--client-id",
+            "SPICE_CLOUD_CLIENT_ID",
+            "OAuth client ID",
+            false,
+            false,
+        )
+        .expect("provided value should be accepted");
+
+        assert_eq!(value, "client-id");
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_rejects_empty_value() {
+        let err = resolve_string_or_prompt_with_terminal(
+            Some(""),
+            "OAuth client ID",
+            "--client-id",
+            "SPICE_CLOUD_CLIENT_ID",
+            "OAuth client ID",
+            false,
+            false,
+        )
+        .expect_err("empty value should fail");
+
+        assert!(
+            err.to_string().contains("OAuth client ID cannot be empty."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_requires_value_when_non_interactive() {
+        let err = resolve_string_or_prompt_with_terminal(
+            None,
+            "OAuth client ID",
+            "--client-id",
+            "SPICE_CLOUD_CLIENT_ID",
+            "OAuth client ID",
+            false,
+            false,
+        )
+        .expect_err("missing value should fail without a TTY");
+
+        assert!(
+            err.to_string().contains(
+                "OAuth client ID is required. Provide --client-id or set SPICE_CLOUD_CLIENT_ID."
+            ),
+            "unexpected error: {err}"
+        );
+    }
 }
