@@ -52,6 +52,7 @@ use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
 use yaml::Value;
 
+#[cfg(feature = "anonymous_telemetry")]
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 #[path = "tracing.rs"]
@@ -863,28 +864,34 @@ async fn start_anonymous_telemetry(
         .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
     hardware_info.log_debug();
 
-    // Wait for the spicepod telemetry config to be resolved.  For schedulers
-    // and standalone instances this is already set; for executors it will be
-    // set once the app definition is fetched from the scheduler.
-    let config = telemetry_config.wait().await;
-
-    if should_warn_telemetry_disabled_setting_ignored(telemetry_enabled, config) {
-        tracing::warn!("{TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE}");
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    {
+        let _ = (telemetry_enabled, telemetry_config);
     }
 
     #[cfg(feature = "anonymous_telemetry")]
-    let telemetry_properties: Vec<KeyValue> = config
-        .properties
-        .iter()
-        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
-        .collect();
+    {
+        // Wait for the spicepod telemetry config to be resolved.  For schedulers
+        // and standalone instances this is already set; for executors it will be
+        // set once the app definition is fetched from the scheduler.
+        let config = telemetry_config.wait().await;
 
-    #[cfg(feature = "anonymous_telemetry")]
-    telemetry::anonymous::start(
-        spicepod_name.map_or_else(|| "unknown", String::as_str),
-        telemetry_properties,
-    )
-    .await;
+        if should_warn_telemetry_disabled_setting_ignored(telemetry_enabled, config) {
+            tracing::warn!("{TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE}");
+        }
+
+        let telemetry_properties: Vec<KeyValue> = config
+            .properties
+            .iter()
+            .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+            .collect();
+
+        telemetry::anonymous::start(
+            spicepod_name.map_or_else(|| "unknown", String::as_str),
+            telemetry_properties,
+        )
+        .await;
+    }
 }
 
 fn should_warn_telemetry_disabled_setting_ignored(
@@ -1054,6 +1061,19 @@ mod tests {
             Some(false),
             &config
         ));
+    }
+
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    #[tokio::test]
+    async fn returns_without_telemetry_config_when_anonymous_telemetry_is_not_compiled() {
+        let telemetry_config = Arc::new(SetOnce::new());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            start_anonymous_telemetry(None, telemetry_config, None),
+        )
+        .await
+        .expect("anonymous telemetry should return without waiting for telemetry config when the feature is disabled");
     }
 
     #[test]
