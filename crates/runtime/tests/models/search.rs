@@ -206,7 +206,7 @@ fn assert_score_ordering(resp: &Value) -> Result<(), anyhow::Error> {
     for result in results {
         let score: f64 = result
             .get("_score")
-            .and_then(|s| s.as_f64())
+            .and_then(Value::as_f64)
             .context("Search responses missing '_score'.")?;
 
         anyhow::ensure!(
@@ -302,7 +302,7 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value) {
             && !name.contains("vector_search_sql")
             && !name.contains("with_where") =>
         {
-            assert_search_response_structure(name, resp);
+            assert_search_response_structure(name, &resp);
         }
         _ => {
             insta::assert_snapshot!(
@@ -316,7 +316,7 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value) {
 
 /// Validate the structure and invariants of a search response without asserting exact item content.
 /// Used for S3 Vectors HTTP search tests where the result set is non-deterministic.
-fn assert_search_response_structure(test_name: &str, resp: Value) {
+fn assert_search_response_structure(test_name: &str, resp: &Value) {
     let results = resp
         .get("results")
         .and_then(|r| r.as_array())
@@ -361,7 +361,7 @@ fn assert_search_response_structure(test_name: &str, resp: Value) {
         // Verify scores are in descending order and within [0, 1]
         let score: f64 = result
             .get("_score")
-            .and_then(|s| s.as_f64())
+            .and_then(Value::as_f64)
             .unwrap_or(-1.0);
         assert!(
             (0.0..=1.0).contains(&score),
@@ -404,10 +404,10 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
         // variance from non-deterministic embeddings (model2vec/s3vectors/OpenAI)
         // across CI runners, matching the previous round_scores behaviour.
         matches.sort_by(|a, b| {
-            let Some(score_a) = a.get("_score").and_then(|s| s.as_f64()) else {
+            let Some(score_a) = a.get("_score").and_then(Value::as_f64) else {
                 return Ordering::Greater;
             };
-            let Some(score_b) = b.get("_score").and_then(|s| s.as_f64()) else {
+            let Some(score_b) = b.get("_score").and_then(Value::as_f64) else {
                 return Ordering::Less;
             };
 
@@ -446,10 +446,10 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
         });
 
         for m in matches {
-            if let Some(obj) = m.as_object_mut() {
-                if obj.contains_key("_score") {
-                    obj.insert("_score".to_string(), Value::String("[score]".to_string()));
-                }
+            if let Some(obj) = m.as_object_mut()
+                && obj.contains_key("_score")
+            {
+                obj.insert("_score".to_string(), Value::String("[score]".to_string()));
             }
         }
     }
