@@ -642,7 +642,7 @@ async fn execute_login_with_chooser() -> Result<()> {
     ];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("How would you like to log in to Spice Cloud?")
-        .items(&items)
+        .items(items)
         .default(0)
         .interact()
         .map_err(|err| crate::error::Error::InvalidArgument {

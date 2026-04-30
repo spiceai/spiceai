@@ -73,7 +73,7 @@ impl CloudClient {
         self.inner.exchange_code(auth_code).await.map_err(into_cli)
     }
 
-    /// Exchange OAuth2 client credentials for an access token.
+    /// Exchange `OAuth2` client credentials for an access token.
     pub async fn exchange_client_credentials(
         &self,
         client_id: &str,
