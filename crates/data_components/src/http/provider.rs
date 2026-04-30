@@ -2449,7 +2449,11 @@ fn merge_base_and_partition_queries_with_override(
 }
 
 impl HttpTableProvider {
-    /// Extract paths from filters for creating partitions. Query and body filters are validated but not used for partitioning.
+    /// Extract request partition values from filters.
+    ///
+    /// Path, query, body, and header filters are all used to build the partition
+    /// cross product, with each unique combination producing a separate HTTP
+    /// request partition.
     fn extract_partitions(&self, filters: &[Expr]) -> DataFusionResult<Vec<PartitionSpec>> {
         tracing::trace!(
             "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}, allow_header_filters={}",
@@ -3037,7 +3041,7 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Only path creates partition, query is validated but not used for partitioning
+        // Path and query filters together produce one partition tuple containing both values.
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
@@ -3156,8 +3160,8 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Query filters don't create partitions, only path filters do
-        // This will create a single partition with no path
+        // Query filters in an IN list produce one extracted partition tuple per query value.
+        // These partitions do not constrain the path, so `request_path` remains `None`.
         assert_eq!(partitions.len(), 2);
         assert_eq!(
             partitions[0],
@@ -3230,7 +3234,7 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Only path creates partition; query filters are validated but don't create separate partitions
+        // The path filter is crossed with each query value to produce separate partitions.
         assert_eq!(partitions.len(), 2);
         assert_eq!(
             partitions[0],

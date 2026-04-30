@@ -167,7 +167,7 @@ The HTTP connector provides metadata columns:
 - `request_headers` (String, NULL): The JSON request headers object used for this row's request. When no request-specific headers are provided, the current provider emits an empty string rather than SQL `NULL`.
 - `content` (String, NOT NULL): The parsed content from the response
 
-**Row Expansion**: When a response contains a JSON array or newline-delimited JSON (NDJSON), each item becomes a separate row with the same `request_path`, `request_query`, and `request_body` values but different `content`.
+**Row Expansion**: When a response contains a JSON array or newline-delimited JSON (NDJSON), each item becomes a separate row with the same `request_path`, `request_query`, `request_body`, and `request_headers` values but different `content`.
 
 ## Notes
 
