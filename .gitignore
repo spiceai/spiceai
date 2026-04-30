@@ -87,4 +87,7 @@ cluster_logs/
 *.pending-snap
 
 # Claude worktrees
-.claude/worktrees/
+.claude/
+
+# Distributed helper script working directory
+.distributed/

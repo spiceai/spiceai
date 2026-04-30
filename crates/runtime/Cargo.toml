@@ -130,6 +130,7 @@ runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-auth = { path = "../runtime-auth" }
+runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
@@ -184,8 +185,9 @@ twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = ">=8.1.1", features = [
+utoipa-swagger-ui = { version = "9", features = [
     "axum",
+    "vendored",
 ], optional = true }
 
 gethostname.workspace = true
@@ -262,6 +264,8 @@ yaml = { path = "../yaml" }
 [features]
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "dep:sha2", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
+azure-keyvault = ["runtime-secrets/azure-keyvault"]
+hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
 bedrock = []
 clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
 cosmosdb = ["data_components/cosmosdb"]
@@ -271,6 +275,7 @@ debezium = ["kafka", "data_components/debezium"]
 default = [
     "keyring-secret-store",
     "aws-secrets-manager",
+    "hashicorp_vault",
     "sharepoint",
     "bedrock",
     "flightsql",
@@ -290,6 +295,7 @@ duckdb = [
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
+    "search/duckdb",
 ]
 dynamodb = [
     "dep:aws-sdk-dynamodb",
@@ -333,7 +339,7 @@ postgres = [
     "datafusion-table-providers/postgres",
 ]
 postgres-accel = ["postgres"]
-postgres-write = []
+
 s3_vectors = [
     "data_components/s3_vectors",
     "dep:s3_vectors",

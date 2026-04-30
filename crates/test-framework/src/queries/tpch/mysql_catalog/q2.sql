@@ -9,11 +9,11 @@ SELECT
     s_phone,
     s_comment
 FROM
-    mysql.public.part,
-    mysql.public.supplier,
-    mysql.public.partsupp,
-    mysql.public.nation,
-    mysql.public.region
+    mysql.tpch_sf1.part,
+    mysql.tpch_sf1.supplier,
+    mysql.tpch_sf1.partsupp,
+    mysql.tpch_sf1.nation,
+    mysql.tpch_sf1.region
 WHERE
     p_partkey = ps_partkey
     AND s_suppkey = ps_suppkey
@@ -26,10 +26,10 @@ WHERE
         SELECT
             MIN(ps_supplycost)
         FROM
-            mysql.public.partsupp,
-            mysql.public.supplier,
-            mysql.public.nation,
-            mysql.public.region
+            mysql.tpch_sf1.partsupp,
+            mysql.tpch_sf1.supplier,
+            mysql.tpch_sf1.nation,
+            mysql.tpch_sf1.region
         WHERE
             p_partkey = ps_partkey
             AND s_suppkey = ps_suppkey

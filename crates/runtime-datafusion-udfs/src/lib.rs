@@ -22,6 +22,12 @@ pub mod cosine_distance;
 pub mod digest_many;
 #[cfg(feature = "models")]
 pub mod embed;
+pub mod flatten_json;
+pub mod inner_product;
+pub mod json_properties;
+pub mod json_tree;
+pub mod l2_distance;
+pub mod l2_norm;
 pub mod org;
 pub mod primitive_json_codec;
 pub mod role;
@@ -29,3 +35,4 @@ pub mod session_property;
 pub mod truncate;
 pub mod user;
 pub mod user_functions;
+pub(crate) mod vector_simd;

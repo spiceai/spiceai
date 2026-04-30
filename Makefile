@@ -111,7 +111,7 @@ lint: lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## Default variant: no models, no nfs
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,mcp --workspace --exclude libnfs -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,mcp,snapshots --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -126,7 +126,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,mcp --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,mcp,snapshots --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -146,7 +146,7 @@ lint-rust:
 .PHONY: lint-rust-models
 lint-rust-models:
 	## Models variant lint
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,elasticsearch --workspace --exclude libnfs -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -161,7 +161,7 @@ lint-rust-models:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,elasticsearch --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -215,7 +215,7 @@ lint-rust-nas:
 
 ## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
 ## Optional: FEATURES="feat1,feat2" to override features
-## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp for workspace (unless PACKAGES is set, then uses package defaults)
+## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch for workspace (unless PACKAGES is set, then uses package defaults)
 ## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
 PACKAGES ?=
 FEATURES ?=
@@ -233,7 +233,7 @@ _FEATURES_FLAGS := --features $(FEATURES)
 else ifdef PACKAGES
 _FEATURES_FLAGS :=
 else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,elasticsearch
+_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch
 endif
 
 lint-rust-fix:
@@ -291,6 +291,7 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features --features dynamodb
 	cargo check $(CARGO_PROFILE) --no-default-features --features oracle
 	cargo check $(CARGO_PROFILE) --no-default-features --features mongodb
+	cargo check $(CARGO_PROFILE) --no-default-features --features snapshots
 
 .PHONY: fmt-toml
 fmt-toml:
@@ -329,6 +330,10 @@ display-deps:
 ################################################################################
 # Target: install                                                              #
 ################################################################################
+# Honour CARGO_TARGET_DIR if set (e.g. for custom build directories / sccache setups),
+# otherwise fall back to the default Cargo output directory.
+TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
+
 # Default install includes models. Use -data suffix variants to build without models.
 # Data-only features (default features minus models)
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
@@ -337,14 +342,14 @@ SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,de
 .PHONY: install
 install: build
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
-	install -m 755 target/release/spiced ~/.spice/bin/spiced
+	install -m 755 $(TARGET_DIR)/release/spice ~/.spice/bin/spice
+	install -m 755 $(TARGET_DIR)/release/spiced ~/.spice/bin/spiced
 
 .PHONY: install-dev
 install-dev: build-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/spice ~/.spice/bin/spice
-	install -m 755 target/debug/spiced ~/.spice/bin/spiced
+	install -m 755 $(TARGET_DIR)/debug/spice ~/.spice/bin/spice
+	install -m 755 $(TARGET_DIR)/debug/spiced ~/.spice/bin/spiced
 
 # Data-only variants (without models)
 .PHONY: install-data-only
@@ -405,12 +410,12 @@ install-build:
 .PHONY: install-testoperator-dev
 install-testoperator-dev: build-testoperator-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/testoperator ~/.spice/bin/testoperator
+	install -m 755 $(TARGET_DIR)/debug/testoperator ~/.spice/bin/testoperator
 
 .PHONY: install-testoperator
 install-testoperator: build-testoperator
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
+	install -m 755 $(TARGET_DIR)/release/testoperator ~/.spice/bin/testoperator
 
 .PHONY: install-distributed-dev
 install-distributed-dev: build-distributed-dev
@@ -425,37 +430,37 @@ install-distributed: build-distributed
 .PHONY: install-spidapter-dev
 install-spidapter-dev: build-spidapter-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/spidapter ~/.spice/bin/spidapter
+	install -m 755 $(TARGET_DIR)/debug/spidapter ~/.spice/bin/spidapter
 
 .PHONY: install-spidapter
 install-spidapter: build-spidapter
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spidapter ~/.spice/bin/spidapter
+	install -m 755 $(TARGET_DIR)/release/spidapter ~/.spice/bin/spidapter
 
 .PHONY: install-cayenne-flightsql-dev
 install-cayenne-flightsql-dev: build-cayenne-flightsql-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
+	install -m 755 $(TARGET_DIR)/debug/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
 
 .PHONY: install-cayenne-flightsql
 install-cayenne-flightsql: build-cayenne-flightsql
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
+	install -m 755 $(TARGET_DIR)/release/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
 
 .PHONY: install-cli
 install-cli: build-cli
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 $(TARGET_DIR)/release/spice ~/.spice/bin/spice
 
 .PHONY: install-runtime
 install-runtime: build-runtime
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spiced ~/.spice/bin/spiced
+	install -m 755 $(TARGET_DIR)/release/spiced ~/.spice/bin/spiced
 
 .PHONY: install-cli-dev
 install-cli-dev: build-cli-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/debug/spice ~/.spice/bin/spice
+	install -m 755 $(TARGET_DIR)/debug/spice ~/.spice/bin/spice
 
 ################################################################################
 # Target: distributed                                                          #

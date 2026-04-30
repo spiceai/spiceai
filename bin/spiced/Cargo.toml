@@ -72,6 +72,8 @@ alloc-snmalloc = ["dep:snmalloc-rs"]
 alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
+azure-keyvault = ["runtime/azure-keyvault"]
+hashicorp_vault = ["runtime/hashicorp_vault"]
 clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
 cosmosdb = ["runtime/cosmosdb"]
 cuda = ["runtime/cuda"]
@@ -90,7 +92,6 @@ default = [
     "clickhouse",
     "cosmosdb",
     "sharepoint",
-    "snapshots",
     "snowflake",
     "snapshots",
     "spark",
@@ -137,7 +138,7 @@ oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]
 postgres-accel = ["runtime/postgres-accel"]
-postgres-write = ["runtime/postgres-write"]
+
 release = []
 scylladb = ["connector-scylladb", "runtime/scylladb"]
 sftp = ["connector-sftp", "runtime/sftp"]

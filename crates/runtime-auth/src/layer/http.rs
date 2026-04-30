@@ -75,17 +75,16 @@ where
 
             match auth_verifier.http_verify(&parts) {
                 Ok(AuthVerdict::Allow(principal)) => {
-                    let req = Request::from_parts(parts, body);
-                    if let Some(Err(e)) = req
+                    let mut request = Request::from_parts(parts, body);
+                    if let Some(context) = request
                         .extensions()
                         .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
-                        .map(|ctx| ctx.set_auth_principal(principal))
+                        && let Err(err) = context.set_auth_principal(Arc::clone(&principal))
                     {
-                        tracing::error!(
-                            "Failed to associate authentication information with the HTTP request: {e}"
-                        );
+                        tracing::warn!(%err, "Failed to set auth principal on request context");
                     }
-                    inner.call(req).await
+                    request.extensions_mut().insert(principal);
+                    inner.call(request).await
                 }
                 Ok(AuthVerdict::Deny) => Ok(unauthorized_response()),
                 Err(e) => {

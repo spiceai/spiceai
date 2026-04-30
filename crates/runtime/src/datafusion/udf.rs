@@ -47,6 +47,11 @@ use runtime_datafusion_udfs::{
     bucket::{BUCKET_SCALAR_UDF_NAME, Bucket},
     cosine_distance::{COSINE_DISTANCE_UDF_NAME, CosineDistance},
     digest_many::{DIGEST_UDF_NAME, INSTANCE},
+    inner_product::{INNER_PRODUCT_UDF_NAME, InnerProduct},
+    l2_distance::{
+        L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME, L2Distance, L2SquaredDistance,
+    },
+    l2_norm::{L2_NORM_UDF_NAME, L2Norm},
     org::{ORG_UDF_NAME, OrgUdf},
     role::{ROLE_UDF_NAME, RoleUdf},
     session_property::{SESSION_PROPERTY_UDF_NAME, SessionPropertyUdf},
@@ -62,6 +67,10 @@ pub fn register_core_scalar_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
     ctx.register_udf(Bucket::new().into());
     ctx.register_udf(CosineDistance::new().into());
+    ctx.register_udf(InnerProduct::new().into());
+    ctx.register_udf(L2Distance::new().into());
+    ctx.register_udf(L2SquaredDistance::new().into());
+    ctx.register_udf(L2Norm::new().into());
     ctx.register_udf(Truncate::new().into());
     ctx.register_udf(INSTANCE.clone());
     ctx.register_udf(UserUdf::new().into());
@@ -340,6 +349,10 @@ fn builtin_deny_list() -> Vec<String> {
         "rand",
         BUCKET_SCALAR_UDF_NAME,
         COSINE_DISTANCE_UDF_NAME,
+        INNER_PRODUCT_UDF_NAME,
+        L2_DISTANCE_UDF_NAME,
+        L2_SQUARED_DISTANCE_UDF_NAME,
+        L2_NORM_UDF_NAME,
         TRUNCATE_SCALAR_UDF_NAME,
         EMBED_UDF_NAME,
         #[cfg(feature = "models")]
@@ -358,6 +371,12 @@ fn builtin_deny_list() -> Vec<String> {
     .map(ToString::to_string)
     .collect();
     names.extend(json_functions());
+    names
+}
+
+fn duckdb_builtin_deny_list() -> Vec<String> {
+    let mut names = builtin_deny_list();
+    names.retain(|name| name != COSINE_DISTANCE_UDF_NAME);
     names
 }
 
@@ -455,6 +474,16 @@ pub fn remove_user_function_from_deny_list(name: &str) {
 #[must_use]
 pub fn deny_spice_specific_functions() -> FunctionSupport {
     (**DENY_LIST.read()).clone()
+}
+
+/// Return the [`FunctionSupport`] for `DuckDB` accelerators.
+///
+/// Identical to [`deny_spice_specific_functions`] except `cosine_distance` is
+/// allowed (`DuckDB` translates it to `array_cosine_distance`).
+#[must_use]
+pub fn deny_spice_functions_for_duckdb() -> FunctionSupport {
+    let user = USER_FUNCTION_NAMES.read().clone();
+    build_function_support(&duckdb_builtin_deny_list(), &user)
 }
 
 fn json_functions() -> Vec<String> {

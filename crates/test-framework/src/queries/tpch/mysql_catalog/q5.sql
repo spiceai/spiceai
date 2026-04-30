@@ -2,12 +2,12 @@ SELECT
     n_name,
     SUM(l_extendedprice * (1 - l_discount)) AS revenue
 FROM
-    mysql.public.customer,
-    mysql.public.orders,
-    mysql.public.lineitem,
-    mysql.public.supplier,
-    mysql.public.nation,
-    mysql.public.region
+    mysql.tpch_sf1.customer,
+    mysql.tpch_sf1.orders,
+    mysql.tpch_sf1.lineitem,
+    mysql.tpch_sf1.supplier,
+    mysql.tpch_sf1.nation,
+    mysql.tpch_sf1.region
 WHERE
     c_custkey = o_custkey
     AND l_orderkey = o_orderkey

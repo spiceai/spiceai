@@ -75,7 +75,9 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
-use crate::cluster::{DistributedNode, PartitionManager, SchedulerPeers};
+use crate::cluster::{
+    ClusterStateStore, DistributedNode, PartitionStore, SchedulerHeartbeatStore, SchedulerPeers,
+};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
@@ -202,14 +204,26 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unknown data connector: {data_connector}. Specify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+        "Unknown data connector '{data_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/data-connectors",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownDataConnector { data_connector: String },
+    UnknownDataConnector {
+        data_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
-        "Unknown catalog connector: {catalog_connector}. Specify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+        "Unknown catalog connector '{catalog_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/catalogs",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownCatalogConnector { catalog_connector: String },
+    UnknownCatalogConnector {
+        catalog_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
         "The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
@@ -257,9 +271,14 @@ pub enum Error {
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
-        "An accelerated table was configured as read_write without setting replication.enabled = true"
+        "An accelerated table for {dataset_name} cannot be configured with both 'on_conflict' and 'acceleration.write_mode: write_back' without 'refresh_mode: changes'. Without CDC, 'on_conflict' forces writes to the accelerator only and there is no sync path back to the federated source. Add 'refresh_mode: changes' to enable CDC-based sync, or remove 'on_conflict'."
     ))]
-    AcceleratedReadWriteTableWithoutReplication,
+    AcceleratedWriteBackWithOnConflict { dataset_name: String },
+
+    #[snafu(display(
+        "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back commits to the local accelerator first and persists to the federated source asynchronously, so source persistence failures are logged rather than returned to the caller. Set 'replication.enabled: true' to opt in to asynchronous source durability, or use a different write_mode."
+    ))]
+    AcceleratedWriteBackWithoutReplication { dataset_name: String },
 
     #[snafu(display(
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
@@ -781,32 +800,21 @@ impl Runtime {
         Ok(())
     }
 
-    /// Returns the partition manager for accelerated table partition metadata (scheduler only).
+    /// Returns the partition store for accelerated table partition metadata (scheduler only).
     #[must_use]
-    pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
+    pub fn partition_store(&self) -> Option<Arc<PartitionStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
-                accelerations_partitions,
+                accelerations_partitions_store,
                 ..
-            }) => Some(Arc::clone(accelerations_partitions)),
+            }) => Some(Arc::clone(accelerations_partitions_store)),
             _ => None,
         }
     }
 
-    /// Returns the catalog/federated partition manager (scheduler only).
+    /// Returns the cluster state store (scheduler only).
     #[must_use]
-    pub fn catalog_partition_manager(&self) -> Option<Arc<PartitionManager>> {
-        match self.distributed.as_ref() {
-            Some(DistributedNode::Scheduler {
-                catalog_partitions, ..
-            }) => Some(Arc::clone(catalog_partitions)),
-            _ => None,
-        }
-    }
-
-    /// Returns the shared cluster state store (scheduler only).
-    #[must_use]
-    pub fn cluster_state(&self) -> Option<Arc<crate::cluster::ClusterStateStore>> {
+    pub fn cluster_state(&self) -> Option<Arc<ClusterStateStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { cluster_state, .. }) => {
                 Some(Arc::clone(cluster_state))
@@ -817,7 +825,7 @@ impl Runtime {
 
     /// Returns the scheduler heartbeat store (scheduler only).
     #[must_use]
-    pub fn scheduler_heartbeats(&self) -> Option<Arc<crate::cluster::SchedulerHeartbeatStore>> {
+    pub fn scheduler_heartbeats(&self) -> Option<Arc<SchedulerHeartbeatStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { heartbeats, .. }) => Some(Arc::clone(heartbeats)),
             _ => None,

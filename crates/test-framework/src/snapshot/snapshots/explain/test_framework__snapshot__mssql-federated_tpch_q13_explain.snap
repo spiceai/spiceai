@@ -16,7 +16,7 @@ description: "Query: tpch_q13"
 |               |                 TableScan: customer projection=[c_custkey]                                                                                                                 |
 |               |                 Projection: orders.o_orderkey, orders.o_custkey                                                                                                            |
 |               |                   Filter: orders.o_comment NOT LIKE Utf8("%special%requests%")                                                                                             |
-|               |                     TableScan: orders projection=[o_orderkey, o_custkey, o_comment]                                                                                        |
+|               |                     TableScan: orders projection=[o_orderkey, o_custkey, o_comment], partial_filters=[orders.o_comment NOT LIKE Utf8("%special%requests%")]                |
 | physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                                                 |
 |               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                                                           |
 |               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                                                             |
@@ -35,6 +35,6 @@ description: "Query: tpch_q13"
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                |
 |               |                         CooperativeExec                                                                                                                                    |
 |               |                           BytesProcessedExec                                                                                                                               |
-|               |                             SqlServerExec sql=SELECT o_orderkey, o_custkey, o_comment FROM orders                                                                          |
+|               |                             SqlServerExec sql=SELECT o_orderkey, o_custkey, o_comment FROM orders WHERE (o_comment NOT LIKE '%special%requests%')                          |
 |               |                                                                                                                                                                            |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -2,20 +2,20 @@ SELECT
     s_name,
     s_address
 FROM
-    mysql.public.supplier,
-    mysql.public.nation
+    mysql.tpch_sf1.supplier,
+    mysql.tpch_sf1.nation
 WHERE
     s_suppkey IN (
         SELECT
             ps_suppkey
         FROM
-            mysql.public.partsupp
+            mysql.tpch_sf1.partsupp
         WHERE
             ps_partkey IN (
                 SELECT
                     p_partkey
                 FROM
-                    mysql.public.part
+                    mysql.tpch_sf1.part
                 WHERE
                     p_name LIKE 'forest%'
             )
@@ -23,7 +23,7 @@ WHERE
                 SELECT
                     0.5 * SUM(l_quantity)
                 FROM
-                    mysql.public.lineitem
+                    mysql.tpch_sf1.lineitem
                 WHERE
                     l_partkey = ps_partkey
                     AND l_suppkey = ps_suppkey
