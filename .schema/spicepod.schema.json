@@ -3497,6 +3497,11 @@
           "description": "Source URI selecting the execution tier (e.g. `sql`, `wasm:./x.wasm`,\n`http://host/path`). See [`Function`] docs for the full scheme list.",
           "type": "string"
         },
+        "enabled": {
+          "description": "Whether this function should be registered. Defaults to `true`.\n\nSet to `false` to keep the declaration in the spicepod without making\nit callable through SQL, tool exposure, `list_udfs()`, or\n`/v1/functions`.",
+          "type": "boolean",
+          "default": true
+        },
         "description": {
           "description": "Free-form description surfaced in `list_udfs()` and the\n`/v1/functions` HTTP endpoint.",
           "type": [
