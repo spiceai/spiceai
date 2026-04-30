@@ -51,6 +51,12 @@ pub enum Error {
         source: Box<stores::azure_keyvault::Error>,
     },
 
+    #[cfg(feature = "hashicorp_vault")]
+    #[snafu(display("Unable to initialize HashiCorp Vault: {source}"))]
+    UnableToInitializeHashicorpVault {
+        source: Box<stores::hashicorp_vault::Error>,
+    },
+
     #[snafu(display("Unable to parse secret value"))]
     UnableToParseSecretValue,
 
@@ -91,6 +97,8 @@ pub fn known_secret_stores() -> Vec<&'static str> {
     stores.push("aws_secrets_manager");
     #[cfg(feature = "azure-keyvault")]
     stores.push("azure_keyvault");
+    #[cfg(feature = "hashicorp_vault")]
+    stores.push("hashicorp_vault");
     stores.push("scheduler_rpc");
     stores
 }
@@ -374,6 +382,8 @@ pub enum SecretStoreType {
     AwsSecretsManager(stores::aws_secrets_manager::AwsSecretsManagerConfig),
     #[cfg(feature = "azure-keyvault")]
     AzureKeyVault(stores::azure_keyvault::AzureKeyVaultConfig),
+    #[cfg(feature = "hashicorp_vault")]
+    HashicorpVault(stores::hashicorp_vault::HashicorpVaultConfig),
     SchedulerRPC,
 }
 
@@ -470,6 +480,16 @@ async fn spicepod_secret_store_type(
             Ok(SecretStoreType::AzureKeyVault(
                 stores::azure_keyvault::AzureKeyVaultConfig::from_params(vault, &params),
             ))
+        }
+        #[cfg(feature = "hashicorp_vault")]
+        "hashicorp_vault" => {
+            let path = require_selector(provider, selector)?;
+            let params = validate(stores::hashicorp_vault::PARAMETERS)?;
+            let cfg = stores::hashicorp_vault::HashicorpVaultConfig::from_params(path, &params)
+                .map_err(|e| Error::UnableToInitializeHashicorpVault {
+                    source: Box::new(e),
+                })?;
+            Ok(SecretStoreType::HashicorpVault(cfg))
         }
         "scheduler_rpc" => {
             require_no_selector(provider, selector)?;
@@ -582,6 +602,22 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
                 .init()
                 .await
                 .map_err(|e| Error::UnableToInitializeAzureKeyVault {
+                    source: Box::new(e),
+                })?;
+
+            Ok(Arc::new(secret_store) as Arc<dyn SecretStore>)
+        },
+        #[cfg(feature = "hashicorp_vault")]
+        SecretStoreType::HashicorpVault(config) => {
+            let secret_store = stores::hashicorp_vault::HashicorpVault::from_config(config)
+                .map_err(|e| Error::UnableToInitializeHashicorpVault {
+                    source: Box::new(e),
+                })?;
+
+            secret_store
+                .init()
+                .await
+                .map_err(|e| Error::UnableToInitializeHashicorpVault {
                     source: Box::new(e),
                 })?;
 
@@ -1087,6 +1123,214 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("azure_keyvault"), "got {msg}");
+        assert!(
+            msg.contains("secret selector"),
+            "error should explain the selector requirement; got {msg}"
+        );
+    }
+
+    #[cfg(feature = "hashicorp_vault")]
+    #[tokio::test]
+    async fn test_hashicorp_vault_params_threaded_through() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let mut p = HashMap::new();
+        p.insert(
+            "hashicorp_vault_address".to_string(),
+            "https://vault.example.com:8200".to_string(),
+        );
+        p.insert(
+            "hashicorp_vault_namespace".to_string(),
+            "admin/team-a".to_string(),
+        );
+        p.insert("hashicorp_vault_mount".to_string(), "kv".to_string());
+        p.insert("hashicorp_vault_kv_version".to_string(), "v2".to_string());
+        p.insert(
+            "hashicorp_vault_auth_method".to_string(),
+            "approle".to_string(),
+        );
+        p.insert("hashicorp_vault_role_id".to_string(), "rid".to_string());
+        p.insert("hashicorp_vault_secret_id".to_string(), "sid".to_string());
+
+        let store = SpicepodSecret {
+            from: "hashicorp_vault:myapp/config".to_string(),
+            name: "hashicorp_vault".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+        match resolved {
+            super::SecretStoreType::HashicorpVault(cfg) => {
+                assert_eq!(cfg.path, "myapp/config");
+                assert_eq!(cfg.address, "https://vault.example.com:8200");
+                assert_eq!(cfg.namespace.as_deref(), Some("admin/team-a"));
+                assert_eq!(cfg.mount, "kv");
+                assert_eq!(
+                    cfg.kv_version,
+                    super::stores::hashicorp_vault::KvVersion::V2
+                );
+                assert_eq!(
+                    cfg.auth_method,
+                    super::stores::hashicorp_vault::AuthMethod::AppRole
+                );
+                assert_eq!(cfg.role_id.as_deref(), Some("rid"));
+                assert_eq!(
+                    cfg.secret_id
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("sid".to_string())
+                );
+            }
+            _ => panic!("expected Vault variant"),
+        }
+    }
+
+    #[cfg(feature = "hashicorp_vault")]
+    #[tokio::test]
+    async fn test_hashicorp_vault_unknown_param_is_rejected() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let mut p = HashMap::new();
+        p.insert(
+            "hashicorp_vault_addres".to_string(),
+            "https://vault.example.com:8200".to_string(),
+        );
+
+        let store = SpicepodSecret {
+            from: "hashicorp_vault:myapp".to_string(),
+            name: "hashicorp_vault".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("unknown param should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("hashicorp_vault_addres"), "got {msg}");
+        assert!(
+            msg.contains("hashicorp_vault_address"),
+            "error must list supported params; got {msg}"
+        );
+    }
+
+    #[cfg(feature = "hashicorp_vault")]
+    #[tokio::test]
+    async fn test_hashicorp_vault_env_bootstrap_resolves_token() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let _env_guard = lock_env().await;
+        let token_var = format!("SPICE_TEST_VAULT_TOKEN_{}", rand::random::<u64>());
+        unsafe {
+            std::env::set_var(&token_var, "hvs.dev-root");
+        }
+
+        let mut p = HashMap::new();
+        p.insert(
+            "hashicorp_vault_address".to_string(),
+            "https://vault.example.com:8200".to_string(),
+        );
+        p.insert(
+            "hashicorp_vault_token".to_string(),
+            format!("${{ env:{token_var} }}"),
+        );
+
+        let store = SpicepodSecret {
+            from: "hashicorp_vault:myapp".to_string(),
+            name: "hashicorp_vault".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+
+        unsafe {
+            std::env::remove_var(&token_var);
+        }
+
+        match resolved {
+            super::SecretStoreType::HashicorpVault(cfg) => {
+                assert_eq!(
+                    cfg.token.as_ref().map(|s| s.expose_secret().to_string()),
+                    Some("hvs.dev-root".to_string())
+                );
+            }
+            _ => panic!("expected Vault variant"),
+        }
+    }
+
+    #[cfg(feature = "hashicorp_vault")]
+    #[tokio::test]
+    async fn test_hashicorp_vault_rejects_invalid_auth_method() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let mut p = HashMap::new();
+        p.insert(
+            "hashicorp_vault_address".to_string(),
+            "https://vault.example.com:8200".to_string(),
+        );
+        p.insert(
+            "hashicorp_vault_auth_method".to_string(),
+            "oauth".to_string(),
+        );
+
+        let store = SpicepodSecret {
+            from: "hashicorp_vault:myapp".to_string(),
+            name: "hashicorp_vault".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("invalid hashicorp_vault_auth_method should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("oauth"), "got {msg}");
+        assert!(
+            msg.contains("approle") && msg.contains("kubernetes"),
+            "error must list the allowed values; got {msg}"
+        );
+    }
+
+    #[cfg(feature = "hashicorp_vault")]
+    #[tokio::test]
+    async fn test_hashicorp_vault_selector_is_required() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let store = SpicepodSecret {
+            from: "hashicorp_vault".to_string(),
+            name: "hashicorp_vault".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(HashMap::new())),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("missing selector should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("hashicorp_vault"), "got {msg}");
         assert!(
             msg.contains("secret selector"),
             "error should explain the selector requirement; got {msg}"
