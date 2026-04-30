@@ -18,8 +18,8 @@ use std::sync::{Arc, Weak};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
-/// Message shown when a user has configured snapshots but the feature is not
-/// compiled into this build of Spice.
+/// Message shown when snapshots are configured or requested but the feature is
+/// not compiled into this build of Spice.
 ///
 /// In OSS default builds the `snapshots` cargo feature is disabled and snapshot
 /// support is shipped only in the Spice.ai enterprise build.
