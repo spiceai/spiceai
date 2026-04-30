@@ -162,9 +162,9 @@ The HTTP connector's `refresh_sql` supports the following filter expressions on 
 The HTTP connector provides metadata columns:
 
 - `request_path` (String, NOT NULL): The path portion of the URL used for this row's request
-- `request_query` (String, NOT NULL): The query string portion of the URL (empty string if none)
-- `request_body` (String, NOT NULL): The request body for POST requests (empty string if none)
-- `request_headers` (String, NULL): The JSON request headers object used for this row's request (empty string if none)
+- `request_query` (String, NULL): The query string portion of the URL. When no query string is provided, the current provider emits an empty string rather than SQL `NULL`.
+- `request_body` (String, NULL): The request body for POST requests. When no request body is provided, the current provider emits an empty string rather than SQL `NULL`.
+- `request_headers` (String, NULL): The JSON request headers object used for this row's request. When no request-specific headers are provided, the current provider emits an empty string rather than SQL `NULL`.
 - `content` (String, NOT NULL): The parsed content from the response
 
 **Row Expansion**: When a response contains a JSON array or newline-delimited JSON (NDJSON), each item becomes a separate row with the same `request_path`, `request_query`, and `request_body` values but different `content`.

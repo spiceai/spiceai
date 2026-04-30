@@ -41,14 +41,15 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
     Client,
-    header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
+    header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
 use snafu::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::{
     any::Any,
     borrow::ToOwned,
     fmt,
+    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -321,6 +322,36 @@ impl HttpFetchResult {
     }
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct CacheKey {
+    path: String,
+    query: Option<String>,
+    body: Option<String>,
+    request_headers: Option<String>,
+}
+
+impl CacheKey {
+    fn new(
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Self {
+        Self {
+            path: path.to_string(),
+            query: query.map(ToString::to_string),
+            body: body.map(ToString::to_string),
+            request_headers: request_headers.map(ToString::to_string),
+        }
+    }
+
+    fn redacted_label(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        format!("http-cache-key:{:016x}", hasher.finish())
+    }
+}
+
 /// A table provider that fetches data from HTTP endpoints based on path and query filters
 #[derive(Clone)]
 pub struct HttpTableProvider {
@@ -329,7 +360,7 @@ pub struct HttpTableProvider {
     file_format: String,
     schema: SchemaRef,
     constraints: Constraints,
-    cache: Arc<RwLock<HashMap<String, CachedResponse>>>,
+    cache: Arc<RwLock<HashMap<CacheKey, CachedResponse>>>,
     acceleration_enabled: bool,
     retry_strategy: RetryBackoff,
     content_type: Option<String>,
@@ -502,6 +533,12 @@ impl HttpTableProvider {
             let parsed = HeaderName::try_from(raw).map_err(|e| Error::Configuration {
                 message: format!("Invalid request_header_allowlist entry '{raw}': {e}"),
             })?;
+            ensure!(
+                !(self.auth.is_some() && parsed == AUTHORIZATION),
+                ConfigurationSnafu {
+                    message: "request_header_allowlist cannot include 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_header_allowlist or disable HTTP authentication.".to_string()
+                }
+            );
             allowed_headers.insert(parsed);
         }
 
@@ -732,14 +769,8 @@ impl HttpTableProvider {
         query: Option<&str>,
         body: Option<&str>,
         request_headers: Option<&str>,
-    ) -> String {
-        format!(
-            "{}?{}&body={}&headers={}",
-            path,
-            query.unwrap_or(""),
-            body.unwrap_or(""),
-            request_headers.unwrap_or("")
-        )
+    ) -> CacheKey {
+        CacheKey::new(path, query, body, request_headers)
     }
 
     /// Validates the HTTP endpoint by attempting a request to a custom health probe path if configured,
@@ -1185,6 +1216,7 @@ impl HttpTableProvider {
         }
 
         let cache_key = Self::get_cache_key(path, query, body, request_headers);
+        let cache_key_label = cache_key.redacted_label();
 
         // Try to get from cache
         let cached = {
@@ -1198,11 +1230,11 @@ impl HttpTableProvider {
             if let Some(ref format) = cached_response.detected_format {
                 tracing::debug!(
                     "Returning fresh cached content for {} (detected format: {})",
-                    cache_key,
+                    cache_key_label,
                     format
                 );
             } else {
-                tracing::debug!("Returning fresh cached content for {}", cache_key);
+                tracing::debug!("Returning fresh cached content for {}", cache_key_label);
             }
             return Ok(HttpFetchResult {
                 content: (*cached_response.content).clone(),
@@ -2775,6 +2807,12 @@ impl HttpTableProvider {
                 });
             }
 
+            if self.auth.is_some() && header_name == AUTHORIZATION {
+                return Err(Error::FilterRejected {
+                    message: "The 'request_headers' object cannot set 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_headers or disable HTTP authentication.".to_string(),
+                });
+            }
+
             let Some(header_value) = value.as_str() else {
                 return Err(Error::FilterRejected {
                     message: format!(
@@ -2837,6 +2875,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use url::Url;
+
+    #[derive(Debug)]
+    struct TestAuthenticator;
+
+    impl super::super::auth::HttpAuthenticator for TestAuthenticator {
+        fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            builder.header(AUTHORIZATION, "Bearer token")
+        }
+    }
 
     /// Build a query string by adding or replacing a token parameter.
     fn build_query_with_token(existing_query: Option<&str>, param: &str, token: &str) -> String {
@@ -3331,6 +3378,34 @@ mod tests {
     }
 
     #[test]
+    fn test_request_headers_filter_rejects_authorization_with_auth() {
+        let provider = base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["authorization"])
+            .expect("authorization should be allowlisted before auth is configured")
+            .with_auth(Arc::new(TestAuthenticator));
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"authorization":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("authorization"));
+                assert!(message.contains("HTTP authentication"));
+                assert!(!message.contains("secret"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_request_headers_filter_rejects_invalid_json() {
         let provider = header_provider();
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -3475,19 +3550,23 @@ mod tests {
             Some("body"),
             Some(r#"{"x-sandbox-id":"sandbox-1"}"#),
         );
+        let collision_candidate_1 =
+            HttpTableProvider::get_cache_key("/path", Some("q&body=b"), Some(""), None);
+        let collision_candidate_2 =
+            HttpTableProvider::get_cache_key("/path", Some("q"), Some("b&body="), None);
 
-        assert_eq!(key1, "/path?query&body=&headers=");
-        assert_eq!(key2, "/path?&body=&headers=");
-        assert_eq!(key3, "/other?query&body=&headers=");
-        assert_eq!(key4, "/path?query&body=body&headers=");
-        assert_eq!(
-            key5,
-            r#"/path?query&body=body&headers={"x-sandbox-id":"sandbox-1"}"#
-        );
-        assert_ne!(key1, key2);
-        assert_ne!(key1, key3);
-        assert_ne!(key1, key4);
-        assert_ne!(key4, key5);
+        assert!(key1 == CacheKey::new("/path", Some("query"), None, None));
+        assert!(key1 != key2);
+        assert!(key1 != key3);
+        assert!(key1 != key4);
+        assert!(key4 != key5);
+        assert!(collision_candidate_1 != collision_candidate_2);
+
+        let redacted_label = key5.redacted_label();
+        assert!(redacted_label.starts_with("http-cache-key:"));
+        assert!(!redacted_label.contains("/path"));
+        assert!(!redacted_label.contains("body"));
+        assert!(!redacted_label.contains("sandbox-1"));
     }
 
     #[test]
