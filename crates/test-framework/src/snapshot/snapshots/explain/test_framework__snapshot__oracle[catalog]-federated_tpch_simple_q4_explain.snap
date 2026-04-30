@@ -1,0 +1,23 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q4"
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: oracle_tpch.TPCH_SF1.LINEITEM.L_QUANTITY DESC NULLS FIRST, fetch=10                                                                                                           |
+|               |   Projection: avg(oracle_tpch.TPCH_SF1.LINEITEM.L_TAX), oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER, oracle_tpch.TPCH_SF1.LINEITEM.L_QUANTITY                                        |
+|               |     Aggregate: groupBy=[[oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER, oracle_tpch.TPCH_SF1.LINEITEM.L_QUANTITY]], aggr=[[avg(CAST(oracle_tpch.TPCH_SF1.LINEITEM.L_TAX AS Float64))]] |
+|               |       TableScan: oracle_tpch.TPCH_SF1.LINEITEM projection=[L_LINENUMBER, L_QUANTITY, L_TAX]                                                                                         |
+| physical_plan | SortPreservingMergeExec: [L_QUANTITY@2 DESC], fetch=10                                                                                                                              |
+|               |   SortExec: TopK(fetch=10), expr=[L_QUANTITY@2 DESC], preserve_partitioning=[true]                                                                                                  |
+|               |     ProjectionExec: expr=[avg(oracle_tpch.TPCH_SF1.LINEITEM.L_TAX)@2 as avg(oracle_tpch.TPCH_SF1.LINEITEM.L_TAX), L_LINENUMBER@0 as L_LINENUMBER, L_QUANTITY@1 as L_QUANTITY]       |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[L_LINENUMBER@0 as L_LINENUMBER, L_QUANTITY@1 as L_QUANTITY], aggr=[avg(oracle_tpch.TPCH_SF1.LINEITEM.L_TAX)]                       |
+|               |         RepartitionExec: partitioning=Hash([L_LINENUMBER@0, L_QUANTITY@1], 32), input_partitions=32                                                                                 |
+|               |           AggregateExec: mode=Partial, gby=[L_LINENUMBER@0 as L_LINENUMBER, L_QUANTITY@1 as L_QUANTITY], aggr=[avg(oracle_tpch.TPCH_SF1.LINEITEM.L_TAX)]                            |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                                   |
+|               |               CooperativeExec                                                                                                                                                       |
+|               |                 BytesProcessedExec                                                                                                                                                  |
+|               |                   OracleExec sql=SELECT "L_LINENUMBER", "L_QUANTITY", "L_TAX" FROM "TPCH_SF1"."LINEITEM"                                                                            |
+|               |                                                                                                                                                                                     |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
