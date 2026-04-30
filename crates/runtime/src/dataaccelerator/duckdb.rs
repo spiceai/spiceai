@@ -31,7 +31,7 @@ use crate::{
     datafusion::{
         dialect::new_duckdb_dialect,
         sort_columns::{SortColumn, parse_sort_columns},
-        udf::deny_spice_specific_functions,
+        udf::deny_spice_functions_for_duckdb,
     },
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -136,7 +136,7 @@ impl DuckDBAccelerator {
                         .with_setting(Box::new(settings::IndexScanMaxCount))
                         .with_setting(Box::new(settings::TimeZone)),
                 )
-                .with_function_support(deny_spice_specific_functions()),
+                .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone()),
         }
     }
 

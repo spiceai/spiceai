@@ -390,9 +390,9 @@ pub async fn apply_function_diff(
     }
 }
 
-/// Names of built-in Spice UDFs that must never be pushed down to remote
-/// databases. These are resolved at process start and don't change.
-fn builtin_deny_list() -> Vec<String> {
+/// Returns the full list of Spice-specific scalar function names denied for
+/// federation by default.
+fn denied_spice_function_names() -> Vec<String> {
     let mut names: Vec<String> = [
         "rand",
         BUCKET_SCALAR_UDF_NAME,
@@ -418,11 +418,31 @@ fn builtin_deny_list() -> Vec<String> {
     names
 }
 
+fn denied_spice_function_names_for_duckdb() -> Vec<String> {
+    denied_spice_function_names()
+        .into_iter()
+        .filter(|name| name != COSINE_DISTANCE_UDF_NAME)
+        .collect()
+}
+
 /// Dynamic deny-list: built-ins plus any user-registered functions. Held
 /// in a [`RwLock`] so that hot-reload can update the user slice without
 /// requiring callers to refactor.
-static DENY_LIST: LazyLock<RwLock<Arc<FunctionSupport>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(build_function_support(&builtin_deny_list(), &[]))));
+static DENY_LIST: LazyLock<RwLock<Arc<FunctionSupport>>> = LazyLock::new(|| {
+    RwLock::new(Arc::new(build_function_support(
+        &denied_spice_function_names(),
+        &[],
+    )))
+});
+
+/// DuckDB-specific dynamic deny-list: same as the default but allows
+/// `cosine_distance` (`DuckDB` translates it to `array_cosine_distance`).
+static DENY_LIST_DUCKDB: LazyLock<RwLock<Arc<FunctionSupport>>> = LazyLock::new(|| {
+    RwLock::new(Arc::new(build_function_support(
+        &denied_spice_function_names_for_duckdb(),
+        &[],
+    )))
+});
 
 /// Names of user-defined functions currently in the deny-list. Kept
 /// separate so we can rebuild the combined [`FunctionSupport`] when
@@ -476,10 +496,12 @@ fn build_function_support(builtins: &[String], user: &[String]) -> FunctionSuppo
     FunctionSupport::new(Some(FunctionRestriction::Deny(denied)), None, None)
 }
 
-fn rebuild_deny_list() {
+fn rebuild_deny_lists() {
     let user = USER_FUNCTION_NAMES.read().clone();
-    let combined = build_function_support(&builtin_deny_list(), &user);
+    let combined = build_function_support(&denied_spice_function_names(), &user);
     *DENY_LIST.write() = Arc::new(combined);
+    let combined_duckdb = build_function_support(&denied_spice_function_names_for_duckdb(), &user);
+    *DENY_LIST_DUCKDB.write() = Arc::new(combined_duckdb);
 }
 
 /// Add a user function name to the federation deny-list. Idempotent.
@@ -491,7 +513,7 @@ pub fn add_user_function_to_deny_list(name: &str) {
         }
         guard.push(name.to_string());
     }
-    rebuild_deny_list();
+    rebuild_deny_lists();
 }
 
 /// Remove a user function name from the federation deny-list. No-op if
@@ -505,7 +527,7 @@ pub fn remove_user_function_from_deny_list(name: &str) {
             return;
         }
     }
-    rebuild_deny_list();
+    rebuild_deny_lists();
 }
 
 /// Add a function name to the read-write API key requirement set. Idempotent.
@@ -533,14 +555,20 @@ pub fn is_code_executing_function(name: &str) -> bool {
 }
 
 /// Return the current combined deny-list: built-ins plus every
-/// user-registered function.
-///
-/// Returns an owned [`FunctionSupport`] by cloning the internal cached
-/// value. This is called at accelerator/table setup time (infrequent) so
-/// the clone cost is not meaningful.
+/// user-registered function. The returned [`Arc`] is cheap to clone and is
+/// safe to use from per-query filter pushdown paths.
 #[must_use]
-pub fn deny_spice_specific_functions() -> FunctionSupport {
-    (**DENY_LIST.read()).clone()
+pub fn deny_spice_specific_functions() -> Arc<FunctionSupport> {
+    Arc::clone(&*DENY_LIST.read())
+}
+
+/// Return the current [`FunctionSupport`] for `DuckDB` accelerators.
+///
+/// Identical to [`deny_spice_specific_functions`] except `cosine_distance` is
+/// allowed (`DuckDB` translates it to `array_cosine_distance`).
+#[must_use]
+pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
+    Arc::clone(&*DENY_LIST_DUCKDB.read())
 }
 
 fn json_functions() -> Vec<String> {

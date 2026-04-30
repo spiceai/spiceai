@@ -22,21 +22,17 @@ use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::{
-    AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
-    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
-    PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnknownDataConnectorSnafu,
+    AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
+    AcceleratorInitializationFailedSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
+    LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
-    component::{
-        access::AccessMode,
-        dataset::{
-            Dataset,
-            acceleration::{Acceleration, RefreshMode},
-            builder::DatasetBuilder,
-        },
+    component::dataset::{
+        Dataset,
+        acceleration::{Acceleration, RefreshMode},
+        builder::DatasetBuilder,
     },
     dataaccelerator::{
         AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
@@ -665,7 +661,7 @@ impl Runtime {
         ds_name: TableReference,
         ds_acceleration: Option<&Acceleration>,
     ) {
-        if self.df.table_exists(ds_name.clone()) {
+        if self.df.table_exists(&ds_name) {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                 datasets_health_monitor
                     .deregister_dataset(&ds_name.to_string())
@@ -994,12 +990,37 @@ impl Runtime {
                 })?;
         let accelerator_engine = acceleration_settings.engine;
 
-        // Allow ReadWrite access when:
-        // 1. Replication is enabled (changes are synced back to source), OR
-        // 2. on_conflict is configured (accelerator supports local writes via upsert/drop)
         let has_on_conflict = !acceleration_settings.on_conflict.is_empty();
-        if ds.access() == AccessMode::ReadWrite && !replicate && !has_on_conflict {
-            AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
+        let has_changes_refresh = acceleration_settings
+            .refresh_mode
+            .is_some_and(|mode| matches!(mode, RefreshMode::Changes));
+        let has_write_back =
+            acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack;
+
+        // `on_conflict` forces writes to the accelerator only. When combined with
+        // `write_mode: write_back` and `refresh_mode: changes` (CDC), on_conflict acts
+        // as WAL UPDATE upsert routing only and write_back can coexist with it.
+        // Reject the combination of on_conflict + write_back without CDC, since there
+        // would be no path to sync the accelerator writes back to the federated source.
+        if has_on_conflict && has_write_back && !has_changes_refresh {
+            crate::AcceleratedWriteBackWithOnConflictSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
+        }
+
+        // `write_mode: write_back` commits to the local accelerator first and
+        // asynchronously forwards the same mutation to the federated source.
+        // Because the source commit is not part of the synchronous response,
+        // require `replication.enabled` as the user's explicit opt-in to those
+        // asynchronous source durability semantics.
+        if acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack
+            && !replicate
+        {
+            crate::AcceleratedWriteBackWithoutReplicationSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
         }
 
         self.accelerator_engine_registry

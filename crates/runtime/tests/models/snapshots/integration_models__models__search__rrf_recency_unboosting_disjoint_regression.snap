@@ -1,0 +1,23 @@
+---
+source: crates/runtime/tests/models/search.rs
+description: "SELECT id, content, picked_at FROM rrf(vector_search(left_fruit, 'red crispy', content), vector_search(right_fruit, 'red crispy', content), join_key => 'id', k => 0, time_column => 'picked_at', decay_constant => 0.25) ORDER BY _fused_score DESC, id ASC LIMIT 3"
+expression: "normalize_search_response(resp, true)"
+snapshot_kind: text
+---
+[
+  {
+    "content": "apple fruit sweet red crispy",
+    "id": 3,
+    "picked_at": "2026-04-25T00:00:00"
+  },
+  {
+    "content": "orange citrus round juicy",
+    "id": 2,
+    "picked_at": "2026-04-26T00:00:00"
+  },
+  {
+    "content": "apple fruit sweet red crispy",
+    "id": 1,
+    "picked_at": "1970-01-01T00:00:00"
+  }
+]
