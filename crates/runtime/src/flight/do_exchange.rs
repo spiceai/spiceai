@@ -16,8 +16,8 @@ limitations under the License.
 
 use std::{collections::VecDeque, sync::Arc};
 
-use arrow::array::{ListBuilder, RecordBatch, StringBuilder, new_null_array};
 use arrow::array::{ListArray, StringArray, StructArray};
+use arrow::array::{ListBuilder, RecordBatch, StringBuilder, new_null_array};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow_flight::{FlightData, SchemaAsIpc, flight_service_server::FlightService};
 use arrow_ipc::writer::{self, CompressionContext, DictionaryTracker, IpcDataGenerator};
@@ -443,9 +443,11 @@ fn get_primary_keys_from_constraints<'a>(
 }
 
 fn get_primary_keys_array(primary_keys: &[&str], row_count: usize) -> ListArray {
-    let mut list_builder = ListBuilder::new(StringBuilder::new()).with_field(Arc::new(
-        Field::new("item", DataType::Utf8, false),
-    ));
+    let mut list_builder = ListBuilder::new(StringBuilder::new()).with_field(Arc::new(Field::new(
+        "item",
+        DataType::Utf8,
+        false,
+    )));
     for _ in 0..row_count {
         for key in primary_keys {
             list_builder.values().append_value(key);
