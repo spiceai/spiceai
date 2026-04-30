@@ -52,7 +52,7 @@ use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
 use yaml::Value;
 
-const TELEMETRY_CANNOT_BE_DISABLED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated and cannot be disabled in Spice.ai Open Source. To disable telemetry, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
+const SPICEPOD_TELEMETRY_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod does not disable anonymous usage telemetry. To disable telemetry for this run, start spiced with --telemetry-enabled=false. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -874,7 +874,7 @@ async fn start_anonymous_telemetry(
     let config = telemetry_config.wait().await;
 
     if should_warn_spicepod_telemetry_disabled(telemetry_enabled, config) {
-        tracing::warn!("{TELEMETRY_CANNOT_BE_DISABLED_MESSAGE}");
+        tracing::warn!("{SPICEPOD_TELEMETRY_SETTING_IGNORED_MESSAGE}");
     }
 
     #[cfg(feature = "anonymous_telemetry")]
@@ -1063,12 +1063,16 @@ mod tests {
 
     #[cfg(feature = "anonymous_telemetry")]
     #[test]
-    fn telemetry_disabled_message_mentions_enterprise() {
-        assert!(TELEMETRY_CANNOT_BE_DISABLED_MESSAGE.contains("anonymous and aggregated"));
+    fn telemetry_disabled_message_mentions_supported_disable_paths() {
+        assert!(SPICEPOD_TELEMETRY_SETTING_IGNORED_MESSAGE.contains("anonymous and aggregated"));
+        assert!(SPICEPOD_TELEMETRY_SETTING_IGNORED_MESSAGE.contains(
+            "runtime.telemetry.enabled: false in a Spicepod does not disable anonymous usage telemetry"
+        ));
+        assert!(SPICEPOD_TELEMETRY_SETTING_IGNORED_MESSAGE.contains("--telemetry-enabled=false"));
         assert!(
-            TELEMETRY_CANNOT_BE_DISABLED_MESSAGE
-                .contains("cannot be disabled in Spice.ai Open Source")
+            SPICEPOD_TELEMETRY_SETTING_IGNORED_MESSAGE
+                .contains("without the anonymous_telemetry feature")
         );
-        assert!(TELEMETRY_CANNOT_BE_DISABLED_MESSAGE.contains("Spice.ai Enterprise"));
+        assert!(SPICEPOD_TELEMETRY_SETTING_IGNORED_MESSAGE.contains("Spice.ai Enterprise"));
     }
 }
