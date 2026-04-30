@@ -76,6 +76,8 @@ mod git;
 mod github;
 mod glue;
 mod graphql;
+#[cfg(all(feature = "postgres", feature = "hashicorp_vault"))]
+mod hashicorp_vault;
 mod http;
 mod iceberg;
 mod iceberg_api;
