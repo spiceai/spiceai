@@ -22,8 +22,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "openapi")]
-use serde_json::json;
 
 use crate::Runtime;
 use crate::datafusion::udf::user_function_infos;
