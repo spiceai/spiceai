@@ -18,12 +18,12 @@ store. All methods converge on the same post-login path: write
 There are three methods, addressed by Clap subcommands under
 [`bin/spice/src/commands/cloud/mod.rs`](../../bin/spice/src/commands/cloud/mod.rs):
 
-| Method       | Subcommand                                  | Identity               | Browser?            | Automatable via env vars                                    |
-| ------------ | ------------------------------------------- | ---------------------- | ------------------- | ----------------------------------------------------------- |
-| Subscription | `spice cloud login subscription`            | Human Spice Cloud user | Auto-opened         | No (browser required)                                       |
-| Subscription | `spice cloud login subscription --device`   | Human Spice Cloud user | User-opened         | No (browser required)                                       |
-| PAT          | `spice cloud login pat`                     | Human (long-lived)     | None                | Yes (`SPICE_CLOUD_PAT`)                                     |
-| API (OAuth)  | `spice cloud login api`                     | Service principal      | None                | Yes (`SPICE_CLOUD_CLIENT_ID` + `SPICE_CLOUD_CLIENT_SECRET`) |
+| Method       | Subcommand                                | Identity               | Browser?    | Automatable via env vars                                    |
+| ------------ | ----------------------------------------- | ---------------------- | ----------- | ----------------------------------------------------------- |
+| Subscription | `spice cloud login subscription`          | Human Spice Cloud user | Auto-opened | No (browser required)                                       |
+| Subscription | `spice cloud login subscription --device` | Human Spice Cloud user | User-opened | No (browser required)                                       |
+| PAT          | `spice cloud login pat`                   | Human (long-lived)     | None        | Yes (`SPICE_CLOUD_PAT`)                                     |
+| API (OAuth)  | `spice cloud login api`                   | Service principal      | None        | Yes (`SPICE_CLOUD_CLIENT_ID` + `SPICE_CLOUD_CLIENT_SECRET`) |
 
 Running `spice cloud login` with no subcommand opens an interactive chooser
 (via `dialoguer::Select`) when stdin is a TTY, and otherwise fails with a
