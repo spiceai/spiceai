@@ -1,7 +1,22 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp, true))\n    .expect(\"search response snapshot serialization should succeed\")"
 ---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "_score": "[score]",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
+        ]
+      },
+      "primary_key": {
+        "id": 708
+      }
+    },
     {
       "_score": "[score]",
       "dataset": "qs",
@@ -10,6 +25,17 @@ expression: normalize_search_response(resp)
           "a. \\( h(7) = -3(7) - 4 = -21 - 4 = \\boxed{-25} \\)\nb. \\( h(-4) = -3(-4) - 4 = 12 - 4 = \\boxed{8} \\)"
         ]
       },
+      "primary_key": {
+        "id": 255
+      }
+    },
+    {
+      "_score": "[score]",
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "Yasenia is 3 years older than Xavier. How old is Yasenia when Xavier is 18 years old?"
+        ]
       },
       "primary_key": {
         "id": 1323

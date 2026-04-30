@@ -298,7 +298,7 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value) {
         // S3 Vectors HTTP search results are non-deterministic: the backend may return
         // different items with the same rounded score across runs. Use structural validation
         // instead of exact snapshot comparison for these tests.
-        name if name.starts_with("s3vectors_composite")
+        name if name.starts_with("s3vectors")
             && !name.contains("vector_search_sql")
             && !name.contains("with_where") =>
         {
