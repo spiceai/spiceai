@@ -215,7 +215,10 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
     ) -> Result<(Schema, Option<Schema>), Status> {
-        let query = QueryBuilder::new(sql, datafusion).build();
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+        let query = QueryBuilder::new(sql, datafusion)
+            .read_only(read_only)
+            .build();
 
         let (dataset_schema, parameter_schema) =
             query.get_schema().await.map_err(handle_datafusion_error)?;
@@ -243,8 +246,10 @@ impl Service {
         sql: &str,
         parameters: Option<ParamValues>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
         let query_result = QueryBuilder::new(sql, Arc::clone(&datafusion))
             .parameters(parameters)
+            .read_only(read_only)
             .build()
             .run()
             .await

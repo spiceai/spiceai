@@ -53,6 +53,7 @@ pub struct Tool {
     /// Requires [`Self::signature`] to be set with typed Arrow arg /
     /// return types — a tool's free-form JSON Schema does not uniquely
     /// map to a SQL signature, so the author must pin types explicitly.
+    /// Also requires `runtime.functions.enabled: true`.
     #[serde(default)]
     pub as_sql: bool,
 

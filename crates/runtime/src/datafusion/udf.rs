@@ -177,6 +177,12 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
     if app.functions.is_empty() {
         return;
     }
+    if !app.runtime.functions.enabled {
+        tracing::error!(
+            "User-defined functions are declared but disabled. Set `runtime.functions.enabled: true` to register spicepod `functions:` entries."
+        );
+        return;
+    }
 
     warn_alpha_once();
 
@@ -190,6 +196,9 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
             runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
                 ctx.register_udf(udf.as_ref().clone());
                 add_user_function_to_deny_list(&decl.name);
+                if function_executes_code(&decl) {
+                    add_code_executing_function(&decl.name);
+                }
                 upsert_user_function_info(info_from_decl(&decl));
                 tracing::info!(
                     name = %decl.name,
@@ -251,6 +260,16 @@ async fn maybe_register_function_as_tool(
 pub fn register_async_user_udf(ctx: &SessionContext, udf: &ScalarUDF, name: &str) {
     ctx.register_udf(udf.clone());
     add_user_function_to_deny_list(name);
+    add_code_executing_function(name);
+}
+
+fn function_executes_code(decl: &spicepod::component::function::Function) -> bool {
+    let scheme = decl
+        .from
+        .split_once(':')
+        .map_or(decl.from.as_str(), |(scheme, _)| scheme)
+        .to_ascii_lowercase();
+    matches!(scheme.as_str(), "http" | "https")
 }
 
 fn info_from_decl(decl: &spicepod::component::function::Function) -> UserFunctionInfo {
@@ -283,6 +302,8 @@ pub async fn apply_function_diff(
     new_app: &Arc<app::App>,
 ) {
     let ctx = &runtime.df.ctx;
+    let current_enabled = current_app.runtime.functions.enabled;
+    let new_enabled = new_app.runtime.functions.enabled;
 
     // First pass: collect every function that needs to go away (removed or
     // changed). Do all the lock-free work (DF deregister, deny-list, info
@@ -290,13 +311,15 @@ pub async fn apply_function_diff(
     // batch of tool drops.
     let mut tools_to_drop: Vec<String> = Vec::new();
     for current in &current_app.functions {
-        let needs_drop = match new_app.functions.iter().find(|f| f.name == current.name) {
-            Some(next) => next != current,
-            None => true,
-        };
+        let needs_drop = current_enabled
+            && match new_app.functions.iter().find(|f| f.name == current.name) {
+                Some(next) => !new_enabled || next != current,
+                None => true,
+            };
         if needs_drop {
             ctx.deregister_udf(&current.name);
             remove_user_function_from_deny_list(&current.name);
+            remove_code_executing_function(&current.name);
             remove_user_function_info(&current.name);
             if current.as_tool {
                 tools_to_drop.push(current.name.clone());
@@ -311,12 +334,23 @@ pub async fn apply_function_diff(
         }
     }
 
+    if new_app.functions.is_empty() {
+        return;
+    }
+    if !new_enabled {
+        tracing::error!(
+            "User-defined functions are declared but disabled. Set `runtime.functions.enabled: true` to register spicepod `functions:` entries."
+        );
+        return;
+    }
+
     // Build + register any new or changed declarations.
     for next in &new_app.functions {
-        let needs_register = match current_app.functions.iter().find(|f| f.name == next.name) {
-            Some(prev) => prev != next,
-            None => true,
-        };
+        let needs_register = !current_enabled
+            || match current_app.functions.iter().find(|f| f.name == next.name) {
+                Some(prev) => prev != next,
+                None => true,
+            };
         if !needs_register {
             continue;
         }
@@ -325,6 +359,9 @@ pub async fn apply_function_diff(
                 warn_alpha_once();
                 ctx.register_udf(udf.as_ref().clone());
                 add_user_function_to_deny_list(&next.name);
+                if function_executes_code(next) {
+                    add_code_executing_function(&next.name);
+                }
                 upsert_user_function_info(info_from_decl(next));
                 tracing::info!(name = %next.name, from = %next.from, "Registered user function");
                 maybe_register_function_as_tool(runtime, next).await;
@@ -372,6 +409,11 @@ static DENY_LIST: LazyLock<RwLock<Arc<FunctionSupport>>> =
 /// separate so we can rebuild the combined [`FunctionSupport`] when
 /// either slice changes.
 static USER_FUNCTION_NAMES: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(vec![]));
+
+/// Names of UDFs whose invocation can execute external code or make RPC/API
+/// calls. Read-only API keys are not allowed to plan or execute these functions.
+static CODE_EXECUTING_FUNCTION_NAMES: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(vec![]));
 
 /// Metadata for a currently-registered user-defined function. Surfaced
 /// through the `list_udfs()` UDTF and the `/v1/functions` HTTP endpoint.
@@ -445,6 +487,30 @@ pub fn remove_user_function_from_deny_list(name: &str) {
         }
     }
     rebuild_deny_list();
+}
+
+/// Add a function name to the read-write API key requirement set. Idempotent.
+pub fn add_code_executing_function(name: &str) {
+    let mut guard = CODE_EXECUTING_FUNCTION_NAMES.write();
+    if !guard.iter().any(|n| n == name) {
+        guard.push(name.to_string());
+    }
+}
+
+/// Remove a function name from the read-write API key requirement set.
+pub fn remove_code_executing_function(name: &str) {
+    CODE_EXECUTING_FUNCTION_NAMES
+        .write()
+        .retain(|function_name| function_name != name);
+}
+
+/// Returns true when a function requires a read-write API key to execute.
+#[must_use]
+pub fn is_code_executing_function(name: &str) -> bool {
+    CODE_EXECUTING_FUNCTION_NAMES
+        .read()
+        .iter()
+        .any(|function_name| function_name.eq_ignore_ascii_case(name))
 }
 
 /// Return the current combined deny-list: built-ins plus every

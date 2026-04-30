@@ -45,6 +45,9 @@ use serde_json::Value;
 /// schemes are accepted by the parser (so forward-compatible spicepods
 /// load) but rejected at registration time with a clear error until their
 /// factories ship.
+///
+/// Registration is disabled by default. Set `runtime.functions.enabled: true`
+/// in the spicepod to activate declared functions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]

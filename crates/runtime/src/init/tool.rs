@@ -84,8 +84,19 @@ impl Runtime {
     /// register a `DataFusion` async UDF whose invocation calls back into
     /// the tool. The UDF is always `Volatile` and added to the federation
     /// deny-list for correctness.
-    fn maybe_register_tool_as_udf(&self, decl: &Tool, tooling: &Tooling) {
+    async fn maybe_register_tool_as_udf(&self, decl: &Tool, tooling: &Tooling) {
         if !decl.as_sql {
+            return;
+        }
+        let functions_enabled = self
+            .read_app()
+            .await
+            .is_some_and(|app| app.runtime.functions.enabled);
+        if !functions_enabled {
+            tracing::warn!(
+                tool = %decl.name,
+                "`as_sql: true` but user-defined functions are disabled. Set `runtime.functions.enabled: true` to expose tools as SQL functions."
+            );
             return;
         }
         let Some(sig) = decl.signature.as_ref() else {
@@ -144,7 +155,7 @@ impl Runtime {
             .context(UnableToInitializeLlmToolSnafu)
             {
                 Ok(t) => {
-                    self.maybe_register_tool_as_udf(tool, &t);
+                    self.maybe_register_tool_as_udf(tool, &t).await;
                     self.insert_tool(t).await;
                     Ok(())
                 }

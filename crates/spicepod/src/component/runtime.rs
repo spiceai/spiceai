@@ -89,6 +89,9 @@ pub struct Runtime {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
+
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub functions: Functions,
 }
 
 impl Runtime {
@@ -121,6 +124,27 @@ pub enum RuntimeReadyState {
     /// regardless of whether they are currently `Ready`, `Error`, or `Disabled`,
     /// as long as none is `ShuttingDown`.
     OnRegistration,
+}
+
+/// Controls registration and execution surfaces for Spicepod user-defined functions.
+///
+/// Defaults to disabled. Operators must explicitly set
+/// `runtime.functions.enabled: true` before the runtime registers top-level
+/// `functions:` entries or exposes `tools:` entries as SQL functions via
+/// `as_sql: true`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Functions {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Functions {
+    #[must_use]
+    pub fn enabled() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -931,6 +955,8 @@ pub struct RuntimeDeserializer {
     pub metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub functions: Functions,
 }
 
 #[expect(deprecated)]
@@ -1008,6 +1034,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             },
             metrics: deserializer.metrics,
             scheduler: deserializer.scheduler,
+            functions: deserializer.functions,
         })
     }
 }
@@ -2128,5 +2155,21 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.ready_state, RuntimeReadyState::OnRegistration);
+    }
+
+    #[test]
+    fn test_runtime_functions_disabled_by_default() {
+        let runtime: Runtime = yaml::from_str("{}").expect("Failed to parse Runtime");
+        assert!(!runtime.functions.enabled);
+    }
+
+    #[test]
+    fn test_runtime_functions_can_be_enabled() {
+        let yaml = r"
+            functions:
+                enabled: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert!(runtime.functions.enabled);
     }
 }

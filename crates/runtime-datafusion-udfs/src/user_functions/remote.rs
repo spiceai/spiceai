@@ -52,6 +52,7 @@ use datafusion::logical_expr::{
     Volatility as DfVolatility,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde_json::{Map, Value};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::function::{Function, Volatility};
@@ -227,6 +228,8 @@ impl AsyncScalarUDFImpl for RemoteScalarUdf {
         &self,
         args: ScalarFunctionArgs,
     ) -> std::result::Result<ColumnarValue, DataFusionError> {
+        require_read_write_api_key(&self.name).await?;
+
         if args.args.len() != self.arg_names.len() {
             return Err(DataFusionError::Execution(format!(
                 "remote function '{}' expected {} args, got {}",
@@ -328,6 +331,25 @@ impl RemoteScalarUdf {
         })?;
         Ok(parsed.values)
     }
+}
+
+async fn require_read_write_api_key(
+    function_name: &str,
+) -> std::result::Result<(), DataFusionError> {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let Some(principal) = runtime_auth::AuthRequestContext::auth_principal(context.as_ref()) else {
+        return Ok(());
+    };
+    if principal
+        .groups()
+        .iter()
+        .any(|group| *group == "write" || *group == "read_write")
+    {
+        return Ok(());
+    }
+    Err(DataFusionError::Execution(format!(
+        "remote function '{function_name}' requires a read-write API key"
+    )))
 }
 
 #[derive(serde::Deserialize)]
@@ -462,6 +484,21 @@ fn parse_arrow_type(s: &str) -> Result<DataType> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct TestPrincipal {
+        groups: &'static [&'static str],
+    }
+
+    impl runtime_auth::AuthPrincipal for TestPrincipal {
+        fn username(&self) -> &str {
+            "test"
+        }
+
+        fn groups(&self) -> &[&str] {
+            self.groups
+        }
+    }
 
     fn sample_decl(from: &str) -> Function {
         use spicepod::component::function::{FunctionArg, FunctionKind, Signature as YamlSig};
@@ -537,5 +574,40 @@ mod tests {
         let d = sample_decl("http://example.com/udf");
         let udf = build_scalar_udf(&d).expect("builds");
         assert_eq!(udf.name(), "remote_fn");
+    }
+
+    #[tokio::test]
+    async fn read_only_principal_rejected() {
+        let context =
+            Arc::new(RequestContext::builder(runtime_request_context::Protocol::Http).build());
+        runtime_auth::AuthRequestContext::set_auth_principal(
+            context.as_ref(),
+            Arc::new(TestPrincipal { groups: &["read"] }),
+        )
+        .expect("principal should be set");
+
+        let err = context
+            .scope(async { require_read_write_api_key("remote_fn").await })
+            .await
+            .expect_err("read-only principal should be rejected");
+        assert!(err.to_string().contains("read-write API key"));
+    }
+
+    #[tokio::test]
+    async fn read_write_principal_allowed() {
+        let context =
+            Arc::new(RequestContext::builder(runtime_request_context::Protocol::Http).build());
+        runtime_auth::AuthRequestContext::set_auth_principal(
+            context.as_ref(),
+            Arc::new(TestPrincipal {
+                groups: &["read_write"],
+            }),
+        )
+        .expect("principal should be set");
+
+        context
+            .scope(async { require_read_write_api_key("remote_fn").await })
+            .await
+            .expect("read-write principal should be allowed");
     }
 }

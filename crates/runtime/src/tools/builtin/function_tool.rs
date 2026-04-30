@@ -170,8 +170,11 @@ impl SpiceModelTool for FunctionAsTool {
             )
         })?;
 
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+
         let batches = df
             .query_builder(&sql)
+            .read_only(read_only)
             .build()
             .run()
             .await
