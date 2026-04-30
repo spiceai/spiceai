@@ -30,19 +30,12 @@ use datafusion::{
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
-    sql::{
-        TableReference,
-        sqlparser::ast::{DataType, ExactNumberInfo},
-        unparser::{
-            Unparser,
-            dialect::{CustomDialect, CustomDialectBuilder},
-        },
-    },
+    sql::{TableReference, unparser::Unparser},
 };
 use futures::StreamExt;
 use snafu::ResultExt;
 
-use super::connection_manager::SqlServerConnectionPool;
+use super::{connection_manager::SqlServerConnectionPool, dialect::MsSqlDialect};
 
 pub type Result<T, E = super::Error> = std::result::Result<T, E>;
 
@@ -103,12 +96,6 @@ impl SqlServerExecPlan {
         })
     }
 
-    fn dialect() -> CustomDialect {
-        CustomDialectBuilder::new()
-            .with_float64_ast_dtype(DataType::Float(ExactNumberInfo::None))
-            .build()
-    }
-
     pub fn sql(&self) -> DataFusionResult<String> {
         let columns = self
             .projected_schema
@@ -123,7 +110,7 @@ impl SqlServerExecPlan {
             None => String::new(),
         };
 
-        let dialect = SqlServerExecPlan::dialect();
+        let dialect = MsSqlDialect::new();
 
         let where_expr = if self.filters.is_empty() {
             String::new()
@@ -134,7 +121,7 @@ impl SqlServerExecPlan {
                 .map(|f| {
                     Unparser::new(&dialect)
                         .expr_to_sql(f)
-                        .map(|e| e.to_string())
+                        .map(|e| format!("({e})"))
                 })
                 .collect::<DataFusionResult<Vec<String>>>()?
                 .join(" AND ");

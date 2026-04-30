@@ -79,6 +79,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("username").secret(),
     ParameterSpec::component("password").secret(),
     ParameterSpec::component("private_key_path").secret(),
+    ParameterSpec::component("private_key").secret(),
     ParameterSpec::component("private_key_passphrase").secret(),
     ParameterSpec::component("account").secret(),
     ParameterSpec::component("warehouse").secret(),
@@ -196,5 +197,58 @@ impl DataConnector for Snowflake {
                 dataconnector: "snowflake",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_factory_prefix() {
+        let factory = SnowflakeFactory::new();
+        assert_eq!(factory.prefix(), "snowflake");
+    }
+
+    #[test]
+    fn test_parameters_include_inline_private_key() {
+        // Regression test for https://github.com/spiceai/spiceai/issues/10517.
+        // `snowflakepool::init_snowflake_api_with_keypair_auth` reads
+        // `params.get("private_key")` for inline keypair auth, so the parameter
+        // must be declared in PARAMETERS — otherwise runtime parameter
+        // validation strips it before it reaches the pool.
+        let factory = SnowflakeFactory::new();
+        let param_names: Vec<&str> = factory.parameters().iter().map(|p| p.name).collect();
+
+        for name in [
+            "username",
+            "password",
+            "private_key",
+            "private_key_path",
+            "private_key_passphrase",
+            "account",
+            "warehouse",
+            "role",
+            "auth_type",
+        ] {
+            assert!(
+                param_names.contains(&name),
+                "Snowflake PARAMETERS missing `{name}`; declared params: {param_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_private_key_is_secret() {
+        let factory = SnowflakeFactory::new();
+        let private_key = factory
+            .parameters()
+            .iter()
+            .find(|p| p.name == "private_key")
+            .expect("private_key parameter must be declared");
+        assert!(
+            private_key.secret,
+            "private_key holds PEM key material and must be marked secret"
+        );
     }
 }

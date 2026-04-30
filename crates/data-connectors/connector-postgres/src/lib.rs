@@ -82,21 +82,61 @@ impl PostgresFactory {
     }
 }
 
+const POSTGRES_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/postgres";
+
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("connection_string").secret(),
-    ParameterSpec::component("user").secret(),
-    ParameterSpec::component("pass").secret(),
-    ParameterSpec::component("host"),
-    ParameterSpec::component("port"),
-    ParameterSpec::component("db"),
-    ParameterSpec::component("sslmode"),
-    ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("connection_string")
+        .description(
+            "Full libpq-style connection string. Overrides other connection params if set.",
+        )
+        .examples(&["host=db.example.com port=5432 dbname=app user=ro sslmode=require"])
+        .help_link(POSTGRES_DOCS)
+        .secret(),
+    ParameterSpec::component("user")
+        .description("PostgreSQL username.")
+        .examples(&["postgres", "spice_reader"])
+        .help_link(POSTGRES_DOCS)
+        .secret(),
+    ParameterSpec::component("pass")
+        .description("PostgreSQL password.")
+        .help_link(POSTGRES_DOCS)
+        .secret(),
+    ParameterSpec::component("host")
+        .description("PostgreSQL server hostname or IP.")
+        .examples(&["db.internal", "10.0.0.5"])
+        .help_link(POSTGRES_DOCS),
+    ParameterSpec::component("port")
+        .description("PostgreSQL TCP port.")
+        .examples(&["5432"])
+        .help_link(POSTGRES_DOCS),
+    ParameterSpec::component("db")
+        .description("Database name.")
+        .examples(&["app", "analytics"])
+        .help_link(POSTGRES_DOCS),
+    ParameterSpec::component("sslmode")
+        .description("libpq SSL mode: disable, allow, prefer, require, verify-ca, verify-full.")
+        .one_of(&[
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full",
+        ])
+        .help_link(POSTGRES_DOCS),
+    ParameterSpec::component("sslrootcert")
+        .description(
+            "Path to, or inline PEM content for, a CA certificate used when sslmode is verify-ca/verify-full.",
+        )
+        .help_link(POSTGRES_DOCS),
     ParameterSpec::component("connection_pool_min_idle")
         .description("The minimum number of idle connections to keep open in the pool.")
-        .default("1"),
+        .default("1")
+        .help_link(POSTGRES_DOCS),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections created in the connection pool.")
-        .default("5"),
+        .default("5")
+        .help_link(POSTGRES_DOCS),
     // --- Logical replication (WAL streaming) ---
     ParameterSpec::component("replication_slot").description(
         "Name of the Postgres replication slot to create/reuse for this dataset. \
@@ -214,7 +254,6 @@ impl DataConnector for Postgres {
         self
     }
 
-    #[cfg(feature = "postgres-write")]
     async fn read_write_provider(
         &self,
         dataset: &Dataset,

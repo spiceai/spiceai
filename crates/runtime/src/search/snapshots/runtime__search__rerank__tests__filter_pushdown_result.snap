@@ -1,0 +1,10 @@
+---
+source: crates/runtime/src/search/rerank.rs
+expression: "query_snapshot(&rt, sql).await"
+---
++----+--------------+
+| id | rerank_score |
++----+--------------+
+| 2  | 0.8          |
+| 1  | 0.4          |
++----+--------------+

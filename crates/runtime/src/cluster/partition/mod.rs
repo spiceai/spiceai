@@ -14,26 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod discovery;
-pub mod executor_selection;
-mod manager;
-mod metadata;
-pub use manager::{
-    AccelerationsPartitions, AllocationResult, AssignmentRequest, CatalogPartitions,
-    CopyAssignmentsResult, PartitionManager,
-};
+pub(crate) mod discovery;
 pub mod scheduler_task;
 mod startup;
-pub(crate) mod write_through;
 
 use std::collections::HashMap;
 
 use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
-pub use metadata::{
-    PartitionMetadata, PartitionValue, TablePartitionMetadata, partition_value_to_bytes,
-};
 use snafu::Snafu;
+
+// Re-export types that moved into the `runtime-cluster` crate so callers inside
+// `runtime` can continue to import them from `crate::cluster::partition`.
+pub use runtime_cluster::{
+    CopyAssignmentsResult, PartitionMetadata, PartitionService, PartitionStore, PartitionValue,
+    TablePartitionMetadata, partition_value_to_bytes,
+};
+pub use runtime_cluster::{executor_selection, service, store, write_through};
+
 pub use startup::{
     accelerated_tables, executor_request_initial_partitions, initialize_partition_metadata,
     validate_partition_keys,
@@ -44,7 +42,7 @@ pub enum Error {
     #[snafu(display("Failed to initialize partition metadata for table {table}: {source}"))]
     PartitionMetadataInit {
         table: String,
-        source: Box<manager::Error>,
+        source: Box<runtime_cluster::store::Error>,
     },
 
     #[snafu(display("Failed to discover partitions for table {table}: {source}"))]

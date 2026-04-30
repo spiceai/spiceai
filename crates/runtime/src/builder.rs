@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::cluster::ClusterStateStore;
 use crate::cluster::DistributedNode;
 use crate::cluster::ExecutorRegistry;
-use crate::cluster::PartitionManager;
+use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
-use crate::cluster::{ClusterStateStore, SchedulerHeartbeatStore};
+use crate::cluster::SchedulerHeartbeatStore;
+use crate::cluster::partition::service::PartitionService;
 use crate::config::ClusterRole;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
@@ -44,7 +46,7 @@ use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
-use util::in_tracing_context;
+use util::{in_tracing_context, in_tracing_context_async};
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
@@ -240,14 +242,19 @@ impl RuntimeBuilder {
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
         let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
 
+        // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
+        let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
+
         let distributed: Option<DistributedNode> = match self
             .resolved_cluster_config
             .as_ref()
             .and_then(ResolvedClusterConfig::effective_role)
         {
             Some(ClusterRole::Scheduler) => {
-                if let Some(scheduler_config) = self
-                    .app
+                // For a real object store, cluster_state.bootstrap() is called by start_scheduler_registry.
+                if let Some(scheduler_config) = shared_app
+                    .read()
+                    .await
                     .as_ref()
                     .and_then(|app| app.runtime.scheduler.clone())
                 {
@@ -266,24 +273,28 @@ impl RuntimeBuilder {
                                 Arc::clone(&store),
                                 &base_prefix,
                             ));
-                            let accelerations_partitions = Arc::new(
-                                PartitionManager::accelerations(Arc::clone(&cluster_state)),
-                            );
-                            let catalog_partitions =
-                                Arc::new(PartitionManager::catalog(Arc::clone(&cluster_state)));
-
+                            let accelerations_partitions_store =
+                                Arc::new(PartitionStore::accelerations(Arc::clone(&cluster_state)));
+                            let catalog_partitions_store =
+                                Arc::new(PartitionStore::catalog(Arc::clone(&cluster_state)));
+                            let executor_registry = Arc::new(ExecutorRegistry::new(
+                                Arc::clone(&accelerations_partitions_store),
+                                Arc::clone(&catalog_partitions_store),
+                            ));
+                            let partition_service = Arc::new(PartitionService::new(
+                                Arc::clone(&accelerations_partitions_store),
+                                Arc::clone(&executor_registry),
+                                Arc::clone(&shared_app),
+                            ));
                             Some(DistributedNode::Scheduler {
                                 peers: Arc::new(RwLock::new(HashMap::new())),
-                                // Initialized later when scheduler registry starts
                                 job_executor: Arc::new(RwLock::new(None)),
-                                executor_registry: Arc::new(ExecutorRegistry::new(
-                                    Arc::clone(&accelerations_partitions),
-                                    Arc::clone(&catalog_partitions),
-                                )),
+                                executor_registry,
                                 cluster_state,
                                 heartbeats,
-                                accelerations_partitions,
-                                catalog_partitions,
+                                accelerations_partitions_store,
+                                catalog_partitions_store,
+                                partition_service,
                             })
                         }
                         Err(e) => {
@@ -306,21 +317,28 @@ impl RuntimeBuilder {
                         );
                     }
                     let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
-                    let accelerations_partitions =
-                        Arc::new(PartitionManager::accelerations(Arc::clone(&cluster_state)));
-                    let catalog_partitions =
-                        Arc::new(PartitionManager::catalog(Arc::clone(&cluster_state)));
+                    let accelerations_partitions_store =
+                        Arc::new(PartitionStore::accelerations(Arc::clone(&cluster_state)));
+                    let catalog_partitions_store =
+                        Arc::new(PartitionStore::catalog(Arc::clone(&cluster_state)));
+                    let executor_registry = Arc::new(ExecutorRegistry::new(
+                        Arc::clone(&accelerations_partitions_store),
+                        Arc::clone(&catalog_partitions_store),
+                    ));
+                    let partition_service = Arc::new(PartitionService::new(
+                        Arc::clone(&accelerations_partitions_store),
+                        Arc::clone(&executor_registry),
+                        Arc::clone(&shared_app),
+                    ));
                     Some(DistributedNode::Scheduler {
                         peers: Arc::new(RwLock::new(HashMap::new())),
                         job_executor: Arc::new(RwLock::new(None)),
-                        executor_registry: Arc::new(ExecutorRegistry::new(
-                            Arc::clone(&accelerations_partitions),
-                            Arc::clone(&catalog_partitions),
-                        )),
+                        executor_registry,
                         cluster_state,
                         heartbeats,
-                        accelerations_partitions,
-                        catalog_partitions,
+                        accelerations_partitions_store,
+                        catalog_partitions_store,
+                        partition_service,
                     })
                 }
             }
@@ -329,6 +347,7 @@ impl RuntimeBuilder {
             }),
             None => None, // No cluster config means we're running in standalone mode
         };
+
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
@@ -344,10 +363,14 @@ impl RuntimeBuilder {
         .with_url_tables(url_tables_enabled);
 
         if let Some(DistributedNode::Scheduler {
-            executor_registry, ..
+            executor_registry,
+            partition_service,
+            ..
         }) = distributed.as_ref()
         {
-            df_builder = df_builder.with_executor_registry(Arc::clone(executor_registry));
+            df_builder = df_builder
+                .with_executor_registry(Arc::clone(executor_registry))
+                .with_partition_service(Arc::clone(partition_service));
         }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
@@ -378,7 +401,7 @@ impl RuntimeBuilder {
         };
 
         let mut rt = Runtime {
-            app: Arc::new(RwLock::new(self.app)),
+            app: shared_app,
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
@@ -432,10 +455,18 @@ impl RuntimeBuilder {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 
-        if let Some(app) = app
-            && let Err(e) = secrets.load_from(&app.secrets).await
-        {
-            eprintln!("Error loading secret stores: {e}");
+        if let Some(app) = app {
+            // `load_secrets` runs before `spiced::init_tracing` installs the
+            // global subscriber, so any `tracing::*` events emitted by
+            // `Secrets::load_from` and the per-store `init()` paths would
+            // otherwise be dropped on the floor. That hides actionable errors
+            // like "Vault address unreachable" or "AWS credentials missing"
+            // and leaves the operator with only the downstream
+            // "undefined store" message at lookup time. Wrap the await in a
+            // temporary subscriber so those diagnostics surface.
+            if let Err(e) = in_tracing_context_async(secrets.load_from(&app.secrets)).await {
+                eprintln!("Error loading secret stores: {e}");
+            }
         }
 
         secrets
