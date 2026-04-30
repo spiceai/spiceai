@@ -34,6 +34,7 @@ pub mod utils;
 /// include all together (i.e. a catalog).
 pub enum Tooling {
     Tool(Arc<dyn SpiceModelTool>),
+    FunctionTool(Arc<dyn SpiceModelTool>),
     Catalog(Arc<dyn SpiceToolCatalog>),
 }
 
@@ -41,7 +42,7 @@ impl Tooling {
     #[must_use]
     pub async fn tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         match self {
-            Tooling::Tool(t) => vec![Arc::clone(t)],
+            Tooling::Tool(t) | Tooling::FunctionTool(t) => vec![Arc::clone(t)],
             Tooling::Catalog(c) => {
                 let catalog_name = c.name();
                 if default_catalog_names().contains(&catalog_name) {
@@ -61,7 +62,7 @@ impl Tooling {
     #[must_use]
     pub fn name(&self) -> Cow<'_, str> {
         match self {
-            Tooling::Tool(t) => t.name(),
+            Tooling::Tool(t) | Tooling::FunctionTool(t) => t.name(),
             Tooling::Catalog(c) => Cow::Borrowed(c.name()),
         }
     }

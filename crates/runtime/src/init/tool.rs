@@ -107,7 +107,7 @@ impl Runtime {
             return;
         };
         let inner: Arc<dyn crate::tools::SpiceModelTool> = match tooling {
-            Tooling::Tool(t) => Arc::clone(t),
+            Tooling::Tool(t) | Tooling::FunctionTool(t) => Arc::clone(t),
             Tooling::Catalog(_) => {
                 tracing::warn!(
                     tool = %decl.name,

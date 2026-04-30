@@ -132,11 +132,11 @@ fn split_scheme(from: &str) -> (String, &str) {
 /// the [`FunctionKind`] is not yet implemented, the SQL body is missing
 /// for a SQL function, or the tier-specific factory (`sql` / `remote`)
 /// returns a build error.
-pub fn build_function(decl: &Function) -> Result<BuiltFunction> {
+pub async fn build_function(decl: &Function) -> Result<BuiltFunction> {
     let (scheme, _tail) = split_scheme(&decl.from);
 
     match scheme.as_str() {
-        "sql" => build_sql(decl),
+        "sql" => build_sql(decl).await,
         "http" | "https" => build_remote(decl),
         other => UnsupportedSchemeSnafu {
             name: decl.name.clone(),
@@ -167,7 +167,7 @@ fn build_remote(decl: &Function) -> Result<BuiltFunction> {
     Ok(BuiltFunction::Scalar(udf))
 }
 
-fn build_sql(decl: &Function) -> Result<BuiltFunction> {
+async fn build_sql(decl: &Function) -> Result<BuiltFunction> {
     if decl.kind != FunctionKind::Scalar {
         return UnsupportedKindSnafu {
             name: decl.name.clone(),
@@ -175,7 +175,7 @@ fn build_sql(decl: &Function) -> Result<BuiltFunction> {
         }
         .fail();
     }
-    let body = resolve_body(decl)?;
+    let body = resolve_body(decl).await?;
     let udf = sql::build_scalar_udf(decl, &body).map_err(|source| UserFunctionError::Sql {
         name: decl.name.clone(),
         source,
@@ -186,7 +186,7 @@ fn build_sql(decl: &Function) -> Result<BuiltFunction> {
 /// Resolve the effective body for a SQL-tier function, reading from
 /// [`Function::body_ref`] when set. Enforces the "exactly one of `body` /
 /// `body_ref`" invariant.
-fn resolve_body(decl: &Function) -> Result<String> {
+async fn resolve_body(decl: &Function) -> Result<String> {
     match (&decl.body, &decl.body_ref) {
         (Some(_), Some(_)) => ConflictingBodySnafu {
             name: decl.name.clone(),
@@ -194,11 +194,13 @@ fn resolve_body(decl: &Function) -> Result<String> {
         .fail(),
         (Some(s), None) => Ok(s.clone()),
         (None, Some(path)) => {
-            std::fs::read_to_string(path).map_err(|source| UserFunctionError::BodyRefRead {
-                name: decl.name.clone(),
-                path: path.clone(),
-                source,
-            })
+            tokio::fs::read_to_string(path)
+                .await
+                .map_err(|source| UserFunctionError::BodyRefRead {
+                    name: decl.name.clone(),
+                    path: path.clone(),
+                    source,
+                })
         }
         (None, None) => MissingBodySnafu {
             name: decl.name.clone(),
@@ -211,12 +213,13 @@ fn resolve_body(decl: &Function) -> Result<String> {
 /// functions paired with their source declaration (for diagnostics) and
 /// a vector of any per-function build errors. The caller decides whether
 /// to fail the startup on partial failure or log and continue.
-#[must_use]
-pub fn build_all(decls: &[Function]) -> (Vec<(Function, BuiltFunction)>, Vec<UserFunctionError>) {
+pub async fn build_all(
+    decls: &[Function],
+) -> (Vec<(Function, BuiltFunction)>, Vec<UserFunctionError>) {
     let mut built = Vec::with_capacity(decls.len());
     let mut errors = Vec::new();
     for decl in decls {
-        match build_function(decl) {
+        match build_function(decl).await {
             Ok(f) => built.push((decl.clone(), f)),
             Err(e) => errors.push(e),
         }
@@ -269,40 +272,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unsupported_scheme_rejected() {
+    #[tokio::test]
+    async fn unsupported_scheme_rejected() {
         let d = decl("wasm:./x.wasm", FunctionKind::Scalar, None);
-        let err = build_function(&d).expect_err("wasm unsupported in phase 1");
+        let err = build_function(&d)
+            .await
+            .expect_err("wasm unsupported in phase 1");
         let msg = err.to_string();
         assert!(msg.contains("not yet supported"), "{msg}");
         assert!(msg.contains("wasm"), "{msg}");
     }
 
-    #[test]
-    fn unsupported_kind_rejected() {
+    #[tokio::test]
+    async fn unsupported_kind_rejected() {
         let d = decl("sql", FunctionKind::Aggregate, Some("sum(x)"));
-        let err = build_function(&d).expect_err("aggregate unsupported in phase 1");
+        let err = build_function(&d)
+            .await
+            .expect_err("aggregate unsupported in phase 1");
         assert!(err.to_string().contains("Aggregate"));
     }
 
-    #[test]
-    fn sql_missing_body_rejected() {
+    #[tokio::test]
+    async fn sql_missing_body_rejected() {
         let d = decl("sql", FunctionKind::Scalar, None);
-        let err = build_function(&d).expect_err("sql without body");
+        let err = build_function(&d).await.expect_err("sql without body");
         let msg = err.to_string();
         assert!(msg.contains("`body:` or `body_ref:`"), "{msg}");
     }
 
-    #[test]
-    fn sql_conflicting_body_and_ref_rejected() {
+    #[tokio::test]
+    async fn sql_conflicting_body_and_ref_rejected() {
         let mut d = decl("sql", FunctionKind::Scalar, Some("x"));
         d.body_ref = Some("./ignored.sql".into());
-        let err = build_function(&d).expect_err("both body and body_ref");
+        let err = build_function(&d)
+            .await
+            .expect_err("both body and body_ref");
         assert!(err.to_string().contains("mutually exclusive"));
     }
 
-    #[test]
-    fn sql_body_ref_reads_from_file() {
+    #[tokio::test]
+    async fn sql_body_ref_reads_from_file() {
         // Write a tiny SQL body to a temp file and point body_ref at it.
         let tmp = std::env::temp_dir().join("spice_udf_body_ref_test.sql");
         std::fs::write(&tmp, "x + 1").expect("write tmp body");
@@ -310,7 +319,7 @@ mod tests {
         let mut d = decl("sql", FunctionKind::Scalar, None);
         d.body_ref = Some(tmp.to_string_lossy().into_owned());
         // Force known return type to avoid needing SQL planner in the test.
-        let built = build_function(&d).expect("builds");
+        let built = build_function(&d).await.expect("builds");
         match built {
             BuiltFunction::Scalar(udf) => {
                 assert_eq!(udf.name(), "f");
@@ -320,19 +329,21 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
     }
 
-    #[test]
-    fn sql_body_ref_missing_file_surfaces_io_error() {
+    #[tokio::test]
+    async fn sql_body_ref_missing_file_surfaces_io_error() {
         let mut d = decl("sql", FunctionKind::Scalar, None);
         d.body_ref = Some("/nonexistent/path/to/body.sql".into());
-        let err = build_function(&d).expect_err("missing file");
+        let err = build_function(&d).await.expect_err("missing file");
         let msg = err.to_string();
         assert!(msg.contains("body_ref"), "{msg}");
     }
 
-    #[test]
-    fn non_sql_with_body_rejected() {
+    #[tokio::test]
+    async fn non_sql_with_body_rejected() {
         let d = decl("http://example.com/f", FunctionKind::Scalar, Some("x + 1"));
-        let err = build_function(&d).expect_err("body forbidden on remote");
+        let err = build_function(&d)
+            .await
+            .expect_err("body forbidden on remote");
         assert!(err.to_string().contains("must not be set"));
     }
 
@@ -403,7 +414,7 @@ mod tests {
             metrics: None,
             as_tool: true,
         };
-        let built = build_function(&decl).expect("builds");
+        let built = build_function(&decl).await.expect("builds");
 
         let ctx = SessionContext::new();
         match built {
@@ -448,7 +459,7 @@ mod tests {
 
         let mut d = decl("sql", FunctionKind::Scalar, Some("x * 2"));
         d.name = "double_it".into();
-        let built = build_function(&d).expect("builds");
+        let built = build_function(&d).await.expect("builds");
 
         let ctx = SessionContext::new();
         match built {
