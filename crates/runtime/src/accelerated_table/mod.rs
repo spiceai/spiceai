@@ -69,9 +69,9 @@ pub(crate) mod sink;
 mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
-pub mod write_through;
+pub mod write;
 
-pub(crate) use write_through::WriteMode;
+pub(crate) use write::WriteMode;
 
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
@@ -180,6 +180,12 @@ pub enum Error {
 
     #[snafu(display("Failed to construct data for the accelerated dataset: {source}"))]
     FailedToBuildRecordBatch { source: ArrowError },
+
+    #[snafu(display("Failed to process upsert batch for dataset {dataset_name}: {reason}"))]
+    InvalidUpsertPrimaryKeys {
+        dataset_name: String,
+        reason: String,
+    },
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
@@ -326,6 +332,7 @@ pub struct Builder {
     disable_federation: bool,
     write_to_accelerator_only: bool,
     write_through: bool,
+    write_back: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
@@ -375,6 +382,7 @@ impl Builder {
             disable_federation: false,
             write_to_accelerator_only: false,
             write_through: false,
+            write_back: false,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
@@ -447,6 +455,13 @@ impl Builder {
     /// and the local Cayenne accelerator using staged append/commit/rollback semantics.
     pub fn write_through(&mut self) -> &mut Self {
         self.write_through = true;
+        self
+    }
+
+    /// Enable write-back mode: writes commit to the local accelerator first,
+    /// then asynchronously persist to the federated source.
+    pub fn write_back(&mut self) -> &mut Self {
+        self.write_back = true;
         self
     }
 
@@ -956,6 +971,8 @@ impl Builder {
 
         let write_mode = if self.write_through {
             WriteMode::resolve_write_through(&self.accelerator, &self.federated)?
+        } else if self.write_back {
+            WriteMode::WriteBack
         } else if self.write_to_accelerator_only {
             WriteMode::AcceleratorOnly
         } else {
@@ -1081,6 +1098,15 @@ impl AcceleratedTable {
     #[must_use]
     pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.accelerator)
+    }
+
+    #[must_use]
+    pub(crate) fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.accelerator
+    }
+
+    pub(crate) fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        self.accelerator = accelerator;
     }
 
     /// Add a child accelerator that should receive cached data when this parent stores new cache entries.
@@ -1437,10 +1463,22 @@ impl TableProvider for AcceleratedTable {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.insert_into(state, input, overwrite).await
             }
+            WriteMode::WriteBack => {
+                write::write_back::validate_insert_op(overwrite)?;
+                write::write_back::insert_write_back(
+                    state,
+                    input,
+                    overwrite,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                    Arc::clone(&self.refresher),
+                    self.schema(),
+                )
+            }
             WriteMode::WriteThrough {
                 cayenne_target,
                 federated_provider,
-            } => write_through::insert_write_through(
+            } => write::write_through::insert_write_through(
                 input,
                 overwrite,
                 cayenne_target.as_ref(),
@@ -1448,6 +1486,85 @@ impl TableProvider for AcceleratedTable {
                 &self.refresher,
                 self.schema(),
             ),
+        }
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => self.accelerator.delete_from(state, filters).await,
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.delete_from(state, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::delete_write_back(
+                    state,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::delete_write_through(
+                    state,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => {
+                self.accelerator.update(state, assignments, filters).await
+            }
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.update(state, assignments, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::update_write_back(
+                    state,
+                    assignments,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::update_write_through(
+                    state,
+                    assignments,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
         }
     }
 }

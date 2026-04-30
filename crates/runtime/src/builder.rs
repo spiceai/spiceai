@@ -46,7 +46,7 @@ use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
-use util::in_tracing_context;
+use util::{in_tracing_context, in_tracing_context_async};
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
@@ -455,10 +455,18 @@ impl RuntimeBuilder {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 
-        if let Some(app) = app
-            && let Err(e) = secrets.load_from(&app.secrets).await
-        {
-            eprintln!("Error loading secret stores: {e}");
+        if let Some(app) = app {
+            // `load_secrets` runs before `spiced::init_tracing` installs the
+            // global subscriber, so any `tracing::*` events emitted by
+            // `Secrets::load_from` and the per-store `init()` paths would
+            // otherwise be dropped on the floor. That hides actionable errors
+            // like "Vault address unreachable" or "AWS credentials missing"
+            // and leaves the operator with only the downstream
+            // "undefined store" message at lookup time. Wrap the await in a
+            // temporary subscriber so those diagnostics surface.
+            if let Err(e) = in_tracing_context_async(secrets.load_from(&app.secrets)).await {
+                eprintln!("Error loading secret stores: {e}");
+            }
         }
 
         secrets

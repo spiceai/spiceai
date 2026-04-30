@@ -4350,7 +4350,11 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-object-store",
+ "secrecy",
  "snafu",
+ "tokio",
+ "tracing",
  "url",
 ]
 
@@ -6244,7 +6248,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=faaaf61c1fbd66064500bcc2c908b95235b2fc9d#faaaf61c1fbd66064500bcc2c908b95235b2fc9d"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=45266a7b9786dea0a138875280a83828d3272d51#45266a7b9786dea0a138875280a83828d3272d51"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6775,10 +6779,13 @@ name = "document_parse"
 version = "2.0.0-unstable"
 dependencies = [
  "bytes",
+ "calamine",
  "docx-rs",
  "pdf-extract",
+ "quick-xml 0.38.4",
  "snafu",
  "tokio",
+ "zip 7.4.0",
 ]
 
 [[package]]
@@ -8310,8 +8317,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -9445,7 +9452,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -17215,6 +17222,8 @@ dependencies = [
  "datafusion-expr",
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
+ "datafusion-table-providers",
+ "duckdb",
  "elasticsearch",
  "futures",
  "insta",

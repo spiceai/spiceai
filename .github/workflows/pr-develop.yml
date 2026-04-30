@@ -33,6 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
       - name: Check for code changes
@@ -49,6 +50,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -115,6 +118,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust

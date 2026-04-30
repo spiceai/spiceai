@@ -82,6 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
@@ -156,6 +157,8 @@ jobs:
     runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -314,6 +317,8 @@ jobs:
     runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -362,6 +367,8 @@ jobs:
     runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -398,6 +405,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust

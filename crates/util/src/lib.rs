@@ -32,7 +32,7 @@ pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
 mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
-pub use tracing_util::in_tracing_context;
+pub use tracing_util::{in_tracing_context, in_tracing_context_async};
 pub mod arrow;
 #[cfg(feature = "datafusion")]
 pub mod expr;
