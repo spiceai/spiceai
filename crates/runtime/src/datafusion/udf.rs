@@ -191,7 +191,8 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
         return;
     }
 
-    let (built, errors) = runtime_datafusion_udfs::user_functions::build_all(&enabled_functions);
+    let (built, errors) =
+        runtime_datafusion_udfs::user_functions::build_all(&enabled_functions).await;
     for err in &errors {
         tracing::error!("{err}");
     }
@@ -246,7 +247,7 @@ async fn maybe_register_function_as_tool(
                 );
                 return;
             }
-            tools_map.insert(name.clone(), crate::tools::Tooling::Tool(tool));
+            tools_map.insert(name.clone(), crate::tools::Tooling::FunctionTool(tool));
             tracing::info!(name = %name, "Exposed user function as tool");
         }
         Err(e) => {
@@ -346,7 +347,12 @@ pub async fn apply_function_diff(
     if !tools_to_drop.is_empty() {
         let mut tools_map = runtime.tools.write().await;
         for name in &tools_to_drop {
-            tools_map.remove(name);
+            if matches!(
+                tools_map.get(name),
+                Some(crate::tools::Tooling::FunctionTool(_))
+            ) {
+                tools_map.remove(name);
+            }
         }
     }
 
@@ -373,7 +379,7 @@ pub async fn apply_function_diff(
         if !needs_register {
             continue;
         }
-        match runtime_datafusion_udfs::user_functions::build_function(next) {
+        match runtime_datafusion_udfs::user_functions::build_function(next).await {
             Ok(runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf)) => {
                 warn_alpha_once();
                 ctx.register_udf(udf.as_ref().clone());

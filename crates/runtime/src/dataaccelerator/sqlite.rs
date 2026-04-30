@@ -124,7 +124,7 @@ impl SqliteAccelerator {
             sqlite_factory: SqliteTableProviderFactory::new()
                 .with_batch_insert_use_prepared_statements(true)
                 .with_decimal_between(true)
-                .with_function_support(deny_spice_specific_functions()),
+                .with_function_support(deny_spice_specific_functions().as_ref().clone()),
         }
     }
 

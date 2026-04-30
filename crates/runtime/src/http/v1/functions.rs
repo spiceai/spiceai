@@ -21,10 +21,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use datafusion::execution::FunctionRegistry;
 use serde::{Deserialize, Serialize};
 
 use crate::Runtime;
-use crate::datafusion::udf::user_function_infos;
 
 /// Summary of a user-defined function declared in the spicepod's
 /// `functions:` section.
@@ -59,17 +59,49 @@ struct ListFunctionElement {
         )
     )
 ))]
-pub(crate) async fn list(Extension(_rt): Extension<Arc<Runtime>>) -> Response {
-    let functions: Vec<ListFunctionElement> = user_function_infos()
-        .into_iter()
-        .map(|info| ListFunctionElement {
-            name: info.name,
-            kind: info.kind,
-            volatility: info.volatility,
-            from: info.from,
-            description: info.description,
+pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
+    let Some(app) = rt.read_app().await else {
+        return (StatusCode::OK, Json(Vec::<ListFunctionElement>::new())).into_response();
+    };
+    if !app.runtime.functions.enabled {
+        return (StatusCode::OK, Json(Vec::<ListFunctionElement>::new())).into_response();
+    }
+
+    let registered_udfs = rt.df.ctx.udfs();
+    let functions: Vec<ListFunctionElement> = app
+        .functions
+        .iter()
+        .filter(|decl| {
+            decl.enabled
+                && registered_udfs
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&decl.name))
+        })
+        .map(|decl| ListFunctionElement {
+            name: decl.name.clone(),
+            kind: function_kind(decl.kind).to_string(),
+            volatility: volatility(decl.volatility).to_string(),
+            from: decl.from.clone(),
+            description: decl.description.clone(),
         })
         .collect();
 
     (StatusCode::OK, Json(functions)).into_response()
+}
+
+fn function_kind(kind: spicepod::component::function::FunctionKind) -> &'static str {
+    match kind {
+        spicepod::component::function::FunctionKind::Scalar => "scalar",
+        spicepod::component::function::FunctionKind::Aggregate => "aggregate",
+        spicepod::component::function::FunctionKind::Window => "window",
+        spicepod::component::function::FunctionKind::Table => "table",
+    }
+}
+
+fn volatility(volatility: spicepod::component::function::Volatility) -> &'static str {
+    match volatility {
+        spicepod::component::function::Volatility::Immutable => "immutable",
+        spicepod::component::function::Volatility::Stable => "stable",
+        spicepod::component::function::Volatility::Volatile => "volatile",
+    }
 }

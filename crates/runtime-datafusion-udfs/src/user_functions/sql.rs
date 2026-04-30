@@ -22,11 +22,8 @@ limitations under the License.
 //! [`ColumnarValue`] arguments are packed into a [`RecordBatch`] that
 //! matches that schema and the physical expression is evaluated.
 //!
-//! Parsing uses a fresh [`SessionContext`], which registers all standard
-//! `DataFusion` scalar functions (math, string, datetime, etc.). Spark
-//! built-ins and `datafusion-functions-json` are wired in so users can
-//! use them in bodies — they are registered on every production session
-//! context already.
+//! Parsing uses a fresh [`SessionContext`], which registers standard
+//! `DataFusion` scalar functions (math, string, datetime, etc.).
 //!
 //! Phase 1 covers the common primitive Arrow types. Complex types (list,
 //! struct, decimal, timestamp with timezone) are on the roadmap — they
@@ -45,7 +42,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
     Volatility as DfVolatility,
 };
-use datafusion::physical_plan::PhysicalExpr;
+use datafusion::physical_plan::{PhysicalExpr, expressions::CastExpr};
 use datafusion::prelude::SessionContext;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::function::{Function, Volatility};
@@ -136,7 +133,7 @@ pub fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
     // a SQL author expects (e.g. `6371 * acos(...)` where one side is an
     // integer literal and the other is Float64).
     let state = ctx.state();
-    let physical_expr = state
+    let mut physical_expr = state
         .create_physical_expr(logical_expr, &df_schema)
         .context(PlanExpressionSnafu)?;
 
@@ -148,6 +145,9 @@ pub fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
             expected: declared_return,
             actual: actual_return,
         });
+    }
+    if actual_return != declared_return {
+        physical_expr = Arc::new(CastExpr::new(physical_expr, declared_return.clone(), None));
     }
 
     let arg_types: Vec<DataType> = arg_specs.iter().map(|(_, t)| t.clone()).collect();
@@ -300,7 +300,7 @@ fn parse_arrow_type(s: &str) -> Result<DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::Field as ArrowField;
     use spicepod::component::function::{FunctionArg, FunctionKind, Signature as YamlSignature};
     use std::collections::HashMap;
@@ -387,6 +387,32 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 array");
         assert_eq!(as_i64.values(), &[11_i64, 22, 33]);
+    }
+
+    #[test]
+    fn compatible_return_type_is_cast_to_declared_type() {
+        let d = decl("x", vec![("x", "int32")], "int64");
+        let udf = build_scalar_udf(&d, d.body.as_deref().expect("test")).expect("builds");
+
+        let x: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(x)],
+            arg_fields: vec![Arc::new(ArrowField::new("x", DataType::Int32, true))],
+            number_rows: 3,
+            return_field: Arc::new(ArrowField::new("out", DataType::Int64, true)),
+            config_options: Arc::default(),
+        };
+        let result = udf.inner().invoke_with_args(args).expect("invokes");
+        let array = match result {
+            ColumnarValue::Array(a) => a,
+            ColumnarValue::Scalar(s) => s.to_array().expect("to_array"),
+        };
+        assert_eq!(array.data_type(), &DataType::Int64);
+        let as_i64 = array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 array");
+        assert_eq!(as_i64.values(), &[1_i64, 2, 3]);
     }
 
     #[test]
