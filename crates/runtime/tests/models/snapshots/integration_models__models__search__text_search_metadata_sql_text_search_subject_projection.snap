@@ -4,12 +4,12 @@ expression: resp?
 ---
 [
   {
-    "id": 495,
+    "id": 494,
     "subject": "math",
     "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.934
   },
   {
-    "id": 494,
+    "id": 495,
     "subject": "math",
     "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.934
   },

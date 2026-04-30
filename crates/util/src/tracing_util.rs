@@ -14,14 +14,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use tracing::subscriber;
+use std::future::Future;
+
+use tracing::{Dispatch, instrument::WithSubscriber, subscriber};
+
+fn fmt_subscriber() -> tracing_subscriber::FmtSubscriber {
+    tracing_subscriber::FmtSubscriber::builder()
+        .with_ansi(true)
+        .finish()
+}
 
 pub fn in_tracing_context<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_ansi(true)
-        .finish();
-    subscriber::with_default(subscriber, f)
+    subscriber::with_default(fmt_subscriber(), f)
+}
+
+/// Async equivalent of [`in_tracing_context`]. Use this when the work that
+/// needs a temporary subscriber is async (e.g. it `.await`s I/O). The given
+/// future is polled with the temporary `FmtSubscriber` as its dispatcher, so
+/// `tracing::*` events emitted from any awaited code reach a subscriber even
+/// if the global subscriber has not been installed yet.
+pub async fn in_tracing_context_async<F, R>(f: F) -> R
+where
+    F: Future<Output = R>,
+{
+    f.with_subscriber(Dispatch::new(fmt_subscriber())).await
 }
