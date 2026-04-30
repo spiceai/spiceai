@@ -372,6 +372,11 @@ impl HttpFetchResult {
     }
 }
 
+enum CacheWriteMode {
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct CacheKey {
     path: String,
@@ -1103,15 +1108,18 @@ impl HttpTableProvider {
             self.client.get(url.clone())
         };
 
-        let mut merged_headers = self.custom_headers.clone();
         if let Some(request_headers) = request_headers {
+            let mut merged_headers = self.custom_headers.clone();
             for (name, value) in request_headers {
                 merged_headers.insert(name.clone(), value.clone());
             }
-        }
-
-        for (name, value) in &merged_headers {
-            request_builder = request_builder.header(name, value);
+            for (name, value) in &merged_headers {
+                request_builder = request_builder.header(name, value);
+            }
+        } else {
+            for (name, value) in &self.custom_headers {
+                request_builder = request_builder.header(name, value);
+            }
         }
 
         if let Some(auth) = self.auth.as_ref() {
@@ -1201,12 +1209,13 @@ impl HttpTableProvider {
         })
     }
 
-    async fn fetch_and_cache(
+    async fn fetch_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
         request_headers: Option<&str>,
+        cache_write_mode: CacheWriteMode,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
@@ -1227,7 +1236,7 @@ impl HttpTableProvider {
             )
             .await?;
 
-        if fetch_result.should_cache() {
+        if matches!(cache_write_mode, CacheWriteMode::Enabled) && fetch_result.should_cache() {
             self.cache_response(
                 &path_owned,
                 query_owned.as_deref(),
@@ -1241,6 +1250,17 @@ impl HttpTableProvider {
         Ok(fetch_result)
     }
 
+    async fn fetch_and_cache(
+        &self,
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Result<HttpFetchResult> {
+        self.fetch_response(path, query, body, request_headers, CacheWriteMode::Enabled)
+            .await
+    }
+
     async fn get_response(
         &self,
         path: &str,
@@ -1248,15 +1268,14 @@ impl HttpTableProvider {
         body: Option<&str>,
         request_headers: Option<&str>,
     ) -> Result<HttpFetchResult> {
-        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it
+        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
             return self
-                .fetch_and_cache(path, query, body, request_headers)
+                .fetch_response(path, query, body, request_headers, CacheWriteMode::Disabled)
                 .await;
         }
 
         let cache_key = Self::get_cache_key(path, query, body, request_headers);
-        let cache_key_label = cache_key.redacted_label();
 
         // Try to get from cache
         let cached = {
@@ -1267,14 +1286,17 @@ impl HttpTableProvider {
         if let Some(cached_response) = cached
             && cached_response.is_fresh()
         {
-            if let Some(ref format) = cached_response.detected_format {
-                tracing::debug!(
-                    "Returning fresh cached content for {} (detected format: {})",
-                    cache_key_label,
-                    format
-                );
-            } else {
-                tracing::debug!("Returning fresh cached content for {}", cache_key_label);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let cache_key_label = cache_key.redacted_label();
+                if let Some(ref format) = cached_response.detected_format {
+                    tracing::debug!(
+                        "Returning fresh cached content for {} (detected format: {})",
+                        cache_key_label,
+                        format
+                    );
+                } else {
+                    tracing::debug!("Returning fresh cached content for {}", cache_key_label);
+                }
             }
             return Ok(HttpFetchResult {
                 content: (*cached_response.content).clone(),
