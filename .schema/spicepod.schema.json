@@ -90,16 +90,22 @@
         "$ref": "#/$defs/ComponentOrReference5"
       }
     },
-    "tools": {
+    "rerankers": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference6"
       }
     },
-    "workers": {
+    "tools": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference7"
+      }
+    },
+    "workers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ComponentOrReference8"
       }
     },
     "dependencies": {
@@ -934,12 +940,7 @@
           "default": "none"
         },
         "captured_context": {
-          "type": "string",
-          "enum": [
-            "redacted",
-            "truncated",
-            "full"
-          ],
+          "$ref": "#/$defs/TaskHistoryCapturedContext",
           "default": "truncated"
         },
         "retention_period": {
@@ -970,6 +971,14 @@
         }
       },
       "additionalProperties": false
+    },
+    "TaskHistoryCapturedContext": {
+      "type": "string",
+      "enum": [
+        "redacted",
+        "truncated",
+        "full"
+      ]
     },
     "Auth": {
       "type": "object",
@@ -1341,7 +1350,7 @@
       }
     },
     "Secret": {
-      "description": "The secrets configuration for a Spicepod.\n\nExample:\n```yaml\nsecrets:\n  - from: env\n    name: env\n  - from: kubernetes:my_secret_name\n    name: k8s\n```",
+      "description": "The secrets configuration for a Spicepod.\n\nEach entry selects a secret store via `from: <provider>[:<selector>]` and\nmay pass provider-specific configuration through `params:`.\n\n`params:` values may reference environment variables using the same\n`${ env:KEY }` / `${ secrets:KEY }` syntax used elsewhere in the\nspicepod. At this bootstrap point only the env store is loaded, so\n`secrets:KEY` resolves against env as well; references to other stores\nare rejected.\n\nExample:\n```yaml\nsecrets:\n  - from: env\n    name: env\n    params:\n      file_path: .env.local\n  - from: kubernetes:my_secret_name\n    name: k8s\n    params:\n      namespace: spice\n  - from: aws_secrets_manager:my-secret\n    name: aws\n    params:\n      region: ${ env:AWS_REGION }\n      key: ${ env:AWS_ACCESS_KEY_ID }\n      secret: ${ env:AWS_SECRET_ACCESS_KEY }\n  - from: azure_keyvault:my-vault\n    name: azure\n    params:\n      auth_method: service_principal\n      tenant_id: ${ env:AZURE_TENANT_ID }\n      client_id: ${ env:AZURE_CLIENT_ID }\n      client_secret: ${ env:AZURE_CLIENT_SECRET }\n```",
       "type": "object",
       "properties": {
         "from": {
@@ -3157,6 +3166,58 @@
     "ComponentOrReference6": {
       "anyOf": [
         {
+          "$ref": "#/$defs/Reranker"
+        },
+        {
+          "$ref": "#/$defs/ComponentReference"
+        }
+      ]
+    },
+    "Reranker": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "name"
+      ]
+    },
+    "ComponentOrReference7": {
+      "anyOf": [
+        {
           "$ref": "#/$defs/Tool"
         },
         {
@@ -3214,7 +3275,7 @@
         "name"
       ]
     },
-    "ComponentOrReference7": {
+    "ComponentOrReference8": {
       "anyOf": [
         {
           "$ref": "#/$defs/Worker"
@@ -4054,6 +4115,11 @@
           "description": "Behavior when stream lag exceeds shard retention (24h). 'error' marks dataset as Error, 'ready_before_load' marks Ready then re-bootstraps, 'ready_after_load' re-bootstraps then marks Ready",
           "type": "string",
           "default": "error"
+        },
+        "write_parallelism": {
+          "description": "Number of parallel operations for writing and deleting data to DynamoDB",
+          "type": "string",
+          "default": "10"
         }
       },
       "required": [
@@ -4604,15 +4670,25 @@
           "x-secret": true
         },
         "glue_region": {
+          "description": "AWS region for the S3 bucket (e.g. 'us-east-1').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "us-east-1",
+            "eu-west-1"
+          ],
           "x-secret": true
         },
         "glue_endpoint": {
+          "description": "Custom S3-compatible endpoint URL. Leave empty for AWS S3.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "https://s3.us-east-1.amazonaws.com",
+            "http://minio.local:9000"
+          ],
           "x-secret": true
         },
         "glue_url_style": {
-          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.",
+          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "enum": [
             "vhost",
@@ -4620,24 +4696,36 @@
           ]
         },
         "glue_key": {
+          "description": "AWS access key ID (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "glue_secret": {
+          "description": "AWS secret access key (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "glue_session_token": {
+          "description": "Temporary AWS session token (used with STS credentials).\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "glue_auth": {
-          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.",
+          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "iam_role",
+            "key"
+          ],
+          "enum": [
+            "public",
+            "iam_role",
+            "key"
+          ],
           "x-secret": true
         },
         "glue_iam_role_source": {
-          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
+          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "enum": [
             "auto",
@@ -4646,17 +4734,24 @@
           ]
         },
         "glue_versioning": {
-          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.",
+          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "default": "enabled"
         },
         "client_timeout": {
-          "description": "The timeout setting for S3 client.",
-          "type": "string"
+          "description": "The timeout setting for S3 client.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "30s"
+          ]
         },
         "allow_http": {
-          "description": "Allow HTTP protocol for S3 endpoint.",
-          "type": "string"
+          "description": "Allow HTTP protocol for S3 endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
         },
         "file_format": {
           "type": "string"
@@ -5697,36 +5792,50 @@
       "type": "object",
       "properties": {
         "kafka_bootstrap_servers": {
-          "description": "A list of host/port pairs for establishing the initial Kafka cluster connection.",
-          "type": "string"
+          "description": "A list of host/port pairs for establishing the initial Kafka cluster connection.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
+          "type": "string",
+          "examples": [
+            "broker1.kafka.internal:9092,broker2.kafka.internal:9092"
+          ]
         },
         "kafka_security_protocol": {
-          "description": "Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'.",
+          "description": "Security protocol for Kafka connections. Default: 'sasl_ssl'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
-          "default": "sasl_ssl"
+          "default": "sasl_ssl",
+          "enum": [
+            "plaintext",
+            "ssl",
+            "sasl_plaintext",
+            "sasl_ssl"
+          ]
         },
         "kafka_sasl_mechanism": {
-          "description": "SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'.",
+          "description": "SASL authentication mechanism. Default: 'SCRAM-SHA-512'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
-          "default": "SCRAM-SHA-512"
+          "default": "SCRAM-SHA-512",
+          "enum": [
+            "PLAIN",
+            "SCRAM-SHA-256",
+            "SCRAM-SHA-512"
+          ]
         },
         "kafka_sasl_username": {
-          "description": "SASL username.",
+          "description": "SASL username.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "x-secret": true
         },
         "kafka_sasl_password": {
-          "description": "SASL password.",
+          "description": "SASL password.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "x-secret": true
         },
         "kafka_ssl_ca_location": {
-          "description": "Path to the SSL/TLS CA certificate file for server verification.",
+          "description": "Path to the SSL/TLS CA certificate file for server verification.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "x-secret": true
         },
         "kafka_enable_ssl_certificate_verification": {
-          "description": "Enable SSL/TLS certificate verification. Default: 'true'.",
+          "description": "Enable SSL/TLS certificate verification. Default: 'true'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "true",
           "enum": [
@@ -5735,7 +5844,7 @@
           ]
         },
         "kafka_ssl_endpoint_identification_algorithm": {
-          "description": "SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'.",
+          "description": "SSL/TLS endpoint identification algorithm. Default: 'https'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "https",
           "enum": [
@@ -5744,12 +5853,12 @@
           ]
         },
         "schema_infer_max_records": {
-          "description": "Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure.",
+          "description": "Number of Kafka messages to sample for schema inference. Increase if your data has optional fields or varying structure.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "1"
         },
         "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
+          "description": "Set true to flatten nested structs in JSON as separate columns.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "enum": [
             "true",
@@ -5757,16 +5866,16 @@
           ]
         },
         "kafka_consumer_group_id": {
-          "description": "Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.",
+          "description": "Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string"
         },
         "batch_max_size": {
-          "description": "Maximum number of change events to batch together before processing",
+          "description": "Maximum number of change events to batch together before processing.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "10000"
         },
         "batch_max_duration": {
-          "description": "Maximum time to wait for a batch to fill before processing",
+          "description": "Maximum time to wait for a batch to fill before processing.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "1s"
         }
@@ -5793,15 +5902,25 @@
       "type": "object",
       "properties": {
         "s3_region": {
+          "description": "AWS region for the S3 bucket (e.g. 'us-east-1').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "us-east-1",
+            "eu-west-1"
+          ],
           "x-secret": true
         },
         "s3_endpoint": {
+          "description": "Custom S3-compatible endpoint URL. Leave empty for AWS S3.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "https://s3.us-east-1.amazonaws.com",
+            "http://minio.local:9000"
+          ],
           "x-secret": true
         },
         "s3_url_style": {
-          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.",
+          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "enum": [
             "vhost",
@@ -5809,24 +5928,36 @@
           ]
         },
         "s3_key": {
+          "description": "AWS access key ID (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "s3_secret": {
+          "description": "AWS secret access key (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "s3_session_token": {
+          "description": "Temporary AWS session token (used with STS credentials).\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "s3_auth": {
-          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.",
+          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "iam_role",
+            "key"
+          ],
+          "enum": [
+            "public",
+            "iam_role",
+            "key"
+          ],
           "x-secret": true
         },
         "s3_iam_role_source": {
-          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
+          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "enum": [
             "auto",
@@ -5835,17 +5966,24 @@
           ]
         },
         "s3_versioning": {
-          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.",
+          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "default": "enabled"
         },
         "client_timeout": {
-          "description": "The timeout setting for S3 client.",
-          "type": "string"
+          "description": "The timeout setting for S3 client.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "30s"
+          ]
         },
         "allow_http": {
-          "description": "Allow HTTP protocol for S3 endpoint.",
-          "type": "string"
+          "description": "Allow HTTP protocol for S3 endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
         },
         "file_format": {
           "type": "string"
@@ -6500,7 +6638,11 @@
           "default": "spark_connect"
         },
         "client_timeout": {
-          "description": "The timeout setting for object store client.",
+          "description": "HTTP client request timeout. In 'delta_lake' mode, applies to the object store client. In 'sql_warehouse' mode, applies per-HTTP-call (statement submit, status poll, chunk fetch) — set to the longest expected single call, not total query duration. Accepts durations like '30s' or '5m'. Default: 30s.",
+          "type": "string"
+        },
+        "connect_timeout": {
+          "description": "Timeout for establishing TCP/TLS connections to the Databricks API. Applies in 'sql_warehouse' mode. Accepts durations like '10s'. Default: 10s.",
           "type": "string"
         },
         "databricks_cluster_id": {
@@ -7485,7 +7627,7 @@
       "type": "object",
       "properties": {
         "model_type": {
-          "description": "The architecture to load the model as. Supported values: mistral, gemma, mixtral, llama, phi2, phi3, qwen2, gemma2, starcoder2, phi3.5moe, deepseekv2, deepseekv3",
+          "description": "The architecture to load the model as. Supported text architectures: mistral, gemma, mixtral, llama, phi2, phi3, qwen2, gemma2, starcoder2, phi3.5moe, deepseekv2, deepseekv3, qwen3, glm4, glm4moelite, glm4moe, qwen3moe, smollm3, granitemoehybrid, gpt_oss, qwen3next. Supported multimodal architectures: phi3v, idefics2, llava_next, llava, vllama, qwen2vl, idefics3, minicpmo, phi4mm, qwen2_5vl, gemma3, mistral3, llama4, gemma3n, gemma4, qwen3vl, qwen3vlmoe, qwen3_5, qwen3_5moe, voxtral.",
           "type": "string"
         },
         "chat_template": {
