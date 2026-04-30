@@ -39,4 +39,3 @@ tokio-postgres.workspace = true
 
 [features]
 default = []
-postgres-write = []

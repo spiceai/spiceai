@@ -53,7 +53,7 @@ use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
     binary_expr, ident,
 };
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use futures::FutureExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
@@ -84,7 +84,7 @@ use crate::{
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use {
     crate::search::util::find_index_in_table_provider,
     search::index::SearchIndex,
@@ -94,7 +94,7 @@ use {
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
@@ -500,7 +500,7 @@ impl VectorSearchTableFunc {
         })
     }
 
-    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
     fn index_based_vector_table(
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
@@ -523,6 +523,20 @@ impl VectorSearchTableFunc {
             if let Some((es_indexes, _)) = find_index_in_table_provider::<ElasticsearchIndex>(tbl) {
                 vector_indexes.extend(
                     es_indexes
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+            }
+        }
+
+        #[cfg(feature = "duckdb")]
+        {
+            use search::index::duckdb::DuckDBVectorIndex;
+            if let Some((duckdb_indexes, _)) =
+                find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
+            {
+                vector_indexes.extend(
+                    duckdb_indexes
                         .into_iter()
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
@@ -563,7 +577,7 @@ impl VectorSearchTableFunc {
             return Ok(None);
         };
 
-        // Index-backed providers (S3 vectors, Elasticsearch, chunked) ignore
+        // Index-backed providers (S3 vectors, Elasticsearch, DuckDB, chunked) ignore
         // `args.distance_metric` because their underlying `SearchIndex::query_table_provider`
         // takes only the query string and uses the metric the index was configured with.
         // Silently picking an index-configured metric while accepting a different one
@@ -634,7 +648,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         };
 
         // For table with a vector engine, use it.
-        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
         if let Some(table_provider) = Self::index_based_vector_table(&table_provider, &args)? {
             return Ok(table_provider);
         }
