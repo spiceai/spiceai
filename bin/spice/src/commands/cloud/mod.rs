@@ -23,8 +23,9 @@ use crate::context::RuntimeContext;
 use crate::error::{InvalidArgumentSnafu, Result};
 use crate::output::{OutputFormat, TableOutput, write_json};
 use clap::{Args, Subcommand};
+use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
-use std::fmt;
+use std::{fmt, io::IsTerminal};
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
@@ -134,23 +135,97 @@ pub struct RegionsArgs {
 
 #[derive(Args)]
 pub struct LoginArgs {
-    /// Skip opening the browser and print the auth URL instead
-    #[arg(long)]
-    pub no_browser: bool,
-
-    /// `OAuth2` client ID (env: `SPICE_CLIENT_ID`)
-    #[arg(long, env = "SPICE_CLIENT_ID")]
-    pub client_id: Option<String>,
-
-    /// `OAuth2` client secret (env: `SPICE_CLIENT_SECRET`)
-    #[arg(long, env = "SPICE_CLIENT_SECRET")]
-    pub client_secret: Option<String>,
+    #[command(subcommand)]
+    pub method: Option<LoginMethod>,
 }
 
 impl fmt::Debug for LoginArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoginArgs")
-            .field("no_browser", &self.no_browser)
+            .field("method", &self.method)
+            .finish()
+    }
+}
+
+#[derive(Subcommand)]
+pub enum LoginMethod {
+    /// Log in with your Spice Cloud subscription in a browser
+    #[command(alias = "browser")]
+    Subscription(SubscriptionLoginArgs),
+
+    /// Log in by copying a one-time device code
+    Device(DeviceLoginArgs),
+
+    /// Log in with a Spice Cloud personal access token
+    #[command(name = "pat", alias = "token")]
+    Pat(PatLoginArgs),
+
+    /// Log in with OAuth client credentials for automation
+    #[command(alias = "client")]
+    Api(ApiLoginArgs),
+}
+
+impl fmt::Debug for LoginMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Subscription(args) => f.debug_tuple("Subscription").field(args).finish(),
+            Self::Device(args) => f.debug_tuple("Device").field(args).finish(),
+            Self::Pat(args) => f.debug_tuple("Pat").field(args).finish(),
+            Self::Api(args) => f.debug_tuple("Api").field(args).finish(),
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct SubscriptionLoginArgs {}
+
+#[derive(Args, Debug)]
+pub struct DeviceLoginArgs {}
+
+#[derive(Args)]
+pub struct PatLoginArgs {
+    /// Personal access token. Omit to enter it securely.
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_PAT",
+        value_name = "TOKEN",
+        help_heading = "PAT Login Options"
+    )]
+    pub token: Option<String>,
+}
+
+impl fmt::Debug for PatLoginArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PatLoginArgs")
+            .field("token", &self.token.as_deref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+#[derive(Args)]
+pub struct ApiLoginArgs {
+    /// OAuth client ID. Omit to enter it interactively.
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_CLIENT_ID",
+        value_name = "CLIENT_ID",
+        help_heading = "API Login Options"
+    )]
+    pub client_id: Option<String>,
+
+    /// OAuth client secret. Omit to enter it securely.
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_CLIENT_SECRET",
+        value_name = "CLIENT_SECRET",
+        help_heading = "API Login Options"
+    )]
+    pub client_secret: Option<String>,
+}
+
+impl fmt::Debug for ApiLoginArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiLoginArgs")
             .field("client_id", &self.client_id)
             .field(
                 "client_secret",
@@ -552,52 +627,178 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
 // ============================================================================
 
 async fn execute_login(args: &LoginArgs) -> Result<()> {
-    match (&args.client_id, &args.client_secret) {
-        (Some(client_id), Some(client_secret)) => {
-            execute_login_client_credentials(client_id, client_secret).await
-        }
-        (Some(_), None) => InvalidArgumentSnafu {
-            message: "--client-secret is required when --client-id is provided",
-        }
-        .fail(),
-        (None, Some(_)) => InvalidArgumentSnafu {
-            message: "--client-id is required when --client-secret is provided",
-        }
-        .fail(),
-        (None, None) => execute_login_device_flow(args).await,
+    match &args.method {
+        Some(LoginMethod::Subscription(_)) => execute_login_device_flow(true).await,
+        Some(LoginMethod::Device(_)) => execute_login_device_flow(false).await,
+        Some(LoginMethod::Pat(args)) => execute_login_pat(args).await,
+        Some(LoginMethod::Api(args)) => execute_login_api(args).await,
+        None => execute_login_with_chooser().await,
     }
 }
 
-async fn execute_login_client_credentials(client_id: &str, client_secret: &str) -> Result<()> {
-    use crate::commands::login::merge_auth_config;
+async fn execute_login_with_chooser() -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        return InvalidArgumentSnafu {
+            message: "Choose a login type explicitly when running non-interactively: 'spice cloud login subscription', 'spice cloud login device', 'spice cloud login pat', or 'spice cloud login api'",
+        }
+        .fail();
+    }
+
+    let items = [
+        "Subscription Login (browser)",
+        "Device Login (copy code)",
+        "Personal Access Token (PAT)",
+        "API Login (OAuth client)",
+    ];
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("How would you like to log in to Spice Cloud?")
+        .items(&items)
+        .default(0)
+        .interact()
+        .map_err(|err| crate::error::Error::InvalidArgument {
+            message: format!("Failed to read login selection: {err}"),
+        })?;
+
+    match selection {
+        0 => execute_login_device_flow(true).await,
+        1 => execute_login_device_flow(false).await,
+        2 => execute_login_pat(&PatLoginArgs { token: None }).await,
+        3 => {
+            execute_login_api(&ApiLoginArgs {
+                client_id: None,
+                client_secret: None,
+            })
+            .await
+        }
+        _ => InvalidArgumentSnafu {
+            message: "Invalid login selection".to_string(),
+        }
+        .fail(),
+    }
+}
+
+async fn execute_login_pat(args: &PatLoginArgs) -> Result<()> {
+    let token = resolve_string_or_prompt(
+        args.token.as_deref(),
+        "PAT",
+        "--token",
+        "SPICE_CLOUD_PAT",
+        "Spice Cloud personal access token",
+        true,
+    )?;
+
+    save_token_and_print_login_result(&token).await
+}
+
+async fn execute_login_api(args: &ApiLoginArgs) -> Result<()> {
+    let client_id = resolve_string_or_prompt(
+        args.client_id.as_deref(),
+        "OAuth client ID",
+        "--client-id",
+        "SPICE_CLOUD_CLIENT_ID",
+        "OAuth client ID",
+        false,
+    )?;
+    let client_secret = resolve_string_or_prompt(
+        args.client_secret.as_deref(),
+        "OAuth client secret",
+        "--client-secret",
+        "SPICE_CLOUD_CLIENT_SECRET",
+        "OAuth client secret",
+        true,
+    )?;
 
     let client = CloudClient::new_unauthenticated()?;
     let token = client
-        .exchange_client_credentials(client_id, client_secret)
+        .exchange_client_credentials(&client_id, &client_secret)
         .await?;
 
-    merge_auth_config("SPICEAI", &[("TOKEN", &token)])?;
+    save_token_and_print_login_result(&token).await
+}
 
-    let authed_client = CloudClient::new()?;
-    if let Ok(context) = authed_client.get_auth_context().await {
-        if let Some(api_key) = context.app_api_key {
-            merge_auth_config("SPICEAI", &[("API_KEY", &api_key)])?;
+fn resolve_string_or_prompt(
+    value: Option<&str>,
+    label: &str,
+    flag: &str,
+    env_var: &str,
+    prompt: &str,
+    secret: bool,
+) -> Result<String> {
+    if let Some(value) = value
+        && !value.is_empty()
+    {
+        return Ok(value.to_string());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return InvalidArgumentSnafu {
+            message: format!("{label} is required. Provide {flag} or set {env_var}."),
         }
-        println!();
-        println!(
-            "\x1b[32m✓ Successfully logged in to Spice Cloud as {} ({})\x1b[0m",
-            context.username, context.email
-        );
+        .fail();
+    }
+
+    let value = if secret {
+        Password::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .interact()
+            .map_err(|err| crate::error::Error::InvalidArgument {
+                message: format!("Failed to read {label}: {err}"),
+            })?
     } else {
-        println!("\n\x1b[32m✓ Successfully logged in to Spice Cloud\x1b[0m");
+        Input::<String>::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .interact_text()
+            .map_err(|err| crate::error::Error::InvalidArgument {
+                message: format!("Failed to read {label}: {err}"),
+            })?
+    };
+
+    if value.is_empty() {
+        return InvalidArgumentSnafu {
+            message: format!("{label} cannot be empty."),
+        }
+        .fail();
+    }
+
+    Ok(value)
+}
+
+async fn save_token_and_print_login_result(token: &str) -> Result<()> {
+    use crate::commands::login::merge_auth_config;
+
+    let authed_client = CloudClient::with_token(token)?;
+    let auth_context_result = authed_client.get_auth_context().await;
+
+    merge_auth_config("SPICEAI", &[("TOKEN", token)])?;
+
+    match auth_context_result {
+        Ok(context) => {
+            if let Some(api_key) = context.app_api_key {
+                merge_auth_config("SPICEAI", &[("API_KEY", &api_key)])?;
+            }
+
+            println!();
+            println!(
+                "\x1b[32m✓ Successfully logged in to Spice Cloud as {} ({})\x1b[0m",
+                context.username, context.email
+            );
+        }
+        Err(err) => {
+            println!();
+            println!(
+                "\x1b[33m! Login token saved, but Spice Cloud could not verify the authenticated user context: {err}\x1b[0m"
+            );
+            println!(
+                "\x1b[33m! Subsequent cloud commands may fail if the token is invalid or unauthorized.\x1b[0m"
+            );
+        }
     }
 
     print_post_login_help();
     Ok(())
 }
 
-async fn execute_login_device_flow(args: &LoginArgs) -> Result<()> {
-    use crate::commands::login::merge_auth_config;
+async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
     use rand::RngExt;
 
     // Generate auth code
@@ -613,16 +814,24 @@ async fn execute_login_device_flow(args: &LoginArgs) -> Result<()> {
     let client = CloudClient::new_unauthenticated()?;
     let auth_url = client.get_auth_url(&auth_code);
 
-    println!("Opening Spice Cloud authorization page in your default browser...");
+    if open_browser {
+        println!("Opening Spice Cloud authorization page in your default browser...");
+    } else {
+        println!("Complete Spice Cloud device login in a browser.");
+    }
     println!(
         "\nYour auth code:\n\n  {}-{}\n",
         &auth_code[..4],
         &auth_code[4..]
     );
-    println!("If the browser does not open, visit the following URL manually:");
+    if open_browser {
+        println!("If the browser does not open, visit the following URL manually:");
+    } else {
+        println!("Open this URL in a browser:");
+    }
     println!("\n  {auth_url}\n");
 
-    if !args.no_browser {
+    if open_browser {
         let _ = open::that(&auth_url);
     }
 
@@ -651,24 +860,7 @@ async fn execute_login_device_flow(args: &LoginArgs) -> Result<()> {
             }
 
             if let Some(token) = response.access_token {
-                merge_auth_config("SPICEAI", &[("TOKEN", &token)])?;
-
-                let authed_client = CloudClient::new()?;
-                if let Ok(context) = authed_client.get_auth_context().await {
-                    if let Some(api_key) = context.app_api_key {
-                        merge_auth_config("SPICEAI", &[("API_KEY", &api_key)])?;
-                    }
-                    println!();
-                    println!(
-                        "\x1b[32m✓ Successfully logged in to Spice Cloud as {} ({})\x1b[0m",
-                        context.username, context.email
-                    );
-                } else {
-                    println!("\n\x1b[32m✓ Successfully logged in to Spice Cloud\x1b[0m");
-                }
-
-                print_post_login_help();
-                return Ok(());
+                return save_token_and_print_login_result(&token).await;
             }
         }
     }

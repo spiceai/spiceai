@@ -355,10 +355,10 @@ pub struct AuthExchangeResponse {
 
 // Debug is intentionally not derived: client_secret must not appear in logs or error output.
 #[derive(Serialize)]
-pub struct OAuthTokenRequest {
-    pub client_id: String,
-    pub client_secret: String,
-    pub grant_type: String,
+pub struct OAuthTokenRequest<'a> {
+    pub client_id: &'a str,
+    pub client_secret: &'a str,
+    pub grant_type: &'static str,
 }
 
 // Debug is intentionally not derived: access_token must not appear in logs or error output.
