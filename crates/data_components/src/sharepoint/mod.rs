@@ -13,7 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+pub mod auth;
 pub mod client;
 mod drive_items;
 mod error;
+pub mod object_store;
 pub mod table;
+pub mod url;
+
+/// Re-export so downstream crates (tests, runtime helpers) don't need a
+/// direct `graph-rs-sdk` dependency just to hold on to a `GraphClient`.
+pub use graph_rs_sdk::GraphClient;
