@@ -1408,7 +1408,10 @@ impl DataFusion {
             UpdateType::Changes => InsertOp::Replace,
         };
 
-        let broadcast_batches = if self
+        let (broadcast_batches, data): (
+            Option<Arc<ParkingMutex<StreamingBroadcastBuffer>>>,
+            datafusion::execution::SendableRecordBatchStream,
+        ) = if self
             .data_update_broadcaster
             .has_subscribers(table_reference)
             .await
@@ -1422,19 +1425,15 @@ impl DataFusion {
                 }
                 batch_result
             });
-            let data = Box::pin(
+            let data: datafusion::execution::SendableRecordBatchStream = Box::pin(
                 datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
                     Arc::clone(&update_schema),
                     Box::pin(stream),
                 ),
             );
-            Some((broadcast_batches, data))
+            (Some(broadcast_batches), data)
         } else {
-            None
-        };
-        let (broadcast_batches, data) = match broadcast_batches {
-            Some((broadcast_batches, data)) => (Some(broadcast_batches), data),
-            None => (None, data),
+            (None, data)
         };
 
         let insert_plan = table_provider
