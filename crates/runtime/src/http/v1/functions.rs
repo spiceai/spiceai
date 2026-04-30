@@ -21,6 +21,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use datafusion::execution::FunctionRegistry;
 use serde::{Deserialize, Serialize};
 
 use crate::Runtime;

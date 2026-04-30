@@ -488,7 +488,7 @@ mod tests {
     }
 
     impl runtime_auth::AuthPrincipal for TestPrincipal {
-        fn username(&self) -> &str {
+        fn username(&self) -> &'static str {
             "test"
         }
 
