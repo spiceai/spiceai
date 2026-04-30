@@ -363,6 +363,29 @@ pub(super) fn extract_dml_count(batches: &[RecordBatch]) -> u64 {
         .unwrap_or(0)
 }
 
+/// Builds an in-memory execution plan from buffered batches and executes
+/// an `insert_into` against the supplied table provider. The input plan is
+/// cast to the target provider's schema so differences between the
+/// accelerator and federated source schemas (extra columns, differing
+/// types) don't cause incorrect writes.
+async fn execute_insert(
+    table: Arc<dyn TableProvider>,
+    input_schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    overwrite: InsertOp,
+    session_state: &SessionState,
+    task_context: Option<Arc<TaskContext>>,
+) -> DataFusionResult<()> {
+    let memory_source = MemorySourceConfig::try_new(&[batches], input_schema, None)?;
+    let source: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(memory_source)));
+    let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(source, table.schema()));
+
+    let plan = table.insert_into(session_state, input, overwrite).await?;
+    let task_ctx = task_context.unwrap_or_else(|| session_state.task_ctx());
+    let _ = datafusion::physical_plan::collect(plan, task_ctx).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{WriteBackDeletionSink, WriteBackUpdateSink, extract_dml_count};
@@ -400,8 +423,9 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(UInt64Array::from(vec![n]))],
         )
-        .unwrap();
-        let memory = MemorySourceConfig::try_new(&[vec![batch]], schema, None).unwrap();
+        .expect("valid schema and array");
+        let memory =
+            MemorySourceConfig::try_new(&[vec![batch]], schema, None).expect("valid memory source");
         Arc::new(DataSourceExec::new(Arc::new(memory)))
     }
 
@@ -553,7 +577,7 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(UInt64Array::from(vec![99]))],
         )
-        .unwrap();
+        .expect("valid schema and array");
         assert_eq!(extract_dml_count(&[batch]), 99);
     }
 
@@ -564,7 +588,7 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(StringArray::from(vec!["hello"]))],
         )
-        .unwrap();
+        .expect("valid schema and array");
         assert_eq!(extract_dml_count(&[batch]), 0);
     }
 
@@ -579,7 +603,7 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(UInt64Array::from(vec![] as Vec<u64>))],
         )
-        .unwrap();
+        .expect("valid schema and array");
         assert_eq!(extract_dml_count(&[batch]), 0);
     }
 
@@ -598,7 +622,7 @@ mod tests {
             session_state,
         };
 
-        let count = sink.delete_from().await.unwrap();
+        let count = sink.delete_from().await.expect("deletion should succeed");
         assert_eq!(count, 42);
     }
 
@@ -615,7 +639,7 @@ mod tests {
             session_state,
         };
 
-        let err = sink.delete_from().await.unwrap_err();
+        let err = sink.delete_from().await.expect_err("deletion should fail");
         assert!(err.to_string().contains("accelerator delete failed"));
     }
 
@@ -635,7 +659,7 @@ mod tests {
             session_state,
         };
 
-        let count = sink.delete_from().await.unwrap();
+        let count = sink.delete_from().await.expect("update should succeed");
         assert_eq!(count, 7);
     }
 
@@ -653,30 +677,7 @@ mod tests {
             session_state,
         };
 
-        let err = sink.delete_from().await.unwrap_err();
+        let err = sink.delete_from().await.expect_err("update should fail");
         assert!(err.to_string().contains("accelerator update failed"));
     }
-}
-
-/// Builds an in-memory execution plan from buffered batches and executes
-/// an `insert_into` against the supplied table provider. The input plan is
-/// cast to the target provider's schema so differences between the
-/// accelerator and federated source schemas (extra columns, differing
-/// types) don't cause incorrect writes.
-async fn execute_insert(
-    table: Arc<dyn TableProvider>,
-    input_schema: SchemaRef,
-    batches: Vec<RecordBatch>,
-    overwrite: InsertOp,
-    session_state: &SessionState,
-    task_context: Option<Arc<TaskContext>>,
-) -> DataFusionResult<()> {
-    let memory_source = MemorySourceConfig::try_new(&[batches], input_schema, None)?;
-    let source: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(memory_source)));
-    let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(source, table.schema()));
-
-    let plan = table.insert_into(session_state, input, overwrite).await?;
-    let task_ctx = task_context.unwrap_or_else(|| session_state.task_ctx());
-    let _ = datafusion::physical_plan::collect(plan, task_ctx).await?;
-    Ok(())
 }

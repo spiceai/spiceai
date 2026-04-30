@@ -721,8 +721,9 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(UInt64Array::from(vec![n]))],
         )
-        .unwrap();
-        let memory = MemorySourceConfig::try_new(&[vec![batch]], schema, None).unwrap();
+        .expect("valid schema and array");
+        let memory =
+            MemorySourceConfig::try_new(&[vec![batch]], schema, None).expect("valid memory source");
         Arc::new(DataSourceExec::new(Arc::new(memory)))
     }
 
@@ -805,7 +806,7 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let count = sink.delete_from().await.unwrap();
+        let count = sink.delete_from().await.expect("deletion should succeed");
         assert_eq!(count, 5);
     }
 
@@ -817,7 +818,7 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let err = sink.delete_from().await.unwrap_err();
+        let err = sink.delete_from().await.expect_err("deletion should fail");
         assert!(err.to_string().contains("federated delete failed"));
     }
 
@@ -829,7 +830,7 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let err = sink.delete_from().await.unwrap_err();
+        let err = sink.delete_from().await.expect_err("deletion should fail");
         assert!(err.to_string().contains("accelerator delete failed"));
     }
 
@@ -843,7 +844,7 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let count = sink.delete_from().await.unwrap();
+        let count = sink.delete_from().await.expect("update should succeed");
         assert_eq!(count, 3);
     }
 
@@ -855,7 +856,7 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let err = sink.delete_from().await.unwrap_err();
+        let err = sink.delete_from().await.expect_err("update should fail");
         assert!(err.to_string().contains("federated update failed"));
     }
 
@@ -867,7 +868,7 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let err = sink.delete_from().await.unwrap_err();
+        let err = sink.delete_from().await.expect_err("update should fail");
         assert!(err.to_string().contains("accelerator update failed"));
     }
 }
