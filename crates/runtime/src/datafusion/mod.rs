@@ -1447,7 +1447,16 @@ impl DataFusion {
             .acceleration
             .as_ref()
             .is_some_and(|acc| !acc.on_conflict.is_empty());
-        let needs_source_writes = dataset.access().allows_write() && !has_on_conflict;
+        // When refresh_mode is `changes` (CDC), on_conflict provides WAL UPDATE upsert routing
+        // only — it does not imply accelerator-only writes. Writes should reach the federated
+        // source per write_mode. Without CDC, on_conflict means the source may be read-only and
+        // writes are directed to the accelerator only.
+        let has_changes_refresh = dataset.acceleration.as_ref().is_some_and(|acc| {
+            acc.refresh_mode
+                .is_some_and(|m| matches!(m, RefreshMode::Changes))
+        });
+        let needs_source_writes =
+            dataset.access().allows_write() && (!has_on_conflict || has_changes_refresh);
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
@@ -1863,10 +1872,28 @@ impl DataFusion {
                 .await;
         }
 
-        // When on_conflict is configured, writes go to the accelerated table only,
-        // not to the federated source (which may not support writes).
-        if has_on_conflict {
+        // on_conflict forces accelerator-only writes when CDC is not in use. With CDC
+        // (refresh_mode: changes), on_conflict is for WAL UPDATE upsert routing only and
+        // does not override the write destination — writes follow write_mode instead.
+        if has_on_conflict && !has_changes_refresh {
             accelerated_table_builder.write_to_accelerator_only();
+        } else if dataset.access().allows_write() {
+            match acceleration_settings.write_mode {
+                spicepod::acceleration::WriteMode::WriteBack => {
+                    accelerated_table_builder.write_back();
+                }
+                spicepod::acceleration::WriteMode::WriteThrough
+                    if acceleration_settings.engine == Engine::Cayenne =>
+                {
+                    // write_through with staged commit/rollback is only supported for Cayenne.
+                    // For other engines (e.g. DuckDB + CDC), writes fall through to FederatedOnly:
+                    // the write goes directly to the federated source and CDC propagates it back.
+                    accelerated_table_builder.write_through();
+                }
+                spicepod::acceleration::WriteMode::WriteThrough => {
+                    // FederatedOnly is the default for non-Cayenne engines.
+                }
+            }
         }
 
         accelerated_table_builder.bootstrap_status(bootstrap_status);
