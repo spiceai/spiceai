@@ -4350,7 +4350,11 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-object-store",
+ "secrecy",
  "snafu",
+ "tokio",
+ "tracing",
  "url",
 ]
 
@@ -6775,10 +6779,13 @@ name = "document_parse"
 version = "2.0.0-unstable"
 dependencies = [
  "bytes",
+ "calamine",
  "docx-rs",
  "pdf-extract",
+ "quick-xml 0.38.4",
  "snafu",
  "tokio",
+ "zip 7.4.0",
 ]
 
 [[package]]
