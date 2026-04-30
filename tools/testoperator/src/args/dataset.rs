@@ -165,6 +165,7 @@ pub enum QueryOverridesArg {
     #[serde(rename = "mysql-catalog")]
     MysqlCatalog,
     #[serde(rename = "mssql-catalog")]
+    #[value(name = "mssql-catalog")]
     MsSqlCatalog,
     #[serde(rename = "oracle-catalog")]
     OracleCatalog,

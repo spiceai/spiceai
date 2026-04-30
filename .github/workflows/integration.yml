@@ -60,6 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
@@ -75,6 +76,7 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
+          persist-credentials: false
           fetch-depth: 1
 
       # Cache Cargo dependencies
@@ -103,9 +105,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -224,6 +224,7 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
+          persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
@@ -374,6 +375,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 1
 
       - name: Download integration snapshots artifacts
@@ -419,6 +421,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 1
 
       - name: Set up Rust
@@ -459,6 +462,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 1
 
       - name: Set up Rust
@@ -503,6 +507,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 1
 
       - name: Set up Rust
@@ -533,6 +538,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 1
       - name: Set up Rust
         uses: ./.github/actions/setup-rust

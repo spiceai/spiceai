@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use super::{Format, convert_entry_to_csv, dataset_status};
+use super::{Format, convert_entry_to_csv, dataset_status, require_write_access};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]
@@ -282,6 +282,10 @@ pub(crate) async fn refresh(
     // This means malformed Json, etc, will simply return None
     // To get around this, we would need to implement a custom extractor
 ) -> Response {
+    if let Some(response) = require_write_access().await {
+        return response;
+    }
+
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
@@ -392,6 +396,10 @@ pub(crate) async fn acceleration(
     Path(dataset_name): Path<String>,
     Json(payload): Json<AccelerationRequest>,
 ) -> Response {
+    if let Some(response) = require_write_access().await {
+        return response;
+    }
+
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {

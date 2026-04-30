@@ -6,15 +6,15 @@ select
     o_totalprice,
     sum(l_quantity) as 'sum(lineitem.l_quantity)'
 from
-    mssql.public.customer,
-    mssql.public.orders,
-    mssql.public.lineitem
+    mssql.dbo.customer,
+    mssql.dbo.orders,
+    mssql.dbo.lineitem
 where
         o_orderkey in (
         select
             l_orderkey
         from
-            mssql.public.lineitem
+            mssql.dbo.lineitem
         group by
             l_orderkey having
                 sum(l_quantity) > 300

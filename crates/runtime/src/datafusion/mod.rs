@@ -113,15 +113,15 @@ pub mod app_context_extension;
 pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
-pub mod composed_catalog;
-pub mod dialect;
-pub mod error;
+pub use runtime_datafusion::composed_catalog;
+pub use runtime_datafusion::dialect;
+pub use runtime_datafusion::error;
 pub mod filter_converter;
 pub mod flight_session_extension;
 pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
-pub mod managed_runtime;
-pub mod param_utils;
+pub use runtime_datafusion::managed_runtime;
+pub use runtime_datafusion::param_utils;
 #[cfg(not(windows))]
 pub mod planner;
 pub mod refresh_sql;
@@ -129,7 +129,7 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
-pub mod sort_columns;
+pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
 pub mod udf;
 pub mod udtf;
@@ -1368,8 +1368,14 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn table_exists(&self, dataset_name: TableReference) -> bool {
-        self.ctx.table_exist(dataset_name).unwrap_or(false)
+    pub fn table_exists(&self, dataset_name: &TableReference) -> bool {
+        let Some(catalog) = self.resolve_catalog_provider(dataset_name) else {
+            return false;
+        };
+        let Some(s) = Self::resolve_schema_provider(&catalog, dataset_name) else {
+            return false;
+        };
+        s.table_exist(dataset_name.table())
     }
 
     #[must_use]
@@ -2442,10 +2448,7 @@ impl DataFusion {
                     break;
                 }
                 loop {
-                    if !ctx
-                        .table_exist(dependent_table_name.clone())
-                        .unwrap_or(false)
-                    {
+                    if !df_ref.table_exists(dependent_table_name) {
                         if Instant::now() >= deadline {
                             unresolved_dependent_table = Some(dependent_table_name.clone());
                             break;
@@ -2808,6 +2811,7 @@ impl DataFusion {
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
             executor_registry: self.executor_registry().cloned(),
             ddl_handler: self.cayenne_ddl_handler.clone(),
+            io_runtime: self.io_runtime.clone(),
         };
 
         planner::create_logical_plan(sql, session, &ctx).await

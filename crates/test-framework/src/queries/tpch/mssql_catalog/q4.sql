@@ -2,7 +2,7 @@ select
     o_orderpriority,
     count(*) as order_count
 from
-    mssql.public.orders
+    mssql.dbo.orders
 where
         o_orderdate >= '1993-07-01'
   and o_orderdate < date '1993-07-01' + interval '3' month
@@ -10,7 +10,7 @@ where
         select
             *
         from
-            mssql.public.lineitem
+            mssql.dbo.lineitem
         where
                 l_orderkey = o_orderkey
           and l_commitdate < l_receiptdate

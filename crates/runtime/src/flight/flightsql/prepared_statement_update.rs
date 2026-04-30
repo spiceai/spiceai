@@ -31,6 +31,7 @@ use std::sync::{Arc, LazyLock};
 use tokio_stream::{StreamExt, adapters::Peekable};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::flight::is_auth_read_only;
 use crate::{
     datafusion::{query::QueryBuilder, request_context_extension::get_current_datafusion},
     flight::{Service, handle_query_error, metrics, to_tonic_err, util::set_flightsql_protocol},
@@ -97,6 +98,12 @@ pub(crate) async fn do_get(
 
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
+
+    if is_auth_read_only(&context) {
+        return Err(Status::permission_denied(
+            "Write access denied. Verify that authentication key used has write access and try again.",
+        ));
+    }
 
     tracing::trace!("do_get_prepared_statement_update: {query:?}");
 

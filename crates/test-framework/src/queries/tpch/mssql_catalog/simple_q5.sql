@@ -1,1 +1,1 @@
-select SUM(o.o_totalprice) as total_price, l.l_linestatus from mssql.public.orders o join mssql.public.lineitem l on o.o_orderkey = l.l_orderkey group by l.l_linestatus order by total_price desc;
+select SUM(o.o_totalprice) as total_price, l.l_linestatus from mssql.dbo.orders o join mssql.dbo.lineitem l on o.o_orderkey = l.l_orderkey group by l.l_linestatus order by total_price desc;

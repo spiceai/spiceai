@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashSet, sync::Arc};
 
 use datafusion::common::ParamValues;
+use datafusion::logical_expr::LogicalPlan;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -25,9 +26,15 @@ use crate::datafusion::{DataFusion, query::QueryMethod};
 
 use super::{Query, tracker::QueryTracker};
 
+enum SqlOrPlan<'a> {
+    Sql(&'a str),
+    /// Pre-parsed plan with the original SQL retained for cache key compatibility.
+    Plan(Box<LogicalPlan>, Arc<str>),
+}
+
 pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,
-    sql: &'a str,
+    method: SqlOrPlan<'a>,
     parameters: Option<ParamValues>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
     query_id: Uuid,
@@ -38,7 +45,26 @@ impl<'a> QueryBuilder<'a> {
     pub fn new(sql: &'a str, df: Arc<DataFusion>) -> Self {
         Self {
             df,
-            sql,
+            method: SqlOrPlan::Sql(sql),
+            parameters: None,
+            query_id: Uuid::new_v4(),
+            table_allowlist: None,
+            read_only: false,
+        }
+    }
+
+    /// Build a `QueryBuilder` from a pre-parsed [`LogicalPlan`] and its original SQL.
+    ///
+    /// The SQL string is retained so that results-cache lookups use the same key
+    /// as an equivalent [`QueryBuilder::new`] call, meaning cached SELECT results
+    /// written by one path are visible to the other.
+    ///
+    /// Use this when the plan has already been parsed externally (e.g. for
+    /// read-only auth validation) to avoid re-parsing.
+    pub fn from_plan(plan: LogicalPlan, sql: impl Into<Arc<str>>, df: Arc<DataFusion>) -> Self {
+        Self {
+            df,
+            method: SqlOrPlan::Plan(Box::new(plan), sql.into()),
             parameters: None,
             query_id: Uuid::new_v4(),
             table_allowlist: None,
@@ -82,7 +108,6 @@ impl<'a> QueryBuilder<'a> {
 
     #[must_use]
     pub fn build(self) -> Query {
-        let sql: Arc<str> = self.sql.into();
         let tracker = if self.df.task_history_enabled {
             Some(QueryTracker {
                 schema: None,
@@ -101,13 +126,24 @@ impl<'a> QueryBuilder<'a> {
             None
         };
 
-        Query {
-            df: Arc::clone(&self.df),
-            sql: QueryMethod::Text {
-                sql: Arc::clone(&sql),
+        let query_method = match self.method {
+            SqlOrPlan::Sql(sql) => QueryMethod::Text {
+                sql: sql.into(),
                 parameters: self.parameters,
                 table_allowlist: self.table_allowlist,
+                pre_parsed_plan: None,
             },
+            SqlOrPlan::Plan(plan, sql) => QueryMethod::Text {
+                sql,
+                parameters: self.parameters,
+                table_allowlist: self.table_allowlist,
+                pre_parsed_plan: Some(plan),
+            },
+        };
+
+        Query {
+            df: Arc::clone(&self.df),
+            sql: query_method,
             tracker,
             read_only: self.read_only,
         }

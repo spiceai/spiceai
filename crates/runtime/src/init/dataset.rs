@@ -661,7 +661,7 @@ impl Runtime {
         ds_name: TableReference,
         ds_acceleration: Option<&Acceleration>,
     ) {
-        if self.df.table_exists(ds_name.clone()) {
+        if self.df.table_exists(&ds_name) {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                 datasets_health_monitor
                     .deregister_dataset(&ds_name.to_string())

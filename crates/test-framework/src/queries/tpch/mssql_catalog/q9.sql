@@ -9,12 +9,12 @@ from
             extract(year from o_orderdate) as o_year,
             l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
         from
-            mssql.public.part,
-            mssql.public.supplier,
-            mssql.public.lineitem,
-            mssql.public.partsupp,
-            mssql.public.orders,
-            mssql.public.nation
+            mssql.dbo.part,
+            mssql.dbo.supplier,
+            mssql.dbo.lineitem,
+            mssql.dbo.partsupp,
+            mssql.dbo.orders,
+            mssql.dbo.nation
         where
                 s_suppkey = l_suppkey
           and ps_suppkey = l_suppkey

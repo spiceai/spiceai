@@ -1,8 +1,8 @@
 SELECT
     SUM(l_extendedprice * (1 - l_discount)) AS revenue
 FROM
-    mysql.public.lineitem,
-    mysql.public.part
+    mysql.tpch_sf1.lineitem,
+    mysql.tpch_sf1.part
 WHERE
     (
         p_partkey = l_partkey
