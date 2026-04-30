@@ -150,18 +150,13 @@ impl fmt::Debug for LoginArgs {
 #[derive(Subcommand)]
 pub enum LoginMethod {
     /// Log in with your Spice Cloud subscription in a browser
-    #[command(alias = "browser")]
     Subscription(SubscriptionLoginArgs),
 
-    /// Log in by copying a one-time device code
-    Device(DeviceLoginArgs),
-
     /// Log in with a Spice Cloud personal access token
-    #[command(name = "pat", alias = "token")]
+    #[command(name = "pat")]
     Pat(PatLoginArgs),
 
     /// Log in with OAuth client credentials for automation
-    #[command(alias = "client")]
     Api(ApiLoginArgs),
 }
 
@@ -169,7 +164,6 @@ impl fmt::Debug for LoginMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Subscription(args) => f.debug_tuple("Subscription").field(args).finish(),
-            Self::Device(args) => f.debug_tuple("Device").field(args).finish(),
             Self::Pat(args) => f.debug_tuple("Pat").field(args).finish(),
             Self::Api(args) => f.debug_tuple("Api").field(args).finish(),
         }
@@ -177,10 +171,12 @@ impl fmt::Debug for LoginMethod {
 }
 
 #[derive(Args, Debug)]
-pub struct SubscriptionLoginArgs {}
-
-#[derive(Args, Debug)]
-pub struct DeviceLoginArgs {}
+pub struct SubscriptionLoginArgs {
+    /// Don't open a browser; print the URL and a one-time code to enter on
+    /// another device. Useful over SSH or in headless shells.
+    #[arg(long)]
+    pub device: bool,
+}
 
 #[derive(Args)]
 pub struct PatLoginArgs {
@@ -628,8 +624,7 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
 
 async fn execute_login(args: &LoginArgs) -> Result<()> {
     match &args.method {
-        Some(LoginMethod::Subscription(_)) => execute_login_device_flow(true).await,
-        Some(LoginMethod::Device(_)) => execute_login_device_flow(false).await,
+        Some(LoginMethod::Subscription(args)) => execute_login_device_flow(!args.device).await,
         Some(LoginMethod::Pat(args)) => execute_login_pat(args).await,
         Some(LoginMethod::Api(args)) => execute_login_api(args).await,
         None => execute_login_with_chooser().await,
@@ -639,14 +634,14 @@ async fn execute_login(args: &LoginArgs) -> Result<()> {
 async fn execute_login_with_chooser() -> Result<()> {
     if !std::io::stdin().is_terminal() {
         return InvalidArgumentSnafu {
-            message: "Choose a login type explicitly when running non-interactively: 'spice cloud login subscription', 'spice cloud login device', 'spice cloud login pat', or 'spice cloud login api'",
+            message: "Choose a login type explicitly when running non-interactively: 'spice cloud login subscription', 'spice cloud login subscription --device', 'spice cloud login pat', or 'spice cloud login api'",
         }
         .fail();
     }
 
     let items = [
         "Subscription Login (browser)",
-        "Device Login (copy code)",
+        "Subscription Login (device code, no browser)",
         "Personal Access Token (PAT)",
         "API Login (OAuth client)",
     ];
