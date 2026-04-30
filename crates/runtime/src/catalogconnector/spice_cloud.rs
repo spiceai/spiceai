@@ -38,9 +38,7 @@ use iceberg::{CatalogBuilder, NamespaceIdent};
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use snafu::prelude::*;
-use spice_cloud_client::endpoints::{
-    LEGACY_DATA_ENDPOINT, data_endpoint as spice_cloud_data_endpoint, is_valid_region,
-};
+use spice_cloud_client::endpoints::{data_endpoint as spice_cloud_data_endpoint, is_valid_region};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tonic::metadata::MetadataValue;
 
@@ -252,7 +250,11 @@ impl SpiceCloudPlatformCatalog {
             return Ok(spice_cloud_data_endpoint(region));
         }
 
-        Ok(LEGACY_DATA_ENDPOINT.to_string())
+        Err(super::Error::InvalidConfigurationNoSource {
+            connector: "spice.ai".into(),
+            message: "Missing Spice Cloud region. Specify a valid region, for example us-east-1. To list available regions, run: spice cloud regions".to_string(),
+            connector_component: ConnectorComponent::from(catalog),
+        })
     }
 
     fn region(&self) -> Option<&str> {
@@ -540,6 +542,27 @@ mod tests {
             connector.http_endpoint(&catalog),
             Err(super::super::Error::InvalidConfigurationNoSource { message, .. })
             if message.contains("Invalid Spice Cloud region: bad_region")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_http_endpoint_requires_region() {
+        let params = Parameters::try_new(
+            "test",
+            Vec::<(String, SecretString)>::new(),
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+        let catalog = make_test_catalog().await;
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert!(matches!(
+            connector.http_endpoint(&catalog),
+            Err(super::super::Error::InvalidConfigurationNoSource { message, .. })
+            if message.contains("Missing Spice Cloud region")
         ));
     }
 

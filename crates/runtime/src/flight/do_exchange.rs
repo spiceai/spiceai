@@ -16,9 +16,7 @@ limitations under the License.
 
 use std::{collections::VecDeque, sync::Arc};
 
-use arrow::array::{
-    ArrayBuilder, ListBuilder, RecordBatch, StringBuilder, make_builder, new_null_array,
-};
+use arrow::array::{ListBuilder, RecordBatch, StringBuilder, new_null_array};
 use arrow::array::{ListArray, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow_flight::{FlightData, SchemaAsIpc, flight_service_server::FlightService};
@@ -445,24 +443,39 @@ fn get_primary_keys_from_constraints<'a>(
 }
 
 fn get_primary_keys_array(primary_keys: &[&str], row_count: usize) -> ListArray {
-    let mut list_builder_generic = make_builder(
-        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
-        row_count,
-    );
-    let list_builder = list_builder_generic
-        .as_any_mut()
-        .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
-        .unwrap_or_else(|| unreachable!("created above as a list builder"));
+    let mut list_builder = ListBuilder::new(StringBuilder::new()).with_field(Arc::new(
+        Field::new("item", DataType::Utf8, false),
+    ));
     for _ in 0..row_count {
-        let str_builder = list_builder
-            .values()
-            .as_any_mut()
-            .downcast_mut::<StringBuilder>()
-            .unwrap_or_else(|| unreachable!("created above as a string builder"));
         for key in primary_keys {
-            str_builder.append_value(key);
+            list_builder.values().append_value(key);
         }
         list_builder.append(true);
     }
     list_builder.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Array;
+
+    #[test]
+    fn test_get_primary_keys_array_repeats_keys_for_each_row() {
+        let primary_keys = get_primary_keys_array(&["tenant", "id"], 2);
+
+        assert_eq!(primary_keys.len(), 2);
+        assert_eq!(primary_keys.value_type(), DataType::Utf8);
+
+        for row_index in 0..primary_keys.len() {
+            let values = primary_keys.value(row_index);
+            let values = values
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("primary key list values should be strings");
+            assert_eq!(values.len(), 2);
+            assert_eq!(values.value(0), "tenant");
+            assert_eq!(values.value(1), "id");
+        }
+    }
 }
