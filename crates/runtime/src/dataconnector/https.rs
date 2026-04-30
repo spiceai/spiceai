@@ -182,6 +182,16 @@ impl Https {
     }
 }
 
+struct RequestFilterParams {
+    allow_query_filters: bool,
+    max_query_length: usize,
+    allow_body_filters: bool,
+    max_body_bytes: usize,
+    allow_header_filters: bool,
+    max_headers_length: usize,
+    request_header_allowlist: Vec<String>,
+}
+
 struct HttpProviderParams {
     file_format: String,
     acceleration_enabled: bool,
@@ -191,13 +201,7 @@ struct HttpProviderParams {
     retry_jitter: f64,
     custom_headers: HeaderMap,
     allowed_paths: Vec<String>,
-    allow_query_filters: bool,
-    max_query_length: usize,
-    allow_body_filters: bool,
-    max_body_bytes: usize,
-    allow_header_filters: bool,
-    max_headers_length: usize,
-    request_header_allowlist: Vec<String>,
+    request_filters: RequestFilterParams,
     max_request_partitions: Option<usize>,
     health_probe: Option<String>,
     pagination: Option<data_components::http::provider::PaginationConfig>,
@@ -454,13 +458,15 @@ impl Https {
             retry_jitter,
             custom_headers,
             allowed_paths,
-            allow_query_filters,
-            max_query_length,
-            allow_body_filters,
-            max_body_bytes,
-            allow_header_filters,
-            max_headers_length,
-            request_header_allowlist,
+            request_filters: RequestFilterParams {
+                allow_query_filters,
+                max_query_length,
+                allow_body_filters,
+                max_body_bytes,
+                allow_header_filters,
+                max_headers_length,
+                request_header_allowlist,
+            },
             max_request_partitions,
             health_probe,
             pagination,
@@ -751,6 +757,13 @@ impl Https {
             retry_jitter,
             custom_headers,
             allowed_paths,
+            request_filters,
+            max_request_partitions,
+            health_probe,
+            pagination,
+        } = self.resolve_http_provider_params(dataset);
+
+        let RequestFilterParams {
             allow_query_filters,
             max_query_length,
             allow_body_filters,
@@ -758,10 +771,7 @@ impl Https {
             allow_header_filters,
             max_headers_length,
             request_header_allowlist,
-            max_request_partitions,
-            health_probe,
-            pagination,
-        } = self.resolve_http_provider_params(dataset);
+        } = request_filters;
 
         let mut provider = data_components::http::provider::HttpTableProvider::new(
             base_url,
@@ -1391,12 +1401,12 @@ mod tests {
 
         let params = connector.resolve_http_provider_params(&dataset);
 
-        assert!(params.allow_header_filters);
+        assert!(params.request_filters.allow_header_filters);
         assert_eq!(
-            params.request_header_allowlist,
+            params.request_filters.request_header_allowlist,
             vec!["x-sandbox-id", "x-region"]
         );
-        assert_eq!(params.max_headers_length, 2048);
+        assert_eq!(params.request_filters.max_headers_length, 2048);
         assert_eq!(params.max_request_partitions, Some(7000));
     }
 
