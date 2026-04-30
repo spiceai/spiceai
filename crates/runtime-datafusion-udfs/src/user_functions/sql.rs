@@ -309,6 +309,7 @@ mod tests {
         Function {
             name: "f".into(),
             from: "sql".into(),
+            enabled: true,
             description: None,
             kind: FunctionKind::Scalar,
             volatility: Volatility::Immutable,

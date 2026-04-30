@@ -340,11 +340,8 @@ async fn require_read_write_api_key(
     let Some(principal) = runtime_auth::AuthRequestContext::auth_principal(context.as_ref()) else {
         return Ok(());
     };
-    if principal
-        .groups()
-        .iter()
-        .any(|group| *group == "write" || *group == "read_write")
-    {
+    let groups = principal.groups();
+    if groups.contains(&"write") || groups.contains(&"read_write") {
         return Ok(());
     }
     Err(DataFusionError::Execution(format!(
@@ -505,6 +502,7 @@ mod tests {
         Function {
             name: "remote_fn".into(),
             from: from.into(),
+            enabled: true,
             description: None,
             kind: FunctionKind::Scalar,
             volatility: Volatility::Volatile,

@@ -186,7 +186,12 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
 
     warn_alpha_once();
 
-    let (built, errors) = runtime_datafusion_udfs::user_functions::build_all(&app.functions);
+    let enabled_functions = enabled_function_declarations(&app.functions);
+    if enabled_functions.is_empty() {
+        return;
+    }
+
+    let (built, errors) = runtime_datafusion_udfs::user_functions::build_all(&enabled_functions);
     for err in &errors {
         tracing::error!("{err}");
     }
@@ -272,6 +277,16 @@ fn function_executes_code(decl: &spicepod::component::function::Function) -> boo
     matches!(scheme.as_str(), "http" | "https")
 }
 
+fn enabled_function_declarations(
+    functions: &[spicepod::component::function::Function],
+) -> Vec<spicepod::component::function::Function> {
+    functions
+        .iter()
+        .filter(|decl| decl.enabled)
+        .cloned()
+        .collect()
+}
+
 fn info_from_decl(decl: &spicepod::component::function::Function) -> UserFunctionInfo {
     use spicepod::component::function::{FunctionKind, Volatility};
     let kind = match decl.kind {
@@ -311,9 +326,10 @@ pub async fn apply_function_diff(
     // batch of tool drops.
     let mut tools_to_drop: Vec<String> = Vec::new();
     for current in &current_app.functions {
-        let needs_drop = current_enabled
+        let current_registered = current_enabled && current.enabled;
+        let needs_drop = current_registered
             && match new_app.functions.iter().find(|f| f.name == current.name) {
-                Some(next) => !new_enabled || next != current,
+                Some(next) => !new_enabled || !next.enabled || next != current,
                 None => true,
             };
         if needs_drop {
@@ -346,9 +362,12 @@ pub async fn apply_function_diff(
 
     // Build + register any new or changed declarations.
     for next in &new_app.functions {
+        if !next.enabled {
+            continue;
+        }
         let needs_register = !current_enabled
             || match current_app.functions.iter().find(|f| f.name == next.name) {
-                Some(prev) => prev != next,
+                Some(prev) => !prev.enabled || prev != next,
                 None => true,
             };
         if !needs_register {
@@ -556,6 +575,48 @@ mod tests {
         impl_: impl Into<datafusion::logical_expr::ScalarUDF>,
     ) -> Arc<datafusion::logical_expr::ScalarUDF> {
         Arc::new(impl_.into())
+    }
+
+    fn test_user_function(name: &str, enabled: bool) -> spicepod::component::function::Function {
+        use spicepod::component::function::{FunctionArg, FunctionKind, Signature, Volatility};
+
+        spicepod::component::function::Function {
+            name: name.to_string(),
+            from: "sql".to_string(),
+            enabled,
+            description: None,
+            kind: FunctionKind::Scalar,
+            volatility: Volatility::Immutable,
+            signature: Signature {
+                args: vec![FunctionArg {
+                    name: "x".to_string(),
+                    arrow_type: "int64".to_string(),
+                }],
+                returns: Some("int64".to_string()),
+                returns_schema: vec![],
+                null_aware: false,
+            },
+            body: Some("x".to_string()),
+            body_ref: None,
+            metadata: std::collections::HashMap::new(),
+            params: std::collections::HashMap::new(),
+            depends_on: vec![],
+            metrics: None,
+            as_tool: true,
+        }
+    }
+
+    #[test]
+    fn enabled_function_declarations_filters_disabled_functions() {
+        let functions = vec![
+            test_user_function("enabled_fn", true),
+            test_user_function("disabled_fn", false),
+        ];
+
+        let enabled = enabled_function_declarations(&functions);
+
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].name, "enabled_fn");
     }
 
     #[test]

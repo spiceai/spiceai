@@ -246,6 +246,7 @@ mod tests {
         Function {
             name: "f".into(),
             from: from.into(),
+            enabled: true,
             description: None,
             kind,
             volatility: spicepod::component::function::Volatility::Immutable,
@@ -381,6 +382,7 @@ mod tests {
         let decl = Function {
             name: "remote_double".into(),
             from: format!("http://{addr}/double"),
+            enabled: true,
             description: None,
             kind: FunctionKind::Scalar,
             volatility: Volatility::Volatile,

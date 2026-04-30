@@ -530,6 +530,9 @@
               "type": "null"
             }
           ]
+        },
+        "functions": {
+          "$ref": "#/$defs/Functions"
         }
       },
       "additionalProperties": false
@@ -1272,6 +1275,17 @@
         "discovery_timeout": {
           "type": "string",
           "default": "60s"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Functions": {
+      "description": "Controls registration and execution surfaces for Spicepod user-defined functions.\n\nDefaults to disabled. Operators must explicitly set\n`runtime.functions.enabled: true` before the runtime registers top-level\n`functions:` entries or exposes `tools:` entries as SQL functions via\n`as_sql: true`.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
@@ -3275,7 +3289,7 @@
           ]
         },
         "as_sql": {
-          "description": "Whether this tool is also callable as a SQL UDF. Defaults to\n`false`; set to `true` to also register a `DataFusion` `ScalarUDF`\nthat invokes this tool per-row.\n\nRequires [`Self::signature`] to be set with typed Arrow arg /\nreturn types — a tool's free-form JSON Schema does not uniquely\nmap to a SQL signature, so the author must pin types explicitly.",
+          "description": "Whether this tool is also callable as a SQL UDF. Defaults to\n`false`; set to `true` to also register a `DataFusion` `ScalarUDF`\nthat invokes this tool per-row.\n\nRequires [`Self::signature`] to be set with typed Arrow arg /\nreturn types — a tool's free-form JSON Schema does not uniquely\nmap to a SQL signature, so the author must pin types explicitly.\nAlso requires `runtime.functions.enabled: true`.",
           "type": "boolean",
           "default": false
         },
@@ -3472,7 +3486,7 @@
       ]
     },
     "Function": {
-      "description": "A user-defined SQL function registered into the `DataFusion` session context.\n\nFour kinds are defined:\n  * [`FunctionKind::Scalar`] — row-in, row-out (one result value per input row).\n  * [`FunctionKind::Aggregate`] — many-rows-in, one-value-out.\n  * [`FunctionKind::Window`] — row-in + frame, row-out.\n  * [`FunctionKind::Table`] — args-in, many-rows-out (UDTF).\n\nToday only [`FunctionKind::Scalar`] is wired end-to-end; the other kinds\nparse but are rejected at registration time until their factories ship.\n\nThe `from` field selects the execution tier:\n  * `sql` — inline SQL body (tier T0, in-process, no sandbox).\n  * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).\n  * `wasm:./path.wasm` | `wasm:oci://…` — WebAssembly component (tier T1, sandboxed, roadmap).\n  * `grpc://…` | `flight://…` — additional remote transports (roadmap).\n\nCurrently registered at runtime: `sql`, `http://…`, `https://…`. Other\nschemes are accepted by the parser (so forward-compatible spicepods\nload) but rejected at registration time with a clear error until their\nfactories ship.",
+      "description": "A user-defined SQL function registered into the `DataFusion` session context.\n\nFour kinds are defined:\n  * [`FunctionKind::Scalar`] — row-in, row-out (one result value per input row).\n  * [`FunctionKind::Aggregate`] — many-rows-in, one-value-out.\n  * [`FunctionKind::Window`] — row-in + frame, row-out.\n  * [`FunctionKind::Table`] — args-in, many-rows-out (UDTF).\n\nToday only [`FunctionKind::Scalar`] is wired end-to-end; the other kinds\nparse but are rejected at registration time until their factories ship.\n\nThe `from` field selects the execution tier:\n  * `sql` — inline SQL body (tier T0, in-process, no sandbox).\n  * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).\n  * `wasm:./path.wasm` | `wasm:oci://…` — WebAssembly component (tier T1, sandboxed, roadmap).\n  * `grpc://…` | `flight://…` — additional remote transports (roadmap).\n\nCurrently registered at runtime: `sql`, `http://…`, `https://…`. Other\nschemes are accepted by the parser (so forward-compatible spicepods\nload) but rejected at registration time with a clear error until their\nfactories ship.\n\nRegistration is disabled by default. Set `runtime.functions.enabled: true`\nin the spicepod to activate declared functions.",
       "type": "object",
       "properties": {
         "name": {

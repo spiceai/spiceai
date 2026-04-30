@@ -60,6 +60,14 @@ pub struct Function {
     /// `http://host/path`). See [`Function`] docs for the full scheme list.
     pub from: String,
 
+    /// Whether this function should be registered. Defaults to `true`.
+    ///
+    /// Set to `false` to keep the declaration in the spicepod without making
+    /// it callable through SQL, tool exposure, `list_udfs()`, or
+    /// `/v1/functions`.
+    #[serde(default = "crate::component::default_true")]
+    pub enabled: bool,
+
     /// Free-form description surfaced in `list_udfs()` and the
     /// `/v1/functions` HTTP endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,6 +222,7 @@ impl WithDependsOn<Function> for Function {
         Function {
             name: self.name.clone(),
             from: self.from.clone(),
+            enabled: self.enabled,
             description: self.description.clone(),
             kind: self.kind,
             volatility: self.volatility,
@@ -251,6 +260,7 @@ mod tests {
         let f: Function = yaml::from_str(src).expect("parses");
         assert_eq!(f.name, "haversine_km");
         assert_eq!(f.from, "sql");
+        assert!(f.enabled);
         assert_eq!(f.kind, FunctionKind::Scalar);
         assert_eq!(f.volatility, Volatility::Immutable);
         assert_eq!(f.signature.args.len(), 4);
@@ -290,8 +300,24 @@ mod tests {
         "#;
         let f: Function = yaml::from_str(src).expect("parses");
         assert_eq!(f.kind, FunctionKind::Scalar);
+        assert!(f.enabled);
         assert_eq!(f.volatility, Volatility::Volatile);
         assert!(!f.signature.null_aware);
+    }
+
+    #[test]
+    fn can_disable_function() {
+        let src = r#"
+            name: f
+            from: sql
+            enabled: false
+            signature:
+              args: []
+              returns: int64
+            body: "42"
+        "#;
+        let f: Function = yaml::from_str(src).expect("parses");
+        assert!(!f.enabled);
     }
 
     #[test]
@@ -312,6 +338,7 @@ mod tests {
         let f = Function {
             name: "f".into(),
             from: "sql".into(),
+            enabled: true,
             description: None,
             kind: FunctionKind::Scalar,
             volatility: Volatility::Immutable,
@@ -332,6 +359,7 @@ mod tests {
         let g = f.depends_on(&["b".into(), "c".into()]);
         assert_eq!(g.depends_on, vec!["b".to_string(), "c".to_string()]);
         assert_eq!(g.name, "f");
+        assert!(g.enabled);
     }
 
     #[test]
