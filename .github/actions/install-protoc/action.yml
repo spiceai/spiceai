@@ -18,6 +18,16 @@ runs:
       run: |
         set -euo pipefail
 
+        # Ensure jq is available
+        if ! command -v jq &>/dev/null; then
+          echo "jq not found, installing..."
+          if [ "$(uname -s)" = "Darwin" ]; then
+            brew install jq
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          fi
+        fi
+
         # Fetch release metadata
         if [ -z "${INPUT_VERSION}" ]; then
           RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest)
