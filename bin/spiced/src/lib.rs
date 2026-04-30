@@ -873,7 +873,7 @@ async fn start_anonymous_telemetry(
     // set once the app definition is fetched from the scheduler.
     let config = telemetry_config.wait().await;
 
-    if should_warn_spicepod_telemetry_disabled(telemetry_enabled, &config) {
+    if should_warn_spicepod_telemetry_disabled(telemetry_enabled, config) {
         tracing::warn!("{TELEMETRY_CANNOT_BE_DISABLED_MESSAGE}");
     }
 
@@ -896,7 +896,16 @@ fn should_warn_spicepod_telemetry_disabled(
     telemetry_enabled: Option<bool>,
     config: &TelemetryConfig,
 ) -> bool {
-    telemetry_enabled != Some(true) && !config.enabled
+    #[cfg(feature = "anonymous_telemetry")]
+    {
+        telemetry_enabled != Some(true) && !config.enabled
+    }
+
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    {
+        let _ = (telemetry_enabled, config);
+        false
+    }
 }
 
 fn parse_set_string(s: &str) -> Result<(String, String), String> {
@@ -1010,6 +1019,7 @@ fn apply_override(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "anonymous_telemetry")]
     #[test]
     fn warns_when_spicepod_disables_telemetry_without_cli_override() {
         let config = TelemetryConfig {
@@ -1018,6 +1028,17 @@ mod tests {
         };
 
         assert!(should_warn_spicepod_telemetry_disabled(None, &config));
+    }
+
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    #[test]
+    fn does_not_warn_when_anonymous_telemetry_is_not_compiled() {
+        let config = TelemetryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert!(!should_warn_spicepod_telemetry_disabled(None, &config));
     }
 
     #[test]
@@ -1040,6 +1061,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "anonymous_telemetry")]
     #[test]
     fn telemetry_disabled_message_mentions_enterprise() {
         assert!(TELEMETRY_CANNOT_BE_DISABLED_MESSAGE.contains("anonymous and aggregated"));
