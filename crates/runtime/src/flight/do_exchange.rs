@@ -36,7 +36,7 @@ use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-use super::{Service, metrics};
+use super::{Service, do_put::normalize_path_table_reference, metrics};
 
 const MAX_PENDING_INITIAL_SNAPSHOT_UPDATES: usize = 1_024;
 const MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BATCHES: usize = 128;
@@ -188,10 +188,12 @@ pub(crate) async fn handle(
         ));
     }
 
-    let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
-
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
+    let data_path = normalize_path_table_reference(
+        TableReference::parse_str(&flight_descriptor.path.join(".")),
+        &datafusion,
+    );
 
     let Some(table_provider) = datafusion.get_table(&data_path).await else {
         return Err(Status::invalid_argument(format!(

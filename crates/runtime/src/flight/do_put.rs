@@ -286,7 +286,10 @@ fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
         && datafusion.cluster_config.tls_config().is_some()
 }
 
-fn normalize_path_table_reference(path: TableReference, datafusion: &DataFusion) -> TableReference {
+pub(super) fn normalize_path_table_reference(
+    path: TableReference,
+    datafusion: &DataFusion,
+) -> TableReference {
     // NOTE: this uses synchronous `table_exist` checks on schema providers. These
     // checks are expected to be in-memory lookups in current catalog implementations.
     match path {
