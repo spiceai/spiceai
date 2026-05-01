@@ -1007,13 +1007,11 @@ jobs:
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
         run: |
-          CLICKHOUSE_VERSION="26.3.9.8-lts"
-          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}/clickhouse-linux-amd64" -o clickhouse-linux-amd64
-          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}/clickhouse-linux-amd64.sha512" -o clickhouse-linux-amd64.sha512
-          sha512sum -c clickhouse-linux-amd64.sha512
-          mv clickhouse-linux-amd64 clickhouse
-          chmod +x clickhouse
-          sudo ./clickhouse install
+          CLICKHOUSE_VERSION="26.3.9.8"
+          curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-server=${CLICKHOUSE_VERSION} clickhouse-client=${CLICKHOUSE_VERSION}
           sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
@@ -1024,12 +1022,11 @@ jobs:
         if: matrix.target.target_os == 'darwin'
         run: |
           CLICKHOUSE_VERSION="26.3.9.8-lts"
-          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
-          curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}/clickhouse-macos-aarch64.sha512" -o clickhouse-macos-aarch64.sha512
-          shasum -a 512 -c clickhouse-macos-aarch64.sha512
+          BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
+          curl -fsSL "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
           mv clickhouse-macos-aarch64 clickhouse
           chmod +x clickhouse
-          sudo ./clickhouse install
+          sudo ./clickhouse install --noninteractive
           sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
