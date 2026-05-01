@@ -114,7 +114,7 @@ impl SqlServerTableProvider {
         let table_schema = table.schema().unwrap_or("dbo");
 
         let columns_meta_query: String = format!(
-            "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS \
+            "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS \
             WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'"
         );
         tracing::debug!("Executing schema query for dataset {table_name}: {columns_meta_query}");
@@ -136,6 +136,7 @@ impl SqlServerTableProvider {
             let data_type: &str = row.get(1).context(SchemaRetrievalSnafu)?;
             let numeric_precision: Option<u8> = row.get(2);
             let numeric_scale: Option<i32> = row.get(3);
+            let is_nullable: &str = row.get(4).unwrap_or("YES");
 
             let Some(column_type) = map_type_name_to_column_type(data_type) else {
                 tracing::warn!(
@@ -150,7 +151,7 @@ impl SqlServerTableProvider {
                 numeric_scale.map(|v| i8::try_from(v).unwrap_or_default()),
             );
 
-            fields.push(Field::new(column_name, arrow_data_type, true));
+            fields.push(Field::new(column_name, arrow_data_type, is_nullable == "YES"));
         }
 
         if fields.is_empty() {
