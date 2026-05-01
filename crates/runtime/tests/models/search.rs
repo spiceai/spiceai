@@ -381,12 +381,21 @@ fn assert_search_response_structure(test_name: &str, resp: &Value) {
             "{test_name}: result[{i}] matches should contain 'answer'"
         );
 
-        // For additional_columns tests, verify extra fields in primary_key
+        // For additional_columns tests, verify 'question' appears in either primary_key
+        // (when question is a primary key column) or data (for s3_vectors and other backends
+        // that return additional columns separately).
         if test_name.contains("additional_columns") {
-            let pk = result.get("primary_key").and_then(|p| p.as_object());
+            let has_question_in_pk = result
+                .get("primary_key")
+                .and_then(|p| p.as_object())
+                .is_some_and(|p| p.contains_key("question"));
+            let has_question_in_data = result
+                .get("data")
+                .and_then(|d| d.as_object())
+                .is_some_and(|d| d.contains_key("question"));
             assert!(
-                pk.is_some_and(|p| p.contains_key("question")),
-                "{test_name}: result[{i}] primary_key should contain 'question' for additional_columns test"
+                has_question_in_pk || has_question_in_data,
+                "{test_name}: result[{i}] 'question' should appear in primary_key or data for additional_columns test"
             );
         }
     }
