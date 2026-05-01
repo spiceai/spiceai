@@ -148,11 +148,13 @@ pub const SPICE_SCP_SCHEMA: &str = "scp";
 
 const MAX_STREAMING_BROADCAST_BATCHES: usize = 128;
 const MAX_STREAMING_BROADCAST_ROWS: usize = 1_000_000;
+const MAX_STREAMING_BROADCAST_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Default)]
 struct StreamingBroadcastBuffer {
     batches: Vec<RecordBatch>,
     rows: usize,
+    bytes: usize,
     limit_exceeded: bool,
 }
 
@@ -164,16 +166,20 @@ impl StreamingBroadcastBuffer {
 
         let next_batches = self.batches.len().saturating_add(1);
         let next_rows = self.rows.saturating_add(batch.num_rows());
+        let next_bytes = self.bytes.saturating_add(batch.get_array_memory_size());
         if next_batches > MAX_STREAMING_BROADCAST_BATCHES
             || next_rows > MAX_STREAMING_BROADCAST_ROWS
+            || next_bytes > MAX_STREAMING_BROADCAST_BYTES
         {
             self.batches.clear();
             self.rows = 0;
+            self.bytes = 0;
             self.limit_exceeded = true;
             return true;
         }
 
         self.rows = next_rows;
+        self.bytes = next_bytes;
         self.batches.push(batch.clone());
         false
     }
@@ -1365,34 +1371,38 @@ impl DataFusion {
             UpdateType::Changes => InsertOp::Replace,
         };
 
-        let insert_data = Arc::clone(&update_data);
-        let insert_stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                Arc::clone(&update_schema),
-                Box::pin(futures::stream::iter((0..insert_data.len()).map(
-                    move |batch_index| Ok::<_, DataFusionError>(insert_data[batch_index].clone()),
-                ))),
-            ),
-        );
+        {
+            let insert_data = Arc::clone(&update_data);
+            let insert_stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    Arc::clone(&update_schema),
+                    Box::pin(futures::stream::iter((0..insert_data.len()).map(
+                        move |batch_index| {
+                            Ok::<_, DataFusionError>(insert_data[batch_index].clone())
+                        },
+                    ))),
+                ),
+            );
 
-        let insert_plan = table_provider
-            .insert_into(
-                &self.ctx.state(),
-                Arc::new(StreamingDataUpdateExecutionPlan::new(insert_stream)),
-                overwrite,
-            )
-            .await
-            .map_err(find_datafusion_root)
-            .context(UnableToPlanTableInsertSnafu {
-                table_name: table_reference.to_string(),
-            })?;
+            let insert_plan = table_provider
+                .insert_into(
+                    &self.ctx.state(),
+                    Arc::new(StreamingDataUpdateExecutionPlan::new(insert_stream)),
+                    overwrite,
+                )
+                .await
+                .map_err(find_datafusion_root)
+                .context(UnableToPlanTableInsertSnafu {
+                    table_name: table_reference.to_string(),
+                })?;
 
-        let _ = collect(insert_plan, self.ctx.task_ctx())
-            .await
-            .map_err(find_datafusion_root)
-            .context(UnableToExecuteTableInsertSnafu {
-                table_name: table_reference.to_string(),
-            })?;
+            let _ = collect(insert_plan, self.ctx.task_ctx())
+                .await
+                .map_err(find_datafusion_root)
+                .context(UnableToExecuteTableInsertSnafu {
+                    table_name: table_reference.to_string(),
+                })?;
+        }
 
         // Invalidate cached query state for this table.
         // Both results and logical plans can become stale after a write:
@@ -1544,6 +1554,7 @@ impl DataFusion {
                     dataset = %table_reference,
                     max_batches = MAX_STREAMING_BROADCAST_BATCHES,
                     max_rows = MAX_STREAMING_BROADCAST_ROWS,
+                    max_bytes = MAX_STREAMING_BROADCAST_BYTES,
                     "Skipped publishing streaming data update to DoExchange subscribers because the buffered update exceeded limits; subscribers can reconnect to receive a fresh snapshot"
                 );
             }
@@ -3516,6 +3527,7 @@ mod tests {
         let batches = buffer.batches().expect("buffer should be publishable");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(buffer.bytes, batches[0].get_array_memory_size());
     }
 
     #[test]

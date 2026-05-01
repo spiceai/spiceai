@@ -227,11 +227,8 @@ impl RefreshTask {
             );
         }
 
-        if let Some(delete_row_indices) =
-            upsert_pre_delete_rows(change_batch, row_indices, dataset_name)?
-        {
-            self.process_delete_batch(change_batch, &delete_row_indices)
-                .await?;
+        if upsert_pre_delete_rows(change_batch, row_indices, dataset_name)? {
+            self.process_delete_batch(change_batch, row_indices).await?;
         }
 
         let indices_array = UInt32Array::from(
@@ -357,9 +354,9 @@ fn upsert_pre_delete_rows(
     change_batch: &ChangeBatch,
     row_indices: &[usize],
     dataset_name: &TableReference,
-) -> crate::accelerated_table::Result<Option<Vec<usize>>> {
+) -> crate::accelerated_table::Result<bool> {
     let Some(first_row_idx) = row_indices.first() else {
-        return Ok(None);
+        return Ok(false);
     };
 
     let expected_primary_keys = change_batch.primary_keys(*first_row_idx);
@@ -385,7 +382,7 @@ fn upsert_pre_delete_rows(
         }
     );
 
-    Ok(Some(row_indices.to_vec()))
+    Ok(true)
 }
 
 pub(crate) fn get_primary_key_value(
@@ -1096,11 +1093,10 @@ mod tests {
         );
 
         let dataset_name = TableReference::bare("test_dataset");
-        let delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], &dataset_name)
-            .expect("matching primary keys should be valid")
-            .expect("non-empty row indices should return delete rows");
+        let should_delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], &dataset_name)
+            .expect("matching primary keys should be valid");
 
-        assert_eq!(delete_rows, vec![0, 1, 2]);
+        assert!(should_delete_rows);
     }
 
     #[test]
