@@ -1007,13 +1007,11 @@ jobs:
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
         run: |
-          CLICKHOUSE_VERSION="26.3.9.8-lts"
-          CLICKHOUSE_VER_NUM="${CLICKHOUSE_VERSION%-lts}"
-          BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
-          curl -fsSL "${BASE_URL}/clickhouse-common-static_${CLICKHOUSE_VER_NUM}_amd64.deb" -o clickhouse-common-static.deb
-          curl -fsSL "${BASE_URL}/clickhouse-server_${CLICKHOUSE_VER_NUM}_amd64.deb" -o clickhouse-server.deb
-          curl -fsSL "${BASE_URL}/clickhouse-client_${CLICKHOUSE_VER_NUM}_amd64.deb" -o clickhouse-client.deb
-          sudo DEBIAN_FRONTEND=noninteractive dpkg -i clickhouse-common-static.deb clickhouse-server.deb clickhouse-client.deb
+          CLICKHOUSE_VERSION="26.3.9.8"
+          curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-server=${CLICKHOUSE_VERSION} clickhouse-client=${CLICKHOUSE_VERSION}
           sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
