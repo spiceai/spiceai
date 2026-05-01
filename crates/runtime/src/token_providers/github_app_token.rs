@@ -44,6 +44,10 @@ static JWT_CRYPTO_INIT: OnceLock<()> = OnceLock::new();
 
 fn ensure_jwt_crypto_provider() {
     JWT_CRYPTO_INIT.get_or_init(|| {
+        // install_default() returns Err only if a provider is already installed by another caller
+        // (e.g. a test harness). That is not an error — any installed provider is acceptable here.
+        // The only real failure mode (aws_lc_rs feature missing) is a compile error: the symbol
+        // jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER would not exist.
         let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
     });
 }
