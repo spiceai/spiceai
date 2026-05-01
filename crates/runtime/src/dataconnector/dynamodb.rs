@@ -33,6 +33,7 @@ use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 use data_components::dynamodb::{Error, JsonNesting};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
@@ -427,6 +428,7 @@ impl DataConnector for DynamoDB {
         dataset: &Dataset,
         accelerated_table_provider: Arc<dyn TableProvider>,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
 
@@ -484,6 +486,9 @@ impl DataConnector for DynamoDB {
                         checkpoint,
                         acceptable_lag,
                         dataset_name,
+                        accelerated_table_provider,
+                        accelerator_write_mutex,
+                        cpu_runtime,
                     )
                     .await
                 } else {
@@ -580,101 +585,196 @@ async fn get_latest_checkpoint(
     }
 }
 
-/// Creates a bootstrap stream that initializes the table from a full scan,
-/// then transitions to the changes stream from the checkpoint.
+/// Initializes the accelerator from a full DynamoDB table scan, then transitions to
+/// the changes stream from the checkpoint captured before the scan started.
+#[expect(clippy::too_many_arguments)]
 async fn create_bootstrap_stream(
     dynamodb: Arc<DynamoDBTableProvider>,
     dynamodb_sys: Arc<Option<DynamoDBSys>>,
     checkpoint: Checkpoint,
     acceptable_lag: Duration,
     dataset_name: TableReference,
+    accelerated_table_provider: Arc<dyn TableProvider>,
+    accelerator_write_mutex: Arc<Mutex<()>>,
+    cpu_runtime: Option<tokio::runtime::Handle>,
 ) -> Option<ChangesStream> {
+    use crate::datafusion::managed_runtime;
+    use runtime_request_context::{AsyncMarker, RequestContext};
+
     tracing::info!(
         dataset = %dataset_name,
         "No existing lag found for DynamoDB Streams table, starting initialization"
     );
 
-    let dataset_name_for_bootstrap = dataset_name.clone();
-    let dataset_name_for_complete = dataset_name.clone();
-    let dataset_name_for_changes = dataset_name.clone();
+    // Run the DynamoDB scan on the CPU runtime (same as full refresh) when available so that
+    // scan tasks are isolated from the main async runtime and can pre-fill the channel buffer
+    // while the accelerator write is in progress on the main runtime.
+    let data_stream = if let Some(cpu_runtime) = cpu_runtime {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        let span = tracing::Span::current();
+        let dynamodb_for_scan = Arc::clone(&dynamodb);
+        let dataset_name_for_scan = dataset_name.clone();
 
-    // Counter to track total records across batches
-    let total_records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    // Initialize bootstrap stream
-    let bootstrap_stream = Arc::clone(&dynamodb)
-        .bootstrap_stream()
-        .await
-        .ok()?
-        .map(move |msg| {
-            let total_records = Arc::clone(&total_records);
-            let dataset_name_for_bootstrap = dataset_name_for_bootstrap.clone();
-            msg.map(move |change_batch| {
-                let batch_records = change_batch.record.num_rows();
-                let total = total_records
-                    .fetch_add(batch_records, std::sync::atomic::Ordering::Relaxed)
-                    + batch_records;
-                tracing::info!(
-                    dataset = %dataset_name_for_bootstrap,
-                    total_records = total,
-                    "Initializing DynamoDB Streams table"
-                );
-                // Bootstrap stream doesn't commit changes and doesn't mark dataset as ready
-                ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false)
-            })
-        });
-
-    let checkpoint_cloned = checkpoint.clone();
-    let dynamodb_sys_cloned = Arc::clone(&dynamodb_sys);
-
-    // Attach changes stream from initial checkpoint to bootstrap stream
-    Some(
-        bootstrap_stream
-            .chain(
-                stream::once(async move {
-                    tracing::info!(
-                        dataset = %dataset_name_for_complete,
-                        ready_lag = %humantime::format_duration(acceptable_lag),
-                        "DynamoDB Streams table initialization complete, starting to process changes from the Stream. Table will be marked as Ready once lag threshold is reached"
+        match managed_runtime::run_record_batch_stream_on_runtime(
+            cpu_runtime,
+            request_context,
+            span,
+            async move {
+                let ctx = SessionContext::new();
+                let df = ctx
+                    .read_table(Arc::clone(&dynamodb_for_scan) as Arc<dyn TableProvider>)
+                    .map_err(|e| {
+                        tracing::error!(
+                            dataset = %dataset_name_for_scan,
+                            error = ?e,
+                            "Failed to create DataFrame for initialization"
+                        );
+                        e
+                    })?;
+                let stream = df.execute_stream().await.map_err(|e| {
+                    tracing::error!(
+                        dataset = %dataset_name_for_scan,
+                        error = ?e,
+                        "Failed to execute stream for initialization"
                     );
+                    e
+                })?;
+                Ok::<_, datafusion::error::DataFusionError>(((), stream))
+            },
+        )
+        .await
+        {
+            Ok(managed) => {
+                let ((), stream) = managed.into_parts();
+                stream
+            }
+            Err(e) => {
+                tracing::error!(
+                    dataset = %dataset_name,
+                    error = ?e,
+                    "Failed to start initialization scan on CPU runtime"
+                );
+                return None;
+            }
+        }
+    } else {
+        // Fallback: run scan on the current async runtime.
+        let ctx = SessionContext::new();
+        let df = match ctx.read_table(Arc::clone(&dynamodb) as Arc<dyn TableProvider>) {
+            Ok(df) => df,
+            Err(e) => {
+                tracing::error!(
+                    dataset = %dataset_name,
+                    error = ?e,
+                    "Failed to create DataFrame for initialization"
+                );
+                return None;
+            }
+        };
+        match df.execute_stream().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::error!(
+                    dataset = %dataset_name,
+                    error = ?e,
+                    "Failed to execute stream for initialization"
+                );
+                return None;
+            }
+        }
+    };
 
-                    let committer =
-                        DynamoDBStreamCommitter::new(dynamodb_sys_cloned, checkpoint_cloned);
-                    if let Err(err) = committer.commit().await {
-                        tracing::error!(error = ?err, "Failed to commit initialization lag");
-                    }
+    // Accumulate small scan batches into larger write batches and log progress every 10s,
+    // matching the format used by full refresh (DataLoadTracing).
+    let dataset_name_for_log = dataset_name.clone();
+    let schema = data_stream.schema();
 
-                    stream::empty()
-                })
-                .flatten(),
-            )
-            .chain(
-                stream::once(async move {
-                    match changes_stream_from_checkpoint(
-                        Arc::clone(&dynamodb),
-                        Arc::clone(&dynamodb_sys),
-                        checkpoint,
-                        acceptable_lag,
-                        dataset_name_for_changes.clone(),
-                    )
-                    .await
-                    {
-                        Ok(stream) => Some(stream),
-                        Err(e) => {
-                            tracing::error!(
-                                dataset = %dataset_name_for_changes,
-                                error = %e,
-                                "Failed to start changes stream after initialization"
-                            );
-                            None
-                        }
-                    }
-                })
-                .filter_map(|opt| async move { opt })
-                .flatten(),
-            )
-            .boxed(),
+    let mut num_records: usize = 0;
+    let mut bytes_received: usize = 0;
+    let start_time = std::time::Instant::now();
+    let mut last_log_time = start_time;
+    let log_interval = std::time::Duration::from_secs(10);
+
+    let counted_stream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        data_stream.map(move |batch_result| {
+            batch_result.map(|batch| {
+                num_records += batch.num_rows();
+                bytes_received += batch.get_array_memory_size();
+
+                if last_log_time.elapsed() > log_interval {
+                    let pretty_records = util::pretty_print_number(num_records);
+                    let elapsed = start_time.elapsed();
+                    let elapsed_secs = elapsed.as_secs_f64();
+                    #[expect(clippy::cast_precision_loss)]
+                    #[expect(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_sign_loss)]
+                    let throughput = if elapsed_secs > 0.0 {
+                        let bytes_per_sec = (bytes_received as f64 / elapsed_secs) as usize;
+                        format!("{}/s", util::human_readable_bytes(bytes_per_sec))
+                    } else {
+                        "calculating...".to_string()
+                    };
+                    let size = util::human_readable_bytes(bytes_received);
+                    let elapsed_str = format!("{}s", elapsed.as_secs());
+                    tracing::info!(
+                        "Dataset {} received {pretty_records} records ({size} uncompressed) in {elapsed_str}, {throughput}",
+                        dataset_name_for_log
+                    );
+                    last_log_time = std::time::Instant::now();
+                }
+                batch
+            })
+        }),
+    ));
+
+    let table_sink = TableSink::new(accelerated_table_provider);
+    let _guard = accelerator_write_mutex.lock().await;
+    if let Err(e) = table_sink
+        .insert_into(counted_stream, InsertOp::Overwrite)
+        .await
+    {
+        tracing::error!(
+            dataset = %dataset_name,
+            error = ?e,
+            "Failed to write initialization data"
+        );
+        return None;
+    }
+    drop(_guard);
+
+    tracing::info!(
+        dataset = %dataset_name,
+        ready_lag = %humantime::format_duration(acceptable_lag),
+        "DynamoDB Streams table initialization complete, starting to process changes from the Stream. Table will be marked as Ready once lag threshold is reached"
+    );
+
+    // Commit the checkpoint that was captured before the scan started.
+    let committer = DynamoDBStreamCommitter::new(Arc::clone(&dynamodb_sys), checkpoint.clone());
+    if let Err(e) = committer.commit().await {
+        tracing::error!(error = ?e, "Failed to commit initialization checkpoint");
+    }
+
+    // Transition to the changes stream from the pre-scan checkpoint.
+    match changes_stream_from_checkpoint(
+        dynamodb,
+        dynamodb_sys,
+        checkpoint,
+        acceptable_lag,
+        dataset_name.clone(),
     )
+    .await
+    {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            tracing::error!(
+                dataset = %dataset_name,
+                error = %e,
+                "Failed to start changes stream after initialization"
+            );
+            None
+        }
+    }
 }
 
 /// Resumes streaming from an existing checkpoint, handling shard expiration scenarios.

@@ -261,6 +261,7 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
         accelerated_table_provider: Arc<dyn TableProvider>,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
         if let Some(indexed_table) = table_provider
@@ -276,6 +277,7 @@ impl DataConnector for EmbeddingConnector {
                     dataset,
                     accelerated_table_provider,
                     accelerator_write_mutex,
+                    cpu_runtime,
                 );
             };
 
@@ -299,6 +301,7 @@ impl DataConnector for EmbeddingConnector {
                     dataset,
                     accelerated_table_provider,
                     accelerator_write_mutex,
+                    cpu_runtime,
                 )?
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
@@ -317,6 +320,7 @@ impl DataConnector for EmbeddingConnector {
                 dataset,
                 accelerated_table_provider,
                 accelerator_write_mutex,
+                cpu_runtime,
             )
         } else if let Some(embedding_table) =
             table_provider.as_any().downcast_ref::<EmbeddingTable>()
@@ -332,6 +336,7 @@ impl DataConnector for EmbeddingConnector {
                         dataset,
                         accelerated_table_provider,
                         accelerator_write_mutex,
+                        cpu_runtime,
                     )?
                     .then(move |item| {
                         Self::embed_change_envelope(item, Arc::clone(&embedding_table))
