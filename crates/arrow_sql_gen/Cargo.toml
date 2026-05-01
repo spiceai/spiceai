@@ -3,8 +3,8 @@ edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
-publish.workspace = true
 name = "arrow_sql_gen"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -16,9 +16,9 @@ arrow.workspace = true
 bigdecimal.workspace = true
 chrono.workspace = true
 chrono-tz = "0.8.6"
+clickhouse-rs = { workspace = true, optional = true }
 datafusion-table-providers.workspace = true
 snafu.workspace = true
-clickhouse-rs = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [features]
