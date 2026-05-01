@@ -2,7 +2,7 @@
 description = "The spiced runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "runtime"
 repository.workspace = true
 rust-version.workspace = true
@@ -339,7 +339,7 @@ postgres = [
     "datafusion-table-providers/postgres",
 ]
 postgres-accel = ["postgres"]
-postgres-write = []
+
 s3_vectors = [
     "data_components/s3_vectors",
     "dep:s3_vectors",

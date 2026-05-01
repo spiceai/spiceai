@@ -2,7 +2,7 @@
 description = "Spice OSS"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "spiced"
 repository.workspace = true
 rust-version.workspace = true
@@ -139,7 +139,7 @@ oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]
 postgres-accel = ["runtime/postgres-accel"]
-postgres-write = ["runtime/postgres-write"]
+
 release = []
 scylladb = ["connector-scylladb", "runtime/scylladb"]
 sftp = ["connector-sftp", "runtime/sftp"]

@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "tpc-extension"
 repository.workspace = true
 rust-version.workspace = true
