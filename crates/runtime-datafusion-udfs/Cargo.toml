@@ -3,8 +3,8 @@ edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
-publish.workspace = true
 name = "runtime-datafusion-udfs"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -21,8 +21,8 @@ futures.workspace = true
 llms = { path = "../llms", default-features = false, optional = true }
 opentelemetry.workspace = true
 reqwest.workspace = true
-runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-auth = { path = "../runtime-auth" }
+runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
