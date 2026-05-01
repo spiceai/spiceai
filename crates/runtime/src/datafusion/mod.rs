@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -60,6 +60,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_tools::schema::verify_schema;
+use async_trait::async_trait;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -76,7 +77,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
-use datafusion::sql::parser::DFParser;
+use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
@@ -581,6 +582,15 @@ struct DeferredTableRegistration {
     connector: Arc<dyn DataConnector>,
 }
 
+#[async_trait]
+pub trait OnDemandTableLoader: Send + Sync {
+    async fn has_on_demand_tables(&self) -> bool;
+    async fn load_on_demand_tables(
+        &self,
+        table_references: Vec<TableReference>,
+    ) -> std::result::Result<(), DataFusionError>;
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -599,6 +609,7 @@ pub struct DataFusion {
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
+    on_demand_table_loader: RwLock<Option<Weak<dyn OnDemandTableLoader>>>,
 
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -673,6 +684,19 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    pub fn set_on_demand_table_loader(&self, loader: Weak<dyn OnDemandTableLoader>) {
+        if let Ok(mut on_demand_table_loader) = self.on_demand_table_loader.write() {
+            *on_demand_table_loader = Some(loader);
+        }
+    }
+
+    fn on_demand_table_loader(&self) -> Option<Arc<dyn OnDemandTableLoader>> {
+        self.on_demand_table_loader
+            .read()
+            .ok()
+            .and_then(|loader| loader.as_ref().and_then(Weak::upgrade))
     }
 
     pub async fn get_table(
@@ -1168,6 +1192,33 @@ impl DataFusion {
             })?;
 
         Ok(table_provider)
+    }
+
+    async fn load_on_demand_tables_for_statement(
+        &self,
+        session: &SessionState,
+        statement: &Statement,
+    ) -> Result<(), DataFusionError> {
+        let Some(loader) = self.on_demand_table_loader() else {
+            return Ok(());
+        };
+        if !loader.has_on_demand_tables().await {
+            return Ok(());
+        }
+        let table_refs = session.resolve_table_references(statement)?;
+        loader.load_on_demand_tables(table_refs).await
+    }
+
+    pub async fn load_on_demand_dataset(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<(), DataFusionError> {
+        let Some(loader) = self.on_demand_table_loader() else {
+            return Err(DataFusionError::Execution(format!(
+                "Cannot load on-demand dataset {table_reference}: on-demand loader is not initialized yet"
+            )));
+        };
+        loader.load_on_demand_tables(vec![table_reference]).await
     }
 
     pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
@@ -2941,6 +2992,11 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
+        let dialect = session.config().options().sql_parser.dialect;
+        let statement = session.sql_to_statement(sql, &dialect)?;
+        self.load_on_demand_tables_for_statement(session, &statement)
+            .await?;
+
         let ctx = planner::PlannerContext {
             catalog_mode: if self.has_cayenne_catalog() {
                 planner::CatalogMode::Cayenne
@@ -2954,7 +3010,7 @@ impl DataFusion {
             io_runtime: self.io_runtime.clone(),
         };
 
-        planner::create_logical_plan(sql, session, &ctx).await
+        planner::create_logical_plan_from_statement(sql, statement, session, &ctx).await
     }
 
     /// On Windows the `planner` module is not available, so delegate
@@ -2965,7 +3021,11 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        session.create_logical_plan(sql).await
+        let dialect = session.config().options().sql_parser.dialect;
+        let statement = session.sql_to_statement(sql, &dialect)?;
+        self.load_on_demand_tables_for_statement(session, &statement)
+            .await?;
+        session.statement_to_plan(statement).await
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
@@ -3559,6 +3619,7 @@ mod tests {
                 runtime: Arc::new(runtime),
                 vectors: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
+                load: crate::component::dataset::Load::OnStartup,
             }
         }
 

@@ -528,6 +528,7 @@ impl DataFusionBuilder {
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
+            on_demand_table_loader: RwLock::new(None),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
