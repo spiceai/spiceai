@@ -532,6 +532,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         _dataset: &Dataset,
         _accelerated_table_provider: Arc<dyn TableProvider>,
         _accelerator_write_mutex: Arc<Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         None
     }

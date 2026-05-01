@@ -155,6 +155,7 @@ impl DataConnector for FullTextConnector {
         dataset: &Dataset,
         accelerated_table_provider: Arc<dyn TableProvider>,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
             inner.changes_stream(
@@ -162,6 +163,7 @@ impl DataConnector for FullTextConnector {
                 dataset,
                 Arc::clone(&accelerated_table_provider),
                 Arc::clone(&accelerator_write_mutex),
+                cpu_runtime.clone(),
             )
         })
     }
