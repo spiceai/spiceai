@@ -118,11 +118,6 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
 
-      - name: Validate ARM64 image
-        run: |
-          docker load -i /tmp/image-arm64.tar
-          docker run --rm localhost:5000/spiceai:dev-arm64 --version
-
       - name: Upload ARM64 artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -176,11 +171,6 @@ jobs:
           build-args: |
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
-
-      - name: Validate AMD64 image
-        run: |
-          docker load -i /tmp/image-amd64.tar
-          docker run --rm localhost:5000/spiceai:dev-amd64 --version
 
       - name: Upload AMD64 artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

@@ -3,8 +3,8 @@ description = "The spiced runtime"
 edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
-name = "runtime"
 publish.workspace = true
+name = "runtime"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -36,7 +36,6 @@ ballista-core = { workspace = true }
 ballista-executor = { workspace = true }
 ballista-scheduler = { workspace = true }
 base64.workspace = true
-blake3 = { workspace = true, optional = true }
 byte-unit.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
@@ -49,11 +48,11 @@ data_components = { path = "../data_components", features = ["flightsql"] }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
-datafusion-ddl = { path = "../datafusion-ddl" }
-datafusion-dml = { path = "../datafusion-dml" }
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
+datafusion-ddl = { path = "../datafusion-ddl" }
+datafusion-dml = { path = "../datafusion-dml" }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true }
 datafusion-spark.workspace = true
@@ -65,9 +64,7 @@ duckdb = { workspace = true, features = [
     "r2d2",
     "extensions-full",
 ], optional = true }
-duration-parse = { workspace = true, optional = true }
 dynamodb-streams = { path = "../dynamodb-streams", optional = true }
-elasticsearch = { path = "../elasticsearch", optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
@@ -88,6 +85,7 @@ iceberg-datafusion.workspace = true
 iceberg-storage-opendal.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
+opendal.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
@@ -99,7 +97,6 @@ notify = "8.2.0"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
 object_store_occ = { path = "../object_store_occ" }
-opendal.workspace = true
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
@@ -148,6 +145,8 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
+elasticsearch = { path = "../elasticsearch", optional = true }
+duration-parse = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
@@ -158,6 +157,7 @@ search = { path = "../search", default-features = false, features = [
 ], optional = false }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
+blake3 = { workspace = true, optional = true }
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 snafu.workspace = true
@@ -230,6 +230,7 @@ connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
+tokio-postgres = { workspace = true }
 connector-sftp = { path = "../data-connectors/connector-sftp" }
 connector-sharepoint = { path = "../data-connectors/connector-sharepoint" }
 connector-smb = { path = "../data-connectors/connector-smb" }
@@ -247,7 +248,6 @@ pem.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"] }
 repl = { path = "../repl" }
 rstest = "0.26.1"
-rusqlite = { workspace = true }
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
@@ -257,22 +257,16 @@ tempfile.workspace = true
 test-framework = { path = "../test-framework" }
 tiberius.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
-tokio-postgres = { workspace = true }
+rusqlite = { workspace = true }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 
 [features]
-adbc = [
-    "dep:adbc_core",
-    "dep:adbc_driver_manager",
-    "dep:blake3",
-    "dep:sha2",
-    "data_components/adbc",
-    "datafusion-table-providers/adbc-federation",
-]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "dep:sha2", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 azure-keyvault = ["runtime-secrets/azure-keyvault"]
+hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
 bedrock = []
 clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
 cosmosdb = ["data_components/cosmosdb"]
@@ -290,6 +284,12 @@ default = [
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
+elasticsearch = [
+    "data_components/elasticsearch",
+    "dep:elasticsearch",
+    "dep:duration-parse",
+    "search/elasticsearch",
+]
 duckdb = [
     "dep:duckdb",
     "db_connection_pool/duckdb",
@@ -304,16 +304,9 @@ dynamodb = [
     "dep:dynamodb-streams",
     "dep:humantime",
 ]
-elasticsearch = [
-    "data_components/elasticsearch",
-    "dep:elasticsearch",
-    "dep:duration-parse",
-    "search/elasticsearch",
-]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
-hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
 iceberg-write = []
 imap = ["data_components/imap"]
 kafka = ["data_components/kafka"]
@@ -382,10 +375,7 @@ turso = [
 ]
 vortex = ["ballista-core/vortex", "ballista-executor/vortex"]
 [target.'cfg(not(windows))'.dependencies]
-cayenne = { path = "../cayenne", features = [
-    "turso",
-    "partition-table-provider",
-] }
+cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
 vortex.workspace = true
 vortex-datafusion.workspace = true
 

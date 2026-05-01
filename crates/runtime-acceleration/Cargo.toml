@@ -3,8 +3,8 @@ description = "Acceleration support for the Spice runtime"
 edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
-name = "runtime-acceleration"
 publish.workspace = true
+name = "runtime-acceleration"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -27,8 +27,9 @@ fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
 opentelemetry.workspace = true
-runtime-object-store = { path = "../runtime-object-store" }
+telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
+runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
 serde.workspace = true
 serde_json.workspace = true
@@ -36,7 +37,6 @@ sha2.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tar = "0.4"
-telemetry = { path = "../telemetry" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true

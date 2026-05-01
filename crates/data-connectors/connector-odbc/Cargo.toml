@@ -15,18 +15,18 @@
 ##
 
 [package]
-description = "ODBC data connector for Spice.ai runtime"
-edition.workspace = true
-license-file.workspace = true
 name = "connector-odbc"
-publish.workspace = true
-rust-version.workspace = true
+edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "ODBC data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
-data_components = { path = "../../data_components", features = ["odbc"] }
 datafusion.workspace = true
+data_components = { path = "../../data_components", features = ["odbc"] }
 db_connection_pool = { path = "../../db_connection_pool", features = ["odbc"] }
 linkme.workspace = true
 paste.workspace = true

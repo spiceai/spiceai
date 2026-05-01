@@ -1,7 +1,7 @@
 #syntax=docker/dockerfile:1.2
 ARG RUST_VERSION=1.94.1
 
-FROM nvidia/cuda:12.6.0-cudnn-devel-ubuntu24.04 AS build
+FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04 AS build
 
 # cache mounts below may already exist and owned by root
 USER root
@@ -47,7 +47,7 @@ RUN \
     cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default} && \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
-FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu24.04 AS runtime
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04 AS runtime
 ENV CUDA_NVCC_FLAGS=-fPIE
 ARG CARGO_FEATURES
 
@@ -55,7 +55,7 @@ ARG CARGO_FEATURES
 RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
 
 RUN apt update \
-    && apt install --yes ca-certificates libssl3 tzdata cuda-compat-12-6 --no-install-recommends \
+    && apt install --yes ca-certificates libssl3 tzdata --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
@@ -65,8 +65,6 @@ RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     fi
 
 COPY --from=build /root/spiced /usr/local/bin/spiced
-
-ENV LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 
