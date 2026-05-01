@@ -138,7 +138,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
-type PartitionSpec = (
+pub type PartitionSpec = (
     Option<String>,
     Option<String>,
     Option<String>,
@@ -598,6 +598,11 @@ impl HttpTableProvider {
             max_length.min(DEFAULT_MAX_HEADERS_LENGTH * 4);
         self.request_filter_options.allowed_headers = allowed_headers;
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.max_request_partitions
     }
 
     #[must_use]
@@ -1415,9 +1420,42 @@ pub struct HttpExec {
     partitions: Vec<PartitionSpec>,
     limit: Option<usize>,
     properties: PlanProperties,
+    /// When `true`, the partitions are a template that will be expanded
+    /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
+    deferred_partitions: bool,
 }
 
 impl HttpExec {
+    /// Returns the provider used by this exec.
+    #[must_use]
+    pub fn provider(&self) -> &Arc<HttpTableProvider> {
+        &self.provider
+    }
+
+    /// Returns the maximum number of request partitions allowed, if configured.
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.provider.max_request_partitions()
+    }
+
+    /// Returns the partition specs.
+    #[must_use]
+    pub fn partitions(&self) -> &[PartitionSpec] {
+        &self.partitions
+    }
+
+    /// Returns the limit.
+    #[must_use]
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Returns the projected schema.
+    #[must_use]
+    pub fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
     #[must_use]
     pub fn new(
         projected_schema: SchemaRef,
@@ -1437,7 +1475,16 @@ impl HttpExec {
             partitions,
             limit,
             properties,
+            deferred_partitions: false,
         }
+    }
+
+    /// Mark this `HttpExec` as having dynamic partitions that will be
+    /// expanded at runtime. Affects EXPLAIN display only.
+    #[must_use]
+    pub fn with_deferred_partitions(mut self) -> Self {
+        self.deferred_partitions = true;
+        self
     }
 
     async fn fetch_and_create_batch(
@@ -1737,9 +1784,15 @@ impl DisplayAs for HttpExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "HttpExec: base_url={}, format={}, partitions=[",
+            "HttpExec: base_url={}, format={}, ",
             self.provider.base_url, self.provider.file_format
         )?;
+
+        if self.deferred_partitions {
+            return write!(f, "partitions=deferred");
+        }
+
+        write!(f, "partitions=[")?;
 
         for (i, (path, query, body, request_headers)) in self.partitions.iter().enumerate() {
             if i > 0 {
