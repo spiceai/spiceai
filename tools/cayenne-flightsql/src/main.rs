@@ -17,14 +17,95 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::Duration;
 
-use cayenne::{CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider};
+use arrow::array::RecordBatch;
+use async_trait::async_trait;
+use cayenne::ddl::plan_local_merge;
+use cayenne::{
+    CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
+};
 use clap::Parser;
 use data_components::RefreshableCatalogProvider as _;
 use datafusion::catalog::{CatalogProvider as _, SchemaProvider};
+use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner};
+use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_flightsql::FlightSqlService;
+use datafusion_ddl::{DdlAnalyzerRule, DdlExtensionPlanner, new_shared_store};
+use datafusion_dml::DmlExtensionPlanner;
+use datafusion_flightsql::{FlightSqlService, SqlStatementExecutor};
 use snafu::prelude::*;
 use tonic::transport::Server;
+
+// ── Extension planner wrapper ─────────────────────────────────────────────────
+
+/// [`QueryPlanner`] that delegates to a [`DefaultPhysicalPlanner`] pre-loaded
+/// with extension planners (e.g. [`DmlExtensionPlanner`]).
+struct ExtensionQueryPlanner(Arc<dyn datafusion::physical_planner::PhysicalPlanner>);
+
+impl std::fmt::Debug for ExtensionQueryPlanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtensionQueryPlanner").finish()
+    }
+}
+
+#[async_trait]
+impl datafusion::execution::context::QueryPlanner for ExtensionQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &datafusion::logical_expr::LogicalPlan,
+        session_state: &datafusion::execution::SessionState,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.0
+            .create_physical_plan(logical_plan, session_state)
+            .await
+    }
+}
+
+// ── MERGE SQL executor ────────────────────────────────────────────────────────
+
+/// [`SqlStatementExecutor`] that intercepts `MERGE INTO` statements and routes
+/// them through [`plan_local_merge`] + [`DmlExtensionPlanner`].
+struct CayenneMergeExecutor {
+    default_catalog: String,
+    default_schema: String,
+}
+
+#[async_trait]
+impl SqlStatementExecutor for CayenneMergeExecutor {
+    async fn try_execute(
+        &self,
+        sql: &str,
+        ctx: Arc<SessionContext>,
+    ) -> Option<Result<Vec<RecordBatch>, tonic::Status>> {
+        if !sql.trim_start().to_uppercase().starts_with("MERGE") {
+            return None;
+        }
+        Some(self.execute_merge(sql, ctx).await as Result<Vec<RecordBatch>, tonic::Status>)
+    }
+}
+
+impl CayenneMergeExecutor {
+    async fn execute_merge(
+        &self,
+        sql: &str,
+        ctx: Arc<SessionContext>,
+    ) -> Result<Vec<RecordBatch>, tonic::Status> {
+        let plan =
+            plan_local_merge(&ctx.state(), &self.default_catalog, &self.default_schema, sql)
+                .await
+                .map_err(|e| tonic::Status::internal(format!("MERGE planning failed: {e}")))?;
+
+        let df = ctx
+            .execute_logical_plan(plan)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("MERGE execution failed: {e}")))?;
+
+        df.collect()
+            .await
+            .map_err(|e| tonic::Status::internal(format!("MERGE collect failed: {e}")))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
 #[command(
@@ -133,7 +214,20 @@ async fn main() -> Result<()> {
             .clone_from(&args.default_schema);
     }
 
-    let ctx = Arc::new(SessionContext::new_with_config(session_config));
+    // Register DdlExtensionPlanner + DmlExtensionPlanner so that DDL
+    // (CREATE TABLE, DROP TABLE via CayenneDdlHandler) and DML extension nodes
+    // (MERGE via plan_local_merge) are converted to the right physical plans.
+    let extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
+        vec![Arc::new(DdlExtensionPlanner), Arc::new(DmlExtensionPlanner)];
+    let physical_planner = Arc::new(
+        DefaultPhysicalPlanner::with_extension_planners(extension_planners),
+    );
+    let state = SessionStateBuilder::new()
+        .with_config(session_config)
+        .with_default_features()
+        .with_query_planner(Arc::new(ExtensionQueryPlanner(physical_planner)))
+        .build();
+    let ctx = Arc::new(SessionContext::new_with_state(state));
 
     let provider_config = CayenneCatalogProviderConfig {
         data_dir: args.cayenne_data_dir.clone(),
@@ -162,6 +256,27 @@ async fn main() -> Result<()> {
         &args.catalog,
         Arc::clone(&provider) as Arc<dyn datafusion::catalog::CatalogProvider>,
     );
+
+    // Register CayenneDdlHandler so that CREATE TABLE / DROP TABLE / CREATE SCHEMA
+    // executed via Flight SQL create real Cayenne (Vortex) tables, not in-memory ones.
+    {
+        use std::collections::HashSet;
+        use std::sync::RwLock;
+
+        let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::from([args.catalog.clone()])));
+        let ddl_store = new_shared_store(&args.catalog, &args.default_schema);
+        let ddl_handler = Arc::new(cayenne::CayenneDdlHandler {})
+            as Arc<dyn datafusion_ddl::CatalogDdlHandler>;
+
+        ctx.add_analyzer_rule(Arc::new(DdlAnalyzerRule::new(
+            &ctx.state().catalog_list(),
+            &ddl_enabled_catalogs,
+            ddl_store,
+            ddl_handler,
+            &args.default_schema,
+            &args.catalog,
+        )));
+    }
 
     let schema_names = provider.schema_names();
     tracing::info!(
@@ -195,8 +310,18 @@ async fn main() -> Result<()> {
 
     tracing::info!(addr = %args.addr, "Starting Flight SQL service");
 
+    let merge_executor = Arc::new(CayenneMergeExecutor {
+        default_catalog: args.catalog.clone(),
+        default_schema: args.default_schema.clone(),
+    }) as Arc<dyn SqlStatementExecutor>;
+
     let server_result = Server::builder()
-        .add_service(FlightSqlService::new(Arc::clone(&ctx)).into_server())
+        .add_service(
+            FlightSqlService::new(Arc::clone(&ctx))
+                .with_statement_executor(merge_executor)
+                .into_server()
+                .max_decoding_message_size(256 * 1024 * 1024), // 256 MiB — large for lineitem batches
+        )
         .serve_with_shutdown(args.addr, util::shutdown_signal())
         .await;
 
