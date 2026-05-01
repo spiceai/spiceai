@@ -200,7 +200,7 @@ impl RuntimeStatus {
         // Record cluster node status metric
         // Map ComponentStatus to cluster status values: 0=Unknown, 1=Healthy, 2=Unhealthy, 3=Draining
         let status_value = match &status {
-            ComponentStatus::Initializing => 0,
+            ComponentStatus::Initializing | ComponentStatus::NotLoaded => 0,
             ComponentStatus::Ready | ComponentStatus::Refreshing => 1, // Refreshing is still healthy
             ComponentStatus::Disabled | ComponentStatus::Error(_) => 2,
             ComponentStatus::ShuttingDown => 3, // Draining
