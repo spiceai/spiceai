@@ -228,10 +228,10 @@ async fn start_http_server() -> Result<
                 // Use BTreeMap for stable key ordering across runs
                 let mut echoed = std::collections::BTreeMap::new();
                 for (name, value) in &headers {
-                    if name.as_str().starts_with("x-") {
-                        if let Ok(val_str) = value.to_str() {
-                            echoed.insert(name.to_string(), val_str.to_string());
-                        }
+                    if name.as_str().starts_with("x-")
+                        && let Ok(val_str) = value.to_str()
+                    {
+                        echoed.insert(name.to_string(), val_str.to_string());
                     }
                 }
                 let body =
@@ -602,11 +602,11 @@ async fn test_http_dynamic_request_headers() -> Result<(), String> {
                 .map(|i| format!(r#"'{{"x-org-id":"org-{i:03}"}}'"#))
                 .collect();
             let query_100 = format!(
-                r#"SELECT count(*) as cnt
+                r"SELECT count(*) as cnt
                 FROM header_test
                 WHERE request_path = '/headers'
                   AND request_headers IN ({})
-                "#,
+                ",
                 in_values.join(", ")
             );
 
