@@ -2,16 +2,22 @@
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
 ---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
     {
       "_score": "[score]",
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+          "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers."
+        ],
+        "question": [
+          "How many numbers between 0 and 60 are even multiples of 5?"
         ]
       },
       "primary_key": {
-        "id": 1277
+        "id": 470
       }
     },
     {
@@ -22,6 +28,10 @@ expression: normalize_search_response(resp)
           "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
         ]
       },
+      "primary_key": {
+        "id": 361
+      }
+    },
     {
       "_score": "[score]",
       "dataset": "qs",
@@ -30,3 +40,9 @@ expression: normalize_search_response(resp)
           "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
         ]
       },
+      "primary_key": {
+        "id": 787
+      }
+    }
+  ]
+}
