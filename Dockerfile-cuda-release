@@ -1,6 +1,6 @@
 #syntax=docker/dockerfile:1.7
 
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.0-cudnn-runtime-ubuntu24.04
 
 FROM ${CUDA_RUNTIME_IMAGE} AS binary
 
