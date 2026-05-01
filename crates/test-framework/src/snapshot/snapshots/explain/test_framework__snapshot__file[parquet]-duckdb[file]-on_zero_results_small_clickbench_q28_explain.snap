@@ -26,6 +26,6 @@ description: "Query: clickbench_q28"
 |               |                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                               |
 |               |                           CooperativeExec                                                                                   |
 |               |                             BytesProcessedExec                                                                              |
-|               |                               DuckSqlExec sql= SELECT "CounterID", "URL" FROM "hits"                                        |
+|               |                               DuckSqlExec sql= SELECT "CounterID", "URL" FROM "hits" WHERE (CAST("URL" AS VARCHAR) <> '')   |
 |               |                                                                                                                             |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------+

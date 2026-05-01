@@ -2,7 +2,7 @@
 description = "Spice OSS REPL utilities and Flight Query REPL"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "repl"
 repository.workspace = true
 rust-version.workspace = true

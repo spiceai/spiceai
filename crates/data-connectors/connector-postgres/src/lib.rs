@@ -126,7 +126,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .help_link(POSTGRES_DOCS),
     ParameterSpec::component("sslrootcert")
         .description(
-            "Path to a PEM-encoded CA certificate used when sslmode is verify-ca/verify-full.",
+            "Path to, or inline PEM content for, a CA certificate used when sslmode is verify-ca/verify-full.",
         )
         .help_link(POSTGRES_DOCS),
     ParameterSpec::component("connection_pool_min_idle")
@@ -254,7 +254,6 @@ impl DataConnector for Postgres {
         self
     }
 
-    #[cfg(feature = "postgres-write")]
     async fn read_write_provider(
         &self,
         dataset: &Dataset,

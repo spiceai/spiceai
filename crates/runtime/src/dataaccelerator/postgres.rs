@@ -88,7 +88,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("user").secret(),
     ParameterSpec::component("pass").secret(),
     ParameterSpec::component("sslmode"),
-    ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("sslrootcert")
+        .description("The path to, or inline PEM content for, the SSL root certificate."),
     ParameterSpec::component("connection_pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
         .default("5"),
