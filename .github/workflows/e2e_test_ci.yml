@@ -1026,10 +1026,10 @@ jobs:
           CLICKHOUSE_VERSION="26.3.9.8-lts"
           CLICKHOUSE_VER_NUM="${CLICKHOUSE_VERSION%-lts}"
           BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
-          curl -fsSL "${BASE_URL}/clickhouse-common-static-${CLICKHOUSE_VER_NUM}-arm64.tgz" -o clickhouse-common-static.tgz
-          curl -fsSL "${BASE_URL}/clickhouse-common-static-${CLICKHOUSE_VER_NUM}-arm64.tgz.sha512" -o clickhouse-common-static.tgz.sha512
-          shasum -a 512 -c clickhouse-common-static.tgz.sha512
-          tar xzf clickhouse-common-static.tgz
+          curl -fsSL "${BASE_URL}/clickhouse-common-static-${CLICKHOUSE_VER_NUM}-arm64.tgz" -o "clickhouse-common-static-${CLICKHOUSE_VER_NUM}-arm64.tgz"
+          curl -fsSL "${BASE_URL}/clickhouse-common-static-${CLICKHOUSE_VER_NUM}-arm64.tgz.sha512" -o "clickhouse-common-static-${CLICKHOUSE_VER_NUM}-arm64.tgz.sha512"
+          shasum -a 512 -c "clickhouse-common-static-${CLICKHOUSE_VER_NUM}-arm64.tgz.sha512"
+          tar xzf "clickhouse-common-static-${CLICKHOUSE_VER_NUM}-arm64.tgz"
           sudo ./usr/bin/clickhouse install
           sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
