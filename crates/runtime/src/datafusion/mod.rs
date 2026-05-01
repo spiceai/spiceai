@@ -1550,12 +1550,17 @@ impl DataFusion {
                     )
                     .await;
             } else {
+                let subscribers_closed = self
+                    .data_update_broadcaster
+                    .close_subscribers(table_reference)
+                    .await;
                 tracing::warn!(
                     dataset = %table_reference,
                     max_batches = MAX_STREAMING_BROADCAST_BATCHES,
                     max_rows = MAX_STREAMING_BROADCAST_ROWS,
                     max_bytes = MAX_STREAMING_BROADCAST_BYTES,
-                    "Skipped publishing streaming data update to DoExchange subscribers because the buffered update exceeded limits; subscribers can reconnect to receive a fresh snapshot"
+                    subscribers_closed,
+                    "Closed DoExchange subscribers because the buffered streaming data update exceeded limits; subscribers must reconnect to receive a fresh snapshot"
                 );
             }
         }

@@ -209,6 +209,7 @@ pub(crate) async fn handle(
     let datafusion_stream = Arc::clone(&datafusion);
     let data_path_stream = data_path.clone();
 
+    // The stream interleaves a fallible initial snapshot, broadcast updates, and IPC encoding without materializing the response.
     let response_stream = try_stream! {
         let mut encoder = ChangeFlightEncoder::default();
         enum InitialSnapshotEvent {
@@ -230,23 +231,16 @@ pub(crate) async fn handle(
         }
 
         let mut pending_updates = PendingInitialSnapshotUpdates::default();
-        let mut pending_updates_overflowed = false;
-        let mut updates_closed = false;
 
         loop {
             let event = tokio::select! {
-                update = rx.recv(), if !updates_closed => InitialSnapshotEvent::DataUpdate(update),
+                update = rx.recv() => InitialSnapshotEvent::DataUpdate(update),
                 batch = initial_snapshot_stream.next() => InitialSnapshotEvent::SnapshotBatch(batch),
             };
 
             match event {
                 InitialSnapshotEvent::DataUpdate(Ok(data_update)) => {
-                    if pending_updates_overflowed {
-                        continue;
-                    }
-
                     if !pending_updates.push_back(data_update) {
-                        pending_updates_overflowed = true;
                         tracing::warn!(
                             dataset = %data_path_stream,
                             max_pending_updates = MAX_PENDING_INITIAL_SNAPSHOT_UPDATES,
@@ -255,18 +249,27 @@ pub(crate) async fn handle(
                             max_pending_bytes = MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BYTES,
                             "DoExchange subscriber received too much buffered update data while streaming initial snapshot"
                         );
+                        Err(Status::data_loss(format!(
+                            "DoExchange subscriber missed data updates while receiving the initial snapshot for dataset {data_path_stream}; resubscribe and reconcile state"
+                        )))?;
                     }
                 }
                 InitialSnapshotEvent::DataUpdate(Err(RecvError::Lagged(skipped_messages))) => {
                     pending_updates.clear();
-                    pending_updates_overflowed = true;
                     tracing::warn!(
                         dataset = %data_path_stream,
                         skipped_messages,
                         "DoExchange subscriber lagged while streaming initial snapshot"
                     );
+                    Err(Status::data_loss(format!(
+                        "DoExchange subscriber missed {skipped_messages} update(s) while receiving the initial snapshot for dataset {data_path_stream}; resubscribe and reconcile state"
+                    )))?;
                 }
-                InitialSnapshotEvent::DataUpdate(Err(RecvError::Closed)) => updates_closed = true,
+                InitialSnapshotEvent::DataUpdate(Err(RecvError::Closed)) => {
+                    Err(Status::data_loss(format!(
+                        "DoExchange subscriber update stream closed while receiving the initial snapshot for dataset {data_path_stream}; resubscribe and reconcile state"
+                    )))?;
+                }
                 InitialSnapshotEvent::SnapshotBatch(Some(batch)) => {
                     let batch = batch.map_err(|source| Status::internal(format!(
                         "Unable to stream initial snapshot: {source}"
@@ -282,12 +285,6 @@ pub(crate) async fn handle(
                 }
                 InitialSnapshotEvent::SnapshotBatch(None) => break,
             }
-        }
-
-        if pending_updates_overflowed {
-            Err(Status::data_loss(format!(
-                "DoExchange subscriber missed data updates while receiving the initial snapshot for dataset {data_path_stream}; resubscribe and reconcile state"
-            )))?;
         }
 
         while let Some(data_update) = pending_updates.pop_front() {
@@ -308,32 +305,34 @@ pub(crate) async fn handle(
             }
         }
 
-        if !updates_closed {
-            loop {
-                let data_update = match rx.recv().await {
-                    Ok(data_update) => data_update,
-                    Err(RecvError::Lagged(skipped_messages)) => {
-                        Err(Status::data_loss(format!(
-                            "DoExchange subscriber fell behind and missed {skipped_messages} update(s) for dataset {data_path_stream}; resubscribe and reconcile state"
-                        )))?
-                    }
-                    Err(RecvError::Closed) => break,
-                };
-
-                if data_update.update_type == UpdateType::Overwrite {
-                    let truncate_batch = truncate_change_batch(&data_update.schema)?;
-                    let flights = encode_and_count(&mut encoder, &truncate_batch)?;
-                    for flight in flights {
-                        yield flight;
-                    }
+        loop {
+            let data_update = match rx.recv().await {
+                Ok(data_update) => data_update,
+                Err(RecvError::Lagged(skipped_messages)) => {
+                    Err(Status::data_loss(format!(
+                        "DoExchange subscriber fell behind and missed {skipped_messages} update(s) for dataset {data_path_stream}; resubscribe and reconcile state"
+                    )))?
                 }
+                Err(RecvError::Closed) => {
+                    Err(Status::data_loss(format!(
+                        "DoExchange subscriber update stream closed for dataset {data_path_stream}; resubscribe and reconcile state"
+                    )))?
+                }
+            };
 
-                for batch in &data_update.data {
-                    let change_batch = record_batch_to_change_batch(&table_provider_stream, batch)?;
-                    let flights = encode_and_count(&mut encoder, &change_batch)?;
-                    for flight in flights {
-                        yield flight;
-                    }
+            if data_update.update_type == UpdateType::Overwrite {
+                let truncate_batch = truncate_change_batch(&data_update.schema)?;
+                let flights = encode_and_count(&mut encoder, &truncate_batch)?;
+                for flight in flights {
+                    yield flight;
+                }
+            }
+
+            for batch in &data_update.data {
+                let change_batch = record_batch_to_change_batch(&table_provider_stream, batch)?;
+                let flights = encode_and_count(&mut encoder, &change_batch)?;
+                for flight in flights {
+                    yield flight;
                 }
             }
         }

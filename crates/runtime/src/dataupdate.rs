@@ -64,11 +64,16 @@ impl DataUpdateBroadcaster {
     }
 
     pub async fn has_subscribers(&self, table_reference: &TableReference) -> bool {
-        self.channels
-            .read()
-            .await
-            .get(table_reference)
-            .is_some_and(|sender| sender.receiver_count() > 0)
+        let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
+            return false;
+        };
+
+        if channel.receiver_count() > 0 {
+            return true;
+        }
+
+        self.remove_if_unused(table_reference, &channel).await;
+        false
     }
 
     pub async fn publish(&self, table_reference: &TableReference, update: DataUpdate) {
@@ -77,6 +82,7 @@ impl DataUpdateBroadcaster {
         };
 
         if channel.receiver_count() == 0 {
+            self.remove_if_unused(table_reference, &channel).await;
             return;
         }
 
@@ -85,6 +91,33 @@ impl DataUpdateBroadcaster {
                 dataset = %table_reference,
                 "No active DoExchange subscribers received data update: {err}"
             );
+            self.remove_if_unused(table_reference, &channel).await;
+        }
+    }
+
+    pub async fn close_subscribers(&self, table_reference: &TableReference) -> bool {
+        self.channels
+            .write()
+            .await
+            .remove(table_reference)
+            .is_some_and(|sender| sender.receiver_count() > 0)
+    }
+
+    async fn remove_if_unused(
+        &self,
+        table_reference: &TableReference,
+        channel: &Arc<broadcast::Sender<DataUpdate>>,
+    ) {
+        if channel.receiver_count() > 0 {
+            return;
+        }
+
+        let mut channels = self.channels.write().await;
+        if channels
+            .get(table_reference)
+            .is_some_and(|current| Arc::ptr_eq(current, channel) && current.receiver_count() == 0)
+        {
+            channels.remove(table_reference);
         }
     }
 }
@@ -264,5 +297,30 @@ mod tests {
             .expect("published update should be received");
         assert_eq!(update.schema, schema);
         assert!(matches!(update.update_type, UpdateType::Append));
+    }
+
+    #[tokio::test]
+    async fn data_update_broadcaster_prunes_channels_without_subscribers() {
+        let broadcaster = DataUpdateBroadcaster::new();
+        let table_reference = TableReference::bare("cdc_table");
+        let receiver = broadcaster.subscribe(&table_reference).await;
+        drop(receiver);
+
+        assert!(!broadcaster.has_subscribers(&table_reference).await);
+        assert!(broadcaster.channels.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn data_update_broadcaster_close_subscribers_closes_receivers() {
+        let broadcaster = DataUpdateBroadcaster::new();
+        let table_reference = TableReference::bare("cdc_table");
+        let mut receiver = broadcaster.subscribe(&table_reference).await;
+
+        assert!(broadcaster.close_subscribers(&table_reference).await);
+        assert!(matches!(
+            receiver.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        assert!(broadcaster.channels.read().await.is_empty());
     }
 }
