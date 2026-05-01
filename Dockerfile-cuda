@@ -53,7 +53,7 @@ ARG CARGO_FEATURES
 RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
 
 RUN apt update \
-    && apt install --yes ca-certificates libssl3 tzdata --no-install-recommends \
+    && apt install --yes ca-certificates libssl3 tzdata cuda-compat-12-6 --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
@@ -63,6 +63,8 @@ RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     fi
 
 COPY --from=build /root/spiced /usr/local/bin/spiced
+
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 
