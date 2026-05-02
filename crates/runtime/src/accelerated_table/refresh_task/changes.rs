@@ -360,6 +360,41 @@ fn upsert_pre_delete_rows(
     };
 
     let expected_primary_keys = change_batch.primary_keys(*first_row_idx);
+
+    if expected_primary_keys.is_empty() {
+        let inconsistent_row_count = row_indices
+            .iter()
+            .filter(|row_idx| !change_batch.primary_keys(**row_idx).is_empty())
+            .count();
+
+        ensure!(
+            inconsistent_row_count == 0,
+            crate::accelerated_table::InvalidUpsertPrimaryKeysSnafu {
+                dataset_name: dataset_name.to_string(),
+                reason: format!(
+                    "{inconsistent_row_count} row(s) have inconsistent primary key metadata, so applying append would break upsert semantics"
+                ),
+            }
+        );
+
+        let update_row_count = row_indices
+            .iter()
+            .filter(|row_idx| matches!(change_batch.op(**row_idx), ChangeOperation::Update))
+            .count();
+
+        ensure!(
+            update_row_count == 0,
+            crate::accelerated_table::InvalidUpsertPrimaryKeysSnafu {
+                dataset_name: dataset_name.to_string(),
+                reason: format!(
+                    "{update_row_count} update row(s) have no usable primary key metadata, so applying append would break update semantics"
+                ),
+            }
+        );
+
+        return Ok(false);
+    }
+
     let invalid_row_count = row_indices
         .iter()
         .filter(|row_idx| {
@@ -369,16 +404,12 @@ fn upsert_pre_delete_rows(
         .count();
 
     ensure!(
-        !expected_primary_keys.is_empty() && invalid_row_count == 0,
+        invalid_row_count == 0,
         crate::accelerated_table::InvalidUpsertPrimaryKeysSnafu {
             dataset_name: dataset_name.to_string(),
-            reason: if expected_primary_keys.is_empty() {
-                "no usable primary key metadata was available for the upsert rows, so applying append would break upsert semantics".to_string()
-            } else {
-                format!(
-                    "{invalid_row_count} row(s) have missing or inconsistent primary key metadata, so applying append would break upsert semantics"
-                )
-            },
+            reason: format!(
+                "{invalid_row_count} row(s) have missing or inconsistent primary key metadata, so applying append would break upsert semantics"
+            ),
         }
     );
 
@@ -1138,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_upsert_pre_delete_rows_rejects_batch_without_primary_keys() {
+    fn test_upsert_pre_delete_rows_allows_create_rows_without_primary_keys() {
         let change_batch = create_test_change_batch(
             vec!["c", "c"],
             &[vec![], vec![]],
@@ -1147,9 +1178,44 @@ mod tests {
         );
 
         let dataset_name = TableReference::bare("test_dataset");
-        let err = upsert_pre_delete_rows(&change_batch, &[0, 1], &dataset_name)
-            .expect_err("upserts without primary keys should fail safely");
+        let should_delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1], &dataset_name)
+            .expect("create rows without primary keys should append without pre-delete");
 
-        assert!(err.to_string().contains("no usable primary key metadata"));
+        assert!(!should_delete_rows);
+    }
+
+    #[test]
+    fn test_upsert_pre_delete_rows_allows_read_rows_without_primary_keys() {
+        let change_batch = create_test_change_batch(
+            vec!["r", "r"],
+            &[vec![], vec![]],
+            vec![1, 2],
+            vec![Some("a"), Some("b")],
+        );
+
+        let dataset_name = TableReference::bare("test_dataset");
+        let should_delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1], &dataset_name)
+            .expect("read rows without primary keys should append without pre-delete");
+
+        assert!(!should_delete_rows);
+    }
+
+    #[test]
+    fn test_upsert_pre_delete_rows_rejects_update_rows_without_primary_keys() {
+        let change_batch = create_test_change_batch(
+            vec!["u", "u"],
+            &[vec![], vec![]],
+            vec![1, 2],
+            vec![Some("a"), Some("b")],
+        );
+
+        let dataset_name = TableReference::bare("test_dataset");
+        let err = upsert_pre_delete_rows(&change_batch, &[0, 1], &dataset_name)
+            .expect_err("update rows without primary keys should fail safely");
+
+        assert!(
+            err.to_string()
+                .contains("update row(s) have no usable primary key metadata")
+        );
     }
 }
