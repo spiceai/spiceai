@@ -118,8 +118,9 @@ impl Runtime {
         };
         match crate::datafusion::tool_udf::build_scalar_udf(inner, &decl.name, sig) {
             Ok(udf) => {
-                crate::datafusion::udf::register_async_user_udf(&self.df.ctx, &udf, &decl.name);
-                tracing::info!(name = %decl.name, "Exposed tool as SQL function");
+                if crate::datafusion::udf::register_async_user_udf(&self.df.ctx, &udf, &decl.name) {
+                    tracing::info!(name = %decl.name, "Exposed tool as SQL function");
+                }
             }
             Err(e) => {
                 tracing::warn!(

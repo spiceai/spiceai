@@ -188,10 +188,9 @@ pub struct Signature {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub returns_schema: Vec<FunctionArg>,
 
-    /// Whether the function handles NULL inputs itself. When false (the
-    /// default), `DataFusion` short-circuits any call with a NULL argument
-    /// to a NULL result without invoking the function — matching Spark's
-    /// default semantics and avoiding a whole class of NPE-style bugs.
+    /// Reserved for future NULL-handling behavior. This setting is parsed
+    /// and preserved today, but scalar function factories do not yet change
+    /// runtime NULL evaluation based on it.
     #[serde(default)]
     pub null_aware: bool,
 }

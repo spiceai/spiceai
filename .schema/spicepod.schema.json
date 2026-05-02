@@ -3337,7 +3337,7 @@
           }
         },
         "null_aware": {
-          "description": "Whether the function handles NULL inputs itself. When false (the\ndefault), `DataFusion` short-circuits any call with a NULL argument\nto a NULL result without invoking the function — matching Spark's\ndefault semantics and avoiding a whole class of NPE-style bugs.",
+          "description": "Reserved for future NULL-handling behavior. This setting is parsed\nand preserved today, but scalar function factories do not yet change\nruntime NULL evaluation based on it.",
           "type": "boolean",
           "default": false
         }

@@ -30,6 +30,7 @@ use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
+use datafusion::execution::FunctionRegistry;
 use datafusion::functions::math::random::RandomFunc;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
@@ -197,16 +198,17 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
         tracing::error!("{err}");
     }
 
-    let built_function_names = built
-        .iter()
-        .map(|(decl, _)| decl.name.clone())
-        .collect::<Vec<_>>();
-    add_user_functions_to_deny_list(built_function_names);
-
+    let mut registered_function_names = Vec::new();
+    let mut functions_to_expose_as_tools = Vec::new();
     for (decl, built) in built {
         match built {
             runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
+                if let Some(existing_name) = registered_scalar_udf_name(ctx, &decl.name) {
+                    tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
                 ctx.register_udf(udf.as_ref().clone());
+                registered_function_names.push(decl.name.clone());
                 if function_executes_code(&decl) {
                     add_code_executing_function(&decl.name);
                 }
@@ -216,9 +218,13 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                     from = %decl.from,
                     "Registered user function"
                 );
-                maybe_register_function_as_tool(runtime, &decl).await;
+                functions_to_expose_as_tools.push(decl);
             }
         }
+    }
+    add_user_functions_to_deny_list(registered_function_names);
+    for decl in functions_to_expose_as_tools {
+        maybe_register_function_as_tool(runtime, &decl).await;
     }
 }
 
@@ -268,10 +274,23 @@ async fn maybe_register_function_as_tool(
 /// add its name to the federation deny-list in one call. Used by the
 /// tool→SQL bridge so the tool-registration path doesn't need to know
 /// about the deny-list as an implementation detail.
-pub fn register_async_user_udf(ctx: &SessionContext, udf: &ScalarUDF, name: &str) {
+pub fn register_async_user_udf(ctx: &SessionContext, udf: &ScalarUDF, name: &str) -> bool {
+    if let Some(existing_name) = registered_scalar_udf_name(ctx, name) {
+        tracing::warn!(name = %name, existing_name = %existing_name, "Skipping async user UDF registration because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+        return false;
+    }
     ctx.register_udf(udf.clone());
     add_user_function_to_deny_list(name);
     add_code_executing_function(name);
+    true
+}
+
+/// Return the exact registered scalar UDF name that collides with `name`, if any.
+#[must_use]
+pub fn registered_scalar_udf_name(ctx: &SessionContext, name: &str) -> Option<String> {
+    ctx.udfs()
+        .into_iter()
+        .find(|registered_name| registered_name.eq_ignore_ascii_case(name))
 }
 
 fn function_executes_code(decl: &spicepod::component::function::Function) -> bool {
@@ -392,25 +411,30 @@ pub async fn apply_function_diff(
         tracing::error!("{err}");
     }
 
-    let built_function_names = built
-        .iter()
-        .map(|(decl, _)| decl.name.clone())
-        .collect::<Vec<_>>();
-    add_user_functions_to_deny_list(built_function_names);
-
+    let mut registered_function_names = Vec::new();
+    let mut functions_to_expose_as_tools = Vec::new();
     for (next, built) in built {
         match built {
             runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
                 warn_alpha_once();
+                if let Some(existing_name) = registered_scalar_udf_name(ctx, &next.name) {
+                    tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
                 ctx.register_udf(udf.as_ref().clone());
+                registered_function_names.push(next.name.clone());
                 if function_executes_code(&next) {
                     add_code_executing_function(&next.name);
                 }
                 upsert_user_function_info(info_from_decl(&next));
                 tracing::info!(name = %next.name, from = %next.from, "Registered user function");
-                maybe_register_function_as_tool(runtime, &next).await;
+                functions_to_expose_as_tools.push(next);
             }
         }
+    }
+    add_user_functions_to_deny_list(registered_function_names);
+    for next in functions_to_expose_as_tools {
+        maybe_register_function_as_tool(runtime, &next).await;
     }
 }
 
@@ -631,8 +655,11 @@ fn json_functions() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::logical_expr::{ColumnarValue, Volatility as DataFusionVolatility, create_udf};
     use datafusion::prelude::{Expr, lit};
+    use datafusion::scalar::ScalarValue;
     use datafusion_functions_json::udfs::{
         json_as_text_udf, json_contains_udf, json_get_bool_udf, json_get_float_udf,
         json_get_int_udf, json_get_json_udf, json_get_str_udf, json_get_udf, json_length_udf,
@@ -649,6 +676,40 @@ mod tests {
         impl_: impl Into<datafusion::logical_expr::ScalarUDF>,
     ) -> Arc<datafusion::logical_expr::ScalarUDF> {
         Arc::new(impl_.into())
+    }
+
+    fn stub_scalar_udf(name: &str) -> ScalarUDF {
+        create_udf(
+            name,
+            vec![],
+            DataType::Int64,
+            DataFusionVolatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(1))))),
+        )
+    }
+
+    #[test]
+    fn registered_scalar_udf_name_detects_case_insensitive_collision() {
+        let ctx = SessionContext::new();
+        ctx.register_udf(stub_scalar_udf("custom_fn"));
+
+        assert_eq!(
+            registered_scalar_udf_name(&ctx, "CUSTOM_FN").as_deref(),
+            Some("custom_fn")
+        );
+    }
+
+    #[test]
+    fn register_async_user_udf_skips_existing_scalar_udf() {
+        let ctx = SessionContext::new();
+        ctx.register_udf(stub_scalar_udf("existing_fn"));
+
+        assert!(!register_async_user_udf(
+            &ctx,
+            &stub_scalar_udf("Existing_Fn"),
+            "Existing_Fn"
+        ));
+        assert!(!ctx.udfs().contains("Existing_Fn"));
     }
 
     fn test_user_function(name: &str, enabled: bool) -> spicepod::component::function::Function {
