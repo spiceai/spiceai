@@ -69,7 +69,9 @@ pub enum ToolUdfBuildError {
     MissingReturnType { tool: String },
 
     #[snafu(display(
-        "cannot expose tool '{tool}' as SQL: arg '{arg}' has unsupported Arrow type '{arrow_type}'. Supported: int64 / float64 / utf8 / boolean."
+        "cannot expose tool '{tool}' as SQL: arg '{arg}' has unsupported Arrow type '{arrow_type}'. \
+        Supported: signed integer aliases/widths (int, int8, int16, int32, int64; widened to int64), \
+        float aliases/widths (float, double, float32, float64; widened to float64), utf8/string, boolean/bool."
     ))]
     UnsupportedArgType {
         tool: String,
@@ -78,7 +80,9 @@ pub enum ToolUdfBuildError {
     },
 
     #[snafu(display(
-        "cannot expose tool '{tool}' as SQL: return Arrow type '{arrow_type}' is unsupported. Supported: int64 / float64 / utf8 / boolean."
+        "cannot expose tool '{tool}' as SQL: return Arrow type '{arrow_type}' is unsupported. \
+        Supported: signed integer aliases/widths (int, int8, int16, int32, int64; widened to int64), \
+        float aliases/widths (float, double, float32, float64; widened to float64), utf8/string, boolean/bool."
     ))]
     UnsupportedReturnType { tool: String, arrow_type: String },
 }

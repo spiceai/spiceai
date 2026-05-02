@@ -79,11 +79,12 @@ pub struct Function {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
 
-    /// Reference to a file whose contents are the function body. Path is
-    /// resolved relative to the runtime's current working directory, matching
-    /// the convention used by every other file-path field in spicepod. Lets
-    /// authors keep non-trivial SQL in its own file with proper editor support
-    /// instead of embedding it inline.
+    /// Reference to a local filesystem file whose contents are the function
+    /// body. Path is resolved relative to the runtime's current working
+    /// directory. `body_ref` is not read from object stores when a spicepod is
+    /// loaded remotely; use inline [`body`] for portable remote spicepods.
+    /// Lets authors keep non-trivial SQL in its own file with proper editor
+    /// support instead of embedding it inline.
     ///
     /// Mutually exclusive with [`body`].
     #[serde(default, skip_serializing_if = "Option::is_none")]

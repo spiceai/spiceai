@@ -256,7 +256,9 @@ fn extract_single_cell_as_json(
 #[derive(Debug, snafu::Snafu)]
 pub enum FunctionToolBuildError {
     #[snafu(display(
-        "cannot expose function '{function}' as a tool: arg '{arg}' has Arrow type '{arrow_type}', which is not yet JSON-encodable. Supported: int64 / float64 / utf8 / boolean. Set `as_tool: false` on the function to suppress."
+        "cannot expose function '{function}' as a tool: arg '{arg}' has Arrow type '{arrow_type}', which is not yet JSON-encodable. \
+        Supported: signed integer aliases/widths (int, int8, int16, int32, int64), float aliases/widths (float, double, float32, float64), utf8/string, boolean/bool. \
+        Set `as_tool: false` on the function to suppress."
     ))]
     UnsupportedArgType {
         function: String,
@@ -264,7 +266,9 @@ pub enum FunctionToolBuildError {
         arrow_type: String,
     },
     #[snafu(display(
-        "cannot expose function '{function}' as a tool: return Arrow type '{arrow_type}' is not yet JSON-encodable. Supported: int64 / float64 / utf8 / boolean. Set `as_tool: false` to suppress."
+        "cannot expose function '{function}' as a tool: return Arrow type '{arrow_type}' is not yet JSON-encodable. \
+        Supported: signed integer aliases/widths (int, int8, int16, int32, int64), float aliases/widths (float, double, float32, float64), utf8/string, boolean/bool. \
+        Set `as_tool: false` to suppress."
     ))]
     UnsupportedReturnType {
         function: String,

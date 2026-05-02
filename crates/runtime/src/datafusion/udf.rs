@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use crate::datafusion::udtf::flatten_json::{
@@ -41,6 +41,7 @@ use runtime_datafusion_udfs::{
     ai::{AI_UDF_NAME, Ai},
     embed::{self, EMBED_UDF_NAME},
 };
+use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
 const EMBED_UDF_NAME: &str = "embed";
 use runtime_datafusion_udfs::{
@@ -55,6 +56,8 @@ use runtime_datafusion_udfs::{
     l2_norm::{L2_NORM_UDF_NAME, L2Norm},
     truncate::{TRUNCATE_SCALAR_UDF_NAME, Truncate},
 };
+use serde_json::Value;
+use spicepod::component::function::{Function, Volatility};
 
 /// Register core scalar UDFs that have no runtime dependencies.
 ///
@@ -192,6 +195,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
         return;
     }
 
+    let enabled_functions = resolve_function_params(runtime.secrets(), &enabled_functions).await;
     let (built, errors) =
         runtime_datafusion_udfs::user_functions::build_all(&enabled_functions).await;
     for err in &errors {
@@ -237,10 +241,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
 /// or a spicepod `tools:` entry loaded earlier) we log at WARN and skip —
 /// silent overwrites were the pre-review behaviour and would mask
 /// misconfiguration.
-async fn maybe_register_function_as_tool(
-    runtime: &crate::Runtime,
-    decl: &spicepod::component::function::Function,
-) {
+async fn maybe_register_function_as_tool(runtime: &crate::Runtime, decl: &Function) {
     if !decl.as_tool {
         return;
     }
@@ -293,7 +294,7 @@ pub fn registered_scalar_udf_name(ctx: &SessionContext, name: &str) -> Option<St
         .find(|registered_name| registered_name.eq_ignore_ascii_case(name))
 }
 
-fn function_executes_code(decl: &spicepod::component::function::Function) -> bool {
+fn function_executes_code(decl: &Function) -> bool {
     let scheme = decl
         .from
         .split_once(':')
@@ -302,9 +303,7 @@ fn function_executes_code(decl: &spicepod::component::function::Function) -> boo
     matches!(scheme.as_str(), "http" | "https")
 }
 
-fn enabled_function_declarations(
-    functions: &[spicepod::component::function::Function],
-) -> Vec<spicepod::component::function::Function> {
+fn enabled_function_declarations(functions: &[Function]) -> Vec<Function> {
     functions
         .iter()
         .filter(|decl| decl.enabled)
@@ -312,17 +311,45 @@ fn enabled_function_declarations(
         .collect()
 }
 
-fn info_from_decl(decl: &spicepod::component::function::Function) -> UserFunctionInfo {
-    use spicepod::component::function::Volatility;
-    let volatility = match decl.volatility {
-        Volatility::Immutable => "immutable",
-        Volatility::Stable => "stable",
-        Volatility::Volatile => "volatile",
-    };
+async fn resolve_function_params(
+    secrets: Arc<tokio::sync::RwLock<runtime_secrets::Secrets>>,
+    functions: &[Function],
+) -> Vec<Function> {
+    let mut resolved = Vec::with_capacity(functions.len());
+    for decl in functions {
+        let mut decl = decl.clone();
+        let string_params = decl
+            .params
+            .iter()
+            .filter_map(|(key, value)| value.as_str().map(|s| (key.clone(), s.to_string())))
+            .collect::<HashMap<_, _>>();
+        if !string_params.is_empty() {
+            let params_with_secrets =
+                get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
+            for (key, value) in params_with_secrets {
+                decl.params
+                    .insert(key, Value::String(value.expose_secret().to_string()));
+            }
+        }
+        resolved.push(decl);
+    }
+    resolved
+}
+
+pub(crate) fn effective_user_function_volatility(decl: &Function) -> &'static str {
+    match (function_executes_code(decl), decl.volatility) {
+        (true, Volatility::Immutable | Volatility::Stable) => "stable",
+        (_, Volatility::Immutable) => "immutable",
+        (_, Volatility::Stable) => "stable",
+        (_, Volatility::Volatile) => "volatile",
+    }
+}
+
+fn info_from_decl(decl: &Function) -> UserFunctionInfo {
     UserFunctionInfo {
         name: decl.name.clone(),
         kind: "scalar".to_string(),
-        volatility: volatility.to_string(),
+        volatility: effective_user_function_volatility(decl).to_string(),
         from: decl.from.clone(),
         description: decl.description.clone(),
     }
@@ -399,6 +426,8 @@ pub async fn apply_function_diff(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let functions_to_register =
+        resolve_function_params(runtime.secrets(), &functions_to_register).await;
     let (built, errors) =
         runtime_datafusion_udfs::user_functions::build_all(&functions_to_register).await;
     for err in &errors {
@@ -706,10 +735,10 @@ mod tests {
         assert!(!ctx.udfs().contains("Existing_Fn"));
     }
 
-    fn test_user_function(name: &str, enabled: bool) -> spicepod::component::function::Function {
+    fn test_user_function(name: &str, enabled: bool) -> Function {
         use spicepod::component::function::{FunctionArg, FunctionKind, Signature, Volatility};
 
-        spicepod::component::function::Function {
+        Function {
             name: name.to_string(),
             from: "sql".to_string(),
             enabled,
@@ -744,6 +773,72 @@ mod tests {
 
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].name, "enabled_fn");
+    }
+
+    #[test]
+    fn effective_volatility_caps_remote_immutable_to_stable() {
+        let mut function = test_user_function("remote_fn", true);
+        function.from = "https://example.com/udf".to_string();
+
+        assert_eq!(effective_user_function_volatility(&function), "stable");
+
+        function.volatility = spicepod::component::function::Volatility::Volatile;
+        assert_eq!(effective_user_function_volatility(&function), "volatile");
+    }
+
+    #[tokio::test]
+    async fn resolve_function_params_expands_string_secret_refs() {
+        use spicepod::component::secret::Secret;
+
+        let env_file = std::env::temp_dir().join(format!(
+            "spice_udf_params_{}_{}.env",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after UNIX epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&env_file, "UDF_TOKEN=resolved-token\n")
+            .expect("test env file should be written");
+
+        let mut secret_params = HashMap::new();
+        secret_params.insert(
+            "file_path".to_string(),
+            env_file.to_string_lossy().into_owned(),
+        );
+        let mut secrets = runtime_secrets::Secrets::new();
+        secrets
+            .load_from(&[Secret {
+                from: "env".to_string(),
+                name: "env".to_string(),
+                description: None,
+                params: Some(spicepod::param::Params::from_string_map(secret_params)),
+            }])
+            .await
+            .expect("env secret store should load");
+
+        let mut function = test_user_function("remote_fn", true);
+        function.params.insert(
+            "auth_bearer".to_string(),
+            Value::String("${ secrets:UDF_TOKEN }".to_string()),
+        );
+        function
+            .params
+            .insert("batch_size".to_string(), Value::Number(16_u64.into()));
+
+        let resolved =
+            resolve_function_params(Arc::new(tokio::sync::RwLock::new(secrets)), &[function]).await;
+
+        assert_eq!(
+            resolved[0].params.get("auth_bearer"),
+            Some(&Value::String("resolved-token".to_string()))
+        );
+        assert_eq!(
+            resolved[0].params.get("batch_size"),
+            Some(&Value::Number(16_u64.into()))
+        );
+
+        std::fs::remove_file(env_file).ok();
     }
 
     #[test]

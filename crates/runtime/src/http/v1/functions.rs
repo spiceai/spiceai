@@ -80,21 +80,14 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
         .map(|decl| ListFunctionElement {
             name: decl.name.clone(),
             kind: "scalar".to_string(),
-            volatility: volatility(decl.volatility).to_string(),
+            volatility: crate::datafusion::udf::effective_user_function_volatility(decl)
+                .to_string(),
             from: decl.from.clone(),
             description: decl.description.clone(),
         })
         .collect();
 
     (StatusCode::OK, Json(functions)).into_response()
-}
-
-fn volatility(volatility: spicepod::component::function::Volatility) -> &'static str {
-    match volatility {
-        spicepod::component::function::Volatility::Immutable => "immutable",
-        spicepod::component::function::Volatility::Stable => "stable",
-        spicepod::component::function::Volatility::Volatile => "volatile",
-    }
 }
 
 #[cfg(test)]
@@ -125,16 +118,22 @@ mod tests {
 
     #[tokio::test]
     async fn list_filters_to_enabled_registered_functions() {
+        let mut remote_function = test_function("Remote_Fn", true);
+        remote_function.from = "https://example.com/udf".to_string();
+        remote_function.volatility = FunctionVolatility::Immutable;
+
         let rt = test_runtime(
             true,
             vec![
                 test_function("User_Fn", true),
+                remote_function,
                 test_function("disabled_fn", false),
                 test_function("missing_fn", true),
             ],
         )
         .await;
         register_stub_udf(&rt, "user_fn");
+        register_stub_udf(&rt, "remote_fn");
         register_stub_udf(&rt, "disabled_fn");
 
         let (status, functions) = list_json(rt).await;
@@ -142,13 +141,22 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             functions,
-            vec![ListFunctionElement {
-                name: "User_Fn".to_string(),
-                kind: "scalar".to_string(),
-                volatility: "stable".to_string(),
-                from: "sql".to_string(),
-                description: Some("User_Fn description".to_string()),
-            }]
+            vec![
+                ListFunctionElement {
+                    name: "User_Fn".to_string(),
+                    kind: "scalar".to_string(),
+                    volatility: "stable".to_string(),
+                    from: "sql".to_string(),
+                    description: Some("User_Fn description".to_string()),
+                },
+                ListFunctionElement {
+                    name: "Remote_Fn".to_string(),
+                    kind: "scalar".to_string(),
+                    volatility: "stable".to_string(),
+                    from: "https://example.com/udf".to_string(),
+                    description: Some("Remote_Fn description".to_string()),
+                },
+            ]
         );
     }
 

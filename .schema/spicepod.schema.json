@@ -3506,7 +3506,7 @@
           ]
         },
         "body_ref": {
-          "description": "Reference to a file whose contents are the function body. Path is\nresolved relative to the runtime's current working directory, matching\nthe convention used by every other file-path field in spicepod. Lets\nauthors keep non-trivial SQL in its own file with proper editor support\ninstead of embedding it inline.\n\nMutually exclusive with [`body`].",
+          "description": "Reference to a local filesystem file whose contents are the function\nbody. Path is resolved relative to the runtime's current working\ndirectory. `body_ref` is not read from object stores when a spicepod is\nloaded remotely; use inline [`body`] for portable remote spicepods.\nLets authors keep non-trivial SQL in its own file with proper editor\nsupport instead of embedding it inline.\n\nMutually exclusive with [`body`].",
           "type": [
             "string",
             "null"
