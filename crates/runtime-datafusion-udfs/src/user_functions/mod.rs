@@ -24,13 +24,6 @@ limitations under the License.
 //!   * **T2 Remote** via `from: http://…` and `from: https://…` —
 //!     HTTP + JSON endpoint invoked through [`AsyncScalarUDFImpl`].
 //!
-//! On the roadmap:
-//!
-//!   * **T1 WASM** via `from: wasm:…` — WebAssembly component running
-//!     under `wasmtime`.
-//!   * Additional remote transports (`flight://…`, `grpc://…`) and
-//!     UDAF / UDWF / UDTF kinds.
-//!
 //! Unsupported schemes are rejected at build time with
 //! [`UserFunctionError::UnsupportedScheme`].
 
@@ -38,16 +31,15 @@ use std::sync::Arc;
 
 use datafusion::logical_expr::ScalarUDF;
 use snafu::Snafu;
-use spicepod::component::function::{Function, FunctionKind};
+use spicepod::component::function::Function;
 
+mod arrow_type;
 pub mod remote;
 pub mod sql;
 
 /// What a factory produces once a [`Function`] declaration has been
 /// compiled and validated.
 ///
-/// Today only [`BuiltFunction::Scalar`] is produced; aggregate, window,
-/// and table variants will land alongside their tier-specific factories.
 #[derive(Clone, Debug)]
 pub enum BuiltFunction {
     Scalar(Arc<ScalarUDF>),
@@ -61,17 +53,11 @@ pub enum BuiltFunction {
 #[snafu(visibility(pub(crate)))]
 pub enum UserFunctionError {
     #[snafu(display(
-        "Failed to register function {name}: the `from` scheme '{scheme}' is not yet supported. \
-        Supported schemes: `sql`, `http://`, `https://`. WASM (`wasm:...`) ships in a later phase. \
+        "Failed to register function {name}: the `from` scheme '{scheme}' is unsupported. \
+        Supported schemes: `sql`, `http://`, `https://`. \
         See: https://spiceai.org/docs/reference/spicepod/functions"
     ))]
     UnsupportedScheme { name: String, scheme: String },
-
-    #[snafu(display(
-        "Failed to register function {name}: kind '{kind:?}' is not yet supported. \
-        Only `kind: scalar` is supported today; aggregate, window, and table UDFs ship with later phases."
-    ))]
-    UnsupportedKind { name: String, kind: FunctionKind },
 
     #[snafu(display(
         "Failed to register function {name}: one of `body:` or `body_ref:` is required when `from: sql` but neither was provided."
@@ -113,7 +99,7 @@ pub enum UserFunctionError {
 pub type Result<T, E = UserFunctionError> = std::result::Result<T, E>;
 
 /// Split `from:` into `(scheme, tail)` — e.g. `sql` → (`"sql"`, `""`),
-/// `wasm:./x.wasm` → (`"wasm"`, `"./x.wasm"`), `http://host/p` →
+/// `http://host/p` →
 /// (`"http"`, `"//host/p"`). The scheme is lowercased for matching.
 fn split_scheme(from: &str) -> (String, &str) {
     match from.find(':') {
@@ -129,9 +115,8 @@ fn split_scheme(from: &str) -> (String, &str) {
 /// # Errors
 ///
 /// Returns [`UserFunctionError`] when the `from:` scheme is unsupported,
-/// the [`FunctionKind`] is not yet implemented, the SQL body is missing
-/// for a SQL function, or the tier-specific factory (`sql` / `remote`)
-/// returns a build error.
+/// the SQL body is missing for a SQL function, or the tier-specific factory
+/// (`sql` / `remote`) returns a build error.
 pub async fn build_function(decl: &Function) -> Result<BuiltFunction> {
     let (scheme, _tail) = split_scheme(&decl.from);
 
@@ -147,13 +132,6 @@ pub async fn build_function(decl: &Function) -> Result<BuiltFunction> {
 }
 
 fn build_remote(decl: &Function) -> Result<BuiltFunction> {
-    if decl.kind != FunctionKind::Scalar {
-        return UnsupportedKindSnafu {
-            name: decl.name.clone(),
-            kind: decl.kind,
-        }
-        .fail();
-    }
     if decl.body.is_some() || decl.body_ref.is_some() {
         return UnexpectedBodySnafu {
             name: decl.name.clone(),
@@ -168,13 +146,6 @@ fn build_remote(decl: &Function) -> Result<BuiltFunction> {
 }
 
 async fn build_sql(decl: &Function) -> Result<BuiltFunction> {
-    if decl.kind != FunctionKind::Scalar {
-        return UnsupportedKindSnafu {
-            name: decl.name.clone(),
-            kind: decl.kind,
-        }
-        .fail();
-    }
     let body = resolve_body(decl).await?;
     let udf = sql::build_scalar_udf(decl, &body).map_err(|source| UserFunctionError::Sql {
         name: decl.name.clone(),
@@ -236,22 +207,18 @@ mod tests {
     fn split_scheme_variants() {
         assert_eq!(split_scheme("sql"), ("sql".to_string(), ""));
         assert_eq!(
-            split_scheme("wasm:./x.wasm"),
-            ("wasm".to_string(), "./x.wasm")
-        );
-        assert_eq!(
             split_scheme("HTTP://host/p"),
             ("http".to_string(), "//host/p")
         );
     }
 
-    fn decl(from: &str, kind: FunctionKind, body: Option<&str>) -> Function {
+    fn decl(from: &str, body: Option<&str>) -> Function {
         Function {
             name: "f".into(),
             from: from.into(),
             enabled: true,
             description: None,
-            kind,
+            kind: spicepod::component::function::FunctionKind::Scalar,
             volatility: spicepod::component::function::Volatility::Immutable,
             signature: spicepod::component::function::Signature {
                 args: vec![spicepod::component::function::FunctionArg {
@@ -259,8 +226,6 @@ mod tests {
                     arrow_type: "int64".into(),
                 }],
                 returns: Some("int64".into()),
-                returns_schema: vec![],
-                null_aware: false,
             },
             body: body.map(str::to_string),
             body_ref: None,
@@ -274,27 +239,18 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_scheme_rejected() {
-        let d = decl("wasm:./x.wasm", FunctionKind::Scalar, None);
+        let d = decl("file:///tmp/f", None);
         let err = build_function(&d)
             .await
-            .expect_err("wasm unsupported in phase 1");
+            .expect_err("file scheme unsupported in beta");
         let msg = err.to_string();
-        assert!(msg.contains("not yet supported"), "{msg}");
-        assert!(msg.contains("wasm"), "{msg}");
-    }
-
-    #[tokio::test]
-    async fn unsupported_kind_rejected() {
-        let d = decl("sql", FunctionKind::Aggregate, Some("sum(x)"));
-        let err = build_function(&d)
-            .await
-            .expect_err("aggregate unsupported in phase 1");
-        assert!(err.to_string().contains("Aggregate"));
+        assert!(msg.contains("unsupported"), "{msg}");
+        assert!(msg.contains("file"), "{msg}");
     }
 
     #[tokio::test]
     async fn sql_missing_body_rejected() {
-        let d = decl("sql", FunctionKind::Scalar, None);
+        let d = decl("sql", None);
         let err = build_function(&d).await.expect_err("sql without body");
         let msg = err.to_string();
         assert!(msg.contains("`body:` or `body_ref:`"), "{msg}");
@@ -302,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn sql_conflicting_body_and_ref_rejected() {
-        let mut d = decl("sql", FunctionKind::Scalar, Some("x"));
+        let mut d = decl("sql", Some("x"));
         d.body_ref = Some("./ignored.sql".into());
         let err = build_function(&d)
             .await
@@ -316,7 +272,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("spice_udf_body_ref_test.sql");
         std::fs::write(&tmp, "x + 1").expect("write tmp body");
 
-        let mut d = decl("sql", FunctionKind::Scalar, None);
+        let mut d = decl("sql", None);
         d.body_ref = Some(tmp.to_string_lossy().into_owned());
         // Force known return type to avoid needing SQL planner in the test.
         let built = build_function(&d).await.expect("builds");
@@ -331,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn sql_body_ref_missing_file_surfaces_io_error() {
-        let mut d = decl("sql", FunctionKind::Scalar, None);
+        let mut d = decl("sql", None);
         d.body_ref = Some("/nonexistent/path/to/body.sql".into());
         let err = build_function(&d).await.expect_err("missing file");
         let msg = err.to_string();
@@ -340,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_sql_with_body_rejected() {
-        let d = decl("http://example.com/f", FunctionKind::Scalar, Some("x + 1"));
+        let d = decl("http://example.com/f", Some("x + 1"));
         let err = build_function(&d)
             .await
             .expect_err("body forbidden on remote");
@@ -403,8 +359,6 @@ mod tests {
                     arrow_type: "int64".into(),
                 }],
                 returns: Some("int64".into()),
-                returns_schema: vec![],
-                null_aware: false,
             },
             body: None,
             body_ref: None,
@@ -457,7 +411,7 @@ mod tests {
         use datafusion::prelude::SessionContext;
         use std::sync::Arc;
 
-        let mut d = decl("sql", FunctionKind::Scalar, Some("x * 2"));
+        let mut d = decl("sql", Some("x * 2"));
         d.name = "double_it".into();
         let built = build_function(&d).await.expect("builds");
 

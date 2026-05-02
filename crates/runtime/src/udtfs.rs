@@ -56,9 +56,9 @@ impl TableFunctionImpl for ListUDFTableFunc {
 /// Columns:
 ///   * `name` — UDF identifier (Utf8, NOT NULL)
 ///   * `source` — `"builtin"` for Spice / `DataFusion` built-ins, `"user"` for functions declared in a spicepod's `functions:` section
-///   * `kind` — `"scalar"` | `"aggregate"` | `"window"` | `"table"` (NULL for built-ins whose kind we cannot cheaply introspect)
+///   * `kind` — `"scalar"` for beta user-defined functions (NULL for built-ins whose kind we cannot cheaply introspect)
 ///   * `volatility` — `"immutable"` | `"stable"` | `"volatile"` (NULL for built-ins)
-///   * `from` — source URI for user functions (`sql`, `wasm:...`, `http://...`), NULL for built-ins
+///   * `from` — source URI for user functions (`sql`, `http://...`, `https://...`), NULL for built-ins
 ///   * `description` — free-form description, NULL when not provided
 #[derive(Debug)]
 pub struct ListUDFTable {

@@ -155,17 +155,17 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     register_user_functions(runtime, ctx).await;
 }
 
-/// Emits the user-defined functions ALPHA warning at most once per
+/// Emits the user-defined functions BETA warning at most once per
 /// process. Called from both startup registration and hot-reload so the
 /// user sees it whenever a `functions:` entry becomes active for the
 /// first time.
-fn warn_alpha_once() {
-    static ALPHA_WARNING: std::sync::Once = std::sync::Once::new();
-    ALPHA_WARNING.call_once(|| {
+fn warn_beta_once() {
+    static BETA_WARNING: std::sync::Once = std::sync::Once::new();
+    BETA_WARNING.call_once(|| {
         tracing::warn!(
-            "User-defined functions (spicepod `functions:` section) are in ALPHA. \
-             They are not yet supported for production use; behavior, APIs, and on-disk \
-             format may change without notice. See: \
+            "User-defined scalar functions (spicepod `functions:` section) are in BETA. \
+             Supported sources are `sql`, `http://`, and `https://`; APIs and on-disk \
+             format may change before general availability. See: \
              https://spiceai.org/docs/reference/spicepod/functions"
         );
     });
@@ -185,7 +185,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
         return;
     }
 
-    warn_alpha_once();
+    warn_beta_once();
 
     let enabled_functions = enabled_function_declarations(&app.functions);
     if enabled_functions.is_empty() {
@@ -313,13 +313,7 @@ fn enabled_function_declarations(
 }
 
 fn info_from_decl(decl: &spicepod::component::function::Function) -> UserFunctionInfo {
-    use spicepod::component::function::{FunctionKind, Volatility};
-    let kind = match decl.kind {
-        FunctionKind::Scalar => "scalar",
-        FunctionKind::Aggregate => "aggregate",
-        FunctionKind::Window => "window",
-        FunctionKind::Table => "table",
-    };
+    use spicepod::component::function::Volatility;
     let volatility = match decl.volatility {
         Volatility::Immutable => "immutable",
         Volatility::Stable => "stable",
@@ -327,7 +321,7 @@ fn info_from_decl(decl: &spicepod::component::function::Function) -> UserFunctio
     };
     UserFunctionInfo {
         name: decl.name.clone(),
-        kind: kind.to_string(),
+        kind: "scalar".to_string(),
         volatility: volatility.to_string(),
         from: decl.from.clone(),
         description: decl.description.clone(),
@@ -416,7 +410,7 @@ pub async fn apply_function_diff(
     for (next, built) in built {
         match built {
             runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
-                warn_alpha_once();
+                warn_beta_once();
                 if let Some(existing_name) = registered_scalar_udf_name(ctx, &next.name) {
                     tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
                     continue;
@@ -728,8 +722,6 @@ mod tests {
                     arrow_type: "int64".to_string(),
                 }],
                 returns: Some("int64".to_string()),
-                returns_schema: vec![],
-                null_aware: false,
             },
             body: Some("x".to_string()),
             body_ref: None,

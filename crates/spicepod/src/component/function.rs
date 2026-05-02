@@ -24,27 +24,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A user-defined SQL function registered into the `DataFusion` session context.
-///
-/// Four kinds are defined:
-///   * [`FunctionKind::Scalar`] — row-in, row-out (one result value per input row).
-///   * [`FunctionKind::Aggregate`] — many-rows-in, one-value-out.
-///   * [`FunctionKind::Window`] — row-in + frame, row-out.
-///   * [`FunctionKind::Table`] — args-in, many-rows-out (UDTF).
-///
-/// Today only [`FunctionKind::Scalar`] is wired end-to-end; the other kinds
-/// parse but are rejected at registration time until their factories ship.
+/// A user-defined scalar SQL function registered into the `DataFusion` session context.
 ///
 /// The `from` field selects the execution tier:
 ///   * `sql` — inline SQL body (tier T0, in-process, no sandbox).
 ///   * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).
-///   * `wasm:./path.wasm` | `wasm:oci://…` — WebAssembly component (tier T1, sandboxed, roadmap).
-///   * `grpc://…` | `flight://…` — additional remote transports (roadmap).
 ///
-/// Currently registered at runtime: `sql`, `http://…`, `https://…`. Other
-/// schemes are accepted by the parser (so forward-compatible spicepods
-/// load) but rejected at registration time with a clear error until their
-/// factories ship.
+/// Supported at runtime: `sql`, `http://…`, `https://…`.
 ///
 /// Registration is disabled by default. Set `runtime.functions.enabled: true`
 /// in the spicepod to activate declared functions.
@@ -56,8 +42,8 @@ pub struct Function {
     /// session context and referenced by in SQL queries.
     pub name: String,
 
-    /// Source URI selecting the execution tier (e.g. `sql`, `wasm:./x.wasm`,
-    /// `http://host/path`). See [`Function`] docs for the full scheme list.
+    /// Source URI selecting the execution tier (e.g. `sql`, `http://host/path`).
+    /// See [`Function`] docs for the full scheme list.
     pub from: String,
 
     /// Whether this function should be registered. Defaults to `true`.
@@ -73,7 +59,7 @@ pub struct Function {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// Function kind — scalar, aggregate, window, or table (UDTF).
+    /// Function kind. Only scalar functions are supported in the beta surface.
     /// Defaults to [`FunctionKind::Scalar`].
     #[serde(default)]
     pub kind: FunctionKind,
@@ -107,9 +93,8 @@ pub struct Function {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, Value>,
 
-    /// Tier-specific parameters (e.g. transport settings for remote tiers,
-    /// capability grants for WASM). Supports `${ secrets:KEY }` / `${ env:KEY }`
-    /// interpolation at registration time.
+    /// Tier-specific parameters (e.g. transport settings for remote tiers).
+    /// Supports `${ secrets:KEY }` / `${ env:KEY }` interpolation at registration time.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub params: HashMap<String, Value>,
 
@@ -132,16 +117,13 @@ pub struct Function {
     pub as_tool: bool,
 }
 
-/// Distinguishes the four `DataFusion` UDF flavours.
+/// Function kind. The beta user-defined-function surface supports scalar functions.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum FunctionKind {
     #[default]
     Scalar,
-    Aggregate,
-    Window,
-    Table,
 }
 
 /// Function volatility — mirrors [`datafusion_expr::Volatility`].
@@ -167,9 +149,7 @@ pub enum Volatility {
 
 /// Typed function signature.
 ///
-/// For scalar / aggregate / window functions, `returns` names the output
-/// Arrow type. For table functions (UDTFs), `returns_schema` names the
-/// output columns instead.
+/// `returns` names the output Arrow type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -178,21 +158,9 @@ pub struct Signature {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<FunctionArg>,
 
-    /// Return Arrow type. Required for non-table kinds; ignored for
-    /// [`FunctionKind::Table`].
+    /// Return Arrow type. Required for scalar functions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<String>,
-
-    /// Output schema for table functions. Required for
-    /// [`FunctionKind::Table`]; ignored otherwise.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub returns_schema: Vec<FunctionArg>,
-
-    /// Reserved for future NULL-handling behavior. This setting is parsed
-    /// and preserved today, but scalar function factories do not yet change
-    /// runtime NULL evaluation based on it.
-    #[serde(default)]
-    pub null_aware: bool,
 }
 
 /// A single named argument or output column.
@@ -270,21 +238,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_table_function() {
-        let src = r"
+    fn rejects_non_scalar_kind() {
+        let src = r#"
             name: split_lines
-            from: wasm:./funcs/split.wasm
+                        from: sql
             kind: table
             signature:
               args: [{ name: doc, type: utf8 }]
-              returns_schema:
-                - { name: line_no, type: int64 }
-                - { name: line,    type: utf8 }
-        ";
-        let f: Function = yaml::from_str(src).expect("parses");
-        assert_eq!(f.kind, FunctionKind::Table);
-        assert_eq!(f.signature.returns_schema.len(), 2);
-        assert!(f.signature.returns.is_none());
+                            returns: utf8
+                        body: doc
+            "#;
+        yaml::from_str::<Function>(src).expect_err("table functions are not in beta");
     }
 
     #[test]
@@ -301,7 +265,6 @@ mod tests {
         assert_eq!(f.kind, FunctionKind::Scalar);
         assert!(f.enabled);
         assert_eq!(f.volatility, Volatility::Volatile);
-        assert!(!f.signature.null_aware);
     }
 
     #[test]
@@ -344,8 +307,6 @@ mod tests {
             signature: Signature {
                 args: vec![],
                 returns: Some("int64".into()),
-                returns_schema: vec![],
-                null_aware: false,
             },
             body: Some("1".into()),
             body_ref: None,

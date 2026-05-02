@@ -3312,7 +3312,7 @@
       ]
     },
     "Signature": {
-      "description": "Typed function signature.\n\nFor scalar / aggregate / window functions, `returns` names the output\nArrow type. For table functions (UDTFs), `returns_schema` names the\noutput columns instead.",
+      "description": "Typed function signature.\n\n`returns` names the output Arrow type.",
       "type": "object",
       "properties": {
         "args": {
@@ -3323,23 +3323,11 @@
           }
         },
         "returns": {
-          "description": "Return Arrow type. Required for non-table kinds; ignored for\n[`FunctionKind::Table`].",
+          "description": "Return Arrow type. Required for scalar functions.",
           "type": [
             "string",
             "null"
           ]
-        },
-        "returns_schema": {
-          "description": "Output schema for table functions. Required for\n[`FunctionKind::Table`]; ignored otherwise.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/FunctionArg"
-          }
-        },
-        "null_aware": {
-          "description": "Reserved for future NULL-handling behavior. This setting is parsed\nand preserved today, but scalar function factories do not yet change\nruntime NULL evaluation based on it.",
-          "type": "boolean",
-          "default": false
         }
       },
       "additionalProperties": false
@@ -3486,7 +3474,7 @@
       ]
     },
     "Function": {
-      "description": "A user-defined SQL function registered into the `DataFusion` session context.\n\nFour kinds are defined:\n  * [`FunctionKind::Scalar`] — row-in, row-out (one result value per input row).\n  * [`FunctionKind::Aggregate`] — many-rows-in, one-value-out.\n  * [`FunctionKind::Window`] — row-in + frame, row-out.\n  * [`FunctionKind::Table`] — args-in, many-rows-out (UDTF).\n\nToday only [`FunctionKind::Scalar`] is wired end-to-end; the other kinds\nparse but are rejected at registration time until their factories ship.\n\nThe `from` field selects the execution tier:\n  * `sql` — inline SQL body (tier T0, in-process, no sandbox).\n  * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).\n  * `wasm:./path.wasm` | `wasm:oci://…` — WebAssembly component (tier T1, sandboxed, roadmap).\n  * `grpc://…` | `flight://…` — additional remote transports (roadmap).\n\nCurrently registered at runtime: `sql`, `http://…`, `https://…`. Other\nschemes are accepted by the parser (so forward-compatible spicepods\nload) but rejected at registration time with a clear error until their\nfactories ship.\n\nRegistration is disabled by default. Set `runtime.functions.enabled: true`\nin the spicepod to activate declared functions.",
+      "description": "A user-defined scalar SQL function registered into the `DataFusion` session context.\n\nThe `from` field selects the execution tier:\n  * `sql` — inline SQL body (tier T0, in-process, no sandbox).\n  * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).\n\nSupported at runtime: `sql`, `http://…`, `https://…`.\n\nRegistration is disabled by default. Set `runtime.functions.enabled: true`\nin the spicepod to activate declared functions.",
       "type": "object",
       "properties": {
         "name": {
@@ -3494,7 +3482,7 @@
           "type": "string"
         },
         "from": {
-          "description": "Source URI selecting the execution tier (e.g. `sql`, `wasm:./x.wasm`,\n`http://host/path`). See [`Function`] docs for the full scheme list.",
+          "description": "Source URI selecting the execution tier (e.g. `sql`, `http://host/path`).\nSee [`Function`] docs for the full scheme list.",
           "type": "string"
         },
         "enabled": {
@@ -3510,7 +3498,7 @@
           ]
         },
         "kind": {
-          "description": "Function kind — scalar, aggregate, window, or table (UDTF).\nDefaults to [`FunctionKind::Scalar`].",
+          "description": "Function kind. Only scalar functions are supported in the beta surface.\nDefaults to [`FunctionKind::Scalar`].",
           "$ref": "#/$defs/FunctionKind",
           "default": "scalar"
         },
@@ -3543,7 +3531,7 @@
           "additionalProperties": true
         },
         "params": {
-          "description": "Tier-specific parameters (e.g. transport settings for remote tiers,\ncapability grants for WASM). Supports `${ secrets:KEY }` / `${ env:KEY }`\ninterpolation at registration time.",
+          "description": "Tier-specific parameters (e.g. transport settings for remote tiers).\nSupports `${ secrets:KEY }` / `${ env:KEY }` interpolation at registration time.",
           "type": "object",
           "additionalProperties": true
         },
@@ -3579,13 +3567,10 @@
       ]
     },
     "FunctionKind": {
-      "description": "Distinguishes the four `DataFusion` UDF flavours.",
+      "description": "Function kind. The beta user-defined-function surface supports scalar functions.",
       "type": "string",
       "enum": [
-        "scalar",
-        "aggregate",
-        "window",
-        "table"
+        "scalar"
       ]
     },
     "Volatility": {

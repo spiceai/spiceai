@@ -312,8 +312,6 @@ mod tests {
                 arrow_type: "int64".into(),
             }],
             returns: None,
-            returns_schema: vec![],
-            null_aware: false,
         };
         let err = build_scalar_udf(Arc::new(StubTool), "stub", &sig).expect_err("missing return");
         assert!(matches!(err, ToolUdfBuildError::MissingReturnType { .. }));

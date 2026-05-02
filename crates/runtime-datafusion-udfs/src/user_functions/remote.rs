@@ -21,20 +21,19 @@ limitations under the License.
 //!   * Response: HTTP 200 with body `{"values": [<row_0_result>, <row_1_result>, ...]}`.
 //!   * `values.len()` MUST equal `rows.len()`; mismatch is an error.
 //!
-//! Inputs are grouped into `batch_size` chunks; chunks are issued
-//! sequentially today (parallel fan-out will land with the rate-control
-//! integration in a later pass).
+//! Inputs are grouped into `batch_size` chunks; up to `batch_concurrency`
+//! chunks are issued in parallel, while results are appended in input order.
 //!
 //! This tier backs both `http://` / `https://` `from:` schemes.
 //!
 //! ### `params:` knobs
 //!   * `timeout` — per-call timeout, default `30s`. Plain integer (seconds) or `Ns` / `Nms` suffix strings.
 //!   * `batch_size` — rows per HTTP request, default `1024`.
+//!   * `batch_concurrency` — maximum in-flight HTTP batches per invocation, default `4`.
 //!   * `auth_bearer` — optional `Authorization: Bearer <value>` header value (already secret-resolved by the caller).
 //!
-//! Phase 2 first pass: primitive types only (`int64`, `float64`, `utf8`,
-//! `boolean`). Everything else returns a clear `UnsupportedArrowType`
-//! error — consistent with the SQL tier.
+//! Remote beta functions use Arrow's JSON reader/writer, supporting scalar and
+//! complex Arrow types that have a JSON representation.
 
 use std::hash::Hash;
 use std::sync::{
@@ -43,14 +42,18 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use arrow::array::ArrayRef;
-use arrow::datatypes::DataType;
+use arrow::array::{Array, ArrayRef, new_empty_array};
+use arrow::compute::concat;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use arrow_json::{ReaderBuilder, StructMode, writer::JsonArray, writer::WriterBuilder};
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
     Volatility as DfVolatility,
 };
+use futures::{StreamExt, stream};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde_json::{Map, Value};
@@ -63,6 +66,8 @@ static NEXT_REMOTE_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BATCH_SIZE: usize = 1024;
 const MAX_BATCH_SIZE: usize = 100_000;
+const DEFAULT_BATCH_CONCURRENCY: usize = 4;
+const MAX_BATCH_CONCURRENCY: usize = 64;
 
 #[derive(Debug, Snafu)]
 pub enum RemoteBuildError {
@@ -72,8 +77,9 @@ pub enum RemoteBuildError {
     MissingReturnType,
 
     #[snafu(display(
-        "unsupported Arrow type '{arrow_type}' for remote tier — phase 2 supports primitives \
-        (int64, float64, utf8, boolean). Use the T0 SQL tier, or wait for complex-type support."
+        "unsupported or invalid Arrow type '{arrow_type}' for remote UDF signature. \
+        Use Arrow display types like `Int64`, `List(Int64)`, `Struct(\"name\": Utf8)`, \
+        or Spicepod aliases like `int64`, `list<int64>`, `struct<name:utf8>`, `decimal(38,10)`."
     ))]
     UnsupportedArrowType { arrow_type: String },
 
@@ -131,6 +137,7 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
 
     let timeout = parse_timeout(decl.params.get("timeout"))?;
     let batch_size = parse_batch_size(decl.params.get("batch_size"))?;
+    let batch_concurrency = parse_batch_concurrency(decl.params.get("batch_concurrency"))?;
     let auth_bearer = parse_auth_bearer(decl.params.get("auth_bearer"))?;
 
     let mut headers = HeaderMap::new();
@@ -159,6 +166,7 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
         endpoint,
         client,
         batch_size,
+        batch_concurrency,
     };
     let async_udf = AsyncScalarUDF::new(Arc::new(impl_));
     Ok(Arc::new(async_udf.into_scalar_udf()))
@@ -175,6 +183,7 @@ struct RemoteScalarUdf {
     endpoint: Url,
     client: reqwest::Client,
     batch_size: usize,
+    batch_concurrency: usize,
 }
 
 impl PartialEq for RemoteScalarUdf {
@@ -246,27 +255,38 @@ impl AsyncScalarUDFImpl for RemoteScalarUdf {
             .map(|cv| cv.to_array(n))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let mut output =
-            crate::primitive_json_codec::PrimitiveOutputBuilder::new(&self.return_type, n)?;
-
-        let mut offset = 0;
-        while offset < n {
-            let len = std::cmp::min(self.batch_size, n - offset);
-            let rows = self.encode_rows(&arrays, offset, len)?;
-            let values = self.post_batch(rows).await?;
-            if values.len() != len {
-                return Err(DataFusionError::Execution(format!(
-                    "remote function '{}' returned {} values for a batch of {} rows",
-                    self.name,
-                    values.len(),
-                    len
-                )));
-            }
-            output.append_values(&values)?;
-            offset += len;
+        if n == 0 {
+            return Ok(ColumnarValue::Array(new_empty_array(&self.return_type)));
         }
 
-        Ok(ColumnarValue::Array(output.finish()))
+        let mut output_arrays = Vec::new();
+
+        let arrays = arrays.as_slice();
+        let mut batch_stream =
+            stream::iter((0..n).step_by(self.batch_size).map(|offset| async move {
+                let len = std::cmp::min(self.batch_size, n - offset);
+                let rows = self.encode_rows(arrays, offset, len)?;
+                let values = self.post_batch(rows).await?;
+                if values.len() != len {
+                    return Err(DataFusionError::Execution(format!(
+                        "remote function '{}' returned {} values for a batch of {} rows",
+                        self.name,
+                        values.len(),
+                        len
+                    )));
+                }
+                Ok::<_, DataFusionError>(values)
+            }))
+            .buffered(self.batch_concurrency);
+
+        while let Some(values) = batch_stream.next().await {
+            output_arrays.push(self.decode_values(values?)?);
+        }
+
+        Ok(ColumnarValue::Array(concat_arrays(
+            &output_arrays,
+            &self.return_type,
+        )?))
     }
 }
 
@@ -277,22 +297,60 @@ impl RemoteScalarUdf {
         offset: usize,
         len: usize,
     ) -> std::result::Result<Vec<Value>, DataFusionError> {
-        let mut rows = Vec::with_capacity(len);
-        for row_idx in offset..offset + len {
-            let mut obj = Map::with_capacity(self.arg_names.len());
-            for (i, name) in self.arg_names.iter().enumerate() {
-                obj.insert(
-                    name.clone(),
-                    crate::primitive_json_codec::array_cell_to_json(
-                        &arrays[i],
-                        row_idx,
-                        &self.arg_types[i],
-                    )?,
-                );
-            }
-            rows.push(Value::Object(obj));
-        }
-        Ok(rows)
+        let schema = Arc::new(Schema::new(
+            self.arg_names
+                .iter()
+                .zip(&self.arg_types)
+                .map(|(name, data_type)| Field::new(name, data_type.clone(), true))
+                .collect::<Vec<_>>(),
+        ));
+        let columns = arrays
+            .iter()
+            .map(|array| array.slice(offset, len))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(schema, columns)?;
+        record_batch_to_json_rows(&batch, &self.name)
+    }
+
+    fn decode_values(&self, values: Vec<Value>) -> std::result::Result<ArrayRef, DataFusionError> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            self.return_type.clone(),
+            true,
+        )]));
+        let rows = values
+            .into_iter()
+            .map(|value| {
+                let mut row = Map::with_capacity(1);
+                row.insert("value".to_string(), value);
+                Value::Object(row)
+            })
+            .collect::<Vec<_>>();
+        let mut decoder = ReaderBuilder::new(schema)
+            .with_struct_mode(StructMode::ObjectOnly)
+            .build_decoder()
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "remote function '{}' failed to build JSON response decoder: {e}",
+                    self.name
+                ))
+            })?;
+        decoder.serialize(&rows).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "remote function '{}' response values did not match declared return type: {e}",
+                self.name
+            ))
+        })?;
+        let batch = decoder.flush().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "remote function '{}' failed to decode JSON response values: {e}",
+                self.name
+            ))
+        })?;
+        let Some(batch) = batch else {
+            return Ok(new_empty_array(&self.return_type));
+        };
+        Ok(Arc::clone(batch.column(0)))
     }
 
     async fn post_batch(
@@ -448,6 +506,30 @@ fn parse_batch_size(v: Option<&Value>) -> Result<usize> {
     Ok(n)
 }
 
+fn parse_batch_concurrency(v: Option<&Value>) -> Result<usize> {
+    let Some(v) = v else {
+        return Ok(DEFAULT_BATCH_CONCURRENCY);
+    };
+    let n = v.as_u64().ok_or_else(|| RemoteBuildError::InvalidParam {
+        key: "batch_concurrency".into(),
+        expected: "positive integer".into(),
+        got: format!("{v}"),
+    })?;
+    let n = usize::try_from(n).map_err(|_| RemoteBuildError::InvalidParam {
+        key: "batch_concurrency".into(),
+        expected: "positive integer".into(),
+        got: format!("{v}"),
+    })?;
+    if n == 0 || n > MAX_BATCH_CONCURRENCY {
+        return Err(RemoteBuildError::InvalidParam {
+            key: "batch_concurrency".into(),
+            expected: format!("positive integer ≤ {MAX_BATCH_CONCURRENCY}"),
+            got: n.to_string(),
+        });
+    }
+    Ok(n)
+}
+
 fn parse_auth_bearer(v: Option<&Value>) -> Result<Option<String>> {
     match v {
         None | Some(Value::Null) => Ok(None),
@@ -470,16 +552,61 @@ fn map_volatility(v: Volatility) -> DfVolatility {
 }
 
 fn parse_arrow_type(s: &str) -> Result<DataType> {
-    crate::primitive_json_codec::parse_primitive_arrow_type(s).ok_or_else(|| {
-        RemoteBuildError::UnsupportedArrowType {
-            arrow_type: s.to_string(),
-        }
+    super::arrow_type::parse_arrow_type(s).map_err(|_| RemoteBuildError::UnsupportedArrowType {
+        arrow_type: s.to_string(),
+    })
+}
+
+fn record_batch_to_json_rows(
+    batch: &RecordBatch,
+    function_name: &str,
+) -> std::result::Result<Vec<Value>, DataFusionError> {
+    let mut writer = WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .with_struct_mode(StructMode::ObjectOnly)
+        .build::<_, JsonArray>(Vec::new());
+    writer.write_batches(&[batch]).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "remote function '{function_name}' failed to encode request rows as JSON: {e}"
+        ))
+    })?;
+    writer.finish().map_err(|e| {
+        DataFusionError::Execution(format!(
+            "remote function '{function_name}' failed to finish JSON request encoding: {e}"
+        ))
+    })?;
+    serde_json::from_slice::<Vec<Map<String, Value>>>(&writer.into_inner())
+        .map(|rows| rows.into_iter().map(Value::Object).collect())
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "remote function '{function_name}' encoded request rows were not valid JSON: {e}"
+            ))
+        })
+}
+
+fn concat_arrays(
+    arrays: &[ArrayRef],
+    data_type: &DataType,
+) -> std::result::Result<ArrayRef, DataFusionError> {
+    if arrays.is_empty() {
+        return Ok(new_empty_array(data_type));
+    }
+    let array_refs = arrays
+        .iter()
+        .map(|array| array.as_ref() as &dyn Array)
+        .collect::<Vec<_>>();
+    concat(&array_refs).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "failed to concatenate remote UDF response arrays: {e}"
+        ))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Array, ListArray};
+    use datafusion::arrow::datatypes::Int64Type;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -512,8 +639,6 @@ mod tests {
                     arrow_type: "int64".into(),
                 }],
                 returns: Some("int64".into()),
-                returns_schema: vec![],
-                null_aware: false,
             },
             body: None,
             body_ref: None,
@@ -545,9 +670,21 @@ mod tests {
     #[test]
     fn unsupported_arg_type_rejected() {
         let mut d = sample_decl("http://example.com/udf");
-        d.signature.args[0].arrow_type = "binary".into();
-        let err = build_scalar_udf(&d).expect_err("binary not yet supported");
+        d.signature.args[0].arrow_type = "not_a_type".into();
+        let err = build_scalar_udf(&d).expect_err("invalid type rejected");
         assert!(matches!(err, RemoteBuildError::UnsupportedArrowType { .. }));
+    }
+
+    #[test]
+    fn complex_arrow_type_parses_for_remote() {
+        assert_eq!(
+            parse_arrow_type("list<int64>").expect("list parses"),
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true)))
+        );
+        assert_eq!(
+            parse_arrow_type("struct<name:utf8>").expect("struct parses"),
+            DataType::Struct(vec![Field::new("name", DataType::Utf8, true)].into())
+        );
     }
 
     #[test]
@@ -572,6 +709,59 @@ mod tests {
         let d = sample_decl("http://example.com/udf");
         let udf = build_scalar_udf(&d).expect("builds");
         assert_eq!(udf.name(), "remote_fn");
+    }
+
+    #[test]
+    fn batch_concurrency_validates_bounds() {
+        assert_eq!(
+            parse_batch_concurrency(None).expect("default batch concurrency parses"),
+            DEFAULT_BATCH_CONCURRENCY
+        );
+        assert_eq!(
+            parse_batch_concurrency(Some(&Value::Number(8_u64.into())))
+                .expect("explicit batch concurrency parses"),
+            8
+        );
+        assert!(parse_batch_concurrency(Some(&Value::Number(0_u64.into()))).is_err());
+        assert!(parse_batch_concurrency(Some(&Value::String("4".into()))).is_err());
+    }
+
+    #[test]
+    fn complex_json_rows_round_trip() {
+        let list_type = DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true)));
+        let remote = RemoteScalarUdf {
+            id: 0,
+            name: "remote_fn".to_string(),
+            signature: Signature::exact(vec![list_type.clone()], DfVolatility::Volatile),
+            return_type: list_type.clone(),
+            arg_names: vec!["x".to_string()],
+            arg_types: vec![list_type.clone()],
+            endpoint: Url::parse("http://example.com/udf").expect("valid URL"),
+            client: reqwest::Client::new(),
+            batch_size: DEFAULT_BATCH_SIZE,
+            batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
+        };
+        let input: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            None,
+        ]));
+
+        let rows = remote
+            .encode_rows(&[input], 0, 2)
+            .expect("request rows encode");
+        assert_eq!(rows[0], serde_json::json!({"x": [1, 2]}));
+        assert_eq!(rows[1], serde_json::json!({"x": null}));
+
+        let output = remote
+            .decode_values(vec![serde_json::json!([3, 4]), Value::Null])
+            .expect("response values decode");
+        assert_eq!(output.data_type(), &list_type);
+        let list = output
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("list array");
+        assert_eq!(list.value_length(0), 2);
+        assert!(list.is_null(1));
     }
 
     #[tokio::test]

@@ -79,7 +79,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
         })
         .map(|decl| ListFunctionElement {
             name: decl.name.clone(),
-            kind: function_kind(decl.kind).to_string(),
+            kind: "scalar".to_string(),
             volatility: volatility(decl.volatility).to_string(),
             from: decl.from.clone(),
             description: decl.description.clone(),
@@ -87,15 +87,6 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
         .collect();
 
     (StatusCode::OK, Json(functions)).into_response()
-}
-
-fn function_kind(kind: spicepod::component::function::FunctionKind) -> &'static str {
-    match kind {
-        spicepod::component::function::FunctionKind::Scalar => "scalar",
-        spicepod::component::function::FunctionKind::Aggregate => "aggregate",
-        spicepod::component::function::FunctionKind::Window => "window",
-        spicepod::component::function::FunctionKind::Table => "table",
-    }
 }
 
 fn volatility(volatility: spicepod::component::function::Volatility) -> &'static str {
@@ -196,8 +187,6 @@ mod tests {
                     arrow_type: "int64".to_string(),
                 }],
                 returns: Some("int64".to_string()),
-                returns_schema: vec![],
-                null_aware: false,
             },
             body: Some("x".to_string()),
             body_ref: None,

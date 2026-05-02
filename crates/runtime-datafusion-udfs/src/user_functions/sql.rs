@@ -25,9 +25,8 @@ limitations under the License.
 //! Parsing uses a fresh [`SessionContext`], which registers standard
 //! `DataFusion` scalar functions (math, string, datetime, etc.).
 //!
-//! Phase 1 covers the common primitive Arrow types. Complex types (list,
-//! struct, decimal, timestamp with timezone) are on the roadmap — they
-//! return a clear [`SqlBuildError::UnsupportedArrowType`] today.
+//! The beta surface supports scalar and complex Arrow types, including lists,
+//! structs, decimals, and timestamps with timezones.
 
 use std::hash::Hash;
 use std::sync::{
@@ -35,7 +34,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::logical_expr::{
@@ -62,9 +61,9 @@ pub enum SqlBuildError {
     MissingReturnType,
 
     #[snafu(display(
-        "unsupported Arrow type '{arrow_type}' — Phase 1 supports primitives \
-        (int8..64, uint8..64, float32/64, utf8, boolean, binary, date32/64, \
-        and timestamp(<unit>)). Complex types (list, struct, decimal, timestamp+tz) are on the roadmap."
+        "unsupported or invalid Arrow type '{arrow_type}' for SQL UDF signature. \
+        Use Arrow display types like `Int64`, `List(Int64)`, `Struct(\"name\": Utf8)`, \
+        or Spicepod aliases like `int64`, `list<int64>`, `struct<name:utf8>`, `decimal(38,10)`."
     ))]
     UnsupportedArrowType { arrow_type: String },
 
@@ -253,55 +252,19 @@ fn types_compatible(actual: &DataType, declared: &DataType) -> bool {
     )
 }
 
-/// Parse a spicepod arrow-type string into an [`arrow::datatypes::DataType`].
-///
-/// Case-insensitive. Accepts the shorthand names users are likely to type:
-///   * `int8` / `int16` / `int32` / `int64`
-///   * `uint8` / `uint16` / `uint32` / `uint64`
-///   * `float32` / `float64`
-///   * `utf8` / `string` — both map to [`DataType::Utf8`]
-///   * `boolean` / `bool`
-///   * `binary`
-///   * `date32` / `date64`
-///   * `timestamp(s)` / `timestamp(ms)` / `timestamp(us)` / `timestamp(ns)`
-///
-/// Complex types are intentionally rejected in Phase 1.
 fn parse_arrow_type(s: &str) -> Result<DataType> {
-    let t = s.trim().to_ascii_lowercase();
-    let parsed = match t.as_str() {
-        "int8" => DataType::Int8,
-        "int16" => DataType::Int16,
-        "int32" => DataType::Int32,
-        "int64" => DataType::Int64,
-        "uint8" => DataType::UInt8,
-        "uint16" => DataType::UInt16,
-        "uint32" => DataType::UInt32,
-        "uint64" => DataType::UInt64,
-        "float32" => DataType::Float32,
-        "float64" => DataType::Float64,
-        "utf8" | "string" => DataType::Utf8,
-        "boolean" | "bool" => DataType::Boolean,
-        "binary" => DataType::Binary,
-        "date32" => DataType::Date32,
-        "date64" => DataType::Date64,
-        "timestamp(s)" => DataType::Timestamp(TimeUnit::Second, None),
-        "timestamp(ms)" => DataType::Timestamp(TimeUnit::Millisecond, None),
-        "timestamp(us)" => DataType::Timestamp(TimeUnit::Microsecond, None),
-        "timestamp(ns)" => DataType::Timestamp(TimeUnit::Nanosecond, None),
-        _ => {
-            return Err(SqlBuildError::UnsupportedArrowType {
-                arrow_type: s.to_string(),
-            });
-        }
-    };
-    Ok(parsed)
+    super::arrow_type::parse_arrow_type(s).map_err(|_| SqlBuildError::UnsupportedArrowType {
+        arrow_type: s.to_string(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
-    use datafusion::arrow::datatypes::Field as ArrowField;
+    use arrow::array::{
+        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
+    };
+    use datafusion::arrow::datatypes::{Field as ArrowField, Int64Type, TimeUnit};
     use spicepod::component::function::{FunctionArg, FunctionKind, Signature as YamlSignature};
     use std::collections::HashMap;
 
@@ -322,8 +285,6 @@ mod tests {
                     })
                     .collect(),
                 returns: Some(ret.into()),
-                returns_schema: vec![],
-                null_aware: false,
             },
             body: Some(body.into()),
             body_ref: None,
@@ -354,9 +315,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_arrow_type_rejects_complex() {
-        let err = parse_arrow_type("list<int64>").expect_err("list not supported yet");
-        assert!(matches!(err, SqlBuildError::UnsupportedArrowType { .. }));
+    fn parse_arrow_type_complex() {
+        assert_eq!(
+            parse_arrow_type("list<int64>").expect("list parses"),
+            DataType::List(Arc::new(ArrowField::new_list_field(DataType::Int64, true)))
+        );
+        assert_eq!(
+            parse_arrow_type("struct<name:utf8, scores:list<float64>>").expect("struct parses"),
+            DataType::Struct(
+                vec![
+                    ArrowField::new("name", DataType::Utf8, true),
+                    ArrowField::new(
+                        "scores",
+                        DataType::List(Arc::new(ArrowField::new_list_field(
+                            DataType::Float64,
+                            true
+                        ))),
+                        true,
+                    ),
+                ]
+                .into()
+            )
+        );
+        assert_eq!(
+            parse_arrow_type("decimal(38, 10)").expect("decimal parses"),
+            DataType::Decimal128(38, 10)
+        );
+        assert_eq!(
+            parse_arrow_type("timestamp(us, UTC)").expect("timestamp with timezone parses"),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
     }
 
     #[test]
@@ -442,6 +430,39 @@ mod tests {
     }
 
     #[test]
+    fn build_and_invoke_list_identity_udf() {
+        let list_type = DataType::List(Arc::new(ArrowField::new_list_field(DataType::Int64, true)));
+        let d = decl("x", vec![("x", "list<int64>")], "list<int64>");
+        let udf = build_scalar_udf(&d, d.body.as_deref().expect("test")).expect("builds");
+
+        let x: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            None,
+            Some(vec![Some(3)]),
+        ]));
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(x)],
+            arg_fields: vec![Arc::new(ArrowField::new("x", list_type.clone(), true))],
+            number_rows: 3,
+            return_field: Arc::new(ArrowField::new("out", list_type.clone(), true)),
+            config_options: Arc::default(),
+        };
+        let result = udf.inner().invoke_with_args(args).expect("invokes");
+        let array = match result {
+            ColumnarValue::Array(a) => a,
+            ColumnarValue::Scalar(s) => s.to_array().expect("to_array"),
+        };
+        assert_eq!(array.data_type(), &list_type);
+        let list = array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("list array");
+        assert_eq!(list.value_length(0), 2);
+        assert!(list.is_null(1));
+        assert_eq!(list.value_length(2), 1);
+    }
+
+    #[test]
     fn build_math_udf_float64() {
         // Haversine-ish snippet — exercises built-in math functions (cos, sin, acos, radians).
         let d = decl(
@@ -488,7 +509,7 @@ mod tests {
 
     #[test]
     fn unsupported_arg_type_rejected() {
-        let d = decl("x", vec![("x", "list<int64>")], "int64");
+        let d = decl("x", vec![("x", "not_a_type")], "int64");
         let err = build_scalar_udf(&d, d.body.as_deref().expect("test")).expect_err("bad type");
         assert!(matches!(err, SqlBuildError::UnsupportedArrowType { .. }));
     }
