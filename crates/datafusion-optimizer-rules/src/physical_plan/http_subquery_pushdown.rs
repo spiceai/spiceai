@@ -26,7 +26,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{LargeStringArray, StringArray, StringViewArray};
+use datafusion::common::stats::Statistics;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::{
     common::tree_node::{Transformed, TransformedResult, TreeNode},
     config::ConfigOptions,
@@ -35,12 +37,20 @@ use datafusion::{
     physical_expr::expressions::Column,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
+        SortOrderPushdownResult,
         coalesce_partitions::CoalescePartitionsExec,
-        execution_plan::{Boundedness, EmissionType},
+        execution_plan::{
+            Boundedness, CardinalityEffect, EmissionType, InvariantLevel, check_default_invariants,
+        },
+        expressions::PhysicalSortExpr,
+        filter_pushdown::{
+            ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+        },
         joins::HashJoinExec,
         metrics::MetricsSet,
         metrics::{ExecutionPlanMetricsSet, MetricBuilder},
+        projection::ProjectionExec,
         stream::RecordBatchStreamAdapter,
     },
 };
@@ -324,8 +334,16 @@ impl DisplayAs for HttpWithDeferredParamsExec {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for HttpWithDeferredParamsExec {
     fn name(&self) -> &'static str {
+        "HttpWithDeferredParamsExec"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
         "HttpWithDeferredParamsExec"
     }
 
@@ -333,12 +351,122 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         self
     }
 
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::clone(self.properties().eq_properties.schema())
+    }
+
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
 
+    fn check_invariants(&self, check: InvariantLevel) -> Result<(), DataFusionError> {
+        check_default_invariants(self, check)
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![false, false]
+    }
+
+    /// No specific distribution required for either child.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::UnspecifiedDistribution; 2]
+    }
+
+    /// No ordering required for either child.
+    fn required_input_ordering(
+        &self,
+    ) -> Vec<Option<datafusion::physical_expr::OrderingRequirements>> {
+        vec![None, None]
+    }
+
+    /// Neither child benefits from increased parallelism
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false, false]
+    }
+
+    /// Repartitioning is not supported — the true partition count is unknown
+    /// until the build side is materialized at execution time.
+    fn repartitioned(
+        &self,
+        _target_partitions: usize,
+        _config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(None)
+    }
+
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+
+    fn statistics(&self) -> Result<Statistics, DataFusionError> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> Result<Statistics, DataFusionError> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    /// Limit pushdown is not supported — the output stream is assembled
+    /// dynamically at execution time.
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Unknown
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(None)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription, DataFusionError> {
+        Ok(FilterDescription::all_unsupported(
+            &parent_filters,
+            &self.children(),
+        ))
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn with_new_state(
+        &self,
+        _state: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -360,6 +488,11 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
             self.col_name.clone(),
             self.build_col_index,
         )))
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
     }
 
     fn execute(
