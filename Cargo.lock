@@ -5793,6 +5793,7 @@ dependencies = [
  "itertools 0.14.0",
  "object_store",
  "r2d2",
+ "reqwest 0.12.24",
  "snafu",
  "tokio",
  "tonic",
