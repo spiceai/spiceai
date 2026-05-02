@@ -393,7 +393,7 @@ pub(crate) fn routes(
         let mcp_service = StreamableHttpService::new(
             move || Ok(RuntimeServer::from(&runtime_arc)),
             Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
+            StreamableHttpServerConfig::default().disable_allowed_hosts(),
         );
 
         tracing::debug!(
