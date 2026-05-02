@@ -206,6 +206,9 @@ pub enum ComponentStatus {
 
     /// The component is in the process of shutting down
     ShuttingDown,
+
+    /// The component is configured but not loaded yet
+    NotLoaded,
 }
 
 impl ComponentStatus {
@@ -220,6 +223,7 @@ impl ComponentStatus {
             ComponentStatus::Error(_) => 3,
             ComponentStatus::Refreshing => 4,
             ComponentStatus::ShuttingDown => 5,
+            ComponentStatus::NotLoaded => 6,
         }
     }
 
@@ -270,6 +274,7 @@ impl Display for ComponentStatus {
             ComponentStatus::Error(_) => write!(f, "Error"),
             ComponentStatus::Refreshing => write!(f, "Refreshing"),
             ComponentStatus::ShuttingDown => write!(f, "ShuttingDown"),
+            ComponentStatus::NotLoaded => write!(f, "NotLoaded"),
         }
     }
 }
@@ -300,6 +305,7 @@ impl<'de> Deserialize<'de> for ComponentStatus {
             "Error" => Ok(ComponentStatus::Error(None)),
             "Refreshing" => Ok(ComponentStatus::Refreshing),
             "ShuttingDown" => Ok(ComponentStatus::ShuttingDown),
+            "NotLoaded" => Ok(ComponentStatus::NotLoaded),
             other => Err(serde::de::Error::unknown_variant(
                 other,
                 &[
@@ -309,6 +315,7 @@ impl<'de> Deserialize<'de> for ComponentStatus {
                     "Error",
                     "Refreshing",
                     "ShuttingDown",
+                    "NotLoaded",
                 ],
             )),
         }
