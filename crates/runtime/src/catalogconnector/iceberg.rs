@@ -37,7 +37,7 @@ use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::StorageFactory};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog, RestCatalogBuilder,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
+use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use opendal::Operator;
 use secrecy::ExposeSecret;
@@ -112,24 +112,10 @@ impl IcebergCatalog {
 
     async fn load_hadoop_catalog(
         props: HashMap<String, String>,
-        storage_factory: Option<Arc<dyn StorageFactory>>,
+        s3_credential_loader: Option<CustomAwsCredentialLoader>,
         catalog: &Catalog,
         catalog_id: &str,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
-        // Determine storage factory from scheme if not explicitly provided
-        let factory = storage_factory.unwrap_or_else(|| {
-            if catalog_id.starts_with("gs://") || catalog_id.starts_with("gcs://") {
-                Arc::new(OpenDalStorageFactory::Gcs)
-            } else if catalog_id.starts_with("s3://") || catalog_id.starts_with("s3a://") {
-                Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: s3_scheme_from_url(catalog_id),
-                    customized_credential_load: None,
-                })
-            } else {
-                Arc::new(iceberg::io::LocalFsStorageFactory) as Arc<dyn StorageFactory>
-            }
-        });
-
         let operator = build_opendal_operator(catalog_id, &props).map_err(|e| {
             super::Error::InvalidConfiguration {
                 connector: "iceberg".into(),
@@ -140,12 +126,31 @@ impl IcebergCatalog {
         })?;
 
         // Not much we can check with this path for Hadoop, because a namespace could be an empty folder, there could be no namespaces, etc.
-        let catalog_builder = HadoopCatalogBuilder::default()
+        let mut catalog_builder = HadoopCatalogBuilder::default()
             .with_warehouse_root(catalog_id)
             .with_metadata_mode(MetadataMode::Infer)
-            .with_storage_factory(factory)
             .with_operator(operator)
             .with_properties(props);
+
+        // Use a builder closure for the storage factory so that scheme inference
+        // (e.g. inferring `s3a://` from table metadata when the warehouse root is
+        // configured as `s3://`) can rebuild the factory with the new scheme. The
+        // S3 `OpenDalStorageFactory` validates that paths match the configured
+        // scheme, so the factory must be reconstructed when the scheme changes.
+        if catalog_id.starts_with("gs://") || catalog_id.starts_with("gcs://") {
+            catalog_builder =
+                catalog_builder.with_storage_factory(Arc::new(OpenDalStorageFactory::Gcs));
+        } else if catalog_id.starts_with("s3://") || catalog_id.starts_with("s3a://") {
+            catalog_builder = catalog_builder.with_storage_factory_builder(move |scheme| {
+                Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: scheme.to_string(),
+                    customized_credential_load: s3_credential_loader.clone(),
+                })
+            });
+        } else {
+            catalog_builder =
+                catalog_builder.with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory));
+        }
 
         let hadoop_catalog =
             catalog_builder
@@ -337,7 +342,7 @@ impl CatalogConnector for IcebergCatalog {
             }
         }
 
-        let storage_factory: Option<Arc<dyn StorageFactory>> =
+        let s3_credential_loader: Option<CustomAwsCredentialLoader> =
             if let Some(endpoint) = props.get("s3.endpoint") {
                 verify_s3_endpoint(endpoint).await.map_err(|e| {
                     super::Error::InvalidConfiguration {
@@ -376,12 +381,7 @@ impl CatalogConnector for IcebergCatalog {
                     })?
                     .into_custom_loader();
 
-                let configured_scheme = s3_scheme_from_url(&catalog_id);
-
-                Some(Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme,
-                    customized_credential_load: Some(custom_loader),
-                }) as Arc<dyn StorageFactory>)
+                Some(custom_loader)
             } else {
                 None
             };
@@ -394,12 +394,30 @@ impl CatalogConnector for IcebergCatalog {
         {
             return IcebergCatalog::load_hadoop_catalog(
                 props,
-                storage_factory,
+                s3_credential_loader,
                 catalog,
                 &catalog_id,
             )
             .await;
         }
+
+        // For the REST catalog path, materialize the storage factory now so it can
+        // be passed to `get_rest_catalog`. The configured scheme is derived from the
+        // catalog's `warehouse` property (if present) since `catalog_id` is an HTTP
+        // URL for REST catalogs and would otherwise always resolve to plain `s3`.
+        // Falling back to `catalog_id` preserves prior behavior for callers that
+        // do not set a `warehouse` property.
+        let configured_s3_scheme = props.get("warehouse").map_or_else(
+            || s3_scheme_from_url(&catalog_id),
+            |w| s3_scheme_from_url(w),
+        );
+        let storage_factory: Option<Arc<dyn StorageFactory>> =
+            s3_credential_loader.map(|custom_loader| {
+                Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: configured_s3_scheme,
+                    customized_credential_load: Some(custom_loader),
+                }) as Arc<dyn StorageFactory>
+            });
 
         let (base_uri, new_props, namespace) = match parse_catalog_url(catalog_id.as_str()) {
             Ok(result) => result,

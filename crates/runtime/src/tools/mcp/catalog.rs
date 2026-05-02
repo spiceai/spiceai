@@ -18,15 +18,15 @@ use async_openai::types::chat::{ChatCompletionTool, FunctionObject};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
-    RoleClient, ServiceError, ServiceExt,
+    RoleClient, ServiceExt,
     model::{
-        CallToolRequestParam, CallToolResult, ClientCapabilities, ClientInfo, ClientRequest,
-        Extensions, Implementation, InitializeRequestParam, ListToolsResult, PaginatedRequestParam,
-        PingRequest, PingRequestMethod, ProtocolVersion,
+        CallToolRequestParams, CallToolResult, ClientCapabilities, ClientRequest, Implementation,
+        InitializeRequestParams, ListToolsResult, PaginatedRequestParams, PingRequest,
+        ProtocolVersion, ServerResult,
     },
     serve_client,
-    service::RunningService,
-    transport::{ConfigureCommandExt, SseClientTransport, TokioChildProcess},
+    service::{RunningService, ServiceError},
+    transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
 };
 use snafu::ResultExt;
 use std::{
@@ -189,11 +189,11 @@ impl McpToolCatalog {
                     .context(UnderlyingTransportSnafu)?,
                 ))
             }
-            MCPConfig::Https { url } => {
+            MCPConfig::StreamableHttp { url } => {
                 // Security: Validate URL scheme (only https allowed, http for localhost testing)
                 if url.scheme() != "https" && url.scheme() != "http" {
                     return Err(Error::CouldNotConstructTool {
-                        name: "mcp_https".to_string(),
+                        name: "mcp_streamable_http".to_string(),
                         e: format!(
                             "Invalid URL scheme '{}'. Only https:// (or http:// for localhost) allowed",
                             url.scheme()
@@ -211,21 +211,15 @@ impl McpToolCatalog {
                     );
                 }
 
-                let transport = SseClientTransport::start(url.to_string())
-                    .await
-                    .boxed()
-                    .context(UnderlyingTransportSnafu)?;
+                let transport = StreamableHttpClientTransport::from_uri(url.to_string());
 
-                let client_info = ClientInfo {
-                    protocol_version: ProtocolVersion::default(),
-                    capabilities: ClientCapabilities::default(),
-                    client_info: Implementation {
-                        name: "Spice.ai Open Source".to_string(),
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                    },
-                };
+                let client_info = InitializeRequestParams::new(
+                    ClientCapabilities::default(),
+                    Implementation::new("Spice.ai Open Source", env!("CARGO_PKG_VERSION")),
+                )
+                .with_protocol_version(ProtocolVersion::default());
 
-                Ok(McpClient::Sse(
+                Ok(McpClient::Http(
                     client_info
                         .serve(transport)
                         .await
@@ -258,9 +252,9 @@ impl McpToolCatalog {
                 .client
                 .read()
                 .await
-                .list_tools(Some(PaginatedRequestParam {
-                    cursor: cursor.clone(),
-                }))
+                .list_tools(Some(
+                    PaginatedRequestParams::default().with_cursor(cursor.clone()),
+                ))
                 .await?;
 
             // Security: Validate total tools count to prevent memory exhaustion
@@ -305,9 +299,9 @@ impl McpToolCatalog {
                 .client
                 .read()
                 .await
-                .list_tools(Some(PaginatedRequestParam {
-                    cursor: cursor.clone(),
-                }))
+                .list_tools(Some(
+                    PaginatedRequestParams::default().with_cursor(cursor.clone()),
+                ))
                 .await?;
             if let Some(t) = response.tools.iter().find(|t| t.name == name) {
                 return Ok(Some(t.clone()));
@@ -323,39 +317,46 @@ impl McpToolCatalog {
 
 pub enum McpClient {
     Stdio(RunningService<RoleClient, ()>),
-    Sse(RunningService<RoleClient, InitializeRequestParam>),
+    Http(RunningService<RoleClient, InitializeRequestParams>),
 }
 
 impl McpClient {
     pub async fn list_tools(
         &self,
-        params: Option<PaginatedRequestParam>,
+        params: Option<PaginatedRequestParams>,
     ) -> Result<ListToolsResult, ServiceError> {
         match self {
             McpClient::Stdio(s) => s.list_tools(params).await,
-            McpClient::Sse(s) => s.list_tools(params).await,
+            McpClient::Http(s) => s.list_tools(params).await,
         }
     }
     pub async fn call_tool(
         &self,
-        params: CallToolRequestParam,
+        params: CallToolRequestParams,
     ) -> Result<CallToolResult, ServiceError> {
         match self {
             McpClient::Stdio(s) => s.call_tool(params).await,
-            McpClient::Sse(s) => s.call_tool(params).await,
+            McpClient::Http(s) => s.call_tool(params).await,
         }
     }
 
     pub async fn ping(&self) -> Result<(), ServiceError> {
-        let req = ClientRequest::PingRequest(PingRequest {
-            method: PingRequestMethod,
-            extensions: Extensions::new(),
-        });
-        match self {
-            McpClient::Stdio(s) => s.send_request(req).await,
-            McpClient::Sse(s) => s.send_request(req).await,
+        let result = match self {
+            McpClient::Stdio(s) => {
+                s.peer()
+                    .send_request(ClientRequest::PingRequest(PingRequest::default()))
+                    .await?
+            }
+            McpClient::Http(s) => {
+                s.peer()
+                    .send_request(ClientRequest::PingRequest(PingRequest::default()))
+                    .await?
+            }
+        };
+        match result {
+            ServerResult::EmptyResult(_) => Ok(()),
+            _ => Err(ServiceError::UnexpectedResponse),
         }
-        .map(|_| ())
     }
 }
 

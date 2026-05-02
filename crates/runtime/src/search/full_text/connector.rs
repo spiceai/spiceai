@@ -123,6 +123,16 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.metadata_provider(dataset).await
     }
 
+    async fn register_object_stores(
+        &self,
+        dataset: &Dataset,
+        runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        self.inner_connector
+            .register_object_stores(dataset, runtime_env)
+            .await
+    }
+
     fn initialization(&self) -> ComponentInitialization {
         self.inner_connector.initialization()
     }
@@ -155,6 +165,7 @@ impl DataConnector for FullTextConnector {
         dataset: &Dataset,
         accelerated_table_provider: Arc<dyn TableProvider>,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
             inner.changes_stream(
@@ -162,6 +173,7 @@ impl DataConnector for FullTextConnector {
                 dataset,
                 Arc::clone(&accelerated_table_provider),
                 Arc::clone(&accelerator_write_mutex),
+                cpu_runtime.clone(),
             )
         })
     }

@@ -4,10 +4,12 @@ tests:
     query_set: tpch
     runner_type: spiceai-dev-runners
     validate_results: true
+    ready_wait: 180
   throughput:
     spicepod_path: accelerated/iceberg-duckdb[file].yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
+    ready_wait: 180
   load:
     spicepod_path: accelerated/iceberg-duckdb[file].yaml
     query_set: tpch

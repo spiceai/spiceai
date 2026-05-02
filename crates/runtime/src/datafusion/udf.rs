@@ -17,12 +17,16 @@ limitations under the License.
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
+use crate::datafusion::udtf::flatten_json::{
+    FLATTEN_JSON_UDTF_NAME, FlattenJsonScalar, FlattenJsonTableFunc,
+};
 use crate::datafusion::udtf::json_properties::{
     FLATTEN_JSON_PROPERTIES_UDTF_NAME, FlattenJsonPropertiesScalar, FlattenJsonPropertiesTableFunc,
 };
 use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, JsonTreeTableFunc};
 use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
 use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
+use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
@@ -41,6 +45,11 @@ use runtime_datafusion_udfs::{
     bucket::{BUCKET_SCALAR_UDF_NAME, Bucket},
     cosine_distance::{COSINE_DISTANCE_UDF_NAME, CosineDistance},
     digest_many::{DIGEST_UDF_NAME, INSTANCE},
+    inner_product::{INNER_PRODUCT_UDF_NAME, InnerProduct},
+    l2_distance::{
+        L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME, L2Distance, L2SquaredDistance,
+    },
+    l2_norm::{L2_NORM_UDF_NAME, L2Norm},
     truncate::{TRUNCATE_SCALAR_UDF_NAME, Truncate},
 };
 
@@ -52,6 +61,10 @@ pub fn register_core_scalar_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
     ctx.register_udf(Bucket::new().into());
     ctx.register_udf(CosineDistance::new().into());
+    ctx.register_udf(InnerProduct::new().into());
+    ctx.register_udf(L2Distance::new().into());
+    ctx.register_udf(L2SquaredDistance::new().into());
+    ctx.register_udf(L2Norm::new().into());
     ctx.register_udf(Truncate::new().into());
     ctx.register_udf(INSTANCE.clone());
 }
@@ -84,14 +97,45 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(rrf::ReciprocalRankFusion::from_ctx(ctx)),
     );
 
-    // `flatten_json_properties` / `json_tree` — JSON-Schema and generic JSON
-    // shredders. Registered as both UDTF (FROM-clause, literal input) and
-    // ScalarUDF returning `List<Struct<...>>` (per-row / LATERAL via UNNEST).
+    // `rerank(input, model => ..., document => ..., ...)` — reorders a
+    // scored result set using a reranker model. Registered as both a scalar
+    // UDF stub (so `rerank(...)` can appear nested inside another UDTF's arg
+    // list, same trick vector_search/text_search/rrf use) and a UDTF (the
+    // actual `FROM rerank(...)` implementation).
+    let session_ctx: Arc<SessionContext> = Arc::clone(ctx);
+    ctx.register_udf(
+        RerankTableFunc::new(
+            Arc::downgrade(&runtime.df),
+            Arc::clone(&session_ctx),
+            runtime.rerankers(),
+            runtime.completion_llms(),
+        )
+        .into(),
+    );
+    ctx.register_udtf(
+        RERANK_UDTF_NAME,
+        Arc::new(RerankTableFunc::new(
+            Arc::downgrade(&runtime.df),
+            session_ctx,
+            runtime.rerankers(),
+            runtime.completion_llms(),
+        )),
+    );
+
+    // `flatten_json_properties` / `flatten_json` / `json_tree` — JSON-Schema
+    // and generic JSON shredders. Registered as both UDTF (FROM-clause,
+    // literal input) and ScalarUDF returning `List<Struct<...>>` (per-row /
+    // LATERAL via UNNEST).
     ctx.register_udtf(
         FLATTEN_JSON_PROPERTIES_UDTF_NAME,
         Arc::new(FlattenJsonPropertiesTableFunc::new()),
     );
     ctx.register_udf(FlattenJsonPropertiesScalar::new().into());
+    ctx.register_udtf(
+        FLATTEN_JSON_UDTF_NAME,
+        Arc::new(FlattenJsonTableFunc::new()),
+    );
+    ctx.register_udf(FlattenJsonScalar::new().into());
     ctx.register_udtf(JSON_TREE_UDTF_NAME, Arc::new(JsonTreeTableFunc::new()));
     ctx.register_udf(JsonTreeScalar::new().into());
 
@@ -106,37 +150,67 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     }
 }
 
-static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(|| {
+/// Returns the full list of Spice-specific scalar function names denied for
+/// federation by default.
+fn denied_spice_function_names() -> Vec<String> {
     let builtin = [
         "rand",
         BUCKET_SCALAR_UDF_NAME,
         COSINE_DISTANCE_UDF_NAME,
+        INNER_PRODUCT_UDF_NAME,
+        L2_DISTANCE_UDF_NAME,
+        L2_SQUARED_DISTANCE_UDF_NAME,
+        L2_NORM_UDF_NAME,
         TRUNCATE_SCALAR_UDF_NAME,
         EMBED_UDF_NAME,
         #[cfg(feature = "models")]
         AI_UDF_NAME,
         DIGEST_UDF_NAME,
         FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+        FLATTEN_JSON_UDTF_NAME,
         JSON_TREE_UDTF_NAME,
+        RERANK_UDTF_NAME,
     ];
 
+    builtin
+        .iter()
+        .map(ToString::to_string)
+        .chain(json_functions())
+        .collect()
+}
+
+static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(|| {
     FunctionSupport::new(
-        Some(FunctionRestriction::Deny(
-            builtin
-                .iter()
-                .map(ToString::to_string)
-                .chain(json_functions())
-                .collect::<Vec<_>>(),
-        )),
+        Some(FunctionRestriction::Deny(denied_spice_function_names())),
         None,
         None,
     )
+});
+
+/// DuckDB-specific deny list — same as the default but allows `cosine_distance`
+/// (`DuckDB` natively supports it via `array_cosine_distance` and the dialect
+/// already translates the call).
+static DENY_SPICE_FUNCTIONS_DUCKDB: LazyLock<FunctionSupport> = LazyLock::new(|| {
+    let names: Vec<String> = denied_spice_function_names()
+        .into_iter()
+        .filter(|n| n != COSINE_DISTANCE_UDF_NAME)
+        .collect();
+    FunctionSupport::new(Some(FunctionRestriction::Deny(names)), None, None)
 });
 
 /// Return the cached [`FunctionSupport`] that denies Spice-specific functions for federation.
 #[must_use]
 pub fn deny_spice_specific_functions() -> &'static FunctionSupport {
     &DENY_SPICE_SPECIFIC_FUNCTIONS
+}
+
+/// Return the cached [`FunctionSupport`] for `DuckDB` accelerators.
+///
+/// Identical to [`deny_spice_specific_functions`] except `cosine_distance` is
+/// allowed (`DuckDB` translates it to `array_cosine_distance`).
+#[must_use]
+pub fn deny_spice_functions_for_duckdb() -> &'static FunctionSupport {
+    &DENY_SPICE_FUNCTIONS_DUCKDB
 }
 
 fn json_functions() -> Vec<String> {
@@ -209,6 +283,7 @@ mod tests {
             spice_udf(Truncate::new()),
             Arc::new(INSTANCE.clone()),
             spice_udf(FlattenJsonPropertiesScalar::new()),
+            spice_udf(FlattenJsonScalar::new()),
             spice_udf(JsonTreeScalar::new()),
         ];
 

@@ -2,7 +2,7 @@ SELECT
     o_orderpriority,
     COUNT(*) AS order_count
 FROM
-    mysql.public.orders
+    mysql.tpch_sf1.orders
 WHERE
     o_orderdate >= DATE '1993-07-01'
     AND o_orderdate < DATE '1993-10-01'
@@ -10,7 +10,7 @@ WHERE
         SELECT
             *
         FROM
-            mysql.public.lineitem
+            mysql.tpch_sf1.lineitem
         WHERE
             l_orderkey = o_orderkey
             AND l_commitdate < l_receiptdate

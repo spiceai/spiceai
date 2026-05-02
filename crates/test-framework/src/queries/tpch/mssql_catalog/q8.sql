@@ -11,14 +11,14 @@ from
             l_extendedprice * (1 - l_discount) as volume,
             n2.n_name as nation
         from
-            mssql.public.part,
-            mssql.public.supplier,
-            mssql.public.lineitem,
-            mssql.public.orders,
-            mssql.public.customer,
-            mssql.public.nation n1,
-            mssql.public.nation n2,
-            mssql.public.region
+            mssql.dbo.part,
+            mssql.dbo.supplier,
+            mssql.dbo.lineitem,
+            mssql.dbo.orders,
+            mssql.dbo.customer,
+            mssql.dbo.nation n1,
+            mssql.dbo.nation n2,
+            mssql.dbo.region
         where
                 p_partkey = l_partkey
           and s_suppkey = l_suppkey

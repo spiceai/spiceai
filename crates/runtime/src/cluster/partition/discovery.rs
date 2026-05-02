@@ -14,11 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+//! Discovery layer: query the federated source for a table's current partition values.
+//!
+//! The only public entry point is [`query_source_partitions`], which is called by
+//! the [`runtime_cluster::context::PartitionDiscoverer`] impl on `DataFusion`. The
+//! diff-and-apply logic lives in `runtime_cluster::service::PartitionService`.
+
+use std::collections::HashMap;
 
 use crate::{
     accelerated_table::AcceleratedTable,
-    cluster::partition::{Error, PartitionDiscoverySnafu, Result, metadata::PartitionValue},
+    cluster::partition::{Error, PartitionDiscoverySnafu, PartitionValue, Result},
     datafusion::DataFusion,
     search::util::find_concrete_table_provider,
 };
@@ -33,15 +39,16 @@ use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 use util::session_state::builder_from_existing;
 
-/// Query the source table provider for partition values for a given table.
+/// Query the source table for the partition values present right now.
 ///
-/// If all partition expressions can be resolved statically (e.g. `bucket(N, col)` produces
-/// `0..N-1`), the values are generated without querying the source table. Otherwise, a
-/// `SELECT DISTINCT` is executed against the federated source.
-pub async fn table_partition_values(
+/// If every partition expression has a statically known value set (e.g.
+/// `bucket(N, col)` produces `0..N-1`), the values are generated without
+/// querying the source. Otherwise a `SELECT DISTINCT` is executed against the
+/// federated source.
+pub(crate) async fn query_source_partitions(
     table: &TableReference,
     partitioning: &[PartitionedBy],
-    df: &Arc<DataFusion>,
+    df: &DataFusion,
 ) -> Result<Vec<PartitionValue>> {
     let table_name = table.to_string();
 
@@ -81,17 +88,13 @@ pub async fn table_partition_values(
 
     let batches = execute_partition_discovery_query(df, table, partition_exprs).await?;
 
-    // Convert record batches to partition value strings
     let mut partition_values = Vec::new();
-
     for batch in batches {
         let num_rows = batch.num_rows();
         let num_cols = batch.num_columns();
 
         for row_idx in 0..num_rows {
-            // Build partition value string from column values
             let mut value_parts = HashMap::new();
-
             for col_idx in 0..num_cols {
                 let column = batch.column(col_idx);
                 let value_str = arrow::util::display::array_value_to_string(column, row_idx)
@@ -103,7 +106,6 @@ pub async fn table_partition_values(
                     value_parts.insert(pname, value_str);
                 }
             }
-
             partition_values.push(value_parts);
         }
     }
@@ -123,7 +125,7 @@ pub async fn table_partition_values(
 /// to query the *federated* table (the source) rather than the accelerated table itself, as the
 /// acceleration will be empty (for schedulers).
 async fn execute_partition_discovery_query(
-    df: &Arc<DataFusion>,
+    df: &DataFusion,
     table: &TableReference,
     partition_exprs: Vec<String>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>> {

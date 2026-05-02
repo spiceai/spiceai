@@ -18,7 +18,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.30",
+      "_score": "0.31",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -27,6 +27,18 @@ expression: "normalize_search_response(resp, round_scores)"
       },
       "primary_key": {
         "id": 1015
+      }
+    },
+    {
+      "_score": "0.30",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "stemic vascular resistance (SVR) by causing vasodilation."
+        ]
+      },
+      "primary_key": {
+        "id": 1035
       }
     },
     {
@@ -39,18 +51,6 @@ expression: "normalize_search_response(resp, round_scores)"
       },
       "primary_key": {
         "id": 551
-      }
-    },
-    {
-      "_score": "0.29",
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "stemic vascular resistance (SVR) by causing vasodilation."
-        ]
-      },
-      "primary_key": {
-        "id": 1035
       }
     }
   ]

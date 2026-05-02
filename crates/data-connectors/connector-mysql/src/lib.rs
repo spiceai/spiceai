@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
+use datafusion_table_providers::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
 use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError, dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
@@ -80,23 +81,62 @@ impl MySQLFactory {
     }
 }
 
+const MYSQL_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/mysql";
+
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("connection_string").secret(),
-    ParameterSpec::component("user").secret(),
-    ParameterSpec::component("pass").secret(),
-    ParameterSpec::component("host"),
-    ParameterSpec::component("tcp_port"),
-    ParameterSpec::component("db"),
-    ParameterSpec::component("sslmode"),
-    ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("connection_string")
+        .description("Full MySQL DSN. Overrides other connection params if set.")
+        .examples(&["mysql://app:secret@db.internal:3306/analytics"])
+        .help_link(MYSQL_DOCS)
+        .secret(),
+    ParameterSpec::component("user")
+        .description("MySQL username.")
+        .help_link(MYSQL_DOCS)
+        .secret(),
+    ParameterSpec::component("pass")
+        .description("MySQL password.")
+        .help_link(MYSQL_DOCS)
+        .secret(),
+    ParameterSpec::component("host")
+        .description("MySQL server hostname or IP.")
+        .examples(&["db.internal", "mysql.cluster"])
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("tcp_port")
+        .description("MySQL TCP port.")
+        .examples(&["3306"])
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("db")
+        .description("Database name.")
+        .examples(&["app", "analytics"])
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("sslmode")
+        .description(
+            "TLS mode for the connection. Common values: 'disabled', 'preferred', 'required'.",
+        )
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("sslrootcert")
+        .description("Path to a PEM-encoded CA certificate used to verify the server when TLS is enabled.")
+        .help_link(MYSQL_DOCS),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
-        .default("1"),
+        .default("1")
+        .help_link(MYSQL_DOCS),
     ParameterSpec::component("pool_max")
         .description("The maximum number of connections created in the connection pool.")
-        .default("5"),
+        .default("5")
+        .help_link(MYSQL_DOCS),
     ParameterSpec::component("time_zone")
-        .description("The time zone to use for the connection. Default is '+00:00' (UTC)."),
+        .description("The time zone to use for the connection. Default is '+00:00' (UTC).")
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("zero_date_behavior")
+        .description(
+            "How to handle the MySQL '0000-00-00' / '0000-00-00 00:00:00' zero-date sentinel for DATE/DATETIME/TIMESTAMP columns. \
+             'null' (default) coerces zero dates to NULL and reports such columns as nullable in the Arrow schema. \
+             'error' fails the scan when a zero date is encountered and honors the source NOT NULL constraint exactly.",
+        )
+        .default("null")
+        .one_of_ignore_ascii_case(&["null", "error"])
+        .help_link(MYSQL_DOCS),
 ];
 
 // https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs#L1053
@@ -149,6 +189,19 @@ impl DataConnectorFactory for MySQLFactory {
                 );
             }
 
+            let zero_date_behavior = match params
+                .parameters
+                .get("zero_date_behavior")
+                .ok()
+                .map(|s| s.expose_secret().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("error") => MysqlZeroDateBehavior::Error,
+                // `one_of_ignore_ascii_case` validation has already rejected anything other
+                // than "null" / "error"; default + any other value falls through to Null.
+                _ => MysqlZeroDateBehavior::Null,
+            };
+
             if let Some(time_zone) = params.parameters.get("time_zone").expose().ok() {
                 // "LOCAL_SYSTEM" value must be replaced with the actual system time zone information.
                 if time_zone.to_uppercase() == "LOCAL_SYSTEM" {
@@ -169,7 +222,7 @@ impl DataConnectorFactory for MySQLFactory {
             }
 
             let pool = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
-                Ok(pool) => Arc::new(pool),
+                Ok(pool) => Arc::new(pool.with_zero_date_behavior(zero_date_behavior)),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword => {
                         return Err(

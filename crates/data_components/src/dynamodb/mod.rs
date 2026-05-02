@@ -21,6 +21,7 @@ use std::sync::Arc;
 use util::format_datafusion_error;
 
 mod arrow;
+pub mod dml;
 mod json_nest;
 pub mod provider;
 mod request_builder;

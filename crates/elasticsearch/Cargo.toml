@@ -19,15 +19,17 @@ name = "elasticsearch"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Elasticsearch client for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+bytes = { workspace = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 

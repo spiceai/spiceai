@@ -6,15 +6,15 @@ SELECT
     o_totalprice,
     SUM(l_quantity)
 FROM
-    mysql.public.customer,
-    mysql.public.orders,
-    mysql.public.lineitem
+    mysql.tpch_sf1.customer,
+    mysql.tpch_sf1.orders,
+    mysql.tpch_sf1.lineitem
 WHERE
     o_orderkey IN (
         SELECT
             l_orderkey
         FROM
-            mysql.public.lineitem
+            mysql.tpch_sf1.lineitem
         GROUP BY
             l_orderkey
         HAVING

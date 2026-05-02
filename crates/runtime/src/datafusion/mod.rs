@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -54,9 +54,11 @@ use {
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
 
+use crate::cluster::partition::service::PartitionService;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
+use async_trait::async_trait;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -73,7 +75,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
-use datafusion::sql::parser::DFParser;
+use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
@@ -112,15 +114,15 @@ pub mod app_context_extension;
 pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
-pub mod composed_catalog;
-pub mod dialect;
-pub mod error;
+pub use runtime_datafusion::composed_catalog;
+pub use runtime_datafusion::dialect;
+pub use runtime_datafusion::error;
 pub mod filter_converter;
 pub mod flight_session_extension;
 pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
-pub mod managed_runtime;
-pub mod param_utils;
+pub use runtime_datafusion::managed_runtime;
+pub use runtime_datafusion::param_utils;
 #[cfg(not(windows))]
 pub mod planner;
 pub mod refresh_sql;
@@ -128,15 +130,15 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
-pub mod sort_columns;
+pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
 pub mod udf;
 pub mod udtf;
 
-pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 pub const SPICE_EVAL_SCHEMA: &str = "eval";
-pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 pub const SPICE_SCP_SCHEMA: &str = "scp";
 
@@ -408,6 +410,12 @@ pub enum Error {
         "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
     ))]
     UnsupportedAccelerationEngineForSnapshots,
+
+    #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {source}"))]
+    PreRefreshPartitionDiscoveryFailed {
+        table_name: String,
+        source: Box<crate::cluster::partition::service::Error>,
+    },
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -533,6 +541,15 @@ struct DeferredTableRegistration {
     connector: Arc<dyn DataConnector>,
 }
 
+#[async_trait]
+pub trait OnDemandTableLoader: Send + Sync {
+    async fn has_on_demand_tables(&self) -> bool;
+    async fn load_on_demand_tables(
+        &self,
+        table_references: Vec<TableReference>,
+    ) -> std::result::Result<(), DataFusionError>;
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -550,6 +567,7 @@ pub struct DataFusion {
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
+    on_demand_table_loader: RwLock<Option<Weak<dyn OnDemandTableLoader>>>,
 
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -570,8 +588,8 @@ pub struct DataFusion {
     /// Registry of connected executor control streams for `PollNow` broadcasts.
     /// Only used in scheduler mode.
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
-    /// Executor registry for distributed write forwarding (scheduler mode only).
-    pub executor_registry: Option<Arc<ExecutorRegistry>>,
+    /// Partition service for discovering/assigning partitions (scheduler mode only).
+    pub(crate) partition_service: Option<Arc<PartitionService>>,
     #[cfg(not(windows))]
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
@@ -619,6 +637,19 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    pub fn set_on_demand_table_loader(&self, loader: Weak<dyn OnDemandTableLoader>) {
+        if let Ok(mut on_demand_table_loader) = self.on_demand_table_loader.write() {
+            *on_demand_table_loader = Some(loader);
+        }
+    }
+
+    fn on_demand_table_loader(&self) -> Option<Arc<dyn OnDemandTableLoader>> {
+        self.on_demand_table_loader
+            .read()
+            .ok()
+            .and_then(|loader| loader.as_ref().and_then(Weak::upgrade))
     }
 
     pub async fn get_table(
@@ -1002,7 +1033,7 @@ impl DataFusion {
         let catalog = self.resolve_catalog_provider(table_reference);
         resolve_table_partition_expr(
             catalog.as_deref(),
-            self.executor_registry.as_deref(),
+            self.executor_registry().map(Arc::as_ref),
             table_reference,
         )
         .await
@@ -1114,6 +1145,33 @@ impl DataFusion {
             })?;
 
         Ok(table_provider)
+    }
+
+    async fn load_on_demand_tables_for_statement(
+        &self,
+        session: &SessionState,
+        statement: &Statement,
+    ) -> Result<(), DataFusionError> {
+        let Some(loader) = self.on_demand_table_loader() else {
+            return Ok(());
+        };
+        if !loader.has_on_demand_tables().await {
+            return Ok(());
+        }
+        let table_refs = session.resolve_table_references(statement)?;
+        loader.load_on_demand_tables(table_refs).await
+    }
+
+    pub async fn load_on_demand_dataset(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<(), DataFusionError> {
+        let Some(loader) = self.on_demand_table_loader() else {
+            return Err(DataFusionError::Execution(format!(
+                "Cannot load on-demand dataset {table_reference}: on-demand loader is not initialized yet"
+            )));
+        };
+        loader.load_on_demand_tables(vec![table_reference]).await
     }
 
     pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
@@ -1361,8 +1419,14 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn table_exists(&self, dataset_name: TableReference) -> bool {
-        self.ctx.table_exist(dataset_name).unwrap_or(false)
+    pub fn table_exists(&self, dataset_name: &TableReference) -> bool {
+        let Some(catalog) = self.resolve_catalog_provider(dataset_name) else {
+            return false;
+        };
+        let Some(s) = Self::resolve_schema_provider(&catalog, dataset_name) else {
+            return false;
+        };
+        s.table_exist(dataset_name.table())
     }
 
     #[must_use]
@@ -1434,7 +1498,16 @@ impl DataFusion {
             .acceleration
             .as_ref()
             .is_some_and(|acc| !acc.on_conflict.is_empty());
-        let needs_source_writes = dataset.access().allows_write() && !has_on_conflict;
+        // When refresh_mode is `changes` (CDC), on_conflict provides WAL UPDATE upsert routing
+        // only — it does not imply accelerator-only writes. Writes should reach the federated
+        // source per write_mode. Without CDC, on_conflict means the source may be read-only and
+        // writes are directed to the accelerator only.
+        let has_changes_refresh = dataset.acceleration.as_ref().is_some_and(|acc| {
+            acc.refresh_mode
+                .is_some_and(|m| matches!(m, RefreshMode::Changes))
+        });
+        let needs_source_writes =
+            dataset.access().allows_write() && (!has_on_conflict || has_changes_refresh);
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
@@ -1822,6 +1895,7 @@ impl DataFusion {
                 dataset,
                 Arc::clone(&accelerated_table_provider),
                 Arc::clone(&accelerator_write_mutex),
+                self.refresh_runtime().cloned(),
             );
 
             if let Some(changes_stream) = changes_stream {
@@ -1850,10 +1924,28 @@ impl DataFusion {
                 .await;
         }
 
-        // When on_conflict is configured, writes go to the accelerated table only,
-        // not to the federated source (which may not support writes).
-        if has_on_conflict {
+        // on_conflict forces accelerator-only writes when CDC is not in use. With CDC
+        // (refresh_mode: changes), on_conflict is for WAL UPDATE upsert routing only and
+        // does not override the write destination — writes follow write_mode instead.
+        if has_on_conflict && !has_changes_refresh {
             accelerated_table_builder.write_to_accelerator_only();
+        } else if dataset.access().allows_write() {
+            match acceleration_settings.write_mode {
+                spicepod::acceleration::WriteMode::WriteBack => {
+                    accelerated_table_builder.write_back();
+                }
+                spicepod::acceleration::WriteMode::WriteThrough
+                    if acceleration_settings.engine == Engine::Cayenne =>
+                {
+                    // write_through with staged commit/rollback is only supported for Cayenne.
+                    // For other engines (e.g. DuckDB + CDC), writes fall through to FederatedOnly:
+                    // the write goes directly to the federated source and CDC propagates it back.
+                    accelerated_table_builder.write_through();
+                }
+                spicepod::acceleration::WriteMode::WriteThrough => {
+                    // FederatedOnly is the default for non-Cayenne engines.
+                }
+            }
         }
 
         accelerated_table_builder.bootstrap_status(bootstrap_status);
@@ -2087,19 +2179,19 @@ impl DataFusion {
     }
 
     pub async fn refresh_table(
-        &self,
+        self: &Arc<Self>,
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
-        // If we're a scheduler with an executor registry, forward refresh to executors
+        // If we're a scheduler with a partition service, forward refresh to executors
         // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
         if matches!(
             self.cluster_config.effective_role(),
             Some(crate::config::ClusterRole::Scheduler)
-        ) && let Some(executor_registry) = &self.executor_registry
+        ) && let Some(partition_service) = &self.partition_service
         {
             return self
-                .forward_refresh_to_executors(executor_registry, dataset_name, overrides.as_ref())
+                .forward_refresh_to_executors(partition_service, dataset_name, overrides.as_ref())
                 .await;
         }
 
@@ -2124,12 +2216,32 @@ impl DataFusion {
 
     /// Forwards a dataset refresh command to all connected executors via the control stream.
     /// Returns `Ok(None)` because the scheduler does not have a local notifier for executor refreshes.
+    ///
+    /// Before forwarding the refresh, runs on-demand partition discovery to ensure new
+    /// partitions are assigned to executors. This prevents data loss when `spice refresh`
+    /// is triggered before the periodic partition management task discovers new partitions.
     async fn forward_refresh_to_executors(
-        &self,
-        executor_registry: &ExecutorRegistry,
+        self: &Arc<Self>,
+        partition_service: &PartitionService,
         dataset_name: &TableReference,
         overrides: Option<&RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
+        // Run on-demand partition discovery before forwarding the refresh command.
+        // This ensures that any new partition values in the source data are discovered,
+        // assigned to executors, and executors are notified -- before they receive the
+        // refresh command. Without this, the periodic partition management task might
+        // not have discovered new partitions yet, causing executors to ignore data from
+        // unassigned partitions. (fixes #10075)
+        partition_service
+            .reconcile_table(dataset_name, self.as_ref())
+            .await
+            .map_err(|source| Error::PreRefreshPartitionDiscoveryFailed {
+                table_name: dataset_name.to_string(),
+                source: Box::new(source),
+            })?;
+
+        let executor_registry = &partition_service.executor_registry;
+
         let overrides_json = match overrides {
             Some(o) => {
                 Some(
@@ -2388,10 +2500,7 @@ impl DataFusion {
                     break;
                 }
                 loop {
-                    if !ctx
-                        .table_exist(dependent_table_name.clone())
-                        .unwrap_or(false)
-                    {
+                    if !df_ref.table_exists(dependent_table_name) {
                         if Instant::now() >= deadline {
                             unresolved_dependent_table = Some(dependent_table_name.clone());
                             break;
@@ -2744,6 +2853,11 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
+        let dialect = session.config().options().sql_parser.dialect;
+        let statement = session.sql_to_statement(sql, &dialect)?;
+        self.load_on_demand_tables_for_statement(session, &statement)
+            .await?;
+
         let ctx = planner::PlannerContext {
             catalog_mode: if self.has_cayenne_catalog() {
                 planner::CatalogMode::Cayenne
@@ -2752,11 +2866,12 @@ impl DataFusion {
             },
             cluster_role: self.cluster_config.effective_role(),
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
-            executor_registry: self.executor_registry.clone(),
+            executor_registry: self.executor_registry().cloned(),
             ddl_handler: self.cayenne_ddl_handler.clone(),
+            io_runtime: self.io_runtime.clone(),
         };
 
-        planner::create_logical_plan(sql, session, &ctx).await
+        planner::create_logical_plan_from_statement(sql, statement, session, &ctx).await
     }
 
     /// On Windows the `planner` module is not available, so delegate
@@ -2767,7 +2882,11 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        session.create_logical_plan(sql).await
+        let dialect = session.config().options().sql_parser.dialect;
+        let statement = session.sql_to_statement(sql, &dialect)?;
+        self.load_on_demand_tables_for_statement(session, &statement)
+            .await?;
+        session.statement_to_plan(statement).await
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
@@ -2833,6 +2952,13 @@ impl DataFusion {
         self.executor_stream_registry.read().ok()?.clone()
     }
 
+    #[must_use]
+    pub fn executor_registry(&self) -> Option<&Arc<ExecutorRegistry>> {
+        self.partition_service
+            .as_ref()
+            .map(|ps| &ps.executor_registry)
+    }
+
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
         let mut executor_handle = self
             .executor
@@ -2857,6 +2983,31 @@ impl DataFusion {
         };
         self.ctx
             .parse_sql_expr(expr, &tbl_provider.schema().to_dfschema()?)
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_cluster::context::PartitionExprResolver for DataFusion {
+    async fn try_parse_expr(
+        &self,
+        tbl: &TableReference,
+        expr: &str,
+    ) -> Result<Expr, DataFusionError> {
+        DataFusion::try_parse_expr(self, tbl, expr).await
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_cluster::context::PartitionDiscoverer for DataFusion {
+    async fn table_partition_values(
+        &self,
+        table: &TableReference,
+        partition_by: &[spicepod::partitioning::PartitionedBy],
+    ) -> Result<Vec<runtime_cluster::PartitionValue>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        crate::cluster::partition::discovery::query_source_partitions(table, partition_by, self)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }
 
@@ -2916,7 +3067,7 @@ async fn resolve_table_partition_expr(
     let Some(expr_string) = expr_string.or(provider_expr_string).or_else(|| {
         executor_registry.and_then(|registry| {
             registry
-                .federated_partition_manager()
+                .federated_partition_store()
                 .get_cached_table_metadata(table_reference)
                 .and_then(|metadata| metadata.partition_expressions.first().cloned())
         })
@@ -2928,7 +3079,7 @@ async fn resolve_table_partition_expr(
     if let Some(Ok(idx)) = expr_string.strip_prefix("expr").map(str::parse::<usize>)
         && let Some(executor_registry) = executor_registry
         && let Some(metadata) = executor_registry
-            .federated_partition_manager()
+            .federated_partition_store()
             .get_table_metadata(table_reference)
             .await
             .boxed()
@@ -3293,6 +3444,7 @@ mod tests {
                 runtime: Arc::new(runtime),
                 vectors: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
+                load: crate::component::dataset::Load::OnStartup,
             }
         }
 

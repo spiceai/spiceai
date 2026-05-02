@@ -54,6 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           ref: ${{ matrix.branch }}
 
       - name: Install MinIO
@@ -183,6 +184,8 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
