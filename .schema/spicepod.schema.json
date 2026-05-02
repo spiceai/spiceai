@@ -1194,16 +1194,29 @@
             }
           ]
         },
-        "partition_management": {
-          "description": "Partition management configuration",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PartitionManagement"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "partition_assignment_interval": {
+          "description": "How often the scheduler assigns accelerated table partitions to executors.",
+          "type": "string",
+          "default": "30s"
+        },
+        "max_partition_assignments_per_interval": {
+          "description": "Maximum number of partition assignments made per assignment interval.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 100
+        },
+        "max_partitions_per_executor": {
+          "description": "Maximum partitions assigned to a single executor (soft limit).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 1000
+        },
+        "partition_discovery_timeout": {
+          "description": "How long to wait for partition discovery before timing out.",
+          "type": "string",
+          "default": "60s"
         }
       },
       "additionalProperties": false,
@@ -1234,32 +1247,6 @@
           "type": "boolean"
         }
       ]
-    },
-    "PartitionManagement": {
-      "type": "object",
-      "properties": {
-        "interval": {
-          "type": "string",
-          "default": "30s"
-        },
-        "max_assignments_per_cycle": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0,
-          "default": 100
-        },
-        "max_partitions_per_executor": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0,
-          "default": 1000
-        },
-        "discovery_timeout": {
-          "type": "string",
-          "default": "60s"
-        }
-      },
-      "additionalProperties": false
     },
     "Management": {
       "type": "object",
