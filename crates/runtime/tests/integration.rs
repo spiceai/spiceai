@@ -228,7 +228,13 @@ where
     if snapshot_plan {
         insta::with_settings!({
             description => format!("Query: {query}"),
-            omit_expression => true
+            omit_expression => true,
+            filters => vec![
+                // Normalize temp file paths: /var/folders/.../orgs.csv → <TEMPDIR>/orgs.csv
+                (r"\[\[.*?/([^/\]]+\.csv)\]\]", "[[$1]]"),
+                // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
+                (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+            ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);
         });

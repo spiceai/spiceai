@@ -74,8 +74,7 @@ impl PhysicalOptimizerRule for HttpParamsPushdown {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        plan.transform_down(|node| try_rewrite_hash_join(node))
-            .data()
+        plan.transform_down(try_rewrite_hash_join).data()
     }
 
     fn name(&self) -> &'static str {
@@ -95,9 +94,9 @@ impl PhysicalOptimizerRule for HttpParamsPushdown {
 /// The optimizer may choose either orientation depending on cost estimates:
 /// - `LeftSemi`:  `HttpExec` on left  (probe), subquery on right (build)
 /// - `RightSemi`: subquery on left (build/collect), `HttpExec` on right (probe)
-/// Returns an error if an unsupported join type (e.g. `Inner`) is used with
-/// HTTP request parameter columns, since that would silently produce incorrect
-/// results without the pushdown.
+///   Returns an error if an unsupported join type (e.g. `Inner`) is used with
+///   HTTP request parameter columns, since that would silently produce incorrect
+///   results without the pushdown.
 fn try_rewrite_hash_join(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>, DataFusionError> {

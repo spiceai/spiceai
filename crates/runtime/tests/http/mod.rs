@@ -44,7 +44,7 @@ use runtime::{
 use serde_json::{Value, json};
 use spicepod::{
     acceleration::{Acceleration, RefreshMode},
-    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
+    component::{caching::SQLResultsCacheConfig, dataset::Dataset, view::View},
     param::Params as DatasetParams,
 };
 use tokio::net::TcpListener;
@@ -625,6 +625,228 @@ async fn test_http_dynamic_request_headers() -> Result<(), String> {
                 })),
             )
             .await?;
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that `IN (SELECT ...)` subqueries against a real registered table
+/// trigger the `HttpParamsPushdown` optimizer rule (deferred params path).
+///
+///   1. A CSV file (`orgs`) with org IDs
+///   2. An HTTP dataset (`data_api`) with header filters
+///   3. A query that builds JSON headers from the CSV rows and uses
+///      `IN (SELECT ...)` to drive dynamic HTTP requests
+///
+/// DataFusion plans the subquery as a `HashJoinExec` (semi-join) over
+/// `HttpExec`, which the optimizer rewrites into `HttpWithDeferredParamsExec`.
+#[tokio::test]
+async fn test_http_dynamic_request_headers_from_subquery() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+            tracing::debug!("HTTP test server started at {addr}");
+
+            // 1. Write a small CSV with org IDs to a temp file.
+            let csv_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let csv_path = csv_dir.path().join("orgs.csv");
+            std::fs::write(
+                &csv_path,
+                "org_id\norg-001\norg-002\norg-003\norg-004\norg-005\n",
+            )
+            .map_err(|e| format!("Failed to write orgs CSV: {e}"))?;
+
+            // 2. Register both datasets: the CSV lookup table and the HTTP API.
+            let orgs_dataset = Dataset::new(format!("file://{}", csv_path.display()), "orgs");
+
+            let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "data_api");
+            http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                ("allowed_request_paths".to_string(), "/headers".to_string()),
+                (
+                    "http_headers".to_string(),
+                    "x-static-header: static-value".to_string(),
+                ),
+                ("request_header_filters".to_string(), "enabled".to_string()),
+                (
+                    "request_header_allowlist".to_string(),
+                    "x-org-id".to_string(),
+                ),
+                ("max_request_partitions".to_string(), "100".to_string()),
+            ])));
+
+            let app = AppBuilder::new("http_dynamic_headers_subquery_test")
+                .with_dataset(orgs_dataset)
+                .with_dataset(http_dataset)
+                .build();
+            let mut rt = load_runtime(app).await?;
+
+            // 3. Build header JSON from CSV rows, use IN (SELECT ...) to drive dynamic HTTP requests
+            let query = r#"
+                WITH org_headers AS (
+                    SELECT '{"x-org-id":"' || org_id || '"}' AS hdr
+                    FROM orgs
+                )
+                SELECT request_headers, content
+                FROM data_api
+                WHERE request_path = '/headers'
+                  AND request_headers IN (SELECT hdr FROM org_headers)
+                ORDER BY request_headers
+            "#;
+
+            run_query_and_check_results(
+                &mut rt,
+                "http_dynamic_request_headers_from_subquery",
+                query,
+                true,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let pretty = arrow::util::pretty::pretty_format_batches(&result_batches)
+                        .expect("failed to format batches");
+                    insta::assert_snapshot!(
+                        "http_dynamic_request_headers_from_subquery_results",
+                        pretty
+                    );
+                })),
+            )
+            .await?;
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that an **accelerated view** whose SQL uses `IN (SELECT ...)`
+/// against a real registered table triggers the `HttpParamsPushdown`
+/// optimizer rule during the refresh/acceleration path.
+///
+/// ```yaml
+/// views:
+///   - name: org_headers_view
+///     sql: |
+///       WITH org_headers AS (
+///         SELECT '{"x-org-id":"' || org_id || '"}' AS hdr FROM orgs
+///       )
+///       SELECT request_headers, content FROM data_api
+///       WHERE request_path = '/headers'
+///         AND request_headers IN (SELECT hdr FROM org_headers)
+///     acceleration:
+///       enabled: true
+///       refresh_mode: full
+/// ```
+#[tokio::test]
+async fn test_http_dynamic_request_headers_accelerated_view() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+            tracing::debug!("HTTP test server started at {addr}");
+
+            // 1. Write a small CSV with org IDs to a temp file.
+            let csv_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let csv_path = csv_dir.path().join("orgs.csv");
+            std::fs::write(
+                &csv_path,
+                "org_id\norg-001\norg-002\norg-003\norg-004\norg-005\n",
+            )
+            .map_err(|e| format!("Failed to write orgs CSV: {e}"))?;
+
+            // 2. Register datasets: CSV lookup table and HTTP API.
+            let orgs_dataset = Dataset::new(format!("file://{}", csv_path.display()), "orgs");
+
+            let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "data_api");
+            http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                ("allowed_request_paths".to_string(), "/headers".to_string()),
+                (
+                    "http_headers".to_string(),
+                    "x-static-header: static-value".to_string(),
+                ),
+                ("request_header_filters".to_string(), "enabled".to_string()),
+                (
+                    "request_header_allowlist".to_string(),
+                    "x-org-id".to_string(),
+                ),
+                ("max_request_partitions".to_string(), "100".to_string()),
+            ])));
+
+            // 3. Create an accelerated view with IN (SELECT ...) subquery SQL.
+            let mut view = View::new("org_headers_view".to_string());
+            view.sql = Some(format!(
+                r#"
+                WITH org_headers AS (
+                    SELECT '{{"x-org-id":"' || org_id || '"}}' AS hdr
+                    FROM orgs
+                )
+                SELECT request_headers, content
+                FROM data_api
+                WHERE request_path = '/headers'
+                  AND request_headers IN (SELECT hdr FROM org_headers)
+                "#
+            ));
+            view.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Full),
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("http_dynamic_headers_accel_view_test")
+                .with_dataset(orgs_dataset)
+                .with_dataset(http_dataset)
+                .with_view(view)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let cloned_rt = Arc::clone(&rt);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            // 4. Query the accelerated view — data was materialized during refresh.
+            let query =
+                "SELECT request_headers, content FROM org_headers_view ORDER BY request_headers";
+
+            let result_batches: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("collecting results failed: {e}"))?;
+
+            let pretty = arrow::util::pretty::pretty_format_batches(&result_batches)
+                .map_err(|e| format!("format failed: {e}"))?;
+
+            insta::with_settings!({
+                description => "Accelerated view with IN (SELECT ...) subquery over HTTP dataset",
+                omit_expression => true,
+            }, {
+                insta::assert_snapshot!(
+                    "http_dynamic_request_headers_accelerated_view_results",
+                    pretty,
+                );
+            });
+
+            rt.shutdown().await;
 
             tx.send(())
                 .map_err(|()| "Failed to send shutdown signal".to_string())?;

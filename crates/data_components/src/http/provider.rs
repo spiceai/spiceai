@@ -1522,7 +1522,11 @@ impl HttpExec {
                     "request_path" => p.0 = Some(value.clone()),
                     "request_query" => p.1 = Some(value.clone()),
                     "request_body" => p.2 = Some(value.clone()),
-                    _ => {}
+                    other => {
+                        return Err(DataFusionError::Internal(format!(
+                            "HttpExec::with_expanded_params: unsupported column '{other}'. Expected one of: request_path, request_query, request_body, request_headers"
+                        )));
+                    }
                 }
                 new_partitions.push(p);
             }
@@ -6365,5 +6369,150 @@ mod tests {
         let schema = batch.schema();
         let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(field_names, vec!["id", "name", "details"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_expanded_params unit tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an `HttpExec` with the given partitions and optional max.
+    fn make_exec(
+        partitions: Vec<PartitionSpec>,
+        max_request_partitions: Option<usize>,
+    ) -> HttpExec {
+        let provider = base_provider().with_max_request_partitions(max_request_partitions);
+        HttpExec::new(
+            HttpTableProvider::base_table_schema().into(),
+            Arc::new(provider),
+            partitions,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_with_expanded_params_request_path() {
+        let exec = make_exec(vec![(None, None, None, None)], None);
+        let result = exec
+            .with_expanded_params("request_path", &["a".to_string(), "b".to_string()])
+            .expect("expand should succeed");
+
+        assert_eq!(result.partitions.len(), 2);
+        assert_eq!(result.partitions[0].0, Some("a".to_string()));
+        assert_eq!(result.partitions[1].0, Some("b".to_string()));
+        // Other tuple positions remain None.
+        assert_eq!(result.partitions[0].1, None);
+        assert_eq!(result.partitions[0].2, None);
+        assert_eq!(result.partitions[0].3, None);
+    }
+
+    #[test]
+    fn test_with_expanded_params_cross_product() {
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            None,
+        );
+        let result = exec
+            .with_expanded_params(
+                "request_query",
+                &["q1".to_string(), "q2".to_string(), "q3".to_string()],
+            )
+            .expect("expand should succeed");
+
+        // 2 existing × 3 values = 6 partitions
+        assert_eq!(result.partitions.len(), 6);
+
+        // First existing partition (/a) crossed with all three values
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[0].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[2].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[2].1, Some("q3".to_string()));
+
+        // Second existing partition (/b) crossed with all three values
+        assert_eq!(result.partitions[3].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[3].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[4].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[4].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[5].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[5].1, Some("q3".to_string()));
+    }
+
+    #[test]
+    fn test_with_expanded_params_exceeds_max() {
+        // max=3, but 2 partitions × 2 query values = 4 → should fail
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            Some(3),
+        );
+
+        _ = exec
+            .with_expanded_params("request_query", &["q=1".to_string(), "q=2".to_string()])
+            .expect_err("should exceed max_request_partitions");
+    }
+
+    #[test]
+    fn test_with_expanded_params_all_columns() {
+        let cases: Vec<(&str, Box<dyn Fn(&PartitionSpec) -> &Option<String>>)> = vec![
+            ("request_path", Box::new(|p: &PartitionSpec| &p.0)),
+            ("request_query", Box::new(|p: &PartitionSpec| &p.1)),
+            ("request_body", Box::new(|p: &PartitionSpec| &p.2)),
+            ("request_headers", Box::new(|p: &PartitionSpec| &p.3)),
+        ];
+
+        for (col_name, accessor) in &cases {
+            let exec = make_exec(vec![(None, None, None, None)], None);
+            let result = exec
+                .with_expanded_params(col_name, &["val".to_string()])
+                .unwrap_or_else(|e| panic!("expand for {col_name} should succeed: {e}"));
+
+            assert_eq!(
+                result.partitions.len(),
+                1,
+                "one partition expected for {col_name}"
+            );
+            assert_eq!(
+                *accessor(&result.partitions[0]),
+                Some("val".to_string()),
+                "{col_name} should be set"
+            );
+
+            // Verify the OTHER positions are still None.
+            let all_accessors: Vec<Box<dyn Fn(&PartitionSpec) -> &Option<String>>> = vec![
+                Box::new(|p: &PartitionSpec| &p.0),
+                Box::new(|p: &PartitionSpec| &p.1),
+                Box::new(|p: &PartitionSpec| &p.2),
+                Box::new(|p: &PartitionSpec| &p.3),
+            ];
+            let col_names = [
+                "request_path",
+                "request_query",
+                "request_body",
+                "request_headers",
+            ];
+            for (other_name, other_accessor) in col_names.iter().zip(all_accessors.iter()) {
+                if *other_name != *col_name {
+                    assert_eq!(
+                        *other_accessor(&result.partitions[0]),
+                        None,
+                        "{other_name} should remain None when expanding {col_name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_expanded_params_unknown_column_errors() {
+        let exec = make_exec(vec![(Some("/orig".to_string()), None, None, None)], None);
+        let _ = exec
+            .with_expanded_params("nonexistent_column", &["x".to_string()])
+            .expect_err("unknown column should error");
     }
 }
