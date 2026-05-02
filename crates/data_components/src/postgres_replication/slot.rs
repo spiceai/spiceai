@@ -365,7 +365,17 @@ async fn create_logical_slot(
             &[&slot_name, &temporary],
         )
         .await
-        .context(SetupExecSnafu)?;
+        .map_err(|e| {
+            // SQLSTATE 55000 (object_not_in_prerequisite_state) is returned by Postgres when
+            // wal_level is not 'logical'. Surface a clear, actionable message instead of the
+            // raw "logical replication not enabled" Postgres error.
+            if e.as_db_error()
+                .is_some_and(|db| db.code().code() == "55000")
+            {
+                return super::Error::LogicalReplicationNotEnabled;
+            }
+            super::Error::SetupExec { source: e }
+        })?;
 
     let lsn_str: String = row.get(1);
     let consistent_lsn = parse_lsn(&lsn_str)?;
