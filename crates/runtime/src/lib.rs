@@ -476,7 +476,7 @@ pub enum Error {
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
 const CLUSTER_SCHEDULER_REGISTRY: &str = "cluster_scheduler_registry";
-const CLUSTER_PARTITION_MANAGEMENT_TASK: &str = "cluster_partition_management_task";
+const CLUSTER_PARTITION_ASSIGNMENT_TASK: &str = "cluster_partition_assignment_task";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
