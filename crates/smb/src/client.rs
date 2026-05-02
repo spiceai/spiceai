@@ -1046,17 +1046,24 @@ impl SmbClient {
         }
         let cr = decode_create_response(&resp[0].1)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid create response"))?;
+        // Surface CLOSE failures as errors. Critical for callers that rely on
+        // `DELETE_ON_CLOSE` (e.g. `delete_object`, WAL temp cleanup) — a
+        // successful CREATE followed by a failed CLOSE means the deletion
+        // never happened, and we must NOT report success in that case.
         if NtStatus::from_u32(resp[1].0.status).is_error() {
             tracing::warn!(
                 target: "smb",
                 "compound close failed: 0x{:08X}",
                 resp[1].0.status
             );
+            return Err(smb_status_to_io_error(resp[1].0.status, path));
         }
-        let cl = decode_close_response(&resp[1].1).unwrap_or(CloseResponse {
-            last_write_time: cr.last_write_time,
-            file_size: cr.file_size,
-        });
+        let cl = decode_close_response(&resp[1].1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid close response in create_close",
+            )
+        })?;
 
         Ok((cr, cl))
     }
@@ -1185,11 +1192,40 @@ impl SmbClient {
                 resp[1].0.status
             )));
         }
+        // Validate the server-reported Count: SMB2 servers may legally return
+        // a successful WRITE with a short byte count, and silently treating
+        // that as success would corrupt small `put_object` payloads.
+        let written = decode_write_response(&resp[1].1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid write response"))?;
+        if usize::try_from(written).ok() != Some(data.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!(
+                    "create_write_close short write: expected {} bytes but wrote {written}",
+                    data.len()
+                ),
+            ));
+        }
 
-        Ok(decode_close_response(&resp[2].1).unwrap_or(CloseResponse {
-            last_write_time: 0,
-            file_size: data.len() as u64,
-        }))
+        // Surface CLOSE failures and missing post-query attrs as errors.
+        // Falling back to fabricated metadata here means a small put could
+        // return `Ok` even though the server-side close failed (leaking the
+        // handle) or returned a malformed response (giving the caller a
+        // bogus `last_write_time` / `file_size`).
+        if NtStatus::from_u32(resp[2].0.status).is_error() {
+            tracing::warn!(
+                target: "smb",
+                "create_write_close CLOSE failed: 0x{:08X}",
+                resp[2].0.status
+            );
+            return Err(smb_status_to_io_error(resp[2].0.status, path));
+        }
+        decode_close_response(&resp[2].1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid close response in create_write_close",
+            )
+        })
     }
 
     /// Compound batch of Create+Close pairs for directory creation (1 round trip).
@@ -1229,9 +1265,25 @@ impl SmbClient {
         let responses = self.send_compound(requests).await?;
 
         for i in (0..responses.len()).step_by(2) {
-            let status = NtStatus::from_u32(responses[i].0.status);
-            if status.is_error() {
-                return Err(smb_status_to_io_error(responses[i].0.status, &dirs[i / 2]));
+            let dir = &dirs[i / 2];
+            let create_status = NtStatus::from_u32(responses[i].0.status);
+            if create_status.is_error() {
+                return Err(smb_status_to_io_error(responses[i].0.status, dir));
+            }
+            // The CLOSE half of each pair must also be checked. A failed
+            // related CLOSE here leaks one server-side handle per
+            // path segment, which under long-lived write-heavy sessions
+            // can accumulate until the server runs out of handles.
+            if let Some(close_resp) = responses.get(i + 1) {
+                let close_status = NtStatus::from_u32(close_resp.0.status);
+                if close_status.is_error() {
+                    tracing::warn!(
+                        target: "smb",
+                        "ensure_dirs CLOSE failed for {dir}: 0x{:08X}",
+                        close_resp.0.status,
+                    );
+                    return Err(smb_status_to_io_error(close_resp.0.status, dir));
+                }
             }
         }
 

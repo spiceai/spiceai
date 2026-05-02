@@ -89,8 +89,12 @@ fn epoch_secs_to_datetime(epoch_secs: u64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(secs_i64, 0).unwrap_or_else(unix_epoch_datetime)
 }
 
+/// Default SMB-over-TCP port per [MS-SMB2] §2.1.
+const DEFAULT_SMB_PORT: u16 = 445;
+
 struct SMBConfig {
     server: String,
+    port: u16,
     share: String,
     username: String,
     password: String,
@@ -101,6 +105,7 @@ impl std::fmt::Debug for SMBConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SMBConfig")
             .field("server", &self.server)
+            .field("port", &self.port)
             .field("share", &self.share)
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
@@ -113,7 +118,7 @@ impl SMBConfig {
     fn to_smb_config(&self) -> SmbConfig {
         SmbConfig {
             server: self.server.clone(),
-            port: 445,
+            port: self.port,
             username: self.username.clone(),
             password: self.password.clone(),
             domain: String::new(),
@@ -185,9 +190,11 @@ impl std::fmt::Display for SMBObjectStore {
 
 impl SMBObjectStore {
     /// Create a new SMB object store with lazy connection setup.
+    /// `port` defaults to 445 when `None`.
     #[must_use]
     pub fn new(
         server: String,
+        port: Option<u16>,
         share: String,
         username: String,
         password: String,
@@ -197,6 +204,7 @@ impl SMBObjectStore {
             inner: Arc::new(Inner {
                 config: SMBConfig {
                     server,
+                    port: port.unwrap_or(DEFAULT_SMB_PORT),
                     share,
                     username,
                     password,
@@ -347,7 +355,14 @@ impl SMBObjectStore {
 
         let mut writer = share.open_wal_write(key).await.map_err(handle_error)?;
         for chunk in chunks {
-            writer.write(chunk.as_ref()).await.map_err(handle_error)?;
+            // On any write failure we must call `abort()` ourselves before
+            // returning — `WalWriter::abort` is async and so can't run from
+            // `Drop`, which would leave the `.spice-smb-wal/...` temp file
+            // and its open server-side handle behind on the share.
+            if let Err(e) = writer.write(chunk.as_ref()).await {
+                writer.abort().await;
+                return Err(handle_error(e));
+            }
         }
         let meta = writer.commit(share.as_ref()).await.map_err(handle_error)?;
         Ok(PutResult {
@@ -679,6 +694,7 @@ mod tests {
     fn test_smb_object_store_display() {
         let store = SMBObjectStore::new(
             "server.local".to_string(),
+            None,
             "share".to_string(),
             "user".to_string(),
             "pass".to_string(),
@@ -688,9 +704,36 @@ mod tests {
     }
 
     #[test]
+    fn test_smb_object_store_default_port() {
+        let store = SMBObjectStore::new(
+            "host".to_string(),
+            None,
+            "share".to_string(),
+            "u".to_string(),
+            "p".to_string(),
+            None,
+        );
+        assert_eq!(store.config().port, DEFAULT_SMB_PORT);
+    }
+
+    #[test]
+    fn test_smb_object_store_custom_port() {
+        let store = SMBObjectStore::new(
+            "host".to_string(),
+            Some(1445),
+            "share".to_string(),
+            "u".to_string(),
+            "p".to_string(),
+            None,
+        );
+        assert_eq!(store.config().port, 1445);
+    }
+
+    #[test]
     fn test_normalize_subpath_strips_share_prefix() {
         let config = SMBConfig {
             server: "192.168.1.100".to_string(),
+            port: DEFAULT_SMB_PORT,
             share: "myshare".to_string(),
             username: "user".to_string(),
             password: "pass".to_string(),
@@ -724,6 +767,7 @@ mod tests {
     fn test_display_path_formats() {
         let config = SMBConfig {
             server: "server".to_string(),
+            port: DEFAULT_SMB_PORT,
             share: "share".to_string(),
             username: "u".to_string(),
             password: "p".to_string(),

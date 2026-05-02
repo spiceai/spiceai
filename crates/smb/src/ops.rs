@@ -846,9 +846,10 @@ impl WalWriter {
         // succeeded — otherwise the server retains the open file.
         let _ = self.client.close(self.tree_id, &self.file_id).await;
 
-        // If flush or rename failed, clean up the WAL temp file.
-        flush_result?;
-        if let Err(e) = rename_result {
+        // Best-effort delete the WAL temp file on ANY failure path
+        // (flush *or* rename), so a failed upload never leaves an orphan
+        // `.spice-smb-wal/...` file behind on the share.
+        if flush_result.is_err() || rename_result.is_err() {
             let _ = self
                 .client
                 .create_close(
@@ -860,8 +861,10 @@ impl WalWriter {
                     CreateOptions::NonDirectoryFile as u32 | CREATE_OPTION_DELETE_ON_CLOSE,
                 )
                 .await;
-            return Err(e);
         }
+
+        flush_result?;
+        rename_result?;
 
         share.head_object_smb(&self.final_path).await
     }

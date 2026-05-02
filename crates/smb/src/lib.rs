@@ -21,9 +21,16 @@ limitations under the License.
 //!
 //! Ported from <https://github.com/spiceai/spiceio>.
 
-// Wire-protocol code does a lot of safe fixed-size casts between usize/u8/u16/u32
-// that pedantic clippy flags. These are audited and safe by construction:
-// SMB2 header offsets fit in u16, message IDs in u64, etc.
+// Wire-protocol code does a lot of safe fixed-size casts between
+// usize/u8/u16/u32 that pedantic clippy flags. These four are audited and
+// safe by construction: SMB2 header offsets fit in u16, message IDs in u64,
+// etc. — adding `try_from` plumbing at every site would just move the panic
+// from compile time to a `.unwrap()`.
+//
+// TODO: tighten doc-quality lints (`missing_errors_doc`,
+// `missing_panics_doc`, `doc_markdown`) on a per-public-function basis as
+// part of a follow-up docs sweep — they are kept here as a crate-wide
+// allow only to keep the SMB-3.1.1 port reviewable in this PR.
 #![allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
