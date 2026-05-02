@@ -244,6 +244,12 @@ async fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
         .map_err(|e| Status::invalid_argument(format!("Invalid query_id (expected UUID): {e}")))?;
 
     let context = RequestContext::current(AsyncMarker::new().await);
+    if crate::flight::is_auth_read_only(context.as_ref()) {
+        return Err(Status::permission_denied(
+            "API key does not allow write access",
+        ));
+    }
+
     let df = get_current_datafusion(&context);
     let cancelled = df.query_cancel_registry().cancel(parsed);
 

@@ -228,6 +228,18 @@ macro_rules! handle_error {
 }
 
 impl Query {
+    fn ensure_not_cancelled(
+        token: &tokio_util::sync::CancellationToken,
+        query_id: &str,
+    ) -> Result<()> {
+        if token.is_cancelled() {
+            return Err(Error::QueryCancelled {
+                query_id: query_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns the session state for local query execution.
     ///
     /// For Flight SQL sessions, returns the session-specific context to preserve
@@ -583,6 +595,8 @@ impl Query {
 
         let query_result =
             async {
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+
                 let mut session = self.get_session_state(&request_context);
 
                 let ctx = self;
@@ -606,6 +620,7 @@ impl Query {
                         let plan = if let Some(plan) = pre_parsed_plan {
                             plan.clone()
                         } else {
+                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                             match Self::get_plan(
                                 &ctx.df,
                                 &session,
@@ -633,6 +648,7 @@ impl Query {
                                 },
                             }
                         };
+                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                         let tables_referenced = plan.as_table_refs();
                         if let Some(disallowed_table) = tables_referenced
                             .iter()
@@ -668,9 +684,13 @@ impl Query {
                         .await?
                         {
                             PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                                 (plan, tracker, cache_manager)
                             }
-                            PlanOrCached::Cached(query_result) => return Ok(query_result),
+                            PlanOrCached::Cached(query_result) => {
+                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                                return Ok(query_result);
+                            }
                         }
                     }
                     QueryMethod::Plan(logical_plan) => {
@@ -682,6 +702,8 @@ impl Query {
                         (logical_plan.clone(), None, cache_manager)
                     }
                 };
+
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
 
                 if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
                     let e = find_datafusion_root(e);
@@ -780,6 +802,7 @@ impl Query {
                         Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
                     };
 
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     let dataframe = match session_ctx
                         .execute_logical_plan(plan.as_ref().clone())
                         .await
@@ -798,6 +821,7 @@ impl Query {
                         }
                     };
 
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     // Create a physical plan from the dataframe and execute it with our own TaskContext
                     // that includes the request context. This ensures BytesProcessedExec has access to it.
                     let df_plan = match dataframe.create_physical_plan().await {
@@ -815,6 +839,7 @@ impl Query {
                         }
                     };
 
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     let task_ctx = Arc::new(TaskContext::from(&session));
                     let stream = match execute_stream_preserving_output_order(
                         Arc::clone(&df_plan),
@@ -836,6 +861,7 @@ impl Query {
                     (stream, df_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     let physical_plan = match session.create_physical_plan(&plan).await {
                         Ok(stream) => stream,
                         Err(e) => {
@@ -851,6 +877,7 @@ impl Query {
                         }
                     };
 
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     let task_ctx = Arc::new(TaskContext::from(&session));
 
                     let stream = match execute_stream_preserving_output_order(
@@ -870,8 +897,11 @@ impl Query {
                             )
                         }
                     };
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     (stream, physical_plan)
                 };
+
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
 
                 // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
                 // DDL plans (CREATE TABLE/DROP TABLE), DML Delete/Update plans, and Spice
