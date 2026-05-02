@@ -567,12 +567,33 @@ pub async fn run(args: Args) -> Result<()> {
             std::collections::HashMap::new()
         };
 
+        // Pre-build resource attributes from `runtime.telemetry.properties`.
+        // In standalone and scheduler modes the SetOnce is already filled at
+        // this point. In executor mode the SetOnce is resolved later, after
+        // the executor fetches the app definition from the scheduler — same
+        // as `otel_config` above. Executors emit metrics through the cluster
+        // on-demand reader and inherit attribution from the scheduler-side
+        // pipeline, so the empty-resource case here is consistent with the
+        // surrounding executor config flow.
+        let resource_attributes: Vec<KeyValue> = telemetry_config
+            .get()
+            .map(|c| {
+                c.properties
+                    .iter()
+                    .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let metric_prefix = telemetry_config.get().and_then(|c| c.metric_prefix.clone());
+
         init_metrics(
             &rt.datafusion(),
             prometheus_registry.clone(),
             otel_config,
             resolved_otel_headers,
             metrics_reader,
+            resource_attributes,
+            metric_prefix,
         )
         .context(UnableToInitializeMetricsSnafu)?;
     }
@@ -594,6 +615,7 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let rt = Arc::new(rt);
+    rt.install_on_demand_loader();
 
     if needs_metrics {
         rt.init_cache_metrics();
@@ -718,10 +740,54 @@ fn init_metrics(
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
     resolved_otel_headers: std::collections::HashMap<String, String>,
     metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    resource_attributes: Vec<KeyValue>,
+    metric_prefix: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resource = Resource::builder().build();
+    // Apply user-configured `runtime.telemetry.properties` as OpenTelemetry
+    // resource attributes so they appear as dimensions/tags on every metric
+    // exported by any of the readers attached below (Prometheus scrape,
+    // cluster on-demand OTLP, OTEL push). Standard env vars such as
+    // `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are still merged in
+    // by `Resource::builder()`; explicit attributes here take precedence over
+    // env-derived ones with the same key.
+    let mut resource_builder = Resource::builder();
+    if !resource_attributes.is_empty() {
+        resource_builder = resource_builder.with_attributes(resource_attributes);
+    }
+    let resource = resource_builder.build();
 
     let mut provider_builder = SdkMeterProvider::builder().with_resource(resource);
+
+    // Optional metric name prefix (e.g. "spiceai.") configured under
+    // `runtime.telemetry.metric_prefix`. Applied via an OTel View on the
+    // MeterProvider, so the rename happens once at the SDK layer and is
+    // observed by every reader attached below (Prometheus scrape, cluster
+    // on-demand OTLP, OTEL push). The prefix is intentionally placed at the
+    // telemetry level rather than under any single exporter because
+    // OpenTelemetry 0.31's SDK does not support per-reader name transforms.
+    if let Some(prefix) = metric_prefix.filter(|p| !p.is_empty()) {
+        tracing::info!(prefix = %prefix, "OTEL metrics name prefix enabled");
+        provider_builder = provider_builder.with_view(
+            move |instrument: &opentelemetry_sdk::metrics::Instrument| {
+                let new_name = format!("{prefix}{}", instrument.name());
+                match opentelemetry_sdk::metrics::Stream::builder()
+                    .with_name(new_name.clone())
+                    .build()
+                {
+                    Ok(stream) => Some(stream),
+                    Err(e) => {
+                        tracing::warn!(
+                            instrument = %instrument.name(),
+                            new_name = %new_name,
+                            error = %e,
+                            "Failed to apply OTEL metric prefix; instrument will keep its original name"
+                        );
+                        None
+                    }
+                }
+            },
+        );
+    }
 
     // Case 1: Prometheus scrape
     if let Some(registry) = registry {
@@ -759,6 +825,7 @@ fn init_metrics(
                     endpoint = %config.endpoint,
                     protocol = protocol,
                     push_interval = %config.push_interval,
+                    temporality = ?config.temporality,
                     "OTEL metrics exporter enabled"
                 );
             }

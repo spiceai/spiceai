@@ -65,6 +65,7 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
+use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
@@ -87,6 +88,41 @@ pub enum Format {
 
     /// CSV format
     Csv,
+}
+
+pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
+    principal
+        .groups()
+        .iter()
+        .any(|group| *group == "write" || *group == "read_write")
+}
+
+pub(crate) async fn current_principal_requires_read_only() -> bool {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
+        .is_some_and(|principal| !principal_has_write_access(principal))
+}
+
+pub(crate) async fn require_write_access() -> Option<Response> {
+    if current_principal_requires_read_only().await {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({ "message": "API key does not allow write access" })),
+            )
+                .into_response(),
+        )
+    } else {
+        None
+    }
+}
+
+fn status_for_sql_error(message: &str) -> StatusCode {
+    if message.contains("read-only SQL context") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_REQUEST
+    }
 }
 
 #[cfg(feature = "openapi")]
@@ -190,7 +226,7 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     }
 
     // Fallback: if not in runtime status, check if table exists
-    if df.table_exists(ds.name.clone()) {
+    if df.table_exists(&ds.name) {
         ComponentStatus::Ready
     } else {
         ComponentStatus::error()
@@ -203,24 +239,27 @@ pub async fn sql_to_http_response(
     sql: &str,
     parameters: Option<ParamValues>,
     format: ResponseMimeType,
+    read_only: bool,
 ) -> Response {
-    let (data, results_cache_status) = match run_sql(df, sql, parameters).await {
-        Ok((data, results_cache_status)) => (data, results_cache_status),
-        Err(e) => {
-            tracing::debug!("Error executing query: {e}");
-            let status = if let Some(df_err) =
-                e.downcast_ref::<datafusion::error::DataFusionError>()
-                && is_cancellation_error(df_err)
-            {
-                // 499 Client Closed Request: used for cancelled queries so
-                // clients can distinguish cancellation from a bad request.
-                StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            return (status, e.to_string()).into_response();
-        }
-    };
+    let (data, results_cache_status) =
+        match run_sql_with_read_only(df, sql, parameters, read_only).await {
+            Ok((data, results_cache_status)) => (data, results_cache_status),
+            Err(e) => {
+                let message = e.to_string();
+                tracing::debug!("Error executing query: {message}");
+                let status = if let Some(df_err) =
+                    e.downcast_ref::<datafusion::error::DataFusionError>()
+                    && is_cancellation_error(df_err)
+                {
+                    // 499 Client Closed Request: used for cancelled queries so
+                    // clients can distinguish cancellation from a bad request.
+                    StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
+                } else {
+                    status_for_sql_error(&message)
+                };
+                return (status, message).into_response();
+            }
+        };
 
     to_http_response(
         data,
@@ -238,8 +277,19 @@ pub async fn run_sql(
     sql: &str,
     parameters: Option<ParamValues>,
 ) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
+    run_sql_with_read_only(df, sql, parameters, false).await
+}
+
+// Runs query and returns the results as a vector of `RecordBatch`, enforcing read-only mode when requested.
+pub async fn run_sql_with_read_only(
+    df: Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<ParamValues>,
+    read_only: bool,
+) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
     let query_res = QueryBuilder::new(sql, df)
         .parameters(parameters)
+        .read_only(read_only)
         .build()
         .run()
         .await?;

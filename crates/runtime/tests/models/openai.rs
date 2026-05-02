@@ -23,8 +23,10 @@ use crate::{
         create_api_bindings_config, get_params_with_secrets_value, get_taxi_trips_dataset,
         get_tpcds_dataset, normalize_chat_completion_response, send_chat_completions_request,
     },
-    utils::init_tracing_with_task_history,
-    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
+    utils::{
+        init_tracing_with_task_history, init_tracing_with_task_history_captured_context,
+        runtime_ready_check, test_request_context, verify_env_secret_exists,
+    },
 };
 use app::AppBuilder;
 use async_openai::Client as OpenAIClient;
@@ -48,6 +50,7 @@ use runtime::tools::utils::get_tools;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::Value;
 use serde_json::json;
+use spicepod::component::runtime::TaskHistoryCapturedContext;
 use spicepod::component::{embeddings::Embeddings, model::Model};
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 use std::collections::{HashMap, HashSet};
@@ -75,6 +78,8 @@ mod nsql {
                         row_ids: None,
                         chunking: None,
                         vector_size: None,
+                        aggregation: None,
+                        max_elements_per_row: None,
                     }],
                     description: None,
                     full_text_search: None,
@@ -179,6 +184,8 @@ mod search {
                             chunking: None,
                             row_ids: Some(vec!["id".to_string()]),
                             vector_size: None,
+                            aggregation: None,
+                            max_elements_per_row: None,
                         }],
                         description: None,
                         full_text_search: None,
@@ -236,6 +243,8 @@ mod search {
                 row_ids: None,
                 chunking: None,
                 vector_size: None,
+                aggregation: None,
+                max_elements_per_row: None,
             }],
             description: None,
             full_text_search: None,
@@ -254,6 +263,8 @@ mod search {
                     trim_whitespace: false,
                 }),
                 vector_size: None,
+                aggregation: None,
+                max_elements_per_row: None,
             }],
             description: None,
             full_text_search: None,
@@ -607,6 +618,8 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
                     row_ids: Some(vec!["i_item_sk".to_string()]),
                     chunking: None,
                     vector_size: None,
+                    aggregation: None,
+                    max_elements_per_row: None,
                 }],
                 description: None,
                 full_text_search: None,
@@ -624,8 +637,11 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-            let (_tracing, trace_provider) =
-                init_tracing_with_task_history(DEFAULT_TRACING_MODELS, &rt);
+            let (_tracing, trace_provider) = init_tracing_with_task_history_captured_context(
+                DEFAULT_TRACING_MODELS,
+                &rt,
+                TaskHistoryCapturedContext::Full,
+            );
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {

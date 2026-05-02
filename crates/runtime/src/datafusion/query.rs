@@ -82,7 +82,9 @@ use super::{
 
 use super::managed_runtime;
 use crate::datafusion::{
-    DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
+    DataFusion,
+    query::cache::RequestCacheManager,
+    sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
@@ -171,6 +173,8 @@ impl Error {
 }
 
 pub enum QueryMethod {
+    /// A pre-parsed logical plan with no associated SQL. The cache key is
+    /// derived from the plan hash. Used by [`Query::from_logical_plan`].
     Plan(Box<LogicalPlan>),
     Text {
         sql: Arc<str>,
@@ -178,6 +182,11 @@ pub enum QueryMethod {
 
         /// An optional allowlist of tables that can be accessed by this query. When [`Option::is_some`], no SQL results caching is performed. [`LogicalPlan`] caching can still occur (since allowlisting is done post-plan).
         table_allowlist: Option<ResolvedTableAwareAllowlist>,
+
+        /// A pre-parsed logical plan to use instead of re-parsing `sql`.
+        /// The SQL string is still used for results-cache key computation so
+        /// cached entries are shared with equivalent plain `Text` executions.
+        pre_parsed_plan: Option<Box<LogicalPlan>>,
     },
 }
 
@@ -203,6 +212,11 @@ pub struct Query {
     /// execution inherits the request-context cancellation token. Set this to
     /// override the request-context token for this query.
     cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// When true, the validator additionally rejects DDL, DML, COPY, or any
+    /// `LogicalPlan::Statement` node (including PREPARE/EXECUTE/DEALLOCATE),
+    /// regardless of per-catalog writability. Set via [`QueryBuilder::read_only`];
+    /// used by `/v1/tools/sql` and `/v1/nsql` to contain LLM-generated SQL.
+    read_only: bool,
 }
 
 macro_rules! handle_error {
@@ -320,10 +334,15 @@ impl Query {
         // Get logical plan and cache key, reusing existing cache infrastructure
         let (plan, mut tracker, cache_key) = match &self.sql {
             QueryMethod::Text {
-                sql, parameters, ..
+                sql,
+                parameters,
+                pre_parsed_plan,
+                ..
             } => {
                 // Use the existing get_plan_or_cached which handles all cache control,
-                // stale-while-revalidate, and query tracking
+                // stale-while-revalidate, and query tracking. `read_only` is
+                // threaded through so cached results cannot bypass
+                // `validate_sql_query_read_only` below.
                 match Query::get_plan_or_cached(
                     &self.df,
                     &session,
@@ -331,6 +350,8 @@ impl Query {
                     sql,
                     parameters.clone(),
                     tracker,
+                    self.read_only,
+                    pre_parsed_plan.clone(),
                 )
                 .await?
                 {
@@ -399,6 +420,12 @@ impl Query {
 
         // Validate query operations
         if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
+            let e = find_datafusion_root(e);
+            return Err(Error::UnableToExecuteQuery { source: e });
+        }
+        if self.read_only
+            && let Err(e) = validate_sql_query_read_only(&plan)
+        {
             let e = find_datafusion_root(e);
             return Err(Error::UnableToExecuteQuery { source: e });
         }
@@ -572,34 +599,39 @@ impl Query {
                         sql,
                         parameters,
                         table_allowlist: Some(allowlist),
+                        pre_parsed_plan,
                     } => {
                         let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
                             .as_raw_key(Query::plan_hasher(&ctx.df));
-                        let plan = match Self::get_plan(
-                            &ctx.df,
-                            &session,
-                            sql,
-                            &raw_cache_key,
-                            parameters.clone(),
-                        )
-                        .await
-                        {
-                            Ok(plan) => plan,
-                            Err(e) => match e {
-                                Error::UnableToExecuteQuery { source } => {
-                                    let code = ErrorCode::from(&source);
-                                    let snafu_err = Error::UnableToExecuteQuery { source };
-                                    if let Some(t) = tracker {
-                                        t.finish_with_error(
-                                            &request_context,
-                                            snafu_err.to_string(),
-                                            code,
-                                        );
+                        let plan = if let Some(plan) = pre_parsed_plan {
+                            plan.clone()
+                        } else {
+                            match Self::get_plan(
+                                &ctx.df,
+                                &session,
+                                sql,
+                                &raw_cache_key,
+                                parameters.clone(),
+                            )
+                            .await
+                            {
+                                Ok(plan) => Box::new(plan),
+                                Err(e) => match e {
+                                    Error::UnableToExecuteQuery { source } => {
+                                        let code = ErrorCode::from(&source);
+                                        let snafu_err = Error::UnableToExecuteQuery { source };
+                                        if let Some(t) = tracker {
+                                            t.finish_with_error(
+                                                &request_context,
+                                                snafu_err.to_string(),
+                                                code,
+                                            );
+                                        }
+                                        return Err(snafu_err);
                                     }
-                                    return Err(snafu_err);
-                                }
-                                _ => return Err(e),
-                            },
+                                    _ => return Err(e),
+                                },
+                            }
                         };
                         let tables_referenced = plan.as_table_refs();
                         if let Some(disallowed_table) = tables_referenced
@@ -612,7 +644,7 @@ impl Query {
                         }
 
                         (
-                            Box::new(plan),
+                            plan,
                             tracker,
                             RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
                         )
@@ -621,6 +653,7 @@ impl Query {
                         sql,
                         parameters,
                         table_allowlist: None,
+                        pre_parsed_plan,
                     } => {
                         match Self::get_plan_or_cached(
                             &ctx.df,
@@ -629,6 +662,8 @@ impl Query {
                             sql,
                             parameters.clone(),
                             tracker,
+                            ctx.read_only,
+                            pre_parsed_plan.clone(),
                         )
                         .await?
                         {
@@ -649,6 +684,19 @@ impl Query {
                 };
 
                 if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
+                    let e = find_datafusion_root(e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        ErrorCode::QueryPlanningError,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+
+                if ctx.read_only
+                    && let Err(e) = validate_sql_query_read_only(&plan)
+                {
                     let e = find_datafusion_root(e);
                     handle_error!(
                         tracker,
@@ -932,6 +980,7 @@ impl Query {
             tracker: None,
             query_id: uuid::Uuid::new_v4(),
             cancellation_token: None,
+            read_only: false,
         }
     }
 
@@ -965,7 +1014,11 @@ impl Query {
         };
 
         let plan = match self.sql {
-            QueryMethod::Plan(ref plan) => plan.clone(),
+            QueryMethod::Plan(ref plan)
+            | QueryMethod::Text {
+                pre_parsed_plan: Some(ref plan),
+                ..
+            } => plan.clone(),
             QueryMethod::Text { ref sql, .. } => {
                 match self.df.create_logical_plan(&session, sql).await {
                     Ok(plan) => Box::new(plan),
@@ -980,6 +1033,13 @@ impl Query {
 
         // Verify the plan against the restricted options
         if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
+            let e = find_datafusion_root(e);
+            self.handle_schema_error(&request_context, &e);
+            return Err(e);
+        }
+        if self.read_only
+            && let Err(e) = validate_sql_query_read_only(&plan)
+        {
             let e = find_datafusion_root(e);
             self.handle_schema_error(&request_context, &e);
             return Err(e);
@@ -1834,50 +1894,23 @@ fn reconcile_stream_nullability(
 
 /// Extract the target table reference from a DML logical plan.
 ///
-/// Handles both standard `DataFusion` `LogicalPlan::Dml` nodes and
-/// distributed Cayenne DML extension nodes.
+/// Handles both standard `DataFusion` `LogicalPlan::Dml` nodes and generic
+/// `datafusion_dml::DmlExtensionNode` values.
 fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
     match plan {
         LogicalPlan::Dml(dml) => Some(dml.table_name.clone()),
-        #[cfg(not(windows))]
         LogicalPlan::Extension(ext) => {
-            use super::cayenne_ddl::logical_nodes::{
-                DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
-                DistributedCayenneMergeNode, DistributedCayenneUpdateNode,
-            };
-            use super::planner::logical_nodes::CayenneMergeNode;
-            if let Some(n) = ext
+            let dml = ext
                 .node
                 .as_any()
-                .downcast_ref::<DistributedCayenneDeleteNode>()
-            {
-                return Some(n.table_name.clone());
-            }
-            if let Some(n) = ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneUpdateNode>()
-            {
-                return Some(n.table_name.clone());
-            }
-            if let Some(n) = ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneInsertNode>()
-            {
-                return Some(n.table_name.clone());
-            }
-            if let Some(n) = ext.node.as_any().downcast_ref::<CayenneMergeNode>() {
-                return Some(n.target_table.clone());
-            }
-            if let Some(n) = ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneMergeNode>()
-            {
-                return Some(n.target_table.clone());
-            }
-            None
+                .downcast_ref::<datafusion_dml::DmlExtensionNode>()?;
+
+            Some(match &dml.op {
+                datafusion_dml::DmlNodeOp::Delete(params) => params.table_name.clone(),
+                datafusion_dml::DmlNodeOp::Update(params) => params.table_name.clone(),
+                datafusion_dml::DmlNodeOp::Insert(params) => params.table_name.clone(),
+                datafusion_dml::DmlNodeOp::Merge(params) => params.target_table.clone(),
+            })
         }
         _ => None,
     }
@@ -1888,43 +1921,15 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
 /// Used to skip schema verification for DML extension nodes, whose output
 /// schema may differ from the logical plan's schema.
 fn is_dml_extension(plan: &LogicalPlan) -> bool {
-    #[cfg(not(windows))]
-    if let LogicalPlan::Extension(ext) = plan {
-        use super::cayenne_ddl::logical_nodes::{
-            DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
-            DistributedCayenneMergeNode, DistributedCayenneUpdateNode,
-        };
-        use super::planner::logical_nodes::CayenneMergeNode;
-        if ext
-            .node
-            .as_any()
-            .downcast_ref::<DistributedCayenneDeleteNode>()
-            .is_some()
-            || ext
+    matches!(
+        plan,
+        LogicalPlan::Extension(ext)
+            if ext
                 .node
                 .as_any()
-                .downcast_ref::<DistributedCayenneUpdateNode>()
+                .downcast_ref::<datafusion_dml::DmlExtensionNode>()
                 .is_some()
-            || ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneInsertNode>()
-                .is_some()
-            || ext
-                .node
-                .as_any()
-                .downcast_ref::<CayenneMergeNode>()
-                .is_some()
-            || ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneMergeNode>()
-                .is_some()
-        {
-            return true;
-        }
-    }
-    false
+    )
 }
 
 #[cfg(test)]
@@ -1938,6 +1943,7 @@ mod tests {
         buffer::Buffer,
         datatypes::{DataType, Field, Schema, UnionMode},
     };
+    use datafusion::logical_expr::Extension;
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
@@ -1955,6 +1961,57 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug)]
+    struct NoopDmlHandler;
+
+    #[async_trait::async_trait]
+    impl datafusion_dml::CatalogDmlHandler for NoopDmlHandler {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn test_extract_dml_target_table_from_generic_delete_extension() {
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(datafusion_dml::DmlExtensionNode::new_with_count_output(
+                datafusion_dml::DmlNodeOp::Delete(datafusion_dml::DeleteParams {
+                    table_name: TableReference::parse_str("catalog.schema.target"),
+                    filters: vec![],
+                }),
+                Arc::new(NoopDmlHandler),
+                vec![],
+            )),
+        });
+
+        let target = extract_dml_target_table(&plan).expect("should find DML target");
+        assert_eq!(target.to_string(), "catalog.schema.target");
+        assert!(is_dml_extension(&plan));
+    }
+
+    #[test]
+    fn test_extract_dml_target_table_from_generic_merge_extension() {
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(datafusion_dml::DmlExtensionNode::new_with_count_output(
+                datafusion_dml::DmlNodeOp::Merge(Box::new(datafusion_dml::MergeParams {
+                    target_table: TableReference::parse_str("catalog.schema.target"),
+                    source_table: TableReference::parse_str("catalog.schema.source"),
+                    target_qualifier: "t".to_string(),
+                    source_qualifier: "s".to_string(),
+                    on_keys: vec![("id".to_string(), "id".to_string())],
+                    assignments: vec![],
+                    original_sql: None,
+                })),
+                Arc::new(NoopDmlHandler),
+                vec![],
+            )),
+        });
+
+        let target = extract_dml_target_table(&plan).expect("should find MERGE target");
+        assert_eq!(target.to_string(), "catalog.schema.target");
+        assert!(is_dml_extension(&plan));
+    }
 
     #[tokio::test]
     async fn parameterized_query() {

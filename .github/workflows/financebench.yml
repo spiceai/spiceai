@@ -59,9 +59,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced
         uses: ./.github/actions/build-spiced
@@ -71,7 +69,7 @@ jobs:
 
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 

@@ -37,6 +37,8 @@ mod cayenne_catalog_ddl;
 mod clickbench;
 mod cluster;
 mod cors;
+#[cfg(feature = "cosmosdb")]
+mod cosmosdb;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
@@ -74,6 +76,8 @@ mod git;
 mod github;
 mod glue;
 mod graphql;
+#[cfg(all(feature = "postgres", feature = "hashicorp_vault"))]
+mod hashicorp_vault;
 mod http;
 mod iceberg;
 mod iceberg_api;
@@ -111,6 +115,8 @@ mod s3_location_pruning;
     feature = "turso"
 ))]
 mod schema_evolution;
+#[cfg(feature = "sharepoint")]
+mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
 #[cfg(feature = "snowflake")]

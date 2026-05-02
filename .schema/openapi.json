@@ -44,7 +44,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CatalogInfo"
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CatalogInfo"
+                  }
                 },
                 "example": [
                   {

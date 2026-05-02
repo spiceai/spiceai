@@ -92,7 +92,14 @@ impl Parameters {
         }
 
         let Some(spec) = spec else {
-            tracing::warn!("Ignoring parameter {key}: not supported for {component_name}.");
+            let suggestion = closest_param_suggestion(all_params, prefix, key);
+            if let Some(candidate) = suggestion {
+                tracing::warn!(
+                    "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
+                );
+            } else {
+                tracing::warn!("Ignoring parameter `{key}`: not supported for {component_name}.");
+            }
             return None;
         };
 
@@ -183,7 +190,14 @@ impl Parameters {
             };
             if let Some((_, value_secret)) = params.iter().find(|p| p.0 == parameter.name) {
                 let value = value_secret.expose_secret();
-                if !one_of.contains(&value) {
+                let value_is_allowed = if parameter.one_of_ignore_ascii_case {
+                    one_of
+                        .iter()
+                        .any(|option| option.eq_ignore_ascii_case(value))
+                } else {
+                    one_of.contains(&value)
+                };
+                if !value_is_allowed {
                     return Err(Box::new(Error::InvalidConfigurationNoSource {
                         component: component_name.to_string(),
                         message: format!(
@@ -209,8 +223,9 @@ impl Parameters {
                 return Err(Box::new(Error::InvalidConfigurationNoSource {
                     component: component_name.to_string(),
                     message: format!(
-                        "Missing required parameter: {}",
-                        parameter.display_name(prefix)
+                        "Missing required parameter: {}{}",
+                        parameter.display_name(prefix),
+                        describe_missing_parameter(parameter),
                     ),
                 }));
             }
@@ -358,6 +373,30 @@ impl Parameters {
 
         self.params = params.into_iter().collect();
     }
+
+    /// Returns the subset of params that map to `SpiceObjectStoreRegistry`
+    /// configuration keys, with the prefixed names (`aws_*`, `azure_storage_*`,
+    /// `google_*`) rewritten to the registry-facing names (`key`, `secret`,
+    /// `account`, etc.).
+    ///
+    /// Connector-internal params that aren't part of an object store mapping
+    /// (e.g. a Databricks workspace `endpoint`/`token`) are excluded, so this
+    /// is safe to encode directly into an object-store URL fragment.
+    #[must_use]
+    pub fn storage_registry_params(&self) -> Vec<(String, SecretString)> {
+        let map: HashMap<_, _> = self.params.iter().cloned().collect();
+        let mut out = Vec::new();
+        for (prefixed_key, registry_key) in AWS_PREFIXED_FRAGMENT_PARAMS
+            .iter()
+            .chain(AZURE_PREFIXED_FRAGMENT_PARAMS.iter())
+            .chain(GCS_PREFIXED_FRAGMENT_PARAMS.iter())
+        {
+            if let Some(value) = map.get(*prefixed_key) {
+                out.push(((*registry_key).to_string(), value.clone()));
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone)]
@@ -463,160 +502,160 @@ impl<'a> ExposedParamLookup<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ParameterSpec {
-    pub name: &'static str,
-    pub required: bool,
-    pub default: Option<&'static str>,
-    pub secret: bool,
-    pub description: &'static str,
-    pub help_link: &'static str,
-    pub examples: &'static [&'static str],
-    pub one_of: Option<&'static [&'static str]>,
-    pub deprecation_message: Option<&'static str>,
-    pub r#type: ParameterType,
-}
+pub use runtime_parameter_spec::{ParameterSpec, ParameterType};
 
-impl ParameterSpec {
-    #[must_use]
-    pub const fn component(name: &'static str) -> Self {
-        Self {
-            name,
-            required: false,
-            default: None,
-            secret: false,
-            description: "",
-            help_link: "",
-            examples: &[],
-            deprecation_message: None,
-            r#type: ParameterType::Component,
-            one_of: None,
+/// Suggest the closest valid parameter name for a user-typo'd key.
+///
+/// Compares against the user-facing form of every spec (including prefix where relevant).
+/// Returns `Some(candidate)` only when edit distance is low enough to be useful,
+/// to avoid misleading suggestions for keys that are genuinely unknown.
+fn closest_param_suggestion(
+    all_params: &[ParameterSpec],
+    prefix: &str,
+    typo: &str,
+) -> Option<String> {
+    let typo_lower = typo.to_ascii_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for p in all_params {
+        if p.deprecation_message.is_some() {
+            continue;
+        }
+        let candidate = p.display_name(prefix);
+        let d = util::levenshtein::distance(&typo_lower, &candidate.to_ascii_lowercase());
+        if best.as_ref().is_none_or(|(_, best_d)| d < *best_d) {
+            best = Some((candidate, d));
         }
     }
-
-    #[must_use]
-    pub const fn runtime(name: &'static str) -> Self {
-        Self {
-            name,
-            required: false,
-            default: None,
-            secret: false,
-            description: "",
-            help_link: "",
-            examples: &[],
-            deprecation_message: None,
-            r#type: ParameterType::Runtime,
-            one_of: None,
-        }
-    }
-
-    #[must_use]
-    pub const fn required(mut self) -> Self {
-        self.required = true;
-        self
-    }
-
-    #[must_use]
-    pub const fn default(mut self, default: &'static str) -> Self {
-        self.default = Some(default);
-        self
-    }
-
-    #[must_use]
-    pub const fn secret(mut self) -> Self {
-        self.secret = true;
-        self
-    }
-
-    #[must_use]
-    pub const fn description(mut self, description: &'static str) -> Self {
-        self.description = description;
-        self
-    }
-
-    #[must_use]
-    pub const fn help_link(mut self, help_link: &'static str) -> Self {
-        self.help_link = help_link;
-        self
-    }
-
-    #[must_use]
-    pub const fn examples(mut self, examples: &'static [&'static str]) -> Self {
-        self.examples = examples;
-        self
-    }
-
-    #[must_use]
-    pub const fn deprecated(mut self, deprecation_message: &'static str) -> Self {
-        self.deprecation_message = Some(deprecation_message);
-        self
-    }
-
-    #[must_use]
-    pub const fn one_of(mut self, options: &'static [&'static str]) -> Self {
-        self.one_of = Some(options);
-        self
-    }
-
-    #[must_use]
-    pub const fn is_boolean(mut self) -> Self {
-        self = self.one_of(&["true", "false"]);
-        self
-    }
-
-    #[must_use]
-    pub fn display_name(&self, prefix: &str) -> String {
-        if self.r#type.is_prefixed() {
-            format!("{prefix}_{}", self.name)
-        } else {
-            self.name.to_string()
-        }
+    let (candidate, distance) = best?;
+    // Bound: at most 1/3 of the longer string (so short typos only match very close names).
+    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
+    if distance <= max_allowed {
+        Some(candidate)
+    } else {
+        None
     }
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq)]
-pub enum ParameterType {
-    /// A parameter which tells Spice how to configure the underlying component, and is usually passed directly to the underlying component configuration.
-    ///
-    /// These parameters are automatically prefixed with the component's prefix.
-    ///
-    /// # Examples
-    ///
-    /// In Postgres, `host` is a Component parameter and would be auto-prefixed with `pg_`.
-    #[default]
-    Component,
-
-    /// Other parameters which control how the runtime interacts with the component, but does
-    /// not affect the actual component configuration.
-    ///
-    /// These parameters are not prefixed with the component's prefix.
-    ///
-    /// # Examples
-    ///
-    /// In Databricks, the `mode` parameter is used to select which connection to use, and thus is
-    /// not a component parameter.
-    Runtime,
-}
-
-impl Display for ParameterType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Component => write!(f, "Component"),
-            Self::Runtime => write!(f, "Runtime"),
-        }
+/// Build the suffix appended to "Missing required parameter: <name>" when a required
+/// parameter is absent. Renders whatever the spec carries (description, first example,
+/// doc link) as a single trailing sentence — joined with `. ` separators so reading
+/// stays natural regardless of which subset of fields is populated.
+fn describe_missing_parameter(parameter: &ParameterSpec) -> String {
+    let mut parts = Vec::<String>::new();
+    if !parameter.description.is_empty() {
+        // Strip an author-supplied trailing period so we don't produce `..` when
+        // concatenating with the next section.
+        parts.push(parameter.description.trim_end_matches('.').to_string());
     }
-}
-
-impl ParameterType {
-    #[must_use]
-    pub const fn is_prefixed(self) -> bool {
-        matches!(self, Self::Component)
+    if let Some(first_example) = parameter.examples.first() {
+        parts.push(format!("Example: `{first_example}`"));
+    }
+    if !parameter.help_link.is_empty() {
+        parts.push(format!("Docs: {}", parameter.help_link));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(". {}.", parts.join(". "))
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_closest_param_suggestion_close_typo_matches() {
+        let specs = [
+            ParameterSpec::component("host"),
+            ParameterSpec::component("port"),
+            ParameterSpec::component("user"),
+        ];
+        // Single-char typo against the longest match wins.
+        assert_eq!(
+            closest_param_suggestion(&specs, "pg", "pg_hots"),
+            Some("pg_host".to_string())
+        );
+    }
+
+    #[test]
+    fn test_closest_param_suggestion_distant_typo_returns_none() {
+        let specs = [
+            ParameterSpec::component("host"),
+            ParameterSpec::component("port"),
+        ];
+        // Genuinely unrelated key should not suggest anything.
+        assert_eq!(
+            closest_param_suggestion(&specs, "pg", "totally_unrelated"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_closest_param_suggestion_ignores_deprecated() {
+        let specs = [
+            ParameterSpec::component("host"),
+            ParameterSpec::component("hostname").deprecated("use host"),
+        ];
+        // The close-but-deprecated `hostname` shouldn't win over the canonical `host`.
+        assert_eq!(
+            closest_param_suggestion(&specs, "pg", "pg_hostnam"),
+            Some("pg_host".to_string())
+        );
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_empty_spec_is_empty_suffix() {
+        let spec = ParameterSpec::component("host");
+        assert_eq!(describe_missing_parameter(&spec), "");
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_with_description() {
+        let spec = ParameterSpec::component("host").description("The DB host.");
+        assert_eq!(describe_missing_parameter(&spec), ". The DB host.");
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_description_without_trailing_period() {
+        // Author-supplied descriptions without a trailing period should still
+        // render cleanly (no dangling `..`).
+        let spec = ParameterSpec::component("host").description("The DB host");
+        assert_eq!(describe_missing_parameter(&spec), ". The DB host.");
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_full_suffix() {
+        let spec = ParameterSpec::component("host")
+            .description("The DB host.")
+            .examples(&["db.example.com"])
+            .help_link("https://docs.example/host");
+        assert_eq!(
+            describe_missing_parameter(&spec),
+            ". The DB host. Example: `db.example.com`. Docs: https://docs.example/host."
+        );
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_example_without_description() {
+        // Previously this produced a dangling leading-space ` Example: ...`; the
+        // message should start with a proper `. ` sentence boundary regardless of
+        // which subset of fields the spec carries.
+        let spec = ParameterSpec::component("host").examples(&["db.example.com"]);
+        assert_eq!(
+            describe_missing_parameter(&spec),
+            ". Example: `db.example.com`."
+        );
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_help_link_only() {
+        let spec = ParameterSpec::component("host").help_link("https://docs.example/host");
+        assert_eq!(
+            describe_missing_parameter(&spec),
+            ". Docs: https://docs.example/host."
+        );
+    }
 
     #[test]
     fn test_validate_and_format_key_combined() {
@@ -694,6 +733,53 @@ mod test {
                 "accelerator not_file"
             ),
             Some("file_format".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_is_case_sensitive_by_default() {
+        static SPECS: &[ParameterSpec] =
+            &[ParameterSpec::component("mode").one_of(&["enabled", "disabled"])];
+        let err = Parameters::try_new(
+            "connector test",
+            vec![(
+                "test_mode".to_string(),
+                SecretString::new("ENABLED".to_string().into()),
+            )],
+            "test",
+            Arc::new(RwLock::new(Secrets::new())),
+            SPECS,
+        )
+        .await
+        .expect_err("case-sensitive one_of should reject differently-cased values");
+
+        assert!(
+            err.to_string().contains(
+                "'test_mode' parameter must be one of: enabled, disabled. Found ENABLED."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_ignore_ascii_case_accepts_different_case() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("security_protocol")
+            .one_of_ignore_ascii_case(&["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"])];
+        let params = Parameters::try_new(
+            "connector kafka",
+            vec![(
+                "kafka_security_protocol".to_string(),
+                SecretString::new("SASL_PLAINTEXT".to_string().into()),
+            )],
+            "kafka",
+            Arc::new(RwLock::new(Secrets::new())),
+            SPECS,
+        )
+        .await
+        .expect("case-insensitive one_of should accept differently-cased values");
+
+        assert_eq!(
+            params.get("security_protocol").expose().ok(),
+            Some("SASL_PLAINTEXT")
         );
     }
 

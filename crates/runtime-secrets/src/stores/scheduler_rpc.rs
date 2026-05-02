@@ -20,10 +20,16 @@ use secrecy::SecretString;
 use std::sync::Arc;
 
 /// Trait for expanding secrets via the cluster service.
-/// This abstracts over the different channel types that may be used.
+///
+/// The success value is a [`SecretString`] so implementors own
+/// zeroize-on-drop from the moment they have the plaintext. Previously this
+/// returned `Result<String, String>` — a correct implementation had to know
+/// to immediately wrap the returned `String` before doing anything else,
+/// which is exactly the kind of implicit contract secret-handling APIs
+/// should avoid.
 #[async_trait]
 pub trait ClusterSecretExpander: Send + Sync {
-    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String>;
+    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<SecretString, String>;
 }
 
 /// Used by cluster mode to resolve secrets declared in the scheduler
@@ -54,6 +60,6 @@ impl SecretStore for SchedulerRPCSecretStore {
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        Ok(Some(SecretString::from(value)))
+        Ok(Some(value))
     }
 }

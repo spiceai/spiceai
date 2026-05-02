@@ -41,6 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
       - name: Check for code changes
@@ -55,10 +56,11 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
+          persist-credentials: false
           fetch-depth: 1
 
       - name: Cache Cargo registry
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -78,9 +80,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache

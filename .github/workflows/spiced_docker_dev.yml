@@ -27,7 +27,7 @@ on:
 
 jobs:
   setup:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       dev_label: ${{ steps.set_version.outputs.dev_label }}
@@ -113,9 +113,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
 
       - name: Set cargo features
         run: |
@@ -138,6 +135,11 @@ jobs:
           build-args: |
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
+
+      - name: Validate ARM64 image
+        run: |
+          docker load -i /tmp/image-arm64.tar
+          docker run --rm localhost:5000/spiceai:dev-arm64 --version
 
       - name: Upload ARM64 artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -170,9 +172,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
 
       - name: Set cargo features
         run: |
@@ -196,6 +195,11 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
 
+      - name: Validate AMD64 image
+        run: |
+          docker load -i /tmp/image-amd64.tar
+          docker run --rm localhost:5000/spiceai:dev-amd64 --version
+
       - name: Upload AMD64 artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -205,7 +209,7 @@ jobs:
   publish:
     needs: [setup, build-amd64, build-arm64]
     if: always() && (needs.build-amd64.result == 'success' || needs.build-arm64.result == 'success')
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

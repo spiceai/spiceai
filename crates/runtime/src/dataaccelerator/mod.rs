@@ -137,7 +137,9 @@ pub enum Error {
     #[snafu(display("Invalid configuration: {msg}"))]
     InvalidConfiguration { msg: String },
 
-    #[snafu(display("Unknown engine: {engine}"))]
+    #[snafu(display(
+        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres, cayenne. Docs: https://spiceai.org/docs/components/data-accelerators"
+    ))]
     UnknownEngine { engine: Arc<str> },
 
     #[snafu(display("Acceleration creation failed: {source}"))]
@@ -936,7 +938,6 @@ mod accelerator_compat_tests {
         },
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
-    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         datasource::TableProvider,
@@ -2177,12 +2178,10 @@ mod accelerator_compat_tests {
             let data = generate_test_data(Arc::clone(&schema), 50, 0);
             insert_test_data(&table, &ctx, data).await;
 
-            // Get deletion provider
-            let table = get_deletion_provider(table).expect("should support deletion");
-
             // Delete rows where id > 3 (should delete ids 4-49, which is 46 rows)
             let filter = col("id").gt(lit(3_i64));
-            let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
+            let plan = table
+                .delete_from(&ctx.state(), vec![filter])
                 .await
                 .expect("deletion should be successful");
 

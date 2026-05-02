@@ -28,6 +28,7 @@ pub mod model2vec;
 pub mod openai;
 pub mod progress;
 pub mod provider;
+pub mod rerank;
 pub mod responses;
 pub mod spiceai;
 pub mod streaming_utils;

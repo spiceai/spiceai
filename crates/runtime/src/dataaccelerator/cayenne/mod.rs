@@ -23,9 +23,8 @@ use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
 
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
-use data_components::delete::DeletionTableProviderAdapter;
 use data_components::poly::PolyTableProvider;
 use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
@@ -58,6 +57,8 @@ use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
+use runtime_datafusion_index::{Index, IndexedTableProvider};
+use search::index::native_vector::NativeVectorIndex;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -654,6 +655,78 @@ impl CayenneAccelerator {
     }
 }
 
+/// Build a [`NativeVectorIndex`] for each `FixedSizeList<Float32, N>` column in
+/// the schema. These indexes are attached to the accelerated table via
+/// [`IndexedTableProvider`] so the search engine's `get_vector_index()` can
+/// discover them and route `vector_search()` queries through the SIMD distance
+/// UDFs rather than the on-the-fly `embed()` fallback.
+///
+/// This pairs with the existing auto-embedding mechanism: when a dataset
+/// declares `columns: [{name: body, embeddings: [{use: model}]}]`,
+/// `EmbeddingConnector::wrap_table` produces an `EmbeddingTable` that adds
+/// `body_embedding: FixedSizeList<Float32, N>` to the schema handed to
+/// `create_external_table`. This helper picks that column up without any
+/// additional spicepod configuration.
+///
+/// Empty schemas and schemas without vector columns return an empty vec — the
+/// caller should skip the `IndexedTableProvider` wrap in that case.
+fn native_vector_indexes_for_schema(
+    schema: &Schema,
+    table_name: &str,
+    primary_keys: &[String],
+) -> Vec<Arc<dyn Index + Send + Sync>> {
+    let pk_fields: Vec<arrow_schema::Field> = primary_keys
+        .iter()
+        .filter_map(|pk_name| {
+            schema
+                .column_with_name(pk_name)
+                .map(|(_, f)| f.as_ref().clone())
+        })
+        .collect();
+    let table_ref = datafusion::sql::TableReference::bare(table_name.to_string());
+
+    schema
+        .fields()
+        .iter()
+        .filter_map(|f| match f.data_type() {
+            DataType::FixedSizeList(inner, dim)
+                if inner.data_type() == &DataType::Float32 && *dim > 0 =>
+            {
+                let idx = NativeVectorIndex::new(
+                    table_ref.clone(),
+                    f.name().clone(),
+                    pk_fields.clone(),
+                    *dim,
+                );
+                tracing::debug!(
+                    table = table_name,
+                    column = f.name(),
+                    dimension = dim,
+                    "attaching NativeVectorIndex to Cayenne table"
+                );
+                Some(Arc::new(idx) as Arc<dyn Index + Send + Sync>)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Wrap a table provider in [`IndexedTableProvider`] when the schema has at
+/// least one vector column.
+fn wrap_with_native_vector_indexes(
+    provider: Arc<dyn TableProvider>,
+    schema: &Schema,
+    table_name: &str,
+    primary_keys: &[String],
+) -> Arc<dyn TableProvider> {
+    let indexes = native_vector_indexes_for_schema(schema, table_name, primary_keys);
+    if indexes.is_empty() {
+        provider
+    } else {
+        Arc::new(IndexedTableProvider::with_indexes(provider, indexes)) as Arc<dyn TableProvider>
+    }
+}
+
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
@@ -1101,7 +1174,7 @@ impl DataAccelerator for CayenneAccelerator {
         if partition_by.is_empty() {
             // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
                 cayenne_table,
                 &cmd.options,
                 cmd.constraints.clone(),
@@ -1115,12 +1188,16 @@ impl DataAccelerator for CayenneAccelerator {
 
             let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
                 Arc::clone(&write_provider),
-                delete_provider,
                 write_provider,
                 schema_metadata,
-            ));
+            )) as Arc<dyn TableProvider>;
 
-            Ok(table_provider as Arc<dyn TableProvider>)
+            Ok(wrap_with_native_vector_indexes(
+                table_provider,
+                &arrow_schema,
+                &table_name,
+                &primary_keys,
+            ))
         } else {
             // Get metadata catalog for partition tracking
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
@@ -1173,7 +1250,7 @@ impl DataAccelerator for CayenneAccelerator {
             }
 
             let creator = Arc::new(CayennePartitionCreator::new(
-                table_name,
+                table_name.clone(),
                 PathBuf::from(&dir_path),
                 partition_by.clone(),
                 Arc::clone(&arrow_schema),
@@ -1184,21 +1261,21 @@ impl DataAccelerator for CayenneAccelerator {
                 time_retention_filter_builder,
                 vortex_config,
                 object_store_config,
-                primary_keys,
+                primary_keys.clone(),
                 on_conflict,
                 runtime_env,
             ));
 
             // Wrap the base table provider with partitioning logic
             let partition_provider = Arc::new(
-                PartitionTableProvider::new(creator, partition_by, arrow_schema)
+                PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?,
             );
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
                 partition_provider,
                 &cmd.options,
                 cmd.constraints.clone(),
@@ -1212,12 +1289,16 @@ impl DataAccelerator for CayenneAccelerator {
 
             let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
                 Arc::clone(&write_provider),
-                delete_provider,
                 write_provider,
                 schema_metadata,
-            ));
+            )) as Arc<dyn TableProvider>;
 
-            Ok(table_provider as Arc<dyn TableProvider>)
+            Ok(wrap_with_native_vector_indexes(
+                table_provider,
+                &arrow_schema,
+                &table_name,
+                &primary_keys,
+            ))
         }
     }
 
@@ -1518,13 +1599,9 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
-        // Wrap in DeletionTableProviderAdapter so get_deletion_provider can find it
-        let adapted_table: Arc<dyn TableProvider> =
-            Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
-
         Ok(Partition {
             partition_values,
-            table_provider: adapted_table,
+            table_provider: Arc::new(cayenne_table),
         })
     }
 
@@ -1591,13 +1668,9 @@ impl PartitionCreator for CayennePartitionCreator {
                 .boxed()
                 .context(creator::InferringPartitionsSnafu)?;
 
-            // Wrap in DeletionTableProviderAdapter so get_deletion_provider can find it
-            let adapted_table: Arc<dyn TableProvider> =
-                Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
-
             result.push(Partition {
                 partition_values,
-                table_provider: adapted_table,
+                table_provider: Arc::new(cayenne_table),
             });
         }
 
@@ -1655,6 +1728,7 @@ mod tests {
     use app::AppBuilder;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion_table_providers::UnsupportedTypeAction;
+    use search::index::{SearchIndex, VectorIndex};
     use std::sync::Arc;
 
     fn http_response_headers_field() -> Field {
@@ -1673,6 +1747,112 @@ mod tests {
             ),
             true,
         )
+    }
+
+    #[test]
+    fn native_vector_indexes_skips_non_vector_schemas() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "users", &["id".to_string()]);
+        assert!(indexes.is_empty());
+    }
+
+    #[test]
+    fn native_vector_indexes_attached_for_fsl_f32() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 768),
+                true,
+            ),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "docs", &["id".to_string()]);
+        assert_eq!(indexes.len(), 1);
+        let native = indexes[0]
+            .as_any()
+            .downcast_ref::<NativeVectorIndex>()
+            .expect("NativeVectorIndex");
+        assert_eq!(native.dimension(), 768);
+        assert_eq!(native.search_column(), "embedding");
+    }
+
+    #[test]
+    fn native_vector_indexes_ignores_wrong_element_type() {
+        // Only Float32 is supported by the SIMD kernels — Float64 / Int32 must be skipped.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "embedding_f64",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 384),
+                true,
+            ),
+            Field::new(
+                "nums",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 4),
+                true,
+            ),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "docs", &["id".to_string()]);
+        assert!(indexes.is_empty());
+    }
+
+    #[test]
+    fn native_vector_indexes_attached_for_auto_generated_embedding_column() {
+        // Mirrors the schema EmbeddingTable would advertise for a dataset with
+        // `columns: [{ name: body, embeddings: [{ use: model }] }]`:
+        // original text column + `{col}_embedding: FixedSizeList<Float32, N>`.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, true),
+            Field::new(
+                "body_embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 384),
+                true,
+            ),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "docs", &["id".to_string()]);
+        assert_eq!(indexes.len(), 1);
+        let native = indexes[0]
+            .as_any()
+            .downcast_ref::<NativeVectorIndex>()
+            .expect("NativeVectorIndex for auto-generated embedding column");
+        assert_eq!(native.search_column(), "body_embedding");
+        assert_eq!(native.dimension(), 384);
+    }
+
+    #[test]
+    fn native_vector_indexes_attached_per_vector_column() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "title_embed",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 256),
+                true,
+            ),
+            Field::new(
+                "body_embed",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    1536,
+                ),
+                true,
+            ),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "docs", &["id".to_string()]);
+        assert_eq!(indexes.len(), 2);
+        let dims: Vec<i32> = indexes
+            .iter()
+            .filter_map(|i| {
+                i.as_any()
+                    .downcast_ref::<NativeVectorIndex>()
+                    .map(VectorIndex::dimension)
+            })
+            .collect();
+        assert!(dims.contains(&256));
+        assert!(dims.contains(&1536));
     }
 
     #[tokio::test]

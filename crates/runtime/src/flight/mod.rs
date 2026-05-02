@@ -18,6 +18,7 @@ use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
+use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdate;
 use crate::opentelemetry::create_metrics_service;
 use crate::tls::{TlsConfig, server_with_tls_config};
@@ -39,6 +40,7 @@ use bytes::Bytes;
 use cache::result::CacheStatus;
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::parser::ParserError;
 use flight_client::Error as FlightClientError;
@@ -47,7 +49,7 @@ use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
-use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
+use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -81,19 +83,7 @@ pub use session::SessionStore;
 /// keepalive heartbeat. Write-through forwarding tasks send these periodically
 /// to prevent the executor's `DoPut` idle timeout from firing on streams that
 /// receive data in bursts with long idle gaps between them.
-pub const KEEPALIVE_APP_METADATA: &[u8] = b"spice-keepalive";
-
-/// Returns the `DoPut` idle timeout. Override with the
-/// `SPICE_DO_PUT_IDLE_TIMEOUT_SECS` env-var (useful for tests).
-pub fn do_put_idle_timeout() -> std::time::Duration {
-    std::env::var("SPICE_DO_PUT_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or(
-            std::time::Duration::from_secs(120),
-            std::time::Duration::from_secs,
-        )
-}
+pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
 
 pub struct Service {
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
@@ -254,13 +244,23 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
         parameters: Option<ParamValues>,
+        pre_parsed_plan: Option<LogicalPlan>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
-        let query_result = QueryBuilder::new(sql, Arc::clone(&datafusion))
-            .parameters(parameters)
-            .build()
-            .run()
-            .await
-            .map_err(handle_query_error)?;
+        let query_result = if let Some(plan) = pre_parsed_plan {
+            QueryBuilder::from_plan(plan, sql, Arc::clone(&datafusion))
+                .parameters(parameters)
+                .build()
+                .run()
+                .await
+                .map_err(handle_query_error)?
+        } else {
+            QueryBuilder::new(sql, Arc::clone(&datafusion))
+                .parameters(parameters)
+                .build()
+                .run()
+                .await
+                .map_err(handle_query_error)?
+        };
 
         // Reuse the same options for all messages
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
@@ -339,6 +339,62 @@ pub(crate) fn record_batches_to_flight_stream(
     FlightDataEncoderBuilder::new()
         .build(stream::iter(record_batches.into_iter().map(Ok)))
         .map_err(to_tonic_err)
+}
+
+/// Returns `true` when the request has an authenticated principal that
+/// lacks write permission (`"write"` or `"read_write"` group).
+/// Returns `false` when there is no principal (auth not configured)
+/// or the principal has write access.
+pub(crate) fn is_auth_read_only(context: &RequestContext) -> bool {
+    context.auth_principal().is_some_and(|principal| {
+        !principal
+            .groups()
+            .iter()
+            .any(|g| *g == "write" || *g == "read_write")
+    })
+}
+
+/// If the current principal is read-only, validates that `sql` does not contain
+/// any write operations (DDL, DML, COPY, write-capable extensions) and returns
+/// the parsed [`LogicalPlan`] with parameters bound so callers can reuse it
+/// without re-parsing.
+///
+/// Unlike `QueryBuilder::read_only`, this check does NOT disable the results cache —
+/// read-only principals still benefit from cached SELECT results.
+///
+/// If the `sql` is guaranteed to be a write-based, [`is_auth_read_only`] is more efficient.
+///
+/// Returns:
+/// - `Ok(Some(plan))` — principal is read-only, SQL is safe (plan reusable, params bound)
+/// - `Ok(None)`       — principal has write access; no plan was parsed
+/// - `Err(_)`         — principal is read-only and SQL contains a write operation
+pub(crate) async fn check_read_only_sql(
+    context: &RequestContext,
+    datafusion: &Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<&datafusion::common::ParamValues>,
+) -> Result<Option<LogicalPlan>, Status> {
+    if !is_auth_read_only(context) {
+        return Ok(None);
+    }
+    let session = datafusion.ctx.state();
+    let plan = datafusion
+        .create_logical_plan(&session, sql)
+        .await
+        .map_err(|e| Status::invalid_argument(format!("Failed to parse SQL: {e}")))?;
+    // Bind parameters to the plan so the returned plan is fully resolved.
+    let plan = if let Some(params) = parameters {
+        plan.with_param_values(params.clone())
+            .map_err(|e| Status::invalid_argument(format!("Failed to bind parameters: {e}")))?
+    } else {
+        plan
+    };
+    if let Err(e) = validate_sql_query_read_only(&plan) {
+        return Err(Status::permission_denied(format!(
+            "Write access denied. {e}"
+        )));
+    }
+    Ok(Some(plan))
 }
 
 fn to_tonic_err<E>(e: E) -> Status

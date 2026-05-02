@@ -99,6 +99,7 @@ runtime:
       enabled: true
       endpoint: http://localhost:4317
       push_interval: 60s
+      temporality: delta # delta (default, required by Datadog), cumulative, or low_memory
       metrics:
         - runtime.query_duration_ms
         - runtime.memory_usage_bytes
@@ -107,6 +108,7 @@ runtime:
   task_history:
     enabled: true
     captured_output: truncated # none, truncated, full
+    captured_context: redacted # redacted, truncated, full
     retention_period: 24h
     retention_check_interval: 30m
     min_sql_duration: 100ms

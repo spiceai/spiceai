@@ -148,6 +148,13 @@ impl Https {
             .ok()
             .is_some_and(util::parse_enabled);
 
+        let has_header_filters = self
+            .params
+            .get("request_header_filters")
+            .expose()
+            .ok()
+            .is_some_and(util::parse_enabled);
+
         let has_pagination = self
             .params
             .get("pagination")
@@ -167,8 +174,22 @@ impl Https {
             .iter()
             .any(|key| self.params.get(key).expose().ok().is_some());
 
-        has_allowed_paths || has_query_filters || has_body_filters || has_pagination
+        has_allowed_paths
+            || has_query_filters
+            || has_body_filters
+            || has_header_filters
+            || has_pagination
     }
+}
+
+struct RequestFilterParams {
+    allow_query_filters: bool,
+    max_query_length: usize,
+    allow_body_filters: bool,
+    max_body_bytes: usize,
+    allow_header_filters: bool,
+    max_headers_length: usize,
+    request_header_allowlist: Vec<String>,
 }
 
 struct HttpProviderParams {
@@ -180,10 +201,8 @@ struct HttpProviderParams {
     retry_jitter: f64,
     custom_headers: HeaderMap,
     allowed_paths: Vec<String>,
-    allow_query_filters: bool,
-    max_query_length: usize,
-    allow_body_filters: bool,
-    max_body_bytes: usize,
+    request_filters: RequestFilterParams,
+    max_request_partitions: Option<usize>,
     health_probe: Option<String>,
     pagination: Option<data_components::http::provider::PaginationConfig>,
 }
@@ -273,6 +292,43 @@ impl Https {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(data_components::http::provider::DEFAULT_MAX_BODY_BYTES);
+
+        let allow_header_filters = self
+            .params
+            .get("request_header_filters")
+            .expose()
+            .ok()
+            .is_some_and(util::parse_enabled);
+
+        let max_headers_length = self
+            .params
+            .get("max_request_headers_length")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(data_components::http::provider::DEFAULT_MAX_HEADERS_LENGTH);
+
+        let request_header_allowlist = self
+            .params
+            .get("request_header_allowlist")
+            .expose()
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|header_name| header_name.trim().to_string())
+                    .filter(|header_name| !header_name.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let max_request_partitions = self
+            .params
+            .get("max_request_partitions")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|value| *value > 0);
 
         let health_probe = self
             .params
@@ -402,10 +458,16 @@ impl Https {
             retry_jitter,
             custom_headers,
             allowed_paths,
-            allow_query_filters,
-            max_query_length,
-            allow_body_filters,
-            max_body_bytes,
+            request_filters: RequestFilterParams {
+                allow_query_filters,
+                max_query_length,
+                allow_body_filters,
+                max_body_bytes,
+                allow_header_filters,
+                max_headers_length,
+                request_header_allowlist,
+            },
+            max_request_partitions,
             health_probe,
             pagination,
         }
@@ -695,13 +757,21 @@ impl Https {
             retry_jitter,
             custom_headers,
             allowed_paths,
+            request_filters,
+            max_request_partitions,
+            health_probe,
+            pagination,
+        } = self.resolve_http_provider_params(dataset);
+
+        let RequestFilterParams {
             allow_query_filters,
             max_query_length,
             allow_body_filters,
             max_body_bytes,
-            health_probe,
-            pagination,
-        } = self.resolve_http_provider_params(dataset);
+            allow_header_filters,
+            max_headers_length,
+            request_header_allowlist,
+        } = request_filters;
 
         let mut provider = data_components::http::provider::HttpTableProvider::new(
             base_url,
@@ -714,6 +784,7 @@ impl Https {
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
+        .with_max_request_partitions(max_request_partitions)
         .with_health_probe(health_probe)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: "https".to_string(),
@@ -755,10 +826,12 @@ impl Https {
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
         tracing::trace!(
-            "HTTP provider configuration for {}: allow_query_filters={}, allow_body_filters={}",
+            "HTTP provider configuration for {}: allow_query_filters={}, allow_body_filters={}, allow_header_filters={}, max_request_partitions={:?}",
             dataset.name,
             allow_query_filters,
-            allow_body_filters
+            allow_body_filters,
+            allow_header_filters,
+            max_request_partitions
         );
 
         if allow_query_filters {
@@ -772,6 +845,22 @@ impl Https {
         if allow_body_filters {
             tracing::trace!("Enabling body filters with max_bytes={}", max_body_bytes);
             provider = provider.enable_body_filters(max_body_bytes);
+        }
+
+        if allow_header_filters {
+            tracing::trace!(
+                "Enabling header filters with max_length={} and {} allowed header names",
+                max_headers_length,
+                request_header_allowlist.len()
+            );
+            provider = provider
+                .enable_header_filters(max_headers_length, request_header_allowlist)
+                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                    dataconnector: "https".to_string(),
+                    message: format!("Invalid request header filter configuration: {e}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e.into(),
+                })?;
         }
 
         if let Some(pagination_config) = pagination {
@@ -811,18 +900,18 @@ impl Https {
 /// Consistent with the `DynamoDB` connector: exactly one column may be
 /// marked, and the only supported marker value is `"*"`.
 fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<HttpJsonNesting>> {
-    let marked: Vec<&Column> = dataset
+    let marked_columns: Vec<&Column> = dataset
         .columns
         .iter()
         .filter(|col| col.metadata.contains_key("json_object"))
         .collect();
 
-    if marked.is_empty() {
+    if marked_columns.is_empty() {
         return Ok(None);
     }
 
-    if marked.len() > 1 {
-        let names: Vec<&str> = marked.iter().map(|c| c.name.as_str()).collect();
+    if marked_columns.len() > 1 {
+        let names: Vec<&str> = marked_columns.iter().map(|c| c.name.as_str()).collect();
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "https".to_string(),
             connector_component: ConnectorComponent::from(dataset),
@@ -833,19 +922,19 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
         });
     }
 
-    let json_column = marked[0];
-    let Some(marker_value) = json_column.metadata.get("json_object") else {
+    let json_column = marked_columns[0];
+    let Some(marker) = json_column.metadata.get("json_object") else {
         unreachable!("json_object key existence was checked above")
     };
 
-    let is_wildcard = matches!(marker_value, Value::String(s) if s == "*");
+    let is_wildcard = matches!(marker, Value::String(s) if s == "*");
     if !is_wildcard {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "https".to_string(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
                 "Column '{}' has invalid 'json_object' value: {:?}. Only '*' is supported.",
-                json_column.name, marker_value
+                json_column.name, marker
             ),
         });
     }
@@ -962,6 +1051,15 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("max_request_body_bytes")
             .description("Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB)."),
+        ParameterSpec::runtime("request_header_filters")
+            .description("Set to 'enabled' or 'disabled' to control whether request_headers filters can be pushed down as dynamic HTTP request headers.")
+            .one_of(&["enabled", "disabled"]),
+        ParameterSpec::runtime("request_header_allowlist")
+            .description("Comma-separated list of HTTP request header names that request_headers filters may set. Required when request_header_filters is enabled."),
+        ParameterSpec::runtime("max_request_headers_length")
+            .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
+        ParameterSpec::runtime("max_request_partitions")
+            .description("Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped."),
         ParameterSpec::runtime("health_probe")
             .description("Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted."),
         ParameterSpec::runtime("pagination")
@@ -1291,6 +1389,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_http_provider_params_parses_request_header_filters() {
+        let connector = test_connector_with(&[
+            ("request_header_filters", "enabled"),
+            ("request_header_allowlist", "x-sandbox-id, x-region"),
+            ("max_request_headers_length", "2048"),
+            ("max_request_partitions", "7000"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let params = connector.resolve_http_provider_params(&dataset);
+
+        assert!(params.request_filters.allow_header_filters);
+        assert_eq!(
+            params.request_filters.request_header_allowlist,
+            vec!["x-sandbox-id", "x-region"]
+        );
+        assert_eq!(params.request_filters.max_headers_length, 2048);
+        assert_eq!(params.max_request_partitions, Some(7000));
+    }
+
+    #[tokio::test]
     async fn resolve_refresh_token_auth_rejects_refresh_token_without_url() {
         let connector = test_connector_with(&[("http_auth_refresh_token", "rt-only")]).await;
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
@@ -1359,6 +1479,31 @@ mod tests {
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_refresh_token_auth_parses_full_config() {
+        let connector = test_connector_with(&[
+            ("auth_token_url", "https://example.com/oauth/token"),
+            ("http_auth_refresh_token", "rt-seed"),
+            ("http_auth_client_id", "cid"),
+            ("http_auth_client_secret", "csec"),
+            ("auth_scopes", "read:data offline_access"),
+            ("auth_client_auth", "body"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let (config, _refresh_token) = connector
+            .resolve_refresh_token_auth(&dataset)
+            .expect("full config should parse")
+            .expect("expected Some(config) when auth params are set");
+
+        assert_eq!(config.token_url, "https://example.com/oauth/token");
+        assert_eq!(config.client_id.as_deref(), Some("cid"));
+        assert!(config.client_secret.is_some());
+        assert_eq!(config.scopes.as_deref(), Some("read:data offline_access"));
+        assert_eq!(config.client_auth, ClientAuthMethod::Body);
     }
 
     fn column_with_marker(name: &str, marker: Value) -> Column {
@@ -1465,30 +1610,5 @@ mod tests {
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
         }
-    }
-
-    #[tokio::test]
-    async fn resolve_refresh_token_auth_parses_full_config() {
-        let connector = test_connector_with(&[
-            ("auth_token_url", "https://example.com/oauth/token"),
-            ("http_auth_refresh_token", "rt-seed"),
-            ("http_auth_client_id", "cid"),
-            ("http_auth_client_secret", "csec"),
-            ("auth_scopes", "read:data offline_access"),
-            ("auth_client_auth", "body"),
-        ])
-        .await;
-        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-
-        let (config, _refresh_token) = connector
-            .resolve_refresh_token_auth(&dataset)
-            .expect("full config should parse")
-            .expect("expected Some(config) when auth params are set");
-
-        assert_eq!(config.token_url, "https://example.com/oauth/token");
-        assert_eq!(config.client_id.as_deref(), Some("cid"));
-        assert!(config.client_secret.is_some());
-        assert_eq!(config.scopes.as_deref(), Some("read:data offline_access"));
-        assert_eq!(config.client_auth, ClientAuthMethod::Body);
     }
 }

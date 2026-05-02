@@ -30,7 +30,7 @@ env:
 
 jobs:
   check_commits:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
 
@@ -63,7 +63,7 @@ jobs:
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
@@ -91,7 +91,7 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       CARGO_TERM_COLOR: always
@@ -124,9 +124,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -197,9 +195,7 @@ jobs:
           sudo apt-get install build-essential libssl-dev pkg-config cmake unzip -y
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -269,9 +265,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -351,9 +345,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
 
       - name: Build ARM64 Docker image
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -376,7 +367,7 @@ jobs:
     needs: [check_commits, setup, build-linux-x64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -396,9 +387,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
 
       - name: Build AMD64 Docker image
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -421,7 +409,7 @@ jobs:
     needs: [check_commits, setup, build-docker-amd64, build-docker-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6

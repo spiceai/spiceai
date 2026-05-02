@@ -136,9 +136,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
@@ -160,7 +158,7 @@ jobs:
 
   setup-model-matrix:
     name: Setup model strategy matrix
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
     steps:
@@ -1009,8 +1007,11 @@ jobs:
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
         run: |
-          curl https://clickhouse.com/ | sh
-          sudo ./clickhouse install
+          CLICKHOUSE_VERSION="26.3.9.8"
+          curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-server=${CLICKHOUSE_VERSION} clickhouse-client=${CLICKHOUSE_VERSION}
           sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
@@ -1020,8 +1021,12 @@ jobs:
       - name: Install Clickhouse
         if: matrix.target.target_os == 'darwin'
         run: |
-          curl https://clickhouse.com/ | sh
-          sudo ./clickhouse install
+          CLICKHOUSE_VERSION="26.3.9.8-lts"
+          BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
+          curl -fsSL "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
+          mv clickhouse-macos-aarch64 clickhouse
+          chmod +x clickhouse
+          sudo ./clickhouse install --noninteractive
           sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
@@ -1870,8 +1875,11 @@ jobs:
 
       - name: Install DuckDB CLI
         run: |
-          curl https://install.duckdb.org | sh
-          echo "$HOME/.duckdb/cli/latest" >> $GITHUB_PATH
+          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
+          echo "b5bad3ec8bf689885f8270ebd8e0f507e4f671f37dabf6127c09b19960389f96  duckdb_cli.zip" | sha256sum -c
+          unzip duckdb_cli.zip
+          chmod +x ./duckdb
+          echo "$PWD" >> $GITHUB_PATH
 
       - name: Install oha (macOS)
         if: matrix.target.target_os == 'darwin'

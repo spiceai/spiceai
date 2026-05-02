@@ -88,7 +88,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("user").secret(),
     ParameterSpec::component("pass").secret(),
     ParameterSpec::component("sslmode"),
-    ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("sslrootcert")
+        .description("The path to, or inline PEM content for, the SSL root certificate."),
     ParameterSpec::component("connection_pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
         .default("5"),
@@ -175,17 +176,13 @@ impl DataAccelerator for PostgresAccelerator {
         let postgres_writer = Arc::new(postgres_writer.clone());
 
         // Wrap with upsert deduplication if needed
-        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+        let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
             postgres_writer,
             &cmd.options,
             cmd.constraints.clone(),
         );
 
-        let table_provider = Arc::new(PolyTableProvider::new(
-            write_provider,
-            delete_provider,
-            read_provider,
-        ));
+        let table_provider = Arc::new(PolyTableProvider::new(write_provider, read_provider));
 
         Ok(table_provider)
     }

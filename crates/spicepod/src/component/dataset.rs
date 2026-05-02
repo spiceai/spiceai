@@ -117,6 +117,18 @@ pub enum CheckAvailability {
     Disabled,
 }
 
+/// Controls when a dataset is loaded by the runtime.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Load {
+    /// Load the dataset during runtime startup.
+    #[default]
+    OnStartup,
+    /// Load the dataset when it is first queried or explicitly refreshed.
+    OnDemand,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -186,6 +198,13 @@ pub struct Dataset {
     /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
     #[serde(default, skip_serializing_if = "is_default")]
     pub check_availability: CheckAvailability,
+
+    /// Controls when this dataset is loaded by the runtime. Defaults to
+    /// `on_startup`. When set to `on_demand`, the dataset is not initialized at
+    /// runtime startup. The first query against the dataset (or an explicit
+    /// refresh) will trigger initialization.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub load: Load,
 }
 
 impl Nameable for Dataset {
@@ -219,6 +238,7 @@ impl Dataset {
             metrics: None,
             vectors: None,
             check_availability: CheckAvailability::default(),
+            load: Load::default(),
         }
     }
 
@@ -307,6 +327,7 @@ impl WithDependsOn<Dataset> for Dataset {
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
             check_availability: self.check_availability,
+            load: self.load,
         }
     }
 }
@@ -384,6 +405,8 @@ struct DatasetDeserializer {
     vectors: Option<VectorStore>,
     #[serde(default, skip_serializing_if = "is_default")]
     check_availability: CheckAvailability,
+    #[serde(default, skip_serializing_if = "is_default")]
+    load: Load,
 }
 
 #[expect(deprecated)]
@@ -435,7 +458,35 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
             check_availability: deserializer.check_availability,
+            load: deserializer.load,
         })
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+    use yaml;
+
+    #[test]
+    fn test_load_default_is_on_startup() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.load, Load::OnStartup);
+    }
+
+    #[test]
+    fn test_load_on_demand_via_config() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+            load: on_demand
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.load, Load::OnDemand);
     }
 }
 

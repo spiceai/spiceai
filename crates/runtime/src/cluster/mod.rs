@@ -18,15 +18,13 @@ use crate::Error::{self, FailedToStartClusterExecutor};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::cluster::partition::{
     executor_request_initial_partitions,
-    scheduler_task::{PartitionManagementConfig, PartitionManagementTask},
+    scheduler_task::{PartitionAssignmentConfig, PartitionAssignmentTask},
 };
 use crate::config::{ClusterConfig, ClusterRole};
-use crate::dataconnector::listing;
-use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::jobs::JobExecutor;
 use crate::status::ComponentStatus;
 use crate::{
-    CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_MANAGEMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
+    CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
@@ -55,7 +53,6 @@ use ballista_scheduler::scheduler_server::SchedulerServer;
 use ballista_scheduler::state::execution_graph::RunningTaskInfo;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
-use datafusion_datasource::ListingTableUrl;
 use datafusion_expr::Expr;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::future::try_join_all;
@@ -95,8 +92,20 @@ pub enum DistributedNode {
         /// Registry of connected executors for `FlightSQL`.
         executor_registry: Arc<ExecutorRegistry>,
 
-        /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
-        partition_manager: Arc<PartitionManager>,
+        /// Shared cluster state document (cluster.json) for partition metadata and scheduler registry.
+        cluster_state: Arc<ClusterStateStore>,
+
+        /// Heartbeat store for this scheduler.
+        heartbeats: Arc<SchedulerHeartbeatStore>,
+
+        /// Partition store for accelerated table partition metadata.
+        accelerations_partitions_store: Arc<AccelerationsPartitions>,
+
+        /// Partition store for catalog/federated table partition metadata.
+        catalog_partitions_store: Arc<CatalogPartitions>,
+
+        /// Partition service for discovery, assignment, and executor notification.
+        partition_service: Arc<PartitionService>,
     },
     Executor {
         /// Partition assignments for this runtime (executor) for each table.
@@ -396,21 +405,30 @@ fn update_scheduler_pollers(
     *known_schedulers = next_schedulers;
 }
 
+pub(crate) mod accelerated_partition_provider;
+pub(crate) use runtime_cluster::cluster_state;
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
-pub(crate) mod executor_registry;
+mod heartbeat;
 pub mod metrics_collector;
 pub mod partition;
-mod scheduler_registry;
+mod reaper;
+pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
 
+use crate::cluster::partition::service::PartitionService;
+pub use accelerated_partition_provider::AcceleratedPartitionProvider;
+pub use cluster_state::{ClusterStateStore, SchedulerEntry};
 pub use control_stream_client::ControlStreamManager;
-pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider};
-pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
+pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
+pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
+pub use reaper::{Reaper, ReaperOutcome};
+use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
+pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
+pub use scheduler_registry::SchedulerPeers;
 pub use scheduler_registry::start_scheduler_registry;
-pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
@@ -816,40 +834,39 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     };
 
     if let Some(config) = app.runtime.scheduler.clone() {
-        if let Some(partition_manager) = rt.partition_manager() {
+        if rt.partition_store().is_some() {
             // Validate all accelerated datasets/views have partition keys
-            // for distributed partition management.
+            // for distributed partition assignment.
             partition::validate_partition_keys(&app).map_err(|e| {
                 crate::Error::FailedToStartClusterScheduler {
                     source: Box::new(e),
                 }
             })?;
 
-            // Initialize partition metadata for all accelerated tables
-            if let Err(err) = partition::initialize_partition_metadata(
-                rt.datafusion(),
-                Arc::clone(&app),
-                &partition_manager,
-            )
-            .await
+            // Seed partition metadata for all accelerated tables. Requires the
+            // PartitionService to have been wired onto `DataFusion` during
+            // builder setup.
+            let df = rt.datafusion();
+            if let Some(partition_service) = df.partition_service.as_ref()
+                && let Err(err) =
+                    partition::initialize_partition_metadata(partition_service, &df, &app).await
             {
                 tracing::warn!(
                     "Failed to initialize partition metadata during scheduler startup: {err}"
                 );
+            } else if df.partition_service.is_none() {
+                tracing::warn!(
+                    "PartitionService not initialized on DataFusion; skipping partition metadata seeding"
+                );
             }
 
-            // Start partition management task
-            let pm_shutdown = CancellationToken::new();
-            let pm_config = match config
-                .partition_management
-                .clone()
-                .map(PartitionManagementConfig::try_from)
-            {
-                Some(Ok(cfg)) => cfg,
-                None => PartitionManagementConfig::default(),
-                Some(Err(err)) => {
+            // Start partition assignment task
+            let pa_shutdown = CancellationToken::new();
+            let pa_config = match PartitionAssignmentConfig::try_from(config.clone()) {
+                Ok(cfg) => cfg,
+                Err(err) => {
                     tracing::warn!(
-                        "Failed to parse partition management config, partition management task will not be started: {err}"
+                        "Failed to parse partition assignment config, partition assignment task will not be started: {err}"
                     );
                     return Ok(None);
                 }
@@ -859,23 +876,20 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             rt.status
                 .update_component_status("partition_metadata", ComponentStatus::Initializing);
 
-            let pm_task = PartitionManagementTask::new(
-                rt.app(),
+            let pa_task = PartitionAssignmentTask::new(
                 rt.datafusion(),
-                Arc::clone(&partition_manager),
-                Arc::clone(&scheduler_executor_registry),
                 Arc::clone(&rt.status),
-                pm_config,
-                pm_shutdown.clone(),
+                pa_config.interval,
+                pa_shutdown.clone(),
             );
 
             futures.push(Box::pin(
                 self_for_task
                     .start_runtime_task(
-                        CLUSTER_PARTITION_MANAGEMENT_TASK,
-                        Some(pm_shutdown),
+                        CLUSTER_PARTITION_ASSIGNMENT_TASK,
+                        Some(pa_shutdown),
                         async move {
-                            pm_task
+                            pa_task
                                 .run()
                                 .await
                                 .boxed()
@@ -890,16 +904,33 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         let registry_shutdown_for_task = registry_shutdown.clone();
         let peers = Arc::clone(&scheduler_peers);
         let self_ref = Arc::clone(rt);
+        let cluster_state = rt.cluster_state();
+        let heartbeats = rt.scheduler_heartbeats();
         let scheduler_registry_fut = self_for_task
             .start_runtime_task(
                 CLUSTER_SCHEDULER_REGISTRY,
                 Some(registry_shutdown_for_task),
                 async move {
-                    start_scheduler_registry(self_ref, &config, registry_shutdown.clone(), peers)
-                        .await
-                        .map_err(|err| crate::Error::FailedToRegisterScheduler {
-                            source: Box::new(err),
-                        })
+                    let (Some(cluster_state), Some(heartbeats)) = (cluster_state, heartbeats)
+                    else {
+                        return Err(crate::Error::FailedToRegisterScheduler {
+                            source: Box::new(std::io::Error::other(
+                                "cluster state store not initialized for scheduler role",
+                            )),
+                        });
+                    };
+                    start_scheduler_registry(
+                        self_ref,
+                        &config,
+                        registry_shutdown.clone(),
+                        peers,
+                        cluster_state,
+                        heartbeats,
+                    )
+                    .await
+                    .map_err(|err| crate::Error::FailedToRegisterScheduler {
+                        source: Box::new(err),
+                    })
                 },
             )
             .await;
@@ -1751,7 +1782,11 @@ impl ClusterSecretExpanderImpl {
 
 #[async_trait::async_trait]
 impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
-    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String> {
+    async fn expand_secret(
+        &self,
+        executor_id: &str,
+        key: &str,
+    ) -> Result<secrecy::SecretString, String> {
         let request = runtime_proto::ExpandSecretRequest {
             executor_id: executor_id.to_string(),
             key: key.to_string(),
@@ -1764,7 +1799,9 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
             .await
             .map_err(|status| format!("Failed to expand secret from scheduler: {status}"))?;
 
-        Ok(response.into_inner().value)
+        // Wrap at the earliest point we own the plaintext so downstream code
+        // cannot accidentally stash it in a non-zeroizing buffer.
+        Ok(secrecy::SecretString::from(response.into_inner().value))
     }
 }
 
@@ -1796,6 +1833,7 @@ async fn executor_bind_app(
 
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;
+    rt.load_rerankers().await;
     Arc::clone(rt).load_models().await;
     Arc::clone(rt).load_tools().await;
     Arc::clone(rt).load_datasets().await;
@@ -1803,8 +1841,15 @@ async fn executor_bind_app(
     Ok(())
 }
 
-/// Traverses dataset definitions and reifies `ListingTableUrl`s, triggering object store
-/// registration for each.
+/// For each registered dataset on the cluster executor, asks its data
+/// connector to register any object stores it needs against the executor's
+/// runtime env.
+///
+/// On the executor, decoded `ParquetSource` (and other file-source) plans
+/// arrive without their `parquet_file_reader_factory`, so `DataFusion` falls
+/// back to `runtime_env().object_store(url)`. This function gives each
+/// connector a chance to populate that registry using the dataset's
+/// already-secret-expanded params.
 async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     let app = rt.app();
     let app = app.read().await;
@@ -1813,66 +1858,31 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
             source: "Runtime did not bind an App.".into(),
         });
     };
+    let runtime_env = rt.df.ctx.runtime_env();
     for dataset in Arc::clone(&rt).get_valid_datasets(app, LogErrors(true)) {
-        let mut params = ConnectorParamsBuilder::new(dataset.source().into(), (&dataset).into())
-            .build(Arc::clone(&rt.secrets), rt.tokio_io_runtime())
+        let connector = match Arc::clone(&rt)
+            .get_dataconnector_from_dataset(Arc::clone(&dataset))
             .await
-            .context(FailedToStartClusterExecutorSnafu)?;
-
-        // Either this is a URL with a scheme, or a URL with a connector name prefixing it
-        let url = match dataset.from.as_str().split_once(':') {
-            Some((_, rest)) if !rest.starts_with("//") => rest,
-            _ => dataset.from.as_str(),
+        {
+            Ok(connector) => connector,
+            Err(error) => {
+                tracing::warn!(
+                    "Skipping object store registration for dataset {}: {error}",
+                    dataset.name
+                );
+                continue;
+            }
         };
 
-        let Ok(mut parsed) = Url::parse(url) else {
-            tracing::warn!("Unable to configure Dataset URL {}", url);
-            continue;
-        };
-
-        if parsed.scheme() == "file" {
+        if let Err(error) = connector
+            .register_object_stores(&dataset, &runtime_env)
+            .await
+        {
             tracing::warn!(
-                "Dataset {} has a file:// scheme and may not be resolvable without a shared mount.",
+                "Failed to register object stores for dataset {}: {error}",
                 dataset.name
             );
-            continue;
         }
-
-        // Not all connectors have the same parameter structures for S3 -- this makes all fragment
-        // keys match the spec expected by the S3 connector and `SpiceObjectRegistry`.
-        params.parameters.canonicalize_s3_fragments();
-
-        // Canonicalize Azure parameters (e.g., `azure_storage_account_name` -> `account`)
-        // for Delta Lake and other connectors that use Azure-prefixed parameter names.
-        params.parameters.canonicalize_azure_fragments();
-
-        // Canonicalize GCS parameters (e.g., `google_service_account` -> `service_account`)
-        // for Delta Lake and other connectors that use GCS-prefixed parameter names.
-        params.parameters.canonicalize_gcs_fragments();
-
-        let unprefixed = params
-            .parameters
-            .into_iter()
-            .map(|(k, _)| k.as_str())
-            .collect::<Vec<_>>();
-
-        parsed.set_fragment(Some(
-            listing::build_fragments(&params.parameters, unprefixed).as_str(),
-        ));
-
-        let listing_table_url = ListingTableUrl::parse(parsed)
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
-
-        let _ = rt
-            .df
-            .ctx
-            .runtime_env()
-            .object_store(listing_table_url)
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
-
-        tracing::info!("Configured object storage for Dataset {}", dataset.name);
     }
 
     Ok(())
