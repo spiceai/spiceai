@@ -124,6 +124,7 @@ pub use runtime_datafusion::managed_runtime;
 pub use runtime_datafusion::param_utils;
 #[cfg(not(windows))]
 pub mod planner;
+pub(crate) mod policy_enforcer;
 pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
@@ -582,6 +583,9 @@ pub struct DataFusion {
     pub(crate) partition_service: Option<Arc<PartitionService>>,
     #[cfg(not(windows))]
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
+    /// Cedar-based policy engine for query authorization. `None` when no
+    /// authorization is configured.
+    pub(crate) policy_engine: Option<Arc<runtime_policy::PolicyEngine>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -627,6 +631,17 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// Set the Cedar policy engine for query authorization.
+    pub fn set_policy_engine(&mut self, engine: Option<Arc<runtime_policy::PolicyEngine>>) {
+        self.policy_engine = engine;
+    }
+
+    /// Returns the policy engine, if configured.
+    #[must_use]
+    pub fn policy_engine(&self) -> Option<&Arc<runtime_policy::PolicyEngine>> {
+        self.policy_engine.as_ref()
     }
 
     pub async fn get_table(

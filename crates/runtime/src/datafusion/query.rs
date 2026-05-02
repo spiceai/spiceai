@@ -82,6 +82,7 @@ use super::{
 use super::managed_runtime;
 use crate::datafusion::{
     DataFusion,
+    policy_enforcer::authorize_query_plan,
     query::cache::RequestCacheManager,
     sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
@@ -417,6 +418,14 @@ impl Query {
             return Err(Error::UnableToExecuteQuery { source: e });
         }
 
+        // Cedar policy authorization check
+        if let Some(policy_engine) = self.df.policy_engine()
+            && let Err(e) = authorize_query_plan(&plan, policy_engine).await
+        {
+            let e = find_datafusion_root(e);
+            return Err(Error::UnableToExecuteQuery { source: e });
+        }
+
         // Get the schema from the logical plan
         let schema = Arc::new(plan.schema().as_arrow().clone());
 
@@ -656,6 +665,20 @@ impl Query {
 
                 if ctx.read_only
                     && let Err(e) = validate_sql_query_read_only(&plan)
+                {
+                    let e = find_datafusion_root(e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        ErrorCode::QueryPlanningError,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+
+                // Cedar policy authorization check
+                if let Some(policy_engine) = ctx.df.policy_engine()
+                    && let Err(e) = authorize_query_plan(&plan, policy_engine).await
                 {
                     let e = find_datafusion_root(e);
                     handle_error!(

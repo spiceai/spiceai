@@ -544,6 +544,7 @@ impl DataFusionBuilder {
             partition_service: self.partition_service,
             #[cfg(not(windows))]
             cayenne_ddl_handler,
+            policy_engine: None,
         }
     }
 }

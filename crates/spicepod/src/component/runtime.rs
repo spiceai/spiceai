@@ -61,6 +61,9 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<Authorization>,
+
     #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
 
@@ -609,6 +612,124 @@ pub struct Auth {
     pub oidc: Option<OidcAuth>,
 }
 
+/// Cedar-based authorization configuration.
+///
+/// Example YAML:
+/// ```yaml
+/// authorization:
+///   enabled: true
+///   default: allow
+///   provider: local
+///   policies:
+///     - name: analysts-read-only
+///       cedar: |
+///         permit(
+///           principal in Spice::Role::"analyst",
+///           action == Spice::Action::"query",
+///           resource
+///         );
+///     - name: block-pii
+///       path: ./policies/block-pii.cedar
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Authorization {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Controls behavior when no policy matches: `allow` (default) or `deny`.
+    #[serde(default)]
+    pub default: AuthorizationDefault,
+
+    /// Policy source: `local` (inline/file), `operator`, or `cloud`.
+    #[serde(default)]
+    pub provider: AuthorizationProvider,
+
+    /// Inline and file-based Cedar policy definitions (used with `provider: local`).
+    #[serde(default)]
+    pub policies: Vec<PolicyDefinition>,
+
+    /// Configuration for fetching policies from the Spice K8s Operator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator: Option<OperatorPolicyConfig>,
+
+    /// Configuration for fetching policies from Spice Cloud.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudPolicyConfig>,
+}
+
+/// Controls the default authorization decision when no policy matches.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum AuthorizationDefault {
+    /// Permit requests that no policy explicitly matches (default).
+    #[default]
+    Allow,
+    /// Deny requests that no policy explicitly permits.
+    Deny,
+}
+
+/// The source of Cedar authorization policies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum AuthorizationProvider {
+    /// Read policies from inline Cedar text and/or local `.cedar` files.
+    #[default]
+    Local,
+    /// Fetch policies from the Spice K8s Operator API.
+    Operator,
+    /// Fetch policies from the Spice Cloud Management API.
+    Cloud,
+}
+
+/// A single Cedar policy definition in the spicepod configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PolicyDefinition {
+    /// A human-readable name for this policy.
+    pub name: String,
+    /// Inline Cedar policy text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cedar: Option<String>,
+    /// Path to a `.cedar` file (resolved relative to spicepod.yaml).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Configuration for the K8s Operator policy provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPolicyConfig {
+    /// The operator API endpoint for fetching policies.
+    pub endpoint: String,
+    /// How often to poll for policy updates (e.g. `"30s"`).
+    #[serde(default = "default_operator_poll_interval")]
+    pub poll_interval: String,
+}
+
+/// Configuration for the Spice Cloud policy provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CloudPolicyConfig {
+    /// How often to poll for policy updates (e.g. `"60s"`).
+    #[serde(default = "default_cloud_poll_interval")]
+    pub poll_interval: String,
+}
+
+fn default_operator_poll_interval() -> String {
+    "30s".to_string()
+}
+
+fn default_cloud_poll_interval() -> String {
+    "60s".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -956,6 +1077,8 @@ pub struct RuntimeDeserializer {
     pub task_history: TaskHistory,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<Authorization>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1052,6 +1175,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             params: deserializer.params,
             task_history: deserializer.task_history,
             auth: deserializer.auth,
+            authorization: deserializer.authorization,
             cors: deserializer.cors,
             flight: deserializer.flight,
             shutdown_timeout: deserializer.shutdown_timeout,

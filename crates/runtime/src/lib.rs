@@ -538,6 +538,10 @@ pub struct Runtime {
 
     config: Arc<Config>,
 
+    /// Cedar-based authorization policy engine. `None` when no authorization
+    /// is configured — all authorization checks are skipped (current behavior).
+    policy_engine: Option<Arc<runtime_policy::PolicyEngine>>,
+
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
     /// telemetry. For executors this is set after the app definition is
     /// fetched from the scheduler; for all other modes it is set before
@@ -571,6 +575,11 @@ impl Runtime {
     #[must_use]
     pub fn config(&self) -> Arc<Config> {
         Arc::clone(&self.config)
+    }
+
+    #[must_use]
+    pub fn policy_engine(&self) -> Option<Arc<runtime_policy::PolicyEngine>> {
+        self.policy_engine.as_ref().map(Arc::clone)
     }
 
     #[must_use]
