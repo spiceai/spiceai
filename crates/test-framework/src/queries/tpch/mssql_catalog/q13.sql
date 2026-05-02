@@ -7,7 +7,7 @@ from
             c_custkey,
             count(o_orderkey)
         from
-            mssql.public.customer left outer join mssql.public.orders on
+            mssql.dbo.customer left outer join mssql.dbo.orders on
                         c_custkey = o_custkey
                     and o_comment not like '%special%requests%'
         group by

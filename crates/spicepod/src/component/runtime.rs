@@ -418,6 +418,9 @@ pub struct TaskHistory {
     #[serde(default = "default_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub captured_output: Arc<str>,
+    #[serde(default = "default_truncated")]
+    #[cfg_attr(feature = "schemars", schemars(with = "TaskHistoryCapturedContext"))]
+    pub captured_context: Arc<str>,
     #[serde(default = "default_retention_period")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub retention_period: Arc<str>,
@@ -439,6 +442,10 @@ fn default_none() -> Arc<str> {
     "none".into()
 }
 
+fn default_truncated() -> Arc<str> {
+    "truncated".into()
+}
+
 fn default_retention_period() -> Arc<str> {
     "8h".into()
 }
@@ -452,6 +459,7 @@ impl Default for TaskHistory {
         Self {
             enabled: true,
             captured_output: default_none(),
+            captured_context: default_truncated(),
             retention_period: default_retention_period(),
             retention_check_interval: default_retention_check_interval(),
             min_sql_duration: None,
@@ -466,6 +474,16 @@ pub enum TaskHistoryCapturedOutput {
     #[default]
     None,
     Truncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[cfg_attr(feature = "schemars", serde(rename_all = "snake_case"))]
+pub enum TaskHistoryCapturedContext {
+    Redacted,
+    #[default]
+    Truncated,
+    Full,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -487,10 +505,25 @@ impl TaskHistory {
         }
 
         Err(format!(
-            r#"Expected "none" or "truncated" for "captured_output", but got: "{}""#,
+            "Expected \"none\" or \"truncated\" for \"captured_output\", but got: \"{}\"",
             self.captured_output
         )
         .into())
+    }
+
+    pub fn get_captured_context(
+        &self,
+    ) -> Result<TaskHistoryCapturedContext, Box<dyn Error + Send + Sync>> {
+        match self.captured_context.as_ref() {
+            "redacted" => Ok(TaskHistoryCapturedContext::Redacted),
+            "truncated" => Ok(TaskHistoryCapturedContext::Truncated),
+            "full" => Ok(TaskHistoryCapturedContext::Full),
+            _ => Err(format!(
+                "Expected \"redacted\", \"truncated\", or \"full\" for \"captured_context\", but got: \"{}\"",
+                self.captured_context
+            )
+            .into()),
+        }
     }
 
     pub fn get_captured_plan(
@@ -1244,6 +1277,7 @@ mod tests {
             let task_history = TaskHistory {
                 enabled: true,
                 captured_output: "none".into(),
+                captured_context: "truncated".into(),
                 retention_period: "8h".into(),
                 retention_check_interval: "15m".into(),
                 min_sql_duration: Some(duration_str.into()),
@@ -1265,6 +1299,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: Some("invalid".into()),
@@ -1305,6 +1340,42 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, None);
+        assert_eq!(runtime.task_history.captured_context, "truncated".into());
+        assert_eq!(
+            runtime
+                .task_history
+                .get_captured_context()
+                .expect("should parse"),
+            TaskHistoryCapturedContext::Truncated
+        );
+
+        let yaml = r"
+            task_history:
+                enabled: true
+                captured_context: redacted
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime
+                .task_history
+                .get_captured_context()
+                .expect("should parse"),
+            TaskHistoryCapturedContext::Redacted
+        );
+
+        let yaml = r"
+            task_history:
+                enabled: true
+                captured_context: full
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime
+                .task_history
+                .get_captured_context()
+                .expect("should parse"),
+            TaskHistoryCapturedContext::Full
+        );
     }
 
     #[test]
@@ -1323,6 +1394,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1338,6 +1410,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1353,6 +1426,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1368,6 +1442,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1405,6 +1480,7 @@ mod tests {
             let task_history = TaskHistory {
                 enabled: true,
                 captured_output: "none".into(),
+                captured_context: "truncated".into(),
                 retention_period: "8h".into(),
                 retention_check_interval: "15m".into(),
                 min_sql_duration: None,
@@ -1426,6 +1502,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,

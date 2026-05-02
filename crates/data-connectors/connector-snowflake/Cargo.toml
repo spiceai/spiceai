@@ -19,7 +19,7 @@ name = "connector-snowflake"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Snowflake data connector for Spice.ai runtime"
 
 [dependencies]

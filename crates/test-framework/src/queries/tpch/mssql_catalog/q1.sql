@@ -10,7 +10,7 @@ select
     avg(l_discount) as avg_disc,
     count(*) as count_order
 from
-    mssql.public.lineitem
+    mssql.dbo.lineitem
 where
         l_shipdate <= date '1998-09-02'
 group by

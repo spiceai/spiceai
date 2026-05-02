@@ -18,9 +18,5 @@ description: "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'seco
   {
     "id": 819,
     "_score": 0.576
-  },
-  {
-    "id": 432,
-    "_score": 0.573
   }
 ]

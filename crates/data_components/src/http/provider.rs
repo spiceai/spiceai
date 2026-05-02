@@ -41,14 +41,15 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
     Client,
-    header::{CACHE_CONTROL, HeaderMap},
+    header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
 use snafu::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::{
     any::Any,
     borrow::ToOwned,
     fmt,
+    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -134,9 +135,15 @@ impl From<Error> for DataFusionError {
 
 pub const DEFAULT_MAX_QUERY_LENGTH: usize = 1024;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
+pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
-type PartitionSpec = (Option<String>, Option<String>, Option<String>);
+type PartitionSpec = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// Configuration for paginated HTTP API requests.
 ///
@@ -222,14 +229,28 @@ impl CachedResponse {
     }
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum RequestFilterKind {
+    Path,
+    Query,
+    Body,
+    Headers,
+}
+
 #[derive(Default)]
 struct PartitionAccumulator {
     paths: HashSet<String>,
     queries: Vec<Option<String>>,
     bodies: Vec<Option<String>>,
-    has_path_filter: bool,
-    has_query_filter: bool,
-    has_body_filter: bool,
+    headers: Vec<Option<String>>,
+    seen_filters: HashSet<RequestFilterKind>,
+}
+
+struct PartitionValues {
+    paths: Vec<String>,
+    queries: Vec<Option<String>>,
+    bodies: Vec<Option<String>>,
+    headers: Vec<Option<String>>,
 }
 
 impl PartitionAccumulator {
@@ -237,9 +258,13 @@ impl PartitionAccumulator {
         Self::default()
     }
 
+    fn has_filter(&self, kind: RequestFilterKind) -> bool {
+        self.seen_filters.contains(&kind)
+    }
+
     fn record_path(&mut self, value: String) {
         self.paths.insert(value);
-        self.has_path_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Path);
     }
 
     fn record_query(&mut self, value: String) {
@@ -247,7 +272,7 @@ impl PartitionAccumulator {
         if !self.queries.contains(&entry) {
             self.queries.push(entry);
         }
-        self.has_query_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Query);
     }
 
     fn record_body(&mut self, value: String) {
@@ -255,11 +280,24 @@ impl PartitionAccumulator {
         if !self.bodies.contains(&entry) {
             self.bodies.push(entry);
         }
-        self.has_body_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Body);
     }
 
-    fn finalize(mut self) -> (Vec<String>, Vec<Option<String>>, Vec<Option<String>>) {
-        let mut paths: Vec<String> = if self.has_path_filter {
+    fn record_headers(&mut self, value: String) {
+        let entry = Some(value);
+        if !self.headers.contains(&entry) {
+            self.headers.push(entry);
+        }
+        self.seen_filters.insert(RequestFilterKind::Headers);
+    }
+
+    fn finalize(mut self) -> PartitionValues {
+        let has_path_filter = self.has_filter(RequestFilterKind::Path);
+        let has_query_filter = self.has_filter(RequestFilterKind::Query);
+        let has_body_filter = self.has_filter(RequestFilterKind::Body);
+        let has_header_filter = self.has_filter(RequestFilterKind::Headers);
+
+        let mut paths: Vec<String> = if has_path_filter {
             self.paths.into_iter().collect()
         } else {
             vec![String::new()]
@@ -267,13 +305,52 @@ impl PartitionAccumulator {
         // Sort paths for deterministic ordering
         paths.sort();
 
-        if !self.has_query_filter {
+        if !has_query_filter {
             self.queries.push(None);
         }
-        if !self.has_body_filter {
+        if !has_body_filter {
             self.bodies.push(None);
         }
-        (paths, self.queries, self.bodies)
+        if !has_header_filter {
+            self.headers.push(None);
+        }
+        PartitionValues {
+            paths,
+            queries: self.queries,
+            bodies: self.bodies,
+            headers: self.headers,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequestFilterOptions {
+    enabled_filters: HashSet<RequestFilterKind>,
+    max_query_length: usize,
+    max_body_bytes: usize,
+    max_headers_length: usize,
+    allowed_headers: HashSet<HeaderName>,
+}
+
+impl Default for RequestFilterOptions {
+    fn default() -> Self {
+        Self {
+            enabled_filters: HashSet::new(),
+            max_query_length: DEFAULT_MAX_QUERY_LENGTH,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_headers_length: DEFAULT_MAX_HEADERS_LENGTH,
+            allowed_headers: HashSet::new(),
+        }
+    }
+}
+
+impl RequestFilterOptions {
+    fn enable(&mut self, kind: RequestFilterKind) {
+        self.enabled_filters.insert(kind);
+    }
+
+    fn is_enabled(&self, kind: RequestFilterKind) -> bool {
+        self.enabled_filters.contains(&kind)
     }
 }
 
@@ -295,6 +372,41 @@ impl HttpFetchResult {
     }
 }
 
+enum CacheWriteMode {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct CacheKey {
+    path: String,
+    query: Option<String>,
+    body: Option<String>,
+    request_headers: Option<String>,
+}
+
+impl CacheKey {
+    fn new(
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Self {
+        Self {
+            path: path.to_string(),
+            query: query.map(ToString::to_string),
+            body: body.map(ToString::to_string),
+            request_headers: request_headers.map(ToString::to_string),
+        }
+    }
+
+    fn redacted_label(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        format!("http-cache-key:{:016x}", hasher.finish())
+    }
+}
+
 /// A table provider that fetches data from HTTP endpoints based on path and query filters
 #[derive(Clone)]
 pub struct HttpTableProvider {
@@ -303,16 +415,14 @@ pub struct HttpTableProvider {
     file_format: String,
     schema: SchemaRef,
     constraints: Constraints,
-    cache: Arc<RwLock<HashMap<String, CachedResponse>>>,
+    cache: Arc<RwLock<HashMap<CacheKey, CachedResponse>>>,
     acceleration_enabled: bool,
     retry_strategy: RetryBackoff,
     content_type: Option<String>,
     custom_headers: HeaderMap,
     allowed_paths: Option<(GlobSet, Vec<String>)>,
-    allow_query_filters: bool,
-    max_query_length: usize,
-    allow_body_filters: bool,
-    max_body_bytes: usize,
+    request_filter_options: RequestFilterOptions,
+    max_request_partitions: Option<usize>,
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
     auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
@@ -359,10 +469,8 @@ impl HttpTableProvider {
             content_type: None,
             custom_headers: HeaderMap::new(),
             allowed_paths: None,
-            allow_query_filters: false,
-            max_query_length: DEFAULT_MAX_QUERY_LENGTH,
-            allow_body_filters: false,
-            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            request_filter_options: RequestFilterOptions::default(),
+            max_request_partitions: None,
             health_probe: None,
             pagination: None,
             auth: None,
@@ -439,15 +547,62 @@ impl HttpTableProvider {
 
     #[must_use]
     pub fn enable_query_filters(mut self, max_length: usize) -> Self {
-        self.allow_query_filters = true;
-        self.max_query_length = max_length.min(DEFAULT_MAX_QUERY_LENGTH * 4);
+        self.request_filter_options.enable(RequestFilterKind::Query);
+        self.request_filter_options.max_query_length = max_length.min(DEFAULT_MAX_QUERY_LENGTH * 4);
         self
     }
 
     #[must_use]
     pub fn enable_body_filters(mut self, max_bytes: usize) -> Self {
-        self.allow_body_filters = true;
-        self.max_body_bytes = max_bytes.min(DEFAULT_MAX_BODY_BYTES * 4);
+        self.request_filter_options.enable(RequestFilterKind::Body);
+        self.request_filter_options.max_body_bytes = max_bytes.min(DEFAULT_MAX_BODY_BYTES * 4);
+        self
+    }
+
+    pub fn enable_header_filters<I, S>(mut self, max_length: usize, header_names: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut allowed_headers = HashSet::new();
+        for header_name in header_names {
+            let raw = header_name.as_ref().trim();
+            ensure!(
+                !raw.is_empty(),
+                ConfigurationSnafu {
+                    message: "request_header_allowlist entries cannot be empty".to_string()
+                }
+            );
+            let parsed = HeaderName::try_from(raw).map_err(|e| Error::Configuration {
+                message: format!("Invalid request_header_allowlist entry '{raw}': {e}"),
+            })?;
+            ensure!(
+                !(self.auth.is_some() && parsed == AUTHORIZATION),
+                ConfigurationSnafu {
+                    message: "request_header_allowlist cannot include 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_header_allowlist or disable HTTP authentication.".to_string()
+                }
+            );
+            allowed_headers.insert(parsed);
+        }
+
+        ensure!(
+            !allowed_headers.is_empty(),
+            ConfigurationSnafu {
+                message: "request_header_filters requires request_header_allowlist to contain at least one header name".to_string()
+            }
+        );
+
+        self.request_filter_options
+            .enable(RequestFilterKind::Headers);
+        self.request_filter_options.max_headers_length =
+            max_length.min(DEFAULT_MAX_HEADERS_LENGTH * 4);
+        self.request_filter_options.allowed_headers = allowed_headers;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_max_request_partitions(mut self, max_request_partitions: Option<usize>) -> Self {
+        self.max_request_partitions = max_request_partitions;
         self
     }
 
@@ -627,6 +782,7 @@ impl HttpTableProvider {
             Field::new("request_path", DataType::Utf8, false),
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
+            Field::new("request_headers", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
             Field::new("response_status", DataType::UInt16, false),
             Field::new(
@@ -653,13 +809,13 @@ impl HttpTableProvider {
     }
 
     /// Extract path and query from filters
-    fn get_cache_key(path: &str, query: Option<&str>, body: Option<&str>) -> String {
-        format!(
-            "{}?{}&body={}",
-            path,
-            query.unwrap_or(""),
-            body.unwrap_or("")
-        )
+    fn get_cache_key(
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> CacheKey {
+        CacheKey::new(path, query, body, request_headers)
     }
 
     /// Validates the HTTP endpoint by attempting a request to a custom health probe path if configured,
@@ -853,9 +1009,10 @@ impl HttpTableProvider {
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
         result: &HttpFetchResult,
     ) {
-        let cache_key = Self::get_cache_key(path, query, body);
+        let cache_key = Self::get_cache_key(path, query, body, request_headers);
         let cached_response = CachedResponse {
             content: Arc::new(result.content.clone()),
             cached_at: SystemTime::now(),
@@ -874,23 +1031,32 @@ impl HttpTableProvider {
         &self,
         url: Url,
         body: Option<&str>,
+        request_headers: Option<&HeaderMap>,
         path_label: &str,
     ) -> Result<HttpFetchResult> {
         let retry_strategy = self.retry_strategy.clone();
         let this = self.clone();
         let url_clone = url.clone();
         let body_owned = body.map(ToOwned::to_owned);
+        let request_headers_owned = request_headers.cloned();
         let path_owned = path_label.to_string();
 
         let result = retry(retry_strategy, || {
             let this = this.clone();
             let url = url_clone.clone();
             let body = body_owned.clone();
+            let request_headers = request_headers_owned.clone();
             let path = path_owned.clone();
 
             async move {
-                this.perform_single_request(&url, body.as_deref(), &path, false)
-                    .await
+                this.perform_single_request(
+                    &url,
+                    body.as_deref(),
+                    request_headers.as_ref(),
+                    &path,
+                    false,
+                )
+                .await
             }
         })
         .await;
@@ -904,7 +1070,7 @@ impl HttpTableProvider {
             tracing::debug!(
                 "Retries exhausted for {url}, making final attempt accepting any status"
             );
-            self.perform_single_request(&url, body, path_label, true)
+            self.perform_single_request(&url, body, request_headers, path_label, true)
                 .await
                 .map_err(|e| match e {
                     RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
@@ -929,6 +1095,7 @@ impl HttpTableProvider {
         &self,
         url: &Url,
         body: Option<&str>,
+        request_headers: Option<&HeaderMap>,
         path_label: &str,
         accept_retryable: bool,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
@@ -941,8 +1108,18 @@ impl HttpTableProvider {
             self.client.get(url.clone())
         };
 
-        for (name, value) in &self.custom_headers {
-            request_builder = request_builder.header(name, value);
+        if let Some(request_headers) = request_headers {
+            let mut merged_headers = self.custom_headers.clone();
+            for (name, value) in request_headers {
+                merged_headers.insert(name.clone(), value.clone());
+            }
+            for (name, value) in &merged_headers {
+                request_builder = request_builder.header(name, value);
+            }
+        } else {
+            for (name, value) in &self.custom_headers {
+                request_builder = request_builder.header(name, value);
+            }
         }
 
         if let Some(auth) = self.auth.as_ref() {
@@ -1032,26 +1209,39 @@ impl HttpTableProvider {
         })
     }
 
-    async fn fetch_and_cache(
+    async fn fetch_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
+        cache_write_mode: CacheWriteMode,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
         let query_owned = query.map(ToOwned::to_owned);
         let body_owned = body.map(ToOwned::to_owned);
+        let request_headers_owned = request_headers.map(ToOwned::to_owned);
+        let parsed_request_headers = request_headers_owned
+            .as_deref()
+            .map(|headers| self.parse_request_headers(headers))
+            .transpose()?;
 
         let fetch_result = self
-            .perform_request_with_retry(url, body_owned.as_deref(), &path_owned)
+            .perform_request_with_retry(
+                url,
+                body_owned.as_deref(),
+                parsed_request_headers.as_ref(),
+                &path_owned,
+            )
             .await?;
 
-        if fetch_result.should_cache() {
+        if matches!(cache_write_mode, CacheWriteMode::Enabled) && fetch_result.should_cache() {
             self.cache_response(
                 &path_owned,
                 query_owned.as_deref(),
                 body_owned.as_deref(),
+                request_headers_owned.as_deref(),
                 &fetch_result,
             )
             .await;
@@ -1060,18 +1250,32 @@ impl HttpTableProvider {
         Ok(fetch_result)
     }
 
+    async fn fetch_and_cache(
+        &self,
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Result<HttpFetchResult> {
+        self.fetch_response(path, query, body, request_headers, CacheWriteMode::Enabled)
+            .await
+    }
+
     async fn get_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
     ) -> Result<HttpFetchResult> {
-        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it
+        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
-            return self.fetch_and_cache(path, query, body).await;
+            return self
+                .fetch_response(path, query, body, request_headers, CacheWriteMode::Disabled)
+                .await;
         }
 
-        let cache_key = Self::get_cache_key(path, query, body);
+        let cache_key = Self::get_cache_key(path, query, body, request_headers);
 
         // Try to get from cache
         let cached = {
@@ -1082,14 +1286,17 @@ impl HttpTableProvider {
         if let Some(cached_response) = cached
             && cached_response.is_fresh()
         {
-            if let Some(ref format) = cached_response.detected_format {
-                tracing::debug!(
-                    "Returning fresh cached content for {} (detected format: {})",
-                    cache_key,
-                    format
-                );
-            } else {
-                tracing::debug!("Returning fresh cached content for {}", cache_key);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let cache_key_label = cache_key.redacted_label();
+                if let Some(ref format) = cached_response.detected_format {
+                    tracing::debug!(
+                        "Returning fresh cached content for {} (detected format: {})",
+                        cache_key_label,
+                        format
+                    );
+                } else {
+                    tracing::debug!("Returning fresh cached content for {}", cache_key_label);
+                }
             }
             return Ok(HttpFetchResult {
                 content: (*cached_response.content).clone(),
@@ -1102,7 +1309,8 @@ impl HttpTableProvider {
         }
 
         // Fetch fresh content
-        self.fetch_and_cache(path, query, body).await
+        self.fetch_and_cache(path, query, body, request_headers)
+            .await
     }
 
     fn get_projected_schema(
@@ -1237,24 +1445,26 @@ impl HttpExec {
         provider: &HttpTableProvider,
         partition: usize,
     ) -> DataFusionResult<RecordBatch> {
-        let (path, query, body) = &self.partitions[partition];
+        let (path, query, body, request_headers) = &self.partitions[partition];
 
         // Use the filter path or empty string (base URL only)
         let path_val = path.as_deref().unwrap_or("");
         let query_val = query.as_deref();
         let body_val = body.as_deref();
+        let request_headers_val = request_headers.as_deref();
 
         tracing::debug!(
-            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}",
+            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}, request_headers_present={}",
             partition,
             path_val,
             query_val,
-            body_val
+            body_val,
+            request_headers_val.is_some()
         );
 
         // Fetch content with path, query, and body
         let result = provider
-            .get_response(path_val, query_val, body_val)
+            .get_response(path_val, query_val, body_val, request_headers_val)
             .await
             .map_err(DataFusionError::from)?;
 
@@ -1270,6 +1480,7 @@ impl HttpExec {
             path.as_deref(),
             query.as_deref(),
             body.as_deref(),
+            request_headers.as_deref(),
             &content_rows,
             &result,
         )
@@ -1281,6 +1492,7 @@ impl HttpExec {
         path: Option<&str>,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
         content_rows: &[String],
         fetch_result: &HttpFetchResult,
     ) -> DataFusionResult<RecordBatch> {
@@ -1306,6 +1518,7 @@ impl HttpExec {
         let path_for_batch = path.unwrap_or("");
         let query_for_batch = query.unwrap_or("");
         let body_for_batch = body.unwrap_or("");
+        let headers_for_batch = request_headers.unwrap_or("");
 
         tracing::debug!(
             "Creating batch with request_path={:?}, content_len={}, num_rows={}",
@@ -1345,6 +1558,9 @@ impl HttpExec {
                 }
                 "request_body" => {
                     Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
+                }
+                "request_headers" => {
+                    Ok(Arc::new(StringArray::from(vec![headers_for_batch; num_rows])) as ArrayRef)
                 }
                 "content" => Ok(Arc::new(StringArray::from_iter_values(
                     content_rows.iter().map(String::as_str),
@@ -1525,16 +1741,17 @@ impl DisplayAs for HttpExec {
             self.provider.base_url, self.provider.file_format
         )?;
 
-        for (i, (path, query, body)) in self.partitions.iter().enumerate() {
+        for (i, (path, query, body, request_headers)) in self.partitions.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
             write!(
                 f,
-                "(path={:?}, query={:?}, body={:?})",
+                "(path={:?}, query={:?}, body={:?}, request_headers_present={})",
                 path.as_deref().unwrap_or(""),
                 query.as_deref().unwrap_or(""),
-                body.as_deref().unwrap_or("")
+                body.as_deref().unwrap_or(""),
+                request_headers.is_some()
             )?;
         }
 
@@ -1582,7 +1799,7 @@ impl ExecutionPlan for HttpExec {
         let schema = Arc::clone(&self.projected_schema);
 
         if provider.is_paginated() {
-            let (path, query, body) = self.partitions[partition].clone();
+            let (path, query, body, request_headers) = self.partitions[partition].clone();
             let limit = self.limit;
 
             let initial_state = PaginationState {
@@ -1592,6 +1809,7 @@ impl ExecutionPlan for HttpExec {
                 path,
                 query,
                 body,
+                request_headers,
                 limit,
                 done: false,
                 last_page_path: None,
@@ -1650,10 +1868,22 @@ impl ExecutionPlan for HttpExec {
                             state.last_page_path = state.path.clone();
                             state.last_page_query = merged_query.clone();
                             provider
-                                .get_response(path_val, merged_query.as_deref(), body_val)
+                                .get_response(
+                                    path_val,
+                                    merged_query.as_deref(),
+                                    body_val,
+                                    state.request_headers.as_deref(),
+                                )
                                 .await
                                 .map_err(DataFusionError::from)?
                         } else {
+                            let parsed_request_headers = state
+                                .request_headers
+                                .as_deref()
+                                .map(|headers| provider.parse_request_headers(headers))
+                                .transpose()
+                                .map_err(DataFusionError::from)?;
+
                             // Subsequent pages bypass the HTTP cache intentionally:
                             // each page has unique content that shouldn't be cached
                             // under the same key as the base request.
@@ -1682,6 +1912,7 @@ impl ExecutionPlan for HttpExec {
                                         .perform_request_with_retry(
                                             url.clone(),
                                             state.body.as_deref(),
+                                            parsed_request_headers.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -1707,6 +1938,7 @@ impl ExecutionPlan for HttpExec {
                                         .perform_request_with_retry(
                                             url,
                                             state.body.as_deref(),
+                                            parsed_request_headers.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -1733,6 +1965,7 @@ impl ExecutionPlan for HttpExec {
                                         .perform_request_with_retry(
                                             url,
                                             state.body.as_deref(),
+                                            parsed_request_headers.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -1818,6 +2051,7 @@ impl ExecutionPlan for HttpExec {
                             state.last_page_path.as_deref(),
                             state.last_page_query.as_deref(),
                             state.body.as_deref(),
+                            state.request_headers.as_deref(),
                             &content_rows,
                             &fetch_result,
                         )?;
@@ -1876,6 +2110,7 @@ struct PaginationState {
     path: Option<String>,
     query: Option<String>,
     body: Option<String>,
+    request_headers: Option<String>,
     limit: Option<usize>,
     done: bool,
     /// The actual path/query used for the most recent page fetch.
@@ -2236,14 +2471,22 @@ fn merge_base_and_partition_queries_with_override(
 }
 
 impl HttpTableProvider {
-    /// Extract paths from filters for creating partitions. Query and body filters are validated but not used for partitioning.
+    /// Extract request partition values from filters.
+    ///
+    /// Path, query, body, and header filters are all used to build the partition
+    /// cross product, with each unique combination producing a separate HTTP
+    /// request partition.
     fn extract_partitions(&self, filters: &[Expr]) -> DataFusionResult<Vec<PartitionSpec>> {
         tracing::trace!(
-            "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}",
+            "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}, allow_header_filters={}",
             filters.len(),
             self.allowed_paths,
-            self.allow_query_filters,
-            self.allow_body_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Query),
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Body),
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Headers)
         );
 
         let mut accumulator = PartitionAccumulator::new();
@@ -2254,30 +2497,42 @@ impl HttpTableProvider {
         }
 
         tracing::trace!(
-            "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}",
-            accumulator.has_path_filter,
-            accumulator.has_query_filter,
-            accumulator.has_body_filter
+            "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}, has_header_filter={}",
+            accumulator.has_filter(RequestFilterKind::Path),
+            accumulator.has_filter(RequestFilterKind::Query),
+            accumulator.has_filter(RequestFilterKind::Body),
+            accumulator.has_filter(RequestFilterKind::Headers)
         );
 
-        let (paths, queries, bodies) = accumulator.finalize();
+        let partition_values = accumulator.finalize();
 
         tracing::trace!(
-            "After finalize: paths={:?}, queries={:?}, bodies={:?}",
-            paths,
-            queries,
-            bodies
+            "After finalize: paths={:?}, queries={:?}, bodies={:?}, headers_count={}",
+            partition_values.paths,
+            partition_values.queries,
+            partition_values.bodies,
+            partition_values.headers.len()
         );
 
+        self.ensure_request_partition_count(
+            partition_values.paths.len(),
+            partition_values.queries.len(),
+            partition_values.bodies.len(),
+            partition_values.headers.len(),
+        )?;
+
         let mut partitions = vec![];
-        for p in &paths {
-            for q in &queries {
-                for b in &bodies {
-                    partitions.push((
-                        if p.is_empty() { None } else { Some(p.clone()) },
-                        q.clone(),
-                        b.clone(),
-                    ));
+        for p in &partition_values.paths {
+            for q in &partition_values.queries {
+                for b in &partition_values.bodies {
+                    for h in &partition_values.headers {
+                        partitions.push((
+                            if p.is_empty() { None } else { Some(p.clone()) },
+                            q.clone(),
+                            b.clone(),
+                            h.clone(),
+                        ));
+                    }
                 }
             }
         }
@@ -2304,11 +2559,64 @@ impl HttpTableProvider {
     ) -> Result<()> {
         match expr.op {
             Operator::Eq => self.handle_equality_expr(expr, accumulator),
-            Operator::Or | Operator::And => {
+            Operator::And => {
+                self.extract_filter_values(expr.left.as_ref(), accumulator)?;
+                self.extract_filter_values(expr.right.as_ref(), accumulator)
+            }
+            Operator::Or => {
+                // OR within a single HTTP virtual filter column is treated as
+                // an IN list (alternative values). OR across different
+                // columns would be silently rewritten as a cross product
+                // (AND) by the partition accumulator, causing the connector
+                // to issue combined HTTP requests instead of separate ones.
+                // Reject the cross-column case explicitly. (Note: SQL
+                // `IN (...)` is sometimes pre-rewritten by DataFusion into a
+                // chain of OR-of-equality, which is why same-column OR must
+                // still be accepted.)
+                let mut columns = HashSet::new();
+                Self::collect_http_filter_columns(expr.left.as_ref(), &mut columns);
+                Self::collect_http_filter_columns(expr.right.as_ref(), &mut columns);
+                if columns.len() > 1 {
+                    let mut names: Vec<&str> = columns.into_iter().collect();
+                    names.sort_unstable();
+                    return Err(Error::FilterRejected {
+                        message: format!(
+                            "OR across different HTTP filter columns ({}) is not supported because the connector would otherwise issue combined HTTP requests instead of separate ones. Use IN (...) to enumerate values on a single column, or run separate queries (e.g. UNION ALL) for alternative requests.",
+                            names.join(", ")
+                        ),
+                    });
+                }
                 self.extract_filter_values(expr.left.as_ref(), accumulator)?;
                 self.extract_filter_values(expr.right.as_ref(), accumulator)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Walk an expression tree and collect the names of any HTTP virtual
+    /// filter columns (`request_path`, `request_query`, `request_body`,
+    /// `request_headers`) referenced anywhere inside it.
+    fn collect_http_filter_columns(expr: &Expr, columns: &mut HashSet<&'static str>) {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+                Self::collect_http_filter_columns(left.as_ref(), columns);
+                Self::collect_http_filter_columns(right.as_ref(), columns);
+            }
+            Expr::InList(in_list) => {
+                Self::collect_http_filter_columns(in_list.expr.as_ref(), columns);
+            }
+            Expr::Column(column) => {
+                if let Some(static_name) = match column.name.as_str() {
+                    "request_path" => Some("request_path"),
+                    "request_query" => Some("request_query"),
+                    "request_body" => Some("request_body"),
+                    "request_headers" => Some("request_headers"),
+                    _ => None,
+                } {
+                    columns.insert(static_name);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2333,7 +2641,7 @@ impl HttpTableProvider {
         if let Expr::Column(column) = in_list.expr.as_ref()
             && matches!(
                 column.name.as_str(),
-                "request_path" | "request_query" | "request_body"
+                "request_path" | "request_query" | "request_body" | "request_headers"
             )
         {
             for expr in &in_list.list {
@@ -2351,11 +2659,19 @@ impl HttpTableProvider {
         value: &str,
         accumulator: &mut PartitionAccumulator,
     ) -> Result<()> {
-        tracing::trace!(
-            "apply_literal_filter: column={}, value={}",
-            column_name,
-            value
-        );
+        if column_name == "request_headers" {
+            tracing::trace!(
+                "apply_literal_filter: column={}, value=<redacted {} bytes>",
+                column_name,
+                value.len()
+            );
+        } else {
+            tracing::trace!(
+                "apply_literal_filter: column={}, value={}",
+                column_name,
+                value
+            );
+        }
         match column_name {
             "request_path" => {
                 let normalized = self.ensure_allowed_path(value)?;
@@ -2372,6 +2688,11 @@ impl HttpTableProvider {
                 tracing::trace!("Body filter validated and normalized: {}", normalized);
                 accumulator.record_body(normalized);
             }
+            "request_headers" => {
+                let normalized = self.ensure_allowed_headers(value)?;
+                tracing::trace!("Header filter validated: {} bytes", normalized.len());
+                accumulator.record_headers(normalized);
+            }
             _ => {
                 tracing::debug!("Ignoring filter on column: {}", column_name);
             }
@@ -2380,7 +2701,7 @@ impl HttpTableProvider {
     }
 
     /// Check if a filter expression can be pushed down to HTTP requests
-    /// Note: This returns true if the filter is on `request_path`, `request_query`, or `request_body` columns.
+    /// Note: This returns true if the filter is on `request_path`, `request_query`, `request_body`, or `request_headers` columns.
     /// Actual validation (whether the feature is enabled/configured) happens in `extract_partitions` with user-friendly errors.
     fn can_pushdown_filter(filter: &Expr) -> bool {
         match filter {
@@ -2390,7 +2711,7 @@ impl HttpTableProvider {
                     if let Expr::Literal(ScalarValue::Utf8(Some(_value)), _) = right.as_ref() {
                         matches!(
                             col.name.as_str(),
-                            "request_path" | "request_query" | "request_body"
+                            "request_path" | "request_query" | "request_body" | "request_headers"
                         )
                     } else {
                         false
@@ -2404,7 +2725,7 @@ impl HttpTableProvider {
                 if let Expr::Column(col) = in_list.expr.as_ref() {
                     matches!(
                         col.name.as_str(),
-                        "request_path" | "request_query" | "request_body"
+                        "request_path" | "request_query" | "request_body" | "request_headers"
                     )
                 } else {
                     false
@@ -2484,22 +2805,26 @@ impl HttpTableProvider {
         tracing::debug!(
             "ensure_allowed_query called with raw={}, allow_query_filters={}",
             raw,
-            self.allow_query_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Query)
         );
 
-        if !self.allow_query_filters {
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Query)
+        {
             tracing::warn!("Query filter attempted but allow_query_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_query' because query filtering is disabled for this dataset. To enable, set the 'request_query_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
-        if raw.len() > self.max_query_length {
+        if raw.len() > self.request_filter_options.max_query_length {
             return Err(Error::FilterRejected {
                 message: format!(
                     "The 'request_query' value is too long ({} characters). Maximum allowed length is {} characters. You can increase this limit using the 'max_request_query_length' parameter.",
                     raw.len(),
-                    self.max_query_length
+                    self.request_filter_options.max_query_length
                 ),
             });
         }
@@ -2523,27 +2848,157 @@ impl HttpTableProvider {
         tracing::debug!(
             "ensure_allowed_body called with raw={}, allow_body_filters={}",
             raw,
-            self.allow_body_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Body)
         );
 
-        if !self.allow_body_filters {
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Body)
+        {
             tracing::warn!("Body filter attempted but allow_body_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_body' because body filtering is disabled for this dataset. To enable, set the 'request_body_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
-        if raw.len() > self.max_body_bytes {
+        if raw.len() > self.request_filter_options.max_body_bytes {
             return Err(Error::FilterRejected {
                 message: format!(
                     "The 'request_body' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_body_bytes' parameter.",
                     raw.len(),
-                    self.max_body_bytes
+                    self.request_filter_options.max_body_bytes
                 ),
             });
         }
 
         Ok(raw.to_string())
+    }
+
+    fn ensure_allowed_headers(&self, raw: &str) -> Result<String> {
+        tracing::debug!(
+            "ensure_allowed_headers called with allow_header_filters={}, bytes={}",
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Headers),
+            raw.len()
+        );
+
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Headers)
+        {
+            tracing::warn!("Header filter attempted but allow_header_filters is false");
+            return Err(Error::FilterRejected {
+                message:
+                    "Cannot filter by 'request_headers' because header filtering is disabled for this dataset. To enable, set the 'request_header_filters' parameter to 'enabled' and configure 'request_header_allowlist' with the header names that may vary."
+                        .to_string(),
+            });
+        }
+        if raw.len() > self.request_filter_options.max_headers_length {
+            return Err(Error::FilterRejected {
+                message: format!(
+                    "The 'request_headers' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_headers_length' parameter.",
+                    raw.len(),
+                    self.request_filter_options.max_headers_length
+                ),
+            });
+        }
+
+        self.parse_request_headers(raw)?;
+        Ok(raw.to_string())
+    }
+
+    fn parse_request_headers(&self, raw: &str) -> Result<HeaderMap> {
+        let parsed = serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
+            Error::FilterRejected {
+                message: format!(
+                    "The 'request_headers' value must be a JSON object with string header values. Failed to parse JSON: {e}"
+                ),
+            }
+        })?;
+
+        let serde_json::Value::Object(headers_object) = parsed else {
+            return Err(Error::FilterRejected {
+                message: "The 'request_headers' value must be a JSON object with string header values, such as '{\"x-sandbox-id\":\"sandbox-1\"}'.".to_string(),
+            });
+        };
+
+        let mut headers = HeaderMap::new();
+        for (name, value) in headers_object {
+            let header_name = HeaderName::try_from(name.as_str()).map_err(|e| {
+                Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' object contains invalid HTTP header name '{name}': {e}"
+                    ),
+                }
+            })?;
+
+            if !self
+                .request_filter_options
+                .allowed_headers
+                .contains(&header_name)
+            {
+                return Err(Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' object contains header '{name}', which is not in request_header_allowlist. Add '{name}' to request_header_allowlist or remove it from the filter."
+                    ),
+                });
+            }
+
+            if self.auth.is_some() && header_name == AUTHORIZATION {
+                return Err(Error::FilterRejected {
+                    message: "The 'request_headers' object cannot set 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_headers or disable HTTP authentication.".to_string(),
+                });
+            }
+
+            let Some(header_value) = value.as_str() else {
+                return Err(Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' value for header '{name}' must be a string."
+                    ),
+                });
+            };
+
+            let header_value = HeaderValue::from_str(header_value).map_err(|_| {
+                Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' value for header '{name}' is not a valid HTTP header value."
+                    ),
+                }
+            })?;
+            headers.insert(header_name, header_value);
+        }
+
+        Ok(headers)
+    }
+
+    fn ensure_request_partition_count(
+        &self,
+        path_count: usize,
+        query_count: usize,
+        body_count: usize,
+        header_count: usize,
+    ) -> Result<()> {
+        let partition_count = path_count
+            .checked_mul(query_count)
+            .and_then(|count| count.checked_mul(body_count))
+            .and_then(|count| count.checked_mul(header_count))
+            .ok_or_else(|| Error::FilterRejected {
+                message: "The HTTP request partition count overflowed while combining request_path, request_query, request_body, and request_headers filters. Reduce the number of filter values.".to_string(),
+            })?;
+
+        if let Some(max_request_partitions) = self.max_request_partitions {
+            ensure!(
+                partition_count <= max_request_partitions,
+                FilterRejectedSnafu {
+                    message: format!(
+                        "The HTTP connector would create {partition_count} request partitions, which exceeds max_request_partitions={max_request_partitions}. Reduce the number of request_path, request_query, request_body, or request_headers filter values, or increase max_request_partitions."
+                    )
+                }
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -2558,6 +3013,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use url::Url;
+
+    #[derive(Debug)]
+    struct TestAuthenticator;
+
+    impl super::super::auth::HttpAuthenticator for TestAuthenticator {
+        fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            builder.header(AUTHORIZATION, "Bearer token")
+        }
+    }
 
     /// Build a query string by adding or replacing a token parameter.
     fn build_query_with_token(existing_query: Option<&str>, param: &str, token: &str) -> String {
@@ -2618,6 +3082,12 @@ mod tests {
         )
     }
 
+    fn header_provider() -> HttpTableProvider {
+        base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id", "x-region"])
+            .expect("header filters should enable")
+    }
+
     #[test]
     fn test_extract_partitions_with_path_and_query_filters() {
         let provider = base_provider()
@@ -2646,13 +3116,14 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Only path creates partition, query is validated but not used for partitioning
+        // Path and query filters together produce one partition tuple containing both values.
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
             (
                 Some("/singlesearch/shows".to_string()),
                 Some("q=South%20Park".to_string()),
+                None,
                 None
             )
         );
@@ -2675,7 +3146,10 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/data".to_string()), None, None));
+        assert_eq!(
+            partitions[0],
+            (Some("/api/data".to_string()), None, None, None)
+        );
     }
 
     #[test]
@@ -2687,7 +3161,7 @@ mod tests {
             .expect("partitions");
 
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (None, None, None));
+        assert_eq!(partitions[0], (None, None, None, None));
     }
 
     #[test]
@@ -2717,8 +3191,8 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/path1".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/path2".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/path1".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/path2".to_string()), None, None, None)));
     }
 
     #[test]
@@ -2742,8 +3216,8 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/api/v1/users".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/api/v1/posts".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/api/v1/users".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/api/v1/posts".to_string()), None, None, None)));
     }
 
     #[test]
@@ -2761,11 +3235,17 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Query filters don't create partitions, only path filters do
-        // This will create a single partition with no path
+        // Query filters in an IN list produce one extracted partition tuple per query value.
+        // These partitions do not constrain the path, so `request_path` remains `None`.
         assert_eq!(partitions.len(), 2);
-        assert_eq!(partitions[0], (None, Some("limit=10".to_string()), None));
-        assert_eq!(partitions[1], (None, Some("limit=20".to_string()), None));
+        assert_eq!(
+            partitions[0],
+            (None, Some("limit=10".to_string()), None, None)
+        );
+        assert_eq!(
+            partitions[1],
+            (None, Some("limit=20".to_string()), None, None)
+        );
     }
 
     #[test]
@@ -2797,8 +3277,84 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/api/v1".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/api/v2".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/api/v1".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/api/v2".to_string()), None, None, None)));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_query_filters(64);
+        // request_path = '/a' OR request_query = 'b=1'
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_query"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("b=1".to_string())),
+                    None,
+                )),
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("OR across different HTTP filter columns"),
+            "unexpected error message: {message}"
+        );
+        assert!(message.contains("request_path"));
+        assert!(message.contains("request_query"));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_nested_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id".to_string()])
+            .expect("enable header filters");
+        // request_path = '/a' OR request_headers IN ('{"x-sandbox-id":"a"}')
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::InList(InList {
+                expr: Box::new(Expr::Column(Column::from_name("request_headers"))),
+                list: vec![Expr::Literal(
+                    ScalarValue::Utf8(Some(r#"{"x-sandbox-id":"a"}"#.to_string())),
+                    None,
+                )],
+                negated: false,
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        assert!(
+            err.to_string()
+                .contains("OR across different HTTP filter columns")
+        );
     }
 
     #[test]
@@ -2829,13 +3385,14 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Only path creates partition; query filters are validated but don't create separate partitions
+        // The path filter is crossed with each query value to produce separate partitions.
         assert_eq!(partitions.len(), 2);
         assert_eq!(
             partitions[0],
             (
                 Some("/api/users".to_string()),
                 Some("limit=10".to_string()),
+                None,
                 None
             )
         );
@@ -2844,6 +3401,7 @@ mod tests {
             (
                 Some("/api/users".to_string()),
                 Some("limit=20".to_string()),
+                None,
                 None
             )
         );
@@ -2965,6 +3523,164 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_partitions_with_request_headers_in_list() {
+        let provider = header_provider();
+        let headers_1 = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
+        let headers_2 = r#"{"x-sandbox-id":"sandbox-2","x-region":"us-west"}"#.to_string();
+        let filters = vec![Expr::InList(InList::new(
+            Box::new(Expr::Column(Column::from_name("request_headers"))),
+            vec![
+                Expr::Literal(ScalarValue::Utf8(Some(headers_1.clone())), None),
+                Expr::Literal(ScalarValue::Utf8(Some(headers_2.clone())), None),
+            ],
+            false,
+        ))];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0], (None, None, None, Some(headers_1)));
+        assert_eq!(partitions[1], (None, None, None, Some(headers_2)));
+    }
+
+    #[test]
+    fn test_request_headers_filter_needs_enable() {
+        let provider = base_provider();
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"x-sandbox-id":"sandbox-1"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("request_header_filters"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_headers_filter_rejects_unallowlisted_header() {
+        let provider = header_provider();
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"authorization":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("request_header_allowlist"));
+                assert!(message.contains("authorization"));
+                assert!(!message.contains("secret"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_headers_filter_rejects_authorization_with_auth() {
+        let provider = base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["authorization"])
+            .expect("authorization should be allowlisted before auth is configured")
+            .with_auth(Arc::new(TestAuthenticator));
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"authorization":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("authorization"));
+                assert!(message.contains("HTTP authentication"));
+                assert!(!message.contains("secret"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_headers_filter_rejects_invalid_json() {
+        let provider = header_provider();
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("not json".to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("JSON object"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_max_request_partitions_rejects_large_cross_product() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/users".to_string(), "/api/posts".to_string()])
+            .expect("allowed paths")
+            .enable_query_filters(64)
+            .with_max_request_partitions(Some(3));
+        let filters = vec![
+            Expr::InList(InList::new(
+                Box::new(Expr::Column(Column::from_name("request_path"))),
+                vec![
+                    Expr::Literal(ScalarValue::Utf8(Some("/api/users".to_string())), None),
+                    Expr::Literal(ScalarValue::Utf8(Some("/api/posts".to_string())), None),
+                ],
+                false,
+            )),
+            Expr::InList(InList::new(
+                Box::new(Expr::Column(Column::from_name("request_query"))),
+                vec![
+                    Expr::Literal(ScalarValue::Utf8(Some("status=active".to_string())), None),
+                    Expr::Literal(ScalarValue::Utf8(Some("status=inactive".to_string())), None),
+                ],
+                false,
+            )),
+        ];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected partition cap rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("4 request partitions"));
+                assert!(message.contains("max_request_partitions=3"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_url_construction_with_base_path() {
         // Test that path from filter is appended to base URL path
         let base_url = Url::parse("https://api.example.com/v1").expect("valid URL");
@@ -3038,18 +3754,33 @@ mod tests {
 
     #[test]
     fn test_cache_key_generation() {
-        let key1 = HttpTableProvider::get_cache_key("/path", Some("query"), None);
-        let key2 = HttpTableProvider::get_cache_key("/path", None, None);
-        let key3 = HttpTableProvider::get_cache_key("/other", Some("query"), None);
-        let key4 = HttpTableProvider::get_cache_key("/path", Some("query"), Some("body"));
+        let key1 = HttpTableProvider::get_cache_key("/path", Some("query"), None, None);
+        let key2 = HttpTableProvider::get_cache_key("/path", None, None, None);
+        let key3 = HttpTableProvider::get_cache_key("/other", Some("query"), None, None);
+        let key4 = HttpTableProvider::get_cache_key("/path", Some("query"), Some("body"), None);
+        let key5 = HttpTableProvider::get_cache_key(
+            "/path",
+            Some("query"),
+            Some("body"),
+            Some(r#"{"x-sandbox-id":"sandbox-1"}"#),
+        );
+        let collision_candidate_1 =
+            HttpTableProvider::get_cache_key("/path", Some("q&body=b"), Some(""), None);
+        let collision_candidate_2 =
+            HttpTableProvider::get_cache_key("/path", Some("q"), Some("b&body="), None);
 
-        assert_eq!(key1, "/path?query&body=");
-        assert_eq!(key2, "/path?&body=");
-        assert_eq!(key3, "/other?query&body=");
-        assert_eq!(key4, "/path?query&body=body");
-        assert_ne!(key1, key2);
-        assert_ne!(key1, key3);
-        assert_ne!(key1, key4);
+        assert!(key1 == CacheKey::new("/path", Some("query"), None, None));
+        assert!(key1 != key2);
+        assert!(key1 != key3);
+        assert!(key1 != key4);
+        assert!(key4 != key5);
+        assert!(collision_candidate_1 != collision_candidate_2);
+
+        let redacted_label = key5.redacted_label();
+        assert!(redacted_label.starts_with("http-cache-key:"));
+        assert!(!redacted_label.contains("/path"));
+        assert!(!redacted_label.contains("body"));
+        assert!(!redacted_label.contains("sandbox-1"));
     }
 
     #[test]
@@ -3103,39 +3834,43 @@ mod tests {
     fn test_base_table_schema() {
         let schema = HttpTableProvider::base_table_schema();
 
-        assert_eq!(schema.fields().len(), 7);
+        assert_eq!(schema.fields().len(), 8);
         assert_eq!(schema.field(0).name(), "request_path");
         assert_eq!(schema.field(1).name(), "request_query");
         assert_eq!(schema.field(2).name(), "request_body");
-        assert_eq!(schema.field(3).name(), "content");
-        assert_eq!(schema.field(4).name(), "response_status");
-        assert_eq!(schema.field(5).name(), "response_headers");
-        assert_eq!(schema.field(6).name(), "fetched_at");
+        assert_eq!(schema.field(3).name(), "request_headers");
+        assert_eq!(schema.field(4).name(), "content");
+        assert_eq!(schema.field(5).name(), "response_status");
+        assert_eq!(schema.field(6).name(), "response_headers");
+        assert_eq!(schema.field(7).name(), "fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
-        assert_eq!(*schema.field(4).data_type(), DataType::UInt16);
+        assert_eq!(*schema.field(4).data_type(), DataType::Utf8);
+        assert_eq!(*schema.field(5).data_type(), DataType::UInt16);
         assert!(matches!(
-            schema.field(5).data_type(),
+            schema.field(6).data_type(),
             DataType::Map(_, false)
         ));
         assert_eq!(
-            *schema.field(6).data_type(),
+            *schema.field(7).data_type(),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
         );
         assert!(!schema.field(0).is_nullable()); // request_path is not nullable
         assert!(schema.field(1).is_nullable()); // request_query is nullable
         assert!(schema.field(2).is_nullable()); // request_body is nullable
-        assert!(!schema.field(3).is_nullable()); // content is not nullable
-        assert!(!schema.field(4).is_nullable()); // response_status is not nullable
-        assert!(schema.field(5).is_nullable()); // response_headers is nullable
-        assert!(schema.field(6).is_nullable()); // fetched_at is nullable
+        assert!(schema.field(3).is_nullable()); // request_headers is nullable
+        assert!(!schema.field(4).is_nullable()); // content is not nullable
+        assert!(!schema.field(5).is_nullable()); // response_status is not nullable
+        assert!(schema.field(6).is_nullable()); // response_headers is nullable
+        assert!(schema.field(7).is_nullable()); // fetched_at is nullable
     }
 
     #[tokio::test]
     async fn test_fetch_and_create_batch_includes_response_headers() {
         let provider = Arc::new(base_provider());
+        let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
             max_age: Duration::from_secs(60),
@@ -3148,13 +3883,18 @@ mod tests {
             ],
         };
         provider
-            .cache_response("/posts", None, None, &fetch_result)
+            .cache_response("/posts", None, None, Some(&request_headers), &fetch_result)
             .await;
 
         let exec = HttpExec::new(
             HttpTableProvider::base_table_schema().into(),
             Arc::clone(&provider),
-            vec![(Some("/posts".to_string()), None, None)],
+            vec![(
+                Some("/posts".to_string()),
+                None,
+                None,
+                Some(request_headers.clone()),
+            )],
             None,
         );
 
@@ -3169,8 +3909,16 @@ mod tests {
             "JSON array content should yield two rows"
         );
 
+        let request_headers_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("request_headers should be a StringArray");
+        assert_eq!(request_headers_col.value(0), request_headers);
+        assert_eq!(request_headers_col.value(1), request_headers);
+
         let headers_col = batch
-            .column(5)
+            .column(6)
             .as_any()
             .downcast_ref::<arrow::array::MapArray>()
             .expect("response_headers should be a MapArray");
@@ -3379,7 +4127,10 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+        assert_eq!(
+            partitions[0],
+            (Some("/api/users".to_string()), None, None, None)
+        );
     }
 
     #[test]
@@ -3402,7 +4153,7 @@ mod tests {
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
-            (Some("/api/v1/users/123".to_string()), None, None)
+            (Some("/api/v1/users/123".to_string()), None, None, None)
         );
     }
 
@@ -3426,7 +4177,7 @@ mod tests {
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
-            (Some("/api/v1/users".to_string()), None, None)
+            (Some("/api/v1/users".to_string()), None, None, None)
         );
     }
 
@@ -3569,8 +4320,8 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/api/users".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/v1/search".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/api/users".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/v1/search".to_string()), None, None, None)));
     }
 
     #[test]
@@ -3591,7 +4342,10 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("should match");
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+        assert_eq!(
+            partitions[0],
+            (Some("/api/users".to_string()), None, None, None)
+        );
     }
 
     #[test]
@@ -5274,7 +6028,7 @@ mod tests {
         );
         let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
         let schema = provider.schema();
-        let exec = HttpExec::new(schema, provider, vec![(None, None, None)], None);
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
         (exec, nesting)
     }
 
@@ -5417,7 +6171,7 @@ mod tests {
                 ])
                 .expect("projection should succeed"),
         );
-        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
         let rows = vec![r#"{"id":"42","name":"fast","extra":"ignored"}"#.to_string()];
         let batch = exec
             .create_batch_from_rows_nested(&rows, &nesting)
@@ -5442,7 +6196,7 @@ mod tests {
         let id_idx = full_schema.index_of("id").expect("id in schema");
         let projected = datafusion::common::project_schema(&full_schema, Some(&vec![id_idx]))
             .expect("project schema");
-        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
         let rows = vec!["[1,2,3]".to_string(), r#"{"id":"x"}"#.to_string()];
         let batch = exec
             .create_batch_from_rows_nested(&rows, &nesting)
@@ -5469,7 +6223,7 @@ mod tests {
             1,
             "empty projection should fall back to a single field"
         );
-        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
         let rows = vec![
             r#"{"id":"1","extra":"x"}"#.to_string(),
             r#"{"id":"2"}"#.to_string(),
@@ -5497,7 +6251,7 @@ mod tests {
             response_headers: Vec::new(),
         };
         let batch = exec
-            .create_batch_from_rows(None, None, None, &rows, &fetch_result)
+            .create_batch_from_rows(None, None, None, None, &rows, &fetch_result)
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
         let schema = batch.schema();

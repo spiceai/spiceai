@@ -3561,6 +3561,32 @@ impl CayenneTableProvider {
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
     }
 
+    /// Flush inlined rows to Vortex files when pending inline data exists.
+    ///
+    /// Callers must hold `write_lock` while calling this helper.
+    async fn checkpoint_inlined_data_if_present_for_delete(&self) -> datafusion_common::Result<()> {
+        let inlined_count = self
+            .catalog
+            .get_inlined_data_count(&self.table_metadata.table_id)
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to get inlined data count for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+
+        if inlined_count > 0 {
+            self.checkpoint_inlined_data().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to checkpoint inlined data before delete: {e}"
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
     /// Load both position-based and key-based deletion vectors from the catalog.
     ///
     /// This method queries the catalog for delete files and loads them into memory,
@@ -4567,23 +4593,7 @@ impl TableProvider for CayenneTableProvider {
         // and listing table in an inconsistent state.
         {
             let _guard = self.write_lock.lock().await;
-            let inlined_count = self
-                .catalog
-                .get_inlined_data_count(&self.table_metadata.table_id)
-                .await
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to get inlined data count for table {}: {e}",
-                        self.table_metadata.table_name
-                    ))
-                })?;
-            if inlined_count > 0 {
-                self.checkpoint_inlined_data().await.map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to checkpoint inlined data before delete: {e}"
-                    ))
-                })?;
-            }
+            self.checkpoint_inlined_data_if_present_for_delete().await?;
         }
 
         if self.file_based_deletes_preferred(&filters) {
@@ -4719,6 +4729,69 @@ impl CayenneTableProvider {
                 Some(Arc::clone(&self.write_lock)),
             ),
         ))))
+    }
+
+    /// Delete rows by hash-probing key columns against a set of matched keys.
+    ///
+    /// Fast path for `MERGE INTO` on `PositionBased` tables. Bypasses filter
+    /// construction and the O(N) filter-per-file evaluation. Instead, scans
+    /// each file and performs O(1) `HashSet` lookups per row.
+    ///
+    /// Acquires the write lock to prevent concurrent writes/refreshes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing table lock cannot be read or if the
+    /// underlying position-based deletion scan/persist operation fails.
+    pub async fn delete_matched_rows_by_key_probe(
+        &self,
+        matched_keys: std::collections::HashSet<Vec<datafusion_common::ScalarValue>>,
+        key_columns: &[String],
+    ) -> datafusion_common::Result<u64> {
+        let _write_guard = self.write_lock.lock().await;
+
+        // MERGE key-probe deletes operate on listing-table files only, so
+        // pending inlined rows must be materialized first.
+        self.checkpoint_inlined_data_if_present_for_delete().await?;
+
+        let ctx = self.create_session_context();
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Failed to read listing table lock for '{}'",
+                    self.table_metadata.table_name
+                ))
+            })?;
+            Arc::clone(&guard)
+        };
+
+        // PositionBased tables have no protected snapshots, so we only scan the main listing table.
+        let all_tables = vec![listing_table];
+
+        // Build the deletion sink with write_lock=None (we already hold it).
+        let sink = CayenneDeletionSink::new(
+            self.table_metadata.clone(),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.listing_table),
+            Arc::clone(&self.table_metadata.schema),
+            &[], // no filters — positions are resolved by key probe
+            self.pk_deletion_strategy.clone(),
+            self.pk_row_converter.as_ref().map(Arc::clone),
+            self.pk_column_indices.clone(),
+            Vec::new(), // no protected snapshots for PositionBased
+            Arc::clone(self.context.runtime_env()),
+            None, // write lock already held above
+        );
+
+        sink.delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)
+            .await
+            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))
+    }
+
+    /// Returns `true` if this table uses the `PositionBased` deletion strategy.
+    #[must_use]
+    pub fn is_position_based(&self) -> bool {
+        self.pk_deletion_strategy.is_position_based()
     }
 
     /// Build listing tables for all protected snapshots.

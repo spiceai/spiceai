@@ -126,9 +126,7 @@ jobs:
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -223,9 +221,7 @@ jobs:
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -298,89 +294,6 @@ jobs:
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
-  # Dev-profile install (make install-dev)
-  build-install-dev:
-    name: Build (dev profile)
-    runs-on: spiceai-macos
-    needs: [check_changes]
-    env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
-
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          fetch-depth: 1
-
-      - name: Set up Rust
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-rust
-
-      - name: Set up spiceio
-        if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
-        id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
-        with:
-          smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
-          token: ${{ github.token }}
-          bucket: sccache
-          region: us-west-1
-
-      - name: Set up sccache
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-sccache
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-
-      - name: Install Protoc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up make
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-cc
-
-      # The install-* targets hardcode target/debug/ and target/release/ paths, so the workflow-level
-      # RUST_PROFILE=lint must be overridden to match (otherwise binaries land in target/lint/).
-      - name: make install-dev
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          RUST_PROFILE: dev
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-        run: make install-dev
-
-      - name: Cancel workflow on failure
-        if: failure()
-        run: gh run cancel ${{ github.run_id }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
-
-      - name: Kill spiceio
-        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
-
-      - name: Upload spiceio logs
-        if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: spiceio-build-install-dev-logs
-          path: ${{ runner.temp }}/spiceio.log
-          if-no-files-found: ignore
-
   # Release-profile installs (make install, install-cli, install-runtime)
   build-install-release:
     name: Build (release profile)
@@ -419,9 +332,7 @@ jobs:
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
