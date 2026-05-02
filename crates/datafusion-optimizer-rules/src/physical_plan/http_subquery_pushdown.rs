@@ -102,14 +102,19 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
     };
 
     // Determine which side has HttpExec and which is the build side.
-    let (http_side, build_side, col_name) = match join_exec.join_type() {
+    // Also capture the build-side column index so we materialize the
+    // correct join key (not blindly column 0).
+    let (http_side, build_side, col_name, build_col_index) = match join_exec.join_type() {
         JoinType::LeftSemi => {
             let on = join_exec.on();
             if on.len() != 1 {
                 return Transformed::no(plan);
             }
-            let (left_col_expr, _) = &on[0];
+            let (left_col_expr, right_col_expr) = &on[0];
             let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
+                return Transformed::no(plan);
+            };
+            let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
                 return Transformed::no(plan);
             };
             let name = left_col.name().to_string();
@@ -123,6 +128,7 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                 Arc::clone(join_exec.left()),
                 Arc::clone(join_exec.right()),
                 name,
+                right_col.index(),
             )
         }
         JoinType::RightSemi => {
@@ -130,7 +136,10 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
             if on.len() != 1 {
                 return Transformed::no(plan);
             }
-            let (_, right_col_expr) = &on[0];
+            let (left_col_expr, right_col_expr) = &on[0];
+            let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
+                return Transformed::no(plan);
+            };
             let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
                 return Transformed::no(plan);
             };
@@ -145,6 +154,7 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                 Arc::clone(join_exec.right()),
                 Arc::clone(join_exec.left()),
                 name,
+                left_col.index(),
             )
         }
         // Inner join: the entire HashJoinExec is replaced by HttpWithDeferredParamsExec, which only outputs
@@ -165,6 +175,9 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                 let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
                     return Transformed::no(plan);
                 };
+                let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
+                    return Transformed::no(plan);
+                };
                 let name = left_col.name().to_string();
                 if !HTTP_REQUEST_PARAM_COLUMNS.contains(&name.as_str()) {
                     return Transformed::no(plan);
@@ -173,8 +186,12 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                     Arc::clone(join_exec.left()),
                     Arc::clone(join_exec.right()),
                     name,
+                    right_col.index(),
                 )
             } else if right_has_http && !left_has_http {
+                let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
+                    return Transformed::no(plan);
+                };
                 let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
                     return Transformed::no(plan);
                 };
@@ -186,6 +203,7 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                     Arc::clone(join_exec.right()),
                     Arc::clone(join_exec.left()),
                     name,
+                    left_col.index(),
                 )
             } else {
                 return Transformed::no(plan);
@@ -198,7 +216,7 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
         "HttpParamsPushdown: rewriting HashJoinExec for column '{col_name}' into HttpWithDeferredParamsExec"
     );
 
-    let exec = HttpWithDeferredParamsExec::new(http_side, build_side, col_name);
+    let exec = HttpWithDeferredParamsExec::new(http_side, build_side, col_name, build_col_index);
     Transformed::yes(Arc::new(exec))
 }
 
@@ -256,6 +274,8 @@ struct HttpWithDeferredParamsExec {
     build_side: Arc<dyn ExecutionPlan>,
     /// Which HTTP virtual column to push the materialized values into.
     col_name: String,
+    /// Column index in the build side output to materialize values from.
+    build_col_index: usize,
     /// Cached plan properties derived from the http side.
     properties: PlanProperties,
     /// Metrics populated at execution time for EXPLAIN ANALYZE visibility.
@@ -267,6 +287,7 @@ impl HttpWithDeferredParamsExec {
         http_side: Arc<dyn ExecutionPlan>,
         build_side: Arc<dyn ExecutionPlan>,
         col_name: String,
+        build_col_index: usize,
     ) -> Self {
         // Always report 1 output partition. DataFusion reads properties()
         // at planning time to schedule downstream nodes, but the true
@@ -289,6 +310,7 @@ impl HttpWithDeferredParamsExec {
             http_side,
             build_side,
             col_name,
+            build_col_index,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -340,6 +362,7 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
             Arc::clone(&children[0]),
             Arc::clone(&children[1]),
             self.col_name.clone(),
+            self.build_col_index,
         )))
     }
 
@@ -351,6 +374,7 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         let http_side = Arc::clone(&self.http_side);
         let build_side = Arc::clone(&self.build_side);
         let col_name = self.col_name.clone();
+        let build_col_index = self.build_col_index;
         let schema = Arc::clone(&self.http_side.schema());
         let ctx = Arc::clone(&context);
         let build_side_values =
@@ -360,7 +384,7 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
 
         let stream = futures::stream::once(async move {
             // 1. Materialize build side (fully async).
-            let values = materialize_string_values(&build_side, &ctx).await?;
+            let values = materialize_string_values(&build_side, &ctx, build_col_index).await?;
 
             build_side_values.add(values.len());
 
@@ -407,21 +431,22 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
 }
 
 /// Execute the build-side plan asynchronously and collect all unique non-null
-/// string values from its first column. Returns an error if the subquery
+/// string values from the specified column. Returns an error if the subquery
 /// produces more than [`MAX_MATERIALIZED_VALUES`] unique values.
 async fn materialize_string_values(
     plan: &Arc<dyn ExecutionPlan>,
     context: &Arc<TaskContext>,
+    col_index: usize,
 ) -> Result<Vec<String>, DataFusionError> {
     let batches = datafusion::physical_plan::collect(Arc::clone(plan), Arc::clone(context)).await?;
 
     let mut seen = HashSet::new();
     let mut values = Vec::new();
     for batch in &batches {
-        if batch.num_columns() == 0 {
+        if batch.num_columns() <= col_index {
             continue;
         }
-        let array = batch.column(0);
+        let array = batch.column(col_index);
 
         let string_iter: Box<dyn Iterator<Item = Option<&str>>> =
             if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
