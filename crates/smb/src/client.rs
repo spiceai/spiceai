@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 use crate::auth;
 use crate::crypto;
 use crate::protocol::{
-    CloseResponse, Command, CreateResponse, DesiredAccess, DirectoryEntry,
+    CloseResponse, Command, CreateResponse, DIALECT_SMB3_1_1, DesiredAccess, DirectoryEntry,
     FILE_ID_BOTH_DIRECTORY_INFORMATION, Header, NT_STATUS_ERROR_MASK, NtStatus, SENTINEL_FILE_ID,
     SMB2_FLAGS_RELATED, SMB2_FLAGS_SIGNED, SMB2_HEADER_SIZE, STATUS_PENDING, build_request,
     decode_close_response, decode_create_response, decode_negotiate_response, decode_read_response,
@@ -251,6 +251,26 @@ impl SmbClient {
             tracing::warn!(target: "smb", "invalid negotiate response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid negotiate response")
         })?;
+
+        // Subsequent signing-key derivation assumes the SMB 3.1.1 preauth
+        // integrity hash as the KDF context (see [MS-SMB2] 3.1.4.5.1). If a
+        // server selected an older dialect we'd derive the wrong key and every
+        // signed request after auth would fail with STATUS_ACCESS_DENIED.
+        if neg_resp.dialect_revision != DIALECT_SMB3_1_1 {
+            tracing::warn!(
+                target: "smb",
+                "server selected unsupported dialect 0x{:04X}; only 3.1.1 is supported",
+                neg_resp.dialect_revision,
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "server selected unsupported SMB dialect 0x{:04X}; only 3.1.1 is supported",
+                    neg_resp.dialect_revision
+                ),
+            ));
+        }
+
         let io_cap = if self.config.max_io_size > 0 {
             self.config.max_io_size
         } else {

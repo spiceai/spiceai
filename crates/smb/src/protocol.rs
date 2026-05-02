@@ -208,13 +208,15 @@ pub fn credit_charge_for(payload_size: u32) -> u16 {
 
 // ── Negotiate ───────────────────────────────────────────────────────────────
 
-/// SMB 3.1.x dialect family
+/// SMB 3.1.1 dialect (the only dialect we implement: signing-key derivation
+/// and the preauth integrity context shape are 3.1.1-specific).
 pub const DIALECT_SMB3_1_1: u16 = 0x0311;
-pub const DIALECT_SMB3_0_2: u16 = 0x0302;
-pub const DIALECT_SMB3_0_0: u16 = 0x0300;
 
-// Offered dialects in preference order (highest first)
-const DIALECTS: [u16; 3] = [DIALECT_SMB3_1_1, DIALECT_SMB3_0_2, DIALECT_SMB3_0_0];
+// Only 3.1.1 is offered. We must NOT advertise 3.0.x because subsequent
+// signing-key derivation assumes the 3.1.1 preauth-integrity-hash context
+// (see [MS-SMB2] 3.1.4.5.1). Mismatched dialects would produce incorrect
+// signing keys, breaking the session immediately after auth.
+const DIALECTS: [u16; 1] = [DIALECT_SMB3_1_1];
 
 // Negotiate context types for SMB 3.1.1
 const SMB2_PREAUTH_INTEGRITY_CAPABILITIES: u16 = 0x0001;

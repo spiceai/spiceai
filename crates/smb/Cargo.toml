@@ -19,7 +19,7 @@ name = "smb"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "SMB 3.1.1 client for Spice.ai (ported from github.com/spiceai/spiceio)"
 
 [dependencies]

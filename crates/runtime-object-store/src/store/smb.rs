@@ -601,9 +601,14 @@ fn upload_already_finalized() -> object_store::Error {
     }
 }
 
-/// Take the `WalWriter` out of the shared slot. Returns an error if the
-/// upload has already been completed/aborted or if the mutex was poisoned.
-fn take_writer(slot: &StdMutex<Option<WalWriter>>) -> object_store::Result<WalWriter> {
+/// Take the value out of a shared `Option<T>` slot under a sync mutex.
+/// Returns an error if the slot is empty (caller has already taken it,
+/// e.g. via `complete()` or `abort()`) or if the mutex was poisoned.
+///
+/// Generic over `T` so the state-machine semantics — single-take, idempotent
+/// after finalize — can be exercised in unit tests without constructing a
+/// real `WalWriter`.
+fn take_slot<T>(slot: &StdMutex<Option<T>>) -> object_store::Result<T> {
     slot.lock()
         .map_err(|_| object_store::Error::Generic {
             store: STORE_NAME,
@@ -613,10 +618,10 @@ fn take_writer(slot: &StdMutex<Option<WalWriter>>) -> object_store::Result<WalWr
         .ok_or_else(upload_already_finalized)
 }
 
-/// Put the `WalWriter` back into the shared slot after async I/O.
-fn replace_writer(slot: &StdMutex<Option<WalWriter>>, writer: WalWriter) {
+/// Put a value back into a shared `Option<T>` slot after async I/O.
+fn replace_slot<T>(slot: &StdMutex<Option<T>>, value: T) {
     if let Ok(mut guard) = slot.lock() {
-        *guard = Some(writer);
+        *guard = Some(value);
     }
 }
 
@@ -625,7 +630,7 @@ impl MultipartUpload for SMBMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
         let writer_slot = Arc::clone(&self.writer);
         Box::pin(async move {
-            let mut writer = take_writer(&writer_slot)?;
+            let mut writer = take_slot(&writer_slot)?;
             let mut io_result: Result<(), std::io::Error> = Ok(());
             for chunk in data.as_ref() {
                 if let Err(e) = writer.write(chunk.as_ref()).await {
@@ -635,13 +640,13 @@ impl MultipartUpload for SMBMultipartUpload {
             }
             // On error the writer is still valid for `abort()`; on success it
             // is valid for the next `put_part()`/`complete()`.
-            replace_writer(&writer_slot, writer);
+            replace_slot(&writer_slot, writer);
             io_result.map_err(handle_error)
         })
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
-        let writer = take_writer(&self.writer)?;
+        let writer = take_slot(&self.writer)?;
         let meta = writer
             .commit(self.share.as_ref())
             .await
@@ -737,5 +742,55 @@ mod tests {
         guard_read_size(1024).expect("small reads are allowed");
         guard_read_size(MAX_BUFFERED_READ).expect("exactly at cap is allowed");
         assert!(guard_read_size(MAX_BUFFERED_READ + 1).is_err());
+    }
+
+    // ── Multipart upload state-machine ───────────────────────────────────
+    //
+    // The full WAL flow (put_part → flush → rename → complete | abort)
+    // exercises a real SMB server; that lives in the runtime integration
+    // suite under a Samba container. The tests below exercise the parts
+    // of `SMBMultipartUpload` that don't require I/O — specifically the
+    // single-take / replace state machine that backs the take_writer /
+    // replace_writer helpers, and the "already finalized" error semantics
+    // that protect against double-complete or use-after-abort.
+    //
+    // The helpers are generic over `T` precisely to make these tests
+    // possible without constructing a `WalWriter`.
+
+    #[test]
+    fn test_take_slot_extracts_value_once() {
+        let slot: StdMutex<Option<u32>> = StdMutex::new(Some(7));
+        let v = take_slot(&slot).expect("first take should succeed");
+        assert_eq!(v, 7);
+        // Slot is now empty — a second take must fail with "already finalized".
+        let err = take_slot(&slot).expect_err("second take must fail");
+        assert!(matches!(err, object_store::Error::Generic { .. }));
+        assert!(err.to_string().contains("already completed or aborted"));
+    }
+
+    #[test]
+    fn test_replace_slot_round_trips_for_next_part() {
+        let slot: StdMutex<Option<String>> = StdMutex::new(Some("part-1".into()));
+        let v = take_slot(&slot).expect("take part-1");
+        // Mid-flight: slot is empty; concurrent put_part would see "finalized".
+        assert!(take_slot(&slot).is_err());
+        // After async I/O completes the writer is returned to the slot —
+        // this is the put_part success path that must allow further parts.
+        replace_slot(&slot, format!("{v}-resumed"));
+        let v2 = take_slot(&slot).expect("take after replace");
+        assert_eq!(v2, "part-1-resumed");
+    }
+
+    #[test]
+    fn test_take_slot_idempotent_after_finalize() {
+        // Empty slot models the post-complete or post-abort state.
+        let slot: StdMutex<Option<u32>> = StdMutex::new(None);
+        // Both finalize paths (complete, abort) and any stray put_part must
+        // see the "already finalized" error rather than panicking or silently
+        // succeeding against missing state.
+        for _ in 0..3 {
+            let err = take_slot(&slot).expect_err("must reject after finalize");
+            assert!(err.to_string().contains("already completed or aborted"));
+        }
     }
 }

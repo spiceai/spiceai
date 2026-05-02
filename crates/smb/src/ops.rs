@@ -36,7 +36,13 @@ pub const MAX_BUFFERED_OBJECT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 /// A connected share session backed by a pool of SMB connections.
 pub struct ShareSession {
     pool: Arc<SmbPool>,
-    tree_ids: Vec<u32>,
+    /// Share name (e.g. `"data"`); kept so we can re-issue `tree_connect`
+    /// against a freshly-reconnected slot.
+    share: String,
+    /// Per-slot tree id, async-mutex-protected so a poison-detect /
+    /// reconnect / re-tree-connect sequence is serialized atomically per
+    /// slot without holding a sync lock across `.await` points.
+    tree_ids: Vec<tokio::sync::Mutex<u32>>,
 }
 
 /// An open file handle for streaming reads or writes.
@@ -58,7 +64,7 @@ impl ShareSession {
         let n = pool.size();
         let mut joins = Vec::with_capacity(n);
         for i in 0..n {
-            let client = Arc::clone(pool.client(i));
+            let client = pool.client(i);
             let s = share.to_string();
             joins.push(tokio::spawn(async move { client.tree_connect(&s).await }));
         }
@@ -68,14 +74,62 @@ impl ShareSession {
             let tree_id = join
                 .await
                 .map_err(|e| io::Error::other(format!("tree_connect spawn failed: {e}")))??;
-            tree_ids.push(tree_id);
+            tree_ids.push(tokio::sync::Mutex::new(tree_id));
         }
-        Ok(Self { pool, tree_ids })
+        Ok(Self {
+            pool,
+            share: share.to_string(),
+            tree_ids,
+        })
     }
 
-    fn pick(&self) -> (&Arc<SmbClient>, u32) {
-        let idx = self.pool.next_index() % self.pool.size();
-        (self.pool.client(idx), self.tree_ids[idx])
+    /// Pick a healthy `(client, tree_id)` pair, transparently reconnecting
+    /// poisoned slots and re-issuing `tree_connect` against the new client.
+    /// Falls through to subsequent slots if a reconnect attempt fails, so a
+    /// brief outage on one connection does not block progress on the others.
+    async fn pick(&self) -> io::Result<(Arc<SmbClient>, u32)> {
+        let n = self.pool.size();
+        let start = self.pool.next_index();
+
+        let mut last_err: Option<io::Error> = None;
+        for i in 0..n {
+            let idx = (start + i) % n;
+            let mut tree_lock = self.tree_ids[idx].lock().await;
+            let client = self.pool.client(idx);
+
+            if !client.is_poisoned() {
+                return Ok((client, *tree_lock));
+            }
+
+            // Slot poisoned — reconnect under the per-slot tree lock so
+            // concurrent picks for this slot serialize on a single attempt.
+            match self.pool.reconnect(idx).await {
+                Ok(new_client) => match new_client.tree_connect(&self.share).await {
+                    Ok(new_tree) => {
+                        *tree_lock = new_tree;
+                        return Ok((new_client, new_tree));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "smb",
+                            "slot {idx} re-tree-connect failed: {e}",
+                        );
+                        last_err = Some(e);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(target: "smb", "slot {idx} reconnect failed: {e}");
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "all SMB pool connections poisoned and reconnect failed",
+            )
+        }))
     }
 
     #[must_use]
@@ -94,7 +148,7 @@ impl ShareSession {
         key: &str,
         max_read: u32,
     ) -> io::Result<(ObjectMeta, Bytes)> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
         let (cr, data) = client
             .create_read_close(tree_id, &smb_path, max_read)
@@ -113,7 +167,7 @@ impl ShareSession {
 
     /// Open a file for streaming reads. Returns a handle pinned to one connection.
     pub async fn open_read(&self, key: &str) -> io::Result<FileHandle> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
         let file = client
             .create(
@@ -133,7 +187,7 @@ impl ShareSession {
         };
 
         Ok(FileHandle {
-            client: Arc::clone(client),
+            client: Arc::clone(&client),
             tree_id,
             file_id: file.file_id,
             file_size: file.file_size,
@@ -144,9 +198,9 @@ impl ShareSession {
 
     /// Open (or create) a file for streaming writes.
     pub async fn open_write(&self, key: &str) -> io::Result<FileHandle> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
-        self.ensure_parent_dirs_on(client, tree_id, &smb_path)
+        self.ensure_parent_dirs_on(&client, tree_id, &smb_path)
             .await?;
 
         let file = client
@@ -170,7 +224,7 @@ impl ShareSession {
         };
 
         Ok(FileHandle {
-            client: Arc::clone(client),
+            client: Arc::clone(&client),
             tree_id,
             file_id: file.file_id,
             file_size: 0,
@@ -188,7 +242,7 @@ impl ShareSession {
         prefix: &str,
         delimiter: Option<&str>,
     ) -> io::Result<(Vec<ObjectInfo>, Vec<String>)> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(prefix);
         let (dir_path, pattern) = split_dir_pattern(&smb_path);
 
@@ -250,7 +304,7 @@ impl ShareSession {
         &self,
         dir_path: &str,
     ) -> io::Result<(Vec<ObjectInfo>, Vec<String>)> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(dir_path);
 
         let dir = client
@@ -300,7 +354,7 @@ impl ShareSession {
     /// need to handle larger objects should use [`open_read`] and stream
     /// chunks via [`FileHandle::read_chunk`] / [`read_pipeline`].
     pub async fn get_object(&self, key: &str) -> io::Result<(ObjectMeta, Vec<u8>)> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
         let compound_max = self.pool.compound_max_read_size;
         let max_read = self.pool.max_read_size;
@@ -367,7 +421,7 @@ impl ShareSession {
             return Ok(Vec::new());
         }
 
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
         let max_read = self.pool.max_read_size;
 
@@ -403,9 +457,9 @@ impl ShareSession {
     /// Put object (write file). Uses compound Create+Write+Close for small
     /// files, falling back to sequential for larger files.
     pub async fn put_object(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
-        self.ensure_parent_dirs_on(client, tree_id, &smb_path)
+        self.ensure_parent_dirs_on(&client, tree_id, &smb_path)
             .await?;
 
         let compound_max = self.pool.compound_max_write_size as usize;
@@ -476,7 +530,7 @@ impl ShareSession {
 
     /// Delete an object.
     pub async fn delete_object(&self, key: &str) -> io::Result<()> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
         let _ = client
             .create_close(
@@ -493,7 +547,7 @@ impl ShareSession {
 
     /// Head object (metadata only). Compound Create+Close in 1 round trip.
     pub async fn head_object(&self, key: &str) -> io::Result<ObjectMeta> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
         let (cr, _) = client
             .create_close(
@@ -561,7 +615,9 @@ impl ShareSession {
 
     /// Try to remove an empty directory (best effort).
     pub async fn remove_dir(&self, smb_path: &str) {
-        let (client, tree_id) = self.pick();
+        let Ok((client, tree_id)) = self.pick().await else {
+            return;
+        };
         let _ = client
             .create_close(
                 tree_id,
@@ -580,14 +636,14 @@ impl ShareSession {
     /// memory and flushed to a temp file via pipelined SMB writes. Call
     /// `commit()` to atomically rename to the final path.
     pub async fn open_wal_write(&self, key: &str) -> io::Result<WalWriter> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let final_path = to_smb_path(key);
 
-        self.ensure_parent_dirs_on(client, tree_id, &final_path)
+        self.ensure_parent_dirs_on(&client, tree_id, &final_path)
             .await?;
 
         let wal_path = wal_temp_path();
-        self.ensure_parent_dirs_on(client, tree_id, &wal_path)
+        self.ensure_parent_dirs_on(&client, tree_id, &wal_path)
             .await?;
 
         let file = client
@@ -603,7 +659,7 @@ impl ShareSession {
 
         let chunk_size = self.pool.max_write_size as usize;
         Ok(WalWriter {
-            client: Arc::clone(client),
+            client: Arc::clone(&client),
             tree_id,
             file_id: file.file_id,
             wal_path,
@@ -617,7 +673,7 @@ impl ShareSession {
 
     /// Head object by raw SMB path (no forward-slash conversion).
     async fn head_object_smb(&self, smb_path: &str) -> io::Result<ObjectMeta> {
-        let (client, tree_id) = self.pick();
+        let (client, tree_id) = self.pick().await?;
         let (cr, _) = client
             .create_close(
                 tree_id,

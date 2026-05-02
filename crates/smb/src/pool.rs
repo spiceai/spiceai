@@ -29,8 +29,18 @@ use crate::client::{SmbClient, SmbConfig};
 /// Requests are distributed across connections via round-robin. Each connection
 /// is an independently authenticated SMB session with its own TCP stream, so
 /// concurrent operations don't serialize on a single mutex.
+///
+/// Slots are recoverable: when a connection is poisoned (e.g. by a read
+/// timeout) callers can ask the pool to swap in a freshly-authenticated
+/// connection via [`SmbPool::reconnect`], so a brief outage does not
+/// permanently brick the cached pool.
 pub struct SmbPool {
-    clients: Vec<Arc<SmbClient>>,
+    config: SmbConfig,
+    /// Each slot holds a currently-installed `Arc<SmbClient>`. We use a sync
+    /// `Mutex` because the lock is only ever held to clone or replace the
+    /// `Arc` — never across an `.await` point. Concurrent reconnects are
+    /// serialized by the caller (via `ShareSession`'s per-slot tree-id lock).
+    slots: Vec<std::sync::Mutex<Arc<SmbClient>>>,
     next: AtomicUsize,
     /// Cached from the first connection's negotiate response.
     pub(crate) max_read_size: u32,
@@ -70,8 +80,11 @@ impl SmbPool {
             tracing::debug!(target: "smb", "pool: {n} connections ready");
         }
 
+        let slots = clients.into_iter().map(std::sync::Mutex::new).collect();
+
         Ok(Arc::new(Self {
-            clients,
+            config,
+            slots,
             next: AtomicUsize::new(0),
             max_read_size,
             max_write_size,
@@ -81,50 +94,72 @@ impl SmbPool {
     }
 
     /// Pick the next healthy connection via round-robin, skipping poisoned ones.
-    /// Falls back to a poisoned connection if all are poisoned (error will
-    /// surface on the first I/O attempt).
+    /// Falls back to a poisoned connection if all are poisoned (the caller is
+    /// expected to call [`Self::reconnect`] on the returned slot to recover).
     #[must_use]
-    pub fn get(&self) -> &Arc<SmbClient> {
-        let n = self.clients.len();
+    pub fn get(&self) -> Arc<SmbClient> {
+        let n = self.slots.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         for i in 0..n {
             let idx = (start + i) % n;
-            if !self.clients[idx].is_poisoned() {
-                return &self.clients[idx];
+            let client = self.client(idx);
+            if !client.is_poisoned() {
+                return client;
             }
         }
-        &self.clients[start % n]
+        self.client(start % n)
     }
 
     /// Get the next round-robin index, preferring healthy connections.
+    /// Returns the index even if all slots are poisoned — callers should
+    /// invoke [`Self::reconnect`] to recover before using the connection.
     #[must_use]
     pub fn next_index(&self) -> usize {
-        let n = self.clients.len();
+        let n = self.slots.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         for i in 0..n {
             let idx = (start + i) % n;
-            if !self.clients[idx].is_poisoned() {
+            if !self.client(idx).is_poisoned() {
                 return idx;
             }
         }
         start % n
     }
 
-    /// Access a specific connection by index.
+    /// Access a specific connection by index. Returns a clone of the
+    /// currently-installed `Arc<SmbClient>` (the slot may have been swapped
+    /// in by a prior `reconnect`).
     #[must_use]
-    pub fn client(&self, idx: usize) -> &Arc<SmbClient> {
-        &self.clients[idx]
+    pub fn client(&self, idx: usize) -> Arc<SmbClient> {
+        Arc::clone(&self.slots[idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
-    /// Access all connections (for tree-connect setup).
+    /// Snapshot the current set of clients (for tree-connect setup).
     #[must_use]
-    pub fn clients(&self) -> &[Arc<SmbClient>] {
-        &self.clients
+    pub fn clients(&self) -> Vec<Arc<SmbClient>> {
+        (0..self.slots.len()).map(|i| self.client(i)).collect()
     }
 
     /// Number of connections in the pool.
     #[must_use]
     pub fn size(&self) -> usize {
-        self.clients.len()
+        self.slots.len()
+    }
+
+    /// Replace the slot at `idx` with a freshly-authenticated connection,
+    /// returning the new client. The previous client is dropped once no
+    /// outstanding `Arc` references remain.
+    ///
+    /// Concurrent reconnects to the same slot will each establish a new
+    /// connection; callers should serialize per-slot reconnects (see
+    /// `ShareSession::pick` for an example using a per-slot async lock).
+    pub async fn reconnect(&self, idx: usize) -> io::Result<Arc<SmbClient>> {
+        let new_client = SmbClient::connect(self.config.clone()).await?;
+        {
+            let mut slot = self.slots[idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Arc::clone(&new_client);
+        }
+        tracing::info!(target: "smb", "pool: reconnected slot {idx}");
+        Ok(new_client)
     }
 }
