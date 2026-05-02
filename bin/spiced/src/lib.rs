@@ -895,6 +895,7 @@ async fn start_anonymous_telemetry(
     }
 }
 
+#[cfg(any(test, feature = "anonymous_telemetry"))]
 fn should_warn_telemetry_disabled_setting_ignored(
     telemetry_enabled: Option<bool>,
     config: &TelemetryConfig,
