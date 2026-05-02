@@ -221,6 +221,25 @@ async fn start_http_server() -> Result<
             get(|| async { ([("content-type", "application/json")], SHOWS_JSON) }),
         )
         .route(
+            "/api/headers",
+            get(|headers: AxumHeaderMap| async move {
+                // Echo all x-* custom headers for deterministic testing
+                // (filters out standard headers like host, accept, user-agent)
+                // Use BTreeMap for stable key ordering across runs
+                let mut echoed = std::collections::BTreeMap::new();
+                for (name, value) in &headers {
+                    if name.as_str().starts_with("x-")
+                        && let Ok(val_str) = value.to_str()
+                    {
+                        echoed.insert(name.to_string(), val_str.to_string());
+                    }
+                }
+                let body =
+                    serde_json::to_string(&echoed).expect("BTreeMap should serialize to JSON");
+                ([("content-type", "application/json")], body)
+            }),
+        )
+        .route(
             "/data/items.csv",
             get(|| async { ([("content-type", "text/csv")], ITEMS_CSV) }),
         );
@@ -508,6 +527,104 @@ async fn test_http_json_api_dynamic() -> Result<(), String> {
                 )
                 .await?;
             }
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that dynamic `request_headers` filters are correctly applied to HTTP requests.
+///
+/// Verifies:
+/// - Dynamic headers from `request_headers IN (...)` are sent on the HTTP request
+/// - Static headers from `http_headers` param are preserved
+/// - Dynamic headers override static headers with the same name
+/// - `request_headers` virtual column is populated in query results
+#[tokio::test]
+async fn test_http_dynamic_request_headers() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+            tracing::debug!("HTTP test server started at {addr}");
+
+            let mut dataset = Dataset::new(format!("http://{addr}/api"), "header_test");
+            dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                ("allowed_request_paths".to_string(), "/headers".to_string()),
+                (
+                    "http_headers".to_string(),
+                    "x-static-header: static-value; x-org-id: default-org".to_string(),
+                ),
+                ("request_header_filters".to_string(), "enabled".to_string()),
+                (
+                    "request_header_allowlist".to_string(),
+                    "x-org-id, x-custom".to_string(),
+                ),
+                ("max_request_partitions".to_string(), "100".to_string()),
+            ])));
+
+            let app = AppBuilder::new("http_dynamic_headers_test")
+                .with_dataset(dataset)
+                .build();
+            let mut rt = load_runtime(app).await?;
+
+            let query = r#"
+                SELECT request_headers, content
+                FROM header_test
+                WHERE request_path = '/headers'
+                  AND request_headers IN (
+                    '{"x-org-id":"test-1"}',
+                    '{"x-org-id":"test-2","x-custom":"val"}'
+                  )
+                ORDER BY request_headers
+            "#;
+
+            run_query_and_check_results(
+                &mut rt,
+                "http_dynamic_request_headers",
+                query,
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let pretty = arrow::util::pretty::pretty_format_batches(&result_batches)
+                        .expect("failed to format batches");
+                    insta::assert_snapshot!("http_dynamic_request_headers_results", pretty);
+                })),
+            )
+            .await?;
+
+            // Test with 100 header values to verify parallel partition execution
+            let in_values: Vec<String> = (1..=100)
+                .map(|i| format!(r#"'{{"x-org-id":"org-{i:03}"}}'"#))
+                .collect();
+            let query_100 = format!(
+                r"SELECT count(*) as cnt
+                FROM header_test
+                WHERE request_path = '/headers'
+                  AND request_headers IN ({})
+                ",
+                in_values.join(", ")
+            );
+
+            run_query_and_check_results(
+                &mut rt,
+                "http_dynamic_request_headers_100",
+                &query_100,
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let rows = write_to_json_value(&result_batches)
+                        .expect("batches should serialize to JSON");
+                    assert_eq!(
+                        rows[0]["cnt"], 100,
+                        "expected 100 rows from 100 header partitions"
+                    );
+                })),
+            )
+            .await?;
 
             tx.send(())
                 .map_err(|()| "Failed to send shutdown signal".to_string())?;
