@@ -722,8 +722,10 @@ mod tests {
                 .expect("explicit batch concurrency parses"),
             8
         );
-        assert!(parse_batch_concurrency(Some(&Value::Number(0_u64.into()))).is_err());
-        assert!(parse_batch_concurrency(Some(&Value::String("4".into()))).is_err());
+        parse_batch_concurrency(Some(&Value::Number(0_u64.into())))
+            .expect_err("zero batch concurrency is invalid");
+        parse_batch_concurrency(Some(&Value::String("4".into())))
+            .expect_err("string batch concurrency is invalid");
     }
 
     #[test]

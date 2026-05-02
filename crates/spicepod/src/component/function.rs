@@ -239,15 +239,15 @@ mod tests {
 
     #[test]
     fn rejects_non_scalar_kind() {
-        let src = r#"
-            name: split_lines
-                        from: sql
-            kind: table
-            signature:
-              args: [{ name: doc, type: utf8 }]
-                            returns: utf8
-                        body: doc
-            "#;
+        let src = r"
+name: split_lines
+from: sql
+kind: table
+signature:
+    args: [{ name: doc, type: utf8 }]
+    returns: utf8
+body: doc
+";
         yaml::from_str::<Function>(src).expect_err("table functions are not in beta");
     }
 
