@@ -6384,11 +6384,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: build an `HttpExec` with the given partitions and optional max.
+    ///
+    /// Enables all filter types (path, query, body, headers) so that
+    /// `with_expanded_params` validation passes for any column.
     fn make_exec(
         partitions: Vec<PartitionSpec>,
         max_request_partitions: Option<usize>,
     ) -> HttpExec {
-        let provider = base_provider().with_max_request_partitions(max_request_partitions);
+        let provider = base_provider()
+            .with_allowed_paths(["/*"])
+            .expect("valid path glob")
+            .enable_query_filters(DEFAULT_MAX_QUERY_LENGTH)
+            .enable_body_filters(DEFAULT_MAX_BODY_BYTES)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-test"])
+            .expect("header filters should enable")
+            .with_max_request_partitions(max_request_partitions);
         HttpExec::new(
             HttpTableProvider::base_table_schema().into(),
             Arc::new(provider),
@@ -6401,12 +6411,12 @@ mod tests {
     fn test_with_expanded_params_request_path() {
         let exec = make_exec(vec![(None, None, None, None)], None);
         let result = exec
-            .with_expanded_params("request_path", &["a".to_string(), "b".to_string()])
+            .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
             .expect("expand should succeed");
 
         assert_eq!(result.partitions.len(), 2);
-        assert_eq!(result.partitions[0].0, Some("a".to_string()));
-        assert_eq!(result.partitions[1].0, Some("b".to_string()));
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/b".to_string()));
         // Other tuple positions remain None.
         assert_eq!(result.partitions[0].1, None);
         assert_eq!(result.partitions[0].2, None);
@@ -6469,17 +6479,26 @@ mod tests {
 
     #[test]
     fn test_with_expanded_params_all_columns() {
-        let cases: Vec<(&str, PartitionAccessor)> = vec![
-            ("request_path", Box::new(|p: &PartitionSpec| &p.0)),
-            ("request_query", Box::new(|p: &PartitionSpec| &p.1)),
-            ("request_body", Box::new(|p: &PartitionSpec| &p.2)),
-            ("request_headers", Box::new(|p: &PartitionSpec| &p.3)),
+        // Values must satisfy each column's validation rules:
+        // - request_path: must start with '/'
+        // - request_query: plain query string
+        // - request_body: plain body text
+        // - request_headers: JSON with allowed header names
+        let cases: Vec<(&str, &str, PartitionAccessor)> = vec![
+            ("/val", "request_path", Box::new(|p: &PartitionSpec| &p.0)),
+            ("val", "request_query", Box::new(|p: &PartitionSpec| &p.1)),
+            ("val", "request_body", Box::new(|p: &PartitionSpec| &p.2)),
+            (
+                r#"{"x-test":"val"}"#,
+                "request_headers",
+                Box::new(|p: &PartitionSpec| &p.3),
+            ),
         ];
 
-        for (col_name, accessor) in &cases {
+        for (test_value, col_name, accessor) in &cases {
             let exec = make_exec(vec![(None, None, None, None)], None);
             let result = exec
-                .with_expanded_params(col_name, &["val".to_string()])
+                .with_expanded_params(col_name, &[test_value.to_string()])
                 .unwrap_or_else(|e| panic!("expand for {col_name} should succeed: {e}"));
 
             assert_eq!(
@@ -6489,7 +6508,7 @@ mod tests {
             );
             assert_eq!(
                 *accessor(&result.partitions[0]),
-                Some("val".to_string()),
+                Some(test_value.to_string()),
                 "{col_name} should be set"
             );
 

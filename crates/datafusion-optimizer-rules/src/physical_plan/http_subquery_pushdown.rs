@@ -519,13 +519,20 @@ mod tests {
     use data_components::http::provider::HttpTableProvider;
 
     /// Build an `HttpExec` with one empty partition.
+    ///
+    /// Configures `allowed_request_paths` so that
+    /// `with_expanded_params("request_path", …)` succeeds for paths
+    /// matching `/*`.
     fn make_http_exec() -> Arc<dyn ExecutionPlan> {
-        let provider = Arc::new(HttpTableProvider::new(
+        let provider = HttpTableProvider::new(
             Url::parse("http://localhost:9999/api").expect("valid url"),
             Client::new(),
             "json".to_string(),
             false,
-        ));
+        )
+        .with_allowed_paths(["/*"])
+        .expect("valid path glob");
+        let provider = Arc::new(provider);
         let schema: SchemaRef = Arc::new(HttpTableProvider::base_table_schema());
         Arc::new(HttpExec::new(
             schema,
@@ -806,9 +813,9 @@ mod tests {
     #[test]
     fn test_replace_http_exec_expands_partitions() {
         let http = make_http_exec();
-        let values = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+        let values = vec!["/v1".to_string(), "/v2".to_string(), "/v3".to_string()];
 
-        let rewritten = replace_http_exec_with_expanded_params(&http, "request_headers", &values)
+        let rewritten = replace_http_exec_with_expanded_params(&http, "request_path", &values)
             .expect("replace should succeed");
 
         let http_exec = find_http_exec(&rewritten).expect("should contain HttpExec");
@@ -818,12 +825,12 @@ mod tests {
             "expected 3 partitions from 1 × 3 values"
         );
 
-        // Verify each partition has the correct header value
+        // Verify each partition has the correct path value
         for (i, val) in values.iter().enumerate() {
             assert_eq!(
-                http_exec.partitions()[i].3,
+                http_exec.partitions()[i].0,
                 Some(val.clone()),
-                "partition {i} should have request_headers={val}"
+                "partition {i} should have request_path={val}"
             );
         }
     }
