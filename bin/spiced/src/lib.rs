@@ -312,7 +312,8 @@ pub struct Args {
     #[arg(long, value_name = "key.pem")]
     pub tls_key_file: Option<String>,
 
-    /// Enable/disable anonymous telemetry collection.
+    /// Enable anonymous telemetry collection. In Open Source builds that include anonymous telemetry,
+    /// `false` is ignored; build without the `anonymous_telemetry` feature to remove anonymous usage telemetry.
     #[arg(long)]
     pub telemetry_enabled: Option<bool>,
 
@@ -1071,7 +1072,7 @@ mod tests {
         let telemetry_config = Arc::new(SetOnce::new());
 
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(500),
             start_anonymous_telemetry(None, telemetry_config, None),
         )
         .await
