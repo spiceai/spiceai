@@ -402,7 +402,7 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
             );
 
             // 2. Rewrite HttpExec partitions with materialized values.
-            let rewritten = replace_http_exec_with_partitions(&http_side, &col_name, &values)?;
+            let rewritten = replace_http_exec_with_expanded_params(&http_side, &col_name, &values)?;
 
             if let Some(http_exec) = find_http_exec(&rewritten) {
                 http_partitions.add(http_exec.partitions().len());
@@ -482,7 +482,7 @@ async fn materialize_string_values(
 /// Walk the `plan` tree, find the `HttpExec` leaf, and replace it with a new
 /// `HttpExec` whose partitions include the materialized values for the given
 /// column. Validates against `max_request_partitions`.
-fn replace_http_exec_with_partitions(
+fn replace_http_exec_with_expanded_params(
     plan: &Arc<dyn ExecutionPlan>,
     col_name: &str,
     values: &[String],
@@ -808,7 +808,7 @@ mod tests {
         let http = make_http_exec();
         let values = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
 
-        let rewritten = replace_http_exec_with_partitions(&http, "request_headers", &values)
+        let rewritten = replace_http_exec_with_expanded_params(&http, "request_headers", &values)
             .expect("replace should succeed");
 
         let http_exec = find_http_exec(&rewritten).expect("should contain HttpExec");
