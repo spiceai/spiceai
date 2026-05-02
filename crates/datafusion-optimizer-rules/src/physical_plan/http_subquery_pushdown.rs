@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! [`HttpParamsPushdown`] rewrites `HashJoinExec` (semi-join or inner-join)
-//! over `HttpExec` by emitting a lazy [`HttpWithDeferredParamsExec`] node. The node
-//! defers build-side materialization to execution time (fully async), then
-//! injects the collected values as HTTP partition filters. This enables
-//! `IN (SELECT ...)` subqueries and `JOIN` queries against HTTP datasets to
-//! produce one HTTP request per subquery/join value.
+//! [`HttpParamsPushdown`] rewrites `HashJoinExec` (semi-join) over `HttpExec`
+//! by emitting a lazy [`HttpWithDeferredParamsExec`] node. The node defers
+//! build-side materialization to execution time (fully async), then injects the
+//! collected values as HTTP partition filters. This enables `IN (SELECT ...)`
+//! subqueries against HTTP datasets to produce one HTTP request per subquery
+//! value.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -60,11 +60,11 @@ const HTTP_REQUEST_PARAM_COLUMNS: &[&str] = &[
     "request_body",
 ];
 
-/// A [`PhysicalOptimizerRule`] that detects `HashJoinExec` nodes (`LeftSemi`,
-/// `RightSemi`, or `Inner`) where one side contains an `HttpExec` and the other
-/// side is a small, materializable subquery/table. Instead of materializing
-/// during planning, it emits an [`HttpWithDeferredParamsExec`] node that defers
-/// execution to runtime.
+/// A [`PhysicalOptimizerRule`] that detects `HashJoinExec` nodes (`LeftSemi` or
+/// `RightSemi`) where one side contains an `HttpExec` and the other side is a
+/// small, materializable subquery. Instead of materializing during planning, it
+/// emits an [`HttpWithDeferredParamsExec`] node that defers execution to
+/// runtime.
 #[derive(Debug)]
 pub struct HttpParamsPushdown;
 
@@ -74,7 +74,7 @@ impl PhysicalOptimizerRule for HttpParamsPushdown {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        plan.transform_down(|node| Ok(try_rewrite_hash_join(node)))
+        plan.transform_down(|node| try_rewrite_hash_join(node))
             .data()
     }
 
@@ -88,41 +88,50 @@ impl PhysicalOptimizerRule for HttpParamsPushdown {
 }
 
 /// Attempt to rewrite a single plan node. Only fires when the node is a
-/// `HashJoinExec(LeftSemi | RightSemi | Inner)` where one side contains an
-/// `HttpExec` and the join key references an HTTP request parameter column.
+/// `HashJoinExec(LeftSemi | RightSemi)` where one side contains an `HttpExec`
+/// and the join key references an HTTP request parameter column.
 ///
-/// `DataFusion` may produce different orientations depending on cost estimates:
+/// `DataFusion` produces semi-joins for `IN (SELECT ...)` subqueries.
+/// The optimizer may choose either orientation depending on cost estimates:
 /// - `LeftSemi`:  `HttpExec` on left  (probe), subquery on right (build)
 /// - `RightSemi`: subquery on left (build/collect), `HttpExec` on right (probe)
-/// - `Inner`:    either side may have `HttpExec`; the build side is determined
-///   by `CollectLeft` mode (left is collected/materialized)
-fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn ExecutionPlan>> {
+/// Returns an error if an unsupported join type (e.g. `Inner`) is used with
+/// HTTP request parameter columns, since that would silently produce incorrect
+/// results without the pushdown.
+fn try_rewrite_hash_join(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Transformed<Arc<dyn ExecutionPlan>>, DataFusionError> {
     let Some(join_exec) = plan.as_any().downcast_ref::<HashJoinExec>() else {
-        return Transformed::no(plan);
+        return Ok(Transformed::no(plan));
     };
 
     // Determine which side has HttpExec and which is the build side.
-    // Also capture the build-side column index so we materialize the
-    // correct join key (not blindly column 0).
+    // Also capture the build-side column index so we materialize the correct join key.
+    //
+    // Only semi-joins are supported. Inner joins are intentionally excluded because
+    // the rewrite replaces the entire HashJoinExec with HttpWithDeferredParamsExec
+    // which only outputs http_side.schema() — build-side columns are dropped,
+    // changing the join output schema and potentially causing incorrect results
+    // or downstream operator failures when build-side columns are referenced.
     let (http_side, build_side, col_name, build_col_index) = match join_exec.join_type() {
         JoinType::LeftSemi => {
             let on = join_exec.on();
             if on.len() != 1 {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             }
             let (left_col_expr, right_col_expr) = &on[0];
             let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             };
             let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             };
             let name = left_col.name().to_string();
             if !HTTP_REQUEST_PARAM_COLUMNS.contains(&name.as_str()) {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             }
             if !contains_http_exec(join_exec.left()) {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             }
             (
                 Arc::clone(join_exec.left()),
@@ -134,21 +143,21 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
         JoinType::RightSemi => {
             let on = join_exec.on();
             if on.len() != 1 {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             }
             let (left_col_expr, right_col_expr) = &on[0];
             let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             };
             let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             };
             let name = right_col.name().to_string();
             if !HTTP_REQUEST_PARAM_COLUMNS.contains(&name.as_str()) {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             }
             if !contains_http_exec(join_exec.right()) {
-                return Transformed::no(plan);
+                return Ok(Transformed::no(plan));
             }
             (
                 Arc::clone(join_exec.right()),
@@ -157,59 +166,18 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                 left_col.index(),
             )
         }
-        // Inner join: the entire HashJoinExec is replaced by HttpWithDeferredParamsExec, which only outputs
-        // http_side.schema() (build-side columns are dropped). This is intentional — the build side is used
-        // not to produce output columns. If build-side columns are needed downstream, this rewrite 
-        // should be skipped (or extended to preserve the join node and only rewrite the HttpExec leaf).
-        JoinType::Inner => {
-            let on = join_exec.on();
-            if on.len() != 1 {
-                return Transformed::no(plan);
+        // Detect unsupported join types that reference HTTP request param
+        // columns with an HttpExec child — these would silently produce
+        // incorrect results without pushdown. Return a clear error so the
+        // user can rewrite to `IN (SELECT ...)`.
+        _ => {
+            if let Some(col_name) = http_join_param_column(join_exec) {
+                return Err(DataFusionError::Plan(format!(
+                    "JOIN on HTTP request parameter column '{col_name}' is not supported. Use `WHERE {col_name} IN (SELECT ...)` instead."
+                )));
             }
-            let (left_col_expr, right_col_expr) = &on[0];
-
-            let left_has_http = contains_http_exec(join_exec.left());
-            let right_has_http = contains_http_exec(join_exec.right());
-
-            if left_has_http && !right_has_http {
-                let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
-                    return Transformed::no(plan);
-                };
-                let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
-                    return Transformed::no(plan);
-                };
-                let name = left_col.name().to_string();
-                if !HTTP_REQUEST_PARAM_COLUMNS.contains(&name.as_str()) {
-                    return Transformed::no(plan);
-                }
-                (
-                    Arc::clone(join_exec.left()),
-                    Arc::clone(join_exec.right()),
-                    name,
-                    right_col.index(),
-                )
-            } else if right_has_http && !left_has_http {
-                let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
-                    return Transformed::no(plan);
-                };
-                let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
-                    return Transformed::no(plan);
-                };
-                let name = right_col.name().to_string();
-                if !HTTP_REQUEST_PARAM_COLUMNS.contains(&name.as_str()) {
-                    return Transformed::no(plan);
-                }
-                (
-                    Arc::clone(join_exec.right()),
-                    Arc::clone(join_exec.left()),
-                    name,
-                    left_col.index(),
-                )
-            } else {
-                return Transformed::no(plan);
-            }
+            return Ok(Transformed::no(plan));
         }
-        _ => return Transformed::no(plan),
     };
 
     tracing::debug!(
@@ -217,7 +185,36 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
     );
 
     let exec = HttpWithDeferredParamsExec::new(http_side, build_side, col_name, build_col_index);
-    Transformed::yes(Arc::new(exec))
+    Ok(Transformed::yes(Arc::new(exec)))
+}
+
+/// If the `HashJoinExec` has an `HttpExec` on one side and the join key is an
+/// HTTP request parameter column, return the column name. Used to detect
+/// unsupported join types that would silently produce incorrect results.
+fn http_join_param_column(join_exec: &HashJoinExec) -> Option<String> {
+    let on = join_exec.on();
+    if on.len() != 1 {
+        return None;
+    }
+    let (left_col_expr, right_col_expr) = &on[0];
+
+    let left_has_http = contains_http_exec(join_exec.left());
+    let right_has_http = contains_http_exec(join_exec.right());
+
+    if left_has_http && !right_has_http {
+        let col = left_col_expr.as_any().downcast_ref::<Column>()?;
+        let name = col.name();
+        if HTTP_REQUEST_PARAM_COLUMNS.contains(&name) {
+            return Some(name.to_string());
+        }
+    } else if right_has_http && !left_has_http {
+        let col = right_col_expr.as_any().downcast_ref::<Column>()?;
+        let name = col.name();
+        if HTTP_REQUEST_PARAM_COLUMNS.contains(&name) {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 /// Recursively check whether `plan` or any descendant is an `HttpExec`.
