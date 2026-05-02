@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Runtime-wide registry of active synchronous queries, keyed by query id.
+//! Registry of active synchronous queries for a [`DataFusion`](crate::datafusion::DataFusion)
+//! instance, keyed by query id.
 //!
 //! The registry provides a single place for administrative cancel operations
-//! (HTTP `/v1/queries/{id}/cancel`, custom Flight action `CancelQuery` with a
+//! (HTTP `/v1/sql/{id}/cancel`, custom Flight action `CancelQuery` with a
 //! JSON body) to look up a running query's [`CancellationToken`] and signal
 //! cancellation.
 //!
@@ -26,7 +27,7 @@ limitations under the License.
 //! cancellation token plus lightweight metadata to support listing.
 
 use std::{
-    sync::{Arc, LazyLock, RwLock},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -112,6 +113,18 @@ impl QueryCancelRegistry {
         }
     }
 
+    /// Cancels every active query in this registry. Returns the number of
+    /// entries that were signalled.
+    #[must_use]
+    pub fn cancel_all(&self) -> usize {
+        let mut cancelled = 0;
+        for entry in &self.entries {
+            entry.value().token.cancel();
+            cancelled += 1;
+        }
+        cancelled
+    }
+
     /// Returns a snapshot of all active queries.
     #[must_use]
     pub fn list(&self) -> Vec<ActiveQueryInfo> {
@@ -170,32 +183,6 @@ impl Drop for ActiveQueryGuard {
     }
 }
 
-/// Process-wide query cancellation registry.
-///
-/// A single process runs a single Spice runtime, so a static registry is
-/// appropriate. Using a static registry avoids threading the registry handle
-/// through every query execution entry point.
-static GLOBAL_REGISTRY: LazyLock<RwLock<Arc<QueryCancelRegistry>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(QueryCancelRegistry::new())));
-
-/// Returns the process-wide query cancellation registry.
-#[must_use]
-pub fn global_registry() -> Arc<QueryCancelRegistry> {
-    match GLOBAL_REGISTRY.read() {
-        Ok(guard) => Arc::clone(&guard),
-        Err(poisoned) => Arc::clone(&poisoned.into_inner()),
-    }
-}
-
-/// Replaces the process-wide registry (test-only helper).
-#[cfg(test)]
-pub fn replace_global_registry(registry: Arc<QueryCancelRegistry>) {
-    match GLOBAL_REGISTRY.write() {
-        Ok(mut guard) => *guard = registry,
-        Err(poisoned) => *poisoned.into_inner() = registry,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +225,29 @@ mod tests {
     fn cancel_missing_returns_false() {
         let registry = Arc::new(QueryCancelRegistry::new());
         assert!(!registry.cancel(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn cancel_all_signals_every_entry() {
+        let registry = Arc::new(QueryCancelRegistry::new());
+        let first = CancellationToken::new();
+        let second = CancellationToken::new();
+
+        let _first_guard = registry.register(
+            Uuid::new_v4(),
+            Arc::from("SELECT 1"),
+            Protocol::Http,
+            first.clone(),
+        );
+        let _second_guard = registry.register(
+            Uuid::new_v4(),
+            Arc::from("SELECT 2"),
+            Protocol::Flight,
+            second.clone(),
+        );
+
+        assert_eq!(registry.cancel_all(), 2);
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
     }
 }

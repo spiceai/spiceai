@@ -264,6 +264,11 @@ pub(crate) fn routes(
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+        .route("/v1/sql/active", get(v1::queries::list_active))
+        .route(
+            "/v1/sql/{query_id}/cancel",
+            post(v1::queries::cancel_active),
+        )
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
@@ -368,7 +373,6 @@ pub(crate) fn routes(
     let queries_router = Router::new()
         .route("/v1/queries", post(v1::queries::submit))
         .route("/v1/queries", get(v1::queries::list))
-        .route("/v1/queries/active", get(v1::queries::list_active))
         .route("/v1/queries/{query_id}", get(v1::queries::get_query))
         .route(
             "/v1/queries/{query_id}/status",
@@ -497,7 +501,7 @@ async fn track_metrics(
             let cancel_guard = request_context.cancellation_token().clone().drop_guard();
             let response = next.run(req).await;
             let (parts, body) = response.into_parts();
-            let body = axum::body::Body::new(super::cancel_guard_body::CancelGuardBody::new(
+            let body = axum::body::Body::new(util::cancel_guard_body::CancelGuardBody::new(
                 body,
                 cancel_guard,
             ));

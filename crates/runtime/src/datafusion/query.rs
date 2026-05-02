@@ -563,7 +563,7 @@ impl Query {
             None => request_context.child_cancellation_token(),
         };
 
-        // Register in the process-wide active-query registry so administrative
+        // Register in the DataFusion-owned active-query registry so administrative
         // cancel endpoints can locate this query by id. The guard is captured
         // by the returned stream so the registration is removed on completion,
         // drop, or cancellation.
@@ -571,7 +571,7 @@ impl Query {
             QueryMethod::Text { sql, .. } => Arc::clone(sql),
             QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
-        let active_query_guard = crate::datafusion::query::registry::global_registry().register(
+        let active_query_guard = self.df.query_cancel_registry().register(
             self.query_id,
             sql_preview,
             request_context.protocol(),
@@ -940,9 +940,9 @@ impl Query {
                 );
 
                 // Wrap with cancellation observation so that cancelling the
-                // query (via admin cancel, FlightSQL ActionCancelQueryRequest,
-                // or client disconnect) terminates the stream with a clear
-                // error. The active-query registry guard is held by the
+                // query (via HTTP `/v1/sql/{id}/cancel`, the custom Flight
+                // `CancelQuery` action, or client disconnect) terminates the
+                // stream with a clear error. The active-query registry guard is held by the
                 // wrapped stream so deregistration occurs on drop.
                 let final_stream = attach_cancellation_to_stream(
                     final_stream,

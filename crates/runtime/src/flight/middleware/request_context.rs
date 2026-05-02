@@ -107,7 +107,7 @@ where
     ResBody: http_body::Body + Send + 'static,
     ReqBody: Send + 'static,
 {
-    type Response = http::Response<crate::http::cancel_guard_body::CancelGuardBody<ResBody>>;
+    type Response = http::Response<util::cancel_guard_body::CancelGuardBody<ResBody>>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -163,7 +163,7 @@ where
             let cancel_guard = request_context.cancellation_token().clone().drop_guard();
             let response = inner.call(req).await?;
             let (parts, body) = response.into_parts();
-            let body = crate::http::cancel_guard_body::CancelGuardBody::new(body, cancel_guard);
+            let body = util::cancel_guard_body::CancelGuardBody::new(body, cancel_guard);
             Ok(http::Response::from_parts(parts, body))
         }))
     }

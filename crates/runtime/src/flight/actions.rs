@@ -17,9 +17,11 @@ use prost::Message;
 use std::fmt::{self, Display, Formatter};
 use tonic::{Request, Response, Status};
 
-use crate::flight::{
-    Service, async_actions, flightsql::prepared_statement_query, metrics, to_tonic_err,
+use crate::{
+    datafusion::request_context_extension::get_current_datafusion,
+    flight::{Service, async_actions, flightsql::prepared_statement_query, metrics, to_tonic_err},
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
 
 use arrow_flight::{
@@ -208,7 +210,7 @@ pub(crate) async fn do_action(
         }
         ActionType::CancelQuery => {
             tracing::trace!("do_action: CancelQuery");
-            let body = handle_cancel_query(&request.get_ref().body)?;
+            let body = handle_cancel_query(&request.get_ref().body).await?;
             futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
         }
         ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),
@@ -234,15 +236,16 @@ struct CancelQueryResponse {
 /// Handles the custom `CancelQuery` Flight action by looking up the supplied
 /// query id in the runtime's sync query registry and signalling its
 /// cancellation token.
-fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
+async fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let req: CancelQueryRequest = serde_json::from_slice(body)
         .map_err(|e| Status::invalid_argument(format!("Invalid CancelQuery request body: {e}")))?;
 
     let parsed = uuid::Uuid::parse_str(&req.query_id)
         .map_err(|e| Status::invalid_argument(format!("Invalid query_id (expected UUID): {e}")))?;
 
-    let registry = crate::datafusion::query::registry::global_registry();
-    let cancelled = registry.cancel(parsed);
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+    let cancelled = df.query_cancel_registry().cancel(parsed);
 
     let resp = CancelQueryResponse {
         query_id: req.query_id,

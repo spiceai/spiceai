@@ -311,7 +311,7 @@ pub(crate) async fn handle_nsql_query(
 
     // NSQL-scoped cancellation token (child of the request token). Used for
     // both the LLM race and as the per-query cancellation token passed to
-    // `QueryBuilder`. This way `POST /v1/queries/{id}/cancel` against the
+    // `QueryBuilder`. This way `POST /v1/sql/{id}/cancel` against the
     // NSQL-issued query reliably cancels NSQL end-to-end (the inner query
     // registers this same token in the cancel registry).
     let nsql_token = context.child_cancellation_token();
