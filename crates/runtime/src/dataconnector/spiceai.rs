@@ -98,7 +98,7 @@ pub enum Error {
     CloudEndpointRegionMismatch { endpoint: String, region: String },
 
     #[snafu(display(
-        "Unsupported SpiceAI endpoint scheme in endpoint {endpoint}: grpc:// is not supported. Use http:// for plaintext Flight or grpc+tls:// for TLS."
+        "Unsupported SpiceAI endpoint scheme in endpoint {endpoint}: grpc:// is not supported. Use http:// for plaintext Flight or https:// or grpc+tls:// for TLS."
     ))]
     UnsupportedEndpointScheme { endpoint: String },
 }
@@ -466,6 +466,7 @@ impl DataConnector for SpiceAI {
         _dataset: &Dataset,
         _accelerated_table_provider: Arc<dyn TableProvider>,
         _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         self.append_stream(federated_table)
     }

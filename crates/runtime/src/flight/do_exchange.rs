@@ -110,7 +110,7 @@ struct ChangeFlightEncoder {
     tracker: DictionaryTracker,
     compression_context: CompressionContext,
     write_options: writer::IpcWriteOptions,
-    schema_sent: bool,
+    schema: Option<SchemaRef>,
 }
 
 impl Default for ChangeFlightEncoder {
@@ -120,7 +120,7 @@ impl Default for ChangeFlightEncoder {
             tracker: DictionaryTracker::new(false),
             compression_context: CompressionContext::default(),
             write_options: writer::IpcWriteOptions::default(),
-            schema_sent: false,
+            schema: None,
         }
     }
 }
@@ -128,12 +128,18 @@ impl Default for ChangeFlightEncoder {
 impl ChangeFlightEncoder {
     fn encode(&mut self, record_batch: &RecordBatch) -> Result<Vec<FlightData>, Status> {
         let mut flights = Vec::new();
-        if !self.schema_sent {
+        let schema_changed = self
+            .schema
+            .as_ref()
+            .is_none_or(|schema| schema.as_ref() != record_batch.schema().as_ref());
+
+        if schema_changed {
             flights.push(FlightData::from(SchemaAsIpc::new(
                 record_batch.schema().as_ref(),
                 &self.write_options,
             )));
-            self.schema_sent = true;
+            self.schema = Some(record_batch.schema());
+            self.tracker = DictionaryTracker::new(false);
         }
 
         let (flight_dictionaries, flight_batch) = self
@@ -461,7 +467,26 @@ fn get_primary_keys_array(primary_keys: &[&str], row_count: usize) -> ListArray 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Array;
+    use arrow::array::{Array, BooleanArray, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    fn test_batch(values: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(test_schema(), vec![Arc::new(Int32Array::from(values))])
+            .expect("test batch should be valid")
+    }
+
+    fn test_data_update(values: Vec<i32>, update_type: UpdateType) -> DataUpdate {
+        let batch = test_batch(values);
+        DataUpdate {
+            schema: batch.schema(),
+            data: vec![batch],
+            update_type,
+        }
+    }
 
     #[test]
     fn test_get_primary_keys_array_repeats_keys_for_each_row() {
@@ -480,5 +505,83 @@ mod tests {
             assert_eq!(values.value(0), "tenant");
             assert_eq!(values.value(1), "id");
         }
+    }
+
+    #[test]
+    fn test_truncate_change_batch_emits_truncate_operation() {
+        let batch = truncate_change_batch(&test_schema()).expect("truncate batch should be valid");
+        let op_column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("op column should be a string array");
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(op_column.value(0), "t");
+    }
+
+    #[test]
+    fn test_pending_initial_snapshot_updates_preserves_order() {
+        let mut pending_updates = PendingInitialSnapshotUpdates::default();
+        assert!(pending_updates.push_back(test_data_update(vec![1], UpdateType::Append)));
+        assert!(pending_updates.push_back(test_data_update(vec![2], UpdateType::Overwrite)));
+
+        let first_update = pending_updates
+            .pop_front()
+            .expect("first pending update should exist");
+        let second_update = pending_updates
+            .pop_front()
+            .expect("second pending update should exist");
+
+        assert_eq!(first_update.update_type, UpdateType::Append);
+        assert_eq!(second_update.update_type, UpdateType::Overwrite);
+        assert!(pending_updates.pop_front().is_none());
+    }
+
+    #[test]
+    fn test_pending_initial_snapshot_updates_rejects_too_many_batches() {
+        let batch = test_batch(vec![]);
+        let update = DataUpdate {
+            schema: batch.schema(),
+            data: vec![batch; MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BATCHES + 1],
+            update_type: UpdateType::Append,
+        };
+        let mut pending_updates = PendingInitialSnapshotUpdates::default();
+
+        assert!(!pending_updates.push_back(update));
+        assert!(pending_updates.pop_front().is_none());
+    }
+
+    #[test]
+    fn test_change_flight_encoder_resends_schema_when_schema_changes() {
+        let mut encoder = ChangeFlightEncoder::default();
+        let first_batch = test_batch(vec![1]);
+        let second_batch = test_batch(vec![2]);
+        let changed_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("active", DataType::Boolean, false),
+        ]));
+        let changed_batch = RecordBatch::try_new(
+            changed_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(BooleanArray::from(vec![true])),
+            ],
+        )
+        .expect("changed schema batch should be valid");
+
+        let first_flights = encoder
+            .encode(&first_batch)
+            .expect("first batch should encode");
+        let second_flights = encoder
+            .encode(&second_batch)
+            .expect("same-schema batch should encode");
+        let changed_flights = encoder
+            .encode(&changed_batch)
+            .expect("changed-schema batch should encode");
+
+        assert_eq!(first_flights.len(), 2);
+        assert_eq!(second_flights.len(), 1);
+        assert_eq!(changed_flights.len(), 2);
     }
 }
