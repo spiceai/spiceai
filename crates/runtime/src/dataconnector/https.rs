@@ -148,6 +148,13 @@ impl Https {
             .ok()
             .is_some_and(util::parse_enabled);
 
+        let has_header_filters = self
+            .params
+            .get("request_header_filters")
+            .expose()
+            .ok()
+            .is_some_and(util::parse_enabled);
+
         let has_pagination = self
             .params
             .get("pagination")
@@ -167,8 +174,22 @@ impl Https {
             .iter()
             .any(|key| self.params.get(key).expose().ok().is_some());
 
-        has_allowed_paths || has_query_filters || has_body_filters || has_pagination
+        has_allowed_paths
+            || has_query_filters
+            || has_body_filters
+            || has_header_filters
+            || has_pagination
     }
+}
+
+struct RequestFilterParams {
+    allow_query_filters: bool,
+    max_query_length: usize,
+    allow_body_filters: bool,
+    max_body_bytes: usize,
+    allow_header_filters: bool,
+    max_headers_length: usize,
+    request_header_allowlist: Vec<String>,
 }
 
 struct HttpProviderParams {
@@ -180,10 +201,8 @@ struct HttpProviderParams {
     retry_jitter: f64,
     custom_headers: HeaderMap,
     allowed_paths: Vec<String>,
-    allow_query_filters: bool,
-    max_query_length: usize,
-    allow_body_filters: bool,
-    max_body_bytes: usize,
+    request_filters: RequestFilterParams,
+    max_request_partitions: Option<usize>,
     health_probe: Option<String>,
     pagination: Option<data_components::http::provider::PaginationConfig>,
 }
@@ -273,6 +292,43 @@ impl Https {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(data_components::http::provider::DEFAULT_MAX_BODY_BYTES);
+
+        let allow_header_filters = self
+            .params
+            .get("request_header_filters")
+            .expose()
+            .ok()
+            .is_some_and(util::parse_enabled);
+
+        let max_headers_length = self
+            .params
+            .get("max_request_headers_length")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(data_components::http::provider::DEFAULT_MAX_HEADERS_LENGTH);
+
+        let request_header_allowlist = self
+            .params
+            .get("request_header_allowlist")
+            .expose()
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|header_name| header_name.trim().to_string())
+                    .filter(|header_name| !header_name.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let max_request_partitions = self
+            .params
+            .get("max_request_partitions")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|value| *value > 0);
 
         let health_probe = self
             .params
@@ -402,10 +458,16 @@ impl Https {
             retry_jitter,
             custom_headers,
             allowed_paths,
-            allow_query_filters,
-            max_query_length,
-            allow_body_filters,
-            max_body_bytes,
+            request_filters: RequestFilterParams {
+                allow_query_filters,
+                max_query_length,
+                allow_body_filters,
+                max_body_bytes,
+                allow_header_filters,
+                max_headers_length,
+                request_header_allowlist,
+            },
+            max_request_partitions,
             health_probe,
             pagination,
         }
@@ -695,13 +757,21 @@ impl Https {
             retry_jitter,
             custom_headers,
             allowed_paths,
+            request_filters,
+            max_request_partitions,
+            health_probe,
+            pagination,
+        } = self.resolve_http_provider_params(dataset);
+
+        let RequestFilterParams {
             allow_query_filters,
             max_query_length,
             allow_body_filters,
             max_body_bytes,
-            health_probe,
-            pagination,
-        } = self.resolve_http_provider_params(dataset);
+            allow_header_filters,
+            max_headers_length,
+            request_header_allowlist,
+        } = request_filters;
 
         let mut provider = data_components::http::provider::HttpTableProvider::new(
             base_url,
@@ -714,6 +784,7 @@ impl Https {
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
+        .with_max_request_partitions(max_request_partitions)
         .with_health_probe(health_probe)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: "https".to_string(),
@@ -755,10 +826,12 @@ impl Https {
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
         tracing::trace!(
-            "HTTP provider configuration for {}: allow_query_filters={}, allow_body_filters={}",
+            "HTTP provider configuration for {}: allow_query_filters={}, allow_body_filters={}, allow_header_filters={}, max_request_partitions={:?}",
             dataset.name,
             allow_query_filters,
-            allow_body_filters
+            allow_body_filters,
+            allow_header_filters,
+            max_request_partitions
         );
 
         if allow_query_filters {
@@ -772,6 +845,22 @@ impl Https {
         if allow_body_filters {
             tracing::trace!("Enabling body filters with max_bytes={}", max_body_bytes);
             provider = provider.enable_body_filters(max_body_bytes);
+        }
+
+        if allow_header_filters {
+            tracing::trace!(
+                "Enabling header filters with max_length={} and {} allowed header names",
+                max_headers_length,
+                request_header_allowlist.len()
+            );
+            provider = provider
+                .enable_header_filters(max_headers_length, request_header_allowlist)
+                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                    dataconnector: "https".to_string(),
+                    message: format!("Invalid request header filter configuration: {e}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e.into(),
+                })?;
         }
 
         if let Some(pagination_config) = pagination {
@@ -962,6 +1051,15 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("max_request_body_bytes")
             .description("Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB)."),
+        ParameterSpec::runtime("request_header_filters")
+            .description("Set to 'enabled' or 'disabled' to control whether request_headers filters can be pushed down as dynamic HTTP request headers.")
+            .one_of(&["enabled", "disabled"]),
+        ParameterSpec::runtime("request_header_allowlist")
+            .description("Comma-separated list of HTTP request header names that request_headers filters may set. Required when request_header_filters is enabled."),
+        ParameterSpec::runtime("max_request_headers_length")
+            .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
+        ParameterSpec::runtime("max_request_partitions")
+            .description("Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped."),
         ParameterSpec::runtime("health_probe")
             .description("Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted."),
         ParameterSpec::runtime("pagination")
@@ -1288,6 +1386,28 @@ mod tests {
             result.is_none(),
             "expected None when no auth params are configured"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_http_provider_params_parses_request_header_filters() {
+        let connector = test_connector_with(&[
+            ("request_header_filters", "enabled"),
+            ("request_header_allowlist", "x-sandbox-id, x-region"),
+            ("max_request_headers_length", "2048"),
+            ("max_request_partitions", "7000"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let params = connector.resolve_http_provider_params(&dataset);
+
+        assert!(params.request_filters.allow_header_filters);
+        assert_eq!(
+            params.request_filters.request_header_allowlist,
+            vec!["x-sandbox-id", "x-region"]
+        );
+        assert_eq!(params.request_filters.max_headers_length, 2048);
+        assert_eq!(params.max_request_partitions, Some(7000));
     }
 
     #[tokio::test]
