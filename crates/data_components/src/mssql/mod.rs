@@ -151,7 +151,11 @@ impl SqlServerTableProvider {
                 numeric_scale.map(|v| i8::try_from(v).unwrap_or_default()),
             );
 
-            fields.push(Field::new(column_name, arrow_data_type, is_nullable == "YES"));
+            fields.push(Field::new(
+                column_name,
+                arrow_data_type,
+                is_nullable == "YES",
+            ));
         }
 
         if fields.is_empty() {
