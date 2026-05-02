@@ -641,7 +641,7 @@ async fn test_http_dynamic_request_headers() -> Result<(), String> {
 ///   3. A query that builds JSON headers from the CSV rows and uses
 ///      `IN (SELECT ...)` to drive dynamic HTTP requests
 ///
-/// DataFusion plans the subquery as a `HashJoinExec` (semi-join) over
+/// `DataFusion` plans the subquery as a `HashJoinExec` (semi-join) over
 /// `HttpExec`, which the optimizer rewrites into `HttpWithDeferredParamsExec`.
 #[tokio::test]
 async fn test_http_dynamic_request_headers_from_subquery() -> Result<(), String> {
@@ -781,10 +781,10 @@ async fn test_http_dynamic_request_headers_accelerated_view() -> Result<(), Stri
 
             // 3. Create an accelerated view with IN (SELECT ...) subquery SQL.
             let mut view = View::new("org_headers_view".to_string());
-            view.sql = Some(format!(
+            view.sql = Some(
                 r#"
                 WITH org_headers AS (
-                    SELECT '{{"x-org-id":"' || org_id || '"}}' AS hdr
+                    SELECT '{"x-org-id":"' || org_id || '"}' AS hdr
                     FROM orgs
                 )
                 SELECT request_headers, content
@@ -792,7 +792,8 @@ async fn test_http_dynamic_request_headers_accelerated_view() -> Result<(), Stri
                 WHERE request_path = '/headers'
                   AND request_headers IN (SELECT hdr FROM org_headers)
                 "#
-            ));
+                .to_string(),
+            );
             view.acceleration = Some(Acceleration {
                 enabled: true,
                 refresh_mode: Some(RefreshMode::Full),

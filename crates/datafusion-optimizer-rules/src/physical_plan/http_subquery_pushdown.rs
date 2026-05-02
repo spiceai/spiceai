@@ -495,3 +495,355 @@ fn replace_http_exec_with_partitions(
         })
         .data()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::{RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::common::NullEquality;
+    use datafusion::config::ConfigOptions;
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::joins::PartitionMode;
+    use datafusion_datasource::memory::MemorySourceConfig;
+    use reqwest::Client;
+    use url::Url;
+
+    use data_components::http::provider::HttpTableProvider;
+
+    /// Build an `HttpExec` with one empty partition.
+    fn make_http_exec() -> Arc<dyn ExecutionPlan> {
+        let provider = Arc::new(HttpTableProvider::new(
+            Url::parse("http://localhost:9999/api").expect("valid url"),
+            Client::new(),
+            "json".to_string(),
+            false,
+        ));
+        let schema: SchemaRef = Arc::new(HttpTableProvider::base_table_schema());
+        Arc::new(HttpExec::new(
+            schema,
+            provider,
+            vec![(None, None, None, None)],
+            None,
+        ))
+    }
+
+    /// Build a simple in-memory `ExecutionPlan` producing the given string
+    /// column (`col_name`) with the given values.
+    fn make_memory_exec(col_name: &str, values: &[Option<&str>]) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            col_name,
+            DataType::Utf8,
+            true,
+        )]));
+        let array = StringArray::from(values.to_vec());
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)]).expect("valid batch");
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).expect("valid memory exec")
+    }
+
+    /// Build a `HashJoinExec` (semi-join) for testing the optimizer rule.
+    fn make_hash_join(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        left_col: &str,
+        left_idx: usize,
+        right_col: &str,
+        right_idx: usize,
+        join_type: JoinType,
+    ) -> Arc<dyn ExecutionPlan> {
+        let on: Vec<(
+            Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        )> = vec![(
+            Arc::new(Column::new(left_col, left_idx)),
+            Arc::new(Column::new(right_col, right_idx)),
+        )];
+        Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &join_type,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+            )
+            .expect("valid HashJoinExec"),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Optimizer rule rewrite tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_left_semi_rewrite_produces_deferred_exec() {
+        // LeftSemi: HttpExec on left, subquery on right
+        let http = make_http_exec();
+        let build = make_memory_exec("request_headers", &[Some("hdr1"), Some("hdr2")]);
+
+        // request_headers is column index 3 in HttpExec schema, index 0 in build
+        let join = make_hash_join(
+            http,
+            build,
+            "request_headers",
+            3,
+            "request_headers",
+            0,
+            JoinType::LeftSemi,
+        );
+
+        let rule = HttpParamsPushdown;
+        let result = rule
+            .optimize(join, &ConfigOptions::new())
+            .expect("optimize should succeed");
+
+        // The top-level node should be HttpWithDeferredParamsExec
+        assert!(
+            result
+                .as_any()
+                .downcast_ref::<HttpWithDeferredParamsExec>()
+                .is_some(),
+            "expected HttpWithDeferredParamsExec, got {}",
+            result.name()
+        );
+        assert_eq!(
+            result.children().len(),
+            2,
+            "should have http_side and build_side children"
+        );
+    }
+
+    #[test]
+    fn test_right_semi_rewrite_produces_deferred_exec() {
+        // RightSemi: subquery on left, HttpExec on right
+        let build = make_memory_exec("request_path", &[Some("/a"), Some("/b")]);
+        let http = make_http_exec();
+
+        // In RightSemi: left_col is from build, right_col is from HttpExec
+        let join = make_hash_join(
+            build,
+            http,
+            "request_path",
+            0,
+            "request_path",
+            0,
+            JoinType::RightSemi,
+        );
+
+        let rule = HttpParamsPushdown;
+        let result = rule
+            .optimize(join, &ConfigOptions::new())
+            .expect("optimize should succeed");
+
+        let deferred = result
+            .as_any()
+            .downcast_ref::<HttpWithDeferredParamsExec>()
+            .expect("expected HttpWithDeferredParamsExec");
+        assert_eq!(deferred.col_name, "request_path");
+    }
+
+    #[test]
+    fn test_no_rewrite_for_non_http_param_column() {
+        // Join on "content" (not an HTTP request param column) — should not rewrite
+        let http = make_http_exec();
+        let build = make_memory_exec("content", &[Some("hello")]);
+
+        let join = make_hash_join(
+            http,
+            build,
+            "content",
+            4, // content is at index 4 in HttpExec schema
+            "content",
+            0,
+            JoinType::LeftSemi,
+        );
+
+        let rule = HttpParamsPushdown;
+        let result = rule
+            .optimize(Arc::clone(&join), &ConfigOptions::new())
+            .expect("optimize should succeed");
+
+        // Should remain a HashJoinExec (no rewrite)
+        assert!(
+            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "expected HashJoinExec unchanged, got {}",
+            result.name()
+        );
+    }
+
+    #[test]
+    fn test_no_rewrite_without_http_exec() {
+        // Both sides are memory — no HttpExec present
+        let left = make_memory_exec("request_headers", &[Some("a")]);
+        let right = make_memory_exec("request_headers", &[Some("b")]);
+
+        let join = make_hash_join(
+            left,
+            right,
+            "request_headers",
+            0,
+            "request_headers",
+            0,
+            JoinType::LeftSemi,
+        );
+
+        let rule = HttpParamsPushdown;
+        let result = rule
+            .optimize(Arc::clone(&join), &ConfigOptions::new())
+            .expect("optimize should succeed");
+
+        assert!(
+            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "expected HashJoinExec unchanged when no HttpExec is present"
+        );
+    }
+
+    #[test]
+    fn test_inner_join_on_http_param_returns_error() {
+        let http = make_http_exec();
+        let build = make_memory_exec("request_headers", &[Some("hdr1")]);
+
+        let join = make_hash_join(
+            http,
+            build,
+            "request_headers",
+            3,
+            "request_headers",
+            0,
+            JoinType::Inner,
+        );
+
+        let rule = HttpParamsPushdown;
+        let _ = rule
+            .optimize(join, &ConfigOptions::new())
+            .expect_err("inner join on HTTP param should error");
+    }
+
+    // -----------------------------------------------------------------------
+    // materialize_string_values tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_materialize_filters_nulls_and_empties() {
+        let plan = make_memory_exec(
+            "val",
+            &[
+                Some("a"),
+                None,
+                Some(""),
+                Some("b"),
+                None,
+                Some("a"),
+                Some(""),
+            ],
+        );
+        let ctx = Arc::new(TaskContext::default());
+
+        let values = materialize_string_values(&plan, &ctx, 0)
+            .await
+            .expect("materialize should succeed");
+
+        // Should contain only unique non-null, non-empty strings
+        assert_eq!(values.len(), 2, "expected 2 unique values, got {values:?}");
+        assert!(values.contains(&"a".to_string()));
+        assert!(values.contains(&"b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_deduplicates() {
+        let plan = make_memory_exec(
+            "val",
+            &[Some("x"), Some("y"), Some("x"), Some("z"), Some("y")],
+        );
+        let ctx = Arc::new(TaskContext::default());
+
+        let values = materialize_string_values(&plan, &ctx, 0)
+            .await
+            .expect("materialize should succeed");
+
+        assert_eq!(values.len(), 3, "expected 3 unique values");
+    }
+
+    #[tokio::test]
+    async fn test_materialize_empty_build_side() {
+        let plan = make_memory_exec("val", &[]);
+        let ctx = Arc::new(TaskContext::default());
+
+        let values = materialize_string_values(&plan, &ctx, 0)
+            .await
+            .expect("materialize should succeed");
+
+        assert!(values.is_empty(), "expected empty vec for empty input");
+    }
+
+    #[tokio::test]
+    async fn test_materialize_all_nulls_returns_empty() {
+        let plan = make_memory_exec("val", &[None, None, None]);
+        let ctx = Arc::new(TaskContext::default());
+
+        let values = materialize_string_values(&plan, &ctx, 0)
+            .await
+            .expect("materialize should succeed");
+
+        assert!(values.is_empty(), "all-null input should produce empty vec");
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_http_exec_with_partitions tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_replace_http_exec_expands_partitions() {
+        let http = make_http_exec();
+        let values = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        let rewritten = replace_http_exec_with_partitions(&http, "request_headers", &values)
+            .expect("replace should succeed");
+
+        let http_exec = find_http_exec(&rewritten).expect("should contain HttpExec");
+        assert_eq!(
+            http_exec.partitions().len(),
+            3,
+            "expected 3 partitions from 1 × 3 values"
+        );
+
+        // Verify each partition has the correct header value
+        for (i, val) in values.iter().enumerate() {
+            assert_eq!(
+                http_exec.partitions()[i].3,
+                Some(val.clone()),
+                "partition {i} should have request_headers={val}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // contains_http_exec / find_http_exec utility tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_contains_http_exec_positive() {
+        let http = make_http_exec();
+        assert!(contains_http_exec(&http), "should find HttpExec directly");
+
+        // Wrapped in CoalescePartitionsExec
+        let wrapped: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(http));
+        assert!(
+            contains_http_exec(&wrapped),
+            "should find HttpExec inside CoalescePartitionsExec"
+        );
+    }
+
+    #[test]
+    fn test_contains_http_exec_negative() {
+        let mem = make_memory_exec("col", &[Some("val")]);
+        assert!(
+            !contains_http_exec(&mem),
+            "should not find HttpExec in memory exec"
+        );
+    }
+}

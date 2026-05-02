@@ -6457,9 +6457,11 @@ mod tests {
             .expect_err("should exceed max_request_partitions");
     }
 
+    type PartitionAccessor = Box<dyn Fn(&PartitionSpec) -> &Option<String>>;
+
     #[test]
     fn test_with_expanded_params_all_columns() {
-        let cases: Vec<(&str, Box<dyn Fn(&PartitionSpec) -> &Option<String>>)> = vec![
+        let cases: Vec<(&str, PartitionAccessor)> = vec![
             ("request_path", Box::new(|p: &PartitionSpec| &p.0)),
             ("request_query", Box::new(|p: &PartitionSpec| &p.1)),
             ("request_body", Box::new(|p: &PartitionSpec| &p.2)),
@@ -6484,7 +6486,7 @@ mod tests {
             );
 
             // Verify the OTHER positions are still None.
-            let all_accessors: Vec<Box<dyn Fn(&PartitionSpec) -> &Option<String>>> = vec![
+            let all_accessors: Vec<PartitionAccessor> = vec![
                 Box::new(|p: &PartitionSpec| &p.0),
                 Box::new(|p: &PartitionSpec| &p.1),
                 Box::new(|p: &PartitionSpec| &p.2),
