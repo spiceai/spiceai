@@ -565,10 +565,11 @@ mod tests {
     fn test_pending_initial_snapshot_updates_rejects_too_many_rows() {
         let batch = RecordBatch::try_new(
             test_schema(),
-            vec![new_null_array(
-                &DataType::Int32,
-                MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_ROWS + 1,
-            )],
+            vec![Arc::new(Int32Array::from(vec![
+                0;
+                MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_ROWS
+                    + 1
+            ]))],
         )
         .expect("large test batch should be valid");
         let update = DataUpdate {
