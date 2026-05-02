@@ -1,0 +1,31 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: \n                WITH org_headers AS (\n                    SELECT '{\"x-org-id\":\"' || org_id || '\"}' AS hdr\n                    FROM orgs\n                )\n                SELECT request_headers, content\n                FROM data_api\n                WHERE request_path = '/headers'\n                  AND request_headers IN (SELECT hdr FROM org_headers)\n                ORDER BY request_headers\n            "
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                        |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: data_api.request_headers ASC NULLS LAST                                                                                               |
+|               |   LeftSemi Join: data_api.request_headers = __correlated_sq_1.hdr                                                                           |
+|               |     Projection: data_api.request_headers, data_api.content                                                                                  |
+|               |       Filter: data_api.request_path = Utf8("/headers")                                                                                      |
+|               |         TableScan: data_api projection=[request_path, request_headers, content], partial_filters=[data_api.request_path = Utf8("/headers")] |
+|               |     SubqueryAlias: __correlated_sq_1                                                                                                        |
+|               |       SubqueryAlias: org_headers                                                                                                            |
+|               |         Projection: Utf8("{"x-org-id":"") || orgs.org_id || Utf8(""}") AS hdr                                                               |
+|               |           TableScan: orgs projection=[org_id]                                                                                               |
+| physical_plan | SortPreservingMergeExec: [request_headers@0 ASC NULLS LAST]                                                                                 |
+|               |   SortExec: expr=[request_headers@0 ASC NULLS LAST], preserve_partitioning=[true]                                                           |
+|               |     HttpWithDeferredParamsExec: deferred_param=request_headers, build_side=ProjectionExec                                                   |
+|               |       CoalescePartitionsExec                                                                                                                |
+|               |         FilterExec: request_path@0 = /headers, projection=[request_headers@1, content@2]                                                    |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                              |
+|               |             CooperativeExec                                                                                                                 |
+|               |               BytesProcessedExec                                                                                                            |
+|               |                 HttpExec: base_url=http://127.0.0.1:<PORT>/api, format=json, partitions=deferred                                             |
+|               |       ProjectionExec: expr=[{"x-org-id":" || org_id@0 || "} as hdr]                                                                         |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                |
+|               |           BytesProcessedExec                                                                                                                |
+|               |             DataSourceExec: file_groups={1 group: [[orgs.csv]]}, projection=[org_id], file_type=csv, has_header=true                        |
+|               |                                                                                                                                             |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+

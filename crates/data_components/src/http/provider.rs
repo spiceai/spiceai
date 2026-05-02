@@ -138,7 +138,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
-type PartitionSpec = (
+pub type PartitionSpec = (
     Option<String>,
     Option<String>,
     Option<String>,
@@ -598,6 +598,11 @@ impl HttpTableProvider {
             max_length.min(DEFAULT_MAX_HEADERS_LENGTH * 4);
         self.request_filter_options.allowed_headers = allowed_headers;
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.max_request_partitions
     }
 
     #[must_use]
@@ -1415,9 +1420,42 @@ pub struct HttpExec {
     partitions: Vec<PartitionSpec>,
     limit: Option<usize>,
     properties: PlanProperties,
+    /// When `true`, the partitions are a template that will be expanded
+    /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
+    deferred_partitions: bool,
 }
 
 impl HttpExec {
+    /// Returns the provider used by this exec.
+    #[must_use]
+    pub fn provider(&self) -> &Arc<HttpTableProvider> {
+        &self.provider
+    }
+
+    /// Returns the maximum number of request partitions allowed, if configured.
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.provider.max_request_partitions()
+    }
+
+    /// Returns the partition specs.
+    #[must_use]
+    pub fn partitions(&self) -> &[PartitionSpec] {
+        &self.partitions
+    }
+
+    /// Returns the limit.
+    #[must_use]
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Returns the projected schema.
+    #[must_use]
+    pub fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
     #[must_use]
     pub fn new(
         projected_schema: SchemaRef,
@@ -1437,7 +1475,83 @@ impl HttpExec {
             partitions,
             limit,
             properties,
+            deferred_partitions: false,
         }
+    }
+
+    /// Mark this `HttpExec` as having dynamic partitions that will be
+    /// expanded at runtime. Affects EXPLAIN display only.
+    #[must_use]
+    pub fn with_deferred_partitions(mut self) -> Self {
+        self.deferred_partitions = true;
+        self
+    }
+
+    /// Create a new `HttpExec` whose partitions are the cross-product of the
+    /// current partitions and the given `values`, injected into the column
+    /// identified by `col_name` (`request_path`, `request_query`,
+    /// `request_body`, or `request_headers`).
+    ///
+    /// Returns an error if the resulting partition count would exceed
+    /// `max_request_partitions`.
+    pub fn with_expanded_params(
+        &self,
+        col_name: &str,
+        values: &[String],
+    ) -> DataFusionResult<Self> {
+        let existing = &self.partitions;
+        let new_count = existing.len() * values.len();
+
+        if let Some(max) = self.max_request_partitions()
+            && new_count > max
+        {
+            return Err(DataFusionError::Plan(format!(
+                "HttpExec: expanding params would create {new_count} partitions (existing {} x {} values), which exceeds max_request_partitions={max}. Reduce the number of dynamic values or increase max_request_partitions.",
+                existing.len(),
+                values.len(),
+            )));
+        }
+
+        let mut new_partitions = Vec::with_capacity(new_count);
+
+        for partition in existing {
+            for value in values {
+                let mut p = partition.clone();
+                match col_name {
+                    "request_path" => {
+                        p.0 = Some(self.provider.ensure_allowed_path(value)?);
+                    }
+                    "request_query" => {
+                        p.1 = Some(self.provider.ensure_allowed_query(value)?);
+                    }
+                    "request_body" => {
+                        p.2 = Some(self.provider.ensure_allowed_body(value)?);
+                    }
+                    "request_headers" => {
+                        p.3 = Some(self.provider.ensure_allowed_headers(value)?);
+                    }
+                    other => {
+                        return Err(DataFusionError::Internal(format!(
+                            "HttpExec::with_expanded_params: unsupported column '{other}'. Expected one of: request_path, request_query, request_body, request_headers"
+                        )));
+                    }
+                }
+                new_partitions.push(p);
+            }
+        }
+
+        tracing::debug!(
+            "HttpExec::with_expanded_params: replacing partitions with {} (was {}) for column '{col_name}'",
+            new_partitions.len(),
+            existing.len(),
+        );
+
+        Ok(Self::new(
+            Arc::clone(&self.projected_schema),
+            Arc::clone(&self.provider),
+            new_partitions,
+            self.limit,
+        ))
     }
 
     async fn fetch_and_create_batch(
@@ -1737,9 +1851,15 @@ impl DisplayAs for HttpExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "HttpExec: base_url={}, format={}, partitions=[",
+            "HttpExec: base_url={}, format={}, ",
             self.provider.base_url, self.provider.file_format
         )?;
+
+        if self.deferred_partitions {
+            return write!(f, "partitions=deferred");
+        }
+
+        write!(f, "partitions=[")?;
 
         for (i, (path, query, body, request_headers)) in self.partitions.iter().enumerate() {
             if i > 0 {
@@ -6257,5 +6377,171 @@ mod tests {
         let schema = batch.schema();
         let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(field_names, vec!["id", "name", "details"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_expanded_params unit tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an `HttpExec` with the given partitions and optional max.
+    ///
+    /// Enables all filter types (path, query, body, headers) so that
+    /// `with_expanded_params` validation passes for any column.
+    fn make_exec(
+        partitions: Vec<PartitionSpec>,
+        max_request_partitions: Option<usize>,
+    ) -> HttpExec {
+        let provider = base_provider()
+            .with_allowed_paths(["/*"])
+            .expect("valid path glob")
+            .enable_query_filters(DEFAULT_MAX_QUERY_LENGTH)
+            .enable_body_filters(DEFAULT_MAX_BODY_BYTES)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-test"])
+            .expect("header filters should enable")
+            .with_max_request_partitions(max_request_partitions);
+        HttpExec::new(
+            HttpTableProvider::base_table_schema().into(),
+            Arc::new(provider),
+            partitions,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_with_expanded_params_request_path() {
+        let exec = make_exec(vec![(None, None, None, None)], None);
+        let result = exec
+            .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
+            .expect("expand should succeed");
+
+        assert_eq!(result.partitions.len(), 2);
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/b".to_string()));
+        // Other tuple positions remain None.
+        assert_eq!(result.partitions[0].1, None);
+        assert_eq!(result.partitions[0].2, None);
+        assert_eq!(result.partitions[0].3, None);
+    }
+
+    #[test]
+    fn test_with_expanded_params_cross_product() {
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            None,
+        );
+        let result = exec
+            .with_expanded_params(
+                "request_query",
+                &["q1".to_string(), "q2".to_string(), "q3".to_string()],
+            )
+            .expect("expand should succeed");
+
+        // 2 existing × 3 values = 6 partitions
+        assert_eq!(result.partitions.len(), 6);
+
+        // First existing partition (/a) crossed with all three values
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[0].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[2].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[2].1, Some("q3".to_string()));
+
+        // Second existing partition (/b) crossed with all three values
+        assert_eq!(result.partitions[3].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[3].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[4].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[4].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[5].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[5].1, Some("q3".to_string()));
+    }
+
+    #[test]
+    fn test_with_expanded_params_exceeds_max() {
+        // max=3, but 2 partitions × 2 query values = 4 → should fail
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            Some(3),
+        );
+
+        _ = exec
+            .with_expanded_params("request_query", &["q=1".to_string(), "q=2".to_string()])
+            .expect_err("should exceed max_request_partitions");
+    }
+
+    type PartitionAccessor = Box<dyn Fn(&PartitionSpec) -> &Option<String>>;
+
+    #[test]
+    fn test_with_expanded_params_all_columns() {
+        // Values must satisfy each column's validation rules:
+        // - request_path: must start with '/'
+        // - request_query: plain query string
+        // - request_body: plain body text
+        // - request_headers: JSON with allowed header names
+        let cases: Vec<(&str, &str, PartitionAccessor)> = vec![
+            ("/val", "request_path", Box::new(|p: &PartitionSpec| &p.0)),
+            ("val", "request_query", Box::new(|p: &PartitionSpec| &p.1)),
+            ("val", "request_body", Box::new(|p: &PartitionSpec| &p.2)),
+            (
+                r#"{"x-test":"val"}"#,
+                "request_headers",
+                Box::new(|p: &PartitionSpec| &p.3),
+            ),
+        ];
+
+        for (test_value, col_name, accessor) in &cases {
+            let exec = make_exec(vec![(None, None, None, None)], None);
+            let result = exec
+                .with_expanded_params(col_name, &[test_value.to_string()])
+                .unwrap_or_else(|e| panic!("expand for {col_name} should succeed: {e}"));
+
+            assert_eq!(
+                result.partitions.len(),
+                1,
+                "one partition expected for {col_name}"
+            );
+            assert_eq!(
+                *accessor(&result.partitions[0]),
+                Some(test_value.to_string()),
+                "{col_name} should be set"
+            );
+
+            // Verify the OTHER positions are still None.
+            let all_accessors: Vec<PartitionAccessor> = vec![
+                Box::new(|p: &PartitionSpec| &p.0),
+                Box::new(|p: &PartitionSpec| &p.1),
+                Box::new(|p: &PartitionSpec| &p.2),
+                Box::new(|p: &PartitionSpec| &p.3),
+            ];
+            let col_names = [
+                "request_path",
+                "request_query",
+                "request_body",
+                "request_headers",
+            ];
+            for (other_name, other_accessor) in col_names.iter().zip(all_accessors.iter()) {
+                if *other_name != *col_name {
+                    assert_eq!(
+                        *other_accessor(&result.partitions[0]),
+                        None,
+                        "{other_name} should remain None when expanding {col_name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_expanded_params_unknown_column_errors() {
+        let exec = make_exec(vec![(Some("/orig".to_string()), None, None, None)], None);
+        let _ = exec
+            .with_expanded_params("nonexistent_column", &["x".to_string()])
+            .expect_err("unknown column should error");
     }
 }

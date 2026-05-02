@@ -60,7 +60,7 @@ pub mod directory_archive;
 mod engine;
 pub mod metrics;
 pub use crate::layout::AccelerationLayout;
-pub use behavior::SnapshotBehavior;
+pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior};
 use engine::{SnapshotEngine, create_snapshot_engine};
 
 /// Public API types for snapshot information exposed via HTTP endpoints.
