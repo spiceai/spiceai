@@ -27,6 +27,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use snafu::prelude::*;
@@ -142,9 +143,9 @@ fn create_ducklake_factory(
         }
     })?;
 
-    let duckdb_conn = conn
+    let duckdb_wrapper = conn
         .as_any()
-        .downcast_ref::<duckdb::Connection>()
+        .downcast_ref::<DuckDbConnection>()
         .ok_or_else(|| DataConnectorError::InvalidConfiguration {
             dataconnector: "ducklake".to_string(),
             connector_component: params.component.clone(),
@@ -153,7 +154,8 @@ fn create_ducklake_factory(
         })?;
 
     // Install and load the ducklake extension
-    duckdb_conn
+    duckdb_wrapper
+        .conn
         .execute("INSTALL ducklake", [])
         .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
         .map_err(|e| DataConnectorError::UnableToConnectInternal {
@@ -162,7 +164,8 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    duckdb_conn
+    duckdb_wrapper
+        .conn
         .execute("LOAD ducklake", [])
         .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
         .map_err(|e| DataConnectorError::UnableToConnectInternal {
@@ -176,7 +179,8 @@ fn create_ducklake_factory(
     let escaped_catalog_name = catalog_name.replace('"', "\"\"");
     let attach_sql =
         format!("ATTACH 'ducklake:{escaped_connection_string}' AS \"{escaped_catalog_name}\"");
-    duckdb_conn
+    duckdb_wrapper
+        .conn
         .execute(&attach_sql, [])
         .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
         .map_err(|e| DataConnectorError::UnableToConnectInternal {

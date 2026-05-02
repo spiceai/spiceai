@@ -27,6 +27,7 @@ use crate::{
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::ducklake::provider::DuckLakeCatalogProvider;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use snafu::prelude::*;
@@ -172,16 +173,17 @@ impl CatalogConnector for DuckLakeCatalog {
                     }
                 })?;
 
-                let duckdb_conn = conn
+                let duckdb_wrapper = conn
                     .as_any()
-                    .downcast_ref::<duckdb::Connection>()
+                    .downcast_ref::<DuckDbConnection>()
                     .ok_or_else(|| super::Error::InvalidConfigurationNoSource {
                         connector: PREFIX.to_string(),
                         connector_component: connector_component_for_pool.clone(),
                         message: "Failed to get underlying DuckDB connection".to_string(),
                     })?;
 
-                duckdb_conn
+                duckdb_wrapper
+                    .conn
                     .execute("INSTALL ducklake", [])
                     .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
                     .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -190,7 +192,8 @@ impl CatalogConnector for DuckLakeCatalog {
                         source: Box::new(e),
                     })?;
 
-                duckdb_conn
+                duckdb_wrapper
+                    .conn
                     .execute("LOAD ducklake", [])
                     .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
                     .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -204,7 +207,8 @@ impl CatalogConnector for DuckLakeCatalog {
                 let attach_sql = format!(
                     "ATTACH 'ducklake:{escaped_connection_string}' AS \"{escaped_catalog_name}\""
                 );
-                duckdb_conn
+                duckdb_wrapper
+                    .conn
                     .execute(&attach_sql, [])
                     .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
                     .map_err(|e| super::Error::UnableToGetCatalogProvider {
