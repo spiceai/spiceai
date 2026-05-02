@@ -2559,11 +2559,64 @@ impl HttpTableProvider {
     ) -> Result<()> {
         match expr.op {
             Operator::Eq => self.handle_equality_expr(expr, accumulator),
-            Operator::Or | Operator::And => {
+            Operator::And => {
+                self.extract_filter_values(expr.left.as_ref(), accumulator)?;
+                self.extract_filter_values(expr.right.as_ref(), accumulator)
+            }
+            Operator::Or => {
+                // OR within a single HTTP virtual filter column is treated as
+                // an IN list (alternative values). OR across different
+                // columns would be silently rewritten as a cross product
+                // (AND) by the partition accumulator, causing the connector
+                // to issue combined HTTP requests instead of separate ones.
+                // Reject the cross-column case explicitly. (Note: SQL
+                // `IN (...)` is sometimes pre-rewritten by DataFusion into a
+                // chain of OR-of-equality, which is why same-column OR must
+                // still be accepted.)
+                let mut columns = HashSet::new();
+                Self::collect_http_filter_columns(expr.left.as_ref(), &mut columns);
+                Self::collect_http_filter_columns(expr.right.as_ref(), &mut columns);
+                if columns.len() > 1 {
+                    let mut names: Vec<&str> = columns.into_iter().collect();
+                    names.sort_unstable();
+                    return Err(Error::FilterRejected {
+                        message: format!(
+                            "OR across different HTTP filter columns ({}) is not supported because the connector would otherwise issue combined HTTP requests instead of separate ones. Use IN (...) to enumerate values on a single column, or run separate queries (e.g. UNION ALL) for alternative requests.",
+                            names.join(", ")
+                        ),
+                    });
+                }
                 self.extract_filter_values(expr.left.as_ref(), accumulator)?;
                 self.extract_filter_values(expr.right.as_ref(), accumulator)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Walk an expression tree and collect the names of any HTTP virtual
+    /// filter columns (`request_path`, `request_query`, `request_body`,
+    /// `request_headers`) referenced anywhere inside it.
+    fn collect_http_filter_columns(expr: &Expr, columns: &mut HashSet<&'static str>) {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+                Self::collect_http_filter_columns(left.as_ref(), columns);
+                Self::collect_http_filter_columns(right.as_ref(), columns);
+            }
+            Expr::InList(in_list) => {
+                Self::collect_http_filter_columns(in_list.expr.as_ref(), columns);
+            }
+            Expr::Column(column) => {
+                if let Some(static_name) = match column.name.as_str() {
+                    "request_path" => Some("request_path"),
+                    "request_query" => Some("request_query"),
+                    "request_body" => Some("request_body"),
+                    "request_headers" => Some("request_headers"),
+                    _ => None,
+                } {
+                    columns.insert(static_name);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3226,6 +3279,82 @@ mod tests {
         assert_eq!(partitions.len(), 2);
         assert!(partitions.contains(&(Some("/api/v1".to_string()), None, None, None)));
         assert!(partitions.contains(&(Some("/api/v2".to_string()), None, None, None)));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_query_filters(64);
+        // request_path = '/a' OR request_query = 'b=1'
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_query"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("b=1".to_string())),
+                    None,
+                )),
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("OR across different HTTP filter columns"),
+            "unexpected error message: {message}"
+        );
+        assert!(message.contains("request_path"));
+        assert!(message.contains("request_query"));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_nested_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id".to_string()])
+            .expect("enable header filters");
+        // request_path = '/a' OR request_headers IN ('{"x-sandbox-id":"a"}')
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::InList(InList {
+                expr: Box::new(Expr::Column(Column::from_name("request_headers"))),
+                list: vec![Expr::Literal(
+                    ScalarValue::Utf8(Some(r#"{"x-sandbox-id":"a"}"#.to_string())),
+                    None,
+                )],
+                negated: false,
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        assert!(
+            err.to_string()
+                .contains("OR across different HTTP filter columns")
+        );
     }
 
     #[test]
