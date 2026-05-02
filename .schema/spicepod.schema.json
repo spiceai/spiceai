@@ -3345,7 +3345,7 @@
       "additionalProperties": false
     },
     "FunctionArg": {
-      "description": "A single named argument or output column.\n\nThe `type` field is an Arrow logical-type string (e.g. `float64`,\n`utf8`, `list<int32>`, `decimal(38, 10)`, `timestamp(us, utc)`). The\nparser retains it verbatim; validation happens at factory-build time\nagainst [`arrow::datatypes::DataType::try_from`].",
+      "description": "A single named argument or output column.\n\nThe `type` field is an Arrow logical-type string (e.g. `float64`,\n`utf8`, `list<int32>`, `decimal(38, 10)`, `timestamp(us, utc)`). The\nparser retains it verbatim; tier-specific function factories validate\naccepted type strings when the function is registered.",
       "type": "object",
       "properties": {
         "name": {
