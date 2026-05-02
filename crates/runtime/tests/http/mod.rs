@@ -653,17 +653,8 @@ async fn test_http_dynamic_request_headers_from_subquery() -> Result<(), String>
             let (tx, addr, _) = start_http_server().await?;
             tracing::debug!("HTTP test server started at {addr}");
 
-            // 1. Write a small CSV with org IDs to a temp file.
-            let csv_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-            let csv_path = csv_dir.path().join("orgs.csv");
-            std::fs::write(
-                &csv_path,
-                "org_id\norg-001\norg-002\norg-003\norg-004\norg-005\n",
-            )
-            .map_err(|e| format!("Failed to write orgs CSV: {e}"))?;
-
-            // 2. Register both datasets: the CSV lookup table and the HTTP API.
-            let orgs_dataset = Dataset::new(format!("file://{}", csv_path.display()), "orgs");
+            // 1. Register both datasets: the S3 CSV lookup table and the HTTP API.
+            let orgs_dataset = Dataset::new("s3://spiceai-public-datasets/orgs.csv", "orgs");
 
             let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "data_api");
             http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
@@ -687,7 +678,7 @@ async fn test_http_dynamic_request_headers_from_subquery() -> Result<(), String>
                 .build();
             let mut rt = load_runtime(app).await?;
 
-            // 3. Build header JSON from CSV rows, use IN (SELECT ...) to drive dynamic HTTP requests
+            // 2. Build header JSON from CSV rows, use IN (SELECT ...) to drive dynamic HTTP requests
             let query = r#"
                 WITH org_headers AS (
                     SELECT '{"x-org-id":"' || org_id || '"}' AS hdr
@@ -751,17 +742,8 @@ async fn test_http_dynamic_request_headers_accelerated_view() -> Result<(), Stri
             let (tx, addr, _) = start_http_server().await?;
             tracing::debug!("HTTP test server started at {addr}");
 
-            // 1. Write a small CSV with org IDs to a temp file.
-            let csv_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-            let csv_path = csv_dir.path().join("orgs.csv");
-            std::fs::write(
-                &csv_path,
-                "org_id\norg-001\norg-002\norg-003\norg-004\norg-005\n",
-            )
-            .map_err(|e| format!("Failed to write orgs CSV: {e}"))?;
-
-            // 2. Register datasets: CSV lookup table and HTTP API.
-            let orgs_dataset = Dataset::new(format!("file://{}", csv_path.display()), "orgs");
+            // 1. Register datasets: S3 CSV lookup table and HTTP API.
+            let orgs_dataset = Dataset::new("s3://spiceai-public-datasets/orgs.csv", "orgs");
 
             let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "data_api");
             http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
@@ -779,7 +761,7 @@ async fn test_http_dynamic_request_headers_accelerated_view() -> Result<(), Stri
                 ("max_request_partitions".to_string(), "100".to_string()),
             ])));
 
-            // 3. Create an accelerated view with IN (SELECT ...) subquery SQL.
+            // 2. Create an accelerated view with IN (SELECT ...) subquery SQL.
             let mut view = View::new("org_headers_view".to_string());
             view.sql = Some(
                 r#"
