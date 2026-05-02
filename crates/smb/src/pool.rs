@@ -131,7 +131,11 @@ impl SmbPool {
     /// in by a prior `reconnect`).
     #[must_use]
     pub fn client(&self, idx: usize) -> Arc<SmbClient> {
-        Arc::clone(&self.slots[idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+        Arc::clone(
+            &self.slots[idx]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Snapshot the current set of clients (for tree-connect setup).
@@ -156,7 +160,9 @@ impl SmbPool {
     pub async fn reconnect(&self, idx: usize) -> io::Result<Arc<SmbClient>> {
         let new_client = SmbClient::connect(self.config.clone()).await?;
         {
-            let mut slot = self.slots[idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = self.slots[idx]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *slot = Arc::clone(&new_client);
         }
         tracing::info!(target: "smb", "pool: reconnected slot {idx}");

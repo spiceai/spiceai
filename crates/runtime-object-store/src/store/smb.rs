@@ -773,7 +773,7 @@ mod tests {
         let slot: StdMutex<Option<String>> = StdMutex::new(Some("part-1".into()));
         let v = take_slot(&slot).expect("take part-1");
         // Mid-flight: slot is empty; concurrent put_part would see "finalized".
-        assert!(take_slot(&slot).is_err());
+        let _ = take_slot(&slot).expect_err("mid-flight take must reject");
         // After async I/O completes the writer is returned to the slot —
         // this is the put_part success path that must allow further parts.
         replace_slot(&slot, format!("{v}-resumed"));
