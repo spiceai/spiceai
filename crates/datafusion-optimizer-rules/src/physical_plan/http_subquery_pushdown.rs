@@ -426,9 +426,12 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
     }
 }
 
-/// Execute the build-side plan asynchronously and collect all unique non-null
-/// string values from the specified column. Returns an error if the subquery
-/// produces more than [`MAX_MATERIALIZED_VALUES`] unique values.
+/// Execute the build-side plan asynchronously and collect all unique non-null,
+/// deduplicated string values from the specified column. NULLs are skipped
+/// (SQL `IN` never matches NULL), but empty strings are preserved — they are
+/// valid SQL values and downstream `HttpExec`/provider validation decides
+/// whether they are acceptable for the target column. Returns an error if the
+/// subquery produces more than [`MAX_MATERIALIZED_VALUES`] unique values.
 async fn materialize_string_values(
     plan: &Arc<dyn ExecutionPlan>,
     context: &Arc<TaskContext>,
@@ -438,9 +441,12 @@ async fn materialize_string_values(
 
     let mut seen = HashSet::new();
     let mut values = Vec::new();
-    for batch in &batches {
+    for (batch_index, batch) in batches.iter().enumerate() {
         if batch.num_columns() <= col_index {
-            continue;
+            return Err(DataFusionError::Internal(format!(
+                "HttpWithDeferredParamsExec: build-side batch {batch_index} is missing column index {col_index}; batch has {} columns",
+                batch.num_columns()
+            )));
         }
         let array = batch.column(col_index);
 
@@ -459,7 +465,7 @@ async fn materialize_string_values(
             };
 
         for val in string_iter.flatten() {
-            if !val.is_empty() && seen.insert(val.to_string()) {
+            if seen.insert(val.to_string()) {
                 if values.len() >= MAX_MATERIALIZED_VALUES {
                     return Err(DataFusionError::Plan(format!(
                         "HttpWithDeferredParamsExec: subquery produced more than {MAX_MATERIALIZED_VALUES} unique values, aborting pushdown"
@@ -728,7 +734,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_materialize_filters_nulls_and_empties() {
+    async fn test_materialize_filters_nulls_preserves_empties() {
         let plan = make_memory_exec(
             "val",
             &[
@@ -747,10 +753,11 @@ mod tests {
             .await
             .expect("materialize should succeed");
 
-        // Should contain only unique non-null, non-empty strings
-        assert_eq!(values.len(), 2, "expected 2 unique values, got {values:?}");
+        // NULLs are skipped, empty strings are preserved, duplicates are removed
+        assert_eq!(values.len(), 3, "expected 3 unique values, got {values:?}");
         assert!(values.contains(&"a".to_string()));
         assert!(values.contains(&"b".to_string()));
+        assert!(values.contains(&String::new()));
     }
 
     #[tokio::test]

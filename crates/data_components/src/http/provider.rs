@@ -1518,10 +1518,18 @@ impl HttpExec {
             for value in values {
                 let mut p = partition.clone();
                 match col_name {
-                    "request_headers" => p.3 = Some(value.clone()),
-                    "request_path" => p.0 = Some(value.clone()),
-                    "request_query" => p.1 = Some(value.clone()),
-                    "request_body" => p.2 = Some(value.clone()),
+                    "request_path" => {
+                        p.0 = Some(self.provider.ensure_allowed_path(value)?);
+                    }
+                    "request_query" => {
+                        p.1 = Some(self.provider.ensure_allowed_query(value)?);
+                    }
+                    "request_body" => {
+                        p.2 = Some(self.provider.ensure_allowed_body(value)?);
+                    }
+                    "request_headers" => {
+                        p.3 = Some(self.provider.ensure_allowed_headers(value)?);
+                    }
                     other => {
                         return Err(DataFusionError::Internal(format!(
                             "HttpExec::with_expanded_params: unsupported column '{other}'. Expected one of: request_path, request_query, request_body, request_headers"
