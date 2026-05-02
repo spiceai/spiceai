@@ -1487,6 +1487,61 @@ impl HttpExec {
         self
     }
 
+    /// Create a new `HttpExec` whose partitions are the cross-product of the
+    /// current partitions and the given `values`, injected into the column
+    /// identified by `col_name` (`request_path`, `request_query`,
+    /// `request_body`, or `request_headers`).
+    ///
+    /// Returns an error if the resulting partition count would exceed
+    /// `max_request_partitions`.
+    pub fn with_expanded_params(
+        &self,
+        col_name: &str,
+        values: &[String],
+    ) -> DataFusionResult<Self> {
+        let existing = &self.partitions;
+        let new_count = existing.len() * values.len();
+
+        if let Some(max) = self.max_request_partitions()
+            && new_count > max
+        {
+            return Err(DataFusionError::Plan(format!(
+                "HttpExec: expanding params would create {new_count} partitions (existing {} x {} values), which exceeds max_request_partitions={max}. Reduce the number of dynamic values or increase max_request_partitions.",
+                existing.len(),
+                values.len(),
+            )));
+        }
+
+        let mut new_partitions = Vec::with_capacity(new_count);
+
+        for partition in existing {
+            for value in values {
+                let mut p = partition.clone();
+                match col_name {
+                    "request_headers" => p.3 = Some(value.clone()),
+                    "request_path" => p.0 = Some(value.clone()),
+                    "request_query" => p.1 = Some(value.clone()),
+                    "request_body" => p.2 = Some(value.clone()),
+                    _ => {}
+                }
+                new_partitions.push(p);
+            }
+        }
+
+        tracing::debug!(
+            "HttpExec::with_expanded_params: replacing partitions with {} (was {}) for column '{col_name}'",
+            new_partitions.len(),
+            existing.len(),
+        );
+
+        Ok(Self::new(
+            Arc::clone(&self.projected_schema),
+            Arc::clone(&self.provider),
+            new_partitions,
+            self.limit,
+        ))
+    }
+
     async fn fetch_and_create_batch(
         &self,
         provider: &HttpTableProvider,

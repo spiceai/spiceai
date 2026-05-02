@@ -50,10 +50,10 @@ use futures::TryStreamExt;
 use data_components::http::provider::HttpExec;
 
 /// Maximum number of values to materialize from the build side of the join.
-const MAX_MATERIALIZED_VALUES: usize = 50_000;
+const MAX_MATERIALIZED_VALUES: usize = 20_000;
 
-/// HTTP virtual column names that can be pushed down as partition filters.
-const HTTP_VIRTUAL_COLUMNS: &[&str] = &[
+/// HTTP request parameter column names eligible for pushdown.
+const HTTP_REQUEST_PARAM_COLUMNS: &[&str] = &[
     "request_headers",
     "request_path",
     "request_query",
@@ -89,7 +89,7 @@ impl PhysicalOptimizerRule for HttpParamsPushdown {
 
 /// Attempt to rewrite a single plan node. Only fires when the node is a
 /// `HashJoinExec(LeftSemi | RightSemi | Inner)` where one side contains an
-/// `HttpExec` and the join key references an HTTP virtual column.
+/// `HttpExec` and the join key references an HTTP request parameter column.
 ///
 /// `DataFusion` may produce different orientations depending on cost estimates:
 /// - `LeftSemi`:  `HttpExec` on left  (probe), subquery on right (build)
@@ -113,7 +113,7 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                 return Transformed::no(plan);
             };
             let name = left_col.name().to_string();
-            if !HTTP_VIRTUAL_COLUMNS.contains(&name.as_str()) {
+            if !HTTP_REQUEST_PARAM_COLUMNS.contains(&name.as_str()) {
                 return Transformed::no(plan);
             }
             if !contains_http_exec(join_exec.left()) {
@@ -135,7 +135,7 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                 return Transformed::no(plan);
             };
             let name = right_col.name().to_string();
-            if !HTTP_VIRTUAL_COLUMNS.contains(&name.as_str()) {
+            if !HTTP_REQUEST_PARAM_COLUMNS.contains(&name.as_str()) {
                 return Transformed::no(plan);
             }
             if !contains_http_exec(join_exec.right()) {
@@ -147,6 +147,10 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                 name,
             )
         }
+        // Inner join: the entire HashJoinExec is replaced by HttpWithDeferredParamsExec, which only outputs
+        // http_side.schema() (build-side columns are dropped). This is intentional — the build side is used
+        // not to produce output columns. If build-side columns are needed downstream, this rewrite 
+        // should be skipped (or extended to preserve the join node and only rewrite the HttpExec leaf).
         JoinType::Inner => {
             let on = join_exec.on();
             if on.len() != 1 {
@@ -162,7 +166,7 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                     return Transformed::no(plan);
                 };
                 let name = left_col.name().to_string();
-                if !HTTP_VIRTUAL_COLUMNS.contains(&name.as_str()) {
+                if !HTTP_REQUEST_PARAM_COLUMNS.contains(&name.as_str()) {
                     return Transformed::no(plan);
                 }
                 (
@@ -175,7 +179,7 @@ fn try_rewrite_hash_join(plan: Arc<dyn ExecutionPlan>) -> Transformed<Arc<dyn Ex
                     return Transformed::no(plan);
                 };
                 let name = right_col.name().to_string();
-                if !HTTP_VIRTUAL_COLUMNS.contains(&name.as_str()) {
+                if !HTTP_REQUEST_PARAM_COLUMNS.contains(&name.as_str()) {
                     return Transformed::no(plan);
                 }
                 (
@@ -456,20 +460,6 @@ fn replace_http_exec_with_partitions(
     col_name: &str,
     values: &[String],
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    // Pre-validate partition count against the limit.
-    if let Some(http_exec) = find_http_exec(plan) {
-        let existing_count = http_exec.partitions().len();
-        let new_count = existing_count.saturating_mul(values.len());
-        if let Some(max) = http_exec.max_request_partitions()
-            && new_count > max
-        {
-            return Err(DataFusionError::Plan(format!(
-                "HttpWithDeferredParamsExec: pushdown would create {new_count} partitions (existing {existing_count} x {val_count} values), which exceeds max_request_partitions={max}. Reduce the number of subquery values or increase max_request_partitions.",
-                val_count = values.len(),
-            )));
-        }
-    }
-
     let col = col_name.to_string();
     let vals: Arc<[String]> = values.into();
 
@@ -479,36 +469,7 @@ fn replace_http_exec_with_partitions(
                 return Ok(Transformed::no(node));
             };
 
-            let existing = http_exec.partitions();
-            let mut new_partitions = Vec::with_capacity(existing.len() * vals.len());
-
-            for partition in existing {
-                for value in vals.iter() {
-                    let mut p = partition.clone();
-                    match col.as_str() {
-                        "request_headers" => p.3 = Some(value.clone()),
-                        "request_path" => p.0 = Some(value.clone()),
-                        "request_query" => p.1 = Some(value.clone()),
-                        "request_body" => p.2 = Some(value.clone()),
-                        _ => {}
-                    }
-                    new_partitions.push(p);
-                }
-            }
-
-            tracing::debug!(
-                "HttpWithDeferredParamsExec: replacing HttpExec with {} partitions (was {})",
-                new_partitions.len(),
-                existing.len()
-            );
-
-            let new_exec = HttpExec::new(
-                Arc::clone(http_exec.projected_schema()),
-                Arc::clone(http_exec.provider()),
-                new_partitions,
-                http_exec.limit(),
-            );
-
+            let new_exec = http_exec.with_expanded_params(&col, &vals)?;
             Ok(Transformed::yes(Arc::new(new_exec)))
         })
         .data()
