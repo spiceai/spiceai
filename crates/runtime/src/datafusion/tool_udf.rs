@@ -234,30 +234,17 @@ impl AsyncScalarUDFImpl for ToolAsScalarUdf {
             .map(|cv| cv.to_array(n))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // Serialise every row's args into a JSON body up-front, fanning the
-        // requests out concurrently (capped by DEFAULT_TOOL_CONCURRENCY) and
-        // collecting results back into row order via `FuturesOrdered`.
-        let mut bodies = Vec::with_capacity(n);
-        for row in 0..n {
-            let mut obj = Map::with_capacity(self.arg_names.len());
-            for (i, name) in self.arg_names.iter().enumerate() {
-                obj.insert(
-                    name.clone(),
-                    array_cell_to_json(&arrays[i], row, &self.arg_types[i])?,
-                );
-            }
-            bodies.push(Value::Object(obj).to_string());
-        }
-
         let name = self.name.clone();
         let tool = Arc::clone(&self.tool);
         let mut output = PrimitiveOutputBuilder::new(&self.return_type, n)?;
-        // `stream::iter(...).buffered(N)` dispatches up to N calls in flight
-        // while preserving row order for the consumer.
-        let mut rpc_stream = stream::iter(bodies.into_iter().map(|body| {
+        // `stream::iter(...).buffered(N)` builds and dispatches at most N row
+        // bodies at a time, while preserving row order for the consumer.
+        let mut rpc_stream = stream::iter((0..n).map(|row| {
             let tool = Arc::clone(&tool);
             let name = name.clone();
+            let body = self.encode_row_body(&arrays, row);
             async move {
+                let body = body?;
                 tool.call(&body).await.map_err(|e| {
                     DataFusionError::Execution(format!(
                         "tool-backed function '{name}' call failed: {e}"
@@ -272,6 +259,23 @@ impl AsyncScalarUDFImpl for ToolAsScalarUdf {
         }
 
         Ok(ColumnarValue::Array(output.finish()))
+    }
+}
+
+impl ToolAsScalarUdf {
+    fn encode_row_body(
+        &self,
+        arrays: &[ArrayRef],
+        row: usize,
+    ) -> std::result::Result<String, DataFusionError> {
+        let mut obj = Map::with_capacity(self.arg_names.len());
+        for (i, name) in self.arg_names.iter().enumerate() {
+            obj.insert(
+                name.clone(),
+                array_cell_to_json(&arrays[i], row, &self.arg_types[i])?,
+            );
+        }
+        Ok(Value::Object(obj).to_string())
     }
 }
 

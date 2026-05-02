@@ -197,11 +197,16 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
         tracing::error!("{err}");
     }
 
+    let built_function_names = built
+        .iter()
+        .map(|(decl, _)| decl.name.clone())
+        .collect::<Vec<_>>();
+    add_user_functions_to_deny_list(built_function_names);
+
     for (decl, built) in built {
         match built {
             runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
                 ctx.register_udf(udf.as_ref().clone());
-                add_user_function_to_deny_list(&decl.name);
                 if function_executes_code(&decl) {
                     add_code_executing_function(&decl.name);
                 }
@@ -325,6 +330,7 @@ pub async fn apply_function_diff(
     // changed). Do all the lock-free work (DF deregister, deny-list, info
     // registry) first so the tools-map write lock is held only once for the
     // batch of tool drops.
+    let mut functions_to_drop: Vec<String> = Vec::new();
     let mut tools_to_drop: Vec<String> = Vec::new();
     for current in &current_app.functions {
         let current_registered = current_enabled && current.enabled;
@@ -335,7 +341,7 @@ pub async fn apply_function_diff(
             };
         if needs_drop {
             ctx.deregister_udf(&current.name);
-            remove_user_function_from_deny_list(&current.name);
+            functions_to_drop.push(current.name.clone());
             remove_code_executing_function(&current.name);
             remove_user_function_info(&current.name);
             if current.as_tool {
@@ -344,6 +350,7 @@ pub async fn apply_function_diff(
             tracing::info!(name = %current.name, "Deregistered user function");
         }
     }
+    remove_user_functions_from_deny_list(&functions_to_drop);
     if !tools_to_drop.is_empty() {
         let mut tools_map = runtime.tools.write().await;
         for name in &tools_to_drop {
@@ -366,32 +373,43 @@ pub async fn apply_function_diff(
         return;
     }
 
-    // Build + register any new or changed declarations.
-    for next in &new_app.functions {
-        if !next.enabled {
-            continue;
-        }
-        let needs_register = !current_enabled
-            || match current_app.functions.iter().find(|f| f.name == next.name) {
-                Some(prev) => !prev.enabled || prev != next,
-                None => true,
-            };
-        if !needs_register {
-            continue;
-        }
-        match runtime_datafusion_udfs::user_functions::build_function(next).await {
-            Ok(runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf)) => {
+    let functions_to_register = new_app
+        .functions
+        .iter()
+        .filter(|next| next.enabled)
+        .filter(|next| {
+            !current_enabled
+                || match current_app.functions.iter().find(|f| f.name == next.name) {
+                    Some(prev) => !prev.enabled || prev != *next,
+                    None => true,
+                }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let (built, errors) =
+        runtime_datafusion_udfs::user_functions::build_all(&functions_to_register).await;
+    for err in &errors {
+        tracing::error!("{err}");
+    }
+
+    let built_function_names = built
+        .iter()
+        .map(|(decl, _)| decl.name.clone())
+        .collect::<Vec<_>>();
+    add_user_functions_to_deny_list(built_function_names);
+
+    for (next, built) in built {
+        match built {
+            runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
                 warn_alpha_once();
                 ctx.register_udf(udf.as_ref().clone());
-                add_user_function_to_deny_list(&next.name);
-                if function_executes_code(next) {
+                if function_executes_code(&next) {
                     add_code_executing_function(&next.name);
                 }
-                upsert_user_function_info(info_from_decl(next));
+                upsert_user_function_info(info_from_decl(&next));
                 tracing::info!(name = %next.name, from = %next.from, "Registered user function");
-                maybe_register_function_as_tool(runtime, next).await;
+                maybe_register_function_as_tool(runtime, &next).await;
             }
-            Err(e) => tracing::error!("{e}"),
         }
     }
 }
@@ -424,19 +442,23 @@ fn denied_spice_function_names() -> Vec<String> {
     names
 }
 
-fn denied_spice_function_names_for_duckdb() -> Vec<String> {
-    denied_spice_function_names()
-        .into_iter()
-        .filter(|name| name != COSINE_DISTANCE_UDF_NAME)
+static BUILTIN_DENIED_SPICE_FUNCTION_NAMES: LazyLock<Vec<String>> =
+    LazyLock::new(denied_spice_function_names);
+
+static BUILTIN_DENIED_SPICE_FUNCTION_NAMES_DUCKDB: LazyLock<Vec<String>> = LazyLock::new(|| {
+    BUILTIN_DENIED_SPICE_FUNCTION_NAMES
+        .iter()
+        .filter(|name| name.as_str() != COSINE_DISTANCE_UDF_NAME)
+        .cloned()
         .collect()
-}
+});
 
 /// Dynamic deny-list: built-ins plus any user-registered functions. Held
 /// in a [`RwLock`] so that hot-reload can update the user slice without
 /// requiring callers to refactor.
 static DENY_LIST: LazyLock<RwLock<Arc<FunctionSupport>>> = LazyLock::new(|| {
     RwLock::new(Arc::new(build_function_support(
-        &denied_spice_function_names(),
+        BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(),
         &[],
     )))
 });
@@ -445,7 +467,7 @@ static DENY_LIST: LazyLock<RwLock<Arc<FunctionSupport>>> = LazyLock::new(|| {
 /// `cosine_distance` (`DuckDB` translates it to `array_cosine_distance`).
 static DENY_LIST_DUCKDB: LazyLock<RwLock<Arc<FunctionSupport>>> = LazyLock::new(|| {
     RwLock::new(Arc::new(build_function_support(
-        &denied_spice_function_names_for_duckdb(),
+        BUILTIN_DENIED_SPICE_FUNCTION_NAMES_DUCKDB.as_slice(),
         &[],
     )))
 });
@@ -502,38 +524,56 @@ fn build_function_support(builtins: &[String], user: &[String]) -> FunctionSuppo
     FunctionSupport::new(Some(FunctionRestriction::Deny(denied)), None, None)
 }
 
-fn rebuild_deny_lists() {
-    let user = USER_FUNCTION_NAMES.read().clone();
-    let combined = build_function_support(&denied_spice_function_names(), &user);
+fn rebuild_deny_lists(user: &[String]) {
+    let combined = build_function_support(BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(), user);
     *DENY_LIST.write() = Arc::new(combined);
-    let combined_duckdb = build_function_support(&denied_spice_function_names_for_duckdb(), &user);
+    let combined_duckdb =
+        build_function_support(BUILTIN_DENIED_SPICE_FUNCTION_NAMES_DUCKDB.as_slice(), user);
     *DENY_LIST_DUCKDB.write() = Arc::new(combined_duckdb);
 }
 
 /// Add a user function name to the federation deny-list. Idempotent.
 pub fn add_user_function_to_deny_list(name: &str) {
-    {
+    add_user_functions_to_deny_list(std::iter::once(name.to_string()));
+}
+
+fn add_user_functions_to_deny_list(names: impl IntoIterator<Item = String>) {
+    let user = {
         let mut guard = USER_FUNCTION_NAMES.write();
-        if guard.iter().any(|n| n == name) {
-            return;
+        let mut changed = false;
+        for name in names {
+            if !guard.iter().any(|n| n == &name) {
+                guard.push(name);
+                changed = true;
+            }
         }
-        guard.push(name.to_string());
+        changed.then(|| guard.clone())
+    };
+    if let Some(user) = user {
+        rebuild_deny_lists(&user);
     }
-    rebuild_deny_lists();
 }
 
 /// Remove a user function name from the federation deny-list. No-op if
 /// not present.
 pub fn remove_user_function_from_deny_list(name: &str) {
-    {
+    remove_user_functions_from_deny_list(&[name.to_string()]);
+}
+
+fn remove_user_functions_from_deny_list(names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    let user = {
         let mut guard = USER_FUNCTION_NAMES.write();
         let before = guard.len();
-        guard.retain(|n| n != name);
+        guard.retain(|n| !names.iter().any(|name| name == n));
         if guard.len() == before {
             return;
         }
-    }
-    rebuild_deny_lists();
+        guard.clone()
+    };
+    rebuild_deny_lists(&user);
 }
 
 /// Add a function name to the read-write API key requirement set. Idempotent.
