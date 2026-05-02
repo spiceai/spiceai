@@ -132,8 +132,10 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
+    let mcp_config: Option<&spicepod::component::runtime::McpConfig> =
+        app.as_ref().and_then(|a| a.runtime.mcp.as_ref());
     let auth_layer = auth_provider.map(AuthLayer::new);
-    let routes = routes::routes(&rt, config, vsearch, auth_layer, &cors_config);
+    let routes = routes::routes(&rt, config, vsearch, auth_layer, &cors_config, mcp_config);
     drop(app);
 
     let listener = TcpListener::bind(&bind_address)

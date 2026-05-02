@@ -41,7 +41,7 @@ use opentelemetry::KeyValue;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
-use spicepod::component::runtime::CorsConfig;
+use spicepod::component::runtime::{CorsConfig, McpConfig};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -261,6 +261,7 @@ pub(crate) fn routes(
     search: Arc<search_engine::SearchEngine>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
+    mcp_config: Option<&McpConfig>,
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
@@ -390,10 +391,11 @@ pub(crate) fn routes(
         // Streamable HTTP transport endpoint per MCP 2025-11-25 spec.
         // This replaces the legacy SSE transport that was removed in rmcp 1.x.
         let runtime_arc = Arc::clone(rt);
+        let mcp_config = mcp_server_config(mcp_config);
         let mcp_service = StreamableHttpService::new(
             move || Ok(RuntimeServer::from(&runtime_arc)),
             Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default().disable_allowed_hosts(),
+            mcp_config,
         );
 
         tracing::debug!(
@@ -503,6 +505,20 @@ async fn track_metrics(
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
 
     response
+}
+
+/// Build the MCP [`StreamableHttpServerConfig`] from the optional `runtime.mcp` config.
+///
+/// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None`, the default
+///   list (`localhost`, `127.0.0.1`, `::1`) is used.
+/// - If `runtime.mcp.allowed_hosts` is set, those values replace the default list entirely.
+#[cfg(feature = "mcp")]
+fn mcp_server_config(mcp_config: Option<&McpConfig>) -> StreamableHttpServerConfig {
+    let config = StreamableHttpServerConfig::default();
+    match mcp_config.and_then(|c| c.allowed_hosts.as_deref()) {
+        Some(hosts) => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
+        None => config,
+    }
 }
 
 fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {

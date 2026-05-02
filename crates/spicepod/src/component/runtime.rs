@@ -67,6 +67,9 @@ pub struct Runtime {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight: Option<Flight>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
+
     /// Configures how long the runtime waits for connections to be gracefully drained
     /// and components to shut down cleanly during runtime termination
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -369,6 +372,19 @@ impl Default for TelemetryConfig {
             otel_exporter: None,
         }
     }
+}
+
+/// Configuration for the MCP (Model Context Protocol) HTTP endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct McpConfig {
+    /// Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.
+    /// Used to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),
+    /// host-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).
+    /// Defaults to `["localhost", "127.0.0.1", "::1"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -904,6 +920,8 @@ pub struct RuntimeDeserializer {
     pub cors: CorsConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight: Option<Flight>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
     /// Configures where the runtime will store temporary files needed for operations like
     /// spilling to disk for queries & accelerations that are larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -998,6 +1016,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             auth: deserializer.auth,
             cors: deserializer.cors,
             flight: deserializer.flight,
+            mcp: deserializer.mcp,
             shutdown_timeout: deserializer.shutdown_timeout,
             ready_state: deserializer.ready_state,
             output_level: deserializer.output_level,
