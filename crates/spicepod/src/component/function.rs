@@ -200,8 +200,8 @@ pub struct Signature {
 ///
 /// The `type` field is an Arrow logical-type string (e.g. `float64`,
 /// `utf8`, `list<int32>`, `decimal(38, 10)`, `timestamp(us, utc)`). The
-/// parser retains it verbatim; validation happens at factory-build time
-/// against [`arrow::datatypes::DataType::try_from`].
+/// parser retains it verbatim; tier-specific function factories validate
+/// accepted type strings when the function is registered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
