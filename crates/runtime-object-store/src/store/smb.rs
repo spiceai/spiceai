@@ -709,8 +709,8 @@ mod tests {
             "host".to_string(),
             None,
             "share".to_string(),
-            "u".to_string(),
-            "p".to_string(),
+            "user".to_string(),
+            "pass".to_string(),
             None,
         );
         assert_eq!(store.config().port, DEFAULT_SMB_PORT);
@@ -722,8 +722,8 @@ mod tests {
             "host".to_string(),
             Some(1445),
             "share".to_string(),
-            "u".to_string(),
-            "p".to_string(),
+            "user".to_string(),
+            "pass".to_string(),
             None,
         );
         assert_eq!(store.config().port, 1445);
