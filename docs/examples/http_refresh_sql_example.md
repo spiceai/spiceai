@@ -124,7 +124,7 @@ The HTTP connector's `refresh_sql` supports the following filter expressions on 
 
 1. **Equality (`=`)**: `WHERE request_path = '/api/users'`
 2. **IN Lists**: `WHERE request_path IN ('/api/users', '/api/posts')`
-3. **OR expressions**: `WHERE request_path = '/api/users' OR request_path = '/api/posts'`
+3. **OR expressions** (single column only): `WHERE request_path = '/api/users' OR request_path = '/api/posts'`. OR across **different** filter columns is not supported — use separate queries (e.g. `UNION ALL`).
 4. **AND expressions**: `WHERE request_path = '/api/users' AND request_query = 'limit=10'`
 5. **POST requests**: `WHERE request_body = '{"key": "value"}'` (triggers POST with `http_post_content_type`)
 6. **Dynamic headers**: `WHERE request_headers IN ('{"x-sandbox-id":"sandbox-1"}', '{"x-sandbox-id":"sandbox-2"}')`
@@ -153,7 +153,7 @@ The HTTP connector's `refresh_sql` supports the following filter expressions on 
 ## Performance Considerations
 
 - **Caching**: The HTTP connector respects `Cache-Control` headers and caches responses when `max-age` is set.
-- **Parallel Execution**: Multiple endpoints (from IN lists or OR expressions) are fetched in parallel.
+- **Parallel Execution**: Multiple endpoints (from IN lists or single-column OR expressions) are fetched in parallel.
 - **Filter Selectivity**: Use specific filters to minimize unnecessary HTTP requests.
 - **Partition Limits**: Use `max_request_partitions` to cap the number of HTTP requests created from cross-product filters.
 
