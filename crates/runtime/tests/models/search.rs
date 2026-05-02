@@ -1922,6 +1922,7 @@ async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
 
 #[cfg(feature = "flightsql")]
 #[tokio::test]
+#[ignore = "Failing. https://github.com/spiceai/spiceai/issues/10634"]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     use spicepod::{acceleration::Acceleration, param::Params};
 

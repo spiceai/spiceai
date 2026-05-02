@@ -1895,6 +1895,7 @@ impl DataFusion {
                 dataset,
                 Arc::clone(&accelerated_table_provider),
                 Arc::clone(&accelerator_write_mutex),
+                self.refresh_runtime().cloned(),
             );
 
             if let Some(changes_stream) = changes_stream {
