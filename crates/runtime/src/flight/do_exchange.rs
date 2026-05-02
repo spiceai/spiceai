@@ -33,10 +33,10 @@ use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::datafusion::request_context_extension::get_current_datafusion;
-use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::dataupdate::{DataUpdate, DataUpdateReceiver, UpdateType};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-use super::{Service, do_put::normalize_path_table_reference, metrics};
+use super::{Service, metrics};
 
 const MAX_PENDING_INITIAL_SNAPSHOT_UPDATES: usize = 1_024;
 const MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BATCHES: usize = 128;
@@ -196,10 +196,8 @@ pub(crate) async fn handle(
 
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
-    let data_path = normalize_path_table_reference(
-        TableReference::parse_str(&flight_descriptor.path.join(".")),
-        &datafusion,
-    );
+    let data_path = datafusion
+        .normalize_table_reference(TableReference::parse_str(&flight_descriptor.path.join(".")));
 
     let Some(table_provider) = datafusion.get_table(&data_path).await else {
         return Err(Status::invalid_argument(format!(
@@ -207,14 +205,25 @@ pub(crate) async fn handle(
         )));
     };
 
-    let mut rx = flight_svc
+    let rx = flight_svc
         .data_update_broadcaster
         .subscribe(&data_path)
         .await;
-    let table_provider_stream = Arc::clone(&table_provider);
-    let datafusion_stream = Arc::clone(&datafusion);
-    let data_path_stream = data_path.clone();
 
+    Ok(Response::new(do_exchange_response_stream(
+        rx,
+        table_provider,
+        datafusion,
+        data_path,
+    )))
+}
+
+fn do_exchange_response_stream(
+    mut rx: DataUpdateReceiver,
+    table_provider_stream: Arc<dyn TableProvider>,
+    datafusion_stream: Arc<crate::datafusion::DataFusion>,
+    data_path_stream: TableReference,
+) -> futures::stream::BoxStream<'static, Result<FlightData, Status>> {
     // The stream interleaves a fallible initial snapshot, broadcast updates, and IPC encoding without materializing the response.
     let response_stream = try_stream! {
         let mut encoder = ChangeFlightEncoder::default();
@@ -344,7 +353,7 @@ pub(crate) async fn handle(
         }
     };
 
-    Ok(Response::new(response_stream.boxed()))
+    response_stream.boxed()
 }
 
 fn encode_and_count(
@@ -553,6 +562,27 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_initial_snapshot_updates_rejects_too_many_rows() {
+        let batch = RecordBatch::try_new(
+            test_schema(),
+            vec![new_null_array(
+                &DataType::Int32,
+                MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_ROWS + 1,
+            )],
+        )
+        .expect("large test batch should be valid");
+        let update = DataUpdate {
+            schema: batch.schema(),
+            data: vec![batch],
+            update_type: UpdateType::Append,
+        };
+        let mut pending_updates = PendingInitialSnapshotUpdates::default();
+
+        assert!(!pending_updates.push_back(update));
+        assert!(pending_updates.pop_front().is_none());
+    }
+
+    #[test]
     fn test_change_flight_encoder_resends_schema_when_schema_changes() {
         let mut encoder = ChangeFlightEncoder::default();
         let first_batch = test_batch(vec![1]);
@@ -583,5 +613,82 @@ mod tests {
         assert_eq!(first_flights.len(), 2);
         assert_eq!(second_flights.len(), 1);
         assert_eq!(changed_flights.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_do_exchange_response_stream_sends_snapshot_before_buffered_update() {
+        use arrow_flight::{
+            decode::{DecodedPayload, FlightDataDecoder},
+            error::FlightError,
+        };
+        use datafusion::datasource::MemTable;
+        use futures::TryStreamExt;
+        use std::time::Duration;
+
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let table_provider = Arc::new(
+            MemTable::try_new(test_schema(), vec![vec![test_batch(vec![1])]])
+                .expect("mem table should be created"),
+        );
+        let data_path = TableReference::bare("orders");
+        let broadcaster = crate::dataupdate::DataUpdateBroadcaster::new();
+        let rx = broadcaster.subscribe(&data_path).await;
+        let response_stream =
+            do_exchange_response_stream(rx, table_provider, datafusion, data_path.clone())
+                .map_err(|status| FlightError::Tonic(Box::new(status)));
+
+        broadcaster
+            .publish(&data_path, test_data_update(vec![2], UpdateType::Append))
+            .await;
+
+        let batches = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut decoder = FlightDataDecoder::new(response_stream);
+            let mut batches = Vec::new();
+
+            while batches.len() < 3 {
+                let message = decoder
+                    .try_next()
+                    .await
+                    .expect("flight data should decode")
+                    .expect("stream should yield enough batches");
+                if let DecodedPayload::RecordBatch(batch) = message.payload {
+                    batches.push(batch);
+                }
+            }
+
+            batches
+        })
+        .await
+        .expect("snapshot and buffered update should be emitted");
+
+        assert_eq!(change_op(&batches[0]), "t");
+        assert_eq!(change_op(&batches[1]), "r");
+        assert_eq!(change_data_id(&batches[1]), 1);
+        assert_eq!(change_op(&batches[2]), "r");
+        assert_eq!(change_data_id(&batches[2]), 2);
+    }
+
+    fn change_op(batch: &RecordBatch) -> &str {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("operation column should be strings")
+            .value(0)
+    }
+
+    fn change_data_id(batch: &RecordBatch) -> i32 {
+        let data = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("data column should be a struct array");
+        data.column_by_name("id")
+            .expect("id field should exist")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id field should be int32")
+            .value(0)
     }
 }

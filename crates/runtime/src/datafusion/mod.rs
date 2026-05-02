@@ -680,6 +680,82 @@ impl DataFusion {
     }
 
     #[must_use]
+    pub(crate) fn normalize_table_reference(
+        &self,
+        table_reference: TableReference,
+    ) -> TableReference {
+        // NOTE: this uses synchronous `table_exist` checks on schema providers. These
+        // checks are expected to be in-memory lookups in current catalog implementations.
+        match table_reference {
+            TableReference::Full { .. } => table_reference,
+            TableReference::Partial { schema, table } => {
+                let matching_catalogs = self
+                    .ctx
+                    .catalog_names()
+                    .into_iter()
+                    .filter(|catalog_name| {
+                        self.ctx
+                            .catalog(catalog_name)
+                            .and_then(|catalog| catalog.schema(schema.as_ref()))
+                            .is_some_and(|schema_provider| {
+                                schema_provider.table_exist(table.as_ref())
+                                    || self.is_catalog_writable(catalog_name)
+                            })
+                    })
+                    .collect::<Vec<_>>();
+
+                if matching_catalogs.len() == 1 {
+                    return TableReference::full(
+                        matching_catalogs[0].clone(),
+                        schema.to_string(),
+                        table.to_string(),
+                    );
+                }
+
+                TableReference::partial(schema, table)
+            }
+            TableReference::Bare { table } => {
+                let table_name = table.to_string();
+                let matching_tables =
+                    self.ctx
+                        .catalog_names()
+                        .into_iter()
+                        .flat_map(|catalog_name| {
+                            let table_name_for_catalog = table_name.clone();
+                            self.ctx
+                                .catalog(&catalog_name)
+                                .into_iter()
+                                .flat_map(move |catalog| {
+                                    let catalog_name = catalog_name.clone();
+                                    let table_name = table_name_for_catalog.clone();
+                                    catalog.schema_names().into_iter().filter_map(
+                                        move |schema_name| {
+                                            let table_name = table_name.clone();
+                                            catalog
+                                                .schema(&schema_name)
+                                                .filter(|schema_provider| {
+                                                    schema_provider.table_exist(table_name.as_str())
+                                                })
+                                                .map(|_| {
+                                                    (catalog_name.clone(), schema_name, table_name)
+                                                })
+                                        },
+                                    )
+                                })
+                        })
+                        .collect::<Vec<_>>();
+
+                if matching_tables.len() == 1 {
+                    let (catalog, schema, table_name) = matching_tables[0].clone();
+                    return TableReference::full(catalog, schema, table_name);
+                }
+
+                TableReference::bare(table_name)
+            }
+        }
+    }
+
+    #[must_use]
     fn schema(&self, schema_name: &str) -> Option<Arc<dyn SchemaProvider>> {
         if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
             return catalog.schema(schema_name);
@@ -1419,15 +1495,16 @@ impl DataFusion {
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
+        let broadcast_table_reference = self.normalize_table_reference(table_reference.clone());
         if self
             .data_update_broadcaster
-            .has_subscribers(table_reference)
+            .has_subscribers(&broadcast_table_reference)
             .await
         {
             let data = Arc::try_unwrap(update_data).unwrap_or_else(|data| data.as_ref().clone());
             self.data_update_broadcaster
                 .publish(
-                    table_reference,
+                    &broadcast_table_reference,
                     DataUpdate {
                         schema: update_schema,
                         data,
@@ -1454,6 +1531,7 @@ impl DataFusion {
 
         let StreamingDataUpdate { data, update_type } = streaming_update;
         let update_schema = data.schema();
+        let broadcast_table_reference = self.normalize_table_reference(table_reference.clone());
 
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&update_schema))
             .await?;
@@ -1474,7 +1552,7 @@ impl DataFusion {
             datafusion::execution::SendableRecordBatchStream,
         ) = if self
             .data_update_broadcaster
-            .has_subscribers(table_reference)
+            .has_subscribers(&broadcast_table_reference)
             .await
         {
             let broadcast_batches =
@@ -1534,14 +1612,14 @@ impl DataFusion {
         if let Some(broadcast_batches) = broadcast_batches
             && self
                 .data_update_broadcaster
-                .has_subscribers(table_reference)
+                .has_subscribers(&broadcast_table_reference)
                 .await
         {
             let broadcast_data = broadcast_batches.lock().batches();
             if let Some(data) = broadcast_data {
                 self.data_update_broadcaster
                     .publish(
-                        table_reference,
+                        &broadcast_table_reference,
                         DataUpdate {
                             schema: update_schema,
                             data,
@@ -1552,10 +1630,10 @@ impl DataFusion {
             } else {
                 let subscribers_closed = self
                     .data_update_broadcaster
-                    .close_subscribers(table_reference)
+                    .close_subscribers(&broadcast_table_reference)
                     .await;
                 tracing::warn!(
-                    dataset = %table_reference,
+                    dataset = %broadcast_table_reference,
                     max_batches = MAX_STREAMING_BROADCAST_BATCHES,
                     max_rows = MAX_STREAMING_BROADCAST_ROWS,
                     max_bytes = MAX_STREAMING_BROADCAST_BYTES,
@@ -3511,6 +3589,7 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field};
     use cache::{SimpleCache, key::CacheKey};
+    use datafusion::datasource::MemTable;
 
     use crate::builder::RuntimeBuilder;
 
@@ -3549,6 +3628,32 @@ mod tests {
         assert!(buffer.push(&streaming_broadcast_test_batch(999)));
         assert!(buffer.batches().is_none());
         assert!(!buffer.push(&streaming_broadcast_test_batch(1000)));
+    }
+
+    #[tokio::test]
+    async fn test_normalize_table_reference_expands_unique_bare_reference() {
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = DataFusion::builder(
+            status::RuntimeStatus::new(),
+            runtime.accelerator_engine_registry(),
+            Handle::current(),
+        )
+        .build();
+        let table_reference =
+            TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "cdc_table");
+        let table = Arc::new(
+            MemTable::try_new(streaming_broadcast_test_batch(1).schema(), vec![vec![]])
+                .expect("mem table should be created"),
+        );
+
+        df.ctx
+            .register_table(table_reference.clone(), table)
+            .expect("table should be registered");
+
+        assert_eq!(
+            df.normalize_table_reference(TableReference::bare("cdc_table")),
+            table_reference
+        );
     }
 
     #[tokio::test]
