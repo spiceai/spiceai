@@ -527,14 +527,54 @@ fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str,
     .expect("Failed to update checkpoint");
 }
 
+/// Resolves the underlying base table name for an accelerated DuckDB table.
+///
+/// After `InsertOp::Overwrite`, the accelerator exposes data through a view over an internal
+/// `__data_<table_name>_<timestamp>` table. Raw DuckDB DML must target the latest internal
+/// table; if no internal table exists, the definition name is used directly.
+fn resolve_acceleration_base_table(conn: &duckdb::Connection, table_name: &str) -> String {
+    let prefix = format!("__data_{table_name}_");
+    let Ok(mut stmt) =
+        conn.prepare("SELECT table_name FROM duckdb_tables() WHERE starts_with(table_name, ?)")
+    else {
+        return table_name.to_string();
+    };
+
+    let Ok(rows) = stmt.query_map([&prefix], |row| row.get::<usize, String>(0)) else {
+        return table_name.to_string();
+    };
+
+    let mut latest: Option<(String, u64)> = None;
+    for row in rows.flatten() {
+        let Some(inner) = row.strip_prefix("__data_") else {
+            continue;
+        };
+        let Some((name_part, ts_part)) = inner.rsplit_once('_') else {
+            continue;
+        };
+        if name_part != table_name {
+            continue;
+        }
+        let Ok(ts) = ts_part.parse::<u64>() else {
+            continue;
+        };
+        if latest.as_ref().is_none_or(|(_, prev_ts)| ts > *prev_ts) {
+            latest = Some((row.clone(), ts));
+        }
+    }
+
+    latest.map_or_else(|| table_name.to_string(), |(name, _)| name)
+}
+
 /// Deletes rows from the accelerated table to verify rebootstrap restores them.
 fn delete_rows_from_acceleration(duckdb_path: &str, table_name: &str, ids_to_delete: &[&str]) {
     use duckdb::Connection;
 
     let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
+    let base_table = resolve_acceleration_base_table(&conn, table_name);
 
     for id in ids_to_delete {
-        conn.execute(&format!("DELETE FROM {table_name} WHERE id = ?"), [id])
+        conn.execute(&format!(r#"DELETE FROM "{base_table}" WHERE id = ?"#), [id])
             .expect("Failed to delete row");
     }
 }
