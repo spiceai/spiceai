@@ -438,6 +438,7 @@ impl CacheRefreshHelper {
         dataset_name: &str,
         ttl: Duration,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        allowed_request_headers: &[String],
     ) -> DataFusionResult<usize> {
         let ctx = SessionContext::new();
         let state = ctx.state();
@@ -470,7 +471,8 @@ impl CacheRefreshHelper {
         let stale_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
         // Extract unique filter sets from stale rows
-        let filter_sets = Self::extract_unique_filter_sets(&stale_batches)?;
+        let filter_sets =
+            Self::extract_unique_filter_sets(&stale_batches, allowed_request_headers)?;
 
         let total_stale_rows: usize = stale_batches.iter().map(RecordBatch::num_rows).sum();
         tracing::debug!(
@@ -603,15 +605,27 @@ impl CacheRefreshHelper {
         Ok(refreshed_rows)
     }
 
-    /// Extract filter expressions from a row containing `request_path`, `request_query`, `request_body`
+    /// Extract filter expressions from a row containing `request_path`, `request_query`, `request_body`,
+    /// and (when `allowed_request_headers` is non-empty) `request_headers`.
+    ///
+    /// Returns `Ok(None)` when the row carries a redacted sensitive header
+    /// value (see [`data_components::http::provider::SENSITIVE_HASH_PREFIX`])
+    /// in `request_headers`. Such rows cannot be replayed against the upstream
+    /// API because the original token has been one-way hashed; they will
+    /// instead expire via TTL and be re-populated on the next live request.
     fn extract_filters_from_row(
         batch: &RecordBatch,
         row_idx: usize,
-    ) -> DataFusionResult<Vec<Expr>> {
+        allowed_request_headers: &[String],
+    ) -> DataFusionResult<Option<Vec<Expr>>> {
         let schema = batch.schema();
         let mut filters = Vec::new();
 
-        let filter_columns = ["request_path", "request_query", "request_body"];
+        let mut filter_columns: Vec<&str> =
+            vec!["request_path", "request_query", "request_body"];
+        if !allowed_request_headers.is_empty() {
+            filter_columns.push("request_headers");
+        }
 
         for column_name in filter_columns {
             if let Some((idx, _)) = schema.column_with_name(column_name) {
@@ -629,6 +643,17 @@ impl CacheRefreshHelper {
                     let value = array.value(row_idx).to_string();
                     // Only add filter if value is non-empty (empty string means no filter)
                     if !value.is_empty() {
+                        if column_name == "request_headers"
+                            && data_components::http::provider::request_headers_contain_redacted_value(
+                                &value,
+                            )
+                        {
+                            tracing::debug!(
+                                "Skipping background refresh of row with redacted sensitive header value; \
+                                 row will be re-populated lazily on next live request."
+                            );
+                            return Ok(None);
+                        }
                         tracing::debug!("Extracted {column_name} filter: {value}");
                         filters.push(col(column_name).eq(lit(value)));
                     }
@@ -640,22 +665,31 @@ impl CacheRefreshHelper {
             "Extracted {} total filters from row (including empty values)",
             filters.len()
         );
-        Ok(filters)
+        Ok(Some(filters))
     }
 
     /// Extract unique filter sets from batches, deduplicating rows with identical
-    /// `(request_path, request_query, request_body)` values.
+    /// `(request_path, request_query, request_body[, request_headers])` values.
     ///
     /// This is needed because HTTP connector JSON array responses are stored as multiple rows
     /// with identical request parameters. Without deduplication, refreshing N rows from the
     /// same JSON array would trigger N identical HTTP requests.
-    fn extract_unique_filter_sets(batches: &[RecordBatch]) -> DataFusionResult<Vec<Vec<Expr>>> {
+    fn extract_unique_filter_sets(
+        batches: &[RecordBatch],
+        allowed_request_headers: &[String],
+    ) -> DataFusionResult<Vec<Vec<Expr>>> {
         let mut seen_filter_keys = std::collections::HashSet::new();
         let mut filter_sets: Vec<Vec<Expr>> = Vec::new();
 
         for batch in batches {
             for row_idx in 0..batch.num_rows() {
-                let row_filters = Self::extract_filters_from_row(batch, row_idx)?;
+                let Some(row_filters) =
+                    Self::extract_filters_from_row(batch, row_idx, allowed_request_headers)?
+                else {
+                    // Row carries a redacted sensitive header value and cannot
+                    // be background-refreshed.
+                    continue;
+                };
                 let cache_key = compute_cache_key_from_filters(&row_filters);
                 if seen_filter_keys.insert(cache_key) {
                     filter_sets.push(row_filters);
@@ -2054,6 +2088,146 @@ mod tests {
         ]))
     }
 
+    /// A row whose `request_headers` value contains a redacted sensitive header
+    /// (sentinel-prefixed hash) cannot be replayed against upstream and must be
+    /// skipped during background refresh — the row will instead be re-populated
+    /// lazily on the next live request from a user with the matching token.
+    #[test]
+    fn test_extract_filters_from_row_skips_redacted_request_headers() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+            Field::new("request_headers", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+
+        let hashed =
+            data_components::http::provider::hash_sensitive_value("Bearer abc");
+        let redacted_headers_json = format!(r#"{{"authorization":"{hashed}"}}"#);
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("/api/users"), Some("/api/users")])),
+                Arc::new(StringArray::from(vec![Some("page=1"), Some("page=1")])),
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+                Arc::new(StringArray::from(vec![
+                    Some(redacted_headers_json.as_str()),
+                    Some(r#"{"x-region":"us-west"}"#),
+                ])),
+                Arc::new(UInt16Array::from(vec![200, 200])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(now), Some(now)])),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let allowed = vec!["authorization".to_string(), "x-region".to_string()];
+
+        // Row 0: redacted token → skipped.
+        let result = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &allowed)
+            .expect("Should not error");
+        assert!(
+            result.is_none(),
+            "row carrying a redacted sensitive header value must not be refreshable"
+        );
+
+        // Row 1: non-sensitive header value → still refreshable.
+        let result = CacheRefreshHelper::extract_filters_from_row(&batch, 1, &allowed)
+            .expect("Should not error")
+            .expect("row should still be refreshable");
+        assert!(!result.is_empty());
+
+        // Sanity: extract_unique_filter_sets should also skip the redacted row.
+        let sets = CacheRefreshHelper::extract_unique_filter_sets(&[batch], &allowed)
+            .expect("Should not error");
+        assert_eq!(
+            sets.len(),
+            1,
+            "only the non-redacted row should produce a refresh filter set"
+        );
+    }
+
+    /// When `request_headers` is in the allowed list, it should be included as
+    /// an additional filter alongside path/query/body. This enables per-user
+    /// caching with `refresh_mode: caching` where the bearer token (carried in
+    /// `request_headers`) participates in the row-level cache key.
+    #[test]
+    fn test_extract_filters_from_row_includes_request_headers_when_allowed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+            Field::new("request_headers", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some("/api/users")])),
+                Arc::new(StringArray::from(vec![Some("page=1")])),
+                Arc::new(StringArray::from(vec![Some("{\"id\":1}")])),
+                Arc::new(StringArray::from(vec![Some(
+                    r#"{"authorization":"Bearer abc"}"#,
+                )])),
+                Arc::new(UInt16Array::from(vec![200])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(now)])),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        // Without allowlist: only path/query/body extracted (3 filters).
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &[])
+            .map(Option::unwrap_or_default)
+            .expect("Should extract filters");
+        assert_eq!(filters.len(), 3);
+
+        // With allowlist set: request_headers also extracted (4 filters).
+        let allowed = vec!["authorization".to_string()];
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &allowed)
+            .expect("Should extract filters with request_headers")
+            .expect("row should be refreshable");
+        assert_eq!(filters.len(), 4);
+        let filter_strs: Vec<String> = filters.iter().map(ToString::to_string).collect();
+        assert!(
+            filter_strs.iter().any(|s| s.contains("request_headers")),
+            "expected request_headers filter; got: {filter_strs:?}"
+        );
+        assert!(
+            filter_strs
+                .iter()
+                .any(|s| s.contains("Bearer abc") || s.contains("authorization")),
+            "expected request_headers value in filter; got: {filter_strs:?}"
+        );
+    }
+
     #[test]
     fn test_extract_filters_from_row_all_columns_present() {
         let schema = create_test_schema_with_request_params();
@@ -2084,7 +2258,8 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &[])
+            .map(Option::unwrap_or_default)
             .expect("Should extract filters");
         assert_eq!(filters.len(), 3, "Should extract 3 filters");
     }
@@ -2119,7 +2294,8 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &[])
+            .map(Option::unwrap_or_default)
             .expect("Should extract filters");
         // Only path and body should be extracted (query is null)
         assert_eq!(filters.len(), 2, "Should only extract non-null filters");
@@ -2155,7 +2331,8 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &[])
+            .map(Option::unwrap_or_default)
             .expect("Should extract filters");
         // Only query should be extracted (path and body are empty strings)
         assert_eq!(
@@ -2192,7 +2369,8 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &[])
+            .map(Option::unwrap_or_default)
             .expect("Should extract filters");
         assert_eq!(
             filters.len(),
@@ -2603,7 +2781,7 @@ mod tests {
         assert_eq!(batch.num_rows(), 6, "Should have 6 rows total");
 
         // Extract unique filter sets
-        let filter_sets = CacheRefreshHelper::extract_unique_filter_sets(&[batch])
+        let filter_sets = CacheRefreshHelper::extract_unique_filter_sets(&[batch], &[])
             .expect("Should extract filter sets");
 
         // Should only have 2 unique filter sets (5 duplicates + 1 unique)

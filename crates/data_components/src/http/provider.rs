@@ -330,6 +330,15 @@ struct RequestFilterOptions {
     max_body_bytes: usize,
     max_headers_length: usize,
     allowed_headers: HashSet<HeaderName>,
+    /// Header names whose values are treated as sensitive (e.g. bearer tokens).
+    /// Listing a header here permits it in `allowed_headers` even when HTTP
+    /// authentication is configured, causes its value to be redacted in logs and
+    /// error messages, and causes its value to be replaced with a deterministic
+    /// hash before being written into HTTP cache keys or the `request_headers`
+    /// row column persisted by the accelerator. The raw value is still forwarded
+    /// upstream verbatim for authentication.
+    /// See `request_headers_sensitive` dataset parameter.
+    sensitive_headers: HashSet<HeaderName>,
 }
 
 impl Default for RequestFilterOptions {
@@ -340,6 +349,7 @@ impl Default for RequestFilterOptions {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_headers_length: DEFAULT_MAX_HEADERS_LENGTH,
             allowed_headers: HashSet::new(),
+            sensitive_headers: HashSet::new(),
         }
     }
 }
@@ -352,6 +362,79 @@ impl RequestFilterOptions {
     fn is_enabled(&self, kind: RequestFilterKind) -> bool {
         self.enabled_filters.contains(&kind)
     }
+
+    /// True when at least one header is marked sensitive.
+    fn has_sensitive_headers(&self) -> bool {
+        !self.sensitive_headers.is_empty()
+    }
+
+    /// Returns a JSON object string equivalent to `raw` but with the values of
+    /// any sensitive headers replaced by a deterministic hash (prefixed with
+    /// [`SENSITIVE_HASH_PREFIX`]). Returns `raw` unchanged when no sensitive
+    /// headers are configured, when `raw` is not a JSON object, or when no
+    /// sensitive header is present in the object.
+    ///
+    /// Determinism (same input value -> same hash) is required so that two
+    /// requests from the same end client (same bearer token) produce the same
+    /// cache key and therefore share a cached response. The hash is one-way,
+    /// so a redacted value cannot be replayed against the upstream API.
+    fn redact_sensitive_request_headers(&self, raw: &str) -> String {
+        if !self.has_sensitive_headers() {
+            return raw.to_string();
+        }
+        let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(raw)
+        else {
+            // Not a JSON object: leave alone. Validation elsewhere rejects
+            // these inputs before they reach a cache key, so the only way to
+            // hit this branch is via direct test usage.
+            return raw.to_string();
+        };
+        let mut changed = false;
+        for (name, value) in obj.iter_mut() {
+            let Ok(header_name) = HeaderName::try_from(name.as_str()) else {
+                continue;
+            };
+            if !self.sensitive_headers.contains(&header_name) {
+                continue;
+            }
+            if let Some(s) = value.as_str() {
+                *value = serde_json::Value::String(hash_sensitive_value(s));
+                changed = true;
+            }
+        }
+        if !changed {
+            return raw.to_string();
+        }
+        serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| raw.to_string())
+    }
+}
+
+/// Prefix used to mark a hashed sensitive header value in cache keys and the
+/// persisted `request_headers` row column. The accelerator uses this prefix to
+/// detect rows that cannot be background-refreshed (the upstream call would
+/// require the original token, which is not recoverable from the hash).
+pub const SENSITIVE_HASH_PREFIX: &str = "spice-redacted-sha256:";
+
+/// Compute a deterministic, one-way hash of a sensitive header value, prefixed
+/// so consumers can recognize it as a redacted token rather than a real value.
+#[must_use]
+pub fn hash_sensitive_value(value: &str) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    format!(
+        "{SENSITIVE_HASH_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    )
+}
+
+/// True if `headers_json` contains any value that has been redacted via
+/// [`hash_sensitive_value`]. Used by the caching accelerator to skip
+/// background refresh of rows whose original token is not recoverable.
+#[must_use]
+pub fn request_headers_contain_redacted_value(headers_json: &str) -> bool {
+    // Cheap substring check is sufficient because the prefix is namespaced.
+    headers_json.contains(SENSITIVE_HASH_PREFIX)
 }
 
 struct HttpFetchResult {
@@ -559,6 +642,34 @@ impl HttpTableProvider {
         self
     }
 
+    /// Mark the supplied header names as sensitive. Sensitive headers may
+    /// appear in `request_header_allowlist` even when HTTP authentication is
+    /// configured (the conflict guard in `enable_header_filters` and
+    /// `parse_request_headers` is lifted for them). Their values are also
+    /// redacted in logs and error messages.
+    ///
+    /// Note: this should be called *before* `enable_header_filters` so the
+    /// allowlist validation can honor the sensitive set.
+    pub fn with_sensitive_headers<I, S>(mut self, header_names: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut sensitive = HashSet::new();
+        for header_name in header_names {
+            let raw = header_name.as_ref().trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let parsed = HeaderName::try_from(raw).map_err(|e| Error::Configuration {
+                message: format!("Invalid request_headers_sensitive entry '{raw}': {e}"),
+            })?;
+            sensitive.insert(parsed);
+        }
+        self.request_filter_options.sensitive_headers = sensitive;
+        Ok(self)
+    }
+
     pub fn enable_header_filters<I, S>(mut self, max_length: usize, header_names: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -576,10 +687,18 @@ impl HttpTableProvider {
             let parsed = HeaderName::try_from(raw).map_err(|e| Error::Configuration {
                 message: format!("Invalid request_header_allowlist entry '{raw}': {e}"),
             })?;
+            // Allow `authorization` in the allowlist when HTTP authentication
+            // is configured, but only if the header is also marked sensitive.
+            // This supports per-user caching where the bearer token comes from
+            // the client request rather than the dataset's static auth.
+            let is_sensitive = self
+                .request_filter_options
+                .sensitive_headers
+                .contains(&parsed);
             ensure!(
-                !(self.auth.is_some() && parsed == AUTHORIZATION),
+                !(self.auth.is_some() && parsed == AUTHORIZATION && !is_sensitive),
                 ConfigurationSnafu {
-                    message: "request_header_allowlist cannot include 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_header_allowlist or disable HTTP authentication.".to_string()
+                    message: "request_header_allowlist cannot include 'authorization' when HTTP authentication is configured. Either remove 'authorization' from request_header_allowlist, disable HTTP authentication, or add 'authorization' to request_headers_sensitive to acknowledge that per-request bearer tokens override the dataset-level auth.".to_string()
                 }
             );
             allowed_headers.insert(parsed);
@@ -814,6 +933,7 @@ impl HttpTableProvider {
     }
 
     /// Extract path and query from filters
+    #[cfg_attr(not(test), allow(dead_code))]
     fn get_cache_key(
         path: &str,
         query: Option<&str>,
@@ -821,6 +941,30 @@ impl HttpTableProvider {
         request_headers: Option<&str>,
     ) -> CacheKey {
         CacheKey::new(path, query, body, request_headers)
+    }
+
+    /// Like [`Self::get_cache_key`] but redacts the values of any headers
+    /// marked sensitive (`request_headers_sensitive`) before they are folded
+    /// into the cache key. The raw value is never stored in the cache.
+    fn get_cache_key_with_redacted_headers(
+        &self,
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> CacheKey {
+        let redacted = self.redact_request_headers_for_storage(request_headers);
+        CacheKey::new(path, query, body, redacted.as_deref())
+    }
+
+    /// Returns a copy of `request_headers` with the values of any sensitive
+    /// headers replaced by a one-way hash. Used for everything that persists or
+    /// keys on the headers JSON (HTTP cache key, the `request_headers` row
+    /// column written to the accelerator). The raw JSON is still required for
+    /// the live upstream request and must be obtained separately.
+    fn redact_request_headers_for_storage(&self, raw: Option<&str>) -> Option<String> {
+        let raw = raw?;
+        Some(self.request_filter_options.redact_sensitive_request_headers(raw))
     }
 
     /// Validates the HTTP endpoint by attempting a request to a custom health probe path if configured,
@@ -1017,7 +1161,7 @@ impl HttpTableProvider {
         request_headers: Option<&str>,
         result: &HttpFetchResult,
     ) {
-        let cache_key = Self::get_cache_key(path, query, body, request_headers);
+        let cache_key = self.get_cache_key_with_redacted_headers(path, query, body, request_headers);
         let cached_response = CachedResponse {
             content: Arc::new(result.content.clone()),
             cached_at: SystemTime::now(),
@@ -1280,7 +1424,7 @@ impl HttpTableProvider {
                 .await;
         }
 
-        let cache_key = Self::get_cache_key(path, query, body, request_headers);
+        let cache_key = self.get_cache_key_with_redacted_headers(path, query, body, request_headers);
 
         // Try to get from cache
         let cached = {
@@ -1632,7 +1776,12 @@ impl HttpExec {
         let path_for_batch = path.unwrap_or("");
         let query_for_batch = query.unwrap_or("");
         let body_for_batch = body.unwrap_or("");
-        let headers_for_batch = request_headers.unwrap_or("");
+        let headers_for_batch_owned = self
+            .provider
+            .redact_request_headers_for_storage(request_headers);
+        let headers_for_batch = headers_for_batch_owned
+            .as_deref()
+            .unwrap_or("");
 
         tracing::debug!(
             "Creating batch with request_path={:?}, content_len={}, num_rows={}",
@@ -3065,9 +3214,17 @@ impl HttpTableProvider {
                 });
             }
 
-            if self.auth.is_some() && header_name == AUTHORIZATION {
+            // The same authorization conflict guard as `enable_header_filters`:
+            // permit `authorization` to flow through when the dataset has opted
+            // in via `request_headers_sensitive`, signalling that per-request
+            // bearer tokens are intended to override the dataset-level auth.
+            let is_sensitive = self
+                .request_filter_options
+                .sensitive_headers
+                .contains(&header_name);
+            if self.auth.is_some() && header_name == AUTHORIZATION && !is_sensitive {
                 return Err(Error::FilterRejected {
-                    message: "The 'request_headers' object cannot set 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_headers or disable HTTP authentication.".to_string(),
+                    message: "The 'request_headers' object cannot set 'authorization' when HTTP authentication is configured. Either remove 'authorization' from request_headers, disable HTTP authentication, or add 'authorization' to request_headers_sensitive on the dataset.".to_string(),
                 });
             }
 
@@ -3737,6 +3894,142 @@ mod tests {
             }
             other => panic!("Unexpected error: {other:?}"),
         }
+    }
+
+    /// When `authorization` is in `request_headers_sensitive`, it should be allowed
+    /// in `request_header_allowlist` even when HTTP authentication is configured.
+    /// This is the per-user caching scenario where the bearer token comes from the
+    /// client request rather than the dataset-level auth.
+    #[test]
+    fn test_sensitive_authorization_allowlist_with_auth() {
+        base_provider()
+            .with_sensitive_headers(vec!["authorization"])
+            .expect("sensitive headers should accept authorization")
+            .with_auth(Arc::new(TestAuthenticator))
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["authorization"])
+            .expect(
+                "authorization should be allowlistable when also marked sensitive and auth is set",
+            );
+    }
+
+    /// When `authorization` is in `request_headers_sensitive`, dynamic
+    /// `request_headers` filters carrying an `authorization` value should be
+    /// accepted even when HTTP authentication is configured.
+    #[test]
+    fn test_sensitive_authorization_filter_with_auth() {
+        let provider = base_provider()
+            .with_sensitive_headers(vec!["authorization"])
+            .expect("sensitive headers should accept authorization")
+            .with_auth(Arc::new(TestAuthenticator))
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["authorization"])
+            .expect("sensitive authorization is allowlisted under HTTP auth");
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"authorization":"Bearer abc"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider
+            .extract_partitions(&filters)
+            .expect("sensitive authorization filter should be accepted");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(
+            partitions[0],
+            (
+                None,
+                None,
+                None,
+                Some(r#"{"authorization":"Bearer abc"}"#.to_string())
+            )
+        );
+    }
+
+    /// `with_sensitive_headers` should reject malformed header names early.
+    #[test]
+    fn test_sensitive_headers_rejects_invalid_name() {
+        let err = base_provider()
+            .with_sensitive_headers(vec!["not a valid header"])
+            .expect_err("invalid header name should be rejected");
+        let message = format!("{err}");
+        assert!(message.contains("request_headers_sensitive"));
+    }
+
+    /// The hash is deterministic, prefixed with the documented sentinel, and
+    /// distinguishes different inputs. Determinism is required so the same
+    /// bearer token produces the same cache key on every request.
+    #[test]
+    fn test_hash_sensitive_value_is_deterministic_and_distinct() {
+        let h1 = hash_sensitive_value("Bearer abc");
+        let h2 = hash_sensitive_value("Bearer abc");
+        let h3 = hash_sensitive_value("Bearer xyz");
+        assert_eq!(h1, h2, "hash must be deterministic");
+        assert_ne!(h1, h3, "different inputs must hash to different values");
+        assert!(
+            h1.starts_with(SENSITIVE_HASH_PREFIX),
+            "hash must carry the sentinel prefix; got {h1}"
+        );
+        assert!(
+            !h1.contains("abc"),
+            "raw token must not appear in hashed value: {h1}"
+        );
+        assert!(request_headers_contain_redacted_value(
+            &format!(r#"{{"authorization":"{h1}"}}"#)
+        ));
+        assert!(!request_headers_contain_redacted_value(
+            r#"{"authorization":"Bearer abc"}"#
+        ));
+    }
+
+    /// When a header is marked sensitive, redaction replaces only that
+    /// header's value with the hashed sentinel; non-sensitive header values are
+    /// passed through verbatim.
+    #[test]
+    fn test_redact_sensitive_request_headers_replaces_only_listed_headers() {
+        let provider = base_provider()
+            .with_sensitive_headers(vec!["authorization"])
+            .expect("sensitive headers configured")
+            .enable_header_filters(
+                DEFAULT_MAX_HEADERS_LENGTH,
+                vec!["authorization", "x-region"],
+            )
+            .expect("allowlist configured");
+
+        let raw = r#"{"authorization":"Bearer abc","x-region":"us-west"}"#;
+        let redacted = provider
+            .request_filter_options
+            .redact_sensitive_request_headers(raw);
+
+        assert!(
+            !redacted.contains("Bearer abc"),
+            "raw token must not appear in redacted output: {redacted}"
+        );
+        assert!(
+            redacted.contains("us-west"),
+            "non-sensitive header value must be preserved: {redacted}"
+        );
+        assert!(
+            redacted.contains(SENSITIVE_HASH_PREFIX),
+            "redacted output must include the sentinel prefix: {redacted}"
+        );
+        // Determinism check via the public helper.
+        let again = provider
+            .request_filter_options
+            .redact_sensitive_request_headers(raw);
+        assert_eq!(redacted, again);
+    }
+
+    /// Without any sensitive headers configured, redaction is a no-op.
+    #[test]
+    fn test_redact_sensitive_request_headers_noop_when_unconfigured() {
+        let provider = base_provider();
+        let raw = r#"{"authorization":"Bearer abc"}"#;
+        let out = provider
+            .request_filter_options
+            .redact_sensitive_request_headers(raw);
+        assert_eq!(out, raw);
     }
 
     #[test]

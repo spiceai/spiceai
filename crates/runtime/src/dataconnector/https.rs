@@ -190,6 +190,7 @@ struct RequestFilterParams {
     allow_header_filters: bool,
     max_headers_length: usize,
     request_header_allowlist: Vec<String>,
+    request_headers_sensitive: Vec<String>,
 }
 
 struct HttpProviderParams {
@@ -311,6 +312,20 @@ impl Https {
         let request_header_allowlist = self
             .params
             .get("request_header_allowlist")
+            .expose()
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|header_name| header_name.trim().to_string())
+                    .filter(|header_name| !header_name.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let request_headers_sensitive = self
+            .params
+            .get("request_headers_sensitive")
             .expose()
             .ok()
             .map(|value| {
@@ -466,6 +481,7 @@ impl Https {
                 allow_header_filters,
                 max_headers_length,
                 request_header_allowlist,
+                request_headers_sensitive,
             },
             max_request_partitions,
             health_probe,
@@ -771,6 +787,7 @@ impl Https {
             allow_header_filters,
             max_headers_length,
             request_header_allowlist,
+            request_headers_sensitive,
         } = request_filters;
 
         let mut provider = data_components::http::provider::HttpTableProvider::new(
@@ -845,6 +862,22 @@ impl Https {
         if allow_body_filters {
             tracing::trace!("Enabling body filters with max_bytes={}", max_body_bytes);
             provider = provider.enable_body_filters(max_body_bytes);
+        }
+
+        if !request_headers_sensitive.is_empty() {
+            tracing::trace!(
+                "Marking {} sensitive header(s) for {}",
+                request_headers_sensitive.len(),
+                dataset.name
+            );
+            provider = provider
+                .with_sensitive_headers(&request_headers_sensitive)
+                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                    dataconnector: "https".to_string(),
+                    message: format!("Invalid request_headers_sensitive configuration: {e}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e.into(),
+                })?;
         }
 
         if allow_header_filters {
@@ -1056,6 +1089,8 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("request_header_allowlist")
             .description("Comma-separated list of HTTP request header names that request_headers filters may set. Required when request_header_filters is enabled."),
+        ParameterSpec::runtime("request_headers_sensitive")
+            .description("Comma-separated list of HTTP request header names whose values are treated as sensitive (e.g. bearer tokens). Listed headers may appear in request_header_allowlist even when HTTP authentication is configured, signalling that per-request bearer tokens override the dataset-level auth. Intended for per-user caching of HTTP datasets."),
         ParameterSpec::runtime("max_request_headers_length")
             .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
         ParameterSpec::runtime("max_request_partitions")

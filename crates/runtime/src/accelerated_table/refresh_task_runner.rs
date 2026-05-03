@@ -59,6 +59,9 @@ pub struct RefreshTaskRunnerBuilder {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// Lowercased header names that participate in the caching accelerator's
+    /// cache key (caching mode only).
+    caching_allowed_request_headers: Arc<Vec<String>>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -90,6 +93,7 @@ impl RefreshTaskRunnerBuilder {
             accelerator_write_mutex,
             last_updated_at: Arc::new(AtomicI64::new(0)),
             is_s3_express_acceleration: false,
+            caching_allowed_request_headers: Arc::new(Vec::new()),
         }
     }
 
@@ -140,6 +144,17 @@ impl RefreshTaskRunnerBuilder {
         self
     }
 
+    /// Set the lowercased header names that participate in the caching
+    /// accelerator's cache key (caching mode only).
+    #[must_use]
+    pub fn with_caching_allowed_request_headers(
+        mut self,
+        headers: Arc<Vec<String>>,
+    ) -> Self {
+        self.caching_allowed_request_headers = headers;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
@@ -167,6 +182,9 @@ impl RefreshTaskRunnerBuilder {
 
         refresh_task_builder =
             refresh_task_builder.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
+        refresh_task_builder = refresh_task_builder
+            .with_caching_allowed_request_headers(self.caching_allowed_request_headers);
 
         let refresh_task = Arc::new(refresh_task_builder.build());
 

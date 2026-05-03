@@ -344,6 +344,7 @@ pub struct Builder {
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
     caching_stale_if_error: bool,
+    caching_allowed_request_headers: Vec<String>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
@@ -392,6 +393,7 @@ impl Builder {
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: false,
+            caching_allowed_request_headers: Vec::new(),
             resource_monitor: None,
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
@@ -586,6 +588,19 @@ impl Builder {
     /// Set whether to serve expired data on upstream error in cache mode
     pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
         self.caching_stale_if_error = enabled;
+        self
+    }
+
+    /// Headers (lowercased names) that participate in the caching
+    /// accelerator's row-level cache key when the dataset uses
+    /// `refresh_mode: caching`. When non-empty, the `request_headers` column
+    /// is included alongside `request_path`/`request_query`/`request_body`
+    /// when extracting filters from cached rows for background refresh.
+    pub fn caching_allowed_request_headers(
+        &mut self,
+        headers: Vec<String>,
+    ) -> &mut Self {
+        self.caching_allowed_request_headers = headers;
         self
     }
 
@@ -788,6 +803,10 @@ impl Builder {
         }
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
+        refresher.with_caching_allowed_request_headers(Arc::new(
+            self.caching_allowed_request_headers,
+        ));
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {

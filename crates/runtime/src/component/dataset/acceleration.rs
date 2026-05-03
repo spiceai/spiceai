@@ -273,6 +273,14 @@ pub struct Acceleration {
 
     pub caching_stale_if_error: StaleIfError,
 
+    /// Headers (by lowercase name) that are allowed to participate in the
+    /// caching accelerator's cache key for `refresh_mode: caching` datasets.
+    /// When non-empty, `request_headers` filters are included in the row-level
+    /// cache key alongside `request_path`, `request_query`, and `request_body`.
+    /// Intended for per-user caching of HTTP datasets where authentication
+    /// headers vary per request (e.g. bearer tokens).
+    pub caching_allowed_request_headers: Vec<String>,
+
     pub refresh_cron: Option<Arc<str>>,
 
     pub refresh_sql: Option<String>,
@@ -472,6 +480,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let caching_stale_while_revalidate_ttl =
             parse_caching_stale_while_revalidate_ttl(&mut params)?;
         let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
+        let caching_allowed_request_headers =
+            parse_caching_allowed_request_headers(&mut params)?;
 
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",
@@ -500,6 +510,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             caching_ttl,
             caching_stale_while_revalidate_ttl,
             caching_stale_if_error,
+            caching_allowed_request_headers,
             refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -550,6 +561,7 @@ impl Default for Acceleration {
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: StaleIfError::default(),
+            caching_allowed_request_headers: Vec::new(),
             refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
@@ -613,6 +625,35 @@ fn parse_caching_stale_while_revalidate_ttl(
     params: &mut Option<Params>,
 ) -> Result<Option<Duration>, crate::Error> {
     parse_duration_param(params, "caching_stale_while_revalidate_ttl")
+}
+
+/// Parse `caching_allowed_request_headers` (comma-separated header names) from
+/// params for caching mode. Returns the lowercased header names with empty
+/// entries dropped. When unset, returns an empty vector (no headers participate
+/// in the cache key, which preserves pre-existing behavior).
+#[expect(clippy::result_large_err)]
+fn parse_caching_allowed_request_headers(
+    params: &mut Option<Params>,
+) -> Result<Vec<String>, crate::Error> {
+    let Some(params) = params else {
+        return Ok(Vec::new());
+    };
+    let Some(value) = params.data.remove("caching_allowed_request_headers") else {
+        return Ok(Vec::new());
+    };
+    match value {
+        spicepod::param::ParamValue::String(s) => Ok(s
+            .split(',')
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect()),
+        _ => Err(crate::Error::InvalidAccelerationConfiguration {
+            source: format!(
+                "Invalid 'caching_allowed_request_headers' param value: {value:?}. Expected a comma-separated string of header names."
+            )
+            .into(),
+        }),
+    }
 }
 
 /// Parse `caching_stale_if_error` from params for caching mode.
@@ -740,5 +781,43 @@ mod tests {
         // Test missing parameter (default)
         let result = parse_caching_stale_if_error(&mut None).expect("to parse");
         assert_eq!(result, StaleIfError::Disabled);
+    }
+
+    #[test]
+    fn test_parse_caching_allowed_request_headers() {
+        // Comma-separated, normalized to lowercase, whitespace trimmed,
+        // empty entries dropped.
+        let mut params = Some(Params::from_string_map(HashMap::from([(
+            "caching_allowed_request_headers".to_string(),
+            " Authorization , X-Api-Key ,, x-region".to_string(),
+        )])));
+        let result =
+            parse_caching_allowed_request_headers(&mut params).expect("to parse");
+        assert_eq!(
+            result,
+            vec![
+                "authorization".to_string(),
+                "x-api-key".to_string(),
+                "x-region".to_string()
+            ]
+        );
+        // The param should be consumed from the map.
+        assert!(
+            params
+                .as_ref()
+                .map(|p| p.data.is_empty())
+                .unwrap_or(true),
+            "caching_allowed_request_headers should be removed from params after parsing"
+        );
+
+        // Missing param yields empty vector (no headers participate, preserving
+        // pre-existing behavior).
+        let result = parse_caching_allowed_request_headers(&mut None).expect("to parse");
+        assert!(result.is_empty());
+
+        let mut empty_params = Some(Params::from_string_map(HashMap::new()));
+        let result =
+            parse_caching_allowed_request_headers(&mut empty_params).expect("to parse");
+        assert!(result.is_empty());
     }
 }

@@ -1820,6 +1820,9 @@ impl DataFusion {
             );
             accelerated_table_builder
                 .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
+            accelerated_table_builder.caching_allowed_request_headers(
+                acceleration_settings.caching_allowed_request_headers.clone(),
+            );
         }
 
         // Get the acceleration layout (used for snapshots and size metrics)

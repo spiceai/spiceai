@@ -648,6 +648,9 @@ pub struct Refresher {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// Lowercased header names that participate in the caching accelerator's
+    /// cache key (caching mode only).
+    caching_allowed_request_headers: Arc<Vec<String>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -701,6 +704,7 @@ impl Refresher {
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
             is_s3_express_acceleration: false,
+            caching_allowed_request_headers: Arc::new(Vec::new()),
         }
     }
 
@@ -794,6 +798,16 @@ impl Refresher {
     /// Set whether the acceleration uses S3 Express One Zone storage.
     pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    /// Set the lowercased header names that participate in the caching
+    /// accelerator's cache key (caching mode only).
+    pub fn with_caching_allowed_request_headers(
+        &mut self,
+        headers: Arc<Vec<String>>,
+    ) -> &mut Self {
+        self.caching_allowed_request_headers = headers;
         self
     }
 
@@ -937,6 +951,10 @@ impl Refresher {
 
         refresh_task_runner =
             refresh_task_runner.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
+        refresh_task_runner = refresh_task_runner.with_caching_allowed_request_headers(
+            Arc::clone(&self.caching_allowed_request_headers),
+        );
 
         let mut refresh_task_runner = refresh_task_runner.build();
 
@@ -1178,6 +1196,7 @@ impl Refresher {
             .with_on_stream_batch_process_callback(on_batch_process_callback)
             .with_last_updated_at(Arc::clone(&self.last_updated_at))
             .with_s3_express_acceleration(self.is_s3_express_acceleration)
+            .with_caching_allowed_request_headers(Arc::clone(&self.caching_allowed_request_headers))
             .build(),
         );
 

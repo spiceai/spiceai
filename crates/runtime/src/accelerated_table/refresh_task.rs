@@ -129,6 +129,10 @@ pub struct RefreshTaskBuilder {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// Header names (lowercased) that participate in the caching accelerator's
+    /// cache key. When non-empty, `request_headers` is added to the columns
+    /// extracted as filters when scanning stale rows for refresh.
+    caching_allowed_request_headers: Arc<Vec<String>>,
 }
 
 impl RefreshTaskBuilder {
@@ -158,6 +162,7 @@ impl RefreshTaskBuilder {
             on_stream_batch_process_callback: None,
             last_updated_at: Arc::new(AtomicI64::new(0)),
             is_s3_express_acceleration: false,
+            caching_allowed_request_headers: Arc::new(Vec::new()),
         }
     }
 
@@ -217,6 +222,17 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Set the lowercased header names that participate in the caching
+    /// accelerator's cache key (caching mode only).
+    #[must_use]
+    pub fn with_caching_allowed_request_headers(
+        mut self,
+        headers: Arc<Vec<String>>,
+    ) -> RefreshTaskBuilder {
+        self.caching_allowed_request_headers = headers;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -267,6 +283,7 @@ impl RefreshTaskBuilder {
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
             last_updated_at: self.last_updated_at,
             is_s3_express_acceleration: self.is_s3_express_acceleration,
+            caching_allowed_request_headers: self.caching_allowed_request_headers,
         }
     }
 }
@@ -291,6 +308,10 @@ pub struct RefreshTask {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// Header names (lowercased) that participate in the caching accelerator's
+    /// cache key when extracting filters from stale rows during background
+    /// refresh.
+    caching_allowed_request_headers: Arc<Vec<String>>,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -891,6 +912,7 @@ impl RefreshTask {
             self.dataset_name.to_string().as_str(),
             ttl,
             Arc::clone(&self.accelerator_write_mutex),
+            self.caching_allowed_request_headers.as_slice(),
         )
         .await
         .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;
