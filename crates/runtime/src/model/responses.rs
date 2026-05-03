@@ -21,7 +21,9 @@ use crate::model::tool_use_responses::OpenAIResponsesTools;
 use crate::model::wrapper::responses::ResponsesWrapper;
 use crate::parameters::Parameters;
 use crate::tools::options::SpiceToolsOptions;
-use crate::tools::registry::tool_registry_tools;
+use crate::tools::registry::{
+    TOOL_EMBEDDING_MODEL_PARAM, resolve_tool_registry_embedding_model, tool_registry_tools,
+};
 use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
 use llms::openai::{DEFAULT_LLM_MODEL, UsageTier};
@@ -104,6 +106,8 @@ pub async fn try_to_responses_model(
         .transpose()
         .map_err(|_| unreachable!("SpiceToolsOptions::from_str has no error condition"))?;
 
+    let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
+
     // Create table allowlist from model's datasets if specified
     let table_allowlist = create_table_allowlist(&component.datasets);
 
@@ -111,7 +115,11 @@ pub async fn try_to_responses_model(
         Some(opts) if opts.can_use_tools() => {
             let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
             let tools = if opts.use_registry_tools() {
-                tool_registry_tools(tools)
+                let embedding_model =
+                    resolve_tool_registry_embedding_model(Arc::clone(&rt), tool_embedding_model)
+                        .await
+                        .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+                tool_registry_tools(tools, embedding_model)
             } else {
                 tools
             };

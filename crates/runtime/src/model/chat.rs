@@ -43,7 +43,9 @@ use crate::{
     parameters::Parameters,
     tools::{
         options::SpiceToolsOptions,
-        registry::tool_registry_tools,
+        registry::{
+            TOOL_EMBEDDING_MODEL_PARAM, resolve_tool_registry_embedding_model, tool_registry_tools,
+        },
         utils::{create_table_allowlist, get_tools_with_allowlist},
     },
 };
@@ -111,6 +113,8 @@ pub async fn try_to_chat_model(
         // Prevent infinite recursion in case of circular tool calls.
         .or(Some(DEFAULT_SPICE_TOOL_RECURSION_LIMIT));
 
+    let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
+
     // Create table allowlist from model's datasets if specified
     let table_allowlist = create_table_allowlist(&component.datasets);
 
@@ -118,7 +122,11 @@ pub async fn try_to_chat_model(
         Some(opts) if opts.can_use_tools() => {
             let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
             let tools = if opts.use_registry_tools() {
-                tool_registry_tools(tools)
+                let embedding_model =
+                    resolve_tool_registry_embedding_model(Arc::clone(&rt), tool_embedding_model)
+                        .await
+                        .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+                tool_registry_tools(tools, embedding_model)
             } else {
                 tools
             };
