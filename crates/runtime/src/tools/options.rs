@@ -27,6 +27,9 @@ pub enum SpiceToolsOptions {
     /// Automatically use all available builtin tools.
     Auto,
 
+    /// Use a searchable registry over all available builtin tools.
+    Search,
+
     /// Use builtin tools relevant for text-to-SQL.
     Nsql,
 
@@ -42,7 +45,7 @@ impl SpiceToolsOptions {
     #[must_use]
     pub fn can_use_tools(&self) -> bool {
         match self {
-            SpiceToolsOptions::Auto | SpiceToolsOptions::Nsql => true,
+            SpiceToolsOptions::Auto | SpiceToolsOptions::Search | SpiceToolsOptions::Nsql => true,
             SpiceToolsOptions::Disabled => false,
             SpiceToolsOptions::Specific(t) => !t.is_empty(),
         }
@@ -50,12 +53,12 @@ impl SpiceToolsOptions {
 
     #[must_use]
     pub(crate) fn use_registry_tools(&self) -> bool {
-        matches!(self, SpiceToolsOptions::Auto)
+        matches!(self, SpiceToolsOptions::Search)
     }
 
     pub(crate) fn tools_by_name(&self) -> Vec<&str> {
         match self {
-            SpiceToolsOptions::Auto => vec![
+            SpiceToolsOptions::Auto | SpiceToolsOptions::Search => vec![
                 "search",
                 "table_schema",
                 "sql",
@@ -93,6 +96,7 @@ impl FromStr for SpiceToolsOptions {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_lowercase().as_str() {
             "auto" => Ok(SpiceToolsOptions::Auto),
+            "search" => Ok(SpiceToolsOptions::Search),
             "nsql" => Ok(SpiceToolsOptions::Nsql),
             "disabled" => Ok(SpiceToolsOptions::Disabled),
             _ => Ok(SpiceToolsOptions::Specific(
@@ -143,7 +147,8 @@ mod tests {
 
     #[test]
     fn test_auto_uses_registry_tools() {
-        assert!(SpiceToolsOptions::Auto.use_registry_tools());
+        assert!(!SpiceToolsOptions::Auto.use_registry_tools());
+        assert!(SpiceToolsOptions::Search.use_registry_tools());
         assert!(!SpiceToolsOptions::Nsql.use_registry_tools());
         assert!(!SpiceToolsOptions::Disabled.use_registry_tools());
         assert!(!SpiceToolsOptions::Specific(vec!["sql".to_string()]).use_registry_tools());

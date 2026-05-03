@@ -47,7 +47,7 @@ const RRF_K: f64 = 60.0;
 #[must_use]
 pub(crate) fn tool_registry_tools(
     tools: Vec<Arc<dyn SpiceModelTool>>,
-    embedding_model: Option<Arc<dyn Embed>>,
+    embedding_model: Arc<dyn Embed>,
 ) -> Vec<Arc<dyn SpiceModelTool>> {
     if tools.is_empty() {
         return Vec::new();
@@ -73,12 +73,12 @@ pub(crate) fn tool_registry_tools(
 pub(crate) async fn resolve_tool_registry_embedding_model(
     rt: Arc<Runtime>,
     model_name: Option<&str>,
-) -> Result<Option<Arc<dyn Embed>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<dyn Embed>, Box<dyn std::error::Error + Send + Sync>> {
     let embeddings = rt.embeds();
 
     if let Some(model_name) = model_name {
         let embeddings_map = embeddings.read().await;
-        return embeddings_map.get(model_name).cloned().map(Some).ok_or_else(|| {
+        return embeddings_map.get(model_name).cloned().ok_or_else(|| {
             format!("Embedding model '{model_name}' specified by `{TOOL_EMBEDDING_MODEL_PARAM}` was not found").into()
         });
     }
@@ -89,62 +89,52 @@ pub(crate) async fn resolve_tool_registry_embedding_model(
         .get(DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME)
         .cloned()
     {
-        return Ok(Some(default_model));
+        return Ok(default_model);
     }
 
     let component = Embeddings::new(
         DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM,
         DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME,
     );
-    let embed = match try_to_embedding(
+    let embed = try_to_embedding(
         &component,
         rt.secrets(),
         rt.token_provider_registry(),
         rt.datafusion().embeddings_cache_provider(),
     )
     .await
-    {
-        Ok(embed) => embed,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to load default tool-registry embedding model '{}': {}. Continuing with lexical tool lookup only.",
-                DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM,
-                error
-            );
-            return Ok(None);
-        }
-    };
+    .map_err(|error| {
+        format!(
+            "Failed to load default tool-registry embedding model '{}': {error}",
+            DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM
+        )
+    })?;
 
-    let embed = match TaskEmbed::new(DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME, embed).await {
-        Ok(embed) => Arc::new(embed) as Arc<dyn Embed>,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to initialize default tool-registry embedding model '{}': {}. Continuing with lexical tool lookup only.",
-                DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM,
-                error
-            );
-            return Ok(None);
-        }
-    };
+    let embed = TaskEmbed::new(DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME, embed)
+        .await
+        .map(|embed| Arc::new(embed) as Arc<dyn Embed>)
+        .map_err(|error| {
+            format!(
+                "Failed to initialize default tool-registry embedding model '{}': {error}",
+                DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM
+            )
+        })?;
 
     embeddings.write().await.insert(
         DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME.to_string(),
         Arc::clone(&embed),
     );
-    Ok(Some(embed))
+    Ok(embed)
 }
 
 struct ToolRegistrySearchTool {
     tools: Arc<Vec<Arc<dyn SpiceModelTool>>>,
-    embedding_model: Option<Arc<dyn Embed>>,
+    embedding_model: Arc<dyn Embed>,
     tool_embeddings: OnceCell<Vec<Vec<f32>>>,
 }
 
 impl ToolRegistrySearchTool {
-    fn new(
-        tools: Arc<Vec<Arc<dyn SpiceModelTool>>>,
-        embedding_model: Option<Arc<dyn Embed>>,
-    ) -> Self {
+    fn new(tools: Arc<Vec<Arc<dyn SpiceModelTool>>>, embedding_model: Arc<dyn Embed>) -> Self {
         Self {
             tools,
             embedding_model,
@@ -180,10 +170,10 @@ impl SpiceModelTool for ToolRegistrySearchTool {
         let mut ranked_tools = hybrid_rank_tools(
             &self.tools,
             &params,
-            self.embedding_model.as_ref(),
+            &self.embedding_model,
             &self.tool_embeddings,
         )
-        .await;
+        .await?;
         ranked_tools.sort_by(|left, right| {
             right
                 .score
@@ -426,9 +416,9 @@ struct FusedMatch {
 async fn hybrid_rank_tools(
     tools: &[Arc<dyn SpiceModelTool>],
     params: &ToolSearchParams,
-    embedding_model: Option<&Arc<dyn Embed>>,
+    embedding_model: &Arc<dyn Embed>,
     tool_embeddings: &OnceCell<Vec<Vec<f32>>>,
-) -> Vec<RankedTool> {
+) -> Result<Vec<RankedTool>, Box<dyn std::error::Error + Send + Sync>> {
     let documents = tools.iter().map(ToolDocument::new).collect::<Vec<_>>();
     let query_tokens = tokenize_to_vec(&params.query);
     let keyword_tokens = params
@@ -449,24 +439,17 @@ async fn hybrid_rank_tools(
         ),
         ("schema", schema_channel_matches(&documents, &search_tokens)),
     ];
-    if let Some(embedding_model) = embedding_model {
-        match vector_channel_matches(&documents, &params.query, embedding_model, tool_embeddings)
-            .await
-        {
-            Ok(vector_matches) => channels.push(("vector", vector_matches)),
-            Err(error) => tracing::warn!(
-                "Failed to run vector channel for tool registry search: {}. Continuing with lexical channels only.",
-                error
-            ),
-        }
-    }
+    channels.push((
+        "vector",
+        vector_channel_matches(&documents, &params.query, embedding_model, tool_embeddings).await?,
+    ));
     let fused_matches = reciprocal_rank_fusion(channels);
     let max_score = fused_matches
         .values()
         .map(|fused_match| fused_match.fused_score)
         .fold(0.0, f64::max);
 
-    documents
+    Ok(documents
         .into_iter()
         .enumerate()
         .map(|(document_index, document)| {
@@ -493,7 +476,7 @@ async fn hybrid_rank_tools(
                 match_sources: fused_match.match_sources,
             }
         })
-        .collect()
+        .collect())
 }
 
 async fn vector_channel_matches(
@@ -999,6 +982,10 @@ mod tests {
         }
     }
 
+    fn mock_embed() -> Arc<dyn Embed> {
+        Arc::new(MockEmbed)
+    }
+
     #[tokio::test]
     async fn search_ranks_relevant_tools_first() {
         let (sql_tool, _) = mock_tool(
@@ -1011,7 +998,7 @@ mod tests {
             "Retrieve component readiness status",
             json!(null),
         );
-        let advertised_tools = tool_registry_tools(vec![readiness_tool, sql_tool], None);
+        let advertised_tools = tool_registry_tools(vec![readiness_tool, sql_tool], mock_embed());
         let search_tool = advertised_tools
             .iter()
             .find(|tool| tool.name().as_ref() == TOOL_SEARCH_NAME)
@@ -1058,7 +1045,7 @@ mod tests {
             "Retrieve component readiness status",
             json!(null),
         );
-        let advertised_tools = tool_registry_tools(vec![sql_tool, readiness_tool], None);
+        let advertised_tools = tool_registry_tools(vec![sql_tool, readiness_tool], mock_embed());
         let search_tool = advertised_tools
             .iter()
             .find(|tool| tool.name().as_ref() == TOOL_SEARCH_NAME)
@@ -1110,7 +1097,8 @@ mod tests {
             }),
             json!(null),
         );
-        let advertised_tools = tool_registry_tools(vec![calculator_tool, weather_tool], None);
+        let advertised_tools =
+            tool_registry_tools(vec![calculator_tool, weather_tool], mock_embed());
         let search_tool = advertised_tools
             .iter()
             .find(|tool| tool.name().as_ref() == TOOL_SEARCH_NAME)
@@ -1146,17 +1134,14 @@ mod tests {
             json!(null),
         );
         let (sql_tool, _) = mock_tool("sql", "Run SQL queries", json!(null));
-        let advertised_tools = tool_registry_tools(
-            vec![sql_tool, weather_tool],
-            Some(Arc::new(MockEmbed) as Arc<dyn Embed>),
-        );
+        let advertised_tools = tool_registry_tools(vec![sql_tool, weather_tool], mock_embed());
         let search_tool = advertised_tools
             .iter()
             .find(|tool| tool.name().as_ref() == TOOL_SEARCH_NAME)
             .expect("tool_search should be advertised");
 
         let result = search_tool
-            .call(r#"{"query":"temperature outlook","limit":2}"#)
+            .call(r#"{"query":"weather outlook","limit":2}"#)
             .await
             .expect("tool search should succeed");
         let first_tool = result
@@ -1180,7 +1165,7 @@ mod tests {
     #[tokio::test]
     async fn invoke_calls_selected_tool_with_arguments() {
         let (sql_tool, received_args) = mock_tool("sql", "Run SQL queries", json!({"rows": 1}));
-        let advertised_tools = tool_registry_tools(vec![sql_tool], None);
+        let advertised_tools = tool_registry_tools(vec![sql_tool], mock_embed());
         let invoke_tool = advertised_tools
             .iter()
             .find(|tool| tool.name().as_ref() == TOOL_INVOKE_NAME)
@@ -1212,7 +1197,7 @@ mod tests {
         );
         let (sql_tool, _) = mock_tool("sql", "Run SQL queries", json!(null));
 
-        let mut names = tool_registry_tools(vec![list_datasets_tool, sql_tool], None)
+        let mut names = tool_registry_tools(vec![list_datasets_tool, sql_tool], mock_embed())
             .iter()
             .map(|tool| tool.name().to_string())
             .collect::<Vec<_>>();
