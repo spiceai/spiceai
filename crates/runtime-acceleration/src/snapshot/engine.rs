@@ -25,23 +25,55 @@ mod duckdb;
 #[cfg(feature = "duckdb")]
 pub use duckdb::DuckDBSnapshotEngine;
 
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+mod sqlite;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteSnapshotEngine;
+
+#[cfg(feature = "turso")]
+mod turso;
+#[cfg(feature = "turso")]
+pub use turso::TursoSnapshotEngine;
+
 #[derive(Debug, Snafu)]
 pub enum SnapshotEngineError {
     #[snafu(display("DuckDB snapshot error: {source}"))]
     #[cfg(feature = "duckdb")]
     DuckDB { source: duckdb::DuckDBSnapshotError },
 
-    /// Placeholder variant for when no features are enabled
+    #[snafu(display("SQLite snapshot error: {source}"))]
+    #[cfg(any(feature = "sqlite", feature = "turso"))]
+    Sqlite { source: sqlite::SqliteSnapshotError },
+
+    /// Placeholder variant for when no snapshot-capable feature is enabled.
     #[snafu(display(
-        "No snapshot engine is available. Enable a snapshot engine feature (e.g., 'duckdb')."
+        "No snapshot engine is available. Enable a snapshot engine feature \
+         (e.g., 'duckdb', 'sqlite', or 'turso')."
     ))]
-    #[cfg(not(feature = "duckdb"))]
+    #[cfg(not(any(feature = "duckdb", feature = "sqlite", feature = "turso")))]
     Generic,
 }
 
 /// Trait defining engine-specific snapshot operations.
 #[async_trait]
 pub trait SnapshotEngine: Send + Sync {
+    /// Hook invoked on the **live** accelerator file *before* it is copied to a
+    /// temporary snapshot location. Engines that buffer writes outside the
+    /// primary file (e.g. SQLite/Turso WAL) should checkpoint here so that the
+    /// subsequent `fs::copy` produces a self-contained file.
+    ///
+    /// Default implementation is a no-op.
+    ///
+    /// The caller holds the accelerator's write lock for the duration of this
+    /// call, so no concurrent writes are in flight.
+    async fn checkpoint_live(
+        &self,
+        _live_path: &Path,
+        _dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        Ok(())
+    }
+
     /// Prepares a snapshot file for upload.
     /// For engines that support compaction (e.g., `DuckDB`), this may compact the file.
     /// For other engines, this returns the source path unchanged.
@@ -95,9 +127,9 @@ pub fn create_snapshot_engine(
             Arc::new(DuckDBSnapshotEngine::new(compaction_enabled))
         }
         #[cfg(feature = "sqlite")]
-        AccelerationEngine::Sqlite => Arc::new(DefaultSnapshotEngine),
+        AccelerationEngine::Sqlite => Arc::new(SqliteSnapshotEngine::new()),
         #[cfg(feature = "turso")]
-        AccelerationEngine::Turso => Arc::new(DefaultSnapshotEngine),
+        AccelerationEngine::Turso => Arc::new(TursoSnapshotEngine::new()),
         AccelerationEngine::Cayenne => Arc::new(DefaultSnapshotEngine),
     }
 }

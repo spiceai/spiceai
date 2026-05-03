@@ -1080,6 +1080,15 @@ impl SnapshotManager {
         destination_location: &ObjectPath,
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<(u64, String), SnapshotUploadError> {
+        // Step 0: Engine-specific live checkpoint while the lock is held.
+        // For SQLite/Turso this drains the WAL into the main file so that
+        // the subsequent `fs::copy` produces a self-contained snapshot.
+        // Default (no-op) for engines without WAL.
+        self.snapshot_engine
+            .checkpoint_live(source_local_path, &self.dataset_name)
+            .await
+            .context(PrepareUploadSnafu)?;
+
         // Step 1: Copy the database file locally (lock is held)
         let temp_copy_path = source_local_path.with_extension("snapshot_tmp");
         fs::copy(source_local_path, &temp_copy_path)
