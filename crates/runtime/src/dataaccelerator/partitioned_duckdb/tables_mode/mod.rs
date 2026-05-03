@@ -454,7 +454,7 @@ fn create_factory() -> DuckDBTableProviderFactory {
         .with_settings_registry(
             DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
         )
-        .with_function_support(deny_spice_functions_for_duckdb().clone())
+        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
 }
 
 async fn get_pool(
