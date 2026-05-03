@@ -64,9 +64,8 @@ fn usize_to_f64(value: usize) -> f64 {
     let mut converted = 0.0;
 
     while remaining > 0 {
-        let chunk = match u16::try_from(remaining & USIZE_TO_F64_CHUNK_MASK) {
-            Ok(chunk) => chunk,
-            Err(_) => return f64::INFINITY,
+        let Ok(chunk) = u16::try_from(remaining & USIZE_TO_F64_CHUNK_MASK) else {
+            return f64::INFINITY;
         };
         converted += f64::from(chunk) * multiplier;
         remaining >>= USIZE_TO_F64_CHUNK_BITS;

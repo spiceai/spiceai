@@ -119,7 +119,7 @@ fn tool_registry_tools(
     let registry = Arc::new(tools);
     let mut advertised_tools = vec![
         Arc::new(ToolRegistrySearchTool::new(
-            Arc::clone(&registry),
+            registry.as_slice(),
             embedding_model,
         )) as Arc<dyn SpiceModelTool>,
         Arc::new(ToolRegistryInvokeTool::new(registry)) as Arc<dyn SpiceModelTool>,
@@ -149,10 +149,10 @@ pub(crate) async fn get_tool_registry_tool(
             let registry = Arc::new(tools);
             let embedding_model =
                 resolve_tool_registry_embedding_model(rt, embedding_model_name).await?;
-            Ok(Some(
-                Arc::new(ToolRegistrySearchTool::new(registry, embedding_model))
-                    as Arc<dyn SpiceModelTool>,
-            ))
+            Ok(Some(Arc::new(ToolRegistrySearchTool::new(
+                registry.as_slice(),
+                embedding_model,
+            )) as Arc<dyn SpiceModelTool>))
         }
         TOOL_INVOKE_NAME => {
             let tools = get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await;
@@ -227,7 +227,7 @@ struct ToolRegistrySearchTool {
 }
 
 impl ToolRegistrySearchTool {
-    fn new(tools: Arc<Vec<Arc<dyn SpiceModelTool>>>, embedding_model: Arc<dyn Embed>) -> Self {
+    fn new(tools: &[Arc<dyn SpiceModelTool>], embedding_model: Arc<dyn Embed>) -> Self {
         let documents = tools.iter().map(ToolDocument::new).collect::<Vec<_>>();
         let document_texts = documents
             .iter()
@@ -284,8 +284,7 @@ impl SpiceModelTool for ToolRegistrySearchTool {
 
         let max_score = ranked_tools
             .first()
-            .map(|ranked_tool| ranked_tool.score)
-            .unwrap_or(0.0);
+            .map_or(0.0, |ranked_tool| ranked_tool.score);
         let tools = ranked_tools
             .into_iter()
             .filter(|ranked_tool| ranked_tool.score >= min_score || max_score == 0.0)
@@ -394,7 +393,7 @@ struct ToolSearchParams {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ToolInvokeParams {
-    /// Tool identifier returned by tool_search.
+    /// Tool identifier returned by `tool_search`.
     tool_id: String,
 
     /// JSON object matching the selected tool's parameter schema.
@@ -559,13 +558,13 @@ async fn hybrid_rank_tools(
     let mut channels = vec![
         (
             "full_text",
-            full_text_channel_matches(&documents, &search_tokens),
+            full_text_channel_matches(documents, &search_tokens),
         ),
         (
             "keyword",
-            keyword_channel_matches(&documents, &params.query, &params.keywords, &search_tokens),
+            keyword_channel_matches(documents, &params.query, &params.keywords, &search_tokens),
         ),
-        ("schema", schema_channel_matches(&documents, &search_tokens)),
+        ("schema", schema_channel_matches(documents, &search_tokens)),
     ];
     channels.push((
         "vector",
@@ -663,7 +662,7 @@ fn full_text_channel_matches(
         return Vec::new();
     }
 
-    let document_count = documents.len() as f64;
+    let document_count = usize_to_f64(documents.len());
     let document_frequency = document_frequency(documents, query_tokens);
     documents
         .iter()
@@ -673,12 +672,20 @@ fn full_text_channel_matches(
             let mut matched_terms = Vec::new();
 
             for query_token in query_tokens {
-                let field_score = (token_count(&document.name_token_counts, query_token) as f64
-                    * 3.0)
-                    + (token_count(&document.description_token_counts, query_token) as f64 * 2.0)
-                    + token_count(&document.parameter_token_counts, query_token) as f64;
+                let field_score =
+                    (usize_to_f64(token_count(&document.name_token_counts, query_token)) * 3.0)
+                        + (usize_to_f64(token_count(
+                            &document.description_token_counts,
+                            query_token,
+                        )) * 2.0)
+                        + usize_to_f64(token_count(&document.parameter_token_counts, query_token));
                 if field_score > 0.0 {
-                    let frequency = *document_frequency.get(query_token).unwrap_or(&0) as f64;
+                    let frequency = usize_to_f64(
+                        document_frequency
+                            .get(query_token)
+                            .copied()
+                            .unwrap_or_default(),
+                    );
                     let inverse_document_frequency =
                         ((document_count + 1.0) / (frequency + 0.5)).ln().max(0.0) + 1.0;
                     score += inverse_document_frequency * field_score;
@@ -686,7 +693,7 @@ fn full_text_channel_matches(
                 }
             }
 
-            let length_normalizer = (document.total_tokens().max(1) as f64).sqrt();
+            let length_normalizer = usize_to_f64(document.total_tokens().max(1)).sqrt();
             non_zero_channel_match(document_index, score / length_normalizer, matched_terms)
         })
         .collect()
@@ -876,6 +883,27 @@ fn token_counts(tokens: &[String]) -> HashMap<String, usize> {
 
 fn token_count(counts: &HashMap<String, usize>, token: &str) -> usize {
     counts.get(token).copied().unwrap_or_default()
+}
+
+fn usize_to_f64(value: usize) -> f64 {
+    const CHUNK_BITS: usize = 16;
+    const CHUNK_BASE: f64 = 65_536.0;
+    const CHUNK_MASK: usize = (1usize << CHUNK_BITS) - 1;
+
+    let mut remaining = value;
+    let mut multiplier = 1.0;
+    let mut converted = 0.0;
+
+    while remaining > 0 {
+        let Ok(chunk) = u16::try_from(remaining & CHUNK_MASK) else {
+            return f64::INFINITY;
+        };
+        converted += f64::from(chunk) * multiplier;
+        remaining >>= CHUNK_BITS;
+        multiplier *= CHUNK_BASE;
+    }
+
+    converted
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {

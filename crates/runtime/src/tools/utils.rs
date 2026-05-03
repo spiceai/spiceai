@@ -170,11 +170,12 @@ pub async fn get_tools_with_allowlist(
                     }
                 }
                 Ok(SpiceToolsOptions::Disabled) => {}
-                Err(_)
-                | Ok(SpiceToolsOptions::Specific(_))
-                | Ok(SpiceToolsOptions::Auto)
-                | Ok(SpiceToolsOptions::All)
-                | Ok(SpiceToolsOptions::SearchRegistry)
+                Ok(
+                    SpiceToolsOptions::Specific(_)
+                    | SpiceToolsOptions::Auto
+                    | SpiceToolsOptions::All
+                    | SpiceToolsOptions::SearchRegistry,
+                )
                 | Err(_) => {
                     match get_tool_by_name(Arc::clone(&rt), &all_tools, tt, table_allowlist.clone())
                         .await
@@ -182,7 +183,7 @@ pub async fn get_tools_with_allowlist(
                         Some(resolved_tools) => {
                             extend_unique_tools(&mut tools, &mut seen_tool_names, resolved_tools);
                         }
-                        None => missing_tools.push(tt.to_string()),
+                        None => missing_tools.push(tt.clone()),
                     }
                 }
             }
@@ -281,11 +282,10 @@ async fn get_tool_by_name(
                 );
                 Arc::clone(catalog)
             }
-            (Some(builtin_catalog), Some(allowlist)) => Arc::new(
-                builtin_catalog
-                    .clone()
-                    .with_table_allowlist(allowlist.clone()),
-            ) as Arc<dyn SpiceToolCatalog>,
+            (Some(builtin_catalog), Some(allowlist)) => {
+                Arc::new(builtin_catalog.clone().with_table_allowlist(allowlist))
+                    as Arc<dyn SpiceToolCatalog>
+            }
             _ => Arc::clone(catalog),
         };
 
@@ -300,9 +300,7 @@ async fn get_tool_by_name(
         return None;
     }
 
-    let Some(tool) = all_tools.get(tool_name) else {
-        return None;
-    };
+    let tool = all_tools.get(tool_name)?;
 
     if let Some(ref allowlist) = table_allowlist
         && BuiltinToolCatalog::is_builtin_tool(tool_name)
