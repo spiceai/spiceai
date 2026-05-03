@@ -57,7 +57,7 @@ use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
 mod behavior;
 pub mod directory_archive;
-mod engine;
+pub mod engine;
 pub mod metrics;
 pub use crate::layout::AccelerationLayout;
 pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior};
@@ -221,6 +221,8 @@ impl DatasetMetadata {
 /// Details captured when downloading a snapshot for bootstrapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotDownloadInfo {
+    /// The snapshot id from the snapshot metadata that was downloaded.
+    pub snapshot_id: u64,
     pub schema: SchemaRef,
     pub bytes_downloaded: u64,
     pub checksum: String,
@@ -923,6 +925,15 @@ impl SnapshotManager {
         self
     }
 
+    /// Replaces the snapshot engine. Used by accelerators (notably Cayenne)
+    /// that need engine-specific archive create/extract behavior beyond what
+    /// `create_snapshot_engine` produces from `AccelerationEngine` alone.
+    #[must_use]
+    pub fn with_snapshot_engine(mut self, engine: Arc<dyn SnapshotEngine>) -> Self {
+        self.snapshot_engine = engine;
+        self
+    }
+
     /// Sets the policy for snapshot creation.
     #[must_use]
     pub fn with_snapshots_creation_policy(
@@ -942,6 +953,136 @@ impl SnapshotManager {
         let dataset_entry = handle.metadata.datasets.get(&self.dataset_name)?;
         let schema_meta = dataset_entry.current_schema()?;
         schema_meta.to_schema_ref().ok()
+    }
+
+    /// Returns the `current_snapshot_id` from the remote snapshot metadata for this
+    /// dataset, if any. Returns `None` when there is no metadata, no entry for the
+    /// dataset, or the dataset has no current snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or parsing the snapshot metadata from the
+    /// object store fails. Callers (e.g. snapshot-mode refresh) can use this
+    /// to react to transient object-store failures.
+    pub async fn remote_current_snapshot_id(&self) -> Result<Option<u64>, SnapshotDownloadError> {
+        let handle = self.load_metadata().await.map_err(|e| match e {
+            MetadataLoadError::Read { path, source } => {
+                SnapshotDownloadError::ReadMetadata { path, source }
+            }
+            MetadataLoadError::Parse { path, source } => {
+                SnapshotDownloadError::ParseMetadata { path, source }
+            }
+            MetadataLoadError::UnsupportedVersion { path, version } => {
+                SnapshotDownloadError::UnsupportedMetadataVersion { path, version }
+            }
+        })?;
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let Some(dataset_entry) = handle.metadata.datasets.get(&self.dataset_name) else {
+            return Ok(None);
+        };
+        Ok(dataset_entry.current_snapshot_id)
+    }
+
+    /// Downloads the latest snapshot only if its `snapshot_id` is strictly
+    /// greater than `current_local_id`. When the remote `current_snapshot_id`
+    /// is less than or equal to `current_local_id` (matching id, or remote
+    /// metadata rolled back), returns `Ok(None)` without touching local files.
+    ///
+    /// This is the primary entry point for `refresh_mode: snapshot`, which polls
+    /// the snapshot store on a fixed cadence and only reloads the accelerator
+    /// when a strictly newer snapshot is available. Snapshot mode never
+    /// regresses the accelerator to an older snapshot id.
+    ///
+    /// # Errors
+    ///
+    /// Same errors as [`SnapshotManager::download_latest_snapshot`].
+    /// Download the latest snapshot if it is strictly newer than
+    /// `current_local_id`. The optional `validate_schema` callback is given
+    /// the snapshot metadata's recorded schema **before** any bytes are
+    /// downloaded or written to disk; if it returns false a schema
+    /// mismatch is reported and the accelerator's primary file is left
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// Same errors as [`SnapshotManager::download_latest_snapshot`], plus
+    /// [`SnapshotDownloadError::SchemaMismatch`] when `validate_schema`
+    /// rejects the metadata schema.
+    pub async fn download_if_newer(
+        &self,
+        current_local_id: Option<u64>,
+        validate_schema: Option<&(dyn Fn(&SchemaRef) -> bool + Send + Sync)>,
+    ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
+        let Some(remote_id) = self.remote_current_snapshot_id().await? else {
+            return Ok(None);
+        };
+        match current_local_id {
+            Some(local_id) if remote_id <= local_id => {
+                if remote_id < local_id {
+                    tracing::warn!(
+                        dataset = %self.dataset_name,
+                        remote_snapshot_id = remote_id,
+                        local_snapshot_id = local_id,
+                        "snapshot metadata current id is older than the locally loaded snapshot; \
+                         skipping reload to avoid regression"
+                    );
+                }
+                Ok(None)
+            }
+            _ => {
+                // Inspect the metadata-recorded schema first, before
+                // touching the file: an incompatible snapshot must never
+                // overwrite the accelerator's current primary file. If a
+                // validator is provided we require the remote metadata to
+                // expose a parseable schema for this dataset — missing or
+                // malformed schema metadata is treated as a validation
+                // failure rather than silently skipped.
+                if let Some(validate) = validate_schema {
+                    let handle = self.load_metadata().await.map_err(|e| match e {
+                        MetadataLoadError::Read { path, source } => {
+                            SnapshotDownloadError::ReadMetadata { path, source }
+                        }
+                        MetadataLoadError::Parse { path, source } => {
+                            SnapshotDownloadError::ParseMetadata { path, source }
+                        }
+                        MetadataLoadError::UnsupportedVersion { path, version } => {
+                            SnapshotDownloadError::UnsupportedMetadataVersion { path, version }
+                        }
+                    })?;
+                    let handle = handle.ok_or_else(|| SnapshotDownloadError::SchemaMismatch {
+                        dataset: self.dataset_name.clone(),
+                    })?;
+                    let dataset_metadata = handle
+                        .metadata
+                        .datasets
+                        .get(&self.dataset_name)
+                        .ok_or_else(|| SnapshotDownloadError::SchemaMismatch {
+                            dataset: self.dataset_name.clone(),
+                        })?;
+                    let metadata_schema = dataset_metadata.current_schema().ok_or_else(|| {
+                        SnapshotDownloadError::SchemaMismatch {
+                            dataset: self.dataset_name.clone(),
+                        }
+                    })?;
+                    let metadata_schema_ref =
+                        metadata_schema.to_schema_ref().map_err(|source| {
+                            SnapshotDownloadError::MetadataSchemaDeserialize {
+                                dataset: self.dataset_name.clone(),
+                                source,
+                            }
+                        })?;
+                    if !validate(&metadata_schema_ref) {
+                        return Err(SnapshotDownloadError::SchemaMismatch {
+                            dataset: self.dataset_name.clone(),
+                        });
+                    }
+                }
+
+                self.download_latest_snapshot().await
+            }
+        }
     }
 
     /// Creates a new snapshot by streaming the local acceleration file to object storage.
@@ -1150,7 +1291,20 @@ impl SnapshotManager {
         destination_location: &ObjectPath,
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<(u64, String), SnapshotUploadError> {
-        use crate::snapshot::directory_archive::archive_directories;
+        use crate::snapshot::directory_archive::archive_directories_with_plan;
+
+        // Step 0: Ask the engine for any per-directory skip list / extras.
+        let plan = self
+            .snapshot_engine
+            .prepare_directory_snapshot(dirs, &self.dataset_name)
+            .await
+            .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+        let skip_paths: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
+        let extras: Vec<(String, Vec<u8>)> = plan
+            .extra_entries
+            .into_iter()
+            .map(|e| (e.archive_path, e.bytes))
+            .collect();
 
         // Step 1: Create a temporary tar archive of all directories
         let temp_archive_path = std::env::temp_dir().join(format!(
@@ -1167,12 +1321,13 @@ impl SnapshotManager {
                 source,
             })?;
 
-        let total_archived = archive_directories(dirs, archive_file)
-            .await
-            .map_err(|source| SnapshotUploadError::ArchiveCreate {
-                path: temp_archive_path.clone(),
-                source: std::io::Error::other(source.to_string()),
-            })?;
+        let total_archived =
+            archive_directories_with_plan(dirs, archive_file, &skip_paths, &extras)
+                .await
+                .map_err(|source| SnapshotUploadError::ArchiveCreate {
+                    path: temp_archive_path.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })?;
 
         tracing::debug!(
             "Created tar archive for snapshot. dataset={} archive_size={}",
@@ -1705,6 +1860,7 @@ impl SnapshotManager {
                 "Snapshot restored to {local_path_display}"
             );
             Ok(SnapshotDownloadInfo {
+                snapshot_id: entry.snapshot_id,
                 schema,
                 bytes_downloaded: actual_size,
                 checksum: actual_checksum,
@@ -1739,9 +1895,28 @@ impl SnapshotManager {
         }
 
         let mut stream = get_result.into_stream();
-        let mut file = fs::File::create(local_path).await.map_err(|source| {
+
+        // Write to a sibling temp file then atomically rename into the primary
+        // path. This guarantees concurrent readers (e.g. an active accelerator
+        // running in `refresh_mode: snapshot`) never observe a half-written or
+        // truncated file: they either see the previous complete snapshot or
+        // the new complete snapshot.
+        let temp_path = match local_path.file_name() {
+            Some(name) => {
+                let mut tmp_name = std::ffi::OsString::from(".");
+                tmp_name.push(name);
+                tmp_name.push(".download.tmp");
+                local_path.with_file_name(tmp_name)
+            }
+            None => local_path.with_extension("download.tmp"),
+        };
+        // Best-effort cleanup of any leftover temp file from a previous failed
+        // download; ignore errors (e.g. file does not exist).
+        let _ = fs::remove_file(&temp_path).await;
+
+        let mut file = fs::File::create(&temp_path).await.map_err(|source| {
             SnapshotDownloadError::WriteLocal {
-                path: local_path.clone(),
+                path: temp_path.clone(),
                 source,
             }
         })?;
@@ -1753,7 +1928,7 @@ impl SnapshotManager {
             let chunk = match chunk_result {
                 Ok(chunk) => chunk,
                 Err(source) => {
-                    let _ = fs::remove_file(local_path).await;
+                    let _ = fs::remove_file(&temp_path).await;
                     return Err(SnapshotDownloadError::DownloadBytes {
                         path: path_display.to_string(),
                         source,
@@ -1765,7 +1940,82 @@ impl SnapshotManager {
             hasher.update(&chunk);
 
             if let Err(source) = file.write_all(&chunk).await {
-                let _ = fs::remove_file(local_path).await;
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(SnapshotDownloadError::WriteLocal {
+                    path: temp_path.clone(),
+                    source,
+                });
+            }
+        }
+
+        if let Err(source) = file.flush().await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(SnapshotDownloadError::WriteLocal {
+                path: temp_path.clone(),
+                source,
+            });
+        }
+        // fsync the temp file before rename so the downloaded bytes are
+        // durable in the temp file. Crash durability of the renamed primary
+        // path also requires syncing the parent directory after the rename;
+        // we do that below once the rename has succeeded.
+        if let Err(source) = file.sync_all().await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(SnapshotDownloadError::WriteLocal {
+                path: temp_path.clone(),
+                source,
+            });
+        }
+        drop(file);
+
+        // Validate before renaming so a corrupt download never replaces the
+        // current good file at the primary path.
+        let actual_checksum = match self
+            .validate_snapshot(entry, actual_size, hasher, &temp_path, path_display)
+            .await
+        {
+            Ok(checksum) => checksum,
+            Err(e) => {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(e);
+            }
+        };
+
+        // `tokio::fs::rename` defers to `std::fs::rename`, which on every
+        // tier-1 platform we ship for performs a destination-replacing move:
+        //
+        //   - Unix: `rename(2)` atomically replaces an existing file at the
+        //     destination on the same filesystem.
+        //   - Windows: `MoveFileExW` is invoked with `MOVEFILE_REPLACE_EXISTING`
+        //     so the destination is replaced when present (subject to the
+        //     usual Windows constraint that no other process/handle holds the
+        //     destination open with sharing flags that disallow replacement).
+        //
+        // If the platform-level rename fails with `AlreadyExists` (older or
+        // unusual Windows configurations where the replace flag was not
+        // honored), fall back to an explicit remove + rename. This loses
+        // strict atomicity for an instant, but is acceptable here because the
+        // accelerator's connection pool is invalidated immediately after this
+        // call as part of `reload_from_snapshot`, so there is no concurrent
+        // reader between the remove and the rename.
+        if let Err(source) = fs::rename(&temp_path, local_path).await {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                if let Err(remove_err) = fs::remove_file(local_path).await {
+                    let _ = fs::remove_file(&temp_path).await;
+                    return Err(SnapshotDownloadError::WriteLocal {
+                        path: local_path.clone(),
+                        source: remove_err,
+                    });
+                }
+                if let Err(retry_err) = fs::rename(&temp_path, local_path).await {
+                    let _ = fs::remove_file(&temp_path).await;
+                    return Err(SnapshotDownloadError::WriteLocal {
+                        path: local_path.clone(),
+                        source: retry_err,
+                    });
+                }
+            } else {
+                let _ = fs::remove_file(&temp_path).await;
                 return Err(SnapshotDownloadError::WriteLocal {
                     path: local_path.clone(),
                     source,
@@ -1773,18 +2023,16 @@ impl SnapshotManager {
             }
         }
 
-        if let Err(source) = file.flush().await {
-            let _ = fs::remove_file(local_path).await;
-            return Err(SnapshotDownloadError::WriteLocal {
-                path: local_path.clone(),
-                source,
-            });
+        // Best-effort fsync of the parent directory so the rename's directory
+        // entry update is durable across a crash. POSIX requires this in
+        // addition to fsync of the file itself; on platforms where directory
+        // fsync is not supported (or returns EINVAL/ENOTDIR) we silently fall
+        // back to relying on the rename's own metadata journaling.
+        if let Some(parent) = local_path.parent()
+            && let Ok(dir) = fs::File::open(parent).await
+        {
+            let _ = dir.sync_all().await;
         }
-        drop(file);
-
-        let actual_checksum = self
-            .validate_snapshot(entry, actual_size, hasher, local_path, path_display)
-            .await?;
 
         Ok((actual_size, actual_checksum))
     }
@@ -1914,6 +2162,18 @@ impl SnapshotManager {
                 path: temp_archive_path.clone(),
                 source: std::io::Error::other(source.to_string()),
             })?;
+
+        if let Err(source) = self
+            .snapshot_engine
+            .finalize_directory_snapshot(dirs, &self.dataset_name)
+            .await
+        {
+            let _ = fs::remove_file(&temp_archive_path).await;
+            return Err(SnapshotDownloadError::ArchiveExtract {
+                path: temp_archive_path.clone(),
+                source: std::io::Error::other(format!("engine finalize failed: {source}")),
+            });
+        }
 
         // Cleanup temp archive
         let _ = fs::remove_file(&temp_archive_path).await;
@@ -2742,6 +3002,28 @@ mod tests {
         )]))
     }
 
+    /// Writes a sample local accelerator file appropriate for the engine.
+    /// For SQLite/Turso, creates a real (empty) SQLite WAL-mode database
+    /// so that the engine's `checkpoint_live` hook can open it. For other
+    /// engines, writes opaque test bytes since no engine-side validation
+    /// runs against the file pre-snapshot.
+    fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
+        match engine {
+            #[cfg(any(feature = "sqlite", feature = "turso"))]
+            AccelerationEngine::Sqlite | AccelerationEngine::Turso => {
+                let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
+                conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+                    .expect("set wal");
+                conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY)", [])
+                    .expect("create sample table");
+                drop(conn);
+            }
+            _ => {
+                std::fs::write(path, b"test snapshot content").expect("write test file");
+            }
+        }
+    }
+
     /// Builds a `SnapshotManager` for the specified engine type.
     /// This enables testing snapshot functionality across all accelerator backends.
     fn build_manager_for_engine(
@@ -2924,10 +3206,119 @@ mod tests {
         assert_eq!(info.schema.as_ref(), schema.as_ref());
         assert_eq!(info.bytes_downloaded, contents.len() as u64);
         assert_eq!(info.checksum, checksum);
+        assert_eq!(info.snapshot_id, 0);
         let downloaded = fs::read(&local_path)
             .await
             .expect("read downloaded snapshot");
         assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn download_if_newer_returns_none_when_local_id_matches() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+        let contents = Bytes::from_static(b"snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+        let entry = SnapshotEntry {
+            snapshot_id: 7,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: compute_sha256_hex(contents.as_ref()),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(&schema, vec![entry], Some(7)),
+            )]),
+        };
+        let metadata_path = base.child(METADATA_FILE_NAME);
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let result = manager
+            .download_if_newer(Some(7), None)
+            .await
+            .expect("download_if_newer should succeed");
+        assert!(result.is_none(), "matching ids must not download");
+        assert!(
+            !local_path.exists(),
+            "local file must not be written when nothing is newer"
+        );
+
+        // A strictly older local id should still NOT trigger a download to
+        // an *older* remote snapshot (regression-safety): only a strictly
+        // newer remote snapshot causes a reload. Here the remote current id
+        // is 7 and the local id we claim is 8, so this must be a no-op.
+        let result = manager
+            .download_if_newer(Some(8), None)
+            .await
+            .expect("download_if_newer should succeed");
+        assert!(
+            result.is_none(),
+            "local id ahead of remote must not regress"
+        );
+        assert!(
+            !local_path.exists(),
+            "local file must not be written when remote is older"
+        );
+
+        // A strictly older local id (6) than the remote (7) should download.
+        let info = manager
+            .download_if_newer(Some(6), None)
+            .await
+            .expect("download_if_newer should succeed")
+            .expect("expected newer snapshot to be downloaded");
+        assert_eq!(info.snapshot_id, 7);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn download_if_newer_returns_none_when_no_metadata() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+        let result = manager
+            .download_if_newer(None, None)
+            .await
+            .expect("download_if_newer should succeed");
+        assert!(result.is_none());
+        assert!(!local_path.exists());
     }
 
     #[tokio::test]
@@ -4033,7 +4424,7 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.db");
-        std::fs::write(&local_path, b"test snapshot content").expect("write test file");
+        write_sample_local_db(&local_path, engine);
 
         let schema = sample_schema();
         let manager = build_manager_for_engine(
