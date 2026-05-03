@@ -145,19 +145,14 @@ impl DuckLakeCatalogProvider {
                     source: "Failed to downcast to DuckDbConnection during schema refresh".into(),
                 })?;
 
-            // Escape the catalog name for use as a quoted identifier by doubling any embedded quotes.
-            let escaped_catalog_name = catalog_name.replace('"', "\"\"");
-            let sql = format!(
-                r#"SELECT DISTINCT schema_name 
-                   FROM "{escaped_catalog_name}".information_schema.schemata 
+            // Query the global information_schema, filtering by catalog name.
+            // DuckLake catalogs don't expose information_schema under their own catalog prefix.
+            let sql = r"SELECT DISTINCT schema_name 
+                   FROM information_schema.schemata 
                    WHERE catalog_name = ?
-                   ORDER BY schema_name"#
-            );
+                   ORDER BY schema_name";
 
-            let mut stmt = duckdb_wrapper
-                .conn
-                .prepare(&sql)
-                .context(QueryFailedSnafu)?;
+            let mut stmt = duckdb_wrapper.conn.prepare(sql).context(QueryFailedSnafu)?;
             let rows = stmt
                 .query_map([&catalog_name], |row| row.get::<_, String>(0))
                 .context(QueryFailedSnafu)?;
@@ -460,20 +455,15 @@ impl DuckLakeSchemaProvider {
                     source: "Failed to downcast to DuckDbConnection during table refresh".into(),
                 })?;
 
-            // Escape the catalog name for use as a quoted identifier by doubling any embedded quotes.
-            let escaped_catalog_name = catalog_name.replace('"', "\"\"");
-            let sql = format!(
-                r#"SELECT DISTINCT table_name 
-                   FROM "{escaped_catalog_name}".information_schema.tables 
+            // Query the global information_schema, filtering by catalog and schema name.
+            // DuckLake catalogs don't expose information_schema under their own catalog prefix.
+            let sql = r"SELECT DISTINCT table_name 
+                   FROM information_schema.tables 
                    WHERE table_catalog = ?
                      AND table_schema = ?
-                   ORDER BY table_name"#
-            );
+                   ORDER BY table_name";
 
-            let mut stmt = duckdb_wrapper
-                .conn
-                .prepare(&sql)
-                .context(QueryFailedSnafu)?;
+            let mut stmt = duckdb_wrapper.conn.prepare(sql).context(QueryFailedSnafu)?;
             let rows = stmt
                 .query_map([&catalog_name, &schema_name], |row| row.get::<_, String>(0))
                 .context(QueryFailedSnafu)?;
