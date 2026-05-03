@@ -56,7 +56,7 @@ impl ListToolElement {
 #[cfg_attr(feature = "openapi", into_params(parameter_in = Query))]
 pub(crate) struct SearchToolsQuery {
     /// Embedding model name to use for searchable tool discovery. Required only when multiple embedding models are configured.
-    tool_embedding_model: Option<String>,
+    embedding_model: Option<String>,
 }
 
 /// List Tools
@@ -114,7 +114,7 @@ pub(crate) async fn search(
     Extension(rt): Extension<Arc<Runtime>>,
     Query(query): Query<SearchToolsQuery>,
 ) -> Response {
-    match tool_registry_prompt_tools(Arc::clone(&rt), query.tool_embedding_model.as_deref()).await {
+    match tool_registry_prompt_tools(Arc::clone(&rt), query.embedding_model.as_deref()).await {
         Ok(tools) => {
             let tools = tools
                 .iter()
@@ -136,7 +136,7 @@ pub(crate) async fn search(
     tag = "Tools",
     params(
         ("name" = String, Path, description = "Name of the tool"),
-        ("tool_embedding_model" = Option<String>, Query, description = "Embedding model to use when invoking the searchable tool registry's tool_search meta-tool")
+        ("embedding_model" = Option<String>, Query, description = "Embedding model to use when invoking the searchable tool registry's tool_search meta-tool")
     ),
     request_body(
         description = "Tool specific input parameters. See /v1/tools for parameter schema.",
@@ -183,7 +183,7 @@ pub(crate) async fn post(
     let tool = match get_tool_registry_tool(
         Arc::clone(&rt),
         tool_name.as_str(),
-        query.tool_embedding_model.as_deref(),
+        query.embedding_model.as_deref(),
     )
     .await
     {
