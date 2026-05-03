@@ -41,6 +41,9 @@ const RUNTIME_REQUESTS_PER_MINUTE_LIMIT: &str = "http_requests_per_minute_limit"
 const RUNTIME_RATE_CONTROL_JITTER_MIN: &str = "http_rate_control_jitter_min";
 const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
 
+// Fallback for direct connector construction without a Runtime. Factory-created
+// connectors use Runtime's per-instance registry so reloads/tests do not reuse
+// stale origin state.
 static GLOBAL_HTTP_RATE_CONTROL_REGISTRY: LazyLock<Arc<HttpRateControlRegistry>> =
     LazyLock::new(|| Arc::new(HttpRateControlRegistry::default()));
 
