@@ -442,9 +442,8 @@ mod tests {
         };
         let dataset = test_dataset("https://graphql-invalid-limit.example.com/graphql").await;
 
-        let error = match graphql.get_client(&dataset).await {
-            Ok(_) => panic!("zero GraphQL rate-control limit should be rejected"),
-            Err(error) => error,
+        let Err(error) = graphql.get_client(&dataset).await else {
+            panic!("zero GraphQL rate-control limit should be rejected");
         };
 
         match error {

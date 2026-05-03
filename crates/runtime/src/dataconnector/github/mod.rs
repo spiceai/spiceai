@@ -77,7 +77,9 @@ mod stargazers;
 mod workflow_runs;
 mod workflows;
 
-static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, (usize, Arc<Semaphore>)>>> =
+type GitHubConcurrencyLimits = HashMap<String, (usize, Arc<Semaphore>)>;
+
+static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<GitHubConcurrencyLimits>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
@@ -1945,9 +1947,8 @@ mod tests {
         )
         .await;
 
-        let error = match GithubFactory::new().create(params).await {
-            Ok(_) => panic!("zero GitHub max_concurrent_requests should be rejected"),
-            Err(error) => error,
+        let Err(error) = GithubFactory::new().create(params).await else {
+            panic!("zero GitHub max_concurrent_requests should be rejected");
         };
         let message = expect_invalid_configuration_message(error);
 
@@ -1979,9 +1980,8 @@ mod tests {
             &[("max_concurrent_requests", "3")],
         )
         .await;
-        let error = match factory.create(second).await {
-            Ok(_) => panic!("conflicting GitHub concurrency limits should be rejected"),
-            Err(error) => error,
+        let Err(error) = factory.create(second).await else {
+            panic!("conflicting GitHub concurrency limits should be rejected");
         };
         let message = expect_invalid_configuration_message(error);
 

@@ -1640,9 +1640,8 @@ mod tests {
         )
         .await;
 
-        let error = match connector.resolve_http_provider_params(&dataset) {
-            Ok(_) => panic!("zero rate-control limits should be rejected"),
-            Err(error) => error,
+        let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+            panic!("zero rate-control limits should be rejected");
         };
 
         match error {
@@ -1671,9 +1670,8 @@ mod tests {
         )
         .await;
 
-        let error = match connector.resolve_http_provider_params(&dataset) {
-            Ok(_) => panic!("invalid rate-control jitter ranges should be rejected"),
-            Err(error) => error,
+        let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+            panic!("invalid rate-control jitter ranges should be rejected");
         };
 
         match error {

@@ -43,52 +43,49 @@ pub trait RateLimiter: Debug + Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct HttpRateLimiterMetrics {
-    retry_after_updates_total: AtomicU64,
-    retry_after_waits_total: AtomicU64,
-    retry_after_wait_duration_ms_total: AtomicU64,
-    retry_after_deadline_unix_ms: AtomicU64,
+    updates_total: AtomicU64,
+    waits_total: AtomicU64,
+    wait_duration_ms_total: AtomicU64,
+    deadline_unix_ms: AtomicU64,
 }
 
 impl HttpRateLimiterMetrics {
     #[must_use]
     pub fn retry_after_updates_total(&self) -> u64 {
-        self.retry_after_updates_total.load(Ordering::Relaxed)
+        self.updates_total.load(Ordering::Relaxed)
     }
 
     #[must_use]
     pub fn retry_after_waits_total(&self) -> u64 {
-        self.retry_after_waits_total.load(Ordering::Relaxed)
+        self.waits_total.load(Ordering::Relaxed)
     }
 
     #[must_use]
     pub fn retry_after_wait_duration_ms_total(&self) -> u64 {
-        self.retry_after_wait_duration_ms_total
-            .load(Ordering::Relaxed)
+        self.wait_duration_ms_total.load(Ordering::Relaxed)
     }
 
     #[must_use]
     pub fn retry_after_remaining_ms(&self) -> u64 {
-        let deadline = self.retry_after_deadline_unix_ms.load(Ordering::Relaxed);
+        let deadline = self.deadline_unix_ms.load(Ordering::Relaxed);
         let now = system_time_unix_ms(SystemTime::now());
         deadline.saturating_sub(now)
     }
 
     fn record_retry_after_update(&self, deadline_unix_ms: u64) {
-        self.retry_after_updates_total
-            .fetch_add(1, Ordering::Relaxed);
-        self.retry_after_deadline_unix_ms
+        self.updates_total.fetch_add(1, Ordering::Relaxed);
+        self.deadline_unix_ms
             .fetch_max(deadline_unix_ms, Ordering::Relaxed);
     }
 
     fn record_retry_after_wait(&self, duration: Duration) {
-        self.retry_after_waits_total.fetch_add(1, Ordering::Relaxed);
-        self.retry_after_wait_duration_ms_total
+        self.waits_total.fetch_add(1, Ordering::Relaxed);
+        self.wait_duration_ms_total
             .fetch_add(duration_millis_u64(duration), Ordering::Relaxed);
     }
 
     fn clear_retry_after_deadline(&self) {
-        self.retry_after_deadline_unix_ms
-            .store(0, Ordering::Relaxed);
+        self.deadline_unix_ms.store(0, Ordering::Relaxed);
     }
 }
 

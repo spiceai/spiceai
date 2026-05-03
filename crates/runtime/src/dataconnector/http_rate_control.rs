@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
@@ -315,7 +316,7 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             }))),
             "rate_control_max_concurrent_requests" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(metrics.max_concurrent_requests(), &attributes)
+                    observer.observe(metrics.max_concurrent_requests(), &attributes);
                 })))
             }
             "rate_control_requests_per_second_limit" => {
@@ -346,7 +347,7 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             }
             "rate_control_available_permits" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(metrics.available_permits(), &attributes)
+                    observer.observe(metrics.available_permits(), &attributes);
                 })))
             }
             "rate_control_acquisitions_total" => {
@@ -433,9 +434,9 @@ pub fn parameter_specs() -> [ParameterSpec; 5] {
     ]
 }
 
-pub fn resolve_config(
+pub fn resolve_config<S: BuildHasher>(
     params: &Parameters,
-    runtime_params: Option<&HashMap<String, String>>,
+    runtime_params: Option<&HashMap<String, String, S>>,
     dataset: &Dataset,
     dataconnector: &'static str,
 ) -> DataConnectorResult<HttpRateControlConfig> {
@@ -516,12 +517,11 @@ pub fn claim_metrics_owner(base_url: &Url, owner: &str) -> bool {
         return false;
     };
 
-    match metric_owners.get(&key) {
-        Some(existing_owner) => existing_owner == owner,
-        None => {
-            metric_owners.insert(key, owner.to_string());
-            true
-        }
+    if let Some(existing_owner) = metric_owners.get(&key) {
+        existing_owner == owner
+    } else {
+        metric_owners.insert(key, owner.to_string());
+        true
     }
 }
 
@@ -588,9 +588,9 @@ fn resolve_existing_controller(
     conflicting_config_error(dataset, dataconnector, key)
 }
 
-fn parse_optional_nonzero_u32_param(
+fn parse_optional_nonzero_u32_param<S: BuildHasher>(
     params: &Parameters,
-    runtime_params: Option<&HashMap<String, String>>,
+    runtime_params: Option<&HashMap<String, String, S>>,
     dataset: &Dataset,
     dataconnector: &'static str,
     parameter_name: &str,
@@ -635,9 +635,9 @@ fn parse_optional_nonzero_u32_param(
     })
 }
 
-fn parse_optional_nonzero_usize_param(
+fn parse_optional_nonzero_usize_param<S: BuildHasher>(
     params: &Parameters,
-    runtime_params: Option<&HashMap<String, String>>,
+    runtime_params: Option<&HashMap<String, String, S>>,
     dataset: &Dataset,
     dataconnector: &'static str,
     parameter_name: &str,
@@ -684,9 +684,9 @@ fn parse_optional_nonzero_usize_param(
     Ok(Some(value))
 }
 
-fn parse_optional_duration_param(
+fn parse_optional_duration_param<S: BuildHasher>(
     params: &Parameters,
-    runtime_params: Option<&HashMap<String, String>>,
+    runtime_params: Option<&HashMap<String, String, S>>,
     dataset: &Dataset,
     dataconnector: &'static str,
     parameter_name: &str,
@@ -716,8 +716,7 @@ fn parse_optional_duration_param(
         DataConnectorError::InvalidConfiguration {
             dataconnector: dataconnector.to_string(),
             message: format!(
-                "The '{}' parameter must be a valid duration such as '10ms', '1s', or '0ms'.",
-                display_name
+                "The '{display_name}' parameter must be a valid duration such as '10ms', '1s', or '0ms'."
             ),
             connector_component: ConnectorComponent::from(dataset),
             source: source.into(),
@@ -725,9 +724,9 @@ fn parse_optional_duration_param(
     })
 }
 
-fn with_jitter(
+fn with_jitter<S: BuildHasher>(
     params: &Parameters,
-    runtime_params: Option<&HashMap<String, String>>,
+    runtime_params: Option<&HashMap<String, String, S>>,
     dataset: &Dataset,
     dataconnector: &'static str,
     mut config: HttpRateControlConfig,
@@ -790,9 +789,9 @@ fn with_jitter(
     Ok(config)
 }
 
-fn runtime_or_dataset_param_name(
+fn runtime_or_dataset_param_name<S: BuildHasher>(
     params: &Parameters,
-    runtime_params: Option<&HashMap<String, String>>,
+    runtime_params: Option<&HashMap<String, String, S>>,
     parameter_name: &str,
     runtime_parameter_name: &'static str,
 ) -> String {
@@ -807,6 +806,7 @@ fn runtime_or_dataset_param_name(
     }
 }
 
+#[must_use]
 pub fn rate_control_key(base_url: &Url) -> String {
     let scheme = base_url.scheme();
     let host = base_url.host_str().unwrap_or_default().to_ascii_lowercase();
