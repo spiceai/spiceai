@@ -1079,12 +1079,7 @@ mod tests {
         mock_tool_with_parameters(
             name,
             description,
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"}
-                }
-            }),
+            json!({"type": "object", "properties": {}}),
             response,
         )
     }
