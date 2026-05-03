@@ -21,7 +21,9 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use ::search::aggregation::reciprocal_rank::{DEFAULT_RRF_K, reciprocal_rank_fusion_scores};
+use ::search::aggregation::reciprocal_rank::{
+    DEFAULT_RRF_K, reciprocal_rank_fusion_scores, usize_to_f64,
+};
 use async_trait::async_trait;
 use llms::embeddings::{Embed, EmbeddingInput};
 use schemars::JsonSchema;
@@ -46,6 +48,7 @@ pub(crate) const TOOL_EMBEDDING_MODEL_PARAM: &str = "tool_embedding_model";
 const DEFAULT_SEARCH_LIMIT: usize = 5;
 const MAX_SEARCH_LIMIT: usize = 20;
 const AUTO_SEARCH_TOOL_THRESHOLD: usize = 20;
+const TOOL_REGISTRY_SEARCH_TOOL_CACHE_MAX_ENTRIES: usize = 64;
 
 static TOOL_REGISTRY_SEARCH_TOOL_CACHE: LazyLock<
     tokio::sync::RwLock<HashMap<ToolRegistrySearchCacheKey, Arc<ToolRegistrySearchTool>>>,
@@ -73,6 +76,11 @@ enum ToolRegistryError {
         tool_id: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Tool name '{tool_name}' is reserved for the searchable tool registry. Rename the configured tool or disable searchable registry tools."
+    ))]
+    ReservedToolName { tool_name: String },
 }
 
 pub(crate) async fn prepare_model_tools(
@@ -83,12 +91,21 @@ pub(crate) async fn prepare_model_tools(
 ) -> Result<Vec<Arc<dyn SpiceModelTool>>, Box<dyn std::error::Error + Send + Sync>> {
     match opts {
         SpiceToolsOptions::SearchRegistry => {
+            ensure_no_reserved_tool_registry_name_conflicts(&tools)?;
             let embedding_model =
                 resolve_tool_registry_embedding_model(Arc::clone(&rt), embedding_model_name)
                     .await?;
             Ok(tool_registry_tools(tools, embedding_model))
         }
         SpiceToolsOptions::Auto if should_auto_search(tools.len()) => {
+            if let Some(tool_name) = reserved_tool_registry_name_conflict(&tools) {
+                tracing::warn!(
+                    "Unable to use searchable tool registry for tools: auto: tool name '{}' is reserved for the searchable tool registry. Falling back to direct tool definitions.",
+                    tool_name
+                );
+                return Ok(tools);
+            }
+
             match resolve_tool_registry_embedding_model(Arc::clone(&rt), embedding_model_name).await
             {
                 Ok(embedding_model) => Ok(tool_registry_tools(tools, embedding_model)),
@@ -111,6 +128,27 @@ pub(crate) async fn prepare_model_tools(
 
 fn should_auto_search(tool_count: usize) -> bool {
     tool_count > AUTO_SEARCH_TOOL_THRESHOLD
+}
+
+fn is_reserved_tool_registry_name(tool_name: &str) -> bool {
+    matches!(tool_name, TOOL_SEARCH_NAME | TOOL_INVOKE_NAME)
+}
+
+fn reserved_tool_registry_name_conflict(tools: &[Arc<dyn SpiceModelTool>]) -> Option<String> {
+    tools.iter().find_map(|tool| {
+        let tool_name = tool.name();
+        is_reserved_tool_registry_name(tool_name.as_ref()).then(|| tool_name.into_owned())
+    })
+}
+
+fn ensure_no_reserved_tool_registry_name_conflicts(
+    tools: &[Arc<dyn SpiceModelTool>],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(tool_name) = reserved_tool_registry_name_conflict(tools) {
+        return Err(Box::new(ToolRegistryError::ReservedToolName { tool_name }));
+    }
+
+    Ok(())
 }
 
 #[must_use]
@@ -153,6 +191,7 @@ pub(crate) async fn tool_registry_prompt_tools(
     embedding_model_name: Option<&str>,
 ) -> Result<Vec<Arc<dyn SpiceModelTool>>, Box<dyn std::error::Error + Send + Sync>> {
     let tools = Arc::new(get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await);
+    ensure_no_reserved_tool_registry_name_conflicts(tools.as_slice())?;
     let (resolved_embedding_model_name, embedding_model) =
         resolve_tool_registry_embedding_model_with_name(Arc::clone(&rt), embedding_model_name)
             .await?;
@@ -172,6 +211,10 @@ pub(crate) async fn get_tool_registry_tool(
     tool_name: &str,
     embedding_model_name: Option<&str>,
 ) -> Result<Option<Arc<dyn SpiceModelTool>>, Box<dyn std::error::Error + Send + Sync>> {
+    if is_reserved_tool_registry_name(tool_name) && rt.get_tool(tool_name).await.is_some() {
+        return Ok(None);
+    }
+
     match tool_name {
         TOOL_SEARCH_NAME => {
             let tools =
@@ -242,6 +285,13 @@ async fn cached_tool_registry_search_tool(
     }
 
     let mut cache = TOOL_REGISTRY_SEARCH_TOOL_CACHE.write().await;
+    if cache.len() >= TOOL_REGISTRY_SEARCH_TOOL_CACHE_MAX_ENTRIES
+        && !cache.contains_key(&key)
+        && let Some(evicted_key) = cache.keys().next().cloned()
+    {
+        cache.remove(&evicted_key);
+    }
+
     let tool = cache.entry(key).or_insert_with(|| {
         Arc::new(ToolRegistrySearchTool::new(
             tools.as_slice(),
@@ -966,27 +1016,6 @@ fn token_count(counts: &HashMap<String, usize>, token: &str) -> usize {
     counts.get(token).copied().unwrap_or_default()
 }
 
-fn usize_to_f64(value: usize) -> f64 {
-    const CHUNK_BITS: usize = 16;
-    const CHUNK_BASE: f64 = 65_536.0;
-    const CHUNK_MASK: usize = (1usize << CHUNK_BITS) - 1;
-
-    let mut remaining = value;
-    let mut multiplier = 1.0;
-    let mut converted = 0.0;
-
-    while remaining > 0 {
-        let Ok(chunk) = u16::try_from(remaining & CHUNK_MASK) else {
-            return f64::INFINITY;
-        };
-        converted += f64::from(chunk) * multiplier;
-        remaining >>= CHUNK_BITS;
-        multiplier *= CHUNK_BASE;
-    }
-
-    converted
-}
-
 fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {
     if left.len() != right.len() || left.is_empty() {
         return 0.0;
@@ -1302,6 +1331,21 @@ mod tests {
     fn auto_search_threshold_only_triggers_for_large_tool_sets() {
         assert!(!should_auto_search(AUTO_SEARCH_TOOL_THRESHOLD));
         assert!(should_auto_search(AUTO_SEARCH_TOOL_THRESHOLD + 1));
+    }
+
+    #[test]
+    fn reserved_registry_tool_names_are_rejected() {
+        let (reserved_tool, _) = mock_tool(
+            TOOL_SEARCH_NAME,
+            "User configured tool with a reserved registry name",
+            json!(null),
+        );
+        let tools = vec![reserved_tool];
+
+        let error = ensure_no_reserved_tool_registry_name_conflicts(&tools)
+            .expect_err("reserved registry tool names should be rejected");
+
+        assert!(error.to_string().contains("reserved"));
     }
 
     #[tokio::test]

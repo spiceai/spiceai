@@ -25,6 +25,7 @@ use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use serde_json::Value;
+use snafu::Snafu;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -35,6 +36,12 @@ use super::builtin::catalog::BuiltinToolCatalog;
 use super::factory::default_catalog_names;
 use super::{Tooling, options::SpiceToolsOptions};
 use tools::{SpiceModelTool, rename::with_name};
+
+#[derive(Debug, Snafu)]
+enum ToolUtilsError {
+    #[snafu(display("Failed to create table allowlist from model datasets: {source}"))]
+    CreateTableAllowlist { source: globset::Error },
+}
 
 /// Creates the messages that would be sent and received if a language model were to request the `tool`
 /// to be called (via an assistant message), with defined `arg`, and the response from running the
@@ -100,7 +107,7 @@ pub fn create_table_allowlist(
     ResolvedTableAwareAllowlist::with_defaults(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
         .with_table_patterns(datasets.to_vec())
         .map(Some)
-        .map_err(|e| format!("Failed to create table allowlist from model datasets: {e}").into())
+        .map_err(|source| Box::new(ToolUtilsError::CreateTableAllowlist { source }).into())
 }
 
 #[must_use]

@@ -58,15 +58,15 @@ pub fn reciprocal_rank_score(rank: usize, k: f64) -> f64 {
     1.0 / (usize_to_f64(rank) + k)
 }
 
-fn usize_to_f64(value: usize) -> f64 {
+#[must_use]
+pub fn usize_to_f64(value: usize) -> f64 {
     let mut remaining = value;
     let mut multiplier = 1.0;
     let mut converted = 0.0;
 
     while remaining > 0 {
-        let Ok(chunk) = u16::try_from(remaining & USIZE_TO_F64_CHUNK_MASK) else {
-            return f64::INFINITY;
-        };
+        let chunk_bytes = (remaining & USIZE_TO_F64_CHUNK_MASK).to_le_bytes();
+        let chunk = u16::from_le_bytes([chunk_bytes[0], chunk_bytes[1]]);
         converted += f64::from(chunk) * multiplier;
         remaining >>= USIZE_TO_F64_CHUNK_BITS;
         multiplier *= USIZE_TO_F64_CHUNK_BASE;

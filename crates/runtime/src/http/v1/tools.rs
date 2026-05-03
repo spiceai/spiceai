@@ -75,6 +75,12 @@ pub(crate) struct SearchToolsQuery {
                 {"name": "get_readiness", "description": "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.", "parameters": null},
                 {"name": "list_datasets", "description": "List all SQL tables available.", "parameters": null}
             ])
+        ),
+        (
+            status = 401,
+            description = "Tool routes require runtime auth to be configured",
+            body = serde_json::Value,
+            example = json!({"message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."})
         )
     )
 ))]
@@ -107,7 +113,13 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
                 {"name": "list_datasets", "description": "List all SQL tables available.", "parameters": null}
             ])
         ),
-        (status = 400, description = "Searchable tool registry is not configured", body = serde_json::Value)
+        (status = 400, description = "Searchable tool registry is not configured", body = serde_json::Value),
+        (
+            status = 401,
+            description = "Tool routes require runtime auth to be configured",
+            body = serde_json::Value,
+            example = json!({"message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."})
+        )
     )
 ))]
 pub(crate) async fn search(
@@ -169,7 +181,18 @@ pub(crate) async fn search(
             }]))
         ))),
         (status = 400, description = "Invalid searchable tool registry configuration", body = serde_json::Value),
-        (status = 404, description = "Tool not found", body = String, example="Tool no_sql not found"),
+        (
+            status = 401,
+            description = "Tool routes require runtime auth to be configured",
+            body = serde_json::Value,
+            example = json!({"message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."})
+        ),
+        (
+            status = 404,
+            description = "Tool not found",
+            body = serde_json::Value,
+            example = json!({"message": "Tool 'no_sql' not found"})
+        ),
         (status = 500, description = "An error occurred while calling the tool", body = serde_json::Value,
             example=json!({"message": "Error calling tool no_sql: No such tool"}))
     )
