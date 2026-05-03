@@ -767,6 +767,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("workflow_logs")
         .description("Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run. Defaults to 'disabled'.")
         .default("disabled"),
+    ParameterSpec::runtime("max_concurrent_requests")
+        .description("Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.params.github_max_concurrent_connections or the connector default."),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -801,7 +803,15 @@ impl DataConnectorFactory for GithubFactory {
             .ok()
             .map(ToString::to_string);
 
-        let max_concurrent_connections = params
+        let dataset_max_concurrent_requests = params
+            .parameters
+            .get("max_concurrent_requests")
+            .expose()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0);
+
+        let app_max_concurrent_connections = params
             .app
             .and_then(|app| {
                 app.runtime
@@ -810,6 +820,10 @@ impl DataConnectorFactory for GithubFactory {
                     .cloned()
             })
             .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0);
+
+        let max_concurrent_connections = dataset_max_concurrent_requests
+            .or(app_max_concurrent_connections)
             .unwrap_or(GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS);
 
         Box::pin(async move {

@@ -16,23 +16,37 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::graphql::{
-    self, client::GraphQLClient, provider::GraphQLTableProviderBuilder,
+    self, builder::GraphQLClientBuilder, client::GraphQLClient,
+    provider::GraphQLTableProviderBuilder,
 };
+use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
+use runtime::component::metrics::MetricsProvider;
+use runtime::dataconnector::http_rate_control::{
+    HttpRateControlMetrics, HttpRateControlMetricsProvider,
+};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, default_spice_client,
+    DataConnectorResult, NewDataConnectorResult, default_spice_client, http_rate_control,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
-use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, LazyLock},
+};
 use token_provider::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
 #[derive(Debug)]
 pub struct GraphQL {
     params: Parameters,
+    runtime_rate_control_params: Option<HashMap<String, String>>,
+    metrics: Arc<HttpRateControlMetrics>,
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -50,29 +64,34 @@ impl GraphQLFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[
-    // Connector parameters
-    ParameterSpec::component("auth_header")
-        .description("A custom header name to use for authentication instead of the default 'Authorization: Bearer' header. When set, the value of 'auth_token' is sent as the value of this header."),
-    ParameterSpec::component("auth_token")
-        .description("The bearer token to use in the GraphQL requests.")
-        .secret(),
-    ParameterSpec::component("auth_user")
-        .description("The username to use for HTTP Basic Auth.")
-        .secret(),
-    ParameterSpec::component("auth_pass")
-        .description("The password to use for HTTP Basic Auth.")
-        .secret(),
-    ParameterSpec::component("query")
-        .description("The GraphQL query to execute.")
-        .required(),
-    // Runtime parameters
-    ParameterSpec::runtime("json_pointer")
-        .description("The JSON pointer to the data in the GraphQL response."),
-    ParameterSpec::runtime("unnest_depth").description(
-        "Depth level to automatically unnest objects to. By default, disabled if unspecified or 0.",
-    ),
-];
+static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut parameters = Vec::new();
+    parameters.extend_from_slice(&[
+        // Connector parameters
+        ParameterSpec::component("auth_header")
+            .description("A custom header name to use for authentication instead of the default 'Authorization: Bearer' header. When set, the value of 'auth_token' is sent as the value of this header."),
+        ParameterSpec::component("auth_token")
+            .description("The bearer token to use in the GraphQL requests.")
+            .secret(),
+        ParameterSpec::component("auth_user")
+            .description("The username to use for HTTP Basic Auth.")
+            .secret(),
+        ParameterSpec::component("auth_pass")
+            .description("The password to use for HTTP Basic Auth.")
+            .secret(),
+        ParameterSpec::component("query")
+            .description("The GraphQL query to execute.")
+            .required(),
+        // Runtime parameters
+        ParameterSpec::runtime("json_pointer")
+            .description("The JSON pointer to the data in the GraphQL response."),
+        ParameterSpec::runtime("unnest_depth").description(
+            "Depth level to automatically unnest objects to. By default, disabled if unspecified or 0.",
+        ),
+    ]);
+    parameters.extend_from_slice(&http_rate_control::parameter_specs());
+    parameters
+});
 
 impl DataConnectorFactory for GraphQLFactory {
     fn as_any(&self) -> &dyn Any {
@@ -84,8 +103,13 @@ impl DataConnectorFactory for GraphQLFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
+            let runtime_rate_control_params =
+                params.app.as_ref().map(|app| app.runtime.params.clone());
+
             let graphql = GraphQL {
                 params: params.parameters,
+                runtime_rate_control_params,
+                metrics: Arc::new(HttpRateControlMetrics::default()),
             };
             Ok(Arc::new(graphql) as Arc<dyn DataConnector>)
         })
@@ -96,12 +120,12 @@ impl DataConnectorFactory for GraphQLFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        PARAMETERS
+        PARAMETERS.as_slice()
     }
 }
 
 impl GraphQL {
-    fn get_client(&self, dataset: &Dataset) -> DataConnectorResult<GraphQLClient> {
+    async fn get_client(&self, dataset: &Dataset) -> DataConnectorResult<GraphQLClient> {
         let token = self.params.get("auth_token").ok().map(|token| {
             Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
@@ -170,20 +194,33 @@ impl GraphQL {
                 source,
             })?;
 
-        GraphQLClient::new(
-            client,
+        let rate_control = http_rate_control::resolve_config(
+            &self.params,
+            self.runtime_rate_control_params.as_ref(),
+            dataset,
+            "graphql",
+        )?;
+        let rate_limiter = http_rate_control::shared_rate_limiter(&endpoint).await;
+        self.metrics.set_rate_limiter(&rate_limiter);
+        let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
+        let rate_controller =
+            http_rate_control::shared_rate_controller(&endpoint, &rate_control, dataset, "graphql")
+                .await?;
+        self.metrics.set_config(&rate_control);
+        self.metrics.set_rate_controller(rate_controller.as_ref());
+
+        GraphQLClientBuilder::new(
             endpoint,
-            json_pointer,
-            token,
-            user,
-            pass,
             graphql::client::UnnestBehavior::Depth(unnest_depth),
-            None,
-            None,
-            None,
-            None,
-            auth_header,
         )
+        .with_json_pointer(json_pointer)
+        .with_token_provider(token)
+        .with_user(user)
+        .with_pass(pass)
+        .with_rate_limiter(Some(rate_limiter))
+        .with_rate_controller(rate_controller)
+        .with_auth_header(auth_header)
+        .build(client)
         .boxed()
         .map_err(|source| DataConnectorError::InternalWithSource {
             dataconnector: "graphql".to_string(),
@@ -203,7 +240,7 @@ impl DataConnector for GraphQL {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = self.get_client(dataset)?;
+        let client = self.get_client(dataset).await?;
 
         let query = self.params.get("query").expose().ok_or_else(|p| {
             DataConnectorError::InvalidConfigurationNoSource {
@@ -235,6 +272,13 @@ impl DataConnector for GraphQL {
                     }
                 })?,
         ))
+    }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        Some(Arc::new(HttpRateControlMetricsProvider::new(
+            "graphql",
+            Arc::clone(&self.metrics),
+        )))
     }
 }
 
