@@ -26,6 +26,7 @@ use llms::embeddings::{Embed, EmbeddingInput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use snafu::Snafu;
 use tokio::sync::OnceCell;
 use tools::SpiceModelTool;
 
@@ -45,6 +46,23 @@ pub(crate) const TOOL_EMBEDDING_MODEL_PARAM: &str = "tool_embedding_model";
 const DEFAULT_SEARCH_LIMIT: usize = 5;
 const MAX_SEARCH_LIMIT: usize = 20;
 const AUTO_SEARCH_TOOL_THRESHOLD: usize = 20;
+
+#[derive(Debug, Snafu)]
+enum ToolRegistryError {
+    #[snafu(display(
+        "Tool '{tool_id}' was not found in the searchable tool registry. Available tools: {available_tools}"
+    ))]
+    ToolNotFound {
+        tool_id: String,
+        available_tools: String,
+    },
+
+    #[snafu(display("Failed to invoke tool '{tool_id}' from searchable registry: {source}"))]
+    ToolInvokeFailed {
+        tool_id: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
 
 pub(crate) async fn prepare_model_tools(
     rt: Arc<Runtime>,
@@ -327,11 +345,10 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
                 .take(MAX_SEARCH_LIMIT)
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(format!(
-                "Tool '{}' was not found in searchable registry. Available tools: {}",
-                params.tool_id, available_tools
-            )
-            .into());
+            return Err(Box::new(ToolRegistryError::ToolNotFound {
+                tool_id: params.tool_id,
+                available_tools,
+            }));
         };
 
         let tool_id = tool.name().to_string();
@@ -341,16 +358,17 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
             Some(arguments) => serde_json::to_string(&arguments)?,
         };
 
-        match tool.call(&arguments).await {
-            Ok(result) => Ok(json!({
-                "tool_id": tool_id,
-                "result": result,
-            })),
-            Err(error) => Err(format!(
-                "Failed to invoke tool '{tool_id}' from searchable registry: {error}"
-            )
-            .into()),
-        }
+        let result =
+            tool.call(&arguments)
+                .await
+                .map_err(|source| ToolRegistryError::ToolInvokeFailed {
+                    tool_id: tool_id.clone(),
+                    source,
+                })?;
+        Ok(json!({
+            "tool_id": tool_id,
+            "result": result,
+        }))
     }
 }
 
@@ -887,7 +905,8 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {
 
 fn tool_id_matches(tool: &dyn SpiceModelTool, requested_tool_id: &str) -> bool {
     let tool_name = tool.name();
-    tool_name == requested_tool_id || encode_tool_name(&tool_name) == requested_tool_id
+    let tool_name_ref: &str = &tool_name;
+    tool_name_ref == requested_tool_id || encode_tool_name(tool_name_ref) == requested_tool_id
 }
 
 fn normalize_text(text: impl AsRef<str>) -> String {
@@ -1194,15 +1213,16 @@ mod tests {
             "Run SQL queries against datasets and return query results",
             json!(null),
         );
-        let (readiness_tool, _) = mock_tool(
+        let (readiness_tool, _) = mock_tool_with_parameters(
             "get_readiness",
             "Retrieve component readiness status",
+            json!(null),
             json!(null),
         );
         let advertised_tools = tool_registry_tools(vec![readiness_tool, sql_tool], mock_embed());
         let search_tool = advertised_tools
             .iter()
-            .find(|tool| tool.name().as_ref() == TOOL_SEARCH_NAME)
+            .find(|tool| tool.name() == TOOL_SEARCH_NAME)
             .expect("tool_search should be advertised");
 
         let result = search_tool
@@ -1249,7 +1269,7 @@ mod tests {
         let advertised_tools = tool_registry_tools(vec![sql_tool, readiness_tool], mock_embed());
         let search_tool = advertised_tools
             .iter()
-            .find(|tool| tool.name().as_ref() == TOOL_SEARCH_NAME)
+            .find(|tool| tool.name() == TOOL_SEARCH_NAME)
             .expect("tool_search should be advertised");
 
         let result = search_tool
@@ -1302,7 +1322,7 @@ mod tests {
             tool_registry_tools(vec![calculator_tool, weather_tool], mock_embed());
         let search_tool = advertised_tools
             .iter()
-            .find(|tool| tool.name().as_ref() == TOOL_SEARCH_NAME)
+            .find(|tool| tool.name() == TOOL_SEARCH_NAME)
             .expect("tool_search should be advertised");
 
         let result = search_tool
@@ -1338,7 +1358,7 @@ mod tests {
         let advertised_tools = tool_registry_tools(vec![sql_tool, weather_tool], mock_embed());
         let search_tool = advertised_tools
             .iter()
-            .find(|tool| tool.name().as_ref() == TOOL_SEARCH_NAME)
+            .find(|tool| tool.name() == TOOL_SEARCH_NAME)
             .expect("tool_search should be advertised");
 
         let result = search_tool
@@ -1369,7 +1389,7 @@ mod tests {
         let advertised_tools = tool_registry_tools(vec![sql_tool], mock_embed());
         let invoke_tool = advertised_tools
             .iter()
-            .find(|tool| tool.name().as_ref() == TOOL_INVOKE_NAME)
+            .find(|tool| tool.name() == TOOL_INVOKE_NAME)
             .expect("tool_invoke should be advertised");
 
         let result = invoke_tool
@@ -1395,7 +1415,7 @@ mod tests {
         let advertised_tools = tool_registry_tools(vec![sql_tool], mock_embed());
         let invoke_tool = advertised_tools
             .iter()
-            .find(|tool| tool.name().as_ref() == TOOL_INVOKE_NAME)
+            .find(|tool| tool.name() == TOOL_INVOKE_NAME)
             .expect("tool_invoke should be advertised");
 
         let error = invoke_tool
@@ -1403,7 +1423,11 @@ mod tests {
             .await
             .expect_err("missing tool id should return an error");
 
-        assert!(error.to_string().contains("Tool 'missing' was not found"));
+        assert!(
+            error
+                .to_string()
+                .contains("was not found in the searchable tool registry")
+        );
     }
 
     #[tokio::test]
@@ -1412,7 +1436,7 @@ mod tests {
         let advertised_tools = tool_registry_tools(vec![failing_tool], mock_embed());
         let invoke_tool = advertised_tools
             .iter()
-            .find(|tool| tool.name().as_ref() == TOOL_INVOKE_NAME)
+            .find(|tool| tool.name() == TOOL_INVOKE_NAME)
             .expect("tool_invoke should be advertised");
 
         let error = invoke_tool

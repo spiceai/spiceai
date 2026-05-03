@@ -115,7 +115,6 @@ pub async fn try_to_chat_model(
 
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => {
-            // Create table allowlist from model's datasets if specified
             let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
                 LlmError::ModelParameterFailed {
                     model: component.name.clone(),

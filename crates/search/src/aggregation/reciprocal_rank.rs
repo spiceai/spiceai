@@ -43,7 +43,7 @@ use snafu::ResultExt;
 /// ```text
 /// score_a = 1 / (rank_i + k) + 1 / (rank_j + k) + ...
 /// ```
-/// Where `rank_i` is the rank of the i-th stream, and `k` is a constant (e.g. 60).
+/// Where `rank_i` is the rank of the i-th stream, and `k` is a smoothing constant (e.g. 60).
 pub struct ReciprocalRankFusion;
 
 /// Default RRF smoothing parameter used across Spice hybrid search.
@@ -508,12 +508,16 @@ mod tests {
     }
 
     #[test]
-    fn reciprocal_rank_score_decreases_past_u32_max() {
-        let u32_max_rank = usize::try_from(u32::MAX).expect("u32::MAX should fit into usize");
-        let score_at_u32_max = reciprocal_rank_score(u32_max_rank, DEFAULT_RRF_K);
-        let score_after_u32_max = reciprocal_rank_score(u32_max_rank + 1, DEFAULT_RRF_K);
+    fn reciprocal_rank_score_decreases_past_u32_max_rank() {
+        let u32_max_rank = usize::try_from(u32::MAX).expect("u32::MAX should fit in usize");
+        let larger_rank = u32_max_rank
+            .checked_add(1)
+            .expect("test requires usize wider than u32");
 
-        assert!(score_after_u32_max < score_at_u32_max);
+        assert!(
+            reciprocal_rank_score(larger_rank, DEFAULT_RRF_K)
+                < reciprocal_rank_score(u32_max_rank, DEFAULT_RRF_K)
+        );
     }
 
     #[test]

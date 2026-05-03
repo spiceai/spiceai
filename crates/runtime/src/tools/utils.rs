@@ -170,7 +170,8 @@ pub async fn get_tools_with_allowlist(
                     }
                 }
                 Ok(SpiceToolsOptions::Disabled) => {}
-                Ok(SpiceToolsOptions::Specific(_))
+                Err(_)
+                | Ok(SpiceToolsOptions::Specific(_))
                 | Ok(SpiceToolsOptions::Auto)
                 | Ok(SpiceToolsOptions::All)
                 | Ok(SpiceToolsOptions::SearchRegistry)
