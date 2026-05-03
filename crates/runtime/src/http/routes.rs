@@ -267,6 +267,7 @@ pub(crate) fn routes(
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
+        .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
