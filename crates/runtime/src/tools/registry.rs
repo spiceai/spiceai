@@ -20,6 +20,7 @@ use std::{
     sync::Arc,
 };
 
+use ::search::aggregation::reciprocal_rank::{DEFAULT_RRF_K, reciprocal_rank_fusion_scores};
 use async_trait::async_trait;
 use llms::embeddings::{Embed, EmbeddingInput};
 use schemars::JsonSchema;
@@ -42,7 +43,6 @@ const DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM: &str =
     "huggingface:sentence-transformers/all-MiniLM-L6-v2";
 const DEFAULT_SEARCH_LIMIT: usize = 5;
 const MAX_SEARCH_LIMIT: usize = 20;
-const RRF_K: f64 = 60.0;
 
 #[must_use]
 pub(crate) fn tool_registry_tools(
@@ -661,6 +661,7 @@ fn reciprocal_rank_fusion(
     channels: Vec<(&'static str, Vec<ChannelMatch>)>,
 ) -> HashMap<usize, FusedMatch> {
     let mut fused_matches = HashMap::new();
+    let mut ranked_channels = Vec::with_capacity(channels.len());
 
     for (source, mut channel_matches) in channels {
         channel_matches.sort_by(|left, right| {
@@ -669,13 +670,18 @@ fn reciprocal_rank_fusion(
                 .total_cmp(&left.score)
                 .then_with(|| left.document_index.cmp(&right.document_index))
         });
+        ranked_channels.push(
+            channel_matches
+                .iter()
+                .map(|channel_match| channel_match.document_index)
+                .collect::<Vec<_>>(),
+        );
 
         for (rank_index, channel_match) in channel_matches.into_iter().enumerate() {
             let rank = rank_index + 1;
             let fused_match = fused_matches
                 .entry(channel_match.document_index)
                 .or_insert_with(FusedMatch::default);
-            fused_match.fused_score += 1.0 / (rank as f64 + RRF_K);
             fused_match
                 .matched_terms
                 .extend(channel_match.matched_terms);
@@ -685,6 +691,15 @@ fn reciprocal_rank_fusion(
                 score: (channel_match.score * 1000.0).round() / 1000.0,
             });
         }
+    }
+
+    for (document_index, fused_score) in
+        reciprocal_rank_fusion_scores(ranked_channels, DEFAULT_RRF_K)
+    {
+        fused_matches
+            .entry(document_index)
+            .or_insert_with(FusedMatch::default)
+            .fused_score = fused_score;
     }
 
     fused_matches

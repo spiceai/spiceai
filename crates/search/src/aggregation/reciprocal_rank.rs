@@ -12,6 +12,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use crate::aggregation::from_single_input;
@@ -44,6 +45,34 @@ use snafu::ResultExt;
 /// ```
 /// Where `rank_i` is the rank of the i-th stream, and `offset` is a constant (e.g. 60).
 pub struct ReciprocalRankFusion;
+
+/// Default RRF smoothing parameter used across Spice hybrid search.
+pub const DEFAULT_RRF_K: f64 = 60.0;
+
+#[must_use]
+pub fn reciprocal_rank_score(rank: usize, k: f64) -> f64 {
+    let rank = u32::try_from(rank).map_or(f64::from(u32::MAX), f64::from);
+    1.0 / (rank + k)
+}
+
+#[must_use]
+pub fn reciprocal_rank_fusion_scores<K, L, I>(ranked_lists: I, k: f64) -> HashMap<K, f64>
+where
+    K: Eq + Hash,
+    L: IntoIterator<Item = K>,
+    I: IntoIterator<Item = L>,
+{
+    let mut scores = HashMap::new();
+    for ranked_list in ranked_lists {
+        for (rank_index, key) in ranked_list.into_iter().enumerate() {
+            scores
+                .entry(key)
+                .and_modify(|score| *score += reciprocal_rank_score(rank_index + 1, k))
+                .or_insert_with(|| reciprocal_rank_score(rank_index + 1, k));
+        }
+    }
+    scores
+}
 
 #[async_trait]
 impl CandidateAggregation for ReciprocalRankFusion {
@@ -142,7 +171,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
             table_names.as_slice(),
             primary_key.as_slice(),
             additional_columns.as_slice(),
-            60,
+            DEFAULT_RRF_K,
             limit,
         )
         .await
@@ -306,13 +335,12 @@ fn are_types_compatible(t1: &DataType, t2: &DataType) -> bool {
 ///
 /// This function takes already-registered table names from a SessionContext and builds
 /// a logical plan that performs reciprocal rank fusion across them.
-#[expect(clippy::cast_precision_loss)]
 async fn reciprocal_rank_fusion_plan(
     ctx: &SessionContext,
     tables: &[TableReference],
     primary_key: &[Column],
     additional_columns: &[Column],
-    offset: usize,
+    offset: f64,
     limit: usize,
 ) -> datafusion::error::Result<LogicalPlan> {
     // 1) Build CTEs that add explicit rank per table, ranking by SEARCH_SCORE_COLUMN_NAME
@@ -369,7 +397,7 @@ async fn reciprocal_rank_fusion_plan(
         .iter()
         .map(|(table_name, _)| {
             let rank_col = col(Column::new(Some(table_name.clone()), "rank"));
-            let offset_lit = lit(offset as f64);
+            let offset_lit = lit(offset);
             let score = binary_expr(
                 lit(1.0),
                 Operator::Divide,
@@ -436,6 +464,27 @@ mod tests {
     // Note: The old SQL snapshot tests have been removed as we now use LogicalPlanBuilder.
     // The logical plan is tested through integration tests and runtime behavior verification.
     // If snapshot testing is needed, consider using LogicalPlan's display_indent() or explain methods.
+
+    #[test]
+    fn reciprocal_rank_fusion_scores_combines_ranked_lists() {
+        let scores = reciprocal_rank_fusion_scores(
+            vec![vec!["sql", "search"], vec!["search", "table_schema"]],
+            DEFAULT_RRF_K,
+        );
+
+        let search_score = scores
+            .get("search")
+            .expect("search should be present in fused scores");
+        let sql_score = scores
+            .get("sql")
+            .expect("sql should be present in fused scores");
+        let table_schema_score = scores
+            .get("table_schema")
+            .expect("table_schema should be present in fused scores");
+
+        assert!(search_score > sql_score);
+        assert!(sql_score > table_schema_score);
+    }
 
     #[test]
     fn test_additional_columns_of_schema() {
