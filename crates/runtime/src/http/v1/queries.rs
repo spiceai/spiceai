@@ -750,19 +750,11 @@ pub(crate) async fn list_active(Extension(rt): Extension<Arc<Runtime>>) -> Respo
     let queries: Vec<ActiveQuerySummary> = registry
         .list()
         .into_iter()
-        .map(|info| {
-            let sql_preview = if info.sql_preview.chars().count() > 100 {
-                let truncated: String = info.sql_preview.chars().take(97).collect();
-                format!("{truncated}...")
-            } else {
-                info.sql_preview.to_string()
-            };
-            ActiveQuerySummary {
-                query_id: info.query_id.to_string(),
-                protocol: info.protocol.as_str().to_string(),
-                sql_preview,
-                started_at_ms: info.started_at_ms,
-            }
+        .map(|info| ActiveQuerySummary {
+            query_id: info.query_id.to_string(),
+            protocol: info.protocol.as_str().to_string(),
+            sql_preview: info.sql_preview.to_string(),
+            started_at_ms: info.started_at_ms,
         })
         .collect();
 
@@ -994,5 +986,124 @@ fn ms_to_iso8601(ms: u64) -> String {
             "Invalid Unix timestamp; returning sentinel ISO 8601 string"
         );
         format!("INVALID_TIMESTAMP({ms})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use runtime_request_context::Protocol;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    async fn test_runtime() -> Arc<Runtime> {
+        Arc::new(Runtime::builder().build().await)
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body should be readable");
+        serde_json::from_slice(&body).expect("response body should be valid JSON")
+    }
+
+    #[tokio::test]
+    async fn cancel_active_rejects_invalid_uuid() {
+        let rt = test_runtime().await;
+
+        let response = cancel_active(Extension(rt), Path("not-a-uuid".to_string())).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cancel_active_returns_not_found_for_missing_query() {
+        let rt = test_runtime().await;
+
+        let response = cancel_active(Extension(rt), Path(Uuid::new_v4().to_string())).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancel_active_cancels_registered_query() {
+        let rt = test_runtime().await;
+        let query_id = Uuid::new_v4();
+        let token = CancellationToken::new();
+        let registry = rt.df.query_cancel_registry();
+        let _guard = registry.register(query_id, "SELECT 1", Protocol::Http, token.clone());
+
+        let response = cancel_active(Extension(rt), Path(query_id.to_string())).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(token.is_cancelled());
+        let body = response_json(response).await;
+        assert_eq!(body["query_id"], query_id.to_string());
+        assert_eq!(body["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn list_active_returns_stable_truncated_summaries() {
+        let rt = test_runtime().await;
+        let registry = rt.df.query_cancel_registry();
+        let long_query_id = Uuid::from_u128(2);
+        let short_query_id = Uuid::from_u128(1);
+        let long_sql = format!("SELECT '{}'", "x".repeat(160));
+
+        let _long_guard = registry.register(
+            long_query_id,
+            &long_sql,
+            Protocol::Http,
+            CancellationToken::new(),
+        );
+        let _short_guard = registry.register(
+            short_query_id,
+            "SELECT 1",
+            Protocol::Flight,
+            CancellationToken::new(),
+        );
+
+        let response = list_active(Extension(rt)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["total_count"], 2);
+        let queries = body["queries"]
+            .as_array()
+            .expect("queries should be an array");
+        assert!(queries.windows(2).all(|window| {
+            let left = &window[0];
+            let right = &window[1];
+            let left_key = (
+                left["started_at_ms"]
+                    .as_u64()
+                    .expect("started_at_ms should be a u64"),
+                left["query_id"]
+                    .as_str()
+                    .expect("query_id should be a string"),
+            );
+            let right_key = (
+                right["started_at_ms"]
+                    .as_u64()
+                    .expect("started_at_ms should be a u64"),
+                right["query_id"]
+                    .as_str()
+                    .expect("query_id should be a string"),
+            );
+            left_key <= right_key
+        }));
+
+        let long_query = queries
+            .iter()
+            .find(|query| query["query_id"] == long_query_id.to_string())
+            .expect("long query should be listed");
+        let preview = long_query["sql_preview"]
+            .as_str()
+            .expect("sql_preview should be a string");
+        assert_eq!(preview.chars().count(), 100);
+        assert!(preview.ends_with("..."));
+        assert!(long_sql.starts_with(preview.trim_end_matches("...")));
     }
 }

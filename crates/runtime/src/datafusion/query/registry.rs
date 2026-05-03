@@ -36,6 +36,9 @@ use runtime_request_context::Protocol;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+const SQL_PREVIEW_MAX_CHARS: usize = 100;
+const SQL_PREVIEW_ELLIPSIS: &str = "...";
+
 /// Lightweight snapshot of an active query, suitable for listing via admin APIs.
 #[derive(Clone, Debug)]
 pub struct ActiveQueryInfo {
@@ -52,9 +55,9 @@ struct ActiveQueryEntry {
 
 /// Registry of active synchronous queries for administrative cancellation.
 ///
-/// Uses [`DashMap`] for lock-free concurrent access since the registry is
-/// touched on every query start/finish and is looked up by concurrent admin
-/// cancel requests.
+/// Uses [`DashMap`] for sharded-lock concurrent access since the registry is
+/// touched on every query start/finish and looked up by concurrent admin cancel
+/// requests.
 pub struct QueryCancelRegistry {
     entries: DashMap<Uuid, ActiveQueryEntry>,
 }
@@ -73,7 +76,7 @@ impl QueryCancelRegistry {
     pub fn register(
         self: &Arc<Self>,
         query_id: Uuid,
-        sql_preview: Arc<str>,
+        sql: &str,
         protocol: Protocol,
         token: CancellationToken,
     ) -> ActiveQueryGuard {
@@ -88,7 +91,7 @@ impl QueryCancelRegistry {
             ActiveQueryEntry {
                 info: ActiveQueryInfo {
                     query_id,
-                    sql_preview,
+                    sql_preview: Self::truncate_sql_preview(sql),
                     protocol,
                     started_at_ms,
                 },
@@ -128,10 +131,17 @@ impl QueryCancelRegistry {
     /// Returns a snapshot of all active queries.
     #[must_use]
     pub fn list(&self) -> Vec<ActiveQueryInfo> {
-        self.entries
+        let mut entries: Vec<ActiveQueryInfo> = self
+            .entries
             .iter()
             .map(|e| e.value().info.clone())
-            .collect()
+            .collect();
+        entries.sort_by(|left, right| {
+            left.started_at_ms
+                .cmp(&right.started_at_ms)
+                .then_with(|| left.query_id.cmp(&right.query_id))
+        });
+        entries
     }
 
     /// Returns the number of active queries.
@@ -147,6 +157,22 @@ impl QueryCancelRegistry {
 
     fn remove(&self, query_id: Uuid) {
         self.entries.remove(&query_id);
+    }
+
+    fn truncate_sql_preview(sql: &str) -> Arc<str> {
+        if sql.char_indices().nth(SQL_PREVIEW_MAX_CHARS).is_none() {
+            return Arc::from(sql);
+        }
+
+        let truncate_chars = SQL_PREVIEW_MAX_CHARS.saturating_sub(SQL_PREVIEW_ELLIPSIS.len());
+        let truncate_at = sql
+            .char_indices()
+            .nth(truncate_chars)
+            .map_or(sql.len(), |(index, _)| index);
+        let mut preview = String::with_capacity(truncate_at + SQL_PREVIEW_ELLIPSIS.len());
+        preview.push_str(&sql[..truncate_at]);
+        preview.push_str(SQL_PREVIEW_ELLIPSIS);
+        Arc::from(preview)
     }
 }
 
@@ -193,12 +219,7 @@ mod tests {
         let token = CancellationToken::new();
         let query_id = Uuid::new_v4();
 
-        let _guard = registry.register(
-            query_id,
-            Arc::from("SELECT 1"),
-            Protocol::Http,
-            token.clone(),
-        );
+        let _guard = registry.register(query_id, "SELECT 1", Protocol::Http, token.clone());
 
         assert_eq!(registry.len(), 1);
         assert!(registry.cancel(query_id));
@@ -212,7 +233,7 @@ mod tests {
         {
             let _guard = registry.register(
                 query_id,
-                Arc::from("SELECT 1"),
+                "SELECT 1",
                 Protocol::Http,
                 CancellationToken::new(),
             );
@@ -233,21 +254,62 @@ mod tests {
         let first = CancellationToken::new();
         let second = CancellationToken::new();
 
-        let _first_guard = registry.register(
-            Uuid::new_v4(),
-            Arc::from("SELECT 1"),
-            Protocol::Http,
-            first.clone(),
-        );
-        let _second_guard = registry.register(
-            Uuid::new_v4(),
-            Arc::from("SELECT 2"),
-            Protocol::Flight,
-            second.clone(),
-        );
+        let _first_guard =
+            registry.register(Uuid::new_v4(), "SELECT 1", Protocol::Http, first.clone());
+        let _second_guard =
+            registry.register(Uuid::new_v4(), "SELECT 2", Protocol::Flight, second.clone());
 
         assert_eq!(registry.cancel_all(), 2);
         assert!(first.is_cancelled());
         assert!(second.is_cancelled());
+    }
+
+    #[test]
+    fn list_returns_stable_order() {
+        let registry = Arc::new(QueryCancelRegistry::new());
+
+        let _first_guard = registry.register(
+            Uuid::from_u128(2),
+            "SELECT 2",
+            Protocol::Http,
+            CancellationToken::new(),
+        );
+        let _second_guard = registry.register(
+            Uuid::from_u128(1),
+            "SELECT 1",
+            Protocol::Http,
+            CancellationToken::new(),
+        );
+
+        let listed = registry.list();
+        assert!(listed.windows(2).all(|window| {
+            let left = &window[0];
+            let right = &window[1];
+            left.started_at_ms < right.started_at_ms
+                || (left.started_at_ms == right.started_at_ms && left.query_id <= right.query_id)
+        }));
+    }
+
+    #[test]
+    fn register_stores_truncated_sql_preview() {
+        let registry = Arc::new(QueryCancelRegistry::new());
+        let long_sql = format!("SELECT '{}'", "x".repeat(160));
+
+        let _guard = registry.register(
+            Uuid::new_v4(),
+            &long_sql,
+            Protocol::Http,
+            CancellationToken::new(),
+        );
+
+        let preview = registry
+            .list()
+            .pop()
+            .expect("registered query should be listed")
+            .sql_preview
+            .to_string();
+        assert_eq!(preview.chars().count(), SQL_PREVIEW_MAX_CHARS);
+        assert!(preview.ends_with(SQL_PREVIEW_ELLIPSIS));
+        assert!(long_sql.starts_with(preview.trim_end_matches(SQL_PREVIEW_ELLIPSIS)));
     }
 }

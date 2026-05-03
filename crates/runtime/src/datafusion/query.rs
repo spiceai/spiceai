@@ -579,13 +579,13 @@ impl Query {
         // cancel endpoints can locate this query by id. The guard is captured
         // by the returned stream so the registration is removed on completion,
         // drop, or cancellation.
-        let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => Arc::clone(sql),
-            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
+        let sql_preview = match &self.sql {
+            QueryMethod::Text { sql, .. } => sql.as_ref(),
+            QueryMethod::Plan(_) => "<logical plan>",
         };
         let active_query_guard = self.df.query_cancel_registry().register(
             self.query_id,
-            sql_preview,
+            sql_preview.as_ref(),
             request_context.protocol(),
             query_cancel_token.clone(),
         );
