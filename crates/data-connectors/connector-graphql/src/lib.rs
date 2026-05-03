@@ -326,7 +326,7 @@ mod tests {
 
     async fn test_params(extra: &[(&str, &str)]) -> Parameters {
         let mut params = vec![(
-            "query".to_string(),
+            "graphql_query".to_string(),
             "query { users { id } }".to_string().into(),
         )];
         params.extend(
@@ -346,9 +346,10 @@ mod tests {
         .expect("test GraphQL parameters should be valid")
     }
 
-    fn test_dataset(url: &str) -> Dataset {
-        let app = Arc::new(app::AppBuilder::new("graphql_test".to_string()).build());
-        let runtime = Arc::new(Runtime::builder().with_app(Arc::clone(&app)).build());
+    async fn test_dataset(url: &str) -> Dataset {
+        let app = app::AppBuilder::new("graphql_test".to_string()).build();
+        let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
+        let app = Arc::new(app);
 
         DatasetBuilder::try_new(format!("graphql:{url}"), "graphql_test")
             .expect("test dataset should be valid")
@@ -392,7 +393,7 @@ mod tests {
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
         };
-        let dataset = test_dataset("https://graphql-dataset-params.example.com/graphql");
+        let dataset = test_dataset("https://graphql-dataset-params.example.com/graphql").await;
 
         graphql
             .get_client(&dataset)
@@ -420,7 +421,7 @@ mod tests {
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
         };
-        let dataset = test_dataset("https://graphql-runtime-defaults.example.com/graphql");
+        let dataset = test_dataset("https://graphql-runtime-defaults.example.com/graphql").await;
 
         graphql
             .get_client(&dataset)
@@ -439,12 +440,12 @@ mod tests {
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
         };
-        let dataset = test_dataset("https://graphql-invalid-limit.example.com/graphql");
+        let dataset = test_dataset("https://graphql-invalid-limit.example.com/graphql").await;
 
-        let error = graphql
-            .get_client(&dataset)
-            .await
-            .expect_err("zero GraphQL rate-control limit should be rejected");
+        let error = match graphql.get_client(&dataset).await {
+            Ok(_) => panic!("zero GraphQL rate-control limit should be rejected"),
+            Err(error) => error,
+        };
 
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
@@ -457,10 +458,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn graphql_metrics_provider_can_be_suppressed_for_non_owner() {
+    #[tokio::test]
+    async fn graphql_metrics_provider_can_be_suppressed_for_non_owner() {
         let graphql = GraphQL {
-            params: Parameters::default(),
+            params: test_params(&[]).await,
             runtime_rate_control_params: None,
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: false,
