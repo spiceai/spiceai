@@ -60,7 +60,10 @@ use std::{
 };
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
-const LOCAL_LLM_MAX_SEQS: usize = 5;
+const LOCAL_LLM_MAX_SEQS: NonZeroUsize = match NonZeroUsize::new(5) {
+    Some(value) => value,
+    None => panic!("local LLM max sequences must be non-zero"),
+};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
@@ -333,12 +336,9 @@ impl MistralLlama {
         ))
     }
 
-    #[expect(clippy::expect_used)]
     fn default_scheduler_config() -> mistralrs::SchedulerConfig {
         mistralrs::SchedulerConfig::DefaultScheduler {
-            method: mistralrs::DefaultSchedulerMethod::Fixed(
-                NonZeroUsize::new(LOCAL_LLM_MAX_SEQS).expect("unreachable 5 > 0"),
-            ),
+            method: mistralrs::DefaultSchedulerMethod::Fixed(LOCAL_LLM_MAX_SEQS),
         }
     }
 
@@ -350,7 +350,7 @@ impl MistralLlama {
             let cache_config = pipeline.lock().await.get_metadata().cache_config.clone();
             if let Some(config) = cache_config {
                 return mistralrs::SchedulerConfig::PagedAttentionMeta {
-                    max_num_seqs: LOCAL_LLM_MAX_SEQS,
+                    max_num_seqs: LOCAL_LLM_MAX_SEQS.get(),
                     config,
                 };
             }

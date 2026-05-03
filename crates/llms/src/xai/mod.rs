@@ -71,7 +71,7 @@ impl Xai {
         }
     }
 
-    /// Changes to `req` to accomodate xAi not being `OpenAI` compatible.
+    /// Changes to `req` to accommodate xAi not being `OpenAI` compatible.
     fn alter_request(
         &self,
         mut req: CreateChatCompletionRequest,

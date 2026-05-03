@@ -71,16 +71,12 @@ impl ResponsesWrapper {
         system_prompt: Option<&str>,
         defaults: Vec<(String, serde_json::Value)>,
     ) -> Self {
-        let wrapper = Self {
+        Self {
             public_name: public_name.to_string(),
             responses,
             system_prompt: system_prompt.map(ToString::to_string),
             defaults,
-        };
-
-        wrapper.with_model_defaults(CreateResponse::default());
-
-        wrapper
+        }
     }
 
     fn prepare_req(&self, req: CreateResponse) -> CreateResponse {
