@@ -330,10 +330,7 @@ impl MistralLlama {
     }
 
     fn paged_attention_supported() -> bool {
-        cfg!(any(
-            all(feature = "cuda", target_family = "unix"),
-            feature = "metal"
-        ))
+        cfg!(all(feature = "cuda", target_family = "unix"))
     }
 
     fn default_scheduler_config() -> mistralrs::SchedulerConfig {

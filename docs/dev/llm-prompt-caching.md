@@ -41,7 +41,7 @@ When providers return cache-token usage, keep totals data-correct:
 
 ## Local Model Notes
 
-`mistral-rs` regular KV caching is enabled by keeping `no_kv_cache` false. Paged attention is requested only on supported non-CPU backends, then used only if the loaded pipeline exposes cache metadata. If metadata is missing, fall back to the default scheduler and log at debug level.
+`mistral-rs` regular KV caching is enabled by keeping `no_kv_cache` false. Paged attention is requested only on supported CUDA Unix backends, then used only if the loaded pipeline exposes cache metadata. If metadata is missing, fall back to the default scheduler and log at debug level. Metal keeps the default scheduler because the current paged-attention path can panic in the underlying Metal kernels.
 
 Keep scheduler constants non-zero at compile time; do not use `unwrap` or `expect` in the production scheduler path.
 
