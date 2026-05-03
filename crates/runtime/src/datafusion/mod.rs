@@ -1901,11 +1901,23 @@ impl DataFusion {
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
                 if layout.is_enabled() {
+                    // Resolve any engine-specific snapshot engine override
+                    // (e.g. CayenneSnapshotEngine) so the upload pipeline
+                    // ships the engine's preferred archive format.
+                    let snapshot_engine_override = match self
+                        .accelerator_engine_registry
+                        .get_accelerator_engine(acceleration_settings.engine)
+                        .await
+                    {
+                        Some(accel) => accel.snapshot_engine_for_source(dataset).await,
+                        None => None,
+                    };
                     if let Some(snapshot_config) = build_snapshot_creation_config(
                         dataset,
                         &acceleration_settings,
                         refresh_mode,
                         layout.clone(),
+                        snapshot_engine_override,
                     )
                     .await?
                     {
@@ -2103,6 +2115,7 @@ impl DataFusion {
                         layout,
                         accel_engine,
                         Arc::clone(&existing_schema),
+                        None,
                     )
                     .await;
                 }
@@ -3288,6 +3301,9 @@ async fn build_snapshot_creation_config(
     acceleration_settings: &Acceleration,
     refresh_mode: RefreshMode,
     acceleration_layout: AccelerationLayout,
+    snapshot_engine_override: Option<
+        Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
+    >,
 ) -> Result<Option<SnapshotCreationConfig>> {
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
@@ -3421,6 +3437,11 @@ async fn build_snapshot_creation_config(
     .await
     .map(|sm| {
         let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
+        let sm = if let Some(engine) = snapshot_engine_override {
+            sm.with_snapshot_engine(engine)
+        } else {
+            sm
+        };
         SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
     }))
 }
@@ -3715,6 +3736,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3739,6 +3761,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3776,6 +3799,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3813,6 +3837,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3845,6 +3870,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3877,6 +3903,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3909,6 +3936,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3937,6 +3965,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3965,6 +3994,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3996,6 +4026,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 

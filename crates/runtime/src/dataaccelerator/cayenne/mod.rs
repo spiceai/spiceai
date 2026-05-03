@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod s3;
+pub mod snapshot_engine;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -1000,6 +1001,14 @@ impl DataAccelerator for CayenneAccelerator {
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
+                    // For pre-recreate snapshots we don't have a constructed
+                    // catalog handy (the metastore directory may even be in
+                    // a transient state). Pass None and accept the default
+                    // engine; the resulting snapshot will use the legacy
+                    // archive-cayenne.db path. This is acceptable because
+                    // pre-recreate snapshots are best-effort backups, not
+                    // refresh_mode: snapshot sources.
+                    None,
                 )
                 .await;
 
@@ -1056,13 +1065,45 @@ impl DataAccelerator for CayenneAccelerator {
 
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
-            let snapshot_adapter =
-                runtime_acceleration::snapshot::AccelerationLayout::cayenne(metadata_dir, path_buf);
+            let snapshot_adapter = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
+                metadata_dir.clone(),
+                path_buf.clone(),
+            );
+            // Build a CayenneSnapshotEngine so the snapshot tar uses the
+            // per-dataset metastore-slice format (no raw cayenne.db file)
+            // and so `download_latest_snapshot` imports the slice into the
+            // local metastore as the final extraction step.
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str)
+                .to_string();
+            let snapshot_engine = match self
+                .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
+                .await
+            {
+                Ok(catalog) => Some(Arc::new(
+                    crate::dataaccelerator::cayenne::snapshot_engine::CayenneSnapshotEngine::new(
+                        catalog,
+                        source.name().to_string(),
+                        path_buf.clone(),
+                    ),
+                )
+                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to build CayenneSnapshotEngine for snapshot bootstrap, \
+                         falling back to default engine: {err}"
+                    );
+                    None
+                }
+            };
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
+                snapshot_engine,
             )
             .await)
         } else {

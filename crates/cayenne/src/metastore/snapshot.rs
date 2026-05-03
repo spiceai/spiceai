@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Per-dataset metastore snapshot serialization.
 //!
-//! The legacy Cayenne snapshot format archived the entire `cayenne.db` SQLite
+//! The legacy Cayenne snapshot format archived the entire `cayenne.db` `SQLite`
 //! file. That approach forced a one-dataset-per-metadata-directory limitation
 //! (multiple datasets sharing a metastore would clobber each other on extract)
 //! and made snapshots non-portable across nodes whose data directories did not
@@ -176,12 +176,11 @@ impl DatasetMetastoreSlice {
     }
 }
 
-/// Returns the (path_column_index, path_is_relative_column_index) for tables
+/// Returns the (`path_column_index`, `path_is_relative_column_index`) for tables
 /// that store filesystem paths. Returns `None` for tables without path columns.
 fn path_columns_for_table(table_name: &str) -> Option<(usize, usize)> {
     match table_name {
-        "cayenne_table" => Some((2, 3)),
-        "cayenne_delete_file" => Some((2, 3)),
+        "cayenne_table" | "cayenne_delete_file" => Some((2, 3)),
         "cayenne_partition" => Some((5, 6)),
         _ => None,
     }
@@ -189,13 +188,14 @@ fn path_columns_for_table(table_name: &str) -> Option<(usize, usize)> {
 
 /// Returns the column index that holds `table_id` for each metastore table.
 /// `cayenne_table` itself stores it at index 0; child tables store it at index 1.
-/// Returns the column index that holds `table_id` for each metastore table.
-/// `cayenne_table` itself stores it at index 0; child tables store it at index 1.
 ///
 /// Currently informational — wholesale-replace import preserves the slice's
 /// own `table_id` values verbatim, so no remap is needed. Kept for the future
 /// case where we might want to re-key on import.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "retained for future re-keying on import; see doc above"
+)]
 fn table_id_column_index(table_name: &str) -> usize {
     match table_name {
         "cayenne_table" => 0,
@@ -212,15 +212,14 @@ fn table_id_column_index(table_name: &str) -> usize {
 /// resolve there. We log a warning so the operator notices.
 fn make_relative(abs: &str, anchor: &Path) -> String {
     let p = Path::new(abs);
-    match p.strip_prefix(anchor) {
-        Ok(rel) => rel.to_string_lossy().into_owned(),
-        Err(_) => {
-            tracing::warn!(
-                "cayenne metastore export: path {abs:?} is not under anchor {anchor:?}; \
-                 leaving as-is — slice will not be portable to readers with a different data directory"
-            );
-            abs.to_string()
-        }
+    if let Ok(rel) = p.strip_prefix(anchor) {
+        rel.to_string_lossy().into_owned()
+    } else {
+        tracing::warn!(
+            "cayenne metastore export: path {abs:?} is not under anchor {anchor:?}; \
+             leaving as-is — slice will not be portable to readers with a different data directory"
+        );
+        abs.to_string()
     }
 }
 

@@ -543,7 +543,7 @@ pub trait DataAccelerator: Send + Sync {
     /// Engines that need to customise the on-disk archive contents (e.g.
     /// Cayenne, which ships a per-dataset metastore-slice JSON instead of
     /// the raw `cayenne.db` file) override this to return their engine.
-    /// File-based accelerators (DuckDB / SQLite / Turso) return `None` and
+    /// File-based accelerators (`DuckDB` / `SQLite` / `Turso`) return `None` and
     /// the default `SnapshotManager` engine selection applies.
     async fn snapshot_engine_for_source(
         &self,

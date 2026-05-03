@@ -469,6 +469,7 @@ impl DataAccelerator for TursoAccelerator {
                         )),
                         AccelerationEngine::Turso,
                         Arc::new(arrow_schema::Schema::empty()),
+                        None,
                     )
                     .await;
 
@@ -487,6 +488,7 @@ impl DataAccelerator for TursoAccelerator {
                 source,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Turso,
+                None,
             )
             .await;
 

@@ -277,6 +277,7 @@ impl DataAccelerator for SqliteAccelerator {
                         )),
                         AccelerationEngine::Sqlite,
                         Arc::new(arrow_schema::Schema::empty()),
+                        None,
                     )
                     .await;
 
@@ -295,6 +296,7 @@ impl DataAccelerator for SqliteAccelerator {
                 source,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Sqlite,
+                None,
             )
             .await;
 

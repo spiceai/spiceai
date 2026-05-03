@@ -11,9 +11,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! SQLite-specific snapshot engine implementation.
+//! `SQLite`-specific snapshot engine implementation.
 //!
-//! SQLite accelerator databases run in WAL (write-ahead log) journal mode.
+//! `SQLite` accelerator databases run in WAL (write-ahead log) journal mode.
 //! In WAL mode, writes are buffered into a `<db>-wal` sidecar file and only
 //! periodically checkpointed back into the main `.sqlite` file. A naive
 //! `fs::copy` of just the main file therefore captures only the durable
@@ -50,6 +50,19 @@ pub enum SqliteSnapshotError {
         dataset: String,
         path: PathBuf,
         source: rusqlite::Error,
+    },
+    #[snafu(display(
+        "Incomplete WAL checkpoint for dataset '{dataset}' at {path:?}: \
+         busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames}. \
+         Another connection is holding the WAL or not all frames were flushed; \
+         snapshotting now would lose data."
+    ))]
+    CheckpointIncomplete {
+        dataset: String,
+        path: PathBuf,
+        busy: i64,
+        log_frames: i64,
+        checkpointed_frames: i64,
     },
     #[snafu(display(
         "Failed to switch SQLite copy to journal_mode=DELETE for dataset '{dataset}' at {path:?}: {source}"
@@ -100,14 +113,34 @@ impl SnapshotEngine for SqliteSnapshotEngine {
             // database file and truncates the WAL to zero length. This is the
             // strongest available checkpoint short of switching journal mode.
             //
-            // The pragma returns one row (busy, log, checkpointed). We don't
-            // care about the values; if SQLite returned an error it would
-            // surface here.
-            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
+            // The pragma returns one row `(busy, log, checkpointed)`:
+            //   * `busy != 0` means another connection (e.g. a stuck
+            //     read-transaction) is holding the WAL and the truncation
+            //     could not complete.
+            //   * `checkpointed < log` means not every frame was flushed.
+            //
+            // Either case would let post-checkpoint writes leak past the copy
+            // we're about to take, defeating the whole point of the hook. We
+            // surface them as `Checkpoint` errors so the caller can either
+            // retry or fall back rather than silently snapshot a corrupted
+            // database.
+            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
                 .context(CheckpointSnafu {
                     dataset: dataset.clone(),
-                    path: live_path,
+                    path: live_path.clone(),
                 })?;
+            if busy != 0 || checkpointed_frames < log_frames {
+                return Err(SqliteSnapshotError::CheckpointIncomplete {
+                    dataset: dataset.clone(),
+                    path: live_path,
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                });
+            }
             Ok::<(), SqliteSnapshotError>(())
         })
         .await
@@ -212,6 +245,9 @@ mod tests {
         assert!(!final_path.with_extension("sqlite-wal").exists());
         assert!(!final_path.with_extension("sqlite-shm").exists());
 
-        assert_eq!(count_rows(&final_path), rows.len() as i64);
+        assert_eq!(
+            count_rows(&final_path),
+            i64::try_from(rows.len()).expect("row count fits in i64")
+        );
     }
 }

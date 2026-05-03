@@ -1993,27 +1993,38 @@ impl SnapshotManager {
         //
         // If the platform-level rename fails with `AlreadyExists` (older or
         // unusual Windows configurations where the replace flag was not
-        // honored), fall back to an explicit remove + rename. This loses
-        // strict atomicity for an instant, but is acceptable here because the
-        // accelerator's connection pool is invalidated immediately after this
-        // call as part of `reload_from_snapshot`, so there is no concurrent
-        // reader between the remove and the rename.
+        // honored), fall back to a swap-via-sidecar dance: rename the
+        // existing target to a `.old` sidecar (atomic), rename `temp_path`
+        // into place (atomic), then best-effort delete the sidecar. At every
+        // instant `local_path` points to either the old file or the new one,
+        // never to a missing entry — which matters for `refresh_mode: snapshot`
+        // because the accelerator's pool may still be holding readers open
+        // against `local_path` in the gap before `reload_from_snapshot`
+        // evicts them.
         if let Err(source) = fs::rename(&temp_path, local_path).await {
             if source.kind() == std::io::ErrorKind::AlreadyExists {
-                if let Err(remove_err) = fs::remove_file(local_path).await {
+                let sidecar_path = local_path.with_extension(format!("old.{}", std::process::id()));
+                if let Err(swap_err) = fs::rename(local_path, &sidecar_path).await {
                     let _ = fs::remove_file(&temp_path).await;
                     return Err(SnapshotDownloadError::WriteLocal {
                         path: local_path.clone(),
-                        source: remove_err,
+                        source: swap_err,
                     });
                 }
                 if let Err(retry_err) = fs::rename(&temp_path, local_path).await {
+                    // Restore the original to avoid leaving the dataset
+                    // pointing at a missing file.
+                    let _ = fs::rename(&sidecar_path, local_path).await;
                     let _ = fs::remove_file(&temp_path).await;
                     return Err(SnapshotDownloadError::WriteLocal {
                         path: local_path.clone(),
                         source: retry_err,
                     });
                 }
+                // Best-effort cleanup; the sidecar will be reaped on next
+                // restart if this fails (e.g. another process still has it
+                // open on Windows).
+                let _ = fs::remove_file(&sidecar_path).await;
             } else {
                 let _ = fs::remove_file(&temp_path).await;
                 return Err(SnapshotDownloadError::WriteLocal {
@@ -3003,7 +3014,7 @@ mod tests {
     }
 
     /// Writes a sample local accelerator file appropriate for the engine.
-    /// For SQLite/Turso, creates a real (empty) SQLite WAL-mode database
+    /// For `SQLite`/`Turso`, creates a real (empty) `SQLite` WAL-mode database
     /// so that the engine's `checkpoint_live` hook can open it. For other
     /// engines, writes opaque test bytes since no engine-side validation
     /// runs against the file pre-snapshot.

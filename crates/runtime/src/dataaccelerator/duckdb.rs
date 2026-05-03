@@ -396,6 +396,7 @@ impl DataAccelerator for DuckDBAccelerator {
                         )),
                         AccelerationEngine::DuckDB,
                         Arc::new(arrow_schema::Schema::empty()),
+                        None,
                     )
                     .await;
 
@@ -414,6 +415,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 source,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::DuckDB,
+                None,
             )
             .await;
 

@@ -20,6 +20,7 @@ limitations under the License.
 //! that can be used to store Cayenne metadata. This allows swapping between `SQLite`,
 //! Turso, or other storage implementations.
 
+pub mod snapshot;
 pub mod sqlite;
 
 #[cfg(feature = "turso")]
