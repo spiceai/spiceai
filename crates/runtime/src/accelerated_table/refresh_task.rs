@@ -63,6 +63,7 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use datafusion_optimizer_rules::physical_plan::HttpParamsPushdown;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
@@ -1137,6 +1138,7 @@ impl RefreshTask {
             ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
             .with_optimizer_rule(Arc::new(AvoidDerivedVectorColumnOnIndexRule {}))
+            .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
