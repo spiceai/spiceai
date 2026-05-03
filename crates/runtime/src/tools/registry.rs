@@ -26,14 +26,11 @@ use llms::embeddings::{Embed, EmbeddingInput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use spicepod::component::embeddings::Embeddings;
 use tokio::sync::OnceCell;
 use tools::SpiceModelTool;
 
 use crate::{
     Runtime,
-    embeddings::task::TaskEmbed,
-    model::try_to_embedding,
     tools::{options::SpiceToolsOptions, utils::parameters},
 };
 
@@ -41,9 +38,6 @@ const TOOL_SEARCH_NAME: &str = "tool_search";
 const TOOL_INVOKE_NAME: &str = "tool_invoke";
 const LIST_DATASETS_TOOL_NAME: &str = "list_datasets";
 pub(crate) const TOOL_EMBEDDING_MODEL_PARAM: &str = "tool_embedding_model";
-const DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME: &str = "tool_registry_minilm_l6_v2";
-const DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM: &str =
-    "huggingface:sentence-transformers/all-MiniLM-L6-v2";
 const DEFAULT_SEARCH_LIMIT: usize = 5;
 const MAX_SEARCH_LIMIT: usize = 20;
 const AUTO_SEARCH_TOOL_THRESHOLD: usize = 20;
@@ -116,57 +110,54 @@ pub(crate) async fn resolve_tool_registry_embedding_model(
     rt: Arc<Runtime>,
     model_name: Option<&str>,
 ) -> Result<Arc<dyn Embed>, Box<dyn std::error::Error + Send + Sync>> {
-    let embeddings = rt.embeds();
+    let configured_model_names = configured_embedding_model_names(&rt).await;
+    let model_name =
+        select_tool_registry_embedding_model_name(&configured_model_names, model_name)?;
 
-    if let Some(model_name) = model_name {
-        let embeddings_map = embeddings.read().await;
-        return embeddings_map.get(model_name).cloned().ok_or_else(|| {
-            format!("Embedding model '{model_name}' specified by `{TOOL_EMBEDDING_MODEL_PARAM}` was not found").into()
-        });
-    }
-
-    if let Some(default_model) = embeddings
+    rt.embeds()
         .read()
         .await
-        .get(DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME)
+        .get(&model_name)
         .cloned()
-    {
-        return Ok(default_model);
+        .ok_or_else(|| {
+            format!("Embedding model '{model_name}' configured for searchable tool discovery was not loaded. Check earlier embedding model errors and verify the `embeddings` configuration").into()
+        })
+}
+
+async fn configured_embedding_model_names(rt: &Arc<Runtime>) -> Vec<String> {
+    let mut names = rt
+        .read_app()
+        .await
+        .map(|app| {
+            app.embeddings
+                .iter()
+                .map(|embedding| embedding.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn select_tool_registry_embedding_model_name(
+    configured_model_names: &[String],
+    model_name: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(model_name) = model_name {
+        return configured_model_names
+            .iter()
+            .find(|configured_model_name| configured_model_name.as_str() == model_name)
+            .cloned()
+            .ok_or_else(|| {
+                format!("Embedding model '{model_name}' specified by `{TOOL_EMBEDDING_MODEL_PARAM}` was not found in the `embeddings` section").into()
+            });
     }
 
-    let component = Embeddings::new(
-        DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM,
-        DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME,
-    );
-    let embed = try_to_embedding(
-        &component,
-        rt.secrets(),
-        rt.token_provider_registry(),
-        rt.datafusion().embeddings_cache_provider(),
-    )
-    .await
-    .map_err(|error| {
-        format!(
-            "Failed to load default tool-registry embedding model '{}': {error}",
-            DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM
-        )
-    })?;
-
-    let embed = TaskEmbed::new(DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME, embed)
-        .await
-        .map(|embed| Arc::new(embed) as Arc<dyn Embed>)
-        .map_err(|error| {
-            format!(
-                "Failed to initialize default tool-registry embedding model '{}': {error}",
-                DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM
-            )
-        })?;
-
-    embeddings.write().await.insert(
-        DEFAULT_TOOL_REGISTRY_EMBEDDING_NAME.to_string(),
-        Arc::clone(&embed),
-    );
-    Ok(embed)
+    match configured_model_names {
+        [] => Err(format!("No embedding model configured for searchable tool discovery. Add one model to the `embeddings` section, or set `{TOOL_EMBEDDING_MODEL_PARAM}` to reference a configured embedding model").into()),
+        [model_name] => Ok(model_name.clone()),
+        model_names => Err(format!("Multiple embedding models are configured for searchable tool discovery: {}. Set `{TOOL_EMBEDDING_MODEL_PARAM}` to one of them", model_names.join(", ")).into()),
+    }
 }
 
 struct ToolRegistrySearchTool {
@@ -1041,6 +1032,60 @@ mod tests {
 
     fn mock_embed() -> Arc<dyn Embed> {
         Arc::new(MockEmbed)
+    }
+
+    #[test]
+    fn embedding_selection_uses_explicit_configured_model() {
+        let configured_models = vec!["first".to_string(), "second".to_string()];
+        let selected =
+            select_tool_registry_embedding_model_name(&configured_models, Some("second"))
+                .expect("explicit configured embedding model should be selected");
+
+        assert_eq!(selected, "second");
+    }
+
+    #[test]
+    fn embedding_selection_rejects_explicit_missing_model() {
+        let configured_models = vec!["configured".to_string()];
+        let error = select_tool_registry_embedding_model_name(&configured_models, Some("missing"))
+            .expect_err("missing explicit embedding model should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("was not found in the `embeddings` section")
+        );
+    }
+
+    #[test]
+    fn embedding_selection_uses_single_configured_model_when_unset() {
+        let configured_models = vec!["only_embedding".to_string()];
+        let selected = select_tool_registry_embedding_model_name(&configured_models, None)
+            .expect("single configured embedding model should be inferred");
+
+        assert_eq!(selected, "only_embedding");
+    }
+
+    #[test]
+    fn embedding_selection_requires_configuration_when_unset() {
+        let configured_models = Vec::new();
+        let error = select_tool_registry_embedding_model_name(&configured_models, None)
+            .expect_err("missing embedding model should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("No embedding model configured for searchable tool discovery")
+        );
+    }
+
+    #[test]
+    fn embedding_selection_requires_explicit_model_when_multiple_configured() {
+        let configured_models = vec!["first".to_string(), "second".to_string()];
+        let error = select_tool_registry_embedding_model_name(&configured_models, None)
+            .expect_err("ambiguous embedding model should fail");
+
+        assert!(error.to_string().contains(TOOL_EMBEDDING_MODEL_PARAM));
     }
 
     #[test]
