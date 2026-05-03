@@ -28,10 +28,13 @@ limitations under the License.
 //! always `AsyncScalarUDF`, marked volatile, and automatically added
 //! to the federation deny-list.
 
-use std::hash::Hash;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::HashSet,
+    hash::Hash,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::tools::SpiceModelTool;
@@ -69,6 +72,11 @@ pub enum ToolUdfBuildError {
     MissingReturnType { tool: String },
 
     #[snafu(display(
+        "cannot expose tool '{tool}' as SQL: duplicate argument name '{arg}' in `signature.args`"
+    ))]
+    DuplicateArgName { tool: String, arg: String },
+
+    #[snafu(display(
         "cannot expose tool '{tool}' as SQL: arg '{arg}' has unsupported Arrow type '{arrow_type}'. \
         Supported: signed integer aliases/widths (int, int8, int16, int32, int64; widened to int64), \
         float aliases/widths (float, double, float32, float64; widened to float64), utf8/string, boolean/bool."
@@ -97,6 +105,16 @@ pub fn build_scalar_udf(
     tool_name: &str,
     yaml_sig: &YamlSignature,
 ) -> Result<Arc<ScalarUDF>> {
+    let mut seen_arg_names = HashSet::with_capacity(yaml_sig.args.len());
+    for arg in &yaml_sig.args {
+        if !seen_arg_names.insert(arg.name.as_str()) {
+            return Err(ToolUdfBuildError::DuplicateArgName {
+                tool: tool_name.to_string(),
+                arg: arg.name.clone(),
+            });
+        }
+    }
+
     let arg_names: Vec<String> = yaml_sig.args.iter().map(|a| a.name.clone()).collect();
     let arg_types: Vec<DataType> = yaml_sig
         .args
@@ -286,30 +304,35 @@ impl ToolAsScalarUdf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::SpiceModelTool;
+    use spicepod::component::function::FunctionArg;
+
+    struct StubTool;
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for StubTool {
+        fn name(&self) -> std::borrow::Cow<'_, str> {
+            "stub".into()
+        }
+
+        fn description(&self) -> Option<std::borrow::Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Value::Null)
+        }
+    }
 
     #[test]
     fn build_fails_without_signature_returns() {
-        use crate::tools::SpiceModelTool;
-        use spicepod::component::function::FunctionArg;
-        struct StubTool;
-        #[async_trait::async_trait]
-        impl SpiceModelTool for StubTool {
-            fn name(&self) -> std::borrow::Cow<'_, str> {
-                "stub".into()
-            }
-            fn description(&self) -> Option<std::borrow::Cow<'_, str>> {
-                None
-            }
-            fn parameters(&self) -> Option<Value> {
-                None
-            }
-            async fn call(
-                &self,
-                _: &str,
-            ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(Value::Null)
-            }
-        }
         let sig = YamlSignature {
             args: vec![FunctionArg {
                 name: "x".into(),
@@ -319,5 +342,31 @@ mod tests {
         };
         let err = build_scalar_udf(Arc::new(StubTool), "stub", &sig).expect_err("missing return");
         assert!(matches!(err, ToolUdfBuildError::MissingReturnType { .. }));
+    }
+
+    #[test]
+    fn build_rejects_duplicate_arg_names() {
+        let sig = YamlSignature {
+            args: vec![
+                FunctionArg {
+                    name: "x".into(),
+                    arrow_type: "int64".into(),
+                },
+                FunctionArg {
+                    name: "x".into(),
+                    arrow_type: "float64".into(),
+                },
+            ],
+            returns: Some("int64".into()),
+        };
+
+        let err = build_scalar_udf(Arc::new(StubTool), "stub", &sig)
+            .expect_err("duplicate arg names should fail");
+
+        assert!(matches!(
+            err,
+            ToolUdfBuildError::DuplicateArgName { tool, arg }
+                if tool == "stub" && arg == "x"
+        ));
     }
 }
