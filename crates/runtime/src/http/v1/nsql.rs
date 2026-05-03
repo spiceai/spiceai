@@ -154,7 +154,7 @@ pub struct Request {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datasets: Option<Vec<String>>,
 
-    /// Stable prompt-cache key forwarded to OpenAI-compatible models for the generated SQL request.
+    /// Stable prompt-cache key forwarded to the configured NSQL model for provider-specific cache handling.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
 }

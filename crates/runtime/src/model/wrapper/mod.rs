@@ -95,7 +95,7 @@ macro_rules! set_default_w_warning {
                 Ok(val) => Some(val),
                 Err(_) => {
                     tracing::warn!(
-                        "Failed to parse `openai_{}` override for model='{}'. Ensure {:?} is of the correct format.",
+                        "Failed to parse `{}` request override for model='{}'. Ensure {:?} is of the correct format.",
                         stringify!($field),
                         $model,
                         $value

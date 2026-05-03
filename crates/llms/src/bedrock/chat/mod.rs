@@ -362,9 +362,9 @@ impl BedrockConverse {
     ) -> Result<(), BuildError> {
         let cache_point = Self::prompt_cache_point()?;
         if let Some(last_message) = messages.last_mut() {
-            let mut content = last_message.content.clone();
-            content.push(ContentBlock::CachePoint(cache_point));
-            last_message.content = content;
+            last_message
+                .content
+                .push(ContentBlock::CachePoint(cache_point));
         } else if !system.is_empty() {
             system.push(SystemContentBlock::CachePoint(cache_point));
         }
