@@ -135,7 +135,8 @@ pub(crate) async fn search(
     operation_id = "run_tool",
     tag = "Tools",
     params(
-        ("name" = String, Path, description = "Name of the tool")
+        ("name" = String, Path, description = "Name of the tool"),
+        ("tool_embedding_model" = Option<String>, Query, description = "Embedding model to use when invoking the searchable tool registry's tool_search meta-tool")
     ),
     request_body(
         description = "Tool specific input parameters. See /v1/tools for parameter schema.",
@@ -167,6 +168,7 @@ pub(crate) async fn search(
               "passenger_count": 2
             }]))
         ))),
+        (status = 400, description = "Invalid searchable tool registry configuration", body = serde_json::Value),
         (status = 404, description = "Tool not found", body = String, example="Tool no_sql not found"),
         (status = 500, description = "An error occurred while calling the tool", body = serde_json::Value,
             example=json!({"message": "Error calling tool no_sql: No such tool"}))
