@@ -457,7 +457,7 @@ impl DataConnector for SpiceAI {
     }
 
     fn supports_changes_stream(&self) -> bool {
-        true
+        false
     }
 
     fn changes_stream(

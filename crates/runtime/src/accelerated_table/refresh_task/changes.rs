@@ -38,7 +38,7 @@ use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use snafu::{OptionExt, ResultExt, ensure};
+use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -227,10 +227,6 @@ impl RefreshTask {
             );
         }
 
-        if upsert_pre_delete_rows(change_batch, row_indices, dataset_name)? {
-            self.process_delete_batch(change_batch, row_indices).await?;
-        }
-
         let indices_array = UInt32Array::from(
             row_indices
                 .iter()
@@ -350,71 +346,6 @@ impl RefreshTask {
     }
 }
 
-fn upsert_pre_delete_rows(
-    change_batch: &ChangeBatch,
-    row_indices: &[usize],
-    dataset_name: &TableReference,
-) -> crate::accelerated_table::Result<bool> {
-    let Some(first_row_idx) = row_indices.first() else {
-        return Ok(false);
-    };
-
-    let expected_primary_keys = change_batch.primary_keys(*first_row_idx);
-
-    if expected_primary_keys.is_empty() {
-        let inconsistent_row_count = row_indices
-            .iter()
-            .filter(|row_idx| !change_batch.primary_keys(**row_idx).is_empty())
-            .count();
-
-        ensure!(
-            inconsistent_row_count == 0,
-            crate::accelerated_table::InvalidUpsertPrimaryKeysSnafu {
-                dataset_name: dataset_name.to_string(),
-                reason: format!(
-                    "{inconsistent_row_count} row(s) have inconsistent primary key metadata, so applying append would break upsert semantics"
-                ),
-            }
-        );
-
-        let update_row_count = row_indices
-            .iter()
-            .filter(|row_idx| matches!(change_batch.op(**row_idx), ChangeOperation::Update))
-            .count();
-
-        ensure!(
-            update_row_count == 0,
-            crate::accelerated_table::InvalidUpsertPrimaryKeysSnafu {
-                dataset_name: dataset_name.to_string(),
-                reason: format!(
-                    "{update_row_count} update row(s) have no usable primary key metadata, so applying append would break update semantics"
-                ),
-            }
-        );
-
-        return Ok(false);
-    }
-
-    let invalid_row_count = row_indices
-        .iter()
-        .filter(|row_idx| {
-            let primary_keys = change_batch.primary_keys(**row_idx);
-            primary_keys.is_empty() || primary_keys != expected_primary_keys
-        })
-        .count();
-
-    ensure!(
-        invalid_row_count == 0,
-        crate::accelerated_table::InvalidUpsertPrimaryKeysSnafu {
-            dataset_name: dataset_name.to_string(),
-            reason: format!(
-                "{invalid_row_count} row(s) have missing or inconsistent primary key metadata, so applying append would break upsert semantics"
-            ),
-        }
-    );
-
-    Ok(true)
-}
 
 pub(crate) fn get_primary_key_value(
     data: &RecordBatch,
@@ -634,12 +565,6 @@ mod tests {
     use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
     use datafusion::datasource::TableProvider;
-    use datafusion::execution::SendableRecordBatchStream;
-    use datafusion::logical_expr::dml::InsertOp;
-    use datafusion::physical_plan::collect;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::prelude::SessionContext;
-    use futures::stream;
 
     use std::sync::Arc;
 
@@ -963,34 +888,6 @@ mod tests {
         .build()
     }
 
-    async fn insert_test_batch(table: Arc<dyn TableProvider>, batch: RecordBatch) {
-        let ctx = SessionContext::new();
-        let schema = batch.schema();
-        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            Box::pin(stream::once(async move { Ok(batch) })),
-        ));
-        let plan = Arc::new(StreamingDataUpdateExecutionPlan::new(stream));
-        let insert_plan = table
-            .insert_into(&ctx.state(), plan, InsertOp::Append)
-            .await
-            .expect("insert should be planned");
-        collect(insert_plan, ctx.task_ctx())
-            .await
-            .expect("insert should execute");
-    }
-
-    async fn collect_table(table: Arc<dyn TableProvider>) -> Vec<RecordBatch> {
-        let ctx = SessionContext::new();
-        let scan = table
-            .scan(&ctx.state(), None, &[], None)
-            .await
-            .expect("scan should be planned");
-        collect(scan, ctx.task_ctx())
-            .await
-            .expect("scan should execute")
-    }
-
     #[tokio::test]
     async fn test_write_change_upsert_returns_data_written() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
@@ -1002,44 +899,6 @@ mod tests {
                 .expect("write_change should succeed"),
             WriteChangeResult::DataWritten
         );
-    }
-
-    #[tokio::test]
-    async fn test_write_change_upsert_replaces_existing_primary_key_row() {
-        let table = make_mem_table() as Arc<dyn TableProvider>;
-        let initial_batch = RecordBatch::try_new(
-            Arc::new(create_test_data_schema()),
-            vec![
-                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some("Alice")])) as ArrayRef,
-            ],
-        )
-        .expect("initial batch should be valid");
-        insert_test_batch(Arc::clone(&table), initial_batch).await;
-
-        let task = make_refresh_task(Arc::clone(&table));
-        let change_batch =
-            create_test_change_batch(vec!["u"], &[vec!["id"]], vec![1], vec![Some("Alice_v2")]);
-        assert_eq!(
-            task.write_change(change_batch)
-                .await
-                .expect("write_change should succeed"),
-            WriteChangeResult::DataWritten
-        );
-
-        let results = collect_table(table).await;
-        let rows: usize = results.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(
-            rows, 1,
-            "upsert should replace the existing primary key row"
-        );
-        let name = results[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name should be a string array")
-            .value(0);
-        assert_eq!(name, "Alice_v2");
     }
 
     #[tokio::test]
@@ -1114,108 +973,4 @@ mod tests {
         assert_eq!(result[2].1.len(), 2);
     }
 
-    #[test]
-    fn test_upsert_pre_delete_rows_accepts_matching_primary_keys() {
-        let change_batch = create_test_change_batch(
-            vec!["c", "c", "c"],
-            &[vec!["id"], vec!["id"], vec!["id"]],
-            vec![1, 2, 3],
-            vec![Some("a"), Some("b"), Some("c")],
-        );
-
-        let dataset_name = TableReference::bare("test_dataset");
-        let should_delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], &dataset_name)
-            .expect("matching primary keys should be valid");
-
-        assert!(should_delete_rows);
-    }
-
-    #[test]
-    fn test_upsert_pre_delete_rows_rejects_rows_without_primary_keys() {
-        let change_batch = create_test_change_batch(
-            vec!["c", "c", "c"],
-            &[vec!["id"], vec![], vec!["id"]],
-            vec![1, 2, 3],
-            vec![Some("a"), Some("b"), Some("c")],
-        );
-
-        let dataset_name = TableReference::bare("test_dataset");
-        let err = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], &dataset_name)
-            .expect_err("missing primary keys should fail safely");
-
-        assert!(
-            err.to_string()
-                .contains("1 row(s) have missing or inconsistent primary key metadata")
-        );
-    }
-
-    #[test]
-    fn test_upsert_pre_delete_rows_rejects_rows_with_mismatched_primary_keys() {
-        let change_batch = create_test_change_batch(
-            vec!["c", "c", "c"],
-            &[vec!["id"], vec!["id", "name"], vec!["id"]],
-            vec![1, 2, 3],
-            vec![Some("a"), Some("b"), Some("c")],
-        );
-
-        let dataset_name = TableReference::bare("test_dataset");
-        let err = upsert_pre_delete_rows(&change_batch, &[0, 1, 2], &dataset_name)
-            .expect_err("mismatched primary keys should fail safely");
-
-        assert!(
-            err.to_string()
-                .contains("1 row(s) have missing or inconsistent primary key metadata")
-        );
-    }
-
-    #[test]
-    fn test_upsert_pre_delete_rows_allows_create_rows_without_primary_keys() {
-        let change_batch = create_test_change_batch(
-            vec!["c", "c"],
-            &[vec![], vec![]],
-            vec![1, 2],
-            vec![Some("a"), Some("b")],
-        );
-
-        let dataset_name = TableReference::bare("test_dataset");
-        let should_delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1], &dataset_name)
-            .expect("create rows without primary keys should append without pre-delete");
-
-        assert!(!should_delete_rows);
-    }
-
-    #[test]
-    fn test_upsert_pre_delete_rows_allows_read_rows_without_primary_keys() {
-        let change_batch = create_test_change_batch(
-            vec!["r", "r"],
-            &[vec![], vec![]],
-            vec![1, 2],
-            vec![Some("a"), Some("b")],
-        );
-
-        let dataset_name = TableReference::bare("test_dataset");
-        let should_delete_rows = upsert_pre_delete_rows(&change_batch, &[0, 1], &dataset_name)
-            .expect("read rows without primary keys should append without pre-delete");
-
-        assert!(!should_delete_rows);
-    }
-
-    #[test]
-    fn test_upsert_pre_delete_rows_rejects_update_rows_without_primary_keys() {
-        let change_batch = create_test_change_batch(
-            vec!["u", "u"],
-            &[vec![], vec![]],
-            vec![1, 2],
-            vec![Some("a"), Some("b")],
-        );
-
-        let dataset_name = TableReference::bare("test_dataset");
-        let err = upsert_pre_delete_rows(&change_batch, &[0, 1], &dataset_name)
-            .expect_err("update rows without primary keys should fail safely");
-
-        assert!(
-            err.to_string()
-                .contains("update row(s) have no usable primary key metadata")
-        );
-    }
 }
