@@ -10,3 +10,7 @@ The project docs for contributors and community. For user documentation of the S
 
 - [CONTRIBUTING.md](../CONTRIBUTING.md)
 - [Release Process](RELEASE.md)
+
+## Developer Notes
+
+- [LLM Prompt Caching](dev/llm-prompt-caching.md)
