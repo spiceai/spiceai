@@ -28,10 +28,13 @@ mod mcp {
     use runtime::Runtime;
     use runtime::auth::EndpointAuth;
     use serde_json::Value;
-    use spicepod::component::runtime::McpConfig;
+    use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth, McpConfig};
     use spicepod::component::tool::Tool;
     use std::sync::Arc;
     use test_framework::yaml;
+
+    /// A fixed test API key used when the runtime has auth enabled.
+    const TEST_API_KEY: &str = "test-mcp-integration-key";
 
     /// Test that spiced can run a stdio MCP server.
     #[tokio::test]
@@ -192,6 +195,7 @@ params:
             .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json")
             .header(HOST, "spice-test.local")
+            .header("X-API-Key", TEST_API_KEY)
             .json(&init_body)
             .send()
             .await?;
@@ -235,6 +239,7 @@ params:
             .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json")
             .header(HOST, "evil.example.com")
+            .header("X-API-Key", TEST_API_KEY)
             .json(&init_body)
             .send()
             .await?;
@@ -281,6 +286,7 @@ params:
             .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json")
             .header(HOST, "arbitrary.host.example.com")
+            .header("X-API-Key", TEST_API_KEY)
             .json(&init_body)
             .send()
             .await?;
@@ -295,11 +301,22 @@ params:
     }
 
     /// Starts a spiced runtime with the given [`McpConfig`] and returns its HTTP base URL.
+    ///
+    /// Auth is enabled with [`TEST_API_KEY`] so that the MCP endpoint is reachable
+    /// (the `require_auth_configured` guard requires auth to be set up).
     async fn start_spiced_with_mcp_config(mcp_config: McpConfig) -> anyhow::Result<String> {
         use spicepod::component::runtime::Runtime as SpicepodRuntime;
 
         let runtime_config = SpicepodRuntime {
             mcp: Some(mcp_config),
+            auth: Some(Auth {
+                api_key: Some(ApiKeyAuth {
+                    enabled: true,
+                    keys: vec![ApiKey::ReadWrite {
+                        key: TEST_API_KEY.to_string(),
+                    }],
+                }),
+            }),
             ..Default::default()
         };
         let app = AppBuilder::new("mcp-allowed-hosts-test")
@@ -312,9 +329,15 @@ params:
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
         let _tracing = init_tracing_with_task_history(Some("integration=debug,info"), &rt);
 
+        let app_arc = rt
+            .read_app()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("App not loaded"))?;
+        let endpoint_auth = EndpointAuth::new(rt.secrets(), &app_arc).await;
+
         let rt_ref_copy = Arc::clone(&rt);
         tokio::spawn(async move {
-            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            Box::pin(rt_ref_copy.start_servers(api_config, None, endpoint_auth)).await
         });
 
         tokio::select! {

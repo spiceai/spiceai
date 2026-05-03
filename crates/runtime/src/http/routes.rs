@@ -41,7 +41,9 @@ use opentelemetry::KeyValue;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
-use spicepod::component::runtime::{CorsConfig, McpConfig};
+use spicepod::component::runtime::CorsConfig;
+#[cfg(feature = "mcp")]
+use spicepod::component::runtime::McpConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -261,7 +263,7 @@ pub(crate) fn routes(
     search: Arc<search_engine::SearchEngine>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
-    mcp_config: Option<&McpConfig>,
+    #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
