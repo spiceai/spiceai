@@ -24,13 +24,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpiceToolsOptions {
-    /// Automatically choose between direct builtin tools and searchable discovery.
+    /// Automatically choose between direct available tools and searchable discovery.
     Auto,
 
-    /// Use all available builtin tools directly.
+    /// Use all available tools directly.
     All,
 
-    /// Use a searchable registry over all available builtin tools.
+    /// Use a searchable registry over all available tools.
     #[serde(rename = "search_registry")]
     SearchRegistry,
 
@@ -56,6 +56,14 @@ impl SpiceToolsOptions {
             SpiceToolsOptions::Disabled => false,
             SpiceToolsOptions::Specific(t) => !t.is_empty(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn includes_all_available_tools(&self) -> bool {
+        matches!(
+            self,
+            SpiceToolsOptions::Auto | SpiceToolsOptions::All | SpiceToolsOptions::SearchRegistry
+        )
     }
 
     pub(crate) fn tools_by_name(&self) -> Vec<&str> {
@@ -154,6 +162,7 @@ mod tests {
     #[test]
     fn test_all_tool_opts() {
         assert!(SpiceToolsOptions::All.can_use_tools());
+        assert!(SpiceToolsOptions::All.includes_all_available_tools());
         assert_eq!(
             SpiceToolsOptions::All.tools_by_name(),
             SpiceToolsOptions::Auto.tools_by_name()
@@ -170,6 +179,7 @@ mod tests {
     #[test]
     fn test_search_registry_tool_opts() {
         assert!(SpiceToolsOptions::SearchRegistry.can_use_tools());
+        assert!(SpiceToolsOptions::SearchRegistry.includes_all_available_tools());
         assert_eq!(
             SpiceToolsOptions::SearchRegistry.tools_by_name(),
             SpiceToolsOptions::Auto.tools_by_name()

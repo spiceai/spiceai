@@ -25,13 +25,14 @@ use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{Runtime, tools::catalog::SpiceToolCatalog};
 
 use super::builtin::catalog::BuiltinToolCatalog;
+use super::factory::default_catalog_names;
 use super::{Tooling, options::SpiceToolsOptions};
 use tools::{SpiceModelTool, rename::with_name};
 
@@ -120,79 +121,213 @@ pub async fn get_tools_with_allowlist(
 
     let mut tools = vec![];
     let mut missing_tools = vec![];
+    let mut seen_tool_names = HashSet::new();
+
+    if opts.includes_all_available_tools() {
+        extend_unique_tools(
+            &mut tools,
+            &mut seen_tool_names,
+            all_available_tools(Arc::clone(&rt), &all_tools, table_allowlist).await,
+        );
+        return tools;
+    }
+
+    if let SpiceToolsOptions::Specific(requested_tools) = opts {
+        for tt in requested_tools {
+            match tt.parse::<SpiceToolsOptions>() {
+                Ok(group) if group.includes_all_available_tools() => extend_unique_tools(
+                    &mut tools,
+                    &mut seen_tool_names,
+                    all_available_tools(Arc::clone(&rt), &all_tools, table_allowlist.clone()).await,
+                ),
+                Ok(SpiceToolsOptions::Nsql) => {
+                    for tool_name in SpiceToolsOptions::Nsql.tools_by_name() {
+                        match get_tool_by_name(
+                            Arc::clone(&rt),
+                            &all_tools,
+                            tool_name,
+                            table_allowlist.clone(),
+                        )
+                        .await
+                        {
+                            Some(resolved_tools) => extend_unique_tools(
+                                &mut tools,
+                                &mut seen_tool_names,
+                                resolved_tools,
+                            ),
+                            None => missing_tools.push(tool_name.to_string()),
+                        }
+                    }
+                }
+                Ok(SpiceToolsOptions::Disabled) => {}
+                Ok(SpiceToolsOptions::Specific(_))
+                | Ok(SpiceToolsOptions::Auto)
+                | Ok(SpiceToolsOptions::All)
+                | Ok(SpiceToolsOptions::SearchRegistry) => {
+                    match get_tool_by_name(Arc::clone(&rt), &all_tools, tt, table_allowlist.clone())
+                        .await
+                    {
+                        Some(resolved_tools) => {
+                            extend_unique_tools(&mut tools, &mut seen_tool_names, resolved_tools);
+                        }
+                        None => missing_tools.push(tt.to_string()),
+                    }
+                }
+            }
+        }
+
+        warn_missing_tools(&all_tools, &missing_tools);
+        return tools;
+    }
 
     for tt in opts.tools_by_name() {
-        if let Some((catalog_name, catalog_tool)) = tt.split_once(':') {
-            if let Some(Tooling::Catalog(catalog)) = all_tools.get(catalog_name) {
-                let catalog = match (
-                    catalog.as_any().downcast_ref::<BuiltinToolCatalog>(),
-                    table_allowlist.clone(),
-                ) {
-                    (None, Some(_)) => {
-                        tracing::info!(
-                            "Table allowlist is only applicable to builtin catalog/tools. Allowlist will not be applied to '{catalog_name}'"
-                        );
-                        Arc::clone(catalog)
-                    }
-                    (Some(builtin_catalog), Some(allowlist)) => Arc::new(
-                        builtin_catalog
-                            .clone()
-                            .with_table_allowlist(allowlist.clone()),
-                    )
-                        as Arc<dyn SpiceToolCatalog>,
-                    _ => Arc::clone(catalog),
-                };
-
-                if let Some(t) = catalog.get(catalog_tool).await {
-                    tools.push(with_name(
-                        &t,
-                        format!("{catalog_name}/{}", t.name()).as_str(),
-                    ));
-                } else {
-                    tracing::warn!("Tool '{catalog_tool}' is not found in '{catalog_name}'.");
-                    missing_tools.push(tt);
-                }
-            } else {
-                missing_tools.push(tt);
+        match get_tool_by_name(Arc::clone(&rt), &all_tools, tt, table_allowlist.clone()).await {
+            Some(resolved_tools) => {
+                extend_unique_tools(&mut tools, &mut seen_tool_names, resolved_tools);
             }
-        } else if let Some(tool) = all_tools.get(tt) {
-            if let Some(ref allowlist) = table_allowlist
-                && BuiltinToolCatalog::is_builtin_tool(tt)
-            {
-                if let Ok(t) = BuiltinToolCatalog::new(Arc::clone(&rt))
-                    .with_table_allowlist(allowlist.clone())
-                    .construct_builtin(tt, None, None, &HashMap::new())
-                {
-                    tools.push(t);
-                } else {
-                    tracing::warn!("Failed to construct tool '{tt}' with table allowlist.");
-                    missing_tools.push(tt);
-                }
-            } else {
-                if table_allowlist.is_some() {
-                    tracing::info!(
-                        "Table allowlist is only applicable to builtin catalog/tools. Allowlist will not be applied to '{tt}'"
-                    );
-                }
-                tools.extend(tool.tools().await);
-            }
-        } else {
-            missing_tools.push(tt);
+            None => missing_tools.push(tt.to_string()),
         }
     }
 
-    if !missing_tools.is_empty() {
-        let available_tools = all_tools
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<&str>>()
-            .join(", ");
+    warn_missing_tools(&all_tools, &missing_tools);
 
-        tracing::warn!(
-            "The following tools were not found in the registry: {}.\nAvailable tools are: {available_tools}.\nFor details, visit https://spiceai.org/docs/features/large-language-models/tools",
-            missing_tools.join(", ")
-        );
+    tools
+}
+
+async fn all_available_tools(
+    rt: Arc<Runtime>,
+    all_tools: &HashMap<String, Tooling>,
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
+) -> Vec<Arc<dyn SpiceModelTool>> {
+    let mut tools = vec![];
+    let mut seen_tool_names = HashSet::new();
+
+    for tool_name in SpiceToolsOptions::All.tools_by_name() {
+        if let Some(resolved_tools) = get_tool_by_name(
+            Arc::clone(&rt),
+            all_tools,
+            tool_name,
+            table_allowlist.clone(),
+        )
+        .await
+        {
+            extend_unique_tools(&mut tools, &mut seen_tool_names, resolved_tools);
+        }
+    }
+
+    let default_catalog_names = default_catalog_names();
+    let mut tool_entries = all_tools.iter().collect::<Vec<_>>();
+    tool_entries.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+
+    for (tool_name, tooling) in tool_entries {
+        if BuiltinToolCatalog::is_builtin_tool(tool_name) {
+            continue;
+        }
+
+        if let Tooling::Catalog(catalog) = tooling
+            && default_catalog_names.contains(&catalog.name())
+        {
+            continue;
+        }
+
+        extend_unique_tools(&mut tools, &mut seen_tool_names, tooling.tools().await);
     }
 
     tools
+}
+
+async fn get_tool_by_name(
+    rt: Arc<Runtime>,
+    all_tools: &HashMap<String, Tooling>,
+    tool_name: &str,
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
+) -> Option<Vec<Arc<dyn SpiceModelTool>>> {
+    if let Some((catalog_name, catalog_tool)) = tool_name.split_once(':') {
+        let Some(Tooling::Catalog(catalog)) = all_tools.get(catalog_name) else {
+            return None;
+        };
+
+        let catalog = match (
+            catalog.as_any().downcast_ref::<BuiltinToolCatalog>(),
+            table_allowlist,
+        ) {
+            (None, Some(_)) => {
+                tracing::info!(
+                    "Table allowlist is only applicable to builtin catalog/tools. Allowlist will not be applied to '{catalog_name}'"
+                );
+                Arc::clone(catalog)
+            }
+            (Some(builtin_catalog), Some(allowlist)) => Arc::new(
+                builtin_catalog
+                    .clone()
+                    .with_table_allowlist(allowlist.clone()),
+            ) as Arc<dyn SpiceToolCatalog>,
+            _ => Arc::clone(catalog),
+        };
+
+        if let Some(t) = catalog.get(catalog_tool).await {
+            return Some(vec![with_name(
+                &t,
+                format!("{catalog_name}/{}", t.name()).as_str(),
+            )]);
+        }
+
+        tracing::warn!("Tool '{catalog_tool}' is not found in '{catalog_name}'.");
+        return None;
+    }
+
+    let Some(tool) = all_tools.get(tool_name) else {
+        return None;
+    };
+
+    if let Some(ref allowlist) = table_allowlist
+        && BuiltinToolCatalog::is_builtin_tool(tool_name)
+    {
+        if let Ok(t) = BuiltinToolCatalog::new(Arc::clone(&rt))
+            .with_table_allowlist(allowlist.clone())
+            .construct_builtin(tool_name, None, None, &HashMap::new())
+        {
+            return Some(vec![t]);
+        }
+
+        tracing::warn!("Failed to construct tool '{tool_name}' with table allowlist.");
+        return None;
+    }
+
+    if table_allowlist.is_some() {
+        tracing::info!(
+            "Table allowlist is only applicable to builtin catalog/tools. Allowlist will not be applied to '{tool_name}'"
+        );
+    }
+
+    Some(tool.tools().await)
+}
+
+fn extend_unique_tools(
+    tools: &mut Vec<Arc<dyn SpiceModelTool>>,
+    seen_tool_names: &mut HashSet<String>,
+    new_tools: Vec<Arc<dyn SpiceModelTool>>,
+) {
+    for tool in new_tools {
+        if seen_tool_names.insert(tool.name().to_string()) {
+            tools.push(tool);
+        }
+    }
+}
+
+fn warn_missing_tools(all_tools: &HashMap<String, Tooling>, missing_tools: &[String]) {
+    if missing_tools.is_empty() {
+        return;
+    }
+
+    let available_tools = all_tools
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<&str>>()
+        .join(", ");
+
+    tracing::warn!(
+        "The following tools were not found in the registry: {}. Available tools are: {available_tools}. For details, visit https://spiceai.org/docs/features/large-language-models/tools",
+        missing_tools.join(", ")
+    );
 }
