@@ -455,8 +455,31 @@ impl ShareSession {
     }
 
     /// Put object (write file). Uses compound Create+Write+Close for small
-    /// files, falling back to sequential for larger files.
+    /// files, falling back to sequential for larger files. Always overwrites
+    /// existing files; use [`Self::put_object_create`] for create-exclusive
+    /// semantics.
     pub async fn put_object(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
+        self.put_object_inner(key, data, CreateDisposition::OverwriteIf as u32)
+            .await
+    }
+
+    /// Put object atomically only if it does not already exist
+    /// (`PutMode::Create` semantics). Maps to SMB `FILE_CREATE` disposition,
+    /// which the server enforces atomically and returns
+    /// `STATUS_OBJECT_NAME_COLLISION` (→ `io::ErrorKind::AlreadyExists`) on
+    /// collision — no client-side TOCTOU window between an existence check
+    /// and the actual write.
+    pub async fn put_object_create(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
+        self.put_object_inner(key, data, CreateDisposition::Create as u32)
+            .await
+    }
+
+    async fn put_object_inner(
+        &self,
+        key: &str,
+        data: &[u8],
+        disposition: u32,
+    ) -> io::Result<ObjectMeta> {
         let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
         self.ensure_parent_dirs_on(&client, tree_id, &smb_path)
@@ -465,7 +488,10 @@ impl ShareSession {
         let compound_max = self.pool.compound_max_write_size as usize;
         let chunk_size = self.pool.max_write_size as usize;
 
-        if data.len() <= compound_max {
+        if data.len() <= compound_max && disposition == CreateDisposition::OverwriteIf as u32 {
+            // Compound fast path uses the spec-defined OverwriteIf
+            // disposition; create-exclusive falls through to the explicit
+            // open-write-close sequence below so we control the disposition.
             let cl = client.create_write_close(tree_id, &smb_path, data).await?;
             return Ok(ObjectMeta {
                 size: data.len() as u64,
@@ -480,7 +506,7 @@ impl ShareSession {
                 &smb_path,
                 DesiredAccess::GenericWrite as u32,
                 ShareAccess::Read as u32,
-                CreateDisposition::OverwriteIf as u32,
+                disposition,
                 CreateOptions::NonDirectoryFile as u32,
             )
             .await?;
@@ -569,8 +595,31 @@ impl ShareSession {
 
     /// Copy a file on the SMB share by streaming source reads into a WAL
     /// writer. Memory footprint is one pipeline window (`max_read_size *
-    /// PIPELINE_DEPTH`) regardless of source size.
+    /// PIPELINE_DEPTH`) regardless of source size. Always overwrites an
+    /// existing destination; use [`Self::copy_object_create_only`] for
+    /// `copy_if_not_exists` semantics.
     pub async fn copy_object(&self, src_key: &str, dst_key: &str) -> io::Result<ObjectMeta> {
+        self.copy_object_inner(src_key, dst_key, true).await
+    }
+
+    /// Streaming copy that fails atomically if the destination already
+    /// exists. The WAL temp file is renamed with `replace_if_exists=false`,
+    /// which the SMB server enforces atomically — no client-side TOCTOU
+    /// between a head check and the rename.
+    pub async fn copy_object_create_only(
+        &self,
+        src_key: &str,
+        dst_key: &str,
+    ) -> io::Result<ObjectMeta> {
+        self.copy_object_inner(src_key, dst_key, false).await
+    }
+
+    async fn copy_object_inner(
+        &self,
+        src_key: &str,
+        dst_key: &str,
+        replace_if_exists: bool,
+    ) -> io::Result<ObjectMeta> {
         let src = self.open_read(src_key).await?;
         let src_size = src.file_size;
         let mut writer = self.open_wal_write(dst_key).await?;
@@ -605,7 +654,13 @@ impl ShareSession {
 
         let _ = src.close().await;
         match result {
-            Ok(()) => writer.commit(self).await,
+            Ok(()) => {
+                if replace_if_exists {
+                    writer.commit(self).await
+                } else {
+                    writer.commit_create_only(self).await
+                }
+            }
             Err(e) => {
                 writer.abort().await;
                 Err(e)
@@ -830,13 +885,35 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Flush remaining data, close the WAL file, and rename it to the final path.
-    pub async fn commit(mut self, share: &ShareSession) -> io::Result<ObjectMeta> {
+    /// Flush remaining data, close the WAL file, and rename it to the final
+    /// path, replacing any existing object at that path.
+    pub async fn commit(self, share: &ShareSession) -> io::Result<ObjectMeta> {
+        self.commit_inner(share, true).await
+    }
+
+    /// Like [`Self::commit`] but the rename only succeeds when no object
+    /// already exists at the final path (atomic create-exclusive). Used by
+    /// `PutMode::Create` and `copy_if_not_exists` to avoid a TOCTOU window
+    /// between a head check and the rename.
+    pub async fn commit_create_only(self, share: &ShareSession) -> io::Result<ObjectMeta> {
+        self.commit_inner(share, false).await
+    }
+
+    async fn commit_inner(
+        mut self,
+        share: &ShareSession,
+        replace_if_exists: bool,
+    ) -> io::Result<ObjectMeta> {
         // Flush before renaming so no buffered bytes are lost.
         let flush_result = self.flush().await;
         let rename_result = if flush_result.is_ok() {
             self.client
-                .rename(self.tree_id, &self.file_id, &self.final_path, true)
+                .rename(
+                    self.tree_id,
+                    &self.file_id,
+                    &self.final_path,
+                    replace_if_exists,
+                )
                 .await
         } else {
             Ok(())

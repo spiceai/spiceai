@@ -330,7 +330,7 @@ impl SmbClient {
 
         update_preauth_hash(&mut preauth_hash, &packet[4..]);
 
-        let (resp_hdr, ..) = self.send_recv_raw(&mut packet).await?;
+        let (resp_hdr, _resp_body, resp_raw) = self.send_recv_raw(&mut packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
             tracing::warn!(target: "smb", "auth failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::new(
@@ -338,6 +338,15 @@ impl SmbClient {
                 format!("authentication failed: status=0x{:08X}", resp_hdr.status),
             ));
         }
+
+        // Per [MS-SMB2] §3.2.5.3.1, the client must update the preauth
+        // integrity hash with the final SESSION_SETUP response (the one
+        // returning STATUS_SUCCESS) before deriving the SMB 3.1.1 signing
+        // key. Skipping this would derive the key from an incomplete
+        // transcript, so the very first signed request after auth would
+        // fail against servers that validate the full preauth chain
+        // (Samba 4.21+, Windows Server 2025).
+        update_preauth_hash(&mut preauth_hash, &resp_raw);
 
         let signing_key = auth::derive_signing_key(&session_base_key, &preauth_hash);
         tracing::debug!(target: "smb", "authenticated, signing key derived");

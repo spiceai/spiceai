@@ -391,6 +391,10 @@ pub enum ShareAccess {
 #[derive(Debug, Clone, Copy)]
 pub enum CreateDisposition {
     Open = 0x0000_0001,
+    /// FILE_CREATE — atomically fails with `STATUS_OBJECT_NAME_COLLISION`
+    /// if the target already exists. Use for create-exclusive semantics
+    /// (e.g. `PutMode::Create`) to avoid a TOCTOU between `head` and write.
+    Create = 0x0000_0002,
     OpenIf = 0x0000_0003,
     OverwriteIf = 0x0000_0005,
 }

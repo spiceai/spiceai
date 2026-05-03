@@ -33,8 +33,7 @@ use object_store::{
     ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use smb::{ShareSession, SmbConfig, SmbPool, WalWriter};
-use std::sync::Mutex as StdMutex;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
 use super::common::{
     DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
@@ -65,17 +64,6 @@ fn map_head_error(err: std::io::Error, path: String) -> object_store::Error {
         }
     } else {
         handle_error(err)
-    }
-}
-
-/// Check whether the destination exists for create-exclusive semantics.
-/// `Ok(true)` → exists; `Ok(false)` → confirmed not found; `Err` → head
-/// failed for some other reason and should be surfaced as a real error.
-async fn destination_exists(share: &ShareSession, key: &str) -> object_store::Result<bool> {
-    match share.head_object(key).await {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(handle_error(e)),
     }
 }
 
@@ -337,16 +325,21 @@ impl SMBObjectStore {
         &self,
         share: &Arc<ShareSession>,
         key: &str,
+        path: &Path,
         payload: PutPayload,
+        mode: PutMode,
     ) -> object_store::Result<PutResult> {
+        let create_only = matches!(mode, PutMode::Create);
         let chunks = payload.as_ref();
         if chunks.len() == 1 {
             // Single chunk — hand the slice straight to put_object for the
             // small-file compound fast path.
-            let meta = share
-                .put_object(key, chunks[0].as_ref())
-                .await
-                .map_err(handle_error)?;
+            let meta = if create_only {
+                share.put_object_create(key, chunks[0].as_ref()).await
+            } else {
+                share.put_object(key, chunks[0].as_ref()).await
+            }
+            .map_err(|e| map_put_error(e, path.to_string()))?;
             return Ok(PutResult {
                 e_tag: Some(meta.etag),
                 version: None,
@@ -364,11 +357,31 @@ impl SMBObjectStore {
                 return Err(handle_error(e));
             }
         }
-        let meta = writer.commit(share.as_ref()).await.map_err(handle_error)?;
+        let meta = if create_only {
+            writer.commit_create_only(share.as_ref()).await
+        } else {
+            writer.commit(share.as_ref()).await
+        }
+        .map_err(|e| map_put_error(e, path.to_string()))?;
         Ok(PutResult {
             e_tag: Some(meta.etag),
             version: None,
         })
+    }
+}
+
+/// Map an `io::Error` from a put operation into an `object_store::Error`.
+/// `AlreadyExists` is preserved with the supplied path so callers (esp.
+/// `PutMode::Create` and `copy_if_not_exists`) get the typed
+/// `object_store::Error::AlreadyExists` instead of an opaque `Generic`.
+fn map_put_error(err: std::io::Error, path: String) -> object_store::Error {
+    if err.kind() == std::io::ErrorKind::AlreadyExists {
+        object_store::Error::AlreadyExists {
+            path,
+            source: err.into(),
+        }
+    } else {
+        handle_error(err)
     }
 }
 
@@ -395,17 +408,13 @@ impl ObjectStore for SMBObjectStore {
         let share = self.get_share().await?;
         let key = self.config().key_for(location);
 
-        // SMB has no atomic "create-exclusive" primitive that maps cleanly
-        // across dialects; best-effort: head first, reject if the object
-        // already exists. This is a TOCTOU race, same as `copy_if_not_exists`.
-        if matches!(opts.mode, PutMode::Create) && destination_exists(&share, &key).await? {
-            return Err(object_store::Error::AlreadyExists {
-                path: location.to_string(),
-                source: "put_opts(Create): destination already exists".into(),
-            });
-        }
-
-        self.put_streaming(&share, &key, payload).await
+        // `PutMode::Create` is enforced atomically inside `put_streaming` via
+        // SMB `FILE_CREATE` (single-chunk fast path) or via WAL + rename
+        // with `replace_if_exists=false` (multi-chunk path). The previous
+        // head-then-write check had a TOCTOU window; the server-side
+        // primitive closes it.
+        self.put_streaming(&share, &key, location, payload, opts.mode)
+            .await
     }
 
     async fn put_multipart_opts(
@@ -544,24 +553,19 @@ impl ObjectStore for SMBObjectStore {
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        // TOCTOU race: SMB has no atomic copy-if-not-exists primitive.
-        // A head-then-copy sequence is the best we can do.
+        // Atomic via streaming copy + rename(replace_if_exists=false). The
+        // server enforces the no-overwrite rule when renaming the WAL temp
+        // into place, so there is no TOCTOU window between an existence
+        // check and the rename.
         let share = self.get_share().await?;
+        let src_key = self.config().key_for(from);
         let dst_key = self.config().key_for(to);
 
-        if destination_exists(&share, &dst_key).await? {
-            return Err(object_store::Error::AlreadyExists {
-                path: to.to_string(),
-                source: "copy_if_not_exists: destination already exists".into(),
-            });
-        }
-
-        let src_key = self.config().key_for(from);
         share
-            .copy_object(&src_key, &dst_key)
+            .copy_object_create_only(&src_key, &dst_key)
             .await
             .map(|_| ())
-            .map_err(handle_error)
+            .map_err(|e| map_put_error(e, to.to_string()))
     }
 }
 
@@ -583,22 +587,24 @@ fn guard_read_size(size: u64) -> object_store::Result<()> {
 /// Parts are appended in order to a temp file on the SMB share. `complete`
 /// atomically renames the temp file into place.
 ///
-/// Uses a synchronous `std::sync::Mutex` (not `tokio::sync::Mutex`) so the
-/// guard is never held across `.await`. `put_part`/`complete`/`abort` each
-/// briefly lock to `take()` the `WalWriter`, do their async I/O without the
-/// lock held, then briefly lock again to put the writer back. The mutex is
-/// only required to share state with the `'static` future returned by
-/// `put_part`; `&mut self` already serializes concurrent calls.
+/// `MultipartUpload` callers may hold multiple part futures alive at the
+/// same time and poll them concurrently, so we use a `tokio::sync::Mutex`
+/// rather than a `std::sync::Mutex`: `put_part` holds the lock across the
+/// awaited `WalWriter::write` so concurrently-polled parts serialize
+/// (writes are intrinsically ordered into the WAL temp file). `complete`
+/// and `abort` `take()` the writer out of the slot under the lock and
+/// drop the guard *before* awaiting the long-running commit/abort, so
+/// they cannot deadlock against an in-flight `put_part`.
 struct SMBMultipartUpload {
     share: Arc<ShareSession>,
-    writer: Arc<StdMutex<Option<WalWriter>>>,
+    writer: Arc<TokioMutex<Option<WalWriter>>>,
 }
 
 impl SMBMultipartUpload {
     fn new(share: Arc<ShareSession>, writer: WalWriter) -> Self {
         Self {
             share,
-            writer: Arc::new(StdMutex::new(Some(writer))),
+            writer: Arc::new(TokioMutex::new(Some(writer))),
         }
     }
 }
@@ -616,52 +622,34 @@ fn upload_already_finalized() -> object_store::Error {
     }
 }
 
-/// Take the value out of a shared `Option<T>` slot under a sync mutex.
-/// Returns an error if the slot is empty (caller has already taken it,
-/// e.g. via `complete()` or `abort()`) or if the mutex was poisoned.
-///
-/// Generic over `T` so the state-machine semantics — single-take, idempotent
-/// after finalize — can be exercised in unit tests without constructing a
-/// real `WalWriter`.
-fn take_slot<T>(slot: &StdMutex<Option<T>>) -> object_store::Result<T> {
-    slot.lock()
-        .map_err(|_| object_store::Error::Generic {
-            store: STORE_NAME,
-            source: "multipart upload mutex poisoned".into(),
-        })?
-        .take()
-        .ok_or_else(upload_already_finalized)
-}
-
-/// Put a value back into a shared `Option<T>` slot after async I/O.
-fn replace_slot<T>(slot: &StdMutex<Option<T>>, value: T) {
-    if let Ok(mut guard) = slot.lock() {
-        *guard = Some(value);
-    }
-}
-
 #[async_trait]
 impl MultipartUpload for SMBMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
         let writer_slot = Arc::clone(&self.writer);
         Box::pin(async move {
-            let mut writer = take_slot(&writer_slot)?;
-            let mut io_result: Result<(), std::io::Error> = Ok(());
+            // Hold the async lock across the writes so concurrently-polled
+            // `put_part` futures serialize on the underlying WalWriter.
+            // Per-call `take()`-then-`replace()` was racy: a second future
+            // polled before the first finished would see `None` and
+            // erroneously return "already finalized".
+            let mut guard = writer_slot.lock().await;
+            let writer = guard.as_mut().ok_or_else(upload_already_finalized)?;
             for chunk in data.as_ref() {
-                if let Err(e) = writer.write(chunk.as_ref()).await {
-                    io_result = Err(e);
-                    break;
-                }
+                writer.write(chunk.as_ref()).await.map_err(handle_error)?;
             }
-            // On error the writer is still valid for `abort()`; on success it
-            // is valid for the next `put_part()`/`complete()`.
-            replace_slot(&writer_slot, writer);
-            io_result.map_err(handle_error)
+            Ok(())
         })
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
-        let writer = take_slot(&self.writer)?;
+        // Take the writer under the lock, then drop the guard before awaiting
+        // the long-running commit so we don't block a parallel `abort()`.
+        let writer = self
+            .writer
+            .lock()
+            .await
+            .take()
+            .ok_or_else(upload_already_finalized)?;
         let meta = writer
             .commit(self.share.as_ref())
             .await
@@ -673,12 +661,10 @@ impl MultipartUpload for SMBMultipartUpload {
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
-        // Take the writer out under the sync lock, then drop the lock before
-        // awaiting the asynchronous abort.
-        let writer = match self.writer.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => return Ok(()),
-        };
+        // Same pattern as `complete`: take under the lock, drop the guard,
+        // then await abort. `None` here means the upload was already
+        // completed or aborted — abort is idempotent in that case.
+        let writer = self.writer.lock().await.take();
         if let Some(w) = writer {
             w.abort().await;
         }
@@ -788,53 +774,20 @@ mod tests {
         assert!(guard_read_size(MAX_BUFFERED_READ + 1).is_err());
     }
 
-    // ── Multipart upload state-machine ───────────────────────────────────
+    // ── Multipart upload "already finalized" semantics ──────────────────
     //
     // The full WAL flow (put_part → flush → rename → complete | abort)
     // exercises a real SMB server; that lives in the runtime integration
-    // suite under a Samba container. The tests below exercise the parts
-    // of `SMBMultipartUpload` that don't require I/O — specifically the
-    // single-take / replace state machine that backs the take_writer /
-    // replace_writer helpers, and the "already finalized" error semantics
-    // that protect against double-complete or use-after-abort.
-    //
-    // The helpers are generic over `T` precisely to make these tests
-    // possible without constructing a `WalWriter`.
+    // suite under a Samba container. The tests below cover the smaller
+    // surface that's testable without I/O: the `upload_already_finalized`
+    // error has a stable shape (Generic + the contracted message) so that
+    // callers polling a stale `MultipartUpload` after `complete` / `abort`
+    // get a recognizable error, not a panic.
 
     #[test]
-    fn test_take_slot_extracts_value_once() {
-        let slot: StdMutex<Option<u32>> = StdMutex::new(Some(7));
-        let v = take_slot(&slot).expect("first take should succeed");
-        assert_eq!(v, 7);
-        // Slot is now empty — a second take must fail with "already finalized".
-        let err = take_slot(&slot).expect_err("second take must fail");
+    fn test_upload_already_finalized_error_shape() {
+        let err = upload_already_finalized();
         assert!(matches!(err, object_store::Error::Generic { .. }));
         assert!(err.to_string().contains("already completed or aborted"));
-    }
-
-    #[test]
-    fn test_replace_slot_round_trips_for_next_part() {
-        let slot: StdMutex<Option<String>> = StdMutex::new(Some("part-1".into()));
-        let v = take_slot(&slot).expect("take part-1");
-        // Mid-flight: slot is empty; concurrent put_part would see "finalized".
-        let _ = take_slot(&slot).expect_err("mid-flight take must reject");
-        // After async I/O completes the writer is returned to the slot —
-        // this is the put_part success path that must allow further parts.
-        replace_slot(&slot, format!("{v}-resumed"));
-        let v2 = take_slot(&slot).expect("take after replace");
-        assert_eq!(v2, "part-1-resumed");
-    }
-
-    #[test]
-    fn test_take_slot_idempotent_after_finalize() {
-        // Empty slot models the post-complete or post-abort state.
-        let slot: StdMutex<Option<u32>> = StdMutex::new(None);
-        // Both finalize paths (complete, abort) and any stray put_part must
-        // see the "already finalized" error rather than panicking or silently
-        // succeeding against missing state.
-        for _ in 0..3 {
-            let err = take_slot(&slot).expect_err("must reject after finalize");
-            assert!(err.to_string().contains("already completed or aborted"));
-        }
     }
 }
