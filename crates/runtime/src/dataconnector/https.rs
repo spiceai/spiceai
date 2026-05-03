@@ -19,7 +19,8 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::metrics::MetricsProvider;
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::http_rate_control::{
-    self, HttpRateControlConfig, HttpRateControlMetrics, HttpRateControlMetricsProvider,
+    self, HttpRateControlConfig, HttpRateControlMetricSource, HttpRateControlMetrics,
+    HttpRateControlMetricsProvider,
 };
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
@@ -64,6 +65,7 @@ pub struct Https {
     rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     metrics: Arc<HttpRateControlMetrics>,
     emit_rate_control_metrics: bool,
+    rate_control_metric_source: Option<HttpRateControlMetricSource>,
 }
 
 impl std::fmt::Display for Https {
@@ -75,20 +77,30 @@ impl std::fmt::Display for Https {
 impl Https {
     fn shared_rate_control_metrics_for_dataset(
         rate_control_registry: &http_rate_control::HttpRateControlRegistry,
+        rate_control_registry_arc: &Arc<http_rate_control::HttpRateControlRegistry>,
         dataset: &Dataset,
         structured_format: bool,
-    ) -> (Arc<HttpRateControlMetrics>, bool) {
+    ) -> (
+        Arc<HttpRateControlMetrics>,
+        bool,
+        Option<HttpRateControlMetricSource>,
+    ) {
         if structured_format {
-            return (Arc::new(HttpRateControlMetrics::default()), false);
+            return (Arc::new(HttpRateControlMetrics::default()), false, None);
         }
 
         Url::parse(dataset.from.as_str()).map_or_else(
-            |_| (Arc::new(HttpRateControlMetrics::default()), false),
+            |_| (Arc::new(HttpRateControlMetrics::default()), false, None),
             |url| {
+                let metric_source = HttpRateControlMetricSource::new(
+                    Arc::clone(rate_control_registry_arc),
+                    url.clone(),
+                    dataset.name.to_string(),
+                );
                 (
                     rate_control_registry.shared_metrics(&url),
-                    rate_control_registry
-                        .claim_metrics_owner(&url, dataset.name.to_string().as_str()),
+                    true,
+                    Some(metric_source),
                 )
             },
         )
@@ -839,22 +851,8 @@ impl Https {
             request_header_allowlist,
         } = request_filters;
 
-        let rate_limiter = self
-            .rate_control_registry
-            .shared_rate_limiter(&base_url)
-            .await;
-        self.metrics.set_rate_limiter(&rate_limiter);
-        let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
-        let rate_controller = self
-            .rate_control_registry
-            .shared_rate_controller(&base_url, &rate_control, dataset, "https")
-            .await?;
-        self.metrics.set_config(&rate_controller.config);
-        self.metrics
-            .set_rate_controller(rate_controller.controller.as_ref());
-
         let mut provider = data_components::http::provider::HttpTableProvider::new(
-            base_url,
+            base_url.clone(),
             client,
             file_format,
             acceleration_enabled,
@@ -864,8 +862,6 @@ impl Https {
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
-        .with_rate_limiter(Some(rate_limiter))
-        .with_rate_controller(rate_controller.controller)
         .with_max_request_partitions(max_request_partitions)
         .with_health_probe(health_probe)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -968,7 +964,27 @@ impl Https {
             })?;
         }
 
+        let rate_limiter = self
+            .rate_control_registry
+            .shared_rate_limiter(&base_url)
+            .await;
+        self.metrics.set_rate_limiter(&rate_limiter);
+        let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
+        let rate_controller = Arc::clone(&self.rate_control_registry)
+            .reserve_shared_rate_controller(&base_url, &rate_control, dataset, "https")
+            .await?;
+        self.metrics.set_config(&rate_controller.shared().config);
+        self.metrics
+            .set_rate_controller(rate_controller.shared().controller.as_ref());
+        provider = provider
+            .with_rate_limiter(Some(rate_limiter))
+            .with_rate_controller(rate_controller.shared().controller.clone());
+
         let provider = Arc::new(provider);
+        if let Some(metric_source) = &self.rate_control_metric_source {
+            metric_source.claim_owner();
+        }
+        rate_controller.commit().await;
         Self::spawn_endpoint_validation(Arc::clone(&provider), dataset.name.to_string());
 
         Ok(provider)
@@ -1078,6 +1094,7 @@ impl DataConnector for Https {
         Some(Arc::new(HttpRateControlMetricsProvider::new(
             "http",
             Arc::clone(&self.metrics),
+            self.rate_control_metric_source.clone(),
         )))
     }
 
@@ -1217,7 +1234,7 @@ impl DataConnectorFactory for HttpsFactory {
                 .map_or_else(http_rate_control::global_registry, |runtime| {
                     runtime.http_rate_control_registry()
                 });
-            let (metrics, emit_rate_control_metrics) =
+            let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     let structured_format = {
                         let connector = Https {
@@ -1226,16 +1243,18 @@ impl DataConnectorFactory for HttpsFactory {
                             rate_control_registry: Arc::clone(&rate_control_registry),
                             metrics: Arc::new(HttpRateControlMetrics::default()),
                             emit_rate_control_metrics: false,
+                            rate_control_metric_source: None,
                         };
                         connector.is_structured_format(dataset)
                     };
                     Https::shared_rate_control_metrics_for_dataset(
                         &rate_control_registry,
+                        &rate_control_registry,
                         dataset,
                         structured_format,
                     )
                 } else {
-                    (Arc::new(HttpRateControlMetrics::default()), false)
+                    (Arc::new(HttpRateControlMetrics::default()), false, None)
                 };
 
             Ok(Arc::new(Https {
@@ -1244,6 +1263,7 @@ impl DataConnectorFactory for HttpsFactory {
                 rate_control_registry,
                 metrics,
                 emit_rate_control_metrics,
+                rate_control_metric_source,
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -1425,6 +1445,7 @@ mod tests {
             rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
+            rate_control_metric_source: None,
         }
     }
 
@@ -1716,6 +1737,39 @@ mod tests {
             }
             other => panic!("expected jitter range validation error, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_does_not_persist_after_failed_provider_validation() {
+        let failing = test_connector_with(&[
+            ("max_concurrent_requests", "2"),
+            ("health_probe", "not-an-absolute-path"),
+        ])
+        .await;
+        let failing_dataset = test_dataset(
+            "https://failed-provider-validation.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        failing
+            .create_http_table_provider(&failing_dataset)
+            .await
+            .expect_err("invalid health_probe should fail provider validation");
+
+        let succeeding = test_connector_with(&[]).await;
+        let succeeding_dataset = test_dataset(
+            "https://failed-provider-validation.example.com/other",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        succeeding
+            .create_http_table_provider(&succeeding_dataset)
+            .await
+            .expect("failed provider validation should not leave stale origin config");
     }
 
     #[tokio::test]

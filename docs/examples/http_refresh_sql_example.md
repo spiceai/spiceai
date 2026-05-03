@@ -204,7 +204,7 @@ The HTTP connector provides metadata columns:
 
 ## Rate-Control Metrics
 
-HTTP rate-control metrics are auto-registered and available through `/metrics`, `runtime.metrics`, and OTLP exporters as `dataset_http_{metric_name}` with the dataset `name` attribute. Because rate-control state is shared by upstream origin, each origin is emitted once using the first dataset that registers metrics for that origin to avoid double-counting shared counters. They can be disabled individually in the owning dataset `metrics` section with `enabled: false`.
+HTTP rate-control metrics are auto-registered and available through `/metrics`, `runtime.metrics`, and OTLP exporters with the dataset `name` attribute. HTTP connector datasets use `dataset_http_{metric_name}` and GraphQL connector datasets use `dataset_graphql_{metric_name}`. Because rate-control state is shared by upstream origin, each origin is emitted once using the first successfully initialized dataset that claims metrics for that origin to avoid double-counting shared counters. They can be disabled individually in the owning dataset `metrics` section with `enabled: false`.
 
 | Metric                                    | Type    | Description                                                                |
 | ----------------------------------------- | ------- | -------------------------------------------------------------------------- |

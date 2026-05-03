@@ -24,7 +24,7 @@ use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
 use runtime::component::metrics::MetricsProvider;
 use runtime::dataconnector::http_rate_control::{
-    HttpRateControlMetrics, HttpRateControlMetricsProvider,
+    HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -49,6 +49,7 @@ pub struct GraphQL {
     rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     metrics: Arc<HttpRateControlMetrics>,
     emit_rate_control_metrics: bool,
+    rate_control_metric_source: Option<HttpRateControlMetricSource>,
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -113,20 +114,25 @@ impl DataConnectorFactory for GraphQLFactory {
                 .map_or_else(http_rate_control::global_registry, |runtime| {
                     runtime.http_rate_control_registry()
                 });
-            let (metrics, emit_rate_control_metrics) =
+            let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     Url::parse(dataset.path()).map_or_else(
-                        |_| (Arc::new(HttpRateControlMetrics::default()), false),
+                        |_| (Arc::new(HttpRateControlMetrics::default()), false, None),
                         |url| {
+                            let metric_source = HttpRateControlMetricSource::new(
+                                Arc::clone(&rate_control_registry),
+                                url.clone(),
+                                dataset.name.to_string(),
+                            );
                             (
                                 rate_control_registry.shared_metrics(&url),
-                                rate_control_registry
-                                    .claim_metrics_owner(&url, dataset.name.to_string().as_str()),
+                                true,
+                                Some(metric_source),
                             )
                         },
                     )
                 } else {
-                    (Arc::new(HttpRateControlMetrics::default()), false)
+                    (Arc::new(HttpRateControlMetrics::default()), false, None)
                 };
 
             let graphql = GraphQL {
@@ -135,6 +141,7 @@ impl DataConnectorFactory for GraphQLFactory {
                 rate_control_registry,
                 metrics,
                 emit_rate_control_metrics,
+                rate_control_metric_source,
             };
             Ok(Arc::new(graphql) as Arc<dyn DataConnector>)
         })
@@ -150,7 +157,13 @@ impl DataConnectorFactory for GraphQLFactory {
 }
 
 impl GraphQL {
-    async fn get_client(&self, dataset: &Dataset) -> DataConnectorResult<GraphQLClient> {
+    async fn get_client(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<(
+        GraphQLClient,
+        http_rate_control::SharedRateControllerReservation,
+    )> {
         let token = self.params.get("auth_token").ok().map(|token| {
             Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
@@ -210,6 +223,15 @@ impl GraphQL {
                 connector_component: ConnectorComponent::from(dataset),
                 source,
             })?;
+        if unnest_depth > 50 {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "graphql".to_string(),
+                message: format!(
+                    "The `unnest_depth` parameter must be less than or equal to 50, got {unnest_depth}.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/graphql#configuration"
+                ),
+                connector_component: ConnectorComponent::from(dataset),
+            });
+        }
 
         let client = default_spice_client("application/json")
             .boxed()
@@ -231,15 +253,14 @@ impl GraphQL {
             .await;
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
-        let rate_controller = self
-            .rate_control_registry
-            .shared_rate_controller(&endpoint, &rate_control, dataset, "graphql")
+        let rate_controller = Arc::clone(&self.rate_control_registry)
+            .reserve_shared_rate_controller(&endpoint, &rate_control, dataset, "graphql")
             .await?;
-        self.metrics.set_config(&rate_controller.config);
+        self.metrics.set_config(&rate_controller.shared().config);
         self.metrics
-            .set_rate_controller(rate_controller.controller.as_ref());
+            .set_rate_controller(rate_controller.shared().controller.as_ref());
 
-        GraphQLClientBuilder::new(
+        let client_result = GraphQLClientBuilder::new(
             endpoint,
             graphql::client::UnnestBehavior::Depth(unnest_depth),
         )
@@ -248,15 +269,22 @@ impl GraphQL {
         .with_user(user)
         .with_pass(pass)
         .with_rate_limiter(Some(rate_limiter))
-        .with_rate_controller(rate_controller.controller)
+        .with_rate_controller(rate_controller.shared().controller.clone())
         .with_auth_header(auth_header)
         .build(client)
-        .boxed()
-        .map_err(|source| DataConnectorError::InternalWithSource {
-            dataconnector: "graphql".to_string(),
-            connector_component: ConnectorComponent::from(dataset),
-            source,
-        })
+        .boxed();
+
+        match client_result {
+            Ok(client) => Ok((client, rate_controller)),
+            Err(source) => {
+                rate_controller.rollback().await;
+                Err(DataConnectorError::InternalWithSource {
+                    dataconnector: "graphql".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source,
+                })
+            }
+        }
     }
 }
 
@@ -270,8 +298,6 @@ impl DataConnector for GraphQL {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = self.get_client(dataset).await?;
-
         let query = self.params.get("query").expose().ok_or_else(|p| {
             DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "graphql".to_string(),
@@ -280,28 +306,35 @@ impl DataConnector for GraphQL {
             }
         })?;
 
-        Ok(Arc::new(
-            GraphQLTableProviderBuilder::new(client)
-                .build(query)
-                .await
-                .map_err(|e| {
-                    if matches!(e, graphql::Error::InvalidGraphQLQuery { .. }) {
-                        let message = format!("{e}");
-                        DataConnectorError::InvalidConfiguration {
-                            dataconnector: "graphql".to_string(),
-                            connector_component: ConnectorComponent::from(dataset),
-                            source: e.into(),
-                            message,
-                        }
-                    } else {
-                        DataConnectorError::InternalWithSource {
-                            dataconnector: "graphql".to_string(),
-                            connector_component: ConnectorComponent::from(dataset),
-                            source: e.into(),
-                        }
-                    }
-                })?,
-        ))
+        let (client, rate_controller) = self.get_client(dataset).await?;
+
+        match GraphQLTableProviderBuilder::new(client).build(query).await {
+            Ok(provider) => {
+                if let Some(metric_source) = &self.rate_control_metric_source {
+                    metric_source.claim_owner();
+                }
+                rate_controller.commit().await;
+                Ok(Arc::new(provider))
+            }
+            Err(e) => {
+                rate_controller.rollback().await;
+                if matches!(&e, graphql::Error::InvalidGraphQLQuery { .. }) {
+                    let message = format!("{e}");
+                    Err(DataConnectorError::InvalidConfiguration {
+                        dataconnector: "graphql".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e.into(),
+                        message,
+                    })
+                } else {
+                    Err(DataConnectorError::InternalWithSource {
+                        dataconnector: "graphql".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e.into(),
+                    })
+                }
+            }
+        }
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
@@ -312,6 +345,7 @@ impl DataConnector for GraphQL {
         Some(Arc::new(HttpRateControlMetricsProvider::new(
             "graphql",
             Arc::clone(&self.metrics),
+            self.rate_control_metric_source.clone(),
         )))
     }
 }
@@ -403,13 +437,15 @@ mod tests {
             rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
+            rate_control_metric_source: None,
         };
         let dataset = test_dataset("https://graphql-dataset-params.example.com/graphql").await;
 
-        graphql
+        let (_, reservation) = graphql
             .get_client(&dataset)
             .await
             .expect("GraphQL client should build with rate-control params");
+        reservation.commit().await;
 
         assert_eq!(graphql.metrics.max_concurrent_requests(), 4);
         assert_eq!(graphql.metrics.requests_per_second_limit(), 2);
@@ -432,13 +468,15 @@ mod tests {
             rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
+            rate_control_metric_source: None,
         };
         let dataset = test_dataset("https://graphql-runtime-defaults.example.com/graphql").await;
 
-        graphql
+        let (_, reservation) = graphql
             .get_client(&dataset)
             .await
             .expect("GraphQL client should build with runtime rate-control defaults");
+        reservation.commit().await;
 
         assert_eq!(graphql.metrics.max_concurrent_requests(), 2);
         assert_eq!(graphql.metrics.requests_per_second_limit(), 3);
@@ -452,6 +490,7 @@ mod tests {
             rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
+            rate_control_metric_source: None,
         };
         let dataset = test_dataset("https://graphql-invalid-limit.example.com/graphql").await;
 
@@ -478,6 +517,7 @@ mod tests {
             rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: false,
+            rate_control_metric_source: None,
         };
 
         assert!(DataConnector::metrics_provider(&graphql).is_none());

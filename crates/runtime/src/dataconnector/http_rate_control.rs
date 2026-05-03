@@ -50,7 +50,7 @@ static GLOBAL_HTTP_RATE_CONTROL_REGISTRY: LazyLock<Arc<HttpRateControlRegistry>>
 #[derive(Debug, Default)]
 pub struct HttpRateControlRegistry {
     rate_limiters: RwLock<HashMap<String, Arc<HttpRateLimiter>>>,
-    rate_controllers: RwLock<HashMap<String, SharedRateController>>,
+    rate_controllers: RwLock<HashMap<String, SharedRateControllerEntry>>,
     metrics_by_origin: StdRwLock<HashMap<String, Arc<HttpRateControlMetrics>>>,
     metric_owners: StdRwLock<HashMap<String, String>>,
 }
@@ -84,6 +84,68 @@ impl HttpRateControlConfig {
 pub struct SharedRateController {
     pub config: HttpRateControlConfig,
     pub controller: Option<Arc<RateController>>,
+}
+
+#[derive(Clone, Debug)]
+struct SharedRateControllerEntry {
+    shared: SharedRateController,
+    pending_registrations: usize,
+    active_registrations: usize,
+}
+
+#[derive(Debug)]
+pub struct SharedRateControllerReservation {
+    registry: Arc<HttpRateControlRegistry>,
+    key: String,
+    shared: SharedRateController,
+}
+
+impl SharedRateControllerReservation {
+    #[must_use]
+    pub fn shared(&self) -> &SharedRateController {
+        &self.shared
+    }
+
+    pub async fn commit(self) -> SharedRateController {
+        self.registry
+            .commit_rate_controller_reservation(&self.key)
+            .await;
+        self.shared
+    }
+
+    pub async fn rollback(self) {
+        self.registry
+            .rollback_rate_controller_reservation(&self.key)
+            .await;
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HttpRateControlMetricSource {
+    registry: Arc<HttpRateControlRegistry>,
+    base_url: Url,
+    owner: String,
+}
+
+impl HttpRateControlMetricSource {
+    #[must_use]
+    pub fn new(registry: Arc<HttpRateControlRegistry>, base_url: Url, owner: String) -> Self {
+        Self {
+            registry,
+            base_url,
+            owner,
+        }
+    }
+
+    pub fn claim_owner(&self) -> bool {
+        self.registry
+            .claim_metrics_owner(&self.base_url, self.owner.as_str())
+    }
+
+    fn is_owner(&self) -> bool {
+        self.registry
+            .is_metrics_owner(&self.base_url, self.owner.as_str())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -282,14 +344,20 @@ const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
 pub struct HttpRateControlMetricsProvider {
     connector_name: &'static str,
     metrics: Arc<HttpRateControlMetrics>,
+    metric_source: Option<HttpRateControlMetricSource>,
 }
 
 impl HttpRateControlMetricsProvider {
     #[must_use]
-    pub fn new(connector_name: &'static str, metrics: Arc<HttpRateControlMetrics>) -> Self {
+    pub fn new(
+        connector_name: &'static str,
+        metrics: Arc<HttpRateControlMetrics>,
+        metric_source: Option<HttpRateControlMetricSource>,
+    ) -> Self {
         Self {
             connector_name,
             metrics,
+            metric_source,
         }
     }
 }
@@ -313,115 +381,70 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
         attributes: Vec<KeyValue>,
     ) -> Option<ObserveMetricCallback> {
         let metrics = Arc::clone(&self.metrics);
-        match metric.name {
-            "inflight_operations" => Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                observer.observe(
-                    metrics.rate_controller_metric(RateControllerMetrics::inflight_permits),
-                    &attributes,
-                );
-            }))),
-            "rate_control_max_concurrent_requests" => {
+        let metric_source = self.metric_source.clone();
+
+        macro_rules! observe_metric {
+            ($value:expr) => {{
                 Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(metrics.max_concurrent_requests(), &attributes);
+                    if should_observe_metrics(&metric_source) {
+                        observer.observe($value, &attributes);
+                    }
                 })))
+            }};
+        }
+
+        match metric.name {
+            "inflight_operations" => observe_metric!(
+                metrics.rate_controller_metric(RateControllerMetrics::inflight_permits)
+            ),
+            "rate_control_max_concurrent_requests" => {
+                observe_metric!(metrics.max_concurrent_requests())
             }
             "rate_control_requests_per_second_limit" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(metrics.requests_per_second_limit(), &attributes);
-                })))
+                observe_metric!(metrics.requests_per_second_limit())
             }
             "rate_control_requests_per_minute_limit" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(metrics.requests_per_minute_limit(), &attributes);
-                })))
+                observe_metric!(metrics.requests_per_minute_limit())
             }
             "rate_control_jitter_min_ms" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics.rate_control_jitter_min_ms.load(Ordering::Relaxed),
-                        &attributes,
-                    );
-                })))
+                observe_metric!(metrics.rate_control_jitter_min_ms.load(Ordering::Relaxed))
             }
             "rate_control_jitter_max_ms" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics.rate_control_jitter_max_ms.load(Ordering::Relaxed),
-                        &attributes,
-                    );
-                })))
+                observe_metric!(metrics.rate_control_jitter_max_ms.load(Ordering::Relaxed))
             }
-            "rate_control_available_permits" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(metrics.available_permits(), &attributes);
-                })))
-            }
-            "rate_control_acquisitions_total" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics
-                            .rate_controller_metric(RateControllerMetrics::permits_acquired_total),
-                        &attributes,
-                    );
-                })))
-            }
-            "rate_control_acquire_errors_total" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics.rate_controller_metric(RateControllerMetrics::acquire_errors_total),
-                        &attributes,
-                    );
-                })))
-            }
-            "rate_control_wait_duration_ms" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics
-                            .rate_controller_metric(RateControllerMetrics::wait_duration_ms_total),
-                        &attributes,
-                    );
-                })))
-            }
-            "rate_limit_retry_after_updates_total" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics
-                            .rate_limiter_metric(HttpRateLimiterMetrics::retry_after_updates_total),
-                        &attributes,
-                    );
-                })))
-            }
-            "rate_limit_retry_after_waits_total" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics
-                            .rate_limiter_metric(HttpRateLimiterMetrics::retry_after_waits_total),
-                        &attributes,
-                    );
-                })))
-            }
+            "rate_control_available_permits" => observe_metric!(metrics.available_permits()),
+            "rate_control_acquisitions_total" => observe_metric!(
+                metrics.rate_controller_metric(RateControllerMetrics::permits_acquired_total)
+            ),
+            "rate_control_acquire_errors_total" => observe_metric!(
+                metrics.rate_controller_metric(RateControllerMetrics::acquire_errors_total)
+            ),
+            "rate_control_wait_duration_ms" => observe_metric!(
+                metrics.rate_controller_metric(RateControllerMetrics::wait_duration_ms_total)
+            ),
+            "rate_limit_retry_after_updates_total" => observe_metric!(
+                metrics.rate_limiter_metric(HttpRateLimiterMetrics::retry_after_updates_total)
+            ),
+            "rate_limit_retry_after_waits_total" => observe_metric!(
+                metrics.rate_limiter_metric(HttpRateLimiterMetrics::retry_after_waits_total)
+            ),
             "rate_limit_retry_after_wait_duration_ms" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics.rate_limiter_metric(
-                            HttpRateLimiterMetrics::retry_after_wait_duration_ms_total,
-                        ),
-                        &attributes,
-                    );
-                })))
+                observe_metric!(metrics.rate_limiter_metric(
+                    HttpRateLimiterMetrics::retry_after_wait_duration_ms_total,
+                ))
             }
-            "rate_limit_retry_after_remaining_ms" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics
-                            .rate_limiter_metric(HttpRateLimiterMetrics::retry_after_remaining_ms),
-                        &attributes,
-                    );
-                })))
-            }
+            "rate_limit_retry_after_remaining_ms" => observe_metric!(
+                metrics.rate_limiter_metric(HttpRateLimiterMetrics::retry_after_remaining_ms)
+            ),
             _ => None,
         }
     }
+}
+
+fn should_observe_metrics(metric_source: &Option<HttpRateControlMetricSource>) -> bool {
+    metric_source
+        .as_ref()
+        .is_none_or(HttpRateControlMetricSource::is_owner)
 }
 
 #[must_use]
@@ -540,6 +563,75 @@ impl HttpRateControlRegistry {
         }
     }
 
+    fn is_metrics_owner(&self, base_url: &Url, owner: &str) -> bool {
+        let key = rate_control_key(base_url);
+        self.metric_owners
+            .read()
+            .ok()
+            .and_then(|metric_owners| metric_owners.get(&key).cloned())
+            .is_some_and(|existing_owner| existing_owner == owner)
+    }
+
+    pub async fn reserve_shared_rate_controller(
+        self: Arc<Self>,
+        base_url: &Url,
+        config: &HttpRateControlConfig,
+        dataset: &Dataset,
+        dataconnector: &'static str,
+    ) -> DataConnectorResult<SharedRateControllerReservation> {
+        let key = rate_control_key(base_url);
+        let mut rate_controllers = self.rate_controllers.write().await;
+
+        if let Some(existing) = rate_controllers.get_mut(&key) {
+            if existing.shared.config != *config {
+                return conflicting_config_error(dataset, dataconnector, &key);
+            }
+            existing.pending_registrations = existing.pending_registrations.saturating_add(1);
+            let shared = existing.shared.clone();
+            drop(rate_controllers);
+            return Ok(SharedRateControllerReservation {
+                registry: self,
+                key,
+                shared,
+            });
+        }
+
+        let shared = build_shared_rate_controller(config);
+        rate_controllers.insert(
+            key.clone(),
+            SharedRateControllerEntry {
+                shared: shared.clone(),
+                pending_registrations: 1,
+                active_registrations: 0,
+            },
+        );
+
+        drop(rate_controllers);
+        Ok(SharedRateControllerReservation {
+            registry: self,
+            key,
+            shared,
+        })
+    }
+
+    async fn commit_rate_controller_reservation(&self, key: &str) {
+        let mut rate_controllers = self.rate_controllers.write().await;
+        if let Some(existing) = rate_controllers.get_mut(key) {
+            existing.pending_registrations = existing.pending_registrations.saturating_sub(1);
+            existing.active_registrations = existing.active_registrations.saturating_add(1);
+        }
+    }
+
+    async fn rollback_rate_controller_reservation(&self, key: &str) {
+        let mut rate_controllers = self.rate_controllers.write().await;
+        if let Some(existing) = rate_controllers.get_mut(key) {
+            existing.pending_registrations = existing.pending_registrations.saturating_sub(1);
+            if existing.pending_registrations == 0 && existing.active_registrations == 0 {
+                rate_controllers.remove(key);
+            }
+        }
+    }
+
     pub async fn shared_rate_controller(
         &self,
         base_url: &Url,
@@ -550,17 +642,36 @@ impl HttpRateControlRegistry {
         let key = rate_control_key(base_url);
         let rate_controllers = self.rate_controllers.read().await;
         if let Some(existing) = rate_controllers.get(&key) {
-            return resolve_existing_controller(existing, config, dataset, dataconnector, &key);
+            return resolve_existing_controller(
+                &existing.shared,
+                config,
+                dataset,
+                dataconnector,
+                &key,
+            );
         }
 
         drop(rate_controllers);
         let mut rate_controllers = self.rate_controllers.write().await;
         if let Some(existing) = rate_controllers.get(&key) {
-            return resolve_existing_controller(existing, config, dataset, dataconnector, &key);
+            return resolve_existing_controller(
+                &existing.shared,
+                config,
+                dataset,
+                dataconnector,
+                &key,
+            );
         }
 
         let shared = build_shared_rate_controller(config);
-        rate_controllers.insert(key, shared.clone());
+        rate_controllers.insert(
+            key,
+            SharedRateControllerEntry {
+                shared: shared.clone(),
+                pending_registrations: 0,
+                active_registrations: 1,
+            },
+        );
 
         Ok(shared)
     }
@@ -880,4 +991,100 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::builder::DatasetBuilder;
+
+    fn test_dataset() -> Dataset {
+        DatasetBuilder::try_new(
+            "https://rate-control-registry.example.com/data".to_string(),
+            "rate_control_registry_test",
+        )
+        .expect("test dataset builder should be valid")
+        .build()
+        .expect("test dataset should build")
+    }
+
+    fn test_config(max_concurrent_requests: usize) -> HttpRateControlConfig {
+        HttpRateControlConfig {
+            max_concurrent_requests: Some(max_concurrent_requests),
+            requests_per_second: None,
+            requests_per_minute: None,
+            jitter_min: Duration::ZERO,
+            jitter_max: Duration::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn rolled_back_controller_reservation_allows_new_config() {
+        let registry = Arc::new(HttpRateControlRegistry::default());
+        let url = Url::parse("https://rate-control-registry.example.com/data")
+            .expect("test URL should parse");
+        let dataset = test_dataset();
+
+        let reservation = Arc::clone(&registry)
+            .reserve_shared_rate_controller(&url, &test_config(2), &dataset, "https")
+            .await
+            .expect("initial reservation should succeed");
+        reservation.rollback().await;
+
+        let reservation = Arc::clone(&registry)
+            .reserve_shared_rate_controller(&url, &test_config(3), &dataset, "https")
+            .await
+            .expect("rolled back reservation should not leave stale config");
+        let shared = reservation.commit().await;
+
+        assert_eq!(shared.config.max_concurrent_requests, Some(3));
+    }
+
+    #[tokio::test]
+    async fn committed_controller_reservation_rejects_new_config() {
+        let registry = Arc::new(HttpRateControlRegistry::default());
+        let url = Url::parse("https://rate-control-registry-conflict.example.com/data")
+            .expect("test URL should parse");
+        let dataset = test_dataset();
+
+        let reservation = Arc::clone(&registry)
+            .reserve_shared_rate_controller(&url, &test_config(2), &dataset, "https")
+            .await
+            .expect("initial reservation should succeed");
+        reservation.commit().await;
+
+        let error = Arc::clone(&registry)
+            .reserve_shared_rate_controller(&url, &test_config(3), &dataset, "https")
+            .await
+            .expect_err("committed reservation should keep the origin config");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("different rate-control settings"),
+                    "expected conflict message, got: {message}"
+                );
+            }
+            other => panic!("expected rate-control conflict, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn metric_source_observes_only_after_owner_claim() {
+        let registry = Arc::new(HttpRateControlRegistry::default());
+        let url = Url::parse("https://rate-control-metrics.example.com/data")
+            .expect("test URL should parse");
+        let owner = HttpRateControlMetricSource::new(
+            Arc::clone(&registry),
+            url.clone(),
+            "owner".to_string(),
+        );
+        let other = HttpRateControlMetricSource::new(registry, url, "other".to_string());
+
+        assert!(!owner.is_owner());
+        assert!(owner.claim_owner());
+        assert!(owner.is_owner());
+        assert!(!other.claim_owner());
+        assert!(!other.is_owner());
+    }
 }
