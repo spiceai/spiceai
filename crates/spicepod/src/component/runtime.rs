@@ -1163,6 +1163,63 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_mcp_config_no_section() {
+        let yaml = r"
+        http_port: 8090
+        ";
+        let parsed: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert!(parsed.mcp.is_none(), "mcp should be None when not set");
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_empty_section() {
+        let yaml = r"
+        mcp: {}
+        ";
+        let parsed: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = parsed.mcp.expect("mcp section should be present");
+        assert!(
+            mcp.allowed_hosts.is_none(),
+            "allowed_hosts should be None when not set"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_with_allowed_hosts() {
+        let yaml = r"
+        mcp:
+          allowed_hosts:
+            - localhost
+            - example.com:8090
+            - https://example.com
+        ";
+        let parsed: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = parsed.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(
+            hosts,
+            vec![
+                "localhost".to_string(),
+                "example.com:8090".to_string(),
+                "https://example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_unknown_field_rejected() {
+        let yaml = r"
+        mcp:
+          unknown_field: value
+        ";
+        let result: Result<Runtime, _> = yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown fields in mcp section should be rejected due to deny_unknown_fields"
+        );
+    }
+
+    #[test]
     fn test_memory_limit_migration() {
         // Test when only memory_limit is present
         let yaml = r"

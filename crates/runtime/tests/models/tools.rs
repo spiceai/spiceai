@@ -22,12 +22,13 @@ mod mcp {
     use app::AppBuilder;
     use http::{
         HeaderMap, HeaderValue,
-        header::{ACCEPT, CONTENT_TYPE},
+        header::{ACCEPT, CONTENT_TYPE, HOST},
     };
     use insta::{assert_json_snapshot, assert_snapshot};
     use runtime::Runtime;
     use runtime::auth::EndpointAuth;
     use serde_json::Value;
+    use spicepod::component::runtime::McpConfig;
     use spicepod::component::tool::Tool;
     use std::sync::Arc;
     use test_framework::yaml;
@@ -156,6 +157,130 @@ params:
         );
 
         Ok(())
+    }
+
+    /// Test that an MCP request with a Host header matching `runtime.mcp.allowed_hosts` succeeds.
+    #[tokio::test]
+    async fn test_mcp_allowed_host_accepted() -> Result<(), anyhow::Error> {
+        // Restrict allowed hosts to only "spice-test.local"; the actual bind address is
+        // 127.0.0.1 so we override the Host header manually.
+        let mcp_config = McpConfig {
+            allowed_hosts: Some(vec!["spice-test.local".to_string()]),
+        };
+        let http_server_url = start_spiced_with_mcp_config(mcp_config).await?;
+
+        let client = reqwest::Client::new();
+        let protocol_version = rmcp::model::ProtocolVersion::V_2025_03_26
+            .as_str()
+            .to_string();
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "spice-integration-test",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        });
+
+        let resp = client
+            .post(format!("{http_server_url}/v1/mcp"))
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .header(HOST, "spice-test.local")
+            .json(&init_body)
+            .send()
+            .await?;
+
+        assert!(
+            resp.status().is_success(),
+            "Request with allowed Host should succeed, got: {}",
+            resp.status()
+        );
+
+        Ok(())
+    }
+
+    /// Test that an MCP request with a Host header NOT in `runtime.mcp.allowed_hosts` is rejected
+    /// with 403 Forbidden.
+    #[tokio::test]
+    async fn test_mcp_disallowed_host_rejected() -> Result<(), anyhow::Error> {
+        // Only allow "spice-test.local"; sending Host: evil.example.com should be rejected.
+        let mcp_config = McpConfig {
+            allowed_hosts: Some(vec!["spice-test.local".to_string()]),
+        };
+        let http_server_url = start_spiced_with_mcp_config(mcp_config).await?;
+
+        let client = reqwest::Client::new();
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": rmcp::model::ProtocolVersion::V_2025_03_26.as_str(),
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "spice-integration-test",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        });
+
+        let resp = client
+            .post(format!("{http_server_url}/v1/mcp"))
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .header(HOST, "evil.example.com")
+            .json(&init_body)
+            .send()
+            .await?;
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "Request with disallowed Host should be rejected with 403 Forbidden"
+        );
+
+        Ok(())
+    }
+
+    /// Starts a spiced runtime with the given [`McpConfig`] and returns its HTTP base URL.
+    async fn start_spiced_with_mcp_config(mcp_config: McpConfig) -> anyhow::Result<String> {
+        use spicepod::component::runtime::Runtime as SpicepodRuntime;
+
+        let runtime_config = SpicepodRuntime {
+            mcp: Some(mcp_config),
+            ..Default::default()
+        };
+        let app = AppBuilder::new("mcp-allowed-hosts-test")
+            .with_runtime(runtime_config)
+            .build();
+
+        let api_config = create_api_bindings_config();
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
+
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let _tracing = init_tracing_with_task_history(Some("integration=debug,info"), &rt);
+
+        let rt_ref_copy = Arc::clone(&rt);
+        tokio::spawn(async move {
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = Arc::clone(&rt).load_components() => {}
+        }
+
+        runtime_ready_check(&rt).await;
+
+        Ok(http_base_url)
     }
 
     /// Returns the runtime (with all components ready) and the base URL of the HTTP server.
