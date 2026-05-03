@@ -19,17 +19,17 @@ Defaults must not override request-provided values. Keep default parsing on the 
 
 ## Provider Mappings
 
-| Provider path | Cache mapping |
-| --- | --- |
-| OpenAI-compatible chat and Azure chat | Pass `prompt_cache_key` through the OpenAI-compatible chat request field. |
-| OpenAI-compatible Responses | Pass `prompt_cache_key` and `prompt_cache_retention` through the Responses request fields. |
-| xAI chat | Move `prompt_cache_key` out of the request body and send it as the `x-grok-conv-id` request header. |
-| xAI Responses | Leave Responses fields in the request body. |
-| Google Gemini | Map `prompt_cache_key` to `GenerateContentRequest.cached_content.name`; callers must provide a valid cached-content resource name. |
-| Anthropic | Set top-level ephemeral `cache_control` when cache intent is present and preserve cache usage fields in OpenAI-compatible usage. |
-| Bedrock Converse | Append a native `CachePoint` to the last message, or to system content when no messages exist. |
-| Databricks hosted Claude | Use BYOT JSON and add Claude-style `cache_control` to the last text content part. |
-| Local HuggingFace/file models | Use `mistral-rs` native KV cache and paged-attention scheduling when the backend and pipeline support it. Request-level cache keys are not portable to local tensors. |
+| Provider path                         | Cache mapping                                                                                                                                                         |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| OpenAI-compatible chat and Azure chat | Pass `prompt_cache_key` through the OpenAI-compatible chat request field.                                                                                             |
+| OpenAI-compatible Responses           | Pass `prompt_cache_key` and `prompt_cache_retention` through the Responses request fields.                                                                            |
+| xAI chat                              | Move `prompt_cache_key` out of the request body and send it as the `x-grok-conv-id` request header.                                                                   |
+| xAI Responses                         | Leave Responses fields in the request body.                                                                                                                           |
+| Google Gemini                         | Map `prompt_cache_key` to `GenerateContentRequest.cached_content.name`; callers must provide a valid cached-content resource name.                                    |
+| Anthropic                             | Set top-level ephemeral `cache_control` when cache intent is present and preserve cache usage fields in OpenAI-compatible usage.                                      |
+| Bedrock Converse                      | Append a native `CachePoint` to the last message, or to system content when no messages exist.                                                                        |
+| Databricks hosted Claude              | Use BYOT JSON and add Claude-style `cache_control` to the last text content part.                                                                                     |
+| Local HuggingFace/file models         | Use `mistral-rs` native KV cache and paged-attention scheduling when the backend and pipeline support it. Request-level cache keys are not portable to local tensors. |
 
 ## Usage Accounting
 
