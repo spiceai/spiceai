@@ -251,7 +251,7 @@ impl SMBObjectStore {
         share: &ShareSession,
         config: &SMBConfig,
         dir_path: &str,
-    ) -> Vec<DirEntry> {
+    ) -> object_store::Result<Vec<DirEntry>> {
         match share.list_directory(dir_path).await {
             Ok((files, dirs)) => {
                 let mut entries = Vec::with_capacity(files.len() + dirs.len());
@@ -265,18 +265,27 @@ impl SMBObjectStore {
                 for d in dirs {
                     entries.push(DirEntry::directory(leaf_name(&d)));
                 }
-                entries
+                Ok(entries)
             }
             Err(e) => {
                 let display_path = config.display_path(dir_path);
+                // Heuristic: if `dir_path` looks like a file (contains a dot
+                // and doesn't end with `/`), the SMB server's "not a
+                // directory" error is expected — swallow it and return an
+                // empty listing. Anything else (permission denied,
+                // connection reset, malformed protocol) is a real error
+                // that callers must surface, otherwise an empty list would
+                // misrepresent missing data as "directory is empty" and
+                // hide rows from the query planner.
                 if dir_path.contains('.') && !dir_path.ends_with('/') {
                     tracing::debug!(
                         "Path {display_path} appears to be a file, not a directory. Skipping directory listing."
                     );
+                    Ok(Vec::new())
                 } else {
                     tracing::warn!("Failed to list SMB directory {display_path}: {e}");
+                    Err(handle_error(e))
                 }
-                Vec::new()
             }
         }
     }
@@ -294,7 +303,7 @@ impl SMBObjectStore {
         let mut queue = vec![normalized];
 
         while let Some(dir_path) = queue.pop() {
-            let entries = Self::list_dir_entries(&share, config, &dir_path).await;
+            let entries = Self::list_dir_entries(&share, config, &dir_path).await?;
             let (files, dirs) = process_directory_entries(&dir_path, entries);
             results.extend(files);
             queue.extend(dirs);
@@ -311,7 +320,7 @@ impl SMBObjectStore {
         let prefix_str = prefix.map_or(String::new(), Path::to_string);
         let normalized = self.config().normalize_subpath(&prefix_str).to_string();
 
-        let entries = Self::list_dir_entries(&share, self.config(), &normalized).await;
+        let entries = Self::list_dir_entries(&share, self.config(), &normalized).await?;
         Ok(process_directory_entries_shallow(&normalized, entries))
     }
 
@@ -635,7 +644,20 @@ impl MultipartUpload for SMBMultipartUpload {
             let mut guard = writer_slot.lock().await;
             let writer = guard.as_mut().ok_or_else(upload_already_finalized)?;
             for chunk in data.as_ref() {
-                writer.write(chunk.as_ref()).await.map_err(handle_error)?;
+                if let Err(e) = writer.write(chunk.as_ref()).await {
+                    // A failed part write means the WAL no longer holds a
+                    // committable prefix of the upload. Take the writer out,
+                    // drop the guard, and abort it so a subsequent
+                    // `complete()` cannot publish a truncated object —
+                    // future `put_part`/`complete` calls will then see
+                    // `None` and return `upload_already_finalized`.
+                    let aborted = guard.take();
+                    drop(guard);
+                    if let Some(w) = aborted {
+                        w.abort().await;
+                    }
+                    return Err(handle_error(e));
+                }
             }
             Ok(())
         })

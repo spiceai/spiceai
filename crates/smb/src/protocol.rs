@@ -525,8 +525,13 @@ pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
     let data_offset = u16::from_le_bytes(body[2..4].try_into().ok()?) as usize;
     let data_length = (&body[4..8]).get_u32_le() as usize;
 
-    let start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let end = start + data_length;
+    // `body` is the SMB2 message body (everything after the 64-byte SMB2
+    // header), so a spec-conformant `data_offset` is always at least
+    // `SMB2_HEADER_SIZE`. Reject smaller values rather than letting
+    // `saturating_sub` quietly slice from byte 0 — that would surface
+    // unrelated response bytes to the caller as file data.
+    let start = data_offset.checked_sub(SMB2_HEADER_SIZE)?;
+    let end = start.checked_add(data_length)?;
     if end > body.len() {
         return None;
     }
@@ -543,8 +548,13 @@ pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
     let data_offset = u16::from_le_bytes(body[2..4].try_into().ok()?) as usize;
     let data_length = u32::from_le_bytes(body[4..8].try_into().ok()?) as usize;
 
-    let start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let end = start + data_length;
+    // Same malformed-frame guard as `decode_read_response`: a `data_offset`
+    // smaller than the SMB2 header size cannot be valid for a response body
+    // that's already been split from the header, so we reject the frame
+    // instead of letting `saturating_sub` produce an aliased slice into
+    // unrelated response bytes.
+    let start = data_offset.checked_sub(SMB2_HEADER_SIZE)?;
+    let end = start.checked_add(data_length)?;
     if end > body.len() {
         return None;
     }
