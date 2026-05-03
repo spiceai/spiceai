@@ -269,22 +269,27 @@ impl SMBObjectStore {
             }
             Err(e) => {
                 let display_path = config.display_path(dir_path);
-                // Heuristic: if `dir_path` looks like a file (contains a dot
-                // and doesn't end with `/`), the SMB server's "not a
-                // directory" error is expected — swallow it and return an
-                // empty listing. Anything else (permission denied,
-                // connection reset, malformed protocol) is a real error
-                // that callers must surface, otherwise an empty list would
-                // misrepresent missing data as "directory is empty" and
-                // hide rows from the query planner.
-                if dir_path.contains('.') && !dir_path.ends_with('/') {
-                    tracing::debug!(
-                        "Path {display_path} appears to be a file, not a directory. Skipping directory listing."
-                    );
-                    Ok(Vec::new())
-                } else {
-                    tracing::warn!("Failed to list SMB directory {display_path}: {e}");
-                    Err(handle_error(e))
+                // Only swallow the specific server-reported "not a directory"
+                // signals — `STATUS_NOT_A_DIRECTORY` (mapped to
+                // `io::ErrorKind::NotADirectory`) and `STATUS_NO_SUCH_FILE`
+                // / `STATUS_OBJECT_NAME_NOT_FOUND` (mapped to `NotFound`).
+                // The previous filename-based heuristic ("path contains `.`
+                // and doesn't end with `/`") swallowed every error for
+                // directories that happened to have a dot in their name
+                // (e.g. `releases/2026.05`), turning permission failures,
+                // dropped connections, and malformed responses into empty
+                // listings that hid files from query planning.
+                match e.kind() {
+                    std::io::ErrorKind::NotADirectory | std::io::ErrorKind::NotFound => {
+                        tracing::debug!(
+                            "Path {display_path} is not a directory ({e}); returning empty listing."
+                        );
+                        Ok(Vec::new())
+                    }
+                    _ => {
+                        tracing::warn!("Failed to list SMB directory {display_path}: {e}");
+                        Err(handle_error(e))
+                    }
                 }
             }
         }

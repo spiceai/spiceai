@@ -411,6 +411,23 @@ impl ShareSession {
         }
 
         let _ = client.close(tree_id, &file.file_id).await;
+
+        // The caller's `meta.size` came from the initial CREATE response;
+        // if the file shrank between that metadata read and the EOF the
+        // chunk loop hit, we'd otherwise return a `(meta, data)` pair where
+        // `data.len() < meta.size`, silently handing back a truncated
+        // object. Surface the short read as `UnexpectedEof` instead.
+        if (data.len() as u64) < cr.file_size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "SMB object {smb_path}: read returned EOF after {} bytes (expected {})",
+                    data.len(),
+                    cr.file_size
+                ),
+            ));
+        }
+
         Ok((meta, data))
     }
 
@@ -451,6 +468,22 @@ impl ShareSession {
         }
 
         let _ = client.close(tree_id, &file.file_id).await;
+
+        // The caller asked for `[start, end)` and the object-store contract
+        // requires returning exactly that many bytes — surface a short read
+        // as `UnexpectedEof` instead of returning the partial buffer (which
+        // would silently truncate query results if the file shrinks during
+        // the read).
+        if (data.len() as u64) < total {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "SMB object {smb_path}: range read returned {} of {total} requested bytes",
+                    data.len()
+                ),
+            ));
+        }
+
         Ok(data)
     }
 
@@ -632,6 +665,15 @@ impl ShareSession {
             match src.read_pipeline(offset, chunk_size, remaining).await {
                 Ok(chunks) => {
                     if chunks.is_empty() {
+                        // EOF before `src_size` — the source shrank during
+                        // the copy. Treat as a short read so we don't
+                        // commit a truncated destination.
+                        result = Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "copy_object: source {src_key} EOF after {offset} of {src_size} bytes",
+                            ),
+                        ));
                         break;
                     }
                     for chunk in &chunks {
@@ -650,6 +692,18 @@ impl ShareSession {
                     break;
                 }
             }
+        }
+
+        // Final guard: make sure we read exactly `src_size` bytes before
+        // committing. If the loop above terminated cleanly but ended with
+        // `offset != src_size` (e.g. a truncating server returning a
+        // partial chunk that exactly hit the boundary above), refuse to
+        // publish a truncated destination.
+        if result.is_ok() && offset != src_size {
+            result = Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("copy_object: copied {offset} of {src_size} bytes from {src_key}",),
+            ));
         }
 
         let _ = src.close().await;

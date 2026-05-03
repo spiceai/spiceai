@@ -218,6 +218,33 @@ impl SmbClient {
                 continue;
             }
 
+            // Verify the server-side signature once signing is established.
+            // Per [MS-SMB2] §3.2.5.1.3, after auth completes every signed
+            // request must be answered with a signed response, and the
+            // client MUST verify the CMAC. Without this verification, a
+            // MITM or corrupted proxy can tamper with reads, metadata, and
+            // directory listings even after signing is negotiated. We poison
+            // and tear down the connection on any mismatch so subsequent
+            // operations can't read attacker-controlled bytes.
+            if let Some(ref key) = self.signing_key {
+                if header.flags & SMB2_FLAGS_SIGNED == 0 {
+                    self.poison();
+                    let _ = stream.shutdown().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SMB2 response missing signature after signing established",
+                    ));
+                }
+                if !verify_signature(&mut msg, key) {
+                    self.poison();
+                    let _ = stream.shutdown().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SMB2 response signature verification failed",
+                    ));
+                }
+            }
+
             let body = msg[SMB2_HEADER_SIZE..].to_vec();
             return Ok((header, body, msg));
         }
@@ -598,6 +625,25 @@ impl SmbClient {
                     continue;
                 }
 
+                // Verify the per-response CMAC before honoring its body. A
+                // tampered or unsigned read response could otherwise hand a
+                // caller bytes the server never returned (silent data
+                // corruption on signed sessions).
+                if let Some(ref key) = self.signing_key {
+                    if header.flags & SMB2_FLAGS_SIGNED == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pipelined read response missing signature after signing established",
+                        ));
+                    }
+                    if !verify_signature(&mut msg, key) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pipelined read response signature verification failed",
+                        ));
+                    }
+                }
+
                 let slot = (header.message_id.wrapping_sub(base_msg_id)) as usize;
                 if slot >= count {
                     return Err(io::Error::new(
@@ -789,6 +835,21 @@ impl SmbClient {
                     continue;
                 }
 
+                if let Some(ref key) = self.signing_key {
+                    if header.flags & SMB2_FLAGS_SIGNED == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pipelined write response missing signature after signing established",
+                        ));
+                    }
+                    if !verify_signature(&mut msg, key) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pipelined write response signature verification failed",
+                        ));
+                    }
+                }
+
                 let slot = (header.message_id.wrapping_sub(base_msg_id)) as usize;
                 if slot >= n || received[slot] {
                     return Err(io::Error::new(
@@ -919,8 +980,31 @@ impl SmbClient {
             if resp_body.len() >= 9 {
                 let buf_offset = (&resp_body[2..4] as &[u8]).get_u16_le() as usize;
                 let buf_length = (&resp_body[4..8] as &[u8]).get_u32_le() as usize;
-                let start = buf_offset.saturating_sub(SMB2_HEADER_SIZE);
-                let end = (start + buf_length).min(resp_body.len());
+                // `resp_body` is the payload after the 64-byte SMB2 header,
+                // so a `buf_offset` smaller than `SMB2_HEADER_SIZE` is
+                // malformed. Reject the frame instead of silently slicing
+                // from byte 0 (which would re-interpret response metadata
+                // bytes as directory entries and hide real entries).
+                let Some(start) = buf_offset.checked_sub(SMB2_HEADER_SIZE) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "query directory: malformed buf_offset 0x{buf_offset:04X} < SMB2 header size"
+                        ),
+                    ));
+                };
+                let Some(end) = start.checked_add(buf_length) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "query directory: buf_offset + buf_length overflow",
+                    ));
+                };
+                if end > resp_body.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "query directory: declared buffer extends past response body",
+                    ));
+                }
                 if start < end {
                     let entries = parse_directory_entries(&resp_body[start..end]);
                     all_entries.extend(entries);
@@ -1004,6 +1088,19 @@ impl SmbClient {
                 && h.next_command == 0
             {
                 continue;
+            }
+
+            // Verify the per-sub-message CMAC signatures on the compound
+            // response. The send path signs each sub-message individually
+            // (`sign_message` in the loop above); the receive path must
+            // mirror that and reject any tampered or unsigned reply once
+            // signing is established.
+            if let Some(ref key) = self.signing_key
+                && let Err(e) = verify_compound_signatures(&mut msg, key)
+            {
+                self.poison();
+                let _ = stream.shutdown().await;
+                return Err(e);
             }
 
             return Ok(parse_compound_response(&msg));
@@ -1142,6 +1239,20 @@ impl SmbClient {
             })?
         };
 
+        // Surface CLOSE failures the same way `create_close`/`create_write_close`
+        // do — otherwise a successful CREATE+READ followed by a failed CLOSE
+        // would return Ok and leak one server-side handle per call, which under
+        // long-lived read-heavy workloads accumulates until the server runs
+        // out of handles.
+        if NtStatus::from_u32(resp[2].0.status).is_error() {
+            tracing::warn!(
+                target: "smb",
+                "create_read_close CLOSE failed: 0x{:08X}",
+                resp[2].0.status
+            );
+            return Err(smb_status_to_io_error(resp[2].0.status, path));
+        }
+
         Ok((cr, data))
     }
 
@@ -1273,6 +1384,21 @@ impl SmbClient {
 
         let responses = self.send_compound(requests).await?;
 
+        // Verify that the server returned every response we asked for. If a
+        // truncated or malformed compound frame caused `parse_compound_response`
+        // to stop early, we'd otherwise validate only the prefix and silently
+        // declare success on un-created tail directories.
+        let expected = dirs.len() * 2;
+        if responses.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ensure_dirs: expected {expected} compound responses, got {}",
+                    responses.len()
+                ),
+            ));
+        }
+
         for i in (0..responses.len()).step_by(2) {
             let dir = &dirs[i / 2];
             let create_status = NtStatus::from_u32(responses[i].0.status);
@@ -1283,16 +1409,15 @@ impl SmbClient {
             // related CLOSE here leaks one server-side handle per
             // path segment, which under long-lived write-heavy sessions
             // can accumulate until the server runs out of handles.
-            if let Some(close_resp) = responses.get(i + 1) {
-                let close_status = NtStatus::from_u32(close_resp.0.status);
-                if close_status.is_error() {
-                    tracing::warn!(
-                        target: "smb",
-                        "ensure_dirs CLOSE failed for {dir}: 0x{:08X}",
-                        close_resp.0.status,
-                    );
-                    return Err(smb_status_to_io_error(close_resp.0.status, dir));
-                }
+            let close_resp = &responses[i + 1];
+            let close_status = NtStatus::from_u32(close_resp.0.status);
+            if close_status.is_error() {
+                tracing::warn!(
+                    target: "smb",
+                    "ensure_dirs CLOSE failed for {dir}: 0x{:08X}",
+                    close_resp.0.status,
+                );
+                return Err(smb_status_to_io_error(close_resp.0.status, dir));
             }
         }
 
@@ -1324,6 +1449,11 @@ fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
         | 0xC000_0033 // STATUS_OBJECT_NAME_INVALID
         => io::Error::new(io::ErrorKind::NotFound, format!("not found: {path}")),
 
+        0xC000_0103 => io::Error::new( // STATUS_NOT_A_DIRECTORY
+            io::ErrorKind::NotADirectory,
+            format!("not a directory: {path}"),
+        ),
+
         0xC000_0022 => io::Error::new( // STATUS_ACCESS_DENIED
             io::ErrorKind::PermissionDenied,
             format!("access denied: {path}"),
@@ -1352,6 +1482,90 @@ fn sign_message(msg: &mut [u8], key: &[u8; 16]) {
 
     let signature = crypto::aes128_cmac(key, msg);
     msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].copy_from_slice(&signature);
+}
+
+/// Verify the AES-128-CMAC signature on a received SMB2 message in place.
+///
+/// Per [MS-SMB2] §3.2.5.1.3, the client extracts the 16-byte signature from
+/// the SMB2 header, zeroes that field, recomputes the CMAC over the entire
+/// message, and compares. The original signature is restored before
+/// returning so the caller can reuse `msg` for downstream parsing.
+///
+/// Returns `true` when the recomputed CMAC matches the received signature.
+fn verify_signature(msg: &mut [u8], key: &[u8; 16]) -> bool {
+    const SIGNATURE_OFFSET: usize = 48;
+    if msg.len() < SIGNATURE_OFFSET + 16 {
+        return false;
+    }
+
+    let mut received = [0u8; 16];
+    received.copy_from_slice(&msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16]);
+
+    msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].fill(0);
+    let computed = crypto::aes128_cmac(key, msg);
+    msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].copy_from_slice(&received);
+
+    received.as_slice() == &computed[..16]
+}
+
+/// Verify each sub-message of a compound SMB2 response. The send path
+/// signs every sub-message individually before transmission, so the
+/// receive path must verify each in turn. Walks `next_command` offsets to
+/// find sub-message boundaries; rejects any sub-message that is missing
+/// the SIGNED flag or whose CMAC does not match the included signature.
+fn verify_compound_signatures(msg: &mut [u8], key: &[u8; 16]) -> io::Result<()> {
+    let mut offset = 0usize;
+    loop {
+        if offset + SMB2_HEADER_SIZE > msg.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compound response: sub-message truncated before SMB2 header",
+            ));
+        }
+        let header = Header::decode(&msg[offset..]).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compound response: invalid SMB2 header",
+            )
+        })?;
+
+        let next = header.next_command as usize;
+        let sub_end = if next > 0 {
+            let end = offset.checked_add(next).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compound response: next_command overflow",
+                )
+            })?;
+            if end <= offset || end > msg.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compound response: next_command points outside frame",
+                ));
+            }
+            end
+        } else {
+            msg.len()
+        };
+
+        if header.flags & SMB2_FLAGS_SIGNED == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compound response: sub-message missing signature after signing established",
+            ));
+        }
+        if !verify_signature(&mut msg[offset..sub_end], key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compound response: sub-message signature verification failed",
+            ));
+        }
+
+        if next == 0 {
+            return Ok(());
+        }
+        offset = sub_end;
+    }
 }
 
 /// Parse a compound response (multiple SMB2 messages in one frame).
