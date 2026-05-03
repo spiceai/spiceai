@@ -1836,7 +1836,75 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_github_path, sanitize_github_validation_body};
+    use super::{GithubFactory, PARAMETERS, parse_github_path, sanitize_github_validation_body};
+    use crate::Runtime;
+    use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataconnector::{
+        ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
+    };
+    use crate::parameters::Parameters;
+    use runtime_secrets::Secrets;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn github_connector_params(
+        dataset_name: &str,
+        token: &str,
+        extra: &[(&str, &str)],
+    ) -> ConnectorParams {
+        let mut params = vec![("github_token".to_string(), token.to_string().into())];
+        params.extend(
+            extra
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string().into())),
+        );
+
+        let parameters = Parameters::try_new(
+            "connector github",
+            params,
+            "github",
+            Arc::new(RwLock::new(Secrets::default())),
+            PARAMETERS,
+        )
+        .await
+        .expect("test GitHub parameters should be valid");
+
+        let app = app::AppBuilder::new(dataset_name.to_string()).build();
+        let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
+        let app = Arc::new(app);
+        let dataset = DatasetBuilder::try_new(
+            "github:github.com/spiceai/spiceai/issues".to_string(),
+            dataset_name,
+        )
+        .expect("test GitHub dataset should be valid")
+        .with_app(Arc::clone(&app))
+        .with_runtime(Arc::clone(&runtime))
+        .build()
+        .expect("test GitHub dataset should build");
+
+        ConnectorParams {
+            parameters,
+            unsupported_type_action: None,
+            component: ConnectorComponent::from(&dataset),
+            app: Some(app),
+            runtime: Some(runtime),
+            io_runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn expect_invalid_configuration_message(
+        error: Box<dyn std::error::Error + Send + Sync>,
+    ) -> String {
+        let error = error
+            .downcast::<DataConnectorError>()
+            .expect("error should be a DataConnectorError");
+
+        match *error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. }
+            | DataConnectorError::InvalidConfiguration { message, .. } => message,
+            other => panic!("expected GitHub invalid configuration error, got: {other}"),
+        }
+    }
 
     #[test]
     fn test_sanitize_github_validation_body_normalizes_crlf() {
@@ -1866,5 +1934,60 @@ mod tests {
         assert_eq!(parsed.repo, Some("spiceai"));
         assert_eq!(parsed.resource_type, "files");
         assert!(parsed.remaining.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_github_rejects_invalid_max_concurrent_requests() {
+        let params = github_connector_params(
+            "github_invalid_concurrency",
+            "github-invalid-concurrency-token",
+            &[("max_concurrent_requests", "0")],
+        )
+        .await;
+
+        let error = match GithubFactory::new().create(params).await {
+            Ok(_) => panic!("zero GitHub max_concurrent_requests should be rejected"),
+            Err(error) => error,
+        };
+        let message = expect_invalid_configuration_message(error);
+
+        assert!(
+            message.contains("must be greater than 0"),
+            "expected zero-limit validation error, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_github_rejects_conflicting_shared_auth_concurrency_limits() {
+        let factory = GithubFactory::new();
+        let token = "github-conflicting-concurrency-token";
+
+        let first = github_connector_params(
+            "github_conflicting_concurrency_first",
+            token,
+            &[("max_concurrent_requests", "2")],
+        )
+        .await;
+        factory
+            .create(first)
+            .await
+            .expect("first GitHub connector should be created");
+
+        let second = github_connector_params(
+            "github_conflicting_concurrency_second",
+            token,
+            &[("max_concurrent_requests", "3")],
+        )
+        .await;
+        let error = match factory.create(second).await {
+            Ok(_) => panic!("conflicting GitHub concurrency limits should be rejected"),
+            Err(error) => error,
+        };
+        let message = expect_invalid_configuration_message(error);
+
+        assert!(
+            message.contains("different concurrency limits"),
+            "expected shared auth concurrency conflict, got: {message}"
+        );
     }
 }
