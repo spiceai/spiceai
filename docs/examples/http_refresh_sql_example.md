@@ -199,11 +199,12 @@ The HTTP connector provides metadata columns:
 - Limits are shared by upstream origin (`scheme://host:port`), so five datasets targeting the same API with a limit of `5` share five permits rather than each getting five
 - Use `runtime.params.http_requests_per_second_limit` and `runtime.params.http_requests_per_minute_limit` for default request-rate budgets; use dataset `requests_per_second_limit` and `requests_per_minute_limit` for per-dataset/origin overrides
 - Use `runtime.params.http_rate_control_jitter_min` and `runtime.params.http_rate_control_jitter_max` for default jitter controls; use dataset `rate_control_jitter_min` and `rate_control_jitter_max` to override them. Set both to `0ms` to disable rate-control jitter
+- HTTP rate-control parameters apply to dynamic JSON HTTP API datasets and HTTP-family connectors such as GraphQL. Structured HTTP file datasets that route through the listing connector (`csv`, `parquet`, `arrow`, `avro`, `jsonl`, `ndjson`, and similar formats) currently reject these parameters; omit the runtime defaults for those sources or use a dynamic JSON HTTP API dataset
 - HTTP 429 responses and rate-limit cooldown headers are honored automatically and shared by HTTP datasets with the same origin. Supported cooldown hints include `Retry-After`, `retry-after-ms`, `x-retry-after-ms`, and exhausted-quota reset headers such as `RateLimit-Remaining: 0` with `RateLimit-Reset` or common `X-RateLimit-Reset` variants
 
 ## Rate-Control Metrics
 
-HTTP rate-control metrics are auto-registered and available through `/metrics`, `runtime.metrics`, and OTLP exporters as `dataset_http_{metric_name}` with the dataset `name` attribute. They can be disabled individually in the dataset `metrics` section with `enabled: false`.
+HTTP rate-control metrics are auto-registered and available through `/metrics`, `runtime.metrics`, and OTLP exporters as `dataset_http_{metric_name}` with the dataset `name` attribute. Because rate-control state is shared by upstream origin, each origin is emitted once using the first dataset that registers metrics for that origin to avoid double-counting shared counters. They can be disabled individually in the owning dataset `metrics` section with `enabled: false`.
 
 | Metric                                    | Type    | Description                                                                |
 | ----------------------------------------- | ------- | -------------------------------------------------------------------------- |

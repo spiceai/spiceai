@@ -46,6 +46,7 @@ use url::Url;
 pub struct GraphQL {
     params: Parameters,
     runtime_rate_control_params: Option<HashMap<String, String>>,
+    rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     metrics: Arc<HttpRateControlMetrics>,
     emit_rate_control_metrics: bool,
 }
@@ -106,17 +107,21 @@ impl DataConnectorFactory for GraphQLFactory {
         Box::pin(async move {
             let runtime_rate_control_params =
                 params.app.as_ref().map(|app| app.runtime.params.clone());
+            let rate_control_registry = params
+                .runtime
+                .as_ref()
+                .map_or_else(http_rate_control::global_registry, |runtime| {
+                    runtime.http_rate_control_registry()
+                });
             let (metrics, emit_rate_control_metrics) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     Url::parse(dataset.path()).map_or_else(
                         |_| (Arc::new(HttpRateControlMetrics::default()), false),
                         |url| {
                             (
-                                http_rate_control::shared_metrics(&url),
-                                http_rate_control::claim_metrics_owner(
-                                    &url,
-                                    dataset.name.to_string().as_str(),
-                                ),
+                                rate_control_registry.shared_metrics(&url),
+                                rate_control_registry
+                                    .claim_metrics_owner(&url, dataset.name.to_string().as_str()),
                             )
                         },
                     )
@@ -127,6 +132,7 @@ impl DataConnectorFactory for GraphQLFactory {
             let graphql = GraphQL {
                 params: params.parameters,
                 runtime_rate_control_params,
+                rate_control_registry,
                 metrics,
                 emit_rate_control_metrics,
             };
@@ -219,12 +225,16 @@ impl GraphQL {
             dataset,
             "graphql",
         )?;
-        let rate_limiter = http_rate_control::shared_rate_limiter(&endpoint).await;
+        let rate_limiter = self
+            .rate_control_registry
+            .shared_rate_limiter(&endpoint)
+            .await;
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
-        let rate_controller =
-            http_rate_control::shared_rate_controller(&endpoint, &rate_control, dataset, "graphql")
-                .await?;
+        let rate_controller = self
+            .rate_control_registry
+            .shared_rate_controller(&endpoint, &rate_control, dataset, "graphql")
+            .await?;
         self.metrics.set_config(&rate_controller.config);
         self.metrics
             .set_rate_controller(rate_controller.controller.as_ref());
@@ -390,6 +400,7 @@ mod tests {
             ])
             .await,
             runtime_rate_control_params: None,
+            rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
         };
@@ -418,6 +429,7 @@ mod tests {
         let graphql = GraphQL {
             params: test_params(&[("max_concurrent_requests", "2")]).await,
             runtime_rate_control_params: Some(runtime_params),
+            rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
         };
@@ -437,6 +449,7 @@ mod tests {
         let graphql = GraphQL {
             params: test_params(&[("requests_per_second_limit", "0")]).await,
             runtime_rate_control_params: None,
+            rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
         };
@@ -462,6 +475,7 @@ mod tests {
         let graphql = GraphQL {
             params: test_params(&[]).await,
             runtime_rate_control_params: None,
+            rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: false,
         };

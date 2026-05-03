@@ -41,18 +41,21 @@ const RUNTIME_REQUESTS_PER_MINUTE_LIMIT: &str = "http_requests_per_minute_limit"
 const RUNTIME_RATE_CONTROL_JITTER_MIN: &str = "http_rate_control_jitter_min";
 const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
 
-static HTTP_RATE_LIMITERS: LazyLock<RwLock<HashMap<String, Arc<HttpRateLimiter>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static GLOBAL_HTTP_RATE_CONTROL_REGISTRY: LazyLock<Arc<HttpRateControlRegistry>> =
+    LazyLock::new(|| Arc::new(HttpRateControlRegistry::default()));
 
-static HTTP_RATE_CONTROLLERS: LazyLock<RwLock<HashMap<String, SharedRateController>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+#[derive(Debug, Default)]
+pub struct HttpRateControlRegistry {
+    rate_limiters: RwLock<HashMap<String, Arc<HttpRateLimiter>>>,
+    rate_controllers: RwLock<HashMap<String, SharedRateController>>,
+    metrics_by_origin: StdRwLock<HashMap<String, Arc<HttpRateControlMetrics>>>,
+    metric_owners: StdRwLock<HashMap<String, String>>,
+}
 
-static HTTP_RATE_CONTROL_METRICS_BY_ORIGIN: LazyLock<
-    StdRwLock<HashMap<String, Arc<HttpRateControlMetrics>>>,
-> = LazyLock::new(|| StdRwLock::new(HashMap::new()));
-
-static HTTP_RATE_CONTROL_METRIC_OWNERS: LazyLock<StdRwLock<HashMap<String, String>>> =
-    LazyLock::new(|| StdRwLock::new(HashMap::new()));
+#[must_use]
+pub fn global_registry() -> Arc<HttpRateControlRegistry> {
+    Arc::clone(&GLOBAL_HTTP_RATE_CONTROL_REGISTRY)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpRateControlConfig {
@@ -472,57 +475,107 @@ pub fn resolve_config<S: BuildHasher>(
     with_jitter(params, runtime_params, dataset, dataconnector, config)
 }
 
-pub async fn shared_rate_limiter(base_url: &Url) -> Arc<HttpRateLimiter> {
-    let key = rate_control_key(base_url);
-    let rate_limiters = HTTP_RATE_LIMITERS.read().await;
-    if let Some(rate_limiter) = rate_limiters.get(&key) {
-        return Arc::clone(rate_limiter);
+impl HttpRateControlRegistry {
+    pub async fn shared_rate_limiter(&self, base_url: &Url) -> Arc<HttpRateLimiter> {
+        let key = rate_control_key(base_url);
+        let rate_limiters = self.rate_limiters.read().await;
+        if let Some(rate_limiter) = rate_limiters.get(&key) {
+            return Arc::clone(rate_limiter);
+        }
+
+        drop(rate_limiters);
+        let mut rate_limiters = self.rate_limiters.write().await;
+        Arc::clone(
+            rate_limiters
+                .entry(key)
+                .or_insert_with(|| Arc::new(HttpRateLimiter::new())),
+        )
     }
 
-    drop(rate_limiters);
-    let mut rate_limiters = HTTP_RATE_LIMITERS.write().await;
-    Arc::clone(
-        rate_limiters
-            .entry(key)
-            .or_insert_with(|| Arc::new(HttpRateLimiter::new())),
-    )
+    #[must_use]
+    pub fn shared_metrics(&self, base_url: &Url) -> Arc<HttpRateControlMetrics> {
+        let key = rate_control_key(base_url);
+        let metrics_by_origin = self.metrics_by_origin.read().ok();
+        if let Some(metrics) = metrics_by_origin
+            .as_ref()
+            .and_then(|metrics_by_origin| metrics_by_origin.get(&key))
+        {
+            return Arc::clone(metrics);
+        }
+        drop(metrics_by_origin);
+
+        let Ok(mut metrics_by_origin) = self.metrics_by_origin.write() else {
+            return Arc::new(HttpRateControlMetrics::default());
+        };
+
+        Arc::clone(
+            metrics_by_origin
+                .entry(key)
+                .or_insert_with(|| Arc::new(HttpRateControlMetrics::default())),
+        )
+    }
+
+    pub fn claim_metrics_owner(&self, base_url: &Url, owner: &str) -> bool {
+        let key = rate_control_key(base_url);
+        let Ok(mut metric_owners) = self.metric_owners.write() else {
+            return false;
+        };
+
+        if let Some(existing_owner) = metric_owners.get(&key) {
+            if existing_owner != owner {
+                tracing::warn!(
+                    upstream_origin = %key,
+                    metrics_owner = existing_owner.as_str(),
+                    skipped_dataset = owner,
+                    "HTTP rate-control metrics are shared per upstream origin and already emitted by another dataset. Skipping duplicate metric registration for this dataset."
+                );
+            }
+            existing_owner == owner
+        } else {
+            metric_owners.insert(key, owner.to_string());
+            true
+        }
+    }
+
+    pub async fn shared_rate_controller(
+        &self,
+        base_url: &Url,
+        config: &HttpRateControlConfig,
+        dataset: &Dataset,
+        dataconnector: &'static str,
+    ) -> DataConnectorResult<SharedRateController> {
+        let key = rate_control_key(base_url);
+        let rate_controllers = self.rate_controllers.read().await;
+        if let Some(existing) = rate_controllers.get(&key) {
+            return resolve_existing_controller(existing, config, dataset, dataconnector, &key);
+        }
+
+        drop(rate_controllers);
+        let mut rate_controllers = self.rate_controllers.write().await;
+        if let Some(existing) = rate_controllers.get(&key) {
+            return resolve_existing_controller(existing, config, dataset, dataconnector, &key);
+        }
+
+        let shared = build_shared_rate_controller(config);
+        rate_controllers.insert(key, shared.clone());
+
+        Ok(shared)
+    }
+}
+
+pub async fn shared_rate_limiter(base_url: &Url) -> Arc<HttpRateLimiter> {
+    GLOBAL_HTTP_RATE_CONTROL_REGISTRY
+        .shared_rate_limiter(base_url)
+        .await
 }
 
 #[must_use]
 pub fn shared_metrics(base_url: &Url) -> Arc<HttpRateControlMetrics> {
-    let key = rate_control_key(base_url);
-    let metrics_by_origin = HTTP_RATE_CONTROL_METRICS_BY_ORIGIN.read().ok();
-    if let Some(metrics) = metrics_by_origin
-        .as_ref()
-        .and_then(|metrics_by_origin| metrics_by_origin.get(&key))
-    {
-        return Arc::clone(metrics);
-    }
-    drop(metrics_by_origin);
-
-    let Ok(mut metrics_by_origin) = HTTP_RATE_CONTROL_METRICS_BY_ORIGIN.write() else {
-        return Arc::new(HttpRateControlMetrics::default());
-    };
-
-    Arc::clone(
-        metrics_by_origin
-            .entry(key)
-            .or_insert_with(|| Arc::new(HttpRateControlMetrics::default())),
-    )
+    GLOBAL_HTTP_RATE_CONTROL_REGISTRY.shared_metrics(base_url)
 }
 
 pub fn claim_metrics_owner(base_url: &Url, owner: &str) -> bool {
-    let key = rate_control_key(base_url);
-    let Ok(mut metric_owners) = HTTP_RATE_CONTROL_METRIC_OWNERS.write() else {
-        return false;
-    };
-
-    if let Some(existing_owner) = metric_owners.get(&key) {
-        existing_owner == owner
-    } else {
-        metric_owners.insert(key, owner.to_string());
-        true
-    }
+    GLOBAL_HTTP_RATE_CONTROL_REGISTRY.claim_metrics_owner(base_url, owner)
 }
 
 pub async fn shared_rate_controller(
@@ -531,25 +584,17 @@ pub async fn shared_rate_controller(
     dataset: &Dataset,
     dataconnector: &'static str,
 ) -> DataConnectorResult<SharedRateController> {
-    let key = rate_control_key(base_url);
-    let rate_controllers = HTTP_RATE_CONTROLLERS.read().await;
-    if let Some(existing) = rate_controllers.get(&key) {
-        return resolve_existing_controller(existing, config, dataset, dataconnector, &key);
-    }
+    GLOBAL_HTTP_RATE_CONTROL_REGISTRY
+        .shared_rate_controller(base_url, config, dataset, dataconnector)
+        .await
+}
 
-    drop(rate_controllers);
-    let mut rate_controllers = HTTP_RATE_CONTROLLERS.write().await;
-    if let Some(existing) = rate_controllers.get(&key) {
-        return resolve_existing_controller(existing, config, dataset, dataconnector, &key);
-    }
-
+fn build_shared_rate_controller(config: &HttpRateControlConfig) -> SharedRateController {
     if !config.is_enabled() {
-        let shared = SharedRateController {
+        return SharedRateController {
             config: config.clone(),
             controller: None,
         };
-        rate_controllers.insert(key, shared.clone());
-        return Ok(shared);
     }
 
     let mut builder = RateController::builder()
@@ -564,14 +609,10 @@ pub async fn shared_rate_controller(
         builder = builder.add_quota(Quota::per_minute(requests_per_minute));
     }
 
-    let controller = builder.build();
-    let shared = SharedRateController {
+    SharedRateController {
         config: config.clone(),
-        controller: Some(controller),
-    };
-    rate_controllers.insert(key, shared.clone());
-
-    Ok(shared)
+        controller: Some(builder.build()),
+    }
 }
 
 fn resolve_existing_controller(
@@ -581,7 +622,7 @@ fn resolve_existing_controller(
     dataconnector: &'static str,
     key: &str,
 ) -> DataConnectorResult<SharedRateController> {
-    if existing.config == *config || (existing.config.is_enabled() && !config.is_enabled()) {
+    if existing.config == *config {
         return Ok(existing.clone());
     }
 

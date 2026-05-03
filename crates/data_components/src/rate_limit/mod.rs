@@ -136,27 +136,27 @@ impl RateLimiter for HttpRateLimiter {
     }
 
     async fn check_rate_limit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let retry_after = *self.retry_after.read().await;
-        let Some(retry_after) = retry_after else {
-            return Ok(());
-        };
+        loop {
+            let retry_after = *self.retry_after.read().await;
+            let Some(retry_after) = retry_after else {
+                return Ok(());
+            };
 
-        let now = Instant::now();
-        if retry_after <= now {
-            self.clear_elapsed_retry_after(now).await;
-            return Ok(());
+            let now = Instant::now();
+            if retry_after <= now {
+                self.clear_elapsed_retry_after(now).await;
+                continue;
+            }
+
+            let wait_duration = retry_after.saturating_duration_since(now);
+            tracing::warn!(
+                wait_duration_ms = wait_duration.as_millis(),
+                "HTTP rate limit exceeded. Waiting before sending another request."
+            );
+            self.metrics.record_retry_after_wait(wait_duration);
+            tokio::time::sleep(wait_duration).await;
+            self.clear_elapsed_retry_after(Instant::now()).await;
         }
-
-        let wait_duration = retry_after.saturating_duration_since(now);
-        tracing::warn!(
-            wait_duration_ms = wait_duration.as_millis(),
-            "HTTP rate limit exceeded. Waiting before sending another request."
-        );
-        self.metrics.record_retry_after_wait(wait_duration);
-        tokio::time::sleep(wait_duration).await;
-        self.clear_elapsed_retry_after(Instant::now()).await;
-
-        Ok(())
     }
 }
 
@@ -464,5 +464,44 @@ mod tests {
             .expect("elapsed rate limit should be cleared");
 
         assert!(start.elapsed() < Duration::from_millis(1));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_http_rate_limiter_waits_for_extended_retry_after() {
+        let rate_limiter = Arc::new(HttpRateLimiter::new());
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        rate_limiter.update_from_headers(&headers).await;
+
+        let waiter = tokio::spawn({
+            let rate_limiter = Arc::clone(&rate_limiter);
+            async move {
+                let start = tokio::time::Instant::now();
+                rate_limiter
+                    .check_rate_limit()
+                    .await
+                    .expect("rate limit check should succeed");
+                start.elapsed()
+            }
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut extended_headers = HeaderMap::new();
+        extended_headers.insert(RETRY_AFTER, HeaderValue::from_static("3"));
+        rate_limiter.update_from_headers(&extended_headers).await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let elapsed = waiter.await.expect("waiter task should complete");
+
+        let metrics = rate_limiter.metrics();
+        assert!(elapsed >= Duration::from_secs(4));
+        assert_eq!(metrics.retry_after_updates_total(), 2);
+        assert_eq!(metrics.retry_after_waits_total(), 2);
+        assert_eq!(metrics.retry_after_wait_duration_ms_total(), 4000);
     }
 }

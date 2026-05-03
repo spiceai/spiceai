@@ -61,6 +61,7 @@ const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 pub struct Https {
     params: Parameters,
     runtime_rate_control_params: Option<HashMap<String, String>>,
+    rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     metrics: Arc<HttpRateControlMetrics>,
     emit_rate_control_metrics: bool,
 }
@@ -73,6 +74,7 @@ impl std::fmt::Display for Https {
 
 impl Https {
     fn shared_rate_control_metrics_for_dataset(
+        rate_control_registry: &http_rate_control::HttpRateControlRegistry,
         dataset: &Dataset,
         structured_format: bool,
     ) -> (Arc<HttpRateControlMetrics>, bool) {
@@ -84,8 +86,9 @@ impl Https {
             |_| (Arc::new(HttpRateControlMetrics::default()), false),
             |url| {
                 (
-                    http_rate_control::shared_metrics(&url),
-                    http_rate_control::claim_metrics_owner(&url, dataset.name.to_string().as_str()),
+                    rate_control_registry.shared_metrics(&url),
+                    rate_control_registry
+                        .claim_metrics_owner(&url, dataset.name.to_string().as_str()),
                 )
             },
         )
@@ -836,12 +839,16 @@ impl Https {
             request_header_allowlist,
         } = request_filters;
 
-        let rate_limiter = http_rate_control::shared_rate_limiter(&base_url).await;
+        let rate_limiter = self
+            .rate_control_registry
+            .shared_rate_limiter(&base_url)
+            .await;
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
-        let rate_controller =
-            http_rate_control::shared_rate_controller(&base_url, &rate_control, dataset, "https")
-                .await?;
+        let rate_controller = self
+            .rate_control_registry
+            .shared_rate_controller(&base_url, &rate_control, dataset, "https")
+            .await?;
         self.metrics.set_config(&rate_controller.config);
         self.metrics
             .set_rate_controller(rate_controller.controller.as_ref());
@@ -1204,18 +1211,29 @@ impl DataConnectorFactory for HttpsFactory {
         Box::pin(async move {
             let runtime_rate_control_params =
                 params.app.as_ref().map(|app| app.runtime.params.clone());
+            let rate_control_registry = params
+                .runtime
+                .as_ref()
+                .map_or_else(http_rate_control::global_registry, |runtime| {
+                    runtime.http_rate_control_registry()
+                });
             let (metrics, emit_rate_control_metrics) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     let structured_format = {
                         let connector = Https {
                             params: params.parameters.clone(),
                             runtime_rate_control_params: runtime_rate_control_params.clone(),
+                            rate_control_registry: Arc::clone(&rate_control_registry),
                             metrics: Arc::new(HttpRateControlMetrics::default()),
                             emit_rate_control_metrics: false,
                         };
                         connector.is_structured_format(dataset)
                     };
-                    Https::shared_rate_control_metrics_for_dataset(dataset, structured_format)
+                    Https::shared_rate_control_metrics_for_dataset(
+                        &rate_control_registry,
+                        dataset,
+                        structured_format,
+                    )
                 } else {
                     (Arc::new(HttpRateControlMetrics::default()), false)
                 };
@@ -1223,6 +1241,7 @@ impl DataConnectorFactory for HttpsFactory {
             Ok(Arc::new(Https {
                 params: params.parameters,
                 runtime_rate_control_params,
+                rate_control_registry,
                 metrics,
                 emit_rate_control_metrics,
             }) as Arc<dyn DataConnector>)
@@ -1403,6 +1422,7 @@ mod tests {
                         .collect::<HashMap<_, _>>(),
                 )
             },
+            rate_control_registry: http_rate_control::global_registry(),
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
         }
@@ -1442,6 +1462,18 @@ mod tests {
                 );
             }
             other => panic!("expected invalid URL error, got: {other}"),
+        }
+    }
+
+    fn assert_conflicting_rate_control_error(error: DataConnectorError) {
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("different rate-control settings"),
+                    "expected shared-origin rate-control conflict, got: {message}"
+                );
+            }
+            other => panic!("expected shared-origin rate-control conflict, got: {other}"),
         }
     }
 
@@ -1616,6 +1648,7 @@ mod tests {
             "rate_control_jitter_max_ms",
             "rate_control_available_permits",
             "rate_control_acquisitions_total",
+            "rate_control_acquire_errors_total",
             "rate_control_wait_duration_ms",
             "rate_limit_retry_after_updates_total",
             "rate_limit_retry_after_remaining_ms",
@@ -1683,6 +1716,94 @@ mod tests {
             }
             other => panic!("expected jitter range validation error, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_http_structured_dataset_rejects_runtime_rate_control_defaults() {
+        let connector = test_connector_with_runtime_params(
+            &[("file_format", "csv")],
+            &[("http_max_concurrent_requests", "5")],
+        )
+        .await;
+        let dataset = test_dataset(
+            "https://structured-rate-control.example.com/data.csv",
+            RefreshMode::Full,
+            None,
+        )
+        .await;
+
+        let Err(error) = connector.read_provider(&dataset).await else {
+            panic!("structured HTTP file datasets should reject HTTP rate-control defaults");
+        };
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("not supported for structured HTTP file datasets"),
+                    "expected structured dataset rate-control validation error, got: {message}"
+                );
+            }
+            other => {
+                panic!("expected structured dataset rate-control validation error, got: {other}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_rejects_mixed_origin_configuration() {
+        let configured = test_connector_with(&[("max_concurrent_requests", "2")]).await;
+        let unconfigured = test_connector_with(&[]).await;
+        let configured_dataset = test_dataset(
+            "https://mixed-origin-enabled-first.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+        let unconfigured_dataset = test_dataset(
+            "https://mixed-origin-enabled-first.example.com/other",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        configured
+            .create_http_table_provider(&configured_dataset)
+            .await
+            .expect("configured HTTP provider should be created");
+        let Err(error) = unconfigured
+            .create_http_table_provider(&unconfigured_dataset)
+            .await
+        else {
+            panic!("mixed configured/unconfigured origin should be rejected");
+        };
+        assert_conflicting_rate_control_error(error);
+
+        let unconfigured = test_connector_with(&[]).await;
+        let configured = test_connector_with(&[("max_concurrent_requests", "2")]).await;
+        let unconfigured_dataset = test_dataset(
+            "https://mixed-origin-disabled-first.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+        let configured_dataset = test_dataset(
+            "https://mixed-origin-disabled-first.example.com/other",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        unconfigured
+            .create_http_table_provider(&unconfigured_dataset)
+            .await
+            .expect("unconfigured HTTP provider should be created");
+        let Err(error) = configured
+            .create_http_table_provider(&configured_dataset)
+            .await
+        else {
+            panic!("mixed unconfigured/configured origin should be rejected");
+        };
+        assert_conflicting_rate_control_error(error);
     }
 
     #[tokio::test]
