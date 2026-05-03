@@ -692,7 +692,7 @@ impl From<Usage> for CompletionUsage {
         let cache_read_input_tokens = usage.cache_read_input_tokens.unwrap_or_default();
         let prompt_tokens =
             usage.input_tokens + cache_creation_input_tokens + cache_read_input_tokens;
-        let prompt_tokens_details = (cache_read_input_tokens > 0).then(|| PromptTokensDetails {
+        let prompt_tokens_details = (cache_read_input_tokens > 0).then_some(PromptTokensDetails {
             cached_tokens: Some(cache_read_input_tokens),
             audio_tokens: None,
         });
