@@ -31,7 +31,10 @@ use tools::SpiceModelTool;
 
 use crate::{
     Runtime,
-    tools::{options::SpiceToolsOptions, utils::parameters},
+    tools::{
+        options::SpiceToolsOptions,
+        utils::{get_tools, parameters},
+    },
 };
 
 const TOOL_SEARCH_NAME: &str = "tool_search";
@@ -104,6 +107,43 @@ fn tool_registry_tools(
     ];
     advertised_tools.extend(direct_tools);
     advertised_tools
+}
+
+pub(crate) async fn tool_registry_prompt_tools(
+    rt: Arc<Runtime>,
+    embedding_model_name: Option<&str>,
+) -> Result<Vec<Arc<dyn SpiceModelTool>>, Box<dyn std::error::Error + Send + Sync>> {
+    let tools = get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await;
+    let embedding_model = resolve_tool_registry_embedding_model(rt, embedding_model_name).await?;
+
+    Ok(tool_registry_tools(tools, embedding_model))
+}
+
+pub(crate) async fn get_tool_registry_tool(
+    rt: Arc<Runtime>,
+    tool_name: &str,
+    embedding_model_name: Option<&str>,
+) -> Result<Option<Arc<dyn SpiceModelTool>>, Box<dyn std::error::Error + Send + Sync>> {
+    match tool_name {
+        TOOL_SEARCH_NAME => {
+            let tools = get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await;
+            let registry = Arc::new(tools);
+            let embedding_model =
+                resolve_tool_registry_embedding_model(rt, embedding_model_name).await?;
+            Ok(Some(
+                Arc::new(ToolRegistrySearchTool::new(registry, embedding_model))
+                    as Arc<dyn SpiceModelTool>,
+            ))
+        }
+        TOOL_INVOKE_NAME => {
+            let tools = get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await;
+            let registry = Arc::new(tools);
+            Ok(Some(
+                Arc::new(ToolRegistryInvokeTool::new(registry)) as Arc<dyn SpiceModelTool>
+            ))
+        }
+        _ => Ok(None),
+    }
 }
 
 pub(crate) async fn resolve_tool_registry_embedding_model(

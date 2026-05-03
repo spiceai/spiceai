@@ -18,15 +18,19 @@ use std::sync::Arc;
 
 use axum::{
     Extension, Json,
-    extract::Path,
+    extract::{Path, Query},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tools::SpiceModelTool;
 
-use crate::Runtime;
+use crate::{
+    Runtime,
+    tools::registry::{get_tool_registry_tool, tool_registry_prompt_tools},
+};
 
 /// Summary of a tool available to run, and the schema of its input parameters.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -35,6 +39,24 @@ struct ListToolElement {
     name: String,
     description: Option<String>,
     parameters: Option<serde_json::Value>,
+}
+
+impl ListToolElement {
+    fn from_tool(tool: &Arc<dyn SpiceModelTool>) -> Self {
+        Self {
+            name: tool.name().to_string(),
+            description: tool.description().map(|d| d.to_string()),
+            parameters: tool.parameters(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "openapi", into_params(parameter_in = Query))]
+pub(crate) struct SearchToolsQuery {
+    /// Embedding model name to use for searchable tool discovery. Required only when multiple embedding models are configured.
+    tool_embedding_model: Option<String>,
 }
 
 /// List Tools
@@ -59,15 +81,49 @@ struct ListToolElement {
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     let tools = rt
         .list_all_tools()
-        .map(|tool| ListToolElement {
-            name: tool.name().to_string(),
-            description: tool.description().map(|d| d.to_string()),
-            parameters: tool.parameters(),
-        })
+        .map(|tool| ListToolElement::from_tool(&tool))
         .collect::<Vec<_>>()
         .await;
 
     (StatusCode::OK, Json(tools)).into_response()
+}
+
+/// List Searchable Tool Registry Tools
+///
+/// Returns the small set of tool definitions an external LLM client should inject to use Spice's searchable tool registry. Invoke returned tools with `POST /v1/tools/{name}`.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/tools/search",
+    operation_id = "list_searchable_tool_registry_tools",
+    tag = "Tools",
+    params(SearchToolsQuery),
+    responses(
+        (
+            status = 200,  body = [ListToolElement],
+            description = "Searchable tool registry tools to inject into an external LLM prompt",
+            example = json!([
+                {"name": "tool_search", "description": "Search the Spice tool registry for tools relevant to the current task.", "parameters": {"type": "object"}},
+                {"name": "tool_invoke", "description": "Invoke one Spice tool returned by tool_search.", "parameters": {"type": "object"}},
+                {"name": "list_datasets", "description": "List all SQL tables available.", "parameters": null}
+            ])
+        ),
+        (status = 400, description = "Searchable tool registry is not configured", body = serde_json::Value)
+    )
+))]
+pub(crate) async fn search(
+    Extension(rt): Extension<Arc<Runtime>>,
+    Query(query): Query<SearchToolsQuery>,
+) -> Response {
+    match tool_registry_prompt_tools(Arc::clone(&rt), query.tool_embedding_model.as_deref()).await {
+        Ok(tools) => {
+            let tools = tools
+                .iter()
+                .map(ListToolElement::from_tool)
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(tools)).into_response()
+        }
+        Err(error) => bad_request(error.to_string().as_str()),
+    }
 }
 
 /// Run Tool
@@ -119,9 +175,22 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
 pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
     Path(tool_name): Path<String>,
+    Query(query): Query<SearchToolsQuery>,
     body: String,
 ) -> Response {
-    let Some(tool) = rt.get_tool(tool_name.as_str()).await else {
+    let tool = match get_tool_registry_tool(
+        Arc::clone(&rt),
+        tool_name.as_str(),
+        query.tool_embedding_model.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(tool)) => Some(tool),
+        Ok(None) => rt.get_tool(tool_name.as_str()).await,
+        Err(error) => return bad_request(error.to_string().as_str()),
+    };
+
+    let Some(tool) = tool else {
         return not_found(format!("Tool '{tool_name}' not found").as_str());
     };
 
@@ -137,4 +206,8 @@ pub(crate) async fn post(
 
 fn not_found(message: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"message": message}))).into_response()
+}
+
+fn bad_request(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"message": message}))).into_response()
 }
