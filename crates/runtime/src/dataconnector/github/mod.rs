@@ -77,7 +77,7 @@ mod stargazers;
 mod workflow_runs;
 mod workflows;
 
-static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
+static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, (usize, Arc<Semaphore>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
@@ -803,13 +803,43 @@ impl DataConnectorFactory for GithubFactory {
             .ok()
             .map(ToString::to_string);
 
-        let dataset_max_concurrent_requests = params
+        let connector_component = params.component.clone();
+
+        let dataset_max_concurrent_requests = match params
             .parameters
             .get("max_concurrent_requests")
             .expose()
             .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0);
+            .map(str::trim)
+        {
+            Some("") | None => None,
+            Some(value) => match value.parse::<usize>() {
+                Ok(0) => {
+                    let error = DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component,
+                        message: format!(
+                            "The '{}' parameter must be greater than 0.",
+                            params.parameters.user_param("max_concurrent_requests")
+                        ),
+                    };
+                    return Box::pin(async move { Err(Box::new(error) as _) });
+                }
+                Ok(value) => Some(value),
+                Err(source) => {
+                    let error = DataConnectorError::InvalidConfiguration {
+                        dataconnector: "github".to_string(),
+                        message: format!(
+                            "The '{}' parameter must be a positive integer.",
+                            params.parameters.user_param("max_concurrent_requests")
+                        ),
+                        connector_component,
+                        source: source.into(),
+                    };
+                    return Box::pin(async move { Err(Box::new(error) as _) });
+                }
+            },
+        };
 
         let app_max_concurrent_connections = params
             .app
@@ -853,11 +883,27 @@ impl DataConnectorFactory for GithubFactory {
 
             let semaphore = if let Some(key) = semaphore_key {
                 let mut limits = GITHUB_CONCURRENCY_LIMITS.lock().await;
-                Arc::clone(
-                    limits
-                        .entry(key)
-                        .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent_connections))),
-                )
+                match limits.get(&key) {
+                    Some((existing_limit, semaphore))
+                        if *existing_limit == max_concurrent_connections =>
+                    {
+                        Arc::clone(semaphore)
+                    }
+                    Some((existing_limit, _)) => {
+                        return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                            dataconnector: "github".to_string(),
+                            connector_component,
+                            message: format!(
+                                "Multiple GitHub datasets share the same authentication context with different concurrency limits ({existing_limit} and {max_concurrent_connections}). Use the same max_concurrent_requests value for datasets sharing a GitHub token or installation."
+                            ),
+                        }) as _);
+                    }
+                    None => {
+                        let semaphore = Arc::new(Semaphore::new(max_concurrent_connections));
+                        limits.insert(key, (max_concurrent_connections, Arc::clone(&semaphore)));
+                        semaphore
+                    }
+                }
             } else {
                 Arc::new(Semaphore::new(max_concurrent_connections))
             };

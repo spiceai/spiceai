@@ -62,6 +62,7 @@ pub struct Https {
     params: Parameters,
     runtime_rate_control_params: Option<HashMap<String, String>>,
     metrics: Arc<HttpRateControlMetrics>,
+    emit_rate_control_metrics: bool,
 }
 
 impl std::fmt::Display for Https {
@@ -71,6 +72,25 @@ impl std::fmt::Display for Https {
 }
 
 impl Https {
+    fn shared_rate_control_metrics_for_dataset(
+        dataset: &Dataset,
+        structured_format: bool,
+    ) -> (Arc<HttpRateControlMetrics>, bool) {
+        if structured_format {
+            return (Arc::new(HttpRateControlMetrics::default()), false);
+        }
+
+        Url::parse(dataset.from.as_str()).map_or_else(
+            |_| (Arc::new(HttpRateControlMetrics::default()), false),
+            |url| {
+                (
+                    http_rate_control::shared_metrics(&url),
+                    http_rate_control::claim_metrics_owner(&url, dataset.name.to_string().as_str()),
+                )
+            },
+        )
+    }
+
     /// Determines if the dataset uses a structured file format (parquet, csv, json, etc.)
     /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
     fn is_structured_format(&self, dataset: &Dataset) -> bool {
@@ -187,6 +207,28 @@ impl Https {
             || has_body_filters
             || has_header_filters
             || has_pagination
+    }
+
+    fn ensure_rate_control_supported_for_structured_dataset(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<()> {
+        let rate_control = http_rate_control::resolve_config(
+            &self.params,
+            self.runtime_rate_control_params.as_ref(),
+            dataset,
+            "https",
+        )?;
+
+        if rate_control.is_enabled() {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "HTTP rate-control parameters are not supported for structured HTTP file datasets that use the listing connector. Remove max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, and rate_control_jitter_max, or use a dynamic JSON HTTP API dataset.".to_string(),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -800,8 +842,9 @@ impl Https {
         let rate_controller =
             http_rate_control::shared_rate_controller(&base_url, &rate_control, dataset, "https")
                 .await?;
-        self.metrics.set_config(&rate_control);
-        self.metrics.set_rate_controller(rate_controller.as_ref());
+        self.metrics.set_config(&rate_controller.config);
+        self.metrics
+            .set_rate_controller(rate_controller.controller.as_ref());
 
         let mut provider = data_components::http::provider::HttpTableProvider::new(
             base_url,
@@ -815,7 +858,7 @@ impl Https {
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
         .with_rate_limiter(Some(rate_limiter))
-        .with_rate_controller(rate_controller)
+        .with_rate_controller(rate_controller.controller)
         .with_max_request_partitions(max_request_partitions)
         .with_health_probe(health_probe)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -990,6 +1033,7 @@ impl DataConnector for Https {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
+            self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
             // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
             // which properly handles file parsing with correct schemas
             let listing_connector =
@@ -1020,6 +1064,10 @@ impl DataConnector for Https {
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        if !self.emit_rate_control_metrics {
+            return None;
+        }
+
         Some(Arc::new(HttpRateControlMetricsProvider::new(
             "http",
             Arc::clone(&self.metrics),
@@ -1156,11 +1204,27 @@ impl DataConnectorFactory for HttpsFactory {
         Box::pin(async move {
             let runtime_rate_control_params =
                 params.app.as_ref().map(|app| app.runtime.params.clone());
+            let (metrics, emit_rate_control_metrics) =
+                if let ConnectorComponent::Dataset(dataset) = &params.component {
+                    let structured_format = {
+                        let connector = Https {
+                            params: params.parameters.clone(),
+                            runtime_rate_control_params: runtime_rate_control_params.clone(),
+                            metrics: Arc::new(HttpRateControlMetrics::default()),
+                            emit_rate_control_metrics: false,
+                        };
+                        connector.is_structured_format(dataset)
+                    };
+                    Https::shared_rate_control_metrics_for_dataset(dataset, structured_format)
+                } else {
+                    (Arc::new(HttpRateControlMetrics::default()), false)
+                };
 
             Ok(Arc::new(Https {
                 params: params.parameters,
                 runtime_rate_control_params,
-                metrics: Arc::new(HttpRateControlMetrics::default()),
+                metrics,
+                emit_rate_control_metrics,
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -1340,6 +1404,7 @@ mod tests {
                 )
             },
             metrics: Arc::new(HttpRateControlMetrics::default()),
+            emit_rate_control_metrics: true,
         }
     }
 

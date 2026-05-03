@@ -47,6 +47,7 @@ pub struct GraphQL {
     params: Parameters,
     runtime_rate_control_params: Option<HashMap<String, String>>,
     metrics: Arc<HttpRateControlMetrics>,
+    emit_rate_control_metrics: bool,
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -105,11 +106,29 @@ impl DataConnectorFactory for GraphQLFactory {
         Box::pin(async move {
             let runtime_rate_control_params =
                 params.app.as_ref().map(|app| app.runtime.params.clone());
+            let (metrics, emit_rate_control_metrics) =
+                if let ConnectorComponent::Dataset(dataset) = &params.component {
+                    Url::parse(dataset.path()).map_or_else(
+                        |_| (Arc::new(HttpRateControlMetrics::default()), false),
+                        |url| {
+                            (
+                                http_rate_control::shared_metrics(&url),
+                                http_rate_control::claim_metrics_owner(
+                                    &url,
+                                    dataset.name.to_string().as_str(),
+                                ),
+                            )
+                        },
+                    )
+                } else {
+                    (Arc::new(HttpRateControlMetrics::default()), false)
+                };
 
             let graphql = GraphQL {
                 params: params.parameters,
                 runtime_rate_control_params,
-                metrics: Arc::new(HttpRateControlMetrics::default()),
+                metrics,
+                emit_rate_control_metrics,
             };
             Ok(Arc::new(graphql) as Arc<dyn DataConnector>)
         })
@@ -206,8 +225,9 @@ impl GraphQL {
         let rate_controller =
             http_rate_control::shared_rate_controller(&endpoint, &rate_control, dataset, "graphql")
                 .await?;
-        self.metrics.set_config(&rate_control);
-        self.metrics.set_rate_controller(rate_controller.as_ref());
+        self.metrics.set_config(&rate_controller.config);
+        self.metrics
+            .set_rate_controller(rate_controller.controller.as_ref());
 
         GraphQLClientBuilder::new(
             endpoint,
@@ -218,7 +238,7 @@ impl GraphQL {
         .with_user(user)
         .with_pass(pass)
         .with_rate_limiter(Some(rate_limiter))
-        .with_rate_controller(rate_controller)
+        .with_rate_controller(rate_controller.controller)
         .with_auth_header(auth_header)
         .build(client)
         .boxed()
@@ -275,6 +295,10 @@ impl DataConnector for GraphQL {
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        if !self.emit_rate_control_metrics {
+            return None;
+        }
+
         Some(Arc::new(HttpRateControlMetricsProvider::new(
             "graphql",
             Arc::clone(&self.metrics),
@@ -289,4 +313,159 @@ pub const CONNECTOR_NAME: &str = "graphql";
 #[must_use]
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     GraphQLFactory::new_arc()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime::Runtime;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime::secrets::Secrets;
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    async fn test_params(extra: &[(&str, &str)]) -> Parameters {
+        let mut params = vec![(
+            "query".to_string(),
+            "query { users { id } }".to_string().into(),
+        )];
+        params.extend(
+            extra
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string().into())),
+        );
+
+        Parameters::try_new(
+            "connector graphql",
+            params,
+            "graphql",
+            Arc::new(RwLock::new(Secrets::default())),
+            PARAMETERS.as_slice(),
+        )
+        .await
+        .expect("test GraphQL parameters should be valid")
+    }
+
+    fn test_dataset(url: &str) -> Dataset {
+        let app = Arc::new(app::AppBuilder::new("graphql_test".to_string()).build());
+        let runtime = Arc::new(Runtime::builder().with_app(Arc::clone(&app)).build());
+
+        DatasetBuilder::try_new(format!("graphql:{url}"), "graphql_test")
+            .expect("test dataset should be valid")
+            .with_app(app)
+            .with_runtime(runtime)
+            .build()
+            .expect("test dataset should build")
+    }
+
+    #[test]
+    fn graphql_parameters_include_http_rate_control_specs() {
+        let parameters = GraphQLFactory::new().parameters();
+        for parameter_name in [
+            "max_concurrent_requests",
+            "requests_per_second_limit",
+            "requests_per_minute_limit",
+            "rate_control_jitter_min",
+            "rate_control_jitter_max",
+        ] {
+            assert!(
+                parameters
+                    .iter()
+                    .any(|parameter| parameter.name == parameter_name),
+                "GraphQL connector should expose {parameter_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn graphql_rate_control_dataset_params_parse_and_update_metrics() {
+        let graphql = GraphQL {
+            params: test_params(&[
+                ("max_concurrent_requests", "4"),
+                ("requests_per_second_limit", "2"),
+                ("requests_per_minute_limit", "60"),
+                ("rate_control_jitter_min", "2ms"),
+                ("rate_control_jitter_max", "8ms"),
+            ])
+            .await,
+            runtime_rate_control_params: None,
+            metrics: Arc::new(HttpRateControlMetrics::default()),
+            emit_rate_control_metrics: true,
+        };
+        let dataset = test_dataset("https://graphql-dataset-params.example.com/graphql");
+
+        graphql
+            .get_client(&dataset)
+            .await
+            .expect("GraphQL client should build with rate-control params");
+
+        assert_eq!(graphql.metrics.max_concurrent_requests(), 4);
+        assert_eq!(graphql.metrics.requests_per_second_limit(), 2);
+        assert_eq!(graphql.metrics.requests_per_minute_limit(), 60);
+        assert_eq!(graphql.metrics.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn graphql_rate_control_uses_runtime_defaults_and_dataset_overrides() {
+        let runtime_params = HashMap::from([
+            ("http_max_concurrent_requests".to_string(), "5".to_string()),
+            (
+                "http_requests_per_second_limit".to_string(),
+                "3".to_string(),
+            ),
+        ]);
+        let graphql = GraphQL {
+            params: test_params(&[("max_concurrent_requests", "2")]).await,
+            runtime_rate_control_params: Some(runtime_params),
+            metrics: Arc::new(HttpRateControlMetrics::default()),
+            emit_rate_control_metrics: true,
+        };
+        let dataset = test_dataset("https://graphql-runtime-defaults.example.com/graphql");
+
+        graphql
+            .get_client(&dataset)
+            .await
+            .expect("GraphQL client should build with runtime rate-control defaults");
+
+        assert_eq!(graphql.metrics.max_concurrent_requests(), 2);
+        assert_eq!(graphql.metrics.requests_per_second_limit(), 3);
+    }
+
+    #[tokio::test]
+    async fn graphql_rate_control_rejects_invalid_limits() {
+        let graphql = GraphQL {
+            params: test_params(&[("requests_per_second_limit", "0")]).await,
+            runtime_rate_control_params: None,
+            metrics: Arc::new(HttpRateControlMetrics::default()),
+            emit_rate_control_metrics: true,
+        };
+        let dataset = test_dataset("https://graphql-invalid-limit.example.com/graphql");
+
+        let error = graphql
+            .get_client(&dataset)
+            .await
+            .expect_err("zero GraphQL rate-control limit should be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("must be greater than 0"),
+                    "expected zero-limit validation error, got: {message}"
+                );
+            }
+            other => panic!("expected zero-limit validation error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn graphql_metrics_provider_can_be_suppressed_for_non_owner() {
+        let graphql = GraphQL {
+            params: Parameters::default(),
+            runtime_rate_control_params: None,
+            metrics: Arc::new(HttpRateControlMetrics::default()),
+            emit_rate_control_metrics: false,
+        };
+
+        assert!(DataConnector::metrics_provider(&graphql).is_none());
+    }
 }
