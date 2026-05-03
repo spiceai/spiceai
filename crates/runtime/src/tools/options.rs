@@ -48,6 +48,11 @@ impl SpiceToolsOptions {
         }
     }
 
+    #[must_use]
+    pub(crate) fn use_registry_tools(&self) -> bool {
+        matches!(self, SpiceToolsOptions::Auto)
+    }
+
     pub(crate) fn tools_by_name(&self) -> Vec<&str> {
         match self {
             SpiceToolsOptions::Auto => vec![
@@ -134,5 +139,13 @@ mod tests {
             tools.iter().unique().count(),
             "'SpiceToolsOptions::tools_by_name' should not produce duplicates"
         );
+    }
+
+    #[test]
+    fn test_auto_uses_registry_tools() {
+        assert!(SpiceToolsOptions::Auto.use_registry_tools());
+        assert!(!SpiceToolsOptions::Nsql.use_registry_tools());
+        assert!(!SpiceToolsOptions::Disabled.use_registry_tools());
+        assert!(!SpiceToolsOptions::Specific(vec!["sql".to_string()]).use_registry_tools());
     }
 }

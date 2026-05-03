@@ -26,6 +26,7 @@ pub mod factory;
 pub mod mcp;
 pub mod memory;
 pub mod options;
+pub(crate) mod registry;
 pub mod utils;
 
 /// [`Tooling`] define several ways to access and load tools into the runtime.

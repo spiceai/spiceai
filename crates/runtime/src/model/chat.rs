@@ -43,6 +43,7 @@ use crate::{
     parameters::Parameters,
     tools::{
         options::SpiceToolsOptions,
+        registry::tool_registry_tools,
         utils::{create_table_allowlist, get_tools_with_allowlist},
     },
 };
@@ -114,12 +115,20 @@ pub async fn try_to_chat_model(
     let table_allowlist = create_table_allowlist(&component.datasets);
 
     let tool_model = match spice_tool_opt {
-        Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingChat::new(
-            model,
-            Arc::clone(&rt),
-            get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await,
-            spice_recursion_limit,
-        )),
+        Some(opts) if opts.can_use_tools() => {
+            let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
+            let tools = if opts.use_registry_tools() {
+                tool_registry_tools(tools)
+            } else {
+                tools
+            };
+            Arc::new(ToolUsingChat::new(
+                model,
+                Arc::clone(&rt),
+                tools,
+                spice_recursion_limit,
+            ))
+        }
         Some(_) | None => model,
     };
     Ok(tool_model)
