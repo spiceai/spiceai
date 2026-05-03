@@ -129,29 +129,29 @@ impl Databricks {
         let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
             return;
         };
-        let Some(content) = messages
-            .iter_mut()
-            .rev()
-            .find_map(|message| message.get_mut("content"))
-        else {
-            return;
-        };
+        for message in messages.iter_mut().rev() {
+            let Some(content) = message.get_mut("content") else {
+                continue;
+            };
 
-        match content {
-            Value::String(text) if !text.is_empty() => {
-                let text = std::mem::take(text);
-                *content = json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
-            }
-            Value::Array(parts) => {
-                if let Some(Value::Object(part)) = parts
-                    .iter_mut()
-                    .rev()
-                    .find(|part| part.get("text").is_some())
-                {
-                    part.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+            match content {
+                Value::String(text) if !text.is_empty() => {
+                    let text = std::mem::take(text);
+                    *content = json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+                    return;
                 }
+                Value::Array(parts) => {
+                    if let Some(Value::Object(part)) = parts
+                        .iter_mut()
+                        .rev()
+                        .find(|part| part.get("text").is_some())
+                    {
+                        part.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+                        return;
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -473,5 +473,23 @@ mod tests {
             body["messages"][1]["content"][0]["cache_control"],
             json!({ "type": "ephemeral" })
         );
+    }
+
+    #[test]
+    fn prompt_cache_control_skips_trailing_non_text_content() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "Reusable context"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "call_123"}]}
+            ]
+        });
+
+        Databricks::add_prompt_cache_control(&mut body);
+
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(body["messages"][1]["content"][0]["cache_control"].is_null());
     }
 }

@@ -365,7 +365,7 @@ impl BedrockConverse {
             last_message
                 .content
                 .push(ContentBlock::CachePoint(cache_point));
-        } else if !system.is_empty() {
+        } else {
             system.push(SystemContentBlock::CachePoint(cache_point));
         }
         Ok(())
@@ -886,6 +886,21 @@ mod tests {
                 .last()
                 .and_then(|message| message.content.last()),
             Some(ContentBlock::CachePoint(cache_point))
+                if cache_point.r#type == CachePointType::Default
+        ));
+    }
+
+    #[test]
+    fn prompt_cache_point_is_added_to_system_when_messages_are_empty() {
+        let mut system = vec![];
+        let mut messages = vec![];
+
+        BedrockConverse::add_prompt_cache_point(&mut system, &mut messages)
+            .expect("cache point should build");
+
+        assert!(matches!(
+            system.last(),
+            Some(SystemContentBlock::CachePoint(cache_point))
                 if cache_point.r#type == CachePointType::Default
         ));
     }
