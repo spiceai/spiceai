@@ -89,21 +89,18 @@ pub fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
 
 /// Create a [`ResolvedTableAwareAllowlist`] from a list of dataset patterns.
 ///
-/// Returns `None` if the list is empty.
-pub fn create_table_allowlist(datasets: &[String]) -> Option<ResolvedTableAwareAllowlist> {
+/// Returns `Ok(None)` if the list is empty.
+pub fn create_table_allowlist(
+    datasets: &[String],
+) -> Result<Option<ResolvedTableAwareAllowlist>, Box<dyn std::error::Error + Send + Sync>> {
     if datasets.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    match ResolvedTableAwareAllowlist::with_defaults(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+    ResolvedTableAwareAllowlist::with_defaults(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
         .with_table_patterns(datasets.to_vec())
-    {
-        Ok(allowlist) => Some(allowlist),
-        Err(e) => {
-            tracing::warn!("Failed to create table allowlist from model datasets: {e}");
-            None
-        }
-    }
+        .map(Some)
+        .map_err(|e| format!("Failed to create table allowlist from model datasets: {e}").into())
 }
 
 #[must_use]
@@ -117,6 +114,7 @@ pub async fn get_tools_with_allowlist(
     opts: &SpiceToolsOptions,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
 ) -> Vec<Arc<dyn SpiceModelTool>> {
+    let configured_tool_names = configured_tool_names(&rt).await;
     let all_tools = rt.tools.read().await;
 
     let mut tools = vec![];
@@ -127,7 +125,13 @@ pub async fn get_tools_with_allowlist(
         extend_unique_tools(
             &mut tools,
             &mut seen_tool_names,
-            all_available_tools(Arc::clone(&rt), &all_tools, table_allowlist).await,
+            all_available_tools(
+                Arc::clone(&rt),
+                &all_tools,
+                &configured_tool_names,
+                table_allowlist,
+            )
+            .await,
         );
         return tools;
     }
@@ -138,7 +142,13 @@ pub async fn get_tools_with_allowlist(
                 Ok(group) if group.includes_all_available_tools() => extend_unique_tools(
                     &mut tools,
                     &mut seen_tool_names,
-                    all_available_tools(Arc::clone(&rt), &all_tools, table_allowlist.clone()).await,
+                    all_available_tools(
+                        Arc::clone(&rt),
+                        &all_tools,
+                        &configured_tool_names,
+                        table_allowlist.clone(),
+                    )
+                    .await,
                 ),
                 Ok(SpiceToolsOptions::Nsql) => {
                     for tool_name in SpiceToolsOptions::Nsql.tools_by_name() {
@@ -197,6 +207,7 @@ pub async fn get_tools_with_allowlist(
 async fn all_available_tools(
     rt: Arc<Runtime>,
     all_tools: &HashMap<String, Tooling>,
+    configured_tool_names: &HashSet<String>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
 ) -> Vec<Arc<dyn SpiceModelTool>> {
     let mut tools = vec![];
@@ -224,6 +235,10 @@ async fn all_available_tools(
             continue;
         }
 
+        if !configured_tool_names.contains(tool_name) {
+            continue;
+        }
+
         if let Tooling::Catalog(catalog) = tooling
             && default_catalog_names.contains(&catalog.name())
         {
@@ -234,6 +249,13 @@ async fn all_available_tools(
     }
 
     tools
+}
+
+async fn configured_tool_names(rt: &Arc<Runtime>) -> HashSet<String> {
+    rt.read_app()
+        .await
+        .map(|app| app.tools.iter().map(|tool| tool.name.clone()).collect())
+        .unwrap_or_default()
 }
 
 async fn get_tool_by_name(

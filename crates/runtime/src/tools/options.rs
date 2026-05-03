@@ -24,13 +24,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpiceToolsOptions {
-    /// Automatically choose between direct available tools and searchable discovery.
+    /// Automatically choose between direct configured tools and searchable discovery.
     Auto,
 
-    /// Use all available tools directly.
+    /// Use built-in and Spicepod-configured tools directly.
     All,
 
-    /// Use a searchable registry over all available tools.
+    /// Use a searchable registry over built-in and Spicepod-configured tools.
     #[serde(rename = "search_registry")]
     SearchRegistry,
 

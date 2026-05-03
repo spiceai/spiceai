@@ -107,7 +107,12 @@ pub async fn try_to_responses_model(
     let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
 
     // Create table allowlist from model's datasets if specified
-    let table_allowlist = create_table_allowlist(&component.datasets);
+    let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
+        LlmError::ModelParameterFailed {
+            model: component.name.clone(),
+            source: e,
+        }
+    })?;
 
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => {
