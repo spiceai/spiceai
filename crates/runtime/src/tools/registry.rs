@@ -269,7 +269,9 @@ struct ToolDocument {
 impl ToolDocument {
     fn new(tool: &Arc<dyn SpiceModelTool>) -> Self {
         let tool_id = tool.name().to_string();
-        let description = tool.description().map(|description| description.to_string());
+        let description = tool
+            .description()
+            .map(|description| description.to_string());
         let parameters = tool.parameters();
         let parameter_text = parameters
             .as_ref()
@@ -533,7 +535,9 @@ fn reciprocal_rank_fusion(
                 .entry(channel_match.document_index)
                 .or_insert_with(FusedMatch::default);
             fused_match.fused_score += 1.0 / (rank as f64 + RRF_K);
-            fused_match.matched_terms.extend(channel_match.matched_terms);
+            fused_match
+                .matched_terms
+                .extend(channel_match.matched_terms);
             fused_match.match_sources.push(MatchSource {
                 source,
                 rank,
@@ -614,9 +618,11 @@ fn normalize_text(text: impl AsRef<str>) -> String {
 }
 
 fn tokenize_to_vec(text: &str) -> Vec<String> {
-    unique_tokens(normalize_text(text)
-        .split_whitespace()
-        .filter_map(normalize_search_token))
+    unique_tokens(
+        normalize_text(text)
+            .split_whitespace()
+            .filter_map(normalize_search_token),
+    )
 }
 
 fn unique_tokens(tokens: impl IntoIterator<Item = String>) -> Vec<String> {
