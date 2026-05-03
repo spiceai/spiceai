@@ -527,10 +527,10 @@ fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str,
     .expect("Failed to update checkpoint");
 }
 
-/// Resolves the underlying base table name for an accelerated DuckDB table.
+/// Resolves the underlying base table name for an accelerated `DuckDB` table.
 ///
 /// After `InsertOp::Overwrite`, the accelerator exposes data through a view over an internal
-/// `__data_<table_name>_<timestamp>` table. Raw DuckDB DML must target the latest internal
+/// `__data_<table_name>_<timestamp>` table. Raw `DuckDB` DML must target the latest internal
 /// table; if no internal table exists, the definition name is used directly.
 fn resolve_acceleration_base_table(conn: &duckdb::Connection, table_name: &str) -> String {
     let prefix = format!("__data_{table_name}_");
