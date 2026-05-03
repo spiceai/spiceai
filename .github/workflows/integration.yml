@@ -105,6 +105,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/install-protoc
 
       - name: Set up sccache
