@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Arrow schema transformations for Vortex compatibility.
 
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Schema, TimeUnit};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_table_providers::UnsupportedTypeAction;
 
@@ -55,11 +55,9 @@ pub fn transform_schema_for_vortex(
                 "Converting Float16 field '{}' to Float32 for Vortex compatibility",
                 field.name()
             );
-            transformed_fields.push(std::sync::Arc::new(Field::new(
-                field.name(),
-                DataType::Float32,
-                field.is_nullable(),
-            )));
+            transformed_fields.push(std::sync::Arc::new(
+                field.as_ref().clone().with_data_type(DataType::Float32),
+            ));
             continue;
         }
 
@@ -71,11 +69,12 @@ pub fn transform_schema_for_vortex(
                 field.name(),
                 unit
             );
-            transformed_fields.push(std::sync::Arc::new(Field::new(
-                field.name(),
-                DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
-                field.is_nullable(),
-            )));
+            transformed_fields.push(std::sync::Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
+            ));
             continue;
         }
 
@@ -89,11 +88,9 @@ pub fn transform_schema_for_vortex(
                         data_type,
                         field.name()
                     );
-                    transformed_fields.push(std::sync::Arc::new(Field::new(
-                        field.name(),
-                        DataType::Utf8,
-                        field.is_nullable(),
-                    )));
+                    transformed_fields.push(std::sync::Arc::new(
+                        field.as_ref().clone().with_data_type(DataType::Utf8),
+                    ));
                 }
                 UnsupportedTypeAction::Error => {
                     unsupported_fields.push(format!("'{}' (type: {:?})", field.name(), data_type));
@@ -126,11 +123,16 @@ pub fn transform_schema_for_vortex(
         )));
     }
 
-    Ok(Schema::new(transformed_fields))
+    Ok(Schema::new_with_metadata(
+        transformed_fields,
+        schema.metadata().clone(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion_table_providers::UnsupportedTypeAction;
 
@@ -168,5 +170,57 @@ mod tests {
         )]);
         transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
             .expect_err("Duration should be unsupported");
+    }
+
+    #[test]
+    fn field_metadata_preserved_on_type_conversion() {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("logicalType".to_string(), "FIXED".to_string());
+        field_metadata.insert("scale".to_string(), "2".to_string());
+
+        let field = Field::new("x", DataType::Float16, false).with_metadata(field_metadata.clone());
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("source".to_string(), "snowflake".to_string());
+
+        let schema = Schema::new_with_metadata(vec![field], schema_metadata.clone());
+        let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect("should succeed");
+
+        assert_eq!(out.field(0).data_type(), &DataType::Float32);
+        assert_eq!(out.field(0).metadata(), &field_metadata);
+        assert_eq!(out.metadata(), &schema_metadata);
+    }
+
+    #[test]
+    fn field_metadata_preserved_on_timestamp_conversion() {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("logicalType".to_string(), "TIMESTAMP_NTZ".to_string());
+
+        let field = Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false)
+            .with_metadata(field_metadata.clone());
+        let schema = Schema::new(vec![field]);
+        let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect("should succeed");
+
+        assert_eq!(
+            out.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(out.field(0).metadata(), &field_metadata);
+    }
+
+    #[test]
+    fn field_metadata_preserved_on_unsupported_to_string() {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("originalType".to_string(), "interval".to_string());
+
+        let field = Field::new("d", DataType::Duration(TimeUnit::Second), false)
+            .with_metadata(field_metadata.clone());
+        let schema = Schema::new(vec![field]);
+        let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::String)
+            .expect("should succeed");
+
+        assert_eq!(out.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(out.field(0).metadata(), &field_metadata);
     }
 }

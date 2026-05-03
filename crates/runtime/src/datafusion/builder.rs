@@ -67,7 +67,7 @@ use datafusion_optimizer_rules::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
-        EmptyHashJoinExecPhysicalOptimization,
+        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
     },
 };
@@ -344,6 +344,7 @@ impl DataFusionBuilder {
         }
 
         state = state
+            .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
                 Arc::new(Box::new(track_bytes_processed)),
@@ -527,6 +528,7 @@ impl DataFusionBuilder {
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
+            on_demand_table_loader: RwLock::new(None),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
@@ -658,33 +660,20 @@ pub(crate) fn runtime_env(
 }
 
 pub(crate) fn default_extension_planners(
-    executor_registry: Option<Arc<ExecutorRegistry>>,
-    io_runtime: tokio::runtime::Handle,
+    _executor_registry: Option<Arc<ExecutorRegistry>>,
+    _io_runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
-    let mut planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
+    let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
         // One stateless DDL planner handles all DdlExtensionNodes from any handler.
         Arc::new(datafusion_ddl::DdlExtensionPlanner),
+        // One stateless DML planner handles all DmlExtensionNodes from any handler.
+        Arc::new(datafusion_dml::DmlExtensionPlanner),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ];
-    // Cayenne DML (DELETE, UPDATE, INSERT, MERGE forwarding): either single or distributed.
-    #[cfg(not(windows))]
-    if let Some(registry) = executor_registry {
-        planners.push(Arc::new(
-            super::cayenne_ddl::DistributedCayenneDmlExtensionPlanner::new(
-                registry,
-                Some(io_runtime),
-            ),
-        ));
-    } else {
-        planners.push(Arc::new(cayenne::ddl::CayenneDmlExtensionPlanner::new(
-            super::SPICE_DEFAULT_CATALOG,
-            super::SPICE_DEFAULT_SCHEMA,
-        )));
-    };
     planners
 }
 

@@ -150,7 +150,9 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     }
 }
 
-static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(|| {
+/// Returns the full list of Spice-specific scalar function names denied for
+/// federation by default.
+fn denied_spice_function_names() -> Vec<String> {
     let builtin = [
         "rand",
         BUCKET_SCALAR_UDF_NAME,
@@ -170,23 +172,45 @@ static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(
         RERANK_UDTF_NAME,
     ];
 
+    builtin
+        .iter()
+        .map(ToString::to_string)
+        .chain(json_functions())
+        .collect()
+}
+
+static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(|| {
     FunctionSupport::new(
-        Some(FunctionRestriction::Deny(
-            builtin
-                .iter()
-                .map(ToString::to_string)
-                .chain(json_functions())
-                .collect::<Vec<_>>(),
-        )),
+        Some(FunctionRestriction::Deny(denied_spice_function_names())),
         None,
         None,
     )
+});
+
+/// DuckDB-specific deny list — same as the default but allows `cosine_distance`
+/// (`DuckDB` natively supports it via `array_cosine_distance` and the dialect
+/// already translates the call).
+static DENY_SPICE_FUNCTIONS_DUCKDB: LazyLock<FunctionSupport> = LazyLock::new(|| {
+    let names: Vec<String> = denied_spice_function_names()
+        .into_iter()
+        .filter(|n| n != COSINE_DISTANCE_UDF_NAME)
+        .collect();
+    FunctionSupport::new(Some(FunctionRestriction::Deny(names)), None, None)
 });
 
 /// Return the cached [`FunctionSupport`] that denies Spice-specific functions for federation.
 #[must_use]
 pub fn deny_spice_specific_functions() -> &'static FunctionSupport {
     &DENY_SPICE_SPECIFIC_FUNCTIONS
+}
+
+/// Return the cached [`FunctionSupport`] for `DuckDB` accelerators.
+///
+/// Identical to [`deny_spice_specific_functions`] except `cosine_distance` is
+/// allowed (`DuckDB` translates it to `array_cosine_distance`).
+#[must_use]
+pub fn deny_spice_functions_for_duckdb() -> &'static FunctionSupport {
+    &DENY_SPICE_FUNCTIONS_DUCKDB
 }
 
 fn json_functions() -> Vec<String> {

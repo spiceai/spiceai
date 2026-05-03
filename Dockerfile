@@ -1,6 +1,6 @@
 #syntax=docker/dockerfile:1.2
 ARG RUST_VERSION=1.94.1
-FROM rust:${RUST_VERSION}-slim-bookworm as build
+FROM rust:${RUST_VERSION}-slim-trixie as build
 
 # cache mounts below may already exist and owned by root
 USER root
@@ -40,7 +40,7 @@ RUN \
     fi && \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
-FROM debian:bookworm-slim as sandbox-setup
+FROM debian:trixie-slim as sandbox-setup
 
 ARG CARGO_FEATURES
 

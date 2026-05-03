@@ -41,8 +41,10 @@ use crate::generation::text_search::{
 use crate::generation::util::get_primary_keys;
 use crate::index::SearchIndex;
 
-/// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
-pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
+/// The heap budget for the [`tantivy::IndexWriter`] (150 MiB).
+/// A larger budget reduces the number of segment flushes and subsequent merges,
+/// significantly improving bulk-indexing throughput.
+pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
 #[derive(Clone)]
@@ -51,8 +53,7 @@ pub struct FullTextDatabaseIndex {
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
 
-    // `index` access should only be needed for write path. Query/reads should use [`self::reader`].
-    pub index: Arc<Mutex<tantivy::Index>>,
+    pub writer: Arc<Mutex<tantivy::IndexWriter>>,
     pub reader: tantivy::IndexReader,
 }
 
@@ -124,11 +125,14 @@ impl FullTextDatabaseIndex {
             tantivy::Index::create_in_ram(tantivy_schema)
         };
         let reader = index.reader().context(TextSearchIndexingSnafu)?;
+        let writer = index
+            .writer(MEMORY_BUDGET_FOR_INDEX_WRITER)
+            .context(IndexCreationSnafu)?;
 
         Ok(Self {
             base_table: inner,
             search_fields,
-            index: Arc::new(Mutex::new(index)),
+            writer: Arc::new(Mutex::new(writer)),
             primary_key: pks,
             reader,
         })
@@ -242,22 +246,29 @@ impl FullTextDatabaseIndex {
         let docs = parse_json_array(&index_schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
 
-        let index_writable = self.index.lock().await;
-        let mut index_writer: tantivy::IndexWriter = index_writable
-            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
-            .context(IndexCreationSnafu)?;
+        let mut index_writer = self.writer.lock().await;
         // Deletion.
         for t in terms_to_delete {
             index_writer.delete_term(t);
         }
-        // Insertion.
-        for doc in docs {
-            index_writer.add_document(doc).context(IndexCreationSnafu)?;
+        // Insertion and commit. On failure, rollback to discard staged operations
+        // so they don't leak into the next batch's commit.
+        let commit_result = (|| {
+            for doc in docs {
+                index_writer.add_document(doc).context(IndexCreationSnafu)?;
+            }
+            index_writer
+                .commit()
+                .context(FailedToInsertDataIntoIndexSnafu)
+        })();
+        if let Err(e) = &commit_result {
+            tracing::warn!("Rolling back index writer after failed commit: {e}");
+            if let Err(rb_err) = index_writer.rollback() {
+                tracing::error!("Failed to rollback index writer: {rb_err}");
+            }
         }
-        index_writer
-            .commit()
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-        drop(index_writable);
+        drop(index_writer);
+        commit_result?;
 
         self.reader.reload().boxed().context(InvalidIndexingSnafu {
             context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
@@ -282,7 +293,7 @@ impl FullTextDatabaseIndex {
         Self {
             search_fields: self.search_fields.clone(),
             primary_key: self.primary_key.clone(),
-            index: Arc::clone(&self.index),
+            writer: Arc::clone(&self.writer),
             base_table,
             reader: self.reader.clone(),
         }
@@ -521,7 +532,6 @@ mod tests {
         )
     }
 
-    //
     async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {
         let rb: Vec<RecordBatch> = idx
             .search(query.into(), &[], 1000)
@@ -550,7 +560,7 @@ mod tests {
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
-        // Initial table
+        // Use distinct content so each document is independently verifiable.
         index
             .compute_index(vec![
                 record_batch!(
@@ -558,7 +568,11 @@ mod tests {
                     (
                         "content",
                         Utf8,
-                        ["test content 1", "test content 2", "test content 3"]
+                        [
+                            "apple banana cherry",
+                            "dog elephant frog",
+                            "guitar harmonica instrument"
+                        ]
                     )
                 )
                 .expect("Failed to create test batch"),
@@ -566,30 +580,37 @@ mod tests {
             .await
             .expect("failed to compute_index");
 
-        // Initial table as expected
+        // All three documents are indexed
         {
             let search_index = index
                 .full_text_search_field_index("content")
                 .expect("Failed to create FullTextSearchFieldIndex");
 
-            insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
-            +---------------------+----------------+----------------+----+
-            | _score              | _value         | content        | id |
-            +---------------------+----------------+----------------+----+
-            | 0.26706287264823914 | test content 1 | test content 1 | 1  |
-            | 0.26706287264823914 | test content 2 | test content 2 | 2  |
-            | 0.26706287264823914 | test content 3 | test content 3 | 3  |
-            +---------------------+----------------+----------------+----+
-            ");
+            insta::assert_snapshot!(
+                "initial_apple",
+                search_and_format(&search_index, "apple").await
+            );
+            insta::assert_snapshot!(
+                "initial_elephant",
+                search_and_format(&search_index, "elephant").await
+            );
+            insta::assert_snapshot!(
+                "initial_guitar",
+                search_and_format(&search_index, "guitar").await
+            );
         }
 
-        // With an update
+        // Overwrite id=1 and id=3 with new content
         {
             index
                 .compute_index(vec![
                     record_batch!(
-                        ("id", Int32, [1, 3]), // 1 & 3 are existing keys.
-                        ("content", Utf8, ["new content 1", "new content 3"])
+                        ("id", Int32, [1, 3]),
+                        (
+                            "content",
+                            Utf8,
+                            ["mango nectarine orange", "piano quartet rhythm"]
+                        )
                     )
                     .expect("Failed to create test record_batch"),
                 ])
@@ -600,24 +621,31 @@ mod tests {
                 .full_text_search_field_index("content")
                 .expect("Failed to create FullTextSearchFieldIndex");
 
-            // First, ensure old data is no longer existent.
-            insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
-            +--------------------+----------------+----------------+----+
-            | _score             | _value         | content        | id |
-            +--------------------+----------------+----------------+----+
-            | 0.5389965176582336 | test content 2 | test content 2 | 2  |
-            +--------------------+----------------+----------------+----+
-            ");
+            // Old content for id=1 and id=3 should be gone (expects empty results).
+            insta::assert_snapshot!(
+                "after_update_apple",
+                search_and_format(&search_index, "apple").await
+            );
+            insta::assert_snapshot!(
+                "after_update_guitar",
+                search_and_format(&search_index, "guitar").await
+            );
 
-            // Second, ensure new data is searchable.
-            insta::assert_snapshot!(search_and_format(&search_index, "new").await, @r"
-            +--------------------+---------------+---------------+----+
-            | _score             | _value        | content       | id |
-            +--------------------+---------------+---------------+----+
-            | 0.8754687905311584 | new content 1 | new content 1 | 1  |
-            | 0.8754687905311584 | new content 3 | new content 3 | 3  |
-            +--------------------+---------------+---------------+----+
-            ");
+            // id=2 unchanged.
+            insta::assert_snapshot!(
+                "after_update_elephant",
+                search_and_format(&search_index, "elephant").await
+            );
+
+            // New content is searchable.
+            insta::assert_snapshot!(
+                "after_update_mango",
+                search_and_format(&search_index, "mango").await
+            );
+            insta::assert_snapshot!(
+                "after_update_piano",
+                search_and_format(&search_index, "piano").await
+            );
         }
     }
 
@@ -629,7 +657,11 @@ mod tests {
             (
                 "content",
                 Utf8,
-                ["test content 1", "test content 2", "test content 3"]
+                [
+                    "apple banana cherry",
+                    "dog elephant frog",
+                    "guitar harmonica instrument"
+                ]
             )
         )
         .expect("Failed to create test batch");
@@ -652,31 +684,38 @@ mod tests {
             .await
             .expect("failed to compute_index");
 
-        // Initial table as expected
+        // All three documents are indexed
         {
             let search_index = index
                 .full_text_search_field_index("content")
                 .expect("Failed to create FullTextSearchFieldIndex");
 
-            insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
-            +---------------------+----------------+----------------+-----+-----+
-            | _score              | _value         | content        | id1 | id2 |
-            +---------------------+----------------+----------------+-----+-----+
-            | 0.26706287264823914 | test content 1 | test content 1 | a   | 1   |
-            | 0.26706287264823914 | test content 2 | test content 2 | a   | 2   |
-            | 0.26706287264823914 | test content 3 | test content 3 | b   | 1   |
-            +---------------------+----------------+----------------+-----+-----+
-            ");
+            insta::assert_snapshot!(
+                "cpk_initial_apple",
+                search_and_format(&search_index, "apple").await
+            );
+            insta::assert_snapshot!(
+                "cpk_initial_elephant",
+                search_and_format(&search_index, "elephant").await
+            );
+            insta::assert_snapshot!(
+                "cpk_initial_guitar",
+                search_and_format(&search_index, "guitar").await
+            );
         }
 
-        // With an update
+        // Overwrite (a,1) and (b,1) with new content
         {
             index
                 .compute_index(vec![
                     record_batch!(
                         ("id1", Utf8, ["a", "b"]),
                         ("id2", Int32, [1, 1]),
-                        ("content", Utf8, ["new content 1", "new content 3"])
+                        (
+                            "content",
+                            Utf8,
+                            ["mango nectarine orange", "piano quartet rhythm"]
+                        )
                     )
                     .expect("Failed to create test record_batch"),
                 ])
@@ -687,24 +726,31 @@ mod tests {
                 .full_text_search_field_index("content")
                 .expect("Failed to create FullTextSearchFieldIndex");
 
-            // First, ensure old data is no longer existent.
-            insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
-            +--------------------+----------------+----------------+-----+-----+
-            | _score             | _value         | content        | id1 | id2 |
-            +--------------------+----------------+----------------+-----+-----+
-            | 0.5389965176582336 | test content 2 | test content 2 | a   | 2   |
-            +--------------------+----------------+----------------+-----+-----+
-            ");
+            // Old content for (a,1) and (b,1) should be gone (expects empty results).
+            insta::assert_snapshot!(
+                "cpk_after_update_apple",
+                search_and_format(&search_index, "apple").await
+            );
+            insta::assert_snapshot!(
+                "cpk_after_update_guitar",
+                search_and_format(&search_index, "guitar").await
+            );
 
-            // Second, ensure new data is searchable.
-            insta::assert_snapshot!(search_and_format(&search_index, "new").await, @r"
-            +--------------------+---------------+---------------+-----+-----+
-            | _score             | _value        | content       | id1 | id2 |
-            +--------------------+---------------+---------------+-----+-----+
-            | 0.8754687905311584 | new content 1 | new content 1 | a   | 1   |
-            | 0.8754687905311584 | new content 3 | new content 3 | b   | 1   |
-            +--------------------+---------------+---------------+-----+-----+
-            ");
+            // (a,2) unchanged.
+            insta::assert_snapshot!(
+                "cpk_after_update_elephant",
+                search_and_format(&search_index, "elephant").await
+            );
+
+            // New content is searchable.
+            insta::assert_snapshot!(
+                "cpk_after_update_mango",
+                search_and_format(&search_index, "mango").await
+            );
+            insta::assert_snapshot!(
+                "cpk_after_update_piano",
+                search_and_format(&search_index, "piano").await
+            );
         }
     }
 

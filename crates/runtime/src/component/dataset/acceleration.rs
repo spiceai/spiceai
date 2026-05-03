@@ -307,6 +307,8 @@ pub struct Acceleration {
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
+    pub write_mode: spicepod_acceleration::WriteMode,
+
     pub disable_federation: bool,
 
     pub partition_by: Vec<PartitionedBy>,
@@ -522,6 +524,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             indexes,
             primary_key,
             on_conflict,
+            write_mode: acceleration.write_mode,
             partition_by: acceleration.partition_by,
             snapshot_behavior: SnapshotBehavior::disabled(),
             snapshots_trigger: acceleration.snapshots_trigger,
@@ -564,6 +567,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            write_mode: spicepod_acceleration::WriteMode::default(),
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],

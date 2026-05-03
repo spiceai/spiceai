@@ -218,9 +218,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: default
@@ -244,6 +241,12 @@ jobs:
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             GITHUB_REPOSITORY=${{ github.repository }}
+        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
+
+      - name: Validate AMD64 image
+        run: |
+          docker load -i /tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
+          docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64 --version
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Upload AMD64 artifacts
@@ -287,9 +290,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: default
@@ -315,6 +315,12 @@ jobs:
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
+      - name: Validate ARM64 image
+        run: |
+          docker load -i /tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
+          docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64 --version
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
+
       - name: Upload ARM64 artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -337,9 +343,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Configure CUDA build
@@ -363,6 +366,12 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             CUDA_COMPUTE_CAP=${{ env.CUDA_COMPUTE_CAP }}
             GITHUB_REPOSITORY=${{ github.repository }}
+        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
+
+      - name: Validate CUDA image
+        run: |
+          docker load -i /tmp/images-amd64-cuda.tar
+          docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64 --version
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Upload CUDA artifacts

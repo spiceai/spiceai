@@ -289,11 +289,13 @@ pub(crate) async fn submit(
     Extension(rt): Extension<Arc<Runtime>>,
     Json(request): Json<SubmitQueryRequest>,
 ) -> Response {
+    let read_only = super::current_principal_requires_read_only().await;
+
     let executor = match get_executor(&rt) {
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let result = executor.submit(request).await;
+    let result = executor.submit(request, read_only).await;
 
     match result {
         Ok(state) => {
@@ -617,6 +619,10 @@ pub(crate) async fn cancel(
     Extension(rt): Extension<Arc<Runtime>>,
     Path(query_id): Path<String>,
 ) -> Response {
+    if let Some(response) = super::require_write_access().await {
+        return response;
+    }
+
     let executor = match get_executor(&rt) {
         Ok(e) => e,
         Err(resp) => return resp,
