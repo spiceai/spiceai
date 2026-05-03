@@ -349,9 +349,8 @@ impl CatalogProvider for DuckLakeCatalogProvider {
 
         let escaped_catalog_name = catalog_name.replace('"', "\"\"");
         let escaped_schema_name = schema_name.replace('"', "\"\"");
-        let mut sql = format!(
-            r#"DROP SCHEMA IF EXISTS \"{escaped_catalog_name}\".\"{escaped_schema_name}\""#
-        );
+        let mut sql =
+            format!(r#"DROP SCHEMA IF EXISTS "{escaped_catalog_name}"."{escaped_schema_name}""#);
         if cascade {
             sql.push_str(" CASCADE");
         }

@@ -59,6 +59,7 @@ on:
           - 'mysql-catalog'
           - 'mssql-catalog'
           - 'oracle-catalog'
+          - 'ducklake-catalog'
           - 'turso'
           - 'bigquery'
       ready_wait:
@@ -244,9 +245,9 @@ jobs:
       - name: Bootstrap DuckLake TPCH SF1 catalog
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
-          pip install --upgrade 'duckdb==1.4.4' minio
+          python -m pip install --upgrade 'duckdb==1.4.4' minio
 
-          python3 <<'PY'
+          python <<'PY'
           import duckdb
           from minio import Minio
 
