@@ -128,11 +128,11 @@ fn tool_registry_tools(
         embedding_model,
     )) as Arc<dyn SpiceModelTool>;
 
-    tool_registry_tools_with_search_tool(registry, search_tool)
+    tool_registry_tools_with_search_tool(&registry, search_tool)
 }
 
 fn tool_registry_tools_with_search_tool(
-    registry: Arc<Vec<Arc<dyn SpiceModelTool>>>,
+    registry: &Arc<Vec<Arc<dyn SpiceModelTool>>>,
     search_tool: Arc<dyn SpiceModelTool>,
 ) -> Vec<Arc<dyn SpiceModelTool>> {
     let direct_tools = registry
@@ -142,7 +142,7 @@ fn tool_registry_tools_with_search_tool(
         .collect::<Vec<_>>();
     let mut advertised_tools = vec![
         search_tool,
-        Arc::new(ToolRegistryInvokeTool::new(Arc::clone(&registry))) as Arc<dyn SpiceModelTool>,
+        Arc::new(ToolRegistryInvokeTool::new(Arc::clone(registry))) as Arc<dyn SpiceModelTool>,
     ];
     advertised_tools.extend(direct_tools);
     advertised_tools
@@ -164,7 +164,7 @@ pub(crate) async fn tool_registry_prompt_tools(
     )
     .await as Arc<dyn SpiceModelTool>;
 
-    Ok(tool_registry_tools_with_search_tool(tools, search_tool))
+    Ok(tool_registry_tools_with_search_tool(&tools, search_tool))
 }
 
 pub(crate) async fn get_tool_registry_tool(
@@ -237,25 +237,18 @@ async fn cached_tool_registry_search_tool(
         tools_hash: tool_registry_tools_hash(&tools),
     };
 
-    if let Some(tool) = TOOL_REGISTRY_SEARCH_TOOL_CACHE
-        .read()
-        .await
-        .get(&key)
-        .cloned()
-    {
-        return tool;
+    if let Some(tool) = TOOL_REGISTRY_SEARCH_TOOL_CACHE.read().await.get(&key) {
+        return Arc::clone(tool);
     }
 
     let mut cache = TOOL_REGISTRY_SEARCH_TOOL_CACHE.write().await;
-    cache
-        .entry(key)
-        .or_insert_with(|| {
-            Arc::new(ToolRegistrySearchTool::new(
-                tools.as_slice(),
-                embedding_model,
-            ))
-        })
-        .clone()
+    let tool = cache.entry(key).or_insert_with(|| {
+        Arc::new(ToolRegistrySearchTool::new(
+            tools.as_slice(),
+            embedding_model,
+        ))
+    });
+    Arc::clone(tool)
 }
 
 fn tool_registry_tools_hash(tools: &[Arc<dyn SpiceModelTool>]) -> u64 {
