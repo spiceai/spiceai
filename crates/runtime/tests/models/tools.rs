@@ -248,6 +248,52 @@ params:
         Ok(())
     }
 
+    /// Test that setting `allowed_hosts: ["*"]` disables host checking entirely, allowing
+    /// any `Host` header value — consistent with how `runtime.cors.allowed_origins: ["*"]` works.
+    #[tokio::test]
+    async fn test_mcp_wildcard_allowed_hosts_accepts_any() -> Result<(), anyhow::Error> {
+        let mcp_config = McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        };
+        let http_server_url = start_spiced_with_mcp_config(mcp_config).await?;
+
+        let client = reqwest::Client::new();
+        let protocol_version = rmcp::model::ProtocolVersion::V_2025_03_26
+            .as_str()
+            .to_string();
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "spice-integration-test",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        });
+
+        // Send with an arbitrary host that would normally be rejected
+        let resp = client
+            .post(format!("{http_server_url}/v1/mcp"))
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .header(HOST, "arbitrary.host.example.com")
+            .json(&init_body)
+            .send()
+            .await?;
+
+        assert!(
+            resp.status().is_success(),
+            "Wildcard allowed_hosts should accept any Host header, got: {}",
+            resp.status()
+        );
+
+        Ok(())
+    }
+
     /// Starts a spiced runtime with the given [`McpConfig`] and returns its HTTP base URL.
     async fn start_spiced_with_mcp_config(mcp_config: McpConfig) -> anyhow::Result<String> {
         use spicepod::component::runtime::Runtime as SpicepodRuntime;

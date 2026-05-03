@@ -382,7 +382,8 @@ pub struct McpConfig {
     /// Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.
     /// Used to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),
     /// host-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).
-    /// Defaults to `["localhost", "127.0.0.1", "::1"]`.
+    /// Set to `["*"]` to disable host checking entirely.
+    /// Defaults to rmcp defaults (`["localhost", "127.0.0.1", "::1"]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<String>>,
 }

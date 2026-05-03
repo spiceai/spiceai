@@ -509,13 +509,16 @@ async fn track_metrics(
 
 /// Build the MCP [`StreamableHttpServerConfig`] from the optional `runtime.mcp` config.
 ///
-/// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None`, the default
-///   list (`localhost`, `127.0.0.1`, `::1`) is used.
-/// - If `runtime.mcp.allowed_hosts` is set, those values replace the default list entirely.
+/// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None`, rmcp defaults
+///   apply (`localhost`, `127.0.0.1`, `::1`).
+/// - If `runtime.mcp.allowed_hosts` contains `"*"`, host checking is disabled entirely
+///   (matches how `runtime.cors.allowed_origins: ["*"]` works).
+/// - Otherwise the provided list replaces the defaults entirely.
 #[cfg(feature = "mcp")]
 fn mcp_server_config(mcp_config: Option<&McpConfig>) -> StreamableHttpServerConfig {
     let config = StreamableHttpServerConfig::default();
     match mcp_config.and_then(|c| c.allowed_hosts.as_deref()) {
+        Some(hosts) if hosts.iter().any(|h| h == "*") => config.disable_allowed_hosts(),
         Some(hosts) => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
         None => config,
     }
