@@ -21,9 +21,7 @@ use crate::model::tool_use_responses::OpenAIResponsesTools;
 use crate::model::wrapper::responses::ResponsesWrapper;
 use crate::parameters::Parameters;
 use crate::tools::options::SpiceToolsOptions;
-use crate::tools::registry::{
-    TOOL_EMBEDDING_MODEL_PARAM, resolve_tool_registry_embedding_model, tool_registry_tools,
-};
+use crate::tools::registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools};
 use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
 use llms::openai::{DEFAULT_LLM_MODEL, UsageTier};
@@ -114,15 +112,9 @@ pub async fn try_to_responses_model(
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => {
             let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
-            let tools = if opts.use_registry_tools() {
-                let embedding_model =
-                    resolve_tool_registry_embedding_model(Arc::clone(&rt), tool_embedding_model)
-                        .await
-                        .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-                tool_registry_tools(tools, embedding_model)
-            } else {
-                tools
-            };
+            let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
+                .await
+                .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
             Arc::new(ToolUsingResponses::new(
                 model,
                 openai_responses_tools.unwrap_or_default(),

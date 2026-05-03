@@ -31,7 +31,10 @@ use tokio::sync::OnceCell;
 use tools::SpiceModelTool;
 
 use crate::{
-    Runtime, embeddings::task::TaskEmbed, model::try_to_embedding, tools::utils::parameters,
+    Runtime,
+    embeddings::task::TaskEmbed,
+    model::try_to_embedding,
+    tools::{options::SpiceToolsOptions, utils::parameters},
 };
 
 const TOOL_SEARCH_NAME: &str = "tool_search";
@@ -43,9 +46,47 @@ const DEFAULT_TOOL_REGISTRY_EMBEDDING_FROM: &str =
     "huggingface:sentence-transformers/all-MiniLM-L6-v2";
 const DEFAULT_SEARCH_LIMIT: usize = 5;
 const MAX_SEARCH_LIMIT: usize = 20;
+const AUTO_SEARCH_TOOL_THRESHOLD: usize = 20;
+
+pub(crate) async fn prepare_model_tools(
+    rt: Arc<Runtime>,
+    opts: &SpiceToolsOptions,
+    tools: Vec<Arc<dyn SpiceModelTool>>,
+    embedding_model_name: Option<&str>,
+) -> Result<Vec<Arc<dyn SpiceModelTool>>, Box<dyn std::error::Error + Send + Sync>> {
+    match opts {
+        SpiceToolsOptions::SearchRegistry => {
+            let embedding_model =
+                resolve_tool_registry_embedding_model(Arc::clone(&rt), embedding_model_name)
+                    .await?;
+            Ok(tool_registry_tools(tools, embedding_model))
+        }
+        SpiceToolsOptions::Auto if should_auto_search(tools.len()) => {
+            match resolve_tool_registry_embedding_model(Arc::clone(&rt), embedding_model_name).await
+            {
+                Ok(embedding_model) => Ok(tool_registry_tools(tools, embedding_model)),
+                Err(error) => {
+                    tracing::warn!(
+                        "Unable to use searchable tool registry for tools: auto: {}. Falling back to direct tool definitions.",
+                        error
+                    );
+                    Ok(tools)
+                }
+            }
+        }
+        SpiceToolsOptions::Auto
+        | SpiceToolsOptions::Nsql
+        | SpiceToolsOptions::Disabled
+        | SpiceToolsOptions::Specific(_) => Ok(tools),
+    }
+}
+
+fn should_auto_search(tool_count: usize) -> bool {
+    tool_count > AUTO_SEARCH_TOOL_THRESHOLD
+}
 
 #[must_use]
-pub(crate) fn tool_registry_tools(
+fn tool_registry_tools(
     tools: Vec<Arc<dyn SpiceModelTool>>,
     embedding_model: Arc<dyn Embed>,
 ) -> Vec<Arc<dyn SpiceModelTool>> {
@@ -999,6 +1040,12 @@ mod tests {
 
     fn mock_embed() -> Arc<dyn Embed> {
         Arc::new(MockEmbed)
+    }
+
+    #[test]
+    fn auto_search_threshold_only_triggers_for_large_tool_sets() {
+        assert!(!should_auto_search(AUTO_SEARCH_TOOL_THRESHOLD));
+        assert!(should_auto_search(AUTO_SEARCH_TOOL_THRESHOLD + 1));
     }
 
     #[tokio::test]

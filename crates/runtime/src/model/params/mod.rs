@@ -57,9 +57,9 @@ pub const PARAM_WITH_DEPRE_LEN: usize = 48;
 pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to use all available tools directly, or 'search' to use searchable tool discovery."),
+        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, or 'search_registry' to require searchable tool discovery."),
     ParameterSpec::runtime("tool_embedding_model")
-        .description("Embedding model name to use for tools: search registry lookup. Defaults to sentence-transformers/all-MiniLM-L6-v2 when unset."),
+        .description("Embedding model name to use for searchable tool discovery. tools: search_registry requires an embedding model and defaults to sentence-transformers/all-MiniLM-L6-v2 when unset; tools: auto falls back to direct tools if embeddings are unavailable."),
     ParameterSpec::runtime("system_prompt")
         .description("An additional system prompt used for all chat completions to this model."),
     ParameterSpec::runtime("parameterized_prompt"),
@@ -116,9 +116,9 @@ pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
 pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to use all available tools directly, or 'search' to use searchable tool discovery."),
+        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, or 'search_registry' to require searchable tool discovery."),
     ParameterSpec::runtime("tool_embedding_model")
-        .description("Embedding model name to use for tools: search registry lookup. Defaults to sentence-transformers/all-MiniLM-L6-v2 when unset."),
+        .description("Embedding model name to use for searchable tool discovery. tools: search_registry requires an embedding model and defaults to sentence-transformers/all-MiniLM-L6-v2 when unset; tools: auto falls back to direct tools if embeddings are unavailable."),
     ParameterSpec::runtime("system_prompt")
         .description("An additional system prompt used for all chat completions to this model."),
     ParameterSpec::runtime("parameterized_prompt"),

@@ -43,9 +43,7 @@ use crate::{
     parameters::Parameters,
     tools::{
         options::SpiceToolsOptions,
-        registry::{
-            TOOL_EMBEDDING_MODEL_PARAM, resolve_tool_registry_embedding_model, tool_registry_tools,
-        },
+        registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools},
         utils::{create_table_allowlist, get_tools_with_allowlist},
     },
 };
@@ -121,15 +119,9 @@ pub async fn try_to_chat_model(
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => {
             let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
-            let tools = if opts.use_registry_tools() {
-                let embedding_model =
-                    resolve_tool_registry_embedding_model(Arc::clone(&rt), tool_embedding_model)
-                        .await
-                        .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-                tool_registry_tools(tools, embedding_model)
-            } else {
-                tools
-            };
+            let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
+                .await
+                .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
             Arc::new(ToolUsingChat::new(
                 model,
                 Arc::clone(&rt),
