@@ -346,7 +346,6 @@ impl RefreshTask {
     }
 }
 
-
 pub(crate) fn get_primary_key_value(
     data: &RecordBatch,
     key: &str,
@@ -972,5 +971,4 @@ mod tests {
         assert_eq!(result[2].0, ChangeOperationType::Upsert);
         assert_eq!(result[2].1.len(), 2);
     }
-
 }
