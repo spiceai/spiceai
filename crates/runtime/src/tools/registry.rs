@@ -16,8 +16,9 @@ limitations under the License.
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
-    sync::Arc,
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
+    sync::{Arc, LazyLock},
 };
 
 use ::search::aggregation::reciprocal_rank::{DEFAULT_RRF_K, reciprocal_rank_fusion_scores};
@@ -32,7 +33,6 @@ use tools::SpiceModelTool;
 
 use crate::{
     Runtime,
-    model::encode_tool_name,
     tools::{
         options::SpiceToolsOptions,
         utils::{get_tools, parameters},
@@ -46,6 +46,17 @@ pub(crate) const TOOL_EMBEDDING_MODEL_PARAM: &str = "tool_embedding_model";
 const DEFAULT_SEARCH_LIMIT: usize = 5;
 const MAX_SEARCH_LIMIT: usize = 20;
 const AUTO_SEARCH_TOOL_THRESHOLD: usize = 20;
+
+static TOOL_REGISTRY_SEARCH_TOOL_CACHE: LazyLock<
+    tokio::sync::RwLock<HashMap<ToolRegistrySearchCacheKey, Arc<ToolRegistrySearchTool>>>,
+> = LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ToolRegistrySearchCacheKey {
+    runtime_id: usize,
+    embedding_model_name: String,
+    tools_hash: u64,
+}
 
 #[derive(Debug, Snafu)]
 enum ToolRegistryError {
@@ -111,18 +122,27 @@ fn tool_registry_tools(
         return Vec::new();
     }
 
-    let direct_tools = tools
+    let registry = Arc::new(tools);
+    let search_tool = Arc::new(ToolRegistrySearchTool::new(
+        registry.as_slice(),
+        embedding_model,
+    )) as Arc<dyn SpiceModelTool>;
+
+    tool_registry_tools_with_search_tool(registry, search_tool)
+}
+
+fn tool_registry_tools_with_search_tool(
+    registry: Arc<Vec<Arc<dyn SpiceModelTool>>>,
+    search_tool: Arc<dyn SpiceModelTool>,
+) -> Vec<Arc<dyn SpiceModelTool>> {
+    let direct_tools = registry
         .iter()
         .filter(|tool| tool.name() == LIST_DATASETS_TOOL_NAME)
         .cloned()
         .collect::<Vec<_>>();
-    let registry = Arc::new(tools);
     let mut advertised_tools = vec![
-        Arc::new(ToolRegistrySearchTool::new(
-            registry.as_slice(),
-            embedding_model,
-        )) as Arc<dyn SpiceModelTool>,
-        Arc::new(ToolRegistryInvokeTool::new(registry)) as Arc<dyn SpiceModelTool>,
+        search_tool,
+        Arc::new(ToolRegistryInvokeTool::new(Arc::clone(&registry))) as Arc<dyn SpiceModelTool>,
     ];
     advertised_tools.extend(direct_tools);
     advertised_tools
@@ -132,10 +152,19 @@ pub(crate) async fn tool_registry_prompt_tools(
     rt: Arc<Runtime>,
     embedding_model_name: Option<&str>,
 ) -> Result<Vec<Arc<dyn SpiceModelTool>>, Box<dyn std::error::Error + Send + Sync>> {
-    let tools = get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await;
-    let embedding_model = resolve_tool_registry_embedding_model(rt, embedding_model_name).await?;
+    let tools = Arc::new(get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await);
+    let (resolved_embedding_model_name, embedding_model) =
+        resolve_tool_registry_embedding_model_with_name(Arc::clone(&rt), embedding_model_name)
+            .await?;
+    let search_tool = cached_tool_registry_search_tool(
+        &rt,
+        Arc::clone(&tools),
+        &resolved_embedding_model_name,
+        embedding_model,
+    )
+    .await as Arc<dyn SpiceModelTool>;
 
-    Ok(tool_registry_tools(tools, embedding_model))
+    Ok(tool_registry_tools_with_search_tool(tools, search_tool))
 }
 
 pub(crate) async fn get_tool_registry_tool(
@@ -145,14 +174,22 @@ pub(crate) async fn get_tool_registry_tool(
 ) -> Result<Option<Arc<dyn SpiceModelTool>>, Box<dyn std::error::Error + Send + Sync>> {
     match tool_name {
         TOOL_SEARCH_NAME => {
-            let tools = get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await;
-            let registry = Arc::new(tools);
-            let embedding_model =
-                resolve_tool_registry_embedding_model(rt, embedding_model_name).await?;
-            Ok(Some(Arc::new(ToolRegistrySearchTool::new(
-                registry.as_slice(),
+            let tools =
+                Arc::new(get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await);
+            let (resolved_embedding_model_name, embedding_model) =
+                resolve_tool_registry_embedding_model_with_name(
+                    Arc::clone(&rt),
+                    embedding_model_name,
+                )
+                .await?;
+            let search_tool = cached_tool_registry_search_tool(
+                &rt,
+                tools,
+                &resolved_embedding_model_name,
                 embedding_model,
-            )) as Arc<dyn SpiceModelTool>))
+            )
+            .await as Arc<dyn SpiceModelTool>;
+            Ok(Some(search_tool))
         }
         TOOL_INVOKE_NAME => {
             let tools = get_tools(Arc::clone(&rt), &SpiceToolsOptions::SearchRegistry).await;
@@ -169,18 +206,69 @@ pub(crate) async fn resolve_tool_registry_embedding_model(
     rt: Arc<Runtime>,
     model_name: Option<&str>,
 ) -> Result<Arc<dyn Embed>, Box<dyn std::error::Error + Send + Sync>> {
+    let (_, embedding_model) =
+        resolve_tool_registry_embedding_model_with_name(rt, model_name).await?;
+    Ok(embedding_model)
+}
+
+async fn resolve_tool_registry_embedding_model_with_name(
+    rt: Arc<Runtime>,
+    model_name: Option<&str>,
+) -> Result<(String, Arc<dyn Embed>), Box<dyn std::error::Error + Send + Sync>> {
     let configured_model_names = configured_embedding_model_names(&rt).await;
     let model_name =
         select_tool_registry_embedding_model_name(&configured_model_names, model_name)?;
 
-    rt.embeds()
+    let Some(embedding_model) = rt.embeds().read().await.get(&model_name).cloned() else {
+        return Err(format!("Embedding model '{model_name}' configured for searchable tool discovery was not loaded. Check earlier embedding model errors and verify the `embeddings` configuration").into());
+    };
+    Ok((model_name, embedding_model))
+}
+
+async fn cached_tool_registry_search_tool(
+    rt: &Arc<Runtime>,
+    tools: Arc<Vec<Arc<dyn SpiceModelTool>>>,
+    embedding_model_name: &str,
+    embedding_model: Arc<dyn Embed>,
+) -> Arc<ToolRegistrySearchTool> {
+    let key = ToolRegistrySearchCacheKey {
+        runtime_id: Arc::as_ptr(rt).addr(),
+        embedding_model_name: embedding_model_name.to_string(),
+        tools_hash: tool_registry_tools_hash(&tools),
+    };
+
+    if let Some(tool) = TOOL_REGISTRY_SEARCH_TOOL_CACHE
         .read()
         .await
-        .get(&model_name)
+        .get(&key)
         .cloned()
-        .ok_or_else(|| {
-            format!("Embedding model '{model_name}' configured for searchable tool discovery was not loaded. Check earlier embedding model errors and verify the `embeddings` configuration").into()
+    {
+        return tool;
+    }
+
+    let mut cache = TOOL_REGISTRY_SEARCH_TOOL_CACHE.write().await;
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(ToolRegistrySearchTool::new(
+                tools.as_slice(),
+                embedding_model,
+            ))
         })
+        .clone()
+}
+
+fn tool_registry_tools_hash(tools: &[Arc<dyn SpiceModelTool>]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    tools.len().hash(&mut hasher);
+    for tool in tools {
+        tool.name().hash(&mut hasher);
+        tool.description().hash(&mut hasher);
+        tool.parameters()
+            .map(|parameters| parameters.to_string())
+            .hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 async fn configured_embedding_model_names(rt: &Arc<Runtime>) -> Vec<String> {
@@ -313,7 +401,7 @@ impl ToolRegistryInvokeTool {
     fn find_tool(&self, tool_id: &str) -> Option<Arc<dyn SpiceModelTool>> {
         self.tools
             .iter()
-            .find(|tool| tool_id_matches(tool.as_ref(), tool_id))
+            .find(|tool| tool.name() == tool_id)
             .cloned()
     }
 }
@@ -931,12 +1019,6 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {
     }
 }
 
-fn tool_id_matches(tool: &dyn SpiceModelTool, requested_tool_id: &str) -> bool {
-    let tool_name = tool.name();
-    let tool_name_ref: &str = &tool_name;
-    tool_name_ref == requested_tool_id || encode_tool_name(tool_name_ref) == requested_tool_id
-}
-
 fn normalize_text(text: impl AsRef<str>) -> String {
     text.as_ref()
         .chars()
@@ -1472,6 +1554,33 @@ mod tests {
                 .to_string()
                 .contains("Failed to invoke tool 'failing' from searchable registry")
         );
+    }
+
+    #[tokio::test]
+    async fn invoke_requires_exact_tool_id_match() {
+        let (namespaced_tool, _) = mock_tool(
+            "catalog/sql",
+            "Run SQL queries through a catalog tool",
+            json!({"namespaced": true}),
+        );
+        let (encoded_name_tool, _) = mock_tool(
+            "catalog_sql",
+            "A different tool whose raw name matches the encoded namespaced tool",
+            json!({"encoded": true}),
+        );
+        let advertised_tools =
+            tool_registry_tools(vec![namespaced_tool, encoded_name_tool], mock_embed());
+        let invoke_tool = advertised_tools
+            .iter()
+            .find(|tool| tool.name() == TOOL_INVOKE_NAME)
+            .expect("tool_invoke should be advertised");
+
+        let result = invoke_tool
+            .call(r#"{"tool_id":"catalog_sql","arguments":{}}"#)
+            .await
+            .expect("exact tool id should invoke matching raw tool name");
+
+        assert_eq!(result.get("result"), Some(&json!({"encoded": true})));
     }
 
     #[test]

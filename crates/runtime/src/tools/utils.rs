@@ -139,7 +139,11 @@ pub async fn get_tools_with_allowlist(
     if let SpiceToolsOptions::Specific(requested_tools) = opts {
         for tt in requested_tools {
             match tt.parse::<SpiceToolsOptions>() {
-                Ok(group) if group.includes_all_available_tools() => extend_unique_tools(
+                Ok(
+                    SpiceToolsOptions::Auto
+                    | SpiceToolsOptions::All
+                    | SpiceToolsOptions::SearchRegistry,
+                ) => extend_unique_tools(
                     &mut tools,
                     &mut seen_tool_names,
                     all_available_tools(
@@ -170,13 +174,7 @@ pub async fn get_tools_with_allowlist(
                     }
                 }
                 Ok(SpiceToolsOptions::Disabled) => {}
-                Ok(
-                    SpiceToolsOptions::Specific(_)
-                    | SpiceToolsOptions::Auto
-                    | SpiceToolsOptions::All
-                    | SpiceToolsOptions::SearchRegistry,
-                )
-                | Err(_) => {
+                Ok(SpiceToolsOptions::Specific(_)) | Err(_) => {
                     match get_tool_by_name(Arc::clone(&rt), &all_tools, tt, table_allowlist.clone())
                         .await
                     {
