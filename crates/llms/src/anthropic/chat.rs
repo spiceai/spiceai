@@ -33,19 +33,18 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
     ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
     ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
-    ChatCompletionResponseStream, ChatCompletionToolChoiceOption, CompletionUsage,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, FunctionCall,
-    FunctionName, ReasoningEffort, ResponseFormat, ResponseFormatJsonSchema, Role,
-    StopConfiguration, ToolChoiceOptions,
+    ChatCompletionResponseStream, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+    CreateChatCompletionResponse, FinishReason, FunctionCall, FunctionName, ReasoningEffort,
+    ResponseFormat, ResponseFormatJsonSchema, Role, StopConfiguration, ToolChoiceOptions,
 };
 use serde_json::json;
 
 use super::Anthropic;
 use super::types::{
-    AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
-    MessageParam, MessageRole, MetadataParam, ResponseContentBlock, ResponseTextBlock, StopReason,
-    TextBlockParam, ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam, default_max_tokens,
-    tool_from_completion_tools,
+    AnthropicModelVariant, CacheControlEphemeral, ContentBlock, ContentParam, MessageCreateParams,
+    MessageCreateResponse, MessageParam, MessageRole, MetadataParam, ResponseContentBlock,
+    ResponseTextBlock, StopReason, TextBlockParam, ToolChoiceParam, ToolResultBlockParam,
+    ToolUseBlockParam, default_max_tokens, tool_from_completion_tools,
 };
 use super::types_stream::transform_stream;
 use async_trait::async_trait;
@@ -99,13 +98,7 @@ impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
         Ok(CreateChatCompletionResponse {
             id: value.id,
             model: value.model.clone(),
-            usage: Some(CompletionUsage {
-                prompt_tokens: value.usage.input_tokens,
-                completion_tokens: value.usage.output_tokens,
-                total_tokens: value.usage.input_tokens + value.usage.output_tokens,
-                prompt_tokens_details: None,
-                completion_tokens_details: None,
-            }),
+            usage: Some(value.usage.into()),
             created: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
@@ -360,6 +353,10 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
         pair: (AnthropicModelVariant, CreateChatCompletionRequest),
     ) -> Result<Self, Self::Error> {
         let (model, value) = pair;
+        let cache_control = value
+            .prompt_cache_key
+            .as_ref()
+            .map(|_| CacheControlEphemeral::ephemeral());
 
         let messages = value
             .messages
@@ -395,6 +392,7 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
                 StopConfiguration::StringArray(a) => a,
             }),
             system: system_message_from_messages(&value.messages),
+            cache_control,
             messages,
 
             tool_choice: match value.tool_choice {
@@ -493,5 +491,36 @@ fn system_message_from_messages(messages: &[ChatCompletionRequestMessage]) -> Op
         None
     } else {
         Some(system_messages.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::chat::{
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
+    };
+
+    #[test]
+    fn prompt_cache_key_enables_automatic_cache_control() {
+        let req = CreateChatCompletionRequest {
+            messages: vec![
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content("Use the cached context.")
+                    .build()
+                    .expect("user message should build")
+                    .into(),
+            ],
+            prompt_cache_key: Some("schema-context".to_string()),
+            ..CreateChatCompletionRequest::default()
+        };
+
+        let params = MessageCreateParams::try_from(("claude-sonnet-4-6".to_string(), req))
+            .expect("anthropic request should convert");
+
+        assert_eq!(
+            params.cache_control,
+            Some(CacheControlEphemeral::ephemeral())
+        );
     }
 }

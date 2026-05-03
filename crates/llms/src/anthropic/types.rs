@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_openai::{
     error::OpenAIError,
-    types::chat::{ChatCompletionTool, ChatCompletionTools},
+    types::chat::{ChatCompletionTool, ChatCompletionTools, CompletionUsage, PromptTokensDetails},
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,8 @@ pub struct MessageCreateParams {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,6 +400,15 @@ pub struct CacheControlEphemeral {
     pub ttl: Option<CacheTtl>,
 }
 
+impl CacheControlEphemeral {
+    pub fn ephemeral() -> Self {
+        Self {
+            control_type: "ephemeral".to_string(),
+            ttl: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum CacheTtl {
     #[serde(rename = "5m")]
@@ -673,6 +684,27 @@ pub struct Usage {
     pub server_tool_use: Option<ServerToolUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+}
+
+impl From<Usage> for CompletionUsage {
+    fn from(usage: Usage) -> Self {
+        let cache_creation_input_tokens = usage.cache_creation_input_tokens.unwrap_or_default();
+        let cache_read_input_tokens = usage.cache_read_input_tokens.unwrap_or_default();
+        let prompt_tokens =
+            usage.input_tokens + cache_creation_input_tokens + cache_read_input_tokens;
+        let prompt_tokens_details = (cache_read_input_tokens > 0).then(|| PromptTokensDetails {
+            cached_tokens: Some(cache_read_input_tokens),
+            audio_tokens: None,
+        });
+
+        CompletionUsage {
+            prompt_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: prompt_tokens + usage.output_tokens,
+            prompt_tokens_details,
+            completion_tokens_details: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

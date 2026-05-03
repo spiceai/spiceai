@@ -258,13 +258,7 @@ pub fn transform_stream(
                     }) => {
                         state.role = MessageRole::from_opt(&inner_role);
                         state.id = Some(inner_id);
-                        state.usage = Some(CompletionUsage {
-                            prompt_tokens: inner_usage.input_tokens,
-                            completion_tokens: inner_usage.output_tokens,
-                            total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
-                            prompt_tokens_details: None,
-                            completion_tokens_details: None,
-                        });
+                        state.usage = Some(inner_usage.into());
                         state.model = Some(model);
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
