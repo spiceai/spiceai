@@ -93,7 +93,11 @@ impl SpiceToolsOptions {
                 .iter()
                 // Handle nested groupings. e.g: `spiced_tools: nsql, my_other_tool`.
                 .flat_map(|s| match s.parse() {
-                    Ok(SpiceToolsOptions::All) => SpiceToolsOptions::All.tools_by_name(),
+                    Ok(
+                        SpiceToolsOptions::Auto
+                        | SpiceToolsOptions::All
+                        | SpiceToolsOptions::SearchRegistry,
+                    ) => SpiceToolsOptions::All.tools_by_name(),
                     Ok(SpiceToolsOptions::Nsql) => SpiceToolsOptions::Nsql.tools_by_name(),
                     _ => vec![s.as_str()],
                 })
@@ -156,6 +160,19 @@ mod tests {
             tools.len(),
             tools.iter().unique().count(),
             "'SpiceToolsOptions::tools_by_name' should not produce duplicates"
+        );
+
+        assert_eq!(
+            SpiceToolsOptions::Specific(vec![
+                "search_registry".to_string(),
+                "my_other_tool".to_string(),
+            ])
+            .tools_by_name(),
+            SpiceToolsOptions::All
+                .tools_by_name()
+                .into_iter()
+                .chain(["my_other_tool"])
+                .collect::<Vec<_>>()
         );
     }
 

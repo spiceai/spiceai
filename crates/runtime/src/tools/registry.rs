@@ -83,21 +83,27 @@ enum ToolRegistryError {
     ReservedToolName { tool_name: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolRegistryPreparationMode {
+    Required,
+    Auto,
+}
+
 pub(crate) async fn prepare_model_tools(
     rt: Arc<Runtime>,
     opts: &SpiceToolsOptions,
     tools: Vec<Arc<dyn SpiceModelTool>>,
     embedding_model_name: Option<&str>,
 ) -> Result<Vec<Arc<dyn SpiceModelTool>>, Box<dyn std::error::Error + Send + Sync>> {
-    match opts {
-        SpiceToolsOptions::SearchRegistry => {
+    match tool_registry_preparation_mode(opts, tools.len()) {
+        Some(ToolRegistryPreparationMode::Required) => {
             ensure_no_reserved_tool_registry_name_conflicts(&tools)?;
             let embedding_model =
                 resolve_tool_registry_embedding_model(Arc::clone(&rt), embedding_model_name)
                     .await?;
             Ok(tool_registry_tools(tools, embedding_model))
         }
-        SpiceToolsOptions::Auto if should_auto_search(tools.len()) => {
+        Some(ToolRegistryPreparationMode::Auto) => {
             if let Some(tool_name) = reserved_tool_registry_name_conflict(&tools) {
                 tracing::warn!(
                     "Unable to use searchable tool registry for tools: auto: tool name '{}' is reserved for the searchable tool registry. Falling back to direct tool definitions.",
@@ -118,12 +124,52 @@ pub(crate) async fn prepare_model_tools(
                 }
             }
         }
+        None => Ok(tools),
+    }
+}
+
+fn tool_registry_preparation_mode(
+    opts: &SpiceToolsOptions,
+    tool_count: usize,
+) -> Option<ToolRegistryPreparationMode> {
+    match opts {
+        SpiceToolsOptions::SearchRegistry => Some(ToolRegistryPreparationMode::Required),
+        SpiceToolsOptions::Auto if should_auto_search(tool_count) => {
+            Some(ToolRegistryPreparationMode::Auto)
+        }
+        SpiceToolsOptions::Specific(requested_tools) => {
+            specific_tool_registry_preparation_mode(requested_tools, tool_count)
+        }
         SpiceToolsOptions::Auto
         | SpiceToolsOptions::All
         | SpiceToolsOptions::Nsql
-        | SpiceToolsOptions::Disabled
-        | SpiceToolsOptions::Specific(_) => Ok(tools),
+        | SpiceToolsOptions::Disabled => None,
     }
+}
+
+fn specific_tool_registry_preparation_mode(
+    requested_tools: &[String],
+    tool_count: usize,
+) -> Option<ToolRegistryPreparationMode> {
+    let mut auto_requested = false;
+
+    for requested_tool in requested_tools {
+        match requested_tool.parse::<SpiceToolsOptions>() {
+            Ok(SpiceToolsOptions::SearchRegistry) => {
+                return Some(ToolRegistryPreparationMode::Required);
+            }
+            Ok(SpiceToolsOptions::Auto) => auto_requested = true,
+            Ok(
+                SpiceToolsOptions::All
+                | SpiceToolsOptions::Nsql
+                | SpiceToolsOptions::Disabled
+                | SpiceToolsOptions::Specific(_),
+            )
+            | Err(_) => {}
+        }
+    }
+
+    (auto_requested && should_auto_search(tool_count)).then_some(ToolRegistryPreparationMode::Auto)
 }
 
 fn should_auto_search(tool_count: usize) -> bool {
@@ -1331,6 +1377,38 @@ mod tests {
     fn auto_search_threshold_only_triggers_for_large_tool_sets() {
         assert!(!should_auto_search(AUTO_SEARCH_TOOL_THRESHOLD));
         assert!(should_auto_search(AUTO_SEARCH_TOOL_THRESHOLD + 1));
+    }
+
+    #[test]
+    fn specific_search_registry_requests_registry_wrapping() {
+        let opts =
+            SpiceToolsOptions::Specific(vec!["search_registry".to_string(), "my_tool".to_string()]);
+
+        assert_eq!(
+            tool_registry_preparation_mode(&opts, 1),
+            Some(ToolRegistryPreparationMode::Required)
+        );
+    }
+
+    #[test]
+    fn specific_auto_uses_registry_threshold() {
+        let opts = SpiceToolsOptions::Specific(vec!["auto".to_string(), "my_tool".to_string()]);
+
+        assert_eq!(
+            tool_registry_preparation_mode(&opts, AUTO_SEARCH_TOOL_THRESHOLD),
+            None
+        );
+        assert_eq!(
+            tool_registry_preparation_mode(&opts, AUTO_SEARCH_TOOL_THRESHOLD + 1),
+            Some(ToolRegistryPreparationMode::Auto)
+        );
+    }
+
+    #[test]
+    fn specific_all_keeps_direct_tool_mode() {
+        let opts = SpiceToolsOptions::Specific(vec!["all".to_string(), "my_tool".to_string()]);
+
+        assert_eq!(tool_registry_preparation_mode(&opts, usize::MAX), None);
     }
 
     #[test]
