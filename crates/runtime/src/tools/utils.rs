@@ -173,7 +173,8 @@ pub async fn get_tools_with_allowlist(
                 Ok(SpiceToolsOptions::Specific(_))
                 | Ok(SpiceToolsOptions::Auto)
                 | Ok(SpiceToolsOptions::All)
-                | Ok(SpiceToolsOptions::SearchRegistry) => {
+                | Ok(SpiceToolsOptions::SearchRegistry)
+                | Err(_) => {
                     match get_tool_by_name(Arc::clone(&rt), &all_tools, tt, table_allowlist.clone())
                         .await
                     {

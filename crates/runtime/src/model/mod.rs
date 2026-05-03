@@ -44,6 +44,7 @@ pub use model_context::{
 pub use rerank::{RerankerModelStore, try_to_rerank_model};
 pub use responses::{LLMResponsesModelStore, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
+pub(crate) use tool_use::encode_tool_name;
 pub use tool_use_responses::ToolUsingResponses;
 
 use crate::DataFusion;

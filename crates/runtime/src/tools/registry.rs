@@ -31,6 +31,7 @@ use tools::SpiceModelTool;
 
 use crate::{
     Runtime,
+    model::encode_tool_name,
     tools::{
         options::SpiceToolsOptions,
         utils::{get_tools, parameters},
@@ -94,7 +95,7 @@ fn tool_registry_tools(
 
     let direct_tools = tools
         .iter()
-        .filter(|tool| tool.name().as_ref() == LIST_DATASETS_TOOL_NAME)
+        .filter(|tool| tool.name() == LIST_DATASETS_TOOL_NAME)
         .cloned()
         .collect::<Vec<_>>();
     let registry = Arc::new(tools);
@@ -201,15 +202,23 @@ fn select_tool_registry_embedding_model_name(
 }
 
 struct ToolRegistrySearchTool {
-    tools: Arc<Vec<Arc<dyn SpiceModelTool>>>,
+    documents: Arc<Vec<ToolDocument>>,
+    document_texts: Arc<Vec<String>>,
     embedding_model: Arc<dyn Embed>,
     tool_embeddings: OnceCell<Vec<Vec<f32>>>,
 }
 
 impl ToolRegistrySearchTool {
     fn new(tools: Arc<Vec<Arc<dyn SpiceModelTool>>>, embedding_model: Arc<dyn Embed>) -> Self {
+        let documents = tools.iter().map(ToolDocument::new).collect::<Vec<_>>();
+        let document_texts = documents
+            .iter()
+            .map(ToolDocument::vector_text)
+            .collect::<Vec<_>>();
+
         Self {
-            tools,
+            documents: Arc::new(documents),
+            document_texts: Arc::new(document_texts),
             embedding_model,
             tool_embeddings: OnceCell::new(),
         }
@@ -241,7 +250,8 @@ impl SpiceModelTool for ToolRegistrySearchTool {
         let min_score = params.min_score.unwrap_or(0.0).clamp(0.0, 1.0);
 
         let mut ranked_tools = hybrid_rank_tools(
-            &self.tools,
+            self.documents.as_slice(),
+            self.document_texts.as_slice(),
             &params,
             &self.embedding_model,
             &self.tool_embeddings,
@@ -310,11 +320,18 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let params: ToolInvokeParams = serde_json::from_str(arg)?;
         let Some(tool) = self.find_tool(&params.tool_id) else {
-            return Ok(json!({
-                "tool_id": params.tool_id,
-                "error": "Tool not found in registry",
-                "available_tools": self.tools.iter().map(|tool| tool.name().to_string()).take(MAX_SEARCH_LIMIT).collect::<Vec<_>>(),
-            }));
+            let available_tools = self
+                .tools
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .take(MAX_SEARCH_LIMIT)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Tool '{}' was not found in searchable registry. Available tools: {}",
+                params.tool_id, available_tools
+            )
+            .into());
         };
 
         let tool_id = tool.name().to_string();
@@ -329,10 +346,10 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
                 "tool_id": tool_id,
                 "result": result,
             })),
-            Err(error) => Ok(json!({
-                "tool_id": tool_id,
-                "error": error.to_string(),
-            })),
+            Err(error) => Err(format!(
+                "Failed to invoke tool '{tool_id}' from searchable registry: {error}"
+            )
+            .into()),
         }
     }
 }
@@ -418,6 +435,13 @@ struct ToolDocument {
     name_tokens: Vec<String>,
     description_tokens: Vec<String>,
     parameter_tokens: Vec<String>,
+    name_token_set: HashSet<String>,
+    description_token_set: HashSet<String>,
+    parameter_token_set: HashSet<String>,
+    all_token_set: HashSet<String>,
+    name_token_counts: HashMap<String, usize>,
+    description_token_counts: HashMap<String, usize>,
+    parameter_token_counts: HashMap<String, usize>,
     parameter_key_tokens: HashSet<String>,
 }
 
@@ -436,28 +460,41 @@ impl ToolDocument {
         if let Some(parameters) = parameters.as_ref() {
             collect_json_key_tokens(parameters, &mut parameter_key_tokens);
         }
+        let name_tokens = tokenize_to_vec(&tool_id);
+        let description_tokens = tokenize_to_vec(description.as_deref().unwrap_or_default());
+        let parameter_tokens = tokenize_to_vec(&parameter_text);
+        let name_token_set = token_set(&name_tokens);
+        let description_token_set = token_set(&description_tokens);
+        let parameter_token_set = token_set(&parameter_tokens);
+        let all_token_set = name_tokens
+            .iter()
+            .chain(&description_tokens)
+            .chain(&parameter_tokens)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let name_token_counts = token_counts(&name_tokens);
+        let description_token_counts = token_counts(&description_tokens);
+        let parameter_token_counts = token_counts(&parameter_tokens);
 
         Self {
             name_text: normalize_text(&tool_id),
             description_text: normalize_text(description.as_deref().unwrap_or_default()),
             parameter_text: normalize_text(&parameter_text),
-            name_tokens: tokenize_to_vec(&tool_id),
-            description_tokens: tokenize_to_vec(description.as_deref().unwrap_or_default()),
-            parameter_tokens: tokenize_to_vec(&parameter_text),
+            name_tokens,
+            description_tokens,
+            parameter_tokens,
+            name_token_set,
+            description_token_set,
+            parameter_token_set,
+            all_token_set,
+            name_token_counts,
+            description_token_counts,
+            parameter_token_counts,
             parameter_key_tokens,
             tool_id,
             description,
             parameters,
         }
-    }
-
-    fn all_tokens(&self) -> HashSet<&str> {
-        self.name_tokens
-            .iter()
-            .chain(&self.description_tokens)
-            .chain(&self.parameter_tokens)
-            .map(String::as_str)
-            .collect()
     }
 
     fn total_tokens(&self) -> usize {
@@ -487,12 +524,12 @@ struct FusedMatch {
 }
 
 async fn hybrid_rank_tools(
-    tools: &[Arc<dyn SpiceModelTool>],
+    documents: &[ToolDocument],
+    document_texts: &[String],
     params: &ToolSearchParams,
     embedding_model: &Arc<dyn Embed>,
     tool_embeddings: &OnceCell<Vec<Vec<f32>>>,
 ) -> Result<Vec<RankedTool>, Box<dyn std::error::Error + Send + Sync>> {
-    let documents = tools.iter().map(ToolDocument::new).collect::<Vec<_>>();
     let query_tokens = tokenize_to_vec(&params.query);
     let keyword_tokens = params
         .keywords
@@ -514,7 +551,13 @@ async fn hybrid_rank_tools(
     ];
     channels.push((
         "vector",
-        vector_channel_matches(&documents, &params.query, embedding_model, tool_embeddings).await?,
+        vector_channel_matches(
+            document_texts,
+            &params.query,
+            embedding_model,
+            tool_embeddings,
+        )
+        .await?,
     ));
     let fused_matches = reciprocal_rank_fusion(channels);
     let max_score = fused_matches
@@ -523,7 +566,7 @@ async fn hybrid_rank_tools(
         .fold(0.0, f64::max);
 
     Ok(documents
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(document_index, document)| {
             let mut fused_match = fused_matches
@@ -537,9 +580,9 @@ async fn hybrid_rank_tools(
                 .sort_by_key(|source| (source.rank, source.source));
 
             RankedTool {
-                tool_id: document.tool_id,
-                description: document.description,
-                parameters: document.parameters,
+                tool_id: document.tool_id.clone(),
+                description: document.description.clone(),
+                parameters: document.parameters.clone(),
                 score: if max_score > 0.0 {
                     fused_match.fused_score / max_score
                 } else {
@@ -553,12 +596,12 @@ async fn hybrid_rank_tools(
 }
 
 async fn vector_channel_matches(
-    documents: &[ToolDocument],
+    document_texts: &[String],
     query: &str,
     embedding_model: &Arc<dyn Embed>,
     tool_embeddings: &OnceCell<Vec<Vec<f32>>>,
 ) -> Result<Vec<ChannelMatch>, llms::embeddings::Error> {
-    if query.trim().is_empty() || documents.is_empty() {
+    if query.trim().is_empty() || document_texts.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -569,14 +612,10 @@ async fn vector_channel_matches(
         return Ok(Vec::new());
     };
 
-    let document_texts = documents
-        .iter()
-        .map(ToolDocument::vector_text)
-        .collect::<Vec<_>>();
     let document_embeddings = tool_embeddings
         .get_or_try_init(|| {
             let embedding_model = Arc::clone(embedding_model);
-            let document_texts = document_texts.clone();
+            let document_texts = document_texts.to_vec();
             async move {
                 embedding_model
                     .embed(EmbeddingInput::StringArray(document_texts))
@@ -612,16 +651,14 @@ fn full_text_channel_matches(
         .iter()
         .enumerate()
         .filter_map(|(document_index, document)| {
-            let name_counts = token_counts(&document.name_tokens);
-            let description_counts = token_counts(&document.description_tokens);
-            let parameter_counts = token_counts(&document.parameter_tokens);
             let mut score = 0.0;
             let mut matched_terms = Vec::new();
 
             for query_token in query_tokens {
-                let field_score = (token_count(&name_counts, query_token) as f64 * 3.0)
-                    + (token_count(&description_counts, query_token) as f64 * 2.0)
-                    + token_count(&parameter_counts, query_token) as f64;
+                let field_score = (token_count(&document.name_token_counts, query_token) as f64
+                    * 3.0)
+                    + (token_count(&document.description_token_counts, query_token) as f64 * 2.0)
+                    + token_count(&document.parameter_token_counts, query_token) as f64;
                 if field_score > 0.0 {
                     let frequency = *document_frequency.get(query_token).unwrap_or(&0) as f64;
                     let inverse_document_frequency =
@@ -653,9 +690,6 @@ fn keyword_channel_matches(
         .iter()
         .enumerate()
         .filter_map(|(document_index, document)| {
-            let name_set = document.name_tokens.iter().collect::<HashSet<_>>();
-            let description_set = document.description_tokens.iter().collect::<HashSet<_>>();
-            let parameter_set = document.parameter_tokens.iter().collect::<HashSet<_>>();
             let mut score = 0.0;
             let mut matched_terms = Vec::new();
 
@@ -681,11 +715,11 @@ fn keyword_channel_matches(
             }
 
             for query_token in query_tokens {
-                let token_score = if name_set.contains(query_token) {
+                let token_score = if document.name_token_set.contains(query_token) {
                     3.0
-                } else if description_set.contains(query_token) {
+                } else if document.description_token_set.contains(query_token) {
                     2.0
-                } else if parameter_set.contains(query_token) {
+                } else if document.parameter_token_set.contains(query_token) {
                     1.0
                 } else {
                     0.0
@@ -713,14 +747,13 @@ fn schema_channel_matches(
         .iter()
         .enumerate()
         .filter_map(|(document_index, document)| {
-            let parameter_set = document.parameter_tokens.iter().collect::<HashSet<_>>();
             let mut score = 0.0;
             let mut matched_terms = Vec::new();
             for query_token in query_tokens {
                 if document.parameter_key_tokens.contains(query_token) {
                     score += 4.0;
                     matched_terms.push(query_token.clone());
-                } else if parameter_set.contains(query_token) {
+                } else if document.parameter_token_set.contains(query_token) {
                     score += 1.0;
                     matched_terms.push(query_token.clone());
                 }
@@ -796,9 +829,8 @@ fn document_frequency(
 ) -> HashMap<String, usize> {
     let mut frequency = HashMap::new();
     for document in documents {
-        let document_tokens = document.all_tokens();
         for query_token in query_tokens {
-            if document_tokens.contains(query_token.as_str()) {
+            if document.all_token_set.contains(query_token) {
                 frequency
                     .entry(query_token.clone())
                     .and_modify(|count| *count += 1)
@@ -809,18 +841,22 @@ fn document_frequency(
     frequency
 }
 
-fn token_counts<'a>(tokens: &'a [String]) -> HashMap<&'a str, usize> {
+fn token_set(tokens: &[String]) -> HashSet<String> {
+    tokens.iter().cloned().collect()
+}
+
+fn token_counts(tokens: &[String]) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for token in tokens {
         counts
-            .entry(token.as_str())
+            .entry(token.clone())
             .and_modify(|count| *count += 1)
             .or_insert(1);
     }
     counts
 }
 
-fn token_count(counts: &HashMap<&str, usize>, token: &str) -> usize {
+fn token_count(counts: &HashMap<String, usize>, token: &str) -> usize {
     counts.get(token).copied().unwrap_or_default()
 }
 
@@ -851,8 +887,7 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {
 
 fn tool_id_matches(tool: &dyn SpiceModelTool, requested_tool_id: &str) -> bool {
     let tool_name = tool.name();
-    tool_name.as_ref() == requested_tool_id
-        || encode_tool_name(tool_name.as_ref()) == requested_tool_id
+    tool_name == requested_tool_id || encode_tool_name(&tool_name) == requested_tool_id
 }
 
 fn normalize_text(text: impl AsRef<str>) -> String {
@@ -953,14 +988,6 @@ fn is_stop_word(token: &str) -> bool {
     )
 }
 
-fn encode_tool_name(name: &str) -> String {
-    if name.contains('/') {
-        name.replace('_', "__").replace('/', "_")
-    } else {
-        name.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -996,6 +1023,32 @@ mod tests {
                 received_args.push(arg.to_string());
             }
             Ok(self.response.clone())
+        }
+    }
+
+    struct FailingTool {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl SpiceModelTool for FailingTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.name)
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("Always fails"))
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({"type": "object"}))
+        }
+
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Err("tool failed".into())
         }
     }
 
@@ -1334,6 +1387,44 @@ mod tests {
             .lock()
             .expect("received args lock should not be poisoned");
         assert_eq!(received_args.as_slice(), [r#"{"query":"select 1"}"#]);
+    }
+
+    #[tokio::test]
+    async fn invoke_returns_error_when_tool_id_is_missing() {
+        let (sql_tool, _) = mock_tool("sql", "Run SQL queries", json!({"rows": 1}));
+        let advertised_tools = tool_registry_tools(vec![sql_tool], mock_embed());
+        let invoke_tool = advertised_tools
+            .iter()
+            .find(|tool| tool.name().as_ref() == TOOL_INVOKE_NAME)
+            .expect("tool_invoke should be advertised");
+
+        let error = invoke_tool
+            .call(r#"{"tool_id":"missing","arguments":{}}"#)
+            .await
+            .expect_err("missing tool id should return an error");
+
+        assert!(error.to_string().contains("Tool 'missing' was not found"));
+    }
+
+    #[tokio::test]
+    async fn invoke_returns_error_when_selected_tool_fails() {
+        let failing_tool = Arc::new(FailingTool { name: "failing" }) as Arc<dyn SpiceModelTool>;
+        let advertised_tools = tool_registry_tools(vec![failing_tool], mock_embed());
+        let invoke_tool = advertised_tools
+            .iter()
+            .find(|tool| tool.name().as_ref() == TOOL_INVOKE_NAME)
+            .expect("tool_invoke should be advertised");
+
+        let error = invoke_tool
+            .call(r#"{"tool_id":"failing","arguments":{}}"#)
+            .await
+            .expect_err("failing tool should return an error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to invoke tool 'failing' from searchable registry")
+        );
     }
 
     #[test]

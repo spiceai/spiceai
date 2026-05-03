@@ -41,18 +41,39 @@ use snafu::ResultExt;
 /// The underlying score of the search results is not important, only the rank (per stream order).
 /// The rank, for a given entry (for some primary key `a`) is converted to a score using the formula:
 /// ```text
-/// score_a = 1 / (rank_i + offset) + 1 / (rank_j + offset) + ...
+/// score_a = 1 / (rank_i + k) + 1 / (rank_j + k) + ...
 /// ```
-/// Where `rank_i` is the rank of the i-th stream, and `offset` is a constant (e.g. 60).
+/// Where `rank_i` is the rank of the i-th stream, and `k` is a constant (e.g. 60).
 pub struct ReciprocalRankFusion;
 
 /// Default RRF smoothing parameter used across Spice hybrid search.
 pub const DEFAULT_RRF_K: f64 = 60.0;
 
+const USIZE_TO_F64_CHUNK_BITS: usize = 16;
+const USIZE_TO_F64_CHUNK_BASE: f64 = 65_536.0;
+const USIZE_TO_F64_CHUNK_MASK: usize = (1usize << USIZE_TO_F64_CHUNK_BITS) - 1;
+
 #[must_use]
 pub fn reciprocal_rank_score(rank: usize, k: f64) -> f64 {
-    let rank = u32::try_from(rank).map_or(f64::from(u32::MAX), f64::from);
-    1.0 / (rank + k)
+    1.0 / (usize_to_f64(rank) + k)
+}
+
+fn usize_to_f64(value: usize) -> f64 {
+    let mut remaining = value;
+    let mut multiplier = 1.0;
+    let mut converted = 0.0;
+
+    while remaining > 0 {
+        let chunk = match u16::try_from(remaining & USIZE_TO_F64_CHUNK_MASK) {
+            Ok(chunk) => chunk,
+            Err(_) => return f64::INFINITY,
+        };
+        converted += f64::from(chunk) * multiplier;
+        remaining >>= USIZE_TO_F64_CHUNK_BITS;
+        multiplier *= USIZE_TO_F64_CHUNK_BASE;
+    }
+
+    converted
 }
 
 #[must_use]
@@ -340,7 +361,7 @@ async fn reciprocal_rank_fusion_plan(
     tables: &[TableReference],
     primary_key: &[Column],
     additional_columns: &[Column],
-    offset: f64,
+    k: f64,
     limit: usize,
 ) -> datafusion::error::Result<LogicalPlan> {
     // 1) Build CTEs that add explicit rank per table, ranking by SEARCH_SCORE_COLUMN_NAME
@@ -392,16 +413,16 @@ async fn reciprocal_rank_fusion_plan(
         )?;
     }
 
-    // 4) Build the RRF score: SUM(COALESCE(1.0/(rank + offset), 0)) across all tables
+    // 4) Build the RRF score: SUM(COALESCE(1.0/(rank + k), 0)) across all tables
     let rrf_score = ranked_plans
         .iter()
         .map(|(table_name, _)| {
             let rank_col = col(Column::new(Some(table_name.clone()), "rank"));
-            let offset_lit = lit(offset);
+            let k_lit = lit(k);
             let score = binary_expr(
                 lit(1.0),
                 Operator::Divide,
-                binary_expr(rank_col, Operator::Plus, offset_lit),
+                binary_expr(rank_col, Operator::Plus, k_lit),
             );
             coalesce(vec![score, lit(0.0)])
         })
@@ -484,6 +505,15 @@ mod tests {
 
         assert!(search_score > sql_score);
         assert!(sql_score > table_schema_score);
+    }
+
+    #[test]
+    fn reciprocal_rank_score_decreases_past_u32_max() {
+        let u32_max_rank = usize::try_from(u32::MAX).expect("u32::MAX should fit into usize");
+        let score_at_u32_max = reciprocal_rank_score(u32_max_rank, DEFAULT_RRF_K);
+        let score_after_u32_max = reciprocal_rank_score(u32_max_rank + 1, DEFAULT_RRF_K);
+
+        assert!(score_after_u32_max < score_at_u32_max);
     }
 
     #[test]
