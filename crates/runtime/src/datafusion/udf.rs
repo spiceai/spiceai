@@ -337,11 +337,11 @@ async fn resolve_function_params(
 }
 
 pub(crate) fn effective_user_function_volatility(decl: &Function) -> &'static str {
-    match (function_executes_code(decl), decl.volatility) {
-        (true, Volatility::Immutable | Volatility::Stable) => "stable",
-        (_, Volatility::Immutable) => "immutable",
-        (_, Volatility::Stable) => "stable",
-        (_, Volatility::Volatile) => "volatile",
+    match decl.volatility {
+        Volatility::Immutable if function_executes_code(decl) => "stable",
+        Volatility::Immutable => "immutable",
+        Volatility::Stable => "stable",
+        Volatility::Volatile => "volatile",
     }
 }
 
