@@ -51,9 +51,9 @@ use datafusion::{
 
 use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
-    binary_expr, col, ident,
+    binary_expr, ident,
 };
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use futures::FutureExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
@@ -84,7 +84,7 @@ use crate::{
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use {
     crate::search::util::find_index_in_table_provider,
     search::index::SearchIndex,
@@ -94,7 +94,7 @@ use {
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
@@ -140,12 +140,12 @@ pub enum DistanceMetric {
     /// Cosine similarity (default). Score = `1 - cosine_distance(q, v)`.
     /// Best default; if embeddings are L2-normalized, this is equivalent to dot product.
     Cosine,
-    /// Negated Euclidean distance: `Score = -array_distance(q, v)`.
-    /// Use when your embedding model/index was trained against L2 distance.
+    /// Negated Euclidean distance: `Score = -array_distance(q, v)`. Use when
+    /// your embedding model/index was trained against L2 distance.
     L2,
-    /// Dot product. Score = `Σ q[i] * v[i]`.
-    /// Prefer `Cosine` with L2-normalized embeddings when possible — a native
-    /// `dot` UDF is not yet wired through the runtime.
+    /// Dot product. Score = `inner_product(q, v)`. Prefer `Cosine` with
+    /// L2-normalized embeddings when possible — they are equivalent up to a
+    /// constant for unit vectors.
     Dot,
 }
 
@@ -154,14 +154,9 @@ impl DistanceMetric {
         match s.to_ascii_lowercase().as_str() {
             "cosine" | "cos" => Ok(Self::Cosine),
             "l2" | "euclidean" | "euclid" => Ok(Self::L2),
-            // Dot is not yet wired through the scan path; reject at parse time so
-            // users get a clear error instead of silently constructing args that
-            // will then fail with `NotImplemented` deeper in execution.
-            "dot" | "inner" | "ip" => Err(DataFusionError::Plan(format!(
-                "distance_metric '{s}' is not yet implemented for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2'."
-            ))),
+            "dot" | "inner" | "ip" => Ok(Self::Dot),
             other => Err(DataFusionError::Plan(format!(
-                "Unsupported distance_metric '{other}' for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2'."
+                "Unsupported distance_metric '{other}' for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2', 'dot'."
             ))),
         }
     }
@@ -459,30 +454,20 @@ impl VectorSearchTableFunc {
     }
 
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {
-        // Extract named passthrough args that vector_search cares about before
-        // filtering them out of the positional parse. `distance_metric` is the
-        // only one vector_search consumes itself; the rest (e.g. `rank_weight`)
-        // are for RRF.
-        let distance_metric = args
-            .iter()
-            .find_map(|arg| match arg {
-                Expr::Literal(ScalarValue::Utf8(Some(s)), Some(meta))
-                    if meta.inner().get("spice.parameter_name").map(String::as_str)
-                        == Some("distance_metric") =>
-                {
-                    Some(DistanceMetric::parse(s))
-                }
+        let (positional, named) = split_named_args(args);
+
+        // Extract distance_metric from named args (vector_search-specific).
+        let distance_metric = named
+            .get("distance_metric")
+            .and_then(|e| match e {
+                Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(DistanceMetric::parse(s)),
                 _ => None,
             })
             .transpose()?;
 
-        // Filter out passthrough parameters (those with spice.parameter_name metadata)
-        // These are meant for table functions like RRF, not for vector_search itself
-        let mut args = args.iter().filter(|arg| {
-            !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
-        });
+        let mut pos = positional.into_iter();
 
-        let tbl = args.next();
+        let tbl = pos.next();
         let Some(Expr::Column(c)) = tbl else {
             return Err(DataFusionError::Plan(format!(
                 "First argument must be a table reference, but got a different expression: {tbl:?}."
@@ -491,84 +476,17 @@ impl VectorSearchTableFunc {
 
         let tbl_ref = table_ref_from_column_expr(c);
 
-        let query = args.next();
+        let query = pos.next();
         let queries = Self::parse_query_arg(query)?;
-        // `q` is used in downstream error messages + back-compat field.
         let q = queries.first().cloned().ok_or_else(|| {
             DataFusionError::Plan(
                 "Invalid arguments: vector_search query argument must contain at least one query value.".to_string(),
             )
         })?;
 
-        let (column, limit, include_score) = match (args.next(), args.next(), args.next()) {
-            // No arguments, provides defaults
-            (None, None, None) => (None, None, Some(true)),
+        let (column, limit, include_score) =
+            parse_column_limit_score(&mut pos, &named, &tbl_ref.to_string(), &q)?;
 
-            // Single argument cases
-            (Some(Expr::Column(Column { name: col, .. })), None, None) => {
-                (Some(col.clone()), None, Some(true))
-            }
-            (Some(Expr::Literal(scalar, None)), None, None) => {
-                if let ScalarValue::Boolean(Some(include_score)) = *scalar {
-                    (None, None, Some(include_score))
-                } else {
-                    (None, Some(parse_limit_scalar(scalar)?), Some(true))
-                }
-            }
-
-            // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
-            (
-                Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(scalar, None)),
-                None,
-            ) => {
-                if let ScalarValue::Boolean(Some(include_score)) = *scalar {
-                    (Some(col.clone()), None, Some(include_score))
-                } else {
-                    (
-                        Some(col.clone()),
-                        Some(parse_limit_scalar(scalar)?),
-                        Some(true),
-                    )
-                }
-            }
-            (
-                Some(Expr::Literal(scalar, None)),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
-                None,
-            ) => (
-                None,
-                Some(parse_limit_scalar(scalar)?),
-                Some(*include_score),
-            ),
-
-            // All three arguments provided
-            (
-                Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(scalar, None)),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
-            ) => (
-                Some(col.clone()),
-                Some(parse_limit_scalar(scalar)?),
-                Some(*include_score),
-            ),
-
-            // Invalid argument combinations
-            (a, b, c) => {
-                return Err(DataFusionError::Plan(format!(
-                    "Invalid arguments: ({tbl_ref:?}, {q}, {a:?}, {b:?}, {c:?}. Expected (table, query, [column, limit, include_score])."
-                )));
-            }
-        };
-        let limit_usize = limit
-            .map(|l| {
-                usize::try_from(l).map_err(|_| {
-                    DataFusionError::Plan(format!(
-                        "vector_search: limit value {l} is out of range for usize."
-                    ))
-                })
-            })
-            .transpose()?;
         Ok(VectorSearchTableFuncArgs {
             tbl: tbl_ref
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
@@ -576,13 +494,13 @@ impl VectorSearchTableFunc {
             query: q,
             queries,
             column,
-            limit: limit_usize,
+            limit,
             include_score,
             distance_metric,
         })
     }
 
-    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
     fn index_based_vector_table(
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
@@ -605,6 +523,20 @@ impl VectorSearchTableFunc {
             if let Some((es_indexes, _)) = find_index_in_table_provider::<ElasticsearchIndex>(tbl) {
                 vector_indexes.extend(
                     es_indexes
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+            }
+        }
+
+        #[cfg(feature = "duckdb")]
+        {
+            use search::index::duckdb::DuckDBVectorIndex;
+            if let Some((duckdb_indexes, _)) =
+                find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
+            {
+                vector_indexes.extend(
+                    duckdb_indexes
                         .into_iter()
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
@@ -645,7 +577,7 @@ impl VectorSearchTableFunc {
             return Ok(None);
         };
 
-        // Index-backed providers (S3 vectors, Elasticsearch, chunked) ignore
+        // Index-backed providers (S3 vectors, Elasticsearch, DuckDB, chunked) ignore
         // `args.distance_metric` because their underlying `SearchIndex::query_table_provider`
         // takes only the query string and uses the metric the index was configured with.
         // Silently picking an index-configured metric while accepting a different one
@@ -716,7 +648,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         };
 
         // For table with a vector engine, use it.
-        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
         if let Some(table_provider) = Self::index_based_vector_table(&table_provider, &args)? {
             return Ok(table_provider);
         }
@@ -851,7 +783,7 @@ impl ScalarUDFImpl for VectorSearchTableFunc {
     }
 }
 
-/// The [`TableProvider`] produced from the [`VECTOR_SEARCH_UDTF_NAME`] UDTF.
+/// A [`TableProvider`] produced from the [`VECTOR_SEARCH_UDTF_NAME`] UDTF for tables that do not have an explicit vector index.
 ///
 /// This provider computes vector similarity scores on-the-fly using the embedding model,
 /// without relying on a pre-built vector index.
@@ -1035,13 +967,25 @@ impl TableProvider for VectorSearchUDTFProvider {
                 }
             })
             .collect();
+
         let mut base_expr = final_expr.clone();
+
+        // Keep the embedding column in the inner projection even when it is not requested
+        // in the final output. This gives `_score` a stable slot that does not collide
+        // with other projected columns (e.g. recency columns used by RRF rewrites).
+        let embedding_col_name = embedding_col!(embed_col);
+        if !base_expr
+            .iter()
+            .any(|expr| expr.qualified_name().1 == embedding_col_name)
+        {
+            base_expr.push(ident(embedding_col_name.clone()));
+        }
 
         // Pick the scoring expression based on the requested distance metric.
         // In all cases the result is monotonically increasing with similarity
         // (higher == more similar) so the downstream `ORDER BY _score DESC` is correct.
         let metric = self.args.distance_metric.unwrap_or(DistanceMetric::Cosine);
-        let embed_expr = ident(embedding_col!(embed_col));
+        let embed_expr = ident(embedding_col_name);
         let query_lit = lit(ScalarValue::FixedSizeList(Arc::new(query_vector)));
 
         let score_expr: Expr = match metric {
@@ -1061,7 +1005,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                     Operator::Minus,
                     Expr::ScalarFunction(ScalarFunction {
                         func: cosine_distance_udf,
-                        args: vec![query_lit, embed_expr],
+                        args: vec![query_lit.clone(), embed_expr.clone()],
                     }),
                 )
             }
@@ -1079,38 +1023,45 @@ impl TableProvider for VectorSearchUDTFProvider {
                     Operator::Minus,
                     Expr::ScalarFunction(ScalarFunction {
                         func: array_distance_udf,
-                        args: vec![query_lit, embed_expr],
+                        args: vec![query_lit.clone(), embed_expr.clone()],
                     }),
                 )
             }
             DistanceMetric::Dot => {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "distance_metric => 'dot' is not yet wired through {VECTOR_SEARCH_UDTF_NAME}. \
-                     For L2-normalized embeddings, use distance_metric => 'cosine' which is \
-                     mathematically equivalent. See https://spiceai.org/docs for roadmap."
-                )));
+                // inner_product already returns higher-is-more-similar; no negation needed.
+                let Some(inner_product_udf) = state
+                    .scalar_functions()
+                    .get(runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME)
+                    .cloned()
+                else {
+                    return Err(DataFusionError::Execution(format!(
+                        "UDF '{}' is required for distance_metric => 'dot' in {VECTOR_SEARCH_UDTF_NAME}, but it is not registered.",
+                        runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME
+                    )));
+                };
+                Expr::ScalarFunction(ScalarFunction {
+                    func: inner_product_udf,
+                    args: vec![query_lit, embed_expr],
+                })
             }
         };
 
-        base_expr.push(score_expr.alias(SEARCH_SCORE_COLUMN_NAME));
+        base_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
 
         // Only project `_score` into the output when the caller asked for it
         // AND either asked for all columns or explicitly projected that index.
         if let Some(idx) = search_field_index
             && (projection.is_none() || projection.is_some_and(|proj| proj.contains(&idx)))
         {
-            final_expr.push(col(SEARCH_SCORE_COLUMN_NAME));
+            final_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
         }
 
         let final_plan = scan
             .project(base_expr)?
-            .sort(vec![SortExpr::new(
-                Expr::Column(Column::from_name(SEARCH_SCORE_COLUMN_NAME)),
-                false,
-                false,
-            )])?
+            .sort(vec![SortExpr::new(score_expr, false, false)])?
             .limit(0, Some(self.limit_to_use(limit)))?
-            // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
+            // Keep the score calculation and helper columns in a subquery,
+            // then project the user-visible output schema.
             .alias("tbl")?
             .project(final_expr)?
             .build()?;
@@ -1140,6 +1091,172 @@ fn alias_value_to_match(
     Ok(Arc::new(ViewTable::new(bldr.project(cols)?.build()?, None)))
 }
 
+/// Split UDTF `args` into positional and named arguments.
+///
+/// Named args are those carrying a `spice.parameter_name` key in their
+/// [`FieldMetadata`] (set by  `name => value` SQL syntax). Returns `(positional, named)`
+/// where `named` maps parameter names to the corresponding expression.
+fn split_named_args(args: &[Expr]) -> (Vec<&Expr>, HashMap<&str, &Expr>) {
+    fn named_param(e: &Expr) -> Option<(&str, &Expr)> {
+        match e {
+            Expr::Literal(_, Some(meta)) => meta
+                .inner()
+                .get("spice.parameter_name")
+                .map(|n| (n.as_str(), e)),
+            Expr::Alias(alias) => alias
+                .metadata
+                .as_ref()
+                .and_then(|m| m.inner().get("spice.parameter_name"))
+                .map(|n| (n.as_str(), alias.expr.as_ref())),
+            _ => None,
+        }
+    }
+    let mut named: HashMap<&str, &Expr> = HashMap::new();
+    let positional: Vec<&Expr> = args
+        .iter()
+        .filter(|a| {
+            if let Some((name, inner)) = named_param(a) {
+                named.insert(name, inner);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (positional, named)
+}
+
+/// Resolve a single UDTF parameter from its positional and named-arg sources.
+///
+/// Returns `Err` if the parameter was supplied both positionally and as a
+/// named argument (ambiguous). Otherwise returns the positional value, the
+/// named value (via `extract`), or `None`.
+fn resolve_positional_or_named<T>(
+    positional: Option<T>,
+    named: &HashMap<&str, &Expr>,
+    name: &str,
+    extract: impl FnOnce(&Expr) -> DataFusionResult<Option<T>>,
+) -> DataFusionResult<Option<T>> {
+    if positional.is_some() && named.contains_key(name) {
+        return Err(DataFusionError::Plan(format!(
+            "Duplicate '{name}' argument: provided both positionally and as a named argument."
+        )));
+    }
+    if positional.is_none()
+        && let Some(expr) = named.get(name)
+    {
+        return extract(expr);
+    }
+    Ok(positional)
+}
+
+/// Parse the optional `(column, limit, include_score)` triplet shared by
+/// `vector_search` and `text_search` UDTFs.
+///
+/// Reads up to three remaining positional args (after `tbl` and `query` have
+/// been consumed), then merges any matching named overrides from `named`.
+/// The `include_score` default (`true`) is applied only after the named-arg
+/// merge so that `include_score => false` is never silently dropped.
+///
+/// `tbl_display` and `query_display` are used only in error messages.
+fn parse_column_limit_score<'a>(
+    positional: &mut impl Iterator<Item = &'a Expr>,
+    named: &HashMap<&str, &Expr>,
+    tbl_display: &str,
+    query_display: &str,
+) -> DataFusionResult<(Option<String>, Option<usize>, Option<bool>)> {
+    let (column, limit, include_score) = match (
+        positional.next(),
+        positional.next(),
+        positional.next(),
+    ) {
+        // No arguments
+        (None, None, None) => (None, None, None),
+
+        // Single argument cases
+        (Some(Expr::Column(Column { name: col, .. })), None, None) => {
+            (Some(col.clone()), None, None)
+        }
+        (Some(Expr::Literal(scalar, None)), None, None) => {
+            if let ScalarValue::Boolean(Some(include_score)) = *scalar {
+                (None, None, Some(include_score))
+            } else {
+                (None, Some(parse_limit_scalar(scalar)?), None)
+            }
+        }
+
+        // 2 of 3 arguments
+        (Some(Expr::Column(Column { name: col, .. })), Some(Expr::Literal(scalar, None)), None) => {
+            if let ScalarValue::Boolean(Some(include_score)) = *scalar {
+                (Some(col.clone()), None, Some(include_score))
+            } else {
+                (Some(col.clone()), Some(parse_limit_scalar(scalar)?), None)
+            }
+        }
+        (
+            Some(Expr::Literal(scalar, None)),
+            Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
+            None,
+        ) => (
+            None,
+            Some(parse_limit_scalar(scalar)?),
+            Some(*include_score),
+        ),
+
+        // All three arguments provided
+        (
+            Some(Expr::Column(Column { name: col, .. })),
+            Some(Expr::Literal(scalar, None)),
+            Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
+        ) => (
+            Some(col.clone()),
+            Some(parse_limit_scalar(scalar)?),
+            Some(*include_score),
+        ),
+
+        // Invalid argument combinations
+        (a, b, c) => {
+            return Err(DataFusionError::Plan(format!(
+                "Invalid arguments: ({tbl_display}, {query_display}, {a:?}, {b:?}, {c:?}. Expected (table, query, [column, limit, include_score])."
+            )));
+        }
+    };
+
+    // Merge named overrides (with conflict detection).
+    let column = resolve_positional_or_named(column, named, "column", |e| match e {
+        Expr::Column(Column { name, .. }) => Ok(Some(name.clone())),
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(Some(s.clone())),
+        other => Err(DataFusionError::Plan(format!(
+            "Named 'column' argument must be a column reference or string, got {other:?}."
+        ))),
+    })?;
+    let limit = resolve_positional_or_named(limit, named, "limit", |e| match e {
+        Expr::Literal(scalar, _) => parse_limit_scalar(scalar).map(Some),
+        other => Err(DataFusionError::Plan(format!(
+            "Named 'limit' argument must be an integer, got {other:?}."
+        ))),
+    })?;
+    let include_score =
+        resolve_positional_or_named(include_score, named, "include_score", |e| match e {
+            Expr::Literal(ScalarValue::Boolean(Some(b)), _) => Ok(Some(*b)),
+            other => Err(DataFusionError::Plan(format!(
+                "Named 'include_score' argument must be a boolean, got {other:?}."
+            ))),
+        })?;
+    // Apply the `include_score` default once named-arg merge is done.
+    let include_score = include_score.or(Some(true));
+
+    let limit_usize = limit
+        .map(|l| {
+            usize::try_from(l).map_err(|_| {
+                DataFusionError::Plan(format!("limit value {l} is out of range for usize."))
+            })
+        })
+        .transpose()?;
+
+    Ok((column, limit_usize, include_score))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{VectorSearchTableFunc, VectorSearchTableFuncArgs, closest_column};
@@ -1148,6 +1265,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::TableProvider;
     use datafusion::datasource::MemTable;
+    use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
     use datafusion::sql::TableReference;
@@ -1155,6 +1273,7 @@ mod tests {
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{col, lit};
     use search::SEARCH_SCORE_COLUMN_NAME;
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -1387,5 +1506,122 @@ mod tests {
             .expect("pushdown check should succeed");
 
         assert_eq!(result, vec![TableProviderFilterPushDown::Exact]);
+    }
+
+    fn named_arg(name: &str, value: ScalarValue) -> Expr {
+        let meta = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            name.to_string(),
+        )]));
+        Expr::Literal(value, Some(meta))
+    }
+
+    #[test]
+    fn parse_args_named_limit_is_honored() {
+        let exprs = vec![
+            Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+            lit_utf8("hello"),
+            named_arg("limit", ScalarValue::Int64(Some(50))),
+        ];
+        let parsed = VectorSearchTableFunc::parse_args(&exprs).expect("Named limit should parse");
+        assert_eq!(parsed.limit, Some(50));
+    }
+
+    #[test]
+    fn parse_args_named_include_score_overrides_default() {
+        let exprs = vec![
+            Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+            lit_utf8("hello"),
+            named_arg("include_score", ScalarValue::Boolean(Some(false))),
+        ];
+        let parsed =
+            VectorSearchTableFunc::parse_args(&exprs).expect("Named include_score should parse");
+        assert_eq!(parsed.include_score, Some(false));
+    }
+
+    #[test]
+    fn parse_args_named_column_is_honored() {
+        let exprs = vec![
+            Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+            lit_utf8("hello"),
+            named_arg("column", ScalarValue::Utf8(Some("body".to_string()))),
+        ];
+        let parsed = VectorSearchTableFunc::parse_args(&exprs).expect("Named column should parse");
+        assert_eq!(parsed.column.as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn parse_args_named_distance_metric_is_honored() {
+        let exprs = vec![
+            Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+            lit_utf8("hello"),
+            named_arg(
+                "distance_metric",
+                ScalarValue::Utf8(Some("dot".to_string())),
+            ),
+        ];
+        let parsed =
+            VectorSearchTableFunc::parse_args(&exprs).expect("Named distance_metric should parse");
+        assert_eq!(parsed.distance_metric, Some(super::DistanceMetric::Dot));
+    }
+
+    #[test]
+    fn parse_args_positional_limit_still_works() {
+        let exprs = vec![
+            Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+            lit_utf8("hello"),
+            Expr::Literal(ScalarValue::Int64(Some(25)), None),
+        ];
+        let parsed =
+            VectorSearchTableFunc::parse_args(&exprs).expect("Positional limit should parse");
+        assert_eq!(parsed.limit, Some(25));
+    }
+
+    #[test]
+    fn parse_args_passthrough_named_arg_is_filtered() {
+        // rank_weight is a passthrough for RRF, should be ignored by vector_search
+        let exprs = vec![
+            Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+            lit_utf8("hello"),
+            named_arg("rank_weight", ScalarValue::Float64(Some(2.0))),
+        ];
+        let parsed = VectorSearchTableFunc::parse_args(&exprs)
+            .expect("Passthrough named arg should be ignored");
+        assert_eq!(parsed.query, "hello");
+        assert_eq!(parsed.limit, None);
+    }
+
+    #[test]
+    fn parse_args_duplicate_positional_and_named_limit_rejected() {
+        let exprs = vec![
+            Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+            lit_utf8("hello"),
+            Expr::Literal(ScalarValue::Int64(Some(10)), None), // positional limit
+            named_arg("limit", ScalarValue::Int64(Some(50))),  // named limit
+        ];
+        let _err = VectorSearchTableFunc::parse_args(&exprs)
+            .expect_err("Duplicate limit should be rejected");
+    }
+
+    #[test]
+    fn parse_args_named_limit_wrong_type_rejected() {
+        let exprs = vec![
+            Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+            lit_utf8("hello"),
+            named_arg("limit", ScalarValue::Boolean(Some(true))),
+        ];
+        let _err = VectorSearchTableFunc::parse_args(&exprs)
+            .expect_err("Boolean limit should be rejected");
+    }
+
+    #[test]
+    fn parse_args_named_column_wrong_type_rejected() {
+        let exprs = vec![
+            Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+            lit_utf8("hello"),
+            named_arg("column", ScalarValue::Int64(Some(42))),
+        ];
+        let _err = VectorSearchTableFunc::parse_args(&exprs)
+            .expect_err("Integer column should be rejected");
     }
 }

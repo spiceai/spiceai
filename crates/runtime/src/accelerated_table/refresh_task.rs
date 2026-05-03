@@ -63,6 +63,7 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use datafusion_optimizer_rules::physical_plan::HttpParamsPushdown;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
@@ -1137,6 +1138,7 @@ impl RefreshTask {
             ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
             .with_optimizer_rule(Arc::new(AvoidDerivedVectorColumnOnIndexRule {}))
+            .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
@@ -1422,7 +1424,7 @@ impl RefreshTask {
                     reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
                 })?;
 
-            if array.is_empty() {
+            if array.is_empty() || array.is_null(0) {
                 return Ok(None);
             }
 
@@ -2514,5 +2516,25 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("id column should be Int32");
         assert_eq!(id_col.value(0), 4, "remaining row should be id=4");
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_timestamp_ns_all_null_returns_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                None, None, None,
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, None);
     }
 }

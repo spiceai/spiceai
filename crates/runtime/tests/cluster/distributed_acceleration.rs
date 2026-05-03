@@ -24,14 +24,13 @@ limitations under the License.
 
 use app::AppBuilder;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::runtime::{
-    PartitionManagement, Runtime as SpicepodRuntime, Scheduler as SchedulerConfig,
-};
+use spicepod::component::runtime::{Runtime as SpicepodRuntime, Scheduler as SchedulerConfig};
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     partitioning::PartitionedBy,
 };
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 
@@ -522,7 +521,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 "baseline should return 10 rows with 2 executors"
             );
 
-            // Shut down executor[0].  The scheduler's PartitionManagementTask (1s interval)
+            // Shut down executor[0].  The scheduler's PartitionAssignmentTask (1s interval)
             // will detect the disconnect and reassign its buckets to executor[1].
             harness.executors[0].shutdown().await;
             harness
@@ -604,11 +603,8 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                         // Limit each executor to 2 of the 4 partitions per table so
                         // that partitions are forced to split across the 2 executors,
                         // producing a UnionExec in the query plan.
-                        cfg.partition_management = Some(PartitionManagement {
-                            interval: "1s".to_string(),
-                            max_partitions_per_executor: 2,
-                            ..Default::default()
-                        });
+                        cfg.partition_assignment_interval = "1s".to_string();
+                        cfg.max_partitions_per_executor = 2;
                         cfg
                     }),
                     ..SpicepodRuntime::default()
@@ -784,6 +780,153 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
         .await
 }
 
+/// Test that on-demand refresh discovers genuinely new partition values from the
+/// source, assigns them in the partition store, and makes the data queryable.
+///
+/// Uses `city` as a column-value partition (not `bucket()`), so each unique city
+/// is its own partition value. The initial CSV has 10 cities. After the cluster
+/// is running, we append a row with a new city ("Seattle") and trigger refresh.
+///
+/// Verifies:
+/// 1. Before refresh: partition store has 10 partition values
+/// 2. After refresh: partition store has 11 partition values (new city discovered + assigned)
+/// 3. All 11 rows are queryable
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=debug,info"))
+        .with_ansi(true)
+        .try_init();
+
+    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let csv_path = csv_tempdir.path().join("test_data.csv");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            // Partition by city (column value), not bucket — each unique city is a partition.
+            let app = AppBuilder::new("test_refresh_discovers_partitions")
+                .with_dataset(make_column_partitioned_dataset(
+                    format!("file:{}", csv_path.display()),
+                    "test_data",
+                    "city",
+                ))
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(
+                        make_named_scheduler_config_with_max_partitions_per_executor(
+                            "test_on_demand_refresh_discovers_new_partitions",
+                            20,
+                        ),
+                    ),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(1)
+                .start()
+                .await?;
+
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+
+            // Wait for partition management cycle to discover and assign all partitions.
+            // The cycle runs every 1s (configured in make_named_scheduler_config).
+            let partition_store = harness
+                .scheduler
+                .partition_store()
+                .expect("scheduler should have partition store");
+            let table_ref = datafusion::sql::TableReference::parse_str("test_data");
+
+            let partitions_assigned =
+                crate::utils::wait_until_true(Duration::from_secs(30), || async {
+                    partition_store.refresh().await.ok();
+                    partition_store
+                        .get_table_metadata(&table_ref)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| {
+                            m.partitions.len() == 10
+                                && m.partitions
+                                    .iter()
+                                    .all(runtime::cluster::PartitionMetadata::is_assigned)
+                        })
+                })
+                .await;
+            assert!(
+                partitions_assigned,
+                "All 10 initial partitions should be discovered and assigned"
+            );
+
+            // Append a row with a NEW city that doesn't exist in the initial data.
+            let new_row = "\n11,New Person,33,Seattle,87\n";
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&csv_path)
+                .await
+                .expect("open csv for append")
+                .write_all(new_row.as_bytes())
+                .await
+                .expect("append new row");
+
+            // Trigger on-demand refresh. PartitionService.discover_and_assign_for_table()
+            // should discover "Seattle" as a new partition value, add it to the store,
+            // assign it, and then forward the refresh to executors.
+            harness
+                .scheduler
+                .datafusion()
+                .refresh_table(&table_ref, None)
+                .await
+                .expect("refresh_table should succeed");
+
+            // Verify partition store: should now have 11 partitions with Seattle present
+            // and assigned. Use polling because S3 writes may not be immediately visible.
+            let seattle_assigned =
+                crate::utils::wait_until_true(Duration::from_secs(30), || async {
+                    partition_store.refresh().await.ok();
+                    partition_store
+                        .get_table_metadata(&table_ref)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| {
+                            m.partitions.len() == 11
+                                && m.partitions.iter().any(|p| {
+                                    p.partition_value.values().any(|v| v == "Seattle")
+                                        && p.is_assigned()
+                                })
+                        })
+                })
+                .await;
+            assert!(
+                seattle_assigned,
+                "Seattle partition should be discovered, added to store, and assigned"
+            );
+
+            // Wait for the executor to pick up the new partition and load the data.
+            // The executor needs to receive the UpdatePartitions message, update its
+            // partition filter, and then the next refresh will include Seattle.
+            wait_for_row_count(&harness, "test_data", 11, Duration::from_secs(60)).await?;
+
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -901,6 +1044,29 @@ fn make_memory_accelerated_dataset(
     dataset
 }
 
+/// Create a dataset partitioned by a raw column value (not `bucket()`).
+/// Each unique value of `partition_column` becomes its own partition.
+fn make_column_partitioned_dataset(
+    source_path: impl Into<String>,
+    name: &str,
+    partition_column: &str,
+) -> Dataset {
+    let mut dataset = Dataset::new(source_path, name);
+
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        mode: Mode::Memory,
+        refresh_mode: Some(RefreshMode::Full),
+        partition_by: vec![PartitionedBy {
+            name: partition_column.to_string(),
+            expression: partition_column.to_string(),
+        }],
+        ..Acceleration::default()
+    });
+
+    dataset
+}
+
 /// Return a `SchedulerConfig` pointing at an S3 path scoped to `test_name`.
 ///
 /// `PartitionManager` uses OCC (optimistic concurrency control) which needs
@@ -936,10 +1102,11 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
                 ("s3_auth".to_string(), "key".to_string()),
             ]),
         )),
-        partition_management: Some(PartitionManagement {
-            max_partitions_per_executor,
-            interval: "1s".to_string(),
-            ..Default::default()
-        }),
+        partition_assignment_interval: "1s".to_string(),
+        max_partition_assignments_per_interval:
+            spicepod::component::runtime::default_max_partition_assignments_per_interval(),
+        max_partitions_per_executor,
+        partition_discovery_timeout:
+            spicepod::component::runtime::default_partition_discovery_timeout(),
     }
 }

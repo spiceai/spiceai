@@ -1,32 +1,29 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.99",
-      "dataset": "spice.public.item",
+      "_score": "0.94",
+      "dataset": "spice.public.catalog_page_with_chunking",
       "matches": {
-        "i_item_desc": [
-          "Patient"
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends con"
         ]
       },
       "primary_key": {
-        "i_item_sk": 19
+        "cp_catalog_page_sk": 1
       }
     },
     {
-      "_score": "0.98",
-      "dataset": "spice.public.item",
+      "_score": "0.94",
+      "dataset": "spice.public.catalog_page_with_chunking_no_pk",
       "matches": {
-        "i_item_desc": [
-          "New"
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends con"
         ]
-      },
-      "primary_key": {
-        "i_item_sk": 7
       }
     }
   ]

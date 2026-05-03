@@ -1,0 +1,5 @@
+---
+source: crates/runtime/tests/search/mod.rs
+description: "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary', answer, 4) WHERE subject != 'math' ORDER BY _score DESC, id"
+---
+Could not prepare EXPLAIN plan. SQL error: "HTTP error: 400 Bad Request - Failed to execute query: Error during planning: User function 'vector_search' is called on table 'spice.public.qs' that does not have an embedding index on 'answer' column. Indexed column(s): question."

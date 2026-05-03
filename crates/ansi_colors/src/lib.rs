@@ -15,8 +15,78 @@ limitations under the License.
 */
 
 //! Simple ANSI color helpers for terminal output.
+//!
+//! Colors are only applied when the output destination is a terminal and the user
+//! hasn't opted out via `NO_COLOR`. The check is lazy and cached once per process
+//! per stream (stdout/stderr), so subsequent calls are a plain atomic load.
 
 use std::fmt::{self, Display};
+#[cfg(not(test))]
+use std::io::IsTerminal;
+use std::sync::OnceLock;
+
+static STDOUT_COLORS: OnceLock<bool> = OnceLock::new();
+static STDERR_COLORS: OnceLock<bool> = OnceLock::new();
+
+/// Which output stream a [`Painted`] is targeted at. The answer to "should we emit
+/// ANSI escapes?" differs for stdout vs stderr (one can be a TTY while the other is
+/// a pipe), so callers declare the target when they create a `Painted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Stdout,
+    Stderr,
+}
+
+#[cfg(not(test))]
+fn check_target(target: Target) -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var_os("FORCE_COLOR").is_some() {
+        return true;
+    }
+    match target {
+        Target::Stdout => std::io::stdout().is_terminal(),
+        Target::Stderr => std::io::stderr().is_terminal(),
+    }
+}
+
+/// Returns `true` when colored output should be emitted for the given stream.
+#[must_use]
+pub fn colors_enabled_for(target: Target) -> bool {
+    let cell = match target {
+        Target::Stdout => &STDOUT_COLORS,
+        Target::Stderr => &STDERR_COLORS,
+    };
+
+    // Internal tests assert literal escape codes, so under cfg(test) we default to
+    // colors enabled. Still respect an explicit override installed via
+    // `set_colors_enabled(...)` before the first use, so tests (here or downstream)
+    // can opt in to "no color" behavior.
+    #[cfg(test)]
+    {
+        cell.get().copied().unwrap_or(true)
+    }
+    #[cfg(not(test))]
+    {
+        *cell.get_or_init(|| check_target(target))
+    }
+}
+
+/// Convenience — whether stdout gets colour. Equivalent to `colors_enabled_for(Target::Stdout)`.
+#[must_use]
+pub fn colors_enabled() -> bool {
+    colors_enabled_for(Target::Stdout)
+}
+
+/// Force-set the color mode for *both* stdout and stderr. Callers should invoke this
+/// once at startup (e.g. for tests or when the CLI knows better than the default
+/// heuristic). After the first read of the relevant cell this call is a no-op for
+/// that stream.
+pub fn set_colors_enabled(enabled: bool) {
+    let _ = STDOUT_COLORS.set(enabled);
+    let _ = STDERR_COLORS.set(enabled);
+}
 
 /// ANSI color codes for terminal output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,10 +128,26 @@ impl Color {
         }
     }
 
-    /// Paint the given text with this color.
+    /// Paint the given text with this color for use with `println!` / stdout.
     #[must_use]
     pub fn paint<S: AsRef<str>>(self, text: S) -> Painted<S> {
-        Painted { color: self, text }
+        Painted {
+            color: self,
+            text,
+            target: Target::Stdout,
+        }
+    }
+
+    /// Paint the given text with this color for use with `eprintln!` / stderr.
+    /// Uses the stderr TTY check so a redirected stderr stays clean even when stdout
+    /// is a terminal (and vice versa).
+    #[must_use]
+    pub fn paint_err<S: AsRef<str>>(self, text: S) -> Painted<S> {
+        Painted {
+            color: self,
+            text,
+            target: Target::Stderr,
+        }
     }
 }
 
@@ -69,11 +155,16 @@ impl Color {
 pub struct Painted<S> {
     color: Color,
     text: S,
+    target: Target,
 }
 
 impl<S: AsRef<str>> Display for Painted<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const RESET: &str = "\x1b[0m";
+
+        if !colors_enabled_for(self.target) {
+            return write!(f, "{}", self.text.as_ref());
+        }
 
         match self.color {
             Color::Fixed(n) => write!(f, "\x1b[38;5;{n}m{}{RESET}", self.text.as_ref()),
@@ -110,6 +201,23 @@ mod tests {
         let painted = Color::Red.paint("Error");
         let output = painted.to_string();
         assert_eq!(output, "\x1b[31mError\x1b[0m");
+    }
+
+    #[test]
+    fn test_paint_err_targets_stderr() {
+        // `paint_err` must produce a Painted tagged for the Stderr target so the
+        // Display impl consults the stderr TTY check, not stdout's.
+        let p = Color::Red.paint_err("Oops");
+        assert_eq!(p.target, Target::Stderr);
+        // Under cfg(test), `colors_enabled_for` returns true for either target, so
+        // the rendered output still contains the escape sequence.
+        assert_eq!(p.to_string(), "\x1b[31mOops\x1b[0m");
+    }
+
+    #[test]
+    fn test_paint_defaults_to_stdout_target() {
+        let p = Color::Red.paint("Hello");
+        assert_eq!(p.target, Target::Stdout);
     }
 
     #[test]

@@ -19,7 +19,7 @@ name = "connector-smb"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "SMB data connector for Spice.ai runtime"
 
 [dependencies]

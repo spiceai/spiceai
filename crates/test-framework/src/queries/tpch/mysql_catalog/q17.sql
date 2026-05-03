@@ -1,8 +1,8 @@
 SELECT
     SUM(l_extendedprice) / 7.0 AS avg_yearly
 FROM
-    mysql.public.lineitem,
-    mysql.public.part
+    mysql.tpch_sf1.lineitem,
+    mysql.tpch_sf1.part
 WHERE
     p_partkey = l_partkey
     AND p_brand = 'Brand#23'
@@ -11,7 +11,7 @@ WHERE
         SELECT
             0.2 * AVG(l_quantity)
         FROM
-            mysql.public.lineitem
+            mysql.tpch_sf1.lineitem
         WHERE
             l_partkey = p_partkey
     );

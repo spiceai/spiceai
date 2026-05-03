@@ -1,6 +1,6 @@
 # HTTP Data Connector with refresh_sql Filters
 
-This example demonstrates how to use `refresh_sql` with filters in the HTTP data connector. When a refresh_sql query includes filters on the `request_path`, `request_query`, or `request_body` columns, the HTTP connector will use those filters to construct the appropriate HTTP requests.
+This example demonstrates how to use `refresh_sql` with filters in the HTTP data connector. When a refresh_sql query includes filters on the `request_path`, `request_query`, `request_body`, or `request_headers` columns, the HTTP connector will use those filters to construct the appropriate HTTP requests.
 
 ## Basic Example
 
@@ -94,27 +94,53 @@ This creates a cross product, making four requests:
 - `https://api.example.com/api/posts?status=active`
 - `https://api.example.com/api/posts?status=inactive`
 
+### Dynamic Request Headers
+
+```yaml
+datasets:
+  - from: https://api.example.com
+    name: sandbox_data
+    params:
+      request_header_filters: enabled
+      request_header_allowlist: x-sandbox-id
+      max_request_partitions: 10000
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_headers, content
+        FROM sandbox_data
+        WHERE request_headers IN (
+          '{"x-sandbox-id":"sandbox-1"}',
+          '{"x-sandbox-id":"sandbox-2"}'
+        )
+```
+
+This makes one request per `request_headers` value, setting the allowed header values on each request before combining the results.
+
 ## Supported Filter Expressions
 
-The HTTP connector's `refresh_sql` supports the following filter expressions on `request_path`, `request_query`, and `request_body` columns:
+The HTTP connector's `refresh_sql` supports the following filter expressions on `request_path`, `request_query`, `request_body`, and `request_headers` columns:
 
 1. **Equality (`=`)**: `WHERE request_path = '/api/users'`
 2. **IN Lists**: `WHERE request_path IN ('/api/users', '/api/posts')`
-3. **OR expressions**: `WHERE request_path = '/api/users' OR request_path = '/api/posts'`
+3. **OR expressions** (single column only): `WHERE request_path = '/api/users' OR request_path = '/api/posts'`. OR across **different** filter columns is not supported — use separate queries (e.g. `UNION ALL`).
 4. **AND expressions**: `WHERE request_path = '/api/users' AND request_query = 'limit=10'`
 5. **POST requests**: `WHERE request_body = '{"key": "value"}'` (triggers POST with `http_post_content_type`)
-6. **Combinations**: Complex combinations of the above
+6. **Dynamic headers**: `WHERE request_headers IN ('{"x-sandbox-id":"sandbox-1"}', '{"x-sandbox-id":"sandbox-2"}')`
+7. **Combinations**: Complex combinations of the above
 
 ## How It Works
 
-1. **Filter Pushdown**: When refresh_sql contains filters on `request_path`, `request_query`, or `request_body` columns, DataFusion pushes these filters down to the HTTP table provider's `scan` method.
+1. **Filter Pushdown**: When refresh_sql contains filters on `request_path`, `request_query`, `request_body`, or `request_headers` columns, DataFusion pushes these filters down to the HTTP table provider's `scan` method.
 
-2. **Partition Extraction**: The `extract_partitions` method recursively analyzes the filter expressions to extract all unique `(request_path, request_query, request_body)` combinations.
+2. **Partition Extraction**: The `extract_partitions` method recursively analyzes the filter expressions to extract all unique `(request_path, request_query, request_body, request_headers)` combinations.
 
 3. **HTTP Request Construction**: For each partition, the provider constructs the appropriate HTTP request by:
    - Appending the `request_path` filter value to the base URL's path
    - Adding the `request_query` filter value as the query string
    - Using POST method with `request_body` content if `request_body` filter is present
+   - Parsing `request_headers` as a JSON object and setting the allowlisted headers on the request
 
 4. **Content Parsing**: Response content is parsed based on format:
    - **JSON arrays**: Each element becomes a separate row
@@ -127,26 +153,30 @@ The HTTP connector's `refresh_sql` supports the following filter expressions on 
 ## Performance Considerations
 
 - **Caching**: The HTTP connector respects `Cache-Control` headers and caches responses when `max-age` is set.
-- **Parallel Execution**: Multiple endpoints (from IN lists or OR expressions) are fetched in parallel.
+- **Parallel Execution**: Multiple endpoints (from IN lists or single-column OR expressions) are fetched in parallel.
 - **Filter Selectivity**: Use specific filters to minimize unnecessary HTTP requests.
+- **Partition Limits**: Use `max_request_partitions` to cap the number of HTTP requests created from cross-product filters.
 
 ## Schema
 
-The HTTP connector provides four metadata columns:
+The HTTP connector provides metadata columns:
 
 - `request_path` (String, NOT NULL): The path portion of the URL used for this row's request
-- `request_query` (String, NOT NULL): The query string portion of the URL (empty string if none)
-- `request_body` (String, NOT NULL): The request body for POST requests (empty string if none)
+- `request_query` (String, NULL): The query string portion of the URL. When no query string is provided, the current provider emits an empty string rather than SQL `NULL`.
+- `request_body` (String, NULL): The request body for POST requests. When no request body is provided, the current provider emits an empty string rather than SQL `NULL`.
+- `request_headers` (String, NULL): The JSON request headers object used for this row's request. When no request-specific headers are provided, the current provider emits an empty string rather than SQL `NULL`.
 - `content` (String, NOT NULL): The parsed content from the response
 
-**Row Expansion**: When a response contains a JSON array or newline-delimited JSON (NDJSON), each item becomes a separate row with the same `request_path`, `request_query`, and `request_body` values but different `content`.
+**Row Expansion**: When a response contains a JSON array or newline-delimited JSON (NDJSON), each item becomes a separate row with the same `request_path`, `request_query`, `request_body`, and `request_headers` values but different `content`.
 
 ## Notes
 
 - If no `request_path` filter is provided, the base URL's path is used as-is
 - If no `request_query` filter is provided, no query string is added
 - If no `request_body` filter is provided, GET method is used
+- If no `request_headers` filter is provided, only the static `http_headers` configuration is used
 - When `request_body` filter is present, POST method is used with `http_post_content_type` parameter (default: `application/json`)
+- When `request_headers` filter is present, `request_header_filters` must be `enabled`, and every header name must be listed in `request_header_allowlist`
 - The `file_format` parameter must be omitted or set to `json` or `auto` to use the filter-based approach
 - For other formats (CSV, Parquet, etc.), use the listing table connector approach
 - Use `max_retries` parameter to configure retry attempts (default: 3)

@@ -75,6 +75,10 @@ pub struct GeneratePackageRequest {
     )
 ))]
 pub(crate) async fn generate(Json(payload): Json<GeneratePackageRequest>) -> Response {
+    if let Some(response) = super::require_write_access().await {
+        return response;
+    }
+
     if !payload.from.starts_with("github:") {
         return (
             StatusCode::BAD_REQUEST,

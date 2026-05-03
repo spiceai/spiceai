@@ -36,9 +36,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::{any::Any, sync::Arc};
+use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use tonic::async_trait;
 
@@ -160,6 +161,16 @@ pub struct KafkaMetrics {
     pub records_consumed: AtomicU64,
     /// Total bytes consumed
     pub bytes_consumed: AtomicU64,
+    /// Set to true the first time the rdkafka stats callback fires with at
+    /// least one valid partition. Until this flips, `records_lag == 0` only
+    /// means "we haven't observed any stats yet", not "the consumer is
+    /// caught up".
+    pub has_received_stats: AtomicBool,
+    /// Notified by the stats callback whenever the consumer is observed to
+    /// be caught up (received at least one valid stats sample with
+    /// `total_lag == 0`). Used by CDC connectors to emit a synthetic
+    /// ready-signal envelope on quiet topics without polling.
+    pub caught_up: Notify,
 }
 
 struct KafkaConsumerContext {
@@ -189,6 +200,24 @@ impl KafkaMetrics {
     pub fn update_bytes_consumed(&self, bytes: u64) {
         self.bytes_consumed.store(bytes, Ordering::Relaxed);
     }
+
+    /// Returns true once the consumer has received at least one statistics
+    /// callback that reported valid partitions and the most recent total lag
+    /// across those partitions is zero.
+    ///
+    /// Uses Acquire ordering on `has_received_stats` so that an observer that
+    /// sees the flag set is guaranteed to also see the matching Release-stored
+    /// `records_lag` value from the same stats callback (and not a stale
+    /// default 0).
+    ///
+    /// Used by CDC connectors to decide when to emit a synthetic
+    /// `is_dataset_ready=true` envelope on quiet topics. See the
+    /// [`crate::cdc::ChangesStream`] readiness contract.
+    #[must_use]
+    pub fn is_caught_up(&self) -> bool {
+        self.has_received_stats.load(Ordering::Acquire)
+            && self.records_lag.load(Ordering::Relaxed) == 0
+    }
 }
 
 impl rdkafka::ClientContext for KafkaConsumerContext {
@@ -210,7 +239,21 @@ impl rdkafka::ClientContext for KafkaConsumerContext {
 
         // Update total lag only if we have valid partitions to avoid misleading data
         if has_valid_partitions {
+            // Pair these stores with the Acquire load in `is_caught_up`:
+            // store the lag first (Relaxed is sufficient since the Release
+            // store below acts as the release fence), then publish the
+            // "stats received" flag with Release so any observer that sees
+            // the flag set also sees this exact lag value.
             self.metrics.update_records_lag(total_lag);
+            self.metrics
+                .has_received_stats
+                .store(true, Ordering::Release);
+            if total_lag == 0 {
+                // Wake any task waiting on `KafkaMetrics::caught_up` (e.g.
+                // the CDC ready-signal wrapper). Cheap and idempotent: if no
+                // one is waiting, the permit is stored for the next waiter.
+                self.metrics.caught_up.notify_one();
+            }
         }
 
         self.metrics
@@ -682,7 +725,8 @@ impl Kafka {
         let schema = Arc::clone(&self.schema);
         let flatten_json = self.flatten_json.clone();
         let consumer = self.consumer;
-        let stream = self
+        let metrics = Arc::clone(self.consumer.metrics());
+        let inner = self
             .consumer
             .stream_json::<serde_json::Value, serde_json::Value>()
             .chunks_timeout(self.batching.0, self.batching.1)
@@ -710,7 +754,11 @@ impl Kafka {
                 change_batch.map(|rb| ChangeEnvelope::new(Box::new(committer), rb, true))
             });
 
-        Box::pin(stream)
+        Box::pin(inject_ready_signal_on_caught_up(
+            inner,
+            metrics,
+            Arc::clone(&self.schema),
+        ))
     }
 }
 
@@ -777,6 +825,84 @@ impl TableProvider for Kafka {
             &self.schema,
             projection,
         )?)))
+    }
+}
+
+/// Wraps an inner Kafka-derived `ChangesStream` and emits a single synthetic
+/// `is_dataset_ready=true` [`ChangeEnvelope`] (built via
+/// [`cdc::build_ready_signal_envelope`]) once the underlying consumer reports
+/// it has caught up to the source (`KafkaMetrics::caught_up` is notified by
+/// the stats callback when `total_lag == 0`). The wrapper stops watching
+/// after the first ready signal (whether emitted by the wrapper or carried
+/// by a real change envelope).
+///
+/// This satisfies the [`cdc::ChangesStream`] readiness contract for quiet
+/// topics where no actual change events are available to flip the
+/// `is_dataset_ready` flag (e.g. on restart against an already-populated
+/// accelerator). See <https://github.com/spiceai/spiceai/issues/5201>.
+pub(crate) fn inject_ready_signal_on_caught_up<S>(
+    inner: S,
+    metrics: Arc<KafkaMetrics>,
+    schema: SchemaRef,
+) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>>
+where
+    S: Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> + Send + 'static,
+{
+    async_stream::stream! {
+        let mut inner = Box::pin(inner);
+        let mut ready_emitted = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                next = inner.next() => match next {
+                    Some(item) => {
+                        if !ready_emitted
+                            && let Ok(ref env) = item
+                            && env.is_dataset_ready()
+                        {
+                            ready_emitted = true;
+                        }
+                        yield item;
+                    }
+                    None => break,
+                },
+                () = metrics.caught_up.notified(), if !ready_emitted => {
+                    // Re-check under the same memory ordering as the
+                    // notifier; `notified()` may wake spuriously if the
+                    // notifier raced with another waiter.
+                    if metrics.is_caught_up() {
+                        match cdc::build_ready_signal_envelope(&schema) {
+                            Ok(env) => {
+                                ready_emitted = true;
+                                tracing::debug!(
+                                    "Kafka consumer reports zero lag; emitting synthetic ready signal envelope"
+                                );
+                                yield Ok(env);
+                            }
+                            Err(e) => {
+                                // Building the envelope is schema-driven and
+                                // therefore deterministic: a failure here
+                                // will repeat on every wake-up. Surface it
+                                // as a stream error and stop the synthetic
+                                // ready-signal path so we don't spam logs
+                                // forever — the inner stream still runs and
+                                // can deliver readiness via a real envelope
+                                // if any change event ever arrives.
+                                tracing::error!(
+                                    "Failed to build Kafka ready-signal envelope; \
+                                     synthetic readiness disabled for this stream: {e}"
+                                );
+                                ready_emitted = true;
+                                yield Err(cdc::StreamError::Arrow(format!(
+                                    "failed to build Kafka ready-signal envelope: {e}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -982,6 +1108,75 @@ mod tests {
             batch.record.num_rows(),
             1025,
             "1025 rows should not be truncated to 1024"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ready_signal_emitted_when_caught_up_on_quiet_stream() {
+        // Inner stream that produces nothing (quiet topic).
+        let inner = futures::stream::pending::<Result<ChangeEnvelope, cdc::StreamError>>();
+
+        let metrics = Arc::new(KafkaMetrics::default());
+        // Simulate a stats callback observing zero lag: flip the flag and
+        // notify the wrapper.
+        metrics
+            .has_received_stats
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        metrics.caught_up.notify_one();
+
+        let schema = test_schema();
+        let stream = inject_ready_signal_on_caught_up(inner, Arc::clone(&metrics), schema);
+
+        // Should yield a ready envelope essentially immediately.
+        let next = tokio::time::timeout(Duration::from_secs(1), Box::pin(stream).next())
+            .await
+            .expect("ready envelope should be emitted promptly after notification")
+            .expect("stream produced an item")
+            .expect("item is Ok");
+
+        assert!(next.is_dataset_ready(), "envelope must flag dataset ready");
+        assert_eq!(
+            next.change_batch.record.num_rows(),
+            0,
+            "ready signal envelope must carry zero rows"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ready_signal_not_emitted_before_stats_received() {
+        let inner = futures::stream::pending::<Result<ChangeEnvelope, cdc::StreamError>>();
+
+        let metrics = Arc::new(KafkaMetrics::default());
+        // No stats callback yet — nothing notified, has_received_stats=false.
+
+        let schema = test_schema();
+        let stream = inject_ready_signal_on_caught_up(inner, Arc::clone(&metrics), schema);
+
+        let res = tokio::time::timeout(Duration::from_millis(500), Box::pin(stream).next()).await;
+        assert!(
+            res.is_err(),
+            "no ready envelope must be emitted before stats are received"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spurious_notify_without_caught_up_does_not_emit() {
+        // Verifies the re-check guard inside the wrapper: a stale notify
+        // permit must not cause a false ready signal if the consumer is no
+        // longer caught up.
+        let inner = futures::stream::pending::<Result<ChangeEnvelope, cdc::StreamError>>();
+
+        let metrics = Arc::new(KafkaMetrics::default());
+        // Notify but leave has_received_stats=false (e.g. callback never ran).
+        metrics.caught_up.notify_one();
+
+        let schema = test_schema();
+        let stream = inject_ready_signal_on_caught_up(inner, Arc::clone(&metrics), schema);
+
+        let res = tokio::time::timeout(Duration::from_millis(500), Box::pin(stream).next()).await;
+        assert!(
+            res.is_err(),
+            "spurious notify without is_caught_up must not produce a ready envelope"
         );
     }
 }

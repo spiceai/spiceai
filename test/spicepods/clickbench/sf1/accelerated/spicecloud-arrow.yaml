@@ -19,7 +19,7 @@ datasets:
         )
         -- Add more generic data to get close to limit
         OR (
-          date_trunc('day', from_unixtime("EventTime")) >= '2013-07-01' AND date_trunc('day', from_unixtime("EventTime")) <= '2013-07-14'
+          date_trunc('day', to_timestamp("EventTime")) >= '2013-07-01' AND date_trunc('day', to_timestamp("EventTime")) <= '2013-07-14'
         )
         LIMIT 50000000
     params:
