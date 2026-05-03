@@ -75,6 +75,7 @@ pub(crate) async fn prepare_model_tools(
             }
         }
         SpiceToolsOptions::Auto
+        | SpiceToolsOptions::All
         | SpiceToolsOptions::Nsql
         | SpiceToolsOptions::Disabled
         | SpiceToolsOptions::Specific(_) => Ok(tools),
