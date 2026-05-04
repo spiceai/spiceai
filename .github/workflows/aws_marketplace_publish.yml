@@ -35,6 +35,11 @@ on:
         required: false
         default: true
         type: boolean
+      version_suffix:
+        description: 'Optional suffix appended to all published tags (e.g., .1 produces 2.0.0-rc.4-enterprise.1). Use to publish corrected images when the original immutable tags are occupied.'
+        required: false
+        default: ''
+        type: string
       allowed_account_ids:
         description: 'Comma-separated AWS account IDs to grant read-only pull access'
         required: false
@@ -67,14 +72,15 @@ jobs:
           echo "repositories=${REPOS_JSON}" >> "$GITHUB_OUTPUT"
           echo "Repositories to publish: ${REPOS_JSON}"
 
-          # Build the list of tags from version + variants (tag = {version}-{variant})
+          # Build the list of tags from version + variants (tag = {version}-{variant}{suffix})
           VERSION="${{ inputs.version }}"
           VARIANTS="${{ inputs.variants }}"
-          TAGS_JSON=$(echo "${VARIANTS}" | jq -cR --arg v "${VERSION}" '
+          SUFFIX="${{ inputs.version_suffix }}"
+          TAGS_JSON=$(echo "${VARIANTS}" | jq -cR --arg v "${VERSION}" --arg s "${SUFFIX}" '
             split(",")
             | map(ltrimstr(" ") | rtrimstr(" "))
             | map(select(length > 0))
-            | map($v + "-" + .)
+            | map($v + "-" + . + $s)
           ')
           if ! echo "${TAGS_JSON}" | jq -e 'length > 0' >/dev/null; then
             echo "::error title=Invalid variants input::No publishable tags were produced from inputs.variants='${VARIANTS}'. Provide at least one non-empty variant."
@@ -119,7 +125,8 @@ jobs:
       - name: Pull, tag and push images
         env:
           TAG: ${{ matrix.tag }}
-          OLD_TAG: ghcr.io/spicehq/spiceai-enterprise:${{ matrix.tag }}
+          # Source image from GHCR uses the unsuffixed tag (the original build tag)
+          SUFFIX: ${{ inputs.version_suffix }}
           NEW_TAG: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${{ matrix.tag }}
         run: |
           set -e  # Exit on error
@@ -138,6 +145,13 @@ jobs:
           if [ ${#PLATFORMS[@]} -eq 0 ]; then
             echo "Error: No platforms specified"
             exit 1
+          fi
+
+          # Derive the GHCR source tag by stripping the version suffix (source images are unsuffixed)
+          if [ -n "${SUFFIX}" ]; then
+            OLD_TAG="ghcr.io/spicehq/spiceai-enterprise:${TAG%"${SUFFIX}"}"
+          else
+            OLD_TAG="ghcr.io/spicehq/spiceai-enterprise:${TAG}"
           fi
 
           echo "Publishing tag: ${TAG}"
@@ -261,18 +275,23 @@ jobs:
             echo "Error: inputs.variants is empty; cannot determine chart version."
             exit 1
           fi
-          FIRST_TAG="${{ inputs.version }}-${FIRST_VARIANT}"
+          SUFFIX="${{ inputs.version_suffix }}"
+          FIRST_TAG="${{ inputs.version }}-${FIRST_VARIANT}${SUFFIX}"
+          HELM_TAG="${{ inputs.version }}-${FIRST_VARIANT}-helm${SUFFIX}"
 
           # Update Chart.yaml: rename chart to match target repository and align version
           # with the dispatched release so the published chart and image stay in sync.
+          # The chart version uses a -helm suffix to avoid colliding with runtime image tags.
           sed -i "s/^name: spiceai-enterprise$/name: ${CHART_NAME}/" Chart.yaml
-          sed -i "s/^version: .*/version: ${FIRST_TAG}/" Chart.yaml
+          sed -i "s/^version: .*/version: ${HELM_TAG}/" Chart.yaml
           if grep -q '^appVersion:' Chart.yaml; then
             sed -i "s/^appVersion: .*/appVersion: ${FIRST_TAG}/" Chart.yaml
           fi
 
           # Update values.yaml to use ECR image. When multiple variants are provided, use the first.
+          # The image tag in values.yaml stays as FIRST_TAG (the runtime image tag, not the helm tag).
           echo "Using image tag for Helm chart: ${FIRST_TAG}"
+          echo "Helm chart OCI tag: ${HELM_TAG}"
           sed -i 's|repository: ghcr.io/spicehq/spiceai-enterprise|repository: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}|' values.yaml
           sed -i "s/tag: .*/tag: ${FIRST_TAG}/" values.yaml
 
