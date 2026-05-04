@@ -2001,6 +2001,7 @@ impl ExecutionPlan for HttpExec {
                 done: false,
                 last_page_path: None,
                 last_page_query: None,
+                seen_page_urls: HashSet::new(),
             };
 
             let stream = futures::stream::try_unfold(initial_state, move |mut state| {
@@ -2037,7 +2038,7 @@ impl ExecutionPlan for HttpExec {
 
                         // Fetch this page
                         let fetch_result = if state.page == 0 {
-                            let path_val = state.path.as_deref().unwrap_or("");
+                            let path_val = state.path.clone().unwrap_or_default();
                             let body_val = state.body.as_deref();
                             let merged_query = if let Some(ref template) = config.query_params {
                                 let page_size = config.page_size.unwrap_or(0);
@@ -2054,11 +2055,16 @@ impl ExecutionPlan for HttpExec {
                                     state.query.as_deref(),
                                 )
                             };
+                            let request_url = provider
+                                .build_request_url(&path_val, merged_query.as_deref())
+                                .map_err(DataFusionError::from)?;
+                            record_pagination_request_url(&mut state, &request_url)
+                                .map_err(DataFusionError::from)?;
                             state.last_page_path = state.path.clone();
                             state.last_page_query = merged_query.clone();
                             provider
                                 .get_response(
-                                    path_val,
+                                    &path_val,
                                     merged_query.as_deref(),
                                     body_val,
                                     state.request_headers.as_deref(),
@@ -2076,7 +2082,7 @@ impl ExecutionPlan for HttpExec {
                             // Subsequent pages bypass the HTTP cache intentionally:
                             // each page has unique content that shouldn't be cached
                             // under the same key as the base request.
-                            match &state.next_info {
+                            match state.next_info.clone() {
                                 Some(NextPageInfo::Url(url)) => {
                                     if let Some((globset, patterns)) = &provider.allowed_paths
                                         && !globset.is_match(url.path())
@@ -2095,11 +2101,13 @@ impl ExecutionPlan for HttpExec {
                                             },
                                         )));
                                     }
+                                    record_pagination_request_url(&mut state, &url)
+                                        .map_err(DataFusionError::from)?;
                                     state.last_page_path = Some(url.path().to_string());
                                     state.last_page_query = url.query().map(ToString::to_string);
                                     provider
                                         .perform_request_with_retry(
-                                            url.clone(),
+                                            url,
                                             state.body.as_deref(),
                                             parsed_request_headers.as_ref(),
                                             &format!("page_{}", state.page),
@@ -2116,12 +2124,14 @@ impl ExecutionPlan for HttpExec {
                                         base_query,
                                         state.query.as_deref(),
                                         token_param,
-                                        token,
+                                        &token,
                                     );
                                     state.last_page_path = state.path.clone();
                                     state.last_page_query = Some(merged_query.clone());
                                     let url = provider
                                         .build_request_url(path_val, Some(&merged_query))
+                                        .map_err(DataFusionError::from)?;
+                                    record_pagination_request_url(&mut state, &url)
                                         .map_err(DataFusionError::from)?;
                                     provider
                                         .perform_request_with_retry(
@@ -2138,7 +2148,7 @@ impl ExecutionPlan for HttpExec {
                                     let template = config.query_params.as_deref().unwrap_or("");
                                     let page_size = config.page_size.unwrap_or(0);
                                     let expanded =
-                                        expand_query_params_template(template, *page, page_size)?;
+                                        expand_query_params_template(template, page, page_size)?;
                                     let merged_query =
                                         merge_base_and_partition_queries_with_override(
                                             provider.base_url.query(),
@@ -2149,6 +2159,8 @@ impl ExecutionPlan for HttpExec {
                                     state.last_page_query = Some(merged_query.clone());
                                     let url = provider
                                         .build_request_url(path_val, Some(&merged_query))
+                                        .map_err(DataFusionError::from)?;
+                                    record_pagination_request_url(&mut state, &url)
                                         .map_err(DataFusionError::from)?;
                                     provider
                                         .perform_request_with_retry(
@@ -2306,6 +2318,27 @@ struct PaginationState {
     /// Used to populate accurate `request_path`/`request_query` columns.
     last_page_path: Option<String>,
     last_page_query: Option<String>,
+    seen_page_urls: HashSet<String>,
+}
+
+fn pagination_request_label(url: &Url) -> String {
+    let mut hasher = DefaultHasher::new();
+    url.as_str().hash(&mut hasher);
+    format!("http-pagination-request:{:016x}", hasher.finish())
+}
+
+fn record_pagination_request_url(state: &mut PaginationState, url: &Url) -> Result<()> {
+    let request_url = url.as_str().to_string();
+    ensure!(
+        state.seen_page_urls.insert(request_url),
+        PaginationSnafu {
+            message: format!(
+                "HTTP pagination detected a repeated next page request ({}). The connector stopped before fetching duplicate rows. Check pagination_next_pointer, pagination_link_header, pagination_token_param, or pagination_query_params.",
+                pagination_request_label(url)
+            )
+        }
+    );
+    Ok(())
 }
 
 /// Resolve a next-page URL string (absolute or relative) against the base URL
@@ -5514,6 +5547,40 @@ mod tests {
                 assert!(
                     message.contains("pagination_max_pages"),
                     "error should mention pagination_max_pages: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pagination_rejects_repeated_request_url() {
+        let mut state = PaginationState {
+            page: 1,
+            next_info: None,
+            rows_fetched: 0,
+            path: None,
+            query: None,
+            body: None,
+            request_headers: None,
+            limit: None,
+            done: false,
+            last_page_path: None,
+            last_page_query: None,
+            seen_page_urls: HashSet::new(),
+        };
+        let url =
+            Url::parse("https://api.example.com/items?page=2").expect("test URL should be valid");
+
+        record_pagination_request_url(&mut state, &url).expect("first request should be accepted");
+        let error = record_pagination_request_url(&mut state, &url)
+            .expect_err("repeated request should fail");
+
+        match error {
+            Error::Pagination { message } => {
+                assert!(
+                    message.contains("repeated next page request"),
+                    "error should mention repeated pagination request: {message}"
                 );
             }
             other => panic!("Unexpected error: {other:?}"),
