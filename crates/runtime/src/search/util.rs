@@ -278,11 +278,10 @@ pub async fn full_text_search_candidates(
     tbl: &TableReference,
 ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
     let base_table_provider = df.get_table(tbl).await?;
-    let index_table_provider = Arc::clone(&base_table_provider);
 
     // If the table exists, but does not have full text search support, return no candidates.
     let Some(indexed_table) =
-        find_concrete_table_provider::<IndexedTableProvider>(&index_table_provider)
+        find_concrete_table_provider::<IndexedTableProvider>(&base_table_provider)
     else {
         return Some(Ok(vec![]));
     };
@@ -304,16 +303,13 @@ pub async fn full_text_search_candidates(
     #[cfg(feature = "elasticsearch")]
     {
         use search::index::elasticsearch::ElasticsearchTextIndex;
-        if let Some((es_indexes, _)) =
-            find_index_in_table_provider::<ElasticsearchTextIndex>(&index_table_provider)
-        {
-            if !es_indexes.is_empty() {
-                return Some(
-                    as_es_text_candidate_generations(es_indexes, Arc::clone(df), tbl.clone())
-                        .await
-                        .context(SearchGenerationSnafu),
-                );
-            }
+        let es_indexes = indexed_table.get_indexes::<ElasticsearchTextIndex>();
+        if !es_indexes.is_empty() {
+            return Some(
+                as_es_text_candidate_generations(es_indexes, Arc::clone(df), tbl.clone())
+                    .await
+                    .context(SearchGenerationSnafu),
+            );
         }
     }
 
