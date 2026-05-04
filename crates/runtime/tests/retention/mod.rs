@@ -49,6 +49,10 @@ fn make_spiceai_dataset(path: &str, name: &str, engine: &str, retention_sql: &st
         retention_check_interval: Some("200ms".to_string()),
         ..Default::default()
     });
+    ds.params = Some(Params::from_string_map(HashMap::from([(
+        "spiceai_region".to_string(),
+        "us-east-1".to_string(),
+    )])));
     ds
 }
 

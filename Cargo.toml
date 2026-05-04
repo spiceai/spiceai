@@ -64,6 +64,7 @@ members = [
     "crates/workers",
     "crates/yaml",
     "crates/scheduler",
+    "crates/smb",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
     "tools/flight-cookie-server/",
@@ -107,7 +108,7 @@ arrow-json = "57.0.0"
 arrow-odbc = { git = "https://github.com/pacman82/arrow-odbc", rev = "7316b13" }
 arrow-row = "57.0.0"
 arrow-schema = "57.0.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "7d5d31718143bf847cbc46286d4be26f035b58a0", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "8dbb88bcd14b70dfd92ddd02aeb9f31112c7b63b", features = [
     "byot",
     "embedding",
     "chat-completion",
