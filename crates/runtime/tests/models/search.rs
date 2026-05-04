@@ -45,7 +45,7 @@ use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfi
 #[cfg(feature = "duckdb")]
 use spicepod::vector::VectorStore;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Instant;
@@ -473,6 +473,63 @@ fn normalize_search_response(json: Value) -> String {
     serde_json::to_string_pretty(&normalize_search_response_json(json, false)).unwrap_or_default()
 }
 
+/// Normalize a `/v1/sql` HTTP response for stable snapshotting.
+///
+/// SQL responses are top-level JSON arrays of row objects. When a row contains
+/// a `_score` column (e.g. the SELECT aliases `trunc(_score, 2) as _score`),
+/// the underlying raw score can vary by ±0.01 across CI runners, which both
+/// flips row ordering near rounding boundaries and changes the printed score.
+/// Redact `_score` to a placeholder and re-sort on the rounded score (with a
+/// stable secondary key on the rest of the row) so snapshots are deterministic.
+fn normalize_sql_response_json(mut json: Value) -> Value {
+    if let Some(rows) = json.as_array_mut() {
+        let has_score = rows
+            .iter()
+            .any(|r| r.as_object().is_some_and(|o| o.contains_key("_score")));
+        if has_score {
+            rows.sort_by(|a, b| {
+                let score_a = a.get("_score").and_then(Value::as_f64);
+                let score_b = b.get("_score").and_then(Value::as_f64);
+                if let (Some(sa), Some(sb)) = (score_a, score_b) {
+                    let ra = (100.0 * sa).round() / 100.0;
+                    let rb = (100.0 * sb).round() / 100.0;
+                    if ra > rb {
+                        return Ordering::Less;
+                    } else if ra < rb {
+                        return Ordering::Greater;
+                    }
+                }
+                let key_a = row_tiebreak_key(a);
+                let key_b = row_tiebreak_key(b);
+                key_a.cmp(&key_b)
+            });
+
+            for row in rows {
+                if let Some(obj) = row.as_object_mut()
+                    && obj.contains_key("_score")
+                {
+                    obj.insert("_score".to_string(), Value::String("[score]".to_string()));
+                }
+            }
+        }
+    }
+    json
+}
+
+fn row_tiebreak_key(row: &Value) -> String {
+    let Some(obj) = row.as_object() else {
+        return serde_json::to_string(row).unwrap_or_default();
+    };
+    let mut sanitized: BTreeMap<String, Value> = BTreeMap::new();
+    for (k, v) in obj {
+        if k == "_score" {
+            continue;
+        }
+        sanitized.insert(k.clone(), v.clone());
+    }
+    serde_json::to_string(&sanitized).unwrap_or_default()
+}
+
 fn quote_sql_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -659,7 +716,8 @@ pub(crate) async fn run_search_w_explain(
                             continue;
                         }
 
-                        insta::assert_json_snapshot!(test_name.clone(), resp?);
+                        let normalized = normalize_sql_response_json(resp?);
+                        insta::assert_json_snapshot!(test_name.clone(), normalized);
 
                         if explain_sql {
                             let c: Vec<arrow::record_batch::RecordBatch> = client
