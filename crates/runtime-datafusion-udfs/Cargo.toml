@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
+arrow-ipc.workspace = true
 arrow-json.workspace = true
 arrow-schema.workspace = true
 async-openai.workspace = true
@@ -18,6 +19,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 datafusion-datasource.workspace = true
 futures.workspace = true
+blake3 = { workspace = true, optional = true }
 llms = { path = "../llms", default-features = false, optional = true }
 reqwest = { workspace = true, optional = true }
 runtime-auth = { path = "../runtime-auth", optional = true }
@@ -33,6 +35,7 @@ tokio.workspace = true
 tracing.workspace = true
 url = { workspace = true, optional = true }
 util = { path = "../util" }
+wasmtime = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-stream.workspace = true
@@ -41,8 +44,11 @@ governor.workspace = true
 insta.workspace = true
 tracing-subscriber.workspace = true
 tracing-test = "0.2"
+wat.workspace = true
 
 [features]
 default = []
 http-functions = ["dep:reqwest", "dep:runtime-auth", "dep:url"]
 models = ["dep:llms"]
+wasm-functions = ["dep:wasmtime"]
+wasm-functions-compile = ["wasm-functions", "dep:blake3"]

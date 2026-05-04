@@ -1000,6 +1000,7 @@ mod tests {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
+                tables: vec![],
                 returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: None,
@@ -1028,6 +1029,7 @@ mod tests {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
+                tables: vec![],
                 returns: Some(FunctionReturns::Table(vec![
                     FunctionArg {
                         name: "value".into(),

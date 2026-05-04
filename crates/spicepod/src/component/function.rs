@@ -24,14 +24,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A user-defined SQL function registered into the `DataFusion` session context.
+/// A user-defined function registered into the `DataFusion` session context.
 ///
 /// The `from` field selects the execution tier:
 ///   * `sql` - inline SQL body (tier T0, in-process, no sandbox).
 ///   * `http://...` | `https://...` - remote endpoint invoked over HTTP + JSON (tier T2).
+///   * `wasm` - WebAssembly module invoked with Arrow IPC batches.
 ///
 /// Supported at runtime by default: `sql`. HTTP-backed functions require a
-/// runtime built with the `http-functions` feature.
+/// runtime built with the `http-functions` feature. WebAssembly functions
+/// require a runtime built with the `wasm-functions` feature.
 ///
 /// Registration is disabled by default. Set `runtime.functions.enabled: true`
 /// in the spicepod to activate declared functions.
@@ -172,9 +174,29 @@ pub struct Signature {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<FunctionArg>,
 
+    /// Table inputs consumed by table-function backends that accept relational input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<FunctionTableArg>,
+
     /// Return Arrow type for scalar functions, or output columns for table functions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<FunctionReturns>,
+}
+
+/// A declared table input for table-function backends.
+///
+/// The `name` is the logical input name exposed to the backend. `columns`
+/// declares the Arrow schema expected by the backend. The actual input data can
+/// come from a backend-specific parameter, such as `params.input_table`, or from
+/// a SQL `body`/`body_ref` query that produces the declared columns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct FunctionTableArg {
+    pub name: String,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<FunctionArg>,
 }
 
 impl Signature {
@@ -371,6 +393,7 @@ body: SELECT doc AS line, 1 AS line_no FROM args
             volatility: Volatility::Immutable,
             signature: Signature {
                 args: vec![],
+                tables: vec![],
                 returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: Some("1".into()),

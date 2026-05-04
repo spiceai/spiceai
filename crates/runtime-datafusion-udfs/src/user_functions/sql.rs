@@ -714,6 +714,7 @@ mod tests {
                         arrow_type: t.into(),
                     })
                     .collect(),
+                tables: vec![],
                 returns: Some(FunctionReturns::Scalar(ret.into())),
             },
             body: Some(body.into()),
@@ -739,6 +740,7 @@ mod tests {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
+                tables: vec![],
                 returns: Some(FunctionReturns::Table(vec![
                     FunctionArg {
                         name: "value".into(),

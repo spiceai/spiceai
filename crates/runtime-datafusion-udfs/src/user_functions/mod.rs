@@ -23,6 +23,8 @@ limitations under the License.
 //!     `DataFusion` expression or table query.
 //!   * **T2 Remote** via `from: http://...` and `from: https://...` when the
 //!     `http-functions` feature is enabled.
+//!   * **WASM** via `from: wasm` when the `wasm-functions` feature is enabled,
+//!     using Arrow IPC streams as the host/guest data ABI.
 //!
 //! Unsupported schemes are rejected at build time with
 //! [`UserFunctionError::UnsupportedScheme`].
@@ -38,6 +40,8 @@ mod arrow_type;
 #[cfg(feature = "http-functions")]
 pub mod remote;
 pub mod sql;
+#[cfg(feature = "wasm-functions")]
+pub mod wasm;
 
 /// What a factory produces once a [`Function`] declaration has been
 /// compiled and validated.
@@ -71,6 +75,17 @@ pub enum UserFunctionError {
         "Failed to register function {name}: HTTP-backed user-defined functions require the `http-functions` feature. This build supports inline SQL functions only (`from: sql`)."
     ))]
     HttpFunctionsDisabled { name: String },
+
+    #[cfg(not(feature = "wasm-functions"))]
+    #[snafu(display(
+        "Failed to register function {name}: WASM user-defined functions require the `wasm-functions` feature. This build supports inline SQL functions only (`from: sql`) unless other function features are enabled."
+    ))]
+    WasmFunctionsDisabled { name: String },
+
+    #[snafu(display(
+        "Failed to register function {name}: WASM functions currently support `kind: table` only."
+    ))]
+    UnsupportedWasmKind { name: String },
 
     #[snafu(display(
         "Failed to register function {name}: one of `body:` or `body_ref:` is required when `from: sql` but neither was provided."
@@ -108,15 +123,26 @@ pub enum UserFunctionError {
         name: String,
         source: remote::RemoteBuildError,
     },
+
+    #[cfg(feature = "wasm-functions")]
+    #[snafu(display("Failed to register function {name}: {source}"))]
+    Wasm {
+        name: String,
+        source: wasm::WasmBuildError,
+    },
 }
 
 pub type Result<T, E = UserFunctionError> = std::result::Result<T, E>;
 
 fn supported_schemes() -> &'static str {
-    if cfg!(feature = "http-functions") {
-        "`sql`, `http://`, `https://`"
-    } else {
-        "`sql`"
+    match (
+        cfg!(feature = "http-functions"),
+        cfg!(feature = "wasm-functions"),
+    ) {
+        (true, true) => "`sql`, `http://`, `https://`, `wasm`",
+        (true, false) => "`sql`, `http://`, `https://`",
+        (false, true) => "`sql`, `wasm`",
+        (false, false) => "`sql`",
     }
 }
 
@@ -151,6 +177,13 @@ pub async fn build_function(decl: &Function) -> Result<BuiltFunction> {
             name: decl.name.clone(),
         }
         .fail(),
+        #[cfg(feature = "wasm-functions")]
+        "wasm" => build_wasm(decl).await,
+        #[cfg(not(feature = "wasm-functions"))]
+        "wasm" => WasmFunctionsDisabledSnafu {
+            name: decl.name.clone(),
+        }
+        .fail(),
         other => UnsupportedSchemeSnafu {
             name: decl.name.clone(),
             scheme: other.to_string(),
@@ -158,6 +191,24 @@ pub async fn build_function(decl: &Function) -> Result<BuiltFunction> {
         }
         .fail(),
     }
+}
+
+#[cfg(feature = "wasm-functions")]
+async fn build_wasm(decl: &Function) -> Result<BuiltFunction> {
+    if decl.kind != FunctionKind::Table {
+        return UnsupportedWasmKindSnafu {
+            name: decl.name.clone(),
+        }
+        .fail();
+    }
+    let input_sql = resolve_optional_body(decl).await?;
+    let udtf = wasm::build_table_udtf(decl, input_sql)
+        .await
+        .map_err(|source| UserFunctionError::Wasm {
+            name: decl.name.clone(),
+            source,
+        })?;
+    Ok(BuiltFunction::Table(udtf))
 }
 
 #[cfg(feature = "http-functions")]
@@ -237,6 +288,25 @@ async fn resolve_body(decl: &Function) -> Result<String> {
     }
 }
 
+async fn resolve_optional_body(decl: &Function) -> Result<Option<String>> {
+    match (&decl.body, &decl.body_ref) {
+        (Some(_), Some(_)) => ConflictingBodySnafu {
+            name: decl.name.clone(),
+        }
+        .fail(),
+        (Some(s), None) => Ok(Some(s.clone())),
+        (None, Some(path)) => tokio::fs::read_to_string(path)
+            .await
+            .map(Some)
+            .map_err(|source| UserFunctionError::BodyRefRead {
+                name: decl.name.clone(),
+                path: path.clone(),
+                source,
+            }),
+        (None, None) => Ok(None),
+    }
+}
+
 /// Build every function in `decls`, returning a vector of built
 /// functions paired with their source declaration (for diagnostics) and
 /// a vector of any per-function build errors. The caller decides whether
@@ -284,6 +354,7 @@ mod tests {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
+                tables: vec![],
                 returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: body.map(str::to_string),
@@ -432,6 +503,7 @@ mod tests {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
+                tables: vec![],
                 returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: None,
