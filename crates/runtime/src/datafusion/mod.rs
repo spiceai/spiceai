@@ -1822,6 +1822,41 @@ impl DataFusion {
             );
             accelerated_table_builder
                 .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
+
+            // Wire up header-keyed caching if the dataset specifies `caching_allowed_request_headers`.
+            // The set of allowed headers comes from the accelerator param; the sensitive set comes
+            // from the connector's `request_headers_sensitive` param on the dataset.
+            if !acceleration_settings
+                .caching_allowed_request_headers
+                .is_empty()
+            {
+                use reqwest::header::HeaderName;
+
+                // Parse the configured header names into HeaderName values.
+                let allowed: std::collections::HashSet<HeaderName> = acceleration_settings
+                    .caching_allowed_request_headers
+                    .iter()
+                    .filter_map(|h| HeaderName::from_bytes(h.as_bytes()).ok())
+                    .collect();
+
+                // Parse sensitive headers directly from the connector params on the dataset,
+                // intersected with the allowed set.
+                let sensitive: std::collections::HashSet<HeaderName> = dataset
+                    .params
+                    .get("request_headers_sensitive")
+                    .map(|s| {
+                        s.split(',')
+                            .map(|h| h.trim().to_lowercase())
+                            .filter(|h| !h.is_empty())
+                            .filter_map(|h| HeaderName::from_bytes(h.as_bytes()).ok())
+                            .filter(|h| allowed.contains(h))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                accelerated_table_builder.sensitive_headers(Arc::new(sensitive));
+                accelerated_table_builder.caching_allowed_request_headers(Arc::new(allowed));
+            }
         }
 
         // Get the acceleration layout (used for snapshots and size metrics)

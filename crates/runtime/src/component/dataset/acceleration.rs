@@ -273,6 +273,10 @@ pub struct Acceleration {
 
     pub caching_stale_if_error: StaleIfError,
 
+    /// Comma-separated header names to include in the cache key when using caching refresh mode.
+    /// Parsed from the `caching_allowed_request_headers` accelerator param.
+    pub caching_allowed_request_headers: Vec<String>,
+
     pub refresh_cron: Option<Arc<str>>,
 
     pub refresh_sql: Option<String>,
@@ -472,6 +476,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let caching_stale_while_revalidate_ttl =
             parse_caching_stale_while_revalidate_ttl(&mut params)?;
         let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
+        let caching_allowed_request_headers = parse_caching_allowed_request_headers(&mut params);
 
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",
@@ -500,6 +505,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             caching_ttl,
             caching_stale_while_revalidate_ttl,
             caching_stale_if_error,
+            caching_allowed_request_headers,
             refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -550,6 +556,7 @@ impl Default for Acceleration {
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: StaleIfError::default(),
+            caching_allowed_request_headers: Vec::new(),
             refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
@@ -605,6 +612,24 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
 #[expect(clippy::result_large_err)]
 fn parse_caching_ttl(params: &mut Option<Params>) -> Result<Option<Duration>, crate::Error> {
     parse_duration_param(params, "caching_ttl")
+}
+
+/// Parse `caching_allowed_request_headers` from params — comma-separated header names.
+fn parse_caching_allowed_request_headers(params: &mut Option<Params>) -> Vec<String> {
+    let Some(params) = params else {
+        return Vec::new();
+    };
+    let Some(value) = params.data.remove("caching_allowed_request_headers") else {
+        return Vec::new();
+    };
+    match value {
+        spicepod::param::ParamValue::String(s) => s
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Parse `caching_stale_while_revalidate_ttl` duration from params for caching mode.

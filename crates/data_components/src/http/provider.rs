@@ -723,6 +723,18 @@ impl HttpTableProvider {
         &self.custom_headers
     }
 
+    /// Returns the set of header names whose values are hashed before storage (sensitive headers).
+    #[must_use]
+    pub fn sensitive_headers(&self) -> &Arc<HashSet<HeaderName>> {
+        &self.request_filter_options.sensitive_headers
+    }
+
+    /// Returns the set of header names that are allowed in `request_headers` filters.
+    #[must_use]
+    pub fn allowed_headers(&self) -> &HashSet<HeaderName> {
+        &self.request_filter_options.allowed_headers
+    }
+
     /// Attach an [`HttpAuthenticator`](super::auth::HttpAuthenticator) that decorates
     /// every outgoing data request (e.g. to apply a bearer token refreshed in the
     /// background by [`RefreshTokenAuth`](super::auth::RefreshTokenAuth)).
