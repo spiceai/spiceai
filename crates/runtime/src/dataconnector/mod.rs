@@ -57,6 +57,7 @@ use tracing::Level;
 use std::future::Future;
 use std::time::Duration;
 
+pub mod http_rate_control;
 pub mod listing;
 
 /// Creates a default reqwest client with standard Spice settings.

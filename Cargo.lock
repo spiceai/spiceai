@@ -4030,6 +4030,7 @@ dependencies = [
 name = "connector-graphql"
 version = "2.0.0-unstable"
 dependencies = [
+ "app",
  "async-trait",
  "data_components",
  "datafusion",
@@ -4039,6 +4040,7 @@ dependencies = [
  "runtime",
  "snafu",
  "token_provider",
+ "tokio",
  "url",
 ]
 
