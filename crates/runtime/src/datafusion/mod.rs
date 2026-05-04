@@ -2200,6 +2200,11 @@ impl DataFusion {
         let is_s3_express_acceleration = false;
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
 
+        source
+            .on_accelerator_setup(dataset, &mut accelerated_table_builder)
+            .await
+            .context(AccelerationRegistrationSnafu)?;
+
         accelerated_table_builder
             .build()
             .await

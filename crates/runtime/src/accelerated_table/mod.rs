@@ -444,6 +444,20 @@ impl Builder {
         self
     }
 
+    /// Returns a clone of the accelerator `Arc`.
+    #[must_use]
+    pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.accelerator)
+    }
+
+    /// Replace the accelerator provider.
+    ///
+    /// This must be called **before** [`build`](Self::build) so that the
+    /// [`Refresher`] (created during build) receives the updated provider.
+    pub fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        self.accelerator = accelerator;
+    }
+
     /// Set to only write to the accelerator (not replicate to federated source).
     /// This is used when `on_conflict` is configured - writes go only to the accelerator.
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {

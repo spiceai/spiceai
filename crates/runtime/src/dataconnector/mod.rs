@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{self, AcceleratedTable};
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
@@ -629,6 +629,23 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         _dataset: &Dataset,
         _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
+        Ok(())
+    }
+
+    /// A hook called **before** the accelerated table is built, giving the
+    /// connector a chance to wrap or replace the accelerator provider on the
+    /// [`Builder`](crate::accelerated_table::Builder).
+    ///
+    /// Any provider set here will be shared with the [`Refresher`] that is
+    /// created during [`Builder::build`]. Use this hook instead of
+    /// [`on_accelerated_table_registration`](Self::on_accelerated_table_registration)
+    /// when the wrapped provider must be visible to the refresh pipeline
+    /// (e.g. to recreate indexes after a data refresh).
+    async fn on_accelerator_setup(
+        &self,
+        _dataset: &Dataset,
+        _builder: &mut accelerated_table::Builder,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 
