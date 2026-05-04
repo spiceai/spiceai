@@ -27,23 +27,33 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
+use std::hash::Hash;
 use std::io::Cursor;
 #[cfg(feature = "wasm-functions-compile")]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "wasm-functions-compile")]
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
-use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{Column, DataFusionError, Result as DataFusionResult};
+use datafusion::catalog::{
+    Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
+};
+use datafusion::common::{Column, DataFusionError, Result as DataFusionResult, Spans};
 use datafusion::datasource::TableType;
 use datafusion::execution::SessionState;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{
+    ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
+    TableScan, Volatility as DfVolatility,
+    simplify::{ExprSimplifyResult, SimplifyInfo},
+};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
@@ -52,9 +62,11 @@ use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
-use spicepod::component::function::{Function, FunctionArg, FunctionReturns};
+use spicepod::component::function::{Function, FunctionArg, FunctionReturns, Volatility};
 use util::session_state::builder_from_existing;
 use wasmtime::{Engine, Instance, Module, Store, TypedFunc};
+
+static NEXT_WASM_SCALAR_ID: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_ENTRYPOINT: &str = "spice_transform";
 #[cfg(feature = "wasm-functions-compile")]
@@ -73,9 +85,19 @@ pub enum WasmBuildError {
     MissingTableReturnSchema,
 
     #[snafu(display(
+        "WASM scalar functions require `signature.returns` to be a scalar Arrow type"
+    ))]
+    MissingScalarReturnSchema,
+
+    #[snafu(display(
         "WASM table functions require table return columns, not a scalar Arrow return type"
     ))]
     ExpectedTableReturnSchema,
+
+    #[snafu(display(
+        "WASM scalar functions require a scalar Arrow return type, not table return columns"
+    ))]
+    ExpectedScalarReturnSchema,
 
     #[snafu(display(
         "unsupported or invalid Arrow type '{arrow_type}' for WASM function signature"
@@ -230,9 +252,43 @@ pub async fn build_table_udtf(
     decl: &Function,
     input_sql: Option<String>,
 ) -> Result<Arc<dyn TableFunctionImpl>> {
+    let output_schema = table_return_schema(decl)?;
+    let table_func = build_table_func(decl, input_sql, output_schema).await?;
+    Ok(table_func)
+}
+
+/// Build a WASM scalar function from a declaration.
+///
+/// The scalar form uses the same Arrow IPC ABI as WASM table functions, then
+/// rewrites calls to scalar subqueries so `DataFusion` enforces one-row output.
+///
+/// # Errors
+///
+/// Returns [`WasmBuildError`] if the declaration, module, source compilation,
+/// or declared Arrow schemas are invalid.
+pub async fn build_scalar_udf(
+    decl: &Function,
+    input_sql: Option<String>,
+) -> Result<Arc<ScalarUDF>> {
+    let (return_type, output_schema) = scalar_return_schema(decl)?;
+    let table_func = build_table_func(decl, input_sql, output_schema).await?;
+    let udf_impl = WasmScalarTableArgUdf {
+        id: NEXT_WASM_SCALAR_ID.fetch_add(1, Ordering::Relaxed),
+        name: decl.name.clone(),
+        signature: Signature::variadic_any(map_volatility(decl.volatility)),
+        return_type,
+        table_func,
+    };
+    Ok(Arc::new(ScalarUDF::from(udf_impl)))
+}
+
+async fn build_table_func(
+    decl: &Function,
+    input_sql: Option<String>,
+    output_schema: SchemaRef,
+) -> Result<Arc<WasmTableFunc>> {
     let config = WasmConfig::from_decl(decl)?;
     let input_schema = declared_input_schema(decl)?;
-    let output_schema = table_return_schema(decl)?;
     let arg_schema = function_arg_schema(&decl.signature.args)?;
     let input_source = configured_input_source(&config, input_sql)?;
     if input_source.is_none() && input_schema.is_none() {
@@ -264,6 +320,77 @@ pub async fn build_table_udtf(
             entrypoint: config.entrypoint,
         }),
     }))
+}
+
+#[derive(Debug)]
+struct WasmScalarTableArgUdf {
+    id: u64,
+    name: String,
+    signature: Signature,
+    return_type: DataType,
+    table_func: Arc<WasmTableFunc>,
+}
+
+impl PartialEq for WasmScalarTableArgUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for WasmScalarTableArgUdf {}
+
+impl Hash for WasmScalarTableArgUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl ScalarUDFImpl for WasmScalarTableArgUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        Err(DataFusionError::Execution(format!(
+            "WASM scalar function '{}' with table arguments must be rewritten to a scalar subquery before execution",
+            self.name
+        )))
+    }
+
+    fn simplify(
+        &self,
+        args: Vec<Expr>,
+        _info: &dyn SimplifyInfo,
+    ) -> DataFusionResult<ExprSimplifyResult> {
+        let provider = self.table_func.call(&args)?;
+        let table_source = provider_as_source(provider);
+        let table_scan = TableScan::try_new(
+            TableReference::bare(format!("{}_result", self.name)),
+            table_source,
+            None,
+            vec![],
+            None,
+        )?;
+        Ok(ExprSimplifyResult::Simplified(Expr::ScalarSubquery(
+            Subquery {
+                subquery: Arc::new(LogicalPlan::TableScan(table_scan)),
+                outer_ref_columns: vec![],
+                spans: Spans::new(),
+            },
+        )))
+    }
 }
 
 #[derive(Clone)]
@@ -774,6 +901,28 @@ fn table_return_schema(decl: &Function) -> Result<SchemaRef> {
     Ok(Arc::new(Schema::new(fields)))
 }
 
+fn scalar_return_schema(decl: &Function) -> Result<(DataType, SchemaRef)> {
+    let return_type = match decl.signature.returns.as_ref() {
+        Some(FunctionReturns::Scalar(arrow_type)) => parse_arrow_type(arrow_type)?,
+        Some(FunctionReturns::Table(_)) => return ExpectedScalarReturnSchemaSnafu.fail(),
+        None => return MissingScalarReturnSchemaSnafu.fail(),
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        return_type.clone(),
+        true,
+    )]));
+    Ok((return_type, schema))
+}
+
+fn map_volatility(volatility: Volatility) -> DfVolatility {
+    match volatility {
+        Volatility::Immutable => DfVolatility::Immutable,
+        Volatility::Stable => DfVolatility::Stable,
+        Volatility::Volatile => DfVolatility::Volatile,
+    }
+}
+
 fn parse_arrow_type(s: &str) -> Result<DataType> {
     super::arrow_type::parse_arrow_type(s).map_err(|_| WasmBuildError::UnsupportedArrowType {
         arrow_type: s.to_string(),
@@ -1201,6 +1350,30 @@ mod tests {
         }
     }
 
+    fn wasm_scalar_identity_decl(module: &Path) -> Function {
+        let mut decl = wasm_identity_decl(module);
+        decl.name = "wasm_scalar_identity".into();
+        decl.kind = FunctionKind::Scalar;
+        decl.signature.returns = Some(FunctionReturns::Scalar("int64".into()));
+        decl
+    }
+
+    async fn single_value_input_expr(ctx: &SessionContext) -> Expr {
+        let input_df = ctx
+            .table("numbers")
+            .await
+            .expect("table exists")
+            .filter(col("value").eq(lit(2_i64)))
+            .expect("filters")
+            .select(vec![col("value")])
+            .expect("projects");
+        Expr::ScalarSubquery(Subquery {
+            subquery: Arc::new(input_df.into_unoptimized_plan()),
+            outer_ref_columns: vec![],
+            spans: Spans::new(),
+        })
+    }
+
     #[tokio::test]
     async fn wasm_table_udtf_round_trips_arrow_ipc_from_input_table() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1487,5 +1660,93 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 values");
         assert_eq!(values.values(), &[2_i64, 3]);
+    }
+
+    #[tokio::test]
+    async fn wasm_scalar_udf_accepts_dynamic_input_from_sql_subquery() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+        let mut decl = wasm_scalar_identity_decl(&module);
+        decl.params.remove(INPUT_TABLE_PARAM);
+        let udf = build_scalar_udf(&decl, None).await.expect("builds");
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .expect("record batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table("numbers", Arc::new(table))
+            .expect("register table");
+        ctx.register_udf(udf.as_ref().clone());
+
+        let results = ctx
+            .sql(
+                "WITH filtered AS (SELECT value FROM numbers WHERE value = 2) \
+                 SELECT wasm_scalar_identity((SELECT value FROM filtered)) AS value",
+            )
+            .await
+            .expect("sql compiles")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[2_i64]);
+    }
+
+    #[tokio::test]
+    async fn wasm_scalar_udf_accepts_dynamic_input_via_dataframe_api() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+        let mut decl = wasm_scalar_identity_decl(&module);
+        decl.params.remove(INPUT_TABLE_PARAM);
+        let udf = build_scalar_udf(&decl, None).await.expect("builds");
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .expect("record batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table("numbers", Arc::new(table))
+            .expect("register table");
+        ctx.register_udf(udf.as_ref().clone());
+        let input_expr = single_value_input_expr(&ctx).await;
+
+        let results = ctx
+            .table("numbers")
+            .await
+            .expect("table exists")
+            .filter(udf.call(vec![input_expr]).eq(lit(2_i64)))
+            .expect("filters")
+            .sort_by(vec![col("value")])
+            .expect("sorts")
+            .select(vec![col("value")])
+            .expect("projects")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[1_i64, 2, 3]);
     }
 }

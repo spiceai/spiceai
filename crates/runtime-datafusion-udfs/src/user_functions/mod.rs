@@ -89,11 +89,6 @@ pub enum UserFunctionError {
     WasmFunctionsDisabled { name: String },
 
     #[snafu(display(
-        "Failed to register function {name}: WASM functions currently support `kind: table` only."
-    ))]
-    UnsupportedWasmKind { name: String },
-
-    #[snafu(display(
         "Failed to register function {name}: one of `body:` or `body_ref:` is required when `from: sql` but neither was provided."
     ))]
     MissingBody { name: String },
@@ -201,20 +196,27 @@ pub async fn build_function(decl: &Function) -> Result<BuiltFunction> {
 
 #[cfg(feature = "wasm-functions")]
 async fn build_wasm(decl: &Function) -> Result<BuiltFunction> {
-    if decl.kind != FunctionKind::Table {
-        return UnsupportedWasmKindSnafu {
-            name: decl.name.clone(),
-        }
-        .fail();
-    }
     let input_sql = resolve_optional_body(decl).await?;
-    let udtf = wasm::build_table_udtf(decl, input_sql)
-        .await
-        .map_err(|source| UserFunctionError::Wasm {
-            name: decl.name.clone(),
-            source,
-        })?;
-    Ok(BuiltFunction::Table(udtf))
+    match decl.kind {
+        FunctionKind::Scalar => {
+            let udf = wasm::build_scalar_udf(decl, input_sql)
+                .await
+                .map_err(|source| UserFunctionError::Wasm {
+                    name: decl.name.clone(),
+                    source,
+                })?;
+            Ok(BuiltFunction::Scalar(udf))
+        }
+        FunctionKind::Table => {
+            let udtf = wasm::build_table_udtf(decl, input_sql)
+                .await
+                .map_err(|source| UserFunctionError::Wasm {
+                    name: decl.name.clone(),
+                    source,
+                })?;
+            Ok(BuiltFunction::Table(udtf))
+        }
+    }
 }
 
 #[cfg(feature = "http-functions")]

@@ -1044,7 +1044,7 @@ mod tests {
         Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
     };
     use datafusion::arrow::datatypes::{Field as ArrowField, Int64Type, TimeUnit};
-    use datafusion::prelude::{SessionContext, col, lit};
+    use datafusion::prelude::{SessionContext, col, lit, scalar_subquery};
     use spicepod::component::function::{
         FunctionArg, FunctionKind, FunctionReturns, FunctionTableArg, Signature as YamlSignature,
     };
@@ -1191,11 +1191,7 @@ mod tests {
             .expect("filters")
             .select(vec![col("value")])
             .expect("projects");
-        Expr::ScalarSubquery(Subquery {
-            subquery: Arc::new(input_df.into_unoptimized_plan()),
-            outer_ref_columns: vec![],
-            spans: Spans::new(),
-        })
+        scalar_subquery(Arc::new(input_df.into_unoptimized_plan()))
     }
 
     #[test]
@@ -1611,10 +1607,12 @@ mod tests {
             .table("numbers")
             .await
             .expect("table exists")
-            .limit(0, Some(1))
-            .expect("limits outer input")
-            .select(vec![udf.call(vec![input_expr, lit(10_i64)]).alias("total")])
-            .expect("projects scalar UDF")
+            .filter(udf.call(vec![input_expr, lit(10_i64)]).eq(lit(15_i64)))
+            .expect("filters with scalar UDF")
+            .sort_by(vec![col("value")])
+            .expect("sorts")
+            .select(vec![col("value")])
+            .expect("projects")
             .collect()
             .await
             .expect("query runs");
@@ -1623,7 +1621,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("int64 values");
-        assert_eq!(values.values(), &[15_i64]);
+        assert_eq!(values.values(), &[1_i64, 2, 3]);
     }
 
     #[tokio::test]

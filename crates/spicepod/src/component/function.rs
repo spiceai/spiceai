@@ -170,8 +170,8 @@ pub enum Volatility {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Signature {
-    /// Table inputs consumed by table-function backends that accept relational input.
-    /// When a table function accepts table and scalar arguments, table inputs
+    /// Table inputs consumed by function backends that accept relational input.
+    /// When a function accepts table and scalar arguments, table inputs
     /// are the leading arguments and scalar arguments follow them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<FunctionTableArg>,
@@ -185,7 +185,7 @@ pub struct Signature {
     pub returns: Option<FunctionReturns>,
 }
 
-/// A declared table input for table-function backends.
+/// A declared table input for function backends.
 ///
 /// The `name` is the logical input name exposed to the backend. `columns`
 /// declares the Arrow schema expected by the backend. The actual input data can
