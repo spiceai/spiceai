@@ -290,7 +290,7 @@ pub async fn full_text_search_candidates(
     if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
         return Some(
             as_candidate_generations(
-                &fts.with_new_base(base_table_provider),
+                &fts.with_new_base(Arc::clone(&base_table_provider)),
                 Arc::clone(df),
                 tbl.clone(),
             )

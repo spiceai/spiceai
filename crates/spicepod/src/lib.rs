@@ -33,6 +33,7 @@ use component::{
     rerankers::Reranker, runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool,
     view::View, worker::Worker,
 };
+use search_engine::SearchEngine;
 
 use crate::component::Nameable;
 use spec::{SpicepodDefinition, SpicepodVersion};
@@ -46,6 +47,7 @@ pub mod metric;
 pub mod param;
 pub mod partitioning;
 pub mod reader;
+pub mod search_engine;
 pub mod semantic;
 pub mod spec;
 pub mod vector;
@@ -139,6 +141,8 @@ pub struct Spicepod {
     pub embeddings: Vec<Embeddings>,
 
     pub rerankers: Vec<Reranker>,
+
+    pub search_engines: Vec<SearchEngine>,
 
     pub tools: Vec<Tool>,
 
@@ -284,6 +288,15 @@ impl Spicepod {
         .await
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_search_engines = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.search_engines,
+            "search_engines",
+        )
+        .await
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         let resolved_tools =
             component::resolve_component_references(fs, &path, &spicepod_definition.tools, "tools")
                 .await
@@ -313,6 +326,7 @@ impl Spicepod {
         detect_duplicate_component_names("model", &resolved_models[..])?;
         detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
         detect_duplicate_component_names("reranker", &resolved_rerankers[..])?;
+        detect_duplicate_component_names("search_engine", &resolved_search_engines[..])?;
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
         detect_duplicate_component_names("worker", &resolved_workers[..])?;
         detect_duplicate_component_names("function", &resolved_functions[..])?;
@@ -326,6 +340,7 @@ impl Spicepod {
             resolved_views,
             resolved_embeddings,
             resolved_rerankers,
+            resolved_search_engines,
             resolved_tools,
             resolved_models,
             resolved_workers,
@@ -416,6 +431,7 @@ fn from_definition(
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
     rerankers: Vec<Reranker>,
+    search_engines: Vec<SearchEngine>,
     tools: Vec<Tool>,
     models: Vec<Model>,
     workers: Vec<Worker>,
@@ -432,6 +448,7 @@ fn from_definition(
         models,
         embeddings,
         rerankers,
+        search_engines,
         tools,
         workers,
         functions,

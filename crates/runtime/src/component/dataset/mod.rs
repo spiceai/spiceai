@@ -766,6 +766,15 @@ mod tests {
     use super::builder::DatasetBuilder;
     use super::*;
     use app::AppBuilder;
+    use spicepod::{
+        fts::FtsStore,
+        param::Params,
+        search_engine::{
+            SearchEngine, SearchEngineCapabilities, SearchEngineKind, SearchEngineKindSelection,
+        },
+        semantic::{ColumnLevelEmbeddingConfig, FullTextSearchConfig},
+        vector::VectorStore,
+    };
 
     #[test]
     fn test_indexes_roundtrip() {
@@ -856,6 +865,302 @@ mod tests {
 
         dataset.params = params;
         dataset
+    }
+
+    fn params(entries: &[(&str, &str)]) -> Params {
+        Params::from_string_map(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        )
+    }
+
+    fn search_engine(
+        name: &str,
+        from: &str,
+        kind: SearchEngineKind,
+        params: &[(&str, &str)],
+        defaults: &[(&str, &str)],
+        capabilities: Option<SearchEngineCapabilities>,
+    ) -> SearchEngine {
+        SearchEngine {
+            name: name.to_string(),
+            from: from.to_string(),
+            kind: SearchEngineKindSelection::Single(kind),
+            params: (!params.is_empty()).then(|| self::params(params)),
+            defaults: (!defaults.is_empty()).then(|| self::params(defaults)),
+            capabilities,
+            depends_on: Vec::new(),
+        }
+    }
+
+    async fn build_dataset(
+        spicepod_dataset: spicepod::component::dataset::Dataset,
+        app: app::App,
+    ) -> Result<Dataset> {
+        let runtime = crate::Runtime::builder().build().await;
+
+        DatasetBuilder::try_from(spicepod_dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(runtime))
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_dataset_level_search_engine_references_resolve() {
+        let app = AppBuilder::new("test")
+            .with_search_engine(search_engine(
+                "managed_vectors",
+                "elasticsearch",
+                SearchEngineKind::Vector,
+                &[("endpoint", "http://es:9200")],
+                &[("metric", "cosine")],
+                Some(SearchEngineCapabilities {
+                    vector: Some(params(&[("dimensions", "1536")])),
+                    ..SearchEngineCapabilities::default()
+                }),
+            ))
+            .with_search_engine(search_engine(
+                "managed_text",
+                "elasticsearch",
+                SearchEngineKind::Text,
+                &[("endpoint", "http://es:9200")],
+                &[("analyzer", "english")],
+                Some(SearchEngineCapabilities {
+                    text: Some(params(&[("similarity", "bm25")])),
+                    ..SearchEngineCapabilities::default()
+                }),
+            ))
+            .build();
+
+        let mut spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        spicepod_dataset.vectors = Some(VectorStore {
+            enabled: true,
+            engine: Some("managed_vectors".to_string()),
+            partition_by: Vec::new(),
+            params: Some(params(&[("metric", "dot")])),
+        });
+        spicepod_dataset.full_text_search = Some(FtsStore {
+            enabled: true,
+            engine: Some("managed_text".to_string()),
+            params: Some(params(&[("index", "docs_text")])),
+        });
+
+        let dataset = build_dataset(spicepod_dataset, app)
+            .await
+            .expect("search engine references should resolve");
+
+        let vector_store = dataset.vectors.as_ref().expect("vectors should be enabled");
+        assert_eq!(vector_store.engine.as_deref(), Some("elasticsearch"));
+        let vector_params = vector_store
+            .params
+            .as_ref()
+            .expect("vector params should merge")
+            .as_string_map();
+        assert_eq!(
+            vector_params.get("endpoint").map(String::as_str),
+            Some("http://es:9200")
+        );
+        assert_eq!(vector_params.get("metric").map(String::as_str), Some("dot"));
+        assert_eq!(
+            vector_params.get("dimensions").map(String::as_str),
+            Some("1536")
+        );
+
+        let fts_store = dataset
+            .full_text_search
+            .as_ref()
+            .expect("full text search should be enabled");
+        assert_eq!(fts_store.engine.as_deref(), Some("elasticsearch"));
+        let fts_params = fts_store
+            .params
+            .as_ref()
+            .expect("fts params should merge")
+            .as_string_map();
+        assert_eq!(
+            fts_params.get("endpoint").map(String::as_str),
+            Some("http://es:9200")
+        );
+        assert_eq!(
+            fts_params.get("analyzer").map(String::as_str),
+            Some("english")
+        );
+        assert_eq!(
+            fts_params.get("similarity").map(String::as_str),
+            Some("bm25")
+        );
+        assert_eq!(
+            fts_params.get("index").map(String::as_str),
+            Some("docs_text")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_column_level_search_engine_references_resolve() {
+        let app = AppBuilder::new("test")
+            .with_search_engine(search_engine(
+                "managed_vectors",
+                "elasticsearch",
+                SearchEngineKind::Vector,
+                &[("endpoint", "http://es:9200")],
+                &[],
+                None,
+            ))
+            .with_search_engine(search_engine(
+                "managed_text",
+                "elasticsearch",
+                SearchEngineKind::Text,
+                &[("endpoint", "http://es:9200")],
+                &[],
+                None,
+            ))
+            .build();
+
+        let mut column_fts = FullTextSearchConfig::enabled().with_row_id("id");
+        column_fts.engine = Some("managed_text".to_string());
+        column_fts.params = Some(params(&[("index", "body_text")]));
+
+        let mut spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        spicepod_dataset.columns = vec![
+            spicepod::semantic::Column::new("body")
+                .with_embedding(ColumnLevelEmbeddingConfig {
+                    model: "openai_embeddings".to_string(),
+                    chunking: None,
+                    row_ids: Some(vec!["id".to_string()]),
+                    vector_size: None,
+                    engine: Some("managed_vectors".to_string()),
+                    params: Some(params(&[("index", "body_vectors")])),
+                    aggregation: None,
+                    max_elements_per_row: None,
+                })
+                .with_full_text_search(column_fts),
+        ];
+
+        let dataset = build_dataset(spicepod_dataset, app)
+            .await
+            .expect("column search engine references should resolve");
+
+        let vector_store = dataset.vectors.as_ref().expect("vectors should be enabled");
+        assert!(vector_store.enabled);
+        assert_eq!(vector_store.engine, None);
+
+        let column_embedding = dataset.columns[0]
+            .embeddings
+            .first()
+            .expect("embedding should remain on column");
+        assert_eq!(column_embedding.engine.as_deref(), Some("elasticsearch"));
+        let embedding_params = column_embedding
+            .params
+            .as_ref()
+            .expect("embedding params should merge")
+            .as_string_map();
+        assert_eq!(
+            embedding_params.get("endpoint").map(String::as_str),
+            Some("http://es:9200")
+        );
+        assert_eq!(
+            embedding_params.get("index").map(String::as_str),
+            Some("body_vectors")
+        );
+
+        let fts_store = dataset
+            .full_text_search
+            .as_ref()
+            .expect("column text engine should enable dataset fts store");
+        assert_eq!(fts_store.engine.as_deref(), Some("elasticsearch"));
+        let fts_store_params = fts_store
+            .params
+            .as_ref()
+            .expect("column fts params should be promoted")
+            .as_string_map();
+        assert_eq!(
+            fts_store_params.get("endpoint").map(String::as_str),
+            Some("http://es:9200")
+        );
+        assert_eq!(
+            fts_store_params.get("index").map(String::as_str),
+            Some("body_text")
+        );
+
+        let column_fts = dataset.columns[0]
+            .full_text_search
+            .as_ref()
+            .expect("column fts config should remain");
+        assert_eq!(column_fts.engine.as_deref(), Some("elasticsearch"));
+    }
+
+    #[tokio::test]
+    async fn test_incompatible_search_engine_kind_errors() {
+        let app = AppBuilder::new("test")
+            .with_search_engine(search_engine(
+                "managed_text",
+                "elasticsearch",
+                SearchEngineKind::Text,
+                &[],
+                &[],
+                None,
+            ))
+            .build();
+
+        let mut spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        spicepod_dataset.vectors = Some(VectorStore {
+            enabled: true,
+            engine: Some("managed_text".to_string()),
+            partition_by: Vec::new(),
+            params: None,
+        });
+
+        let err = build_dataset(spicepod_dataset, app)
+            .await
+            .expect_err("text engine should not resolve for vector search");
+
+        assert!(
+            err.to_string().contains("incompatible kind"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mixed_column_fts_params_error() {
+        let app = AppBuilder::new("test")
+            .with_search_engine(search_engine(
+                "managed_text",
+                "elasticsearch",
+                SearchEngineKind::Text,
+                &[("endpoint", "http://es:9200")],
+                &[],
+                None,
+            ))
+            .build();
+
+        let mut first_fts = FullTextSearchConfig::enabled().with_row_id("id");
+        first_fts.engine = Some("managed_text".to_string());
+        first_fts.params = Some(params(&[("index", "body_text")]));
+
+        let mut second_fts = FullTextSearchConfig::enabled().with_row_id("id");
+        second_fts.engine = Some("managed_text".to_string());
+        second_fts.params = Some(params(&[("index", "title_text")]));
+
+        let mut spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        spicepod_dataset.columns = vec![
+            spicepod::semantic::Column::new("body").with_full_text_search(first_fts),
+            spicepod::semantic::Column::new("title").with_full_text_search(second_fts),
+        ];
+
+        let err = build_dataset(spicepod_dataset, app)
+            .await
+            .expect_err("mixed column fts params should fail safely");
+
+        assert!(
+            err.to_string().contains("different parameters"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

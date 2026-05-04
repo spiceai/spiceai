@@ -689,7 +689,7 @@ pub(crate) fn get_fts_client(
         }
     }
 
-    let client = Client::new_with_options(endpoint, user, pass, &opts)
+    let client = Client::new_with_options(endpoint, user.as_deref(), pass.as_deref(), &opts)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
     Ok(Arc::new(client) as Arc<dyn Elasticsearch>)
 }

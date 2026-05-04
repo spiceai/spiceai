@@ -84,6 +84,8 @@ mod nsql {
                             row_ids: None,
                             chunking: None,
                             vector_size: None,
+                            engine: None,
+                            params: None,
                             aggregation: None,
                             max_elements_per_row: None,
                         }],

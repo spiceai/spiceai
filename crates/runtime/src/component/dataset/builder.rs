@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    CheckAvailability, Dataset, Error, Load, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
-    acceleration, replication, validate_identifier,
+    CheckAvailability, Dataset, Error, InvalidConfigurationSnafu, Load, ReadyState, Result,
+    TimeFormat, UnsupportedTypeAction, acceleration, replication, validate_identifier,
 };
 use crate::Runtime;
 use crate::component::access::AccessMode;
@@ -36,6 +36,7 @@ use spicepod::{
     fts::FtsStore,
     metric::Metrics,
     param::Params,
+    search_engine::{self, SearchEngineKind},
     semantic::Column,
     vector::VectorStore,
 };
@@ -264,6 +265,13 @@ impl DatasetBuilder {
             );
         }
 
+        self.vectors = resolve_vector_store(&app, &self.name, self.vectors)?;
+        self.full_text_search = resolve_fts_store(&app, &self.name, self.full_text_search)?;
+        self.columns = resolve_column_search_engines(&app, &self.name, self.columns)?;
+        self.vectors = enable_vector_store_from_column_overrides(self.vectors, &self.columns);
+        self.full_text_search =
+            fts_store_from_column_overrides(self.full_text_search, &self.columns, &self.name)?;
+
         let dataset = Dataset {
             from: self.from,
             name: self.name,
@@ -292,6 +300,284 @@ impl DatasetBuilder {
 
         Ok(dataset)
     }
+}
+
+fn resolve_vector_store(
+    app: &App,
+    dataset_name: &TableReference,
+    vector_store: Option<VectorStore>,
+) -> Result<Option<VectorStore>> {
+    vector_store
+        .map(|store| resolve_vector_store_ref(app, dataset_name, store, "vectors.engine"))
+        .transpose()
+}
+
+fn resolve_vector_store_ref(
+    app: &App,
+    dataset_name: &TableReference,
+    mut vector_store: VectorStore,
+    config_key: &str,
+) -> Result<VectorStore> {
+    let Some(engine_name) = vector_store.engine.as_deref() else {
+        return Ok(vector_store);
+    };
+
+    let Some(engine) = app
+        .search_engines
+        .iter()
+        .find(|engine| engine.name == engine_name)
+    else {
+        return Ok(vector_store);
+    };
+
+    ensure_search_engine_kind(
+        dataset_name,
+        engine_name,
+        engine.supports(SearchEngineKind::Vector),
+        config_key,
+    )?;
+
+    let mut params = engine
+        .params_for(SearchEngineKind::Vector)
+        .unwrap_or_default();
+    search_engine::merge_params(&mut params, vector_store.params.as_ref());
+    vector_store.engine = Some(engine.from.clone());
+    vector_store.params = if params.data.is_empty() {
+        None
+    } else {
+        Some(params)
+    };
+    Ok(vector_store)
+}
+
+fn resolve_fts_store(
+    app: &App,
+    dataset_name: &TableReference,
+    fts_store: Option<FtsStore>,
+) -> Result<Option<FtsStore>> {
+    fts_store
+        .map(|store| resolve_fts_store_ref(app, dataset_name, store, "full_text_search.engine"))
+        .transpose()
+}
+
+fn resolve_fts_store_ref(
+    app: &App,
+    dataset_name: &TableReference,
+    mut fts_store: FtsStore,
+    config_key: &str,
+) -> Result<FtsStore> {
+    let Some(engine_name) = fts_store.engine.as_deref() else {
+        return Ok(fts_store);
+    };
+
+    let Some(engine) = app
+        .search_engines
+        .iter()
+        .find(|engine| engine.name == engine_name)
+    else {
+        return Ok(fts_store);
+    };
+
+    ensure_search_engine_kind(
+        dataset_name,
+        engine_name,
+        engine.supports(SearchEngineKind::Text),
+        config_key,
+    )?;
+
+    let mut params = engine
+        .params_for(SearchEngineKind::Text)
+        .unwrap_or_default();
+    search_engine::merge_params(&mut params, fts_store.params.as_ref());
+    fts_store.engine = Some(engine.from.clone());
+    fts_store.params = if params.data.is_empty() {
+        None
+    } else {
+        Some(params)
+    };
+    Ok(fts_store)
+}
+
+fn resolve_column_search_engines(
+    app: &App,
+    dataset_name: &TableReference,
+    columns: Vec<Column>,
+) -> Result<Vec<Column>> {
+    columns
+        .into_iter()
+        .map(|mut column| {
+            for embedding in &mut column.embeddings {
+                let Some(engine_name) = embedding.engine.as_deref() else {
+                    continue;
+                };
+                let Some(engine) = app
+                    .search_engines
+                    .iter()
+                    .find(|engine| engine.name == engine_name)
+                else {
+                    continue;
+                };
+
+                ensure_search_engine_kind(
+                    dataset_name,
+                    engine_name,
+                    engine.supports(SearchEngineKind::Vector),
+                    "columns[].embeddings[].engine",
+                )?;
+
+                let mut params = engine
+                    .params_for(SearchEngineKind::Vector)
+                    .unwrap_or_default();
+                search_engine::merge_params(&mut params, embedding.params.as_ref());
+                embedding.engine = Some(engine.from.clone());
+                embedding.params = if params.data.is_empty() {
+                    None
+                } else {
+                    Some(params)
+                };
+            }
+
+            if let Some(fts) = column.full_text_search.as_mut()
+                && let Some(engine_name) = fts.engine.as_deref()
+                && let Some(engine) = app
+                    .search_engines
+                    .iter()
+                    .find(|engine| engine.name == engine_name)
+            {
+                ensure_search_engine_kind(
+                    dataset_name,
+                    engine_name,
+                    engine.supports(SearchEngineKind::Text),
+                    "columns[].full_text_search.engine",
+                )?;
+
+                let mut params = engine
+                    .params_for(SearchEngineKind::Text)
+                    .unwrap_or_default();
+                search_engine::merge_params(&mut params, fts.params.as_ref());
+                fts.engine = Some(engine.from.clone());
+                fts.params = if params.data.is_empty() {
+                    None
+                } else {
+                    Some(params)
+                };
+            }
+
+            Ok(column)
+        })
+        .collect()
+}
+
+fn enable_vector_store_from_column_overrides(
+    vector_store: Option<VectorStore>,
+    columns: &[Column],
+) -> Option<VectorStore> {
+    if vector_store.is_some() {
+        return vector_store;
+    }
+
+    let has_column_vector_engine = columns
+        .iter()
+        .flat_map(|column| &column.embeddings)
+        .any(|embedding| embedding.engine.is_some());
+
+    has_column_vector_engine.then(|| VectorStore {
+        enabled: true,
+        engine: None,
+        partition_by: Vec::new(),
+        params: None,
+    })
+}
+
+fn fts_store_from_column_overrides(
+    mut fts_store: Option<FtsStore>,
+    columns: &[Column],
+    dataset_name: &TableReference,
+) -> Result<Option<FtsStore>> {
+    let mut column_engine: Option<(String, Option<Params>)> = None;
+
+    for column in columns {
+        let Some(fts) = column.full_text_search.as_ref().filter(|fts| fts.enabled) else {
+            continue;
+        };
+        let Some(engine) = fts.engine.as_ref() else {
+            continue;
+        };
+
+        if let Some((first_engine, first_params)) = &column_engine {
+            ensure!(
+                first_engine == engine,
+                InvalidConfigurationSnafu {
+                    config_key: "columns[].full_text_search.engine".to_string(),
+                    message: format!(
+                        "Dataset '{dataset_name}' has full-text columns that reference different text search engines ('{first_engine}' and '{engine}'). Configure a single dataset-level `full_text_search.engine` or use matching column engines."
+                    )
+                }
+            );
+            ensure!(
+                first_params == &fts.params,
+                InvalidConfigurationSnafu {
+                    config_key: "columns[].full_text_search.params".to_string(),
+                    message: format!(
+                        "Dataset '{dataset_name}' has full-text columns that use the same text search engine '{engine}' with different parameters. Configure a single dataset-level `full_text_search.params` or use matching column parameters."
+                    )
+                }
+            );
+        } else {
+            column_engine = Some((engine.clone(), fts.params.clone()));
+        }
+    }
+
+    let Some((column_engine, column_params)) = column_engine else {
+        return Ok(fts_store);
+    };
+
+    if let Some(store) = fts_store.as_mut() {
+        if let Some(dataset_engine) = store.engine.as_ref() {
+            ensure!(
+                dataset_engine == &column_engine,
+                InvalidConfigurationSnafu {
+                    config_key: "columns[].full_text_search.engine".to_string(),
+                    message: format!(
+                        "Dataset '{dataset_name}' has full-text column engine '{column_engine}' that does not match dataset full_text_search.engine '{dataset_engine}'."
+                    )
+                }
+            );
+        }
+
+        let mut params = store.params.clone().unwrap_or_default();
+        search_engine::merge_params(&mut params, column_params.as_ref());
+        store.params = if params.data.is_empty() {
+            None
+        } else {
+            Some(params)
+        };
+        return Ok(fts_store);
+    }
+
+    Ok(Some(FtsStore {
+        enabled: true,
+        engine: Some(column_engine),
+        params: column_params,
+    }))
+}
+
+fn ensure_search_engine_kind(
+    dataset_name: &TableReference,
+    engine_name: &str,
+    is_supported: bool,
+    config_key: &str,
+) -> Result<()> {
+    ensure!(
+        is_supported,
+        InvalidConfigurationSnafu {
+            config_key: config_key.to_string(),
+            message: format!(
+                "Dataset '{dataset_name}' references search engine '{engine_name}' with an incompatible kind."
+            )
+        }
+    );
+    Ok(())
 }
 
 fn value_to_string(value: &Value) -> String {

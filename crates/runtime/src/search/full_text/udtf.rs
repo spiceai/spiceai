@@ -498,7 +498,11 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 find_index_in_table_provider::<ElasticsearchTextIndex>(&table_provider)
             {
                 if !es_indexes.is_empty() {
-                    return Self::call_with_es_indexes(es_indexes, &args, table_provider);
+                    return Self::call_with_es_indexes(
+                        es_indexes,
+                        &args,
+                        Arc::clone(&table_provider),
+                    );
                 }
             }
         }
