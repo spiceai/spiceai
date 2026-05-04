@@ -46,7 +46,7 @@ use reqwest::{
 };
 use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
     any::Any,
     borrow::ToOwned,
@@ -146,6 +146,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
+const PAGINATION_REPEAT_DETECTION_WINDOW: usize = 1024;
 pub type PartitionSpec = (
     Option<String>,
     Option<String>,
@@ -2001,7 +2002,7 @@ impl ExecutionPlan for HttpExec {
                 done: false,
                 last_page_path: None,
                 last_page_query: None,
-                seen_page_urls: HashSet::new(),
+                recent_page_urls: VecDeque::new(),
             };
 
             let stream = futures::stream::try_unfold(initial_state, move |mut state| {
@@ -2318,7 +2319,7 @@ struct PaginationState {
     /// Used to populate accurate `request_path`/`request_query` columns.
     last_page_path: Option<String>,
     last_page_query: Option<String>,
-    seen_page_urls: HashSet<String>,
+    recent_page_urls: VecDeque<String>,
 }
 
 fn pagination_request_label(url: &Url) -> String {
@@ -2330,7 +2331,7 @@ fn pagination_request_label(url: &Url) -> String {
 fn record_pagination_request_url(state: &mut PaginationState, url: &Url) -> Result<()> {
     let request_url = url.as_str().to_string();
     ensure!(
-        state.seen_page_urls.insert(request_url),
+        !state.recent_page_urls.contains(&request_url),
         PaginationSnafu {
             message: format!(
                 "HTTP pagination detected a repeated next page request ({}). The connector stopped before fetching duplicate rows. Check pagination_next_pointer, pagination_link_header, pagination_token_param, or pagination_query_params.",
@@ -2338,6 +2339,10 @@ fn record_pagination_request_url(state: &mut PaginationState, url: &Url) -> Resu
             )
         }
     );
+    state.recent_page_urls.push_back(request_url);
+    if state.recent_page_urls.len() > PAGINATION_REPEAT_DETECTION_WINDOW {
+        state.recent_page_urls.pop_front();
+    }
     Ok(())
 }
 
@@ -3232,7 +3237,7 @@ mod tests {
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::AtomicUsize};
     use std::time::Duration;
     use url::Url;
 
@@ -5567,7 +5572,7 @@ mod tests {
             done: false,
             last_page_path: None,
             last_page_query: None,
-            seen_page_urls: HashSet::new(),
+            recent_page_urls: VecDeque::new(),
         };
         let url =
             Url::parse("https://api.example.com/items?page=2").expect("test URL should be valid");
@@ -5585,6 +5590,144 @@ mod tests {
             }
             other => panic!("Unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_pagination_repeated_request_tracking_is_bounded() {
+        let mut state = PaginationState {
+            page: 1,
+            next_info: None,
+            rows_fetched: 0,
+            path: None,
+            query: None,
+            body: None,
+            request_headers: None,
+            limit: None,
+            done: false,
+            last_page_path: None,
+            last_page_query: None,
+            recent_page_urls: VecDeque::new(),
+        };
+
+        for page in 0..=PAGINATION_REPEAT_DETECTION_WINDOW {
+            let url = Url::parse(&format!("https://api.example.com/items?page={page}"))
+                .expect("test URL should be valid");
+            record_pagination_request_url(&mut state, &url)
+                .expect("unique request should be accepted");
+        }
+
+        assert_eq!(
+            state.recent_page_urls.len(),
+            PAGINATION_REPEAT_DETECTION_WINDOW,
+            "recent URL tracking should be capped"
+        );
+
+        let evicted_url =
+            Url::parse("https://api.example.com/items?page=0").expect("test URL should be valid");
+        record_pagination_request_url(&mut state, &evicted_url)
+            .expect("evicted URL should not be retained forever");
+    }
+
+    async fn start_query_param_pagination_server(stop_offset: usize) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                    request_count.fetch_add(1, Ordering::SeqCst);
+
+                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                    let request_target = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let request_url = Url::parse(&format!("http://localhost{request_target}"))
+                        .expect("request target should form a valid URL");
+                    let offset = request_url
+                        .query_pairs()
+                        .find_map(|(key, value)| {
+                            (key == "offset")
+                                .then(|| value.parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+
+                    let body = if offset < stop_offset {
+                        format!(r#"{{"docs":[{{"id":{offset}}}]}}"#)
+                    } else {
+                        r#"{"docs":[]}"#.to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_pagination_without_max_pages_fetches_past_default_limit() {
+        use datafusion::prelude::SessionContext;
+        use std::sync::atomic::Ordering;
+
+        let rows_to_return = DEFAULT_PAGINATION_MAX_PAGES + 5;
+        let (base_url, request_count) = start_query_param_pagination_server(rows_to_return).await;
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            .with_pagination(PaginationConfig {
+                query_params: Some("offset={offset}&limit={limit}".to_string()),
+                page_size: Some(1),
+                data_pointer: Some("/docs".to_string()),
+                max_pages: None,
+                use_link_header: false,
+                ..Default::default()
+            })
+            .expect("pagination config should be valid");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+
+        let results = ctx
+            .sql("SELECT content FROM items")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, rows_to_return,
+            "unlimited pagination should fetch beyond the default safety limit"
+        );
+        assert!(
+            request_count.load(Ordering::SeqCst) > DEFAULT_PAGINATION_MAX_PAGES,
+            "execution should request pages beyond the old safety limit"
+        );
     }
 
     #[test]
