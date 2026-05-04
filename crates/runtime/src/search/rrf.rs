@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use ::search::aggregation::reciprocal_rank::DEFAULT_RRF_K;
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -312,7 +313,7 @@ impl ReciprocalRankFusionArgs {
         Ok(Self {
             search_udtf_exprs: search_udtfs,
             rrf_subquery_arguments: subquery_args,
-            k: extract_f64!(rrf_args, "k").unwrap_or(60.0),
+            k: extract_f64!(rrf_args, "k").unwrap_or(DEFAULT_RRF_K),
             join_key: extract_string!(rrf_args, "join_key").map(ident),
             time_column: extract_string!(rrf_args, "time_column").map(ident),
             recency_decay: extract_string!(rrf_args, "recency_decay")

@@ -14,14 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Shared primitive-scalar ↔ JSON codec used by UDF tiers that move
-//! values through a JSON wire (Remote tier, Tool bridge).
+//! Shared primitive-scalar ↔ JSON codec used by the tool-backed SQL UDF bridge.
 //!
-//! Both `user_functions::remote` and the tool-backed UDF bridge in the
-//! runtime crate need the same small building blocks: parse a primitive
+//! The runtime crate needs a few small building blocks: parse a primitive
 //! Arrow-type shorthand, read a row cell as a JSON value, and build a
-//! primitive-typed Arrow output column from a stream of JSON values. We
-//! centralise them here so the two tiers cannot drift.
+//! primitive-typed Arrow output column from a stream of JSON values.
 
 use std::sync::Arc;
 

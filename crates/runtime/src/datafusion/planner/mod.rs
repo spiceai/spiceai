@@ -139,7 +139,15 @@ pub async fn create_logical_plan(
 ) -> DFResult<LogicalPlan> {
     let dialect = session.config().options().sql_parser.dialect;
     let statement = session.sql_to_statement(sql, &dialect)?;
+    create_logical_plan_from_statement(sql, statement, session, ctx).await
+}
 
+pub async fn create_logical_plan_from_statement(
+    sql: &str,
+    statement: Statement,
+    session: &SessionState,
+    ctx: &PlannerContext,
+) -> DFResult<LogicalPlan> {
     if let Statement::Statement(ref sql_stmt) = statement {
         match sql_stmt.as_ref() {
             SQLStatement::CreateTable(ct) if ct.like.is_some() => {
