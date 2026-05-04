@@ -1175,9 +1175,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_table_udtf_round_trips_via_http_json() {
+    async fn remote_table_udtf_round_trips_via_dataframe_api() {
         use axum::{Router, extract::Json as AxJson, routing::post};
-        use datafusion::prelude::SessionContext;
+        use datafusion::prelude::{SessionContext, col, lit};
         use tokio::net::TcpListener;
 
         async fn handler(AxJson(body): AxJson<Value>) -> AxJson<Value> {
@@ -1205,12 +1205,27 @@ mod tests {
         let udtf = build_table_udtf(&decl).expect("builds");
         let ctx = SessionContext::new();
         ctx.register_udtf(&decl.name, udtf);
+        let provider = ctx
+            .table_function(&decl.name)
+            .expect("registered UDTF")
+            .create_table_provider(&[lit(7_i64)])
+            .expect("creates table provider");
+        ctx.register_table("remote_rows_result", provider)
+            .expect("register UDTF result");
 
-        let df = ctx
-            .sql("SELECT value, label FROM remote_rows(7) ORDER BY value")
+        let results = ctx
+            .table("remote_rows_result")
             .await
-            .expect("sql compiles");
-        let results = df.collect().await.expect("runs");
+            .expect("table exists")
+            .filter(col("value").gt(lit(0_i64)))
+            .expect("filters")
+            .sort_by(vec![col("value")])
+            .expect("sorts")
+            .select(vec![col("value"), col("label")])
+            .expect("projects")
+            .collect()
+            .await
+            .expect("runs");
 
         assert_eq!(results.len(), 1);
         let values = results[0]

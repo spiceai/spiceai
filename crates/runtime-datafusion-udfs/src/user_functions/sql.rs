@@ -693,6 +693,7 @@ mod tests {
         Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
     };
     use datafusion::arrow::datatypes::{Field as ArrowField, Int64Type, TimeUnit};
+    use datafusion::prelude::{col, lit};
     use spicepod::component::function::{
         FunctionArg, FunctionKind, FunctionReturns, Signature as YamlSignature,
     };
@@ -1007,6 +1008,58 @@ mod tests {
             .await
             .expect("sql compiles");
         let results = df.collect().await.expect("runs");
+
+        assert_eq!(results.len(), 1);
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value int64");
+        let doubled = results[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("doubled int64");
+        assert_eq!(values.values(), &[4_i64, 5]);
+        assert_eq!(doubled.values(), &[8_i64, 10]);
+    }
+
+    #[tokio::test]
+    async fn sql_table_udtf_queried_via_dataframe_api() {
+        use datafusion::prelude::SessionContext;
+
+        let decl = table_decl(
+            "SELECT x AS value, x * 2 AS doubled FROM args \
+             UNION ALL \
+             SELECT x + 1 AS value, (x + 1) * 2 AS doubled FROM args",
+        );
+        let udtf = build_table_udtf(&decl, decl.body.as_deref().expect("test"))
+            .await
+            .expect("builds");
+
+        let ctx = SessionContext::new();
+        ctx.register_udtf(&decl.name, udtf);
+        let provider = ctx
+            .table_function(&decl.name)
+            .expect("registered UDTF")
+            .create_table_provider(&[lit(4_i64)])
+            .expect("creates table provider");
+        ctx.register_table("emit_pair_result", provider)
+            .expect("register UDTF result");
+
+        let results = ctx
+            .table("emit_pair_result")
+            .await
+            .expect("table exists")
+            .filter(col("doubled").gt(lit(0_i64)))
+            .expect("filters")
+            .sort_by(vec![col("value")])
+            .expect("sorts")
+            .select(vec![col("value"), col("doubled")])
+            .expect("projects")
+            .collect()
+            .await
+            .expect("runs");
 
         assert_eq!(results.len(), 1);
         let values = results[0]

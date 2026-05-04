@@ -664,17 +664,17 @@ mod tests {
     }
 
     /// End-to-end: declare a remote UDF pointing at a local axum HTTP server,
-    /// register it into `DataFusion`, run `SELECT remote_double(x) FROM t`,
+    /// register it into `DataFusion`, project it with the `DataFrame` API,
     /// and verify the values round-tripped through JSON.
     #[cfg(feature = "http-functions")]
     #[tokio::test]
-    async fn remote_udf_round_trips_via_http_json() {
+    async fn remote_udf_round_trips_via_dataframe_api() {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use axum::{Router, extract::Json as AxJson, routing::post};
         use datafusion::datasource::MemTable;
-        use datafusion::prelude::SessionContext;
+        use datafusion::prelude::{SessionContext, col};
         use serde_json::Value;
         use spicepod::component::function::{
             FunctionArg, FunctionKind, FunctionReturns, Signature as YamlSig, Volatility,
@@ -733,12 +733,12 @@ mod tests {
         let built = build_function(&decl).await.expect("builds");
 
         let ctx = SessionContext::new();
-        match built {
-            BuiltFunction::Scalar(udf) => ctx.register_udf(udf.as_ref().clone()),
+        let udf = match built {
+            BuiltFunction::Scalar(udf) => udf,
             BuiltFunction::Table(_) => panic!("expected scalar function"),
-        }
+        };
+        ctx.register_udf(udf.as_ref().clone());
 
-        // MemTable with four rows, query through the SQL layer.
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -749,9 +749,13 @@ mod tests {
         ctx.register_table("t", Arc::new(table)).expect("register");
 
         let df = ctx
-            .sql("SELECT remote_double(x) AS y FROM t ORDER BY x")
+            .table("t")
             .await
-            .expect("sql compiles");
+            .expect("table exists")
+            .sort_by(vec![col("x")])
+            .expect("sorts")
+            .select(vec![udf.call(vec![col("x")]).alias("y")])
+            .expect("projects remote UDF");
         let results = df.collect().await.expect("runs");
 
         assert_eq!(results.len(), 1);
@@ -764,14 +768,14 @@ mod tests {
     }
 
     /// End-to-end: a Function declaration with a valid SQL body builds into a
-    /// `ScalarUDF` that evaluates correctly through `DataFusion`'s SQL layer.
+    /// `ScalarUDF` that evaluates correctly through the `DataFrame` API.
     #[tokio::test]
-    async fn sql_udf_registered_and_queried_via_sql() {
+    async fn sql_udf_registered_and_queried_via_dataframe_api() {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use datafusion::datasource::MemTable;
-        use datafusion::prelude::SessionContext;
+        use datafusion::prelude::{SessionContext, col};
         use std::sync::Arc;
 
         let mut d = decl("sql", Some("x * 2"));
@@ -779,14 +783,12 @@ mod tests {
         let built = build_function(&d).await.expect("builds");
 
         let ctx = SessionContext::new();
-        match built {
-            BuiltFunction::Scalar(udf) => {
-                ctx.register_udf(udf.as_ref().clone());
-            }
+        let udf = match built {
+            BuiltFunction::Scalar(udf) => udf,
             BuiltFunction::Table(_) => panic!("expected scalar function"),
-        }
+        };
+        ctx.register_udf(udf.as_ref().clone());
 
-        // Register a tiny table so we can SELECT double_it(col) FROM t.
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -797,9 +799,13 @@ mod tests {
         ctx.register_table("t", Arc::new(table)).expect("register");
 
         let df = ctx
-            .sql("SELECT double_it(x) AS y FROM t ORDER BY x")
+            .table("t")
             .await
-            .expect("sql compiles");
+            .expect("table exists")
+            .sort_by(vec![col("x")])
+            .expect("sorts")
+            .select(vec![udf.call(vec![col("x")]).alias("y")])
+            .expect("projects SQL UDF");
         let results = df.collect().await.expect("runs");
         assert_eq!(results.len(), 1);
         let col = results[0]

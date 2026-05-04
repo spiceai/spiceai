@@ -1107,7 +1107,7 @@ mod tests {
     use super::*;
     use arrow::array::Int64Array;
     use datafusion::datasource::MemTable;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionContext, col, lit};
     use spicepod::component::function::{FunctionKind, FunctionTableArg, Signature, Volatility};
     use std::collections::HashMap;
     use std::path::Path;
@@ -1299,6 +1299,62 @@ mod tests {
             .sql("SELECT value FROM wasm_identity(numbers, 7) ORDER BY value")
             .await
             .expect("sql compiles")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[1_i64, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn wasm_table_udtf_accepts_input_table_via_dataframe_api() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+        let mut decl = wasm_identity_decl(&module);
+        decl.params.remove(INPUT_TABLE_PARAM);
+        decl.signature.args.push(FunctionArg {
+            name: "unused".into(),
+            arrow_type: "int64".into(),
+        });
+        let udtf = build_table_udtf(&decl, None).await.expect("builds");
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .expect("record batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table("numbers", Arc::new(table))
+            .expect("register table");
+        ctx.register_udtf(&decl.name, udtf);
+        let provider = ctx
+            .table_function(&decl.name)
+            .expect("registered UDTF")
+            .create_table_provider(&[col("numbers"), lit(7_i64)])
+            .expect("creates table provider");
+        ctx.register_table("wasm_identity_result", provider)
+            .expect("register UDTF result");
+
+        let results = ctx
+            .table("wasm_identity_result")
+            .await
+            .expect("table exists")
+            .filter(col("value").gt(lit(0_i64)))
+            .expect("filters")
+            .sort_by(vec![col("value")])
+            .expect("sorts")
+            .select(vec![col("value")])
+            .expect("projects")
             .collect()
             .await
             .expect("query runs");
