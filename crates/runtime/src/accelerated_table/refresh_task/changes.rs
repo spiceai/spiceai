@@ -71,11 +71,18 @@ macro_rules! extract_primary_key {
     }};
 }
 
+/// Channel depth between the CDC source-stream reader and the apply loop.
+/// Each slot can hold one decoded `ChangeEnvelope`, so peak prefetch memory
+/// is `CDC_PREFETCH_BUFFER * max_batch_bytes`. Tuned small to keep memory
+/// bounded for sources that emit large per-transaction batches (e.g.,
+/// Postgres logical replication during bulk inserts).
+const CDC_PREFETCH_BUFFER: usize = 4;
+
 impl RefreshTask {
     pub async fn start_changes_stream(
         &self,
         refresh: Arc<RwLock<Refresh>>,
-        mut changes_stream: ChangesStream,
+        changes_stream: ChangesStream,
         caching: Option<Weak<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
@@ -86,7 +93,33 @@ impl RefreshTask {
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
-        while let Some(update) = changes_stream.next().await {
+        // Pipeline source-stream reads with apply+commit by running the source
+        // in its own task on the refresh runtime and feeding a bounded channel.
+        // While the apply loop writes batch N to the accelerator and commits
+        // its source-side offset, the reader task can already be pulling and
+        // decoding batch N+1 (network/CPU work that would otherwise be idle).
+        // The bounded channel provides natural backpressure: when the apply
+        // loop is the bottleneck, the reader parks on `send` and stops
+        // pulling, so we never accumulate unbounded memory.
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<cdc::ChangeEnvelope, cdc::StreamError>>(
+                CDC_PREFETCH_BUFFER,
+            );
+
+        let reader_dataset = dataset_name.clone();
+        let reader_handle = tokio::spawn(async move {
+            let mut stream = changes_stream;
+            while let Some(item) = stream.next().await {
+                if tx.send(item).await.is_err() {
+                    tracing::debug!(
+                        "CDC consumer for {reader_dataset} dropped; reader exiting"
+                    );
+                    return;
+                }
+            }
+        });
+
+        while let Some(update) = rx.recv().await {
             match update {
                 Ok(change_envelope) => {
                     match self
@@ -151,6 +184,14 @@ impl RefreshTask {
                     .await;
                 }
             }
+        }
+
+        // rx returned None: the reader dropped its sender (stream ended or
+        // panicked). Join to surface panics; this should be immediate.
+        if let Err(e) = reader_handle.await
+            && !self.runtime_status.is_shutdown()
+        {
+            tracing::warn!("CDC reader task for {dataset_name} did not exit cleanly: {e}");
         }
 
         if !self.runtime_status.is_shutdown() {
