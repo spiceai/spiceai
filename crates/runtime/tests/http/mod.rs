@@ -19,6 +19,8 @@ mod json_nested_fields;
 #[cfg(feature = "duckdb")]
 mod view_hot_reload;
 
+mod deferred;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
