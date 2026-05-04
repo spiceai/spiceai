@@ -38,6 +38,8 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::SearchGenerationSnafu;
 use crate::search::full_text::as_candidate_generations;
+#[cfg(feature = "elasticsearch")]
+use crate::search::full_text::as_es_text_candidate_generations;
 
 use super::{Error, Result};
 
@@ -285,19 +287,37 @@ pub async fn full_text_search_candidates(
         return Some(Ok(vec![]));
     };
 
-    let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() else {
-        return Some(Ok(vec![]));
-    };
+    // Tantivy path.
+    if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
+        return Some(
+            as_candidate_generations(
+                &fts.with_new_base(base_table_provider),
+                Arc::clone(df),
+                tbl.clone(),
+            )
+            .await
+            .context(SearchGenerationSnafu),
+        );
+    }
 
-    Some(
-        as_candidate_generations(
-            &fts.with_new_base(base_table_provider),
-            Arc::clone(df),
-            tbl.clone(),
-        )
-        .await
-        .context(SearchGenerationSnafu),
-    )
+    // Elasticsearch BM25 path.
+    #[cfg(feature = "elasticsearch")]
+    {
+        use search::index::elasticsearch::ElasticsearchTextIndex;
+        if let Some((es_indexes, _)) =
+            find_index_in_table_provider::<ElasticsearchTextIndex>(&index_table_provider)
+        {
+            if !es_indexes.is_empty() {
+                return Some(
+                    as_es_text_candidate_generations(es_indexes, Arc::clone(df), tbl.clone())
+                        .await
+                        .context(SearchGenerationSnafu),
+                );
+            }
+        }
+    }
+
+    Some(Ok(vec![]))
 }
 
 /// There is no [`Expr`] that can parse a fully qualified table name. For UDTFs that require
