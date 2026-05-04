@@ -351,11 +351,8 @@ impl ElasticsearchIndex {
 
 /// Elasticsearch-backed full-text search index.
 ///
-/// Uses Elasticsearch's native BM25 full-text search capabilities.
-///
-/// Note: This index type is not yet wired into the `text_search` UDTF or `rrf`
-/// discovery paths. It is currently used only when constructing search providers
-/// directly (e.g. via the vector engine integration).
+/// Uses Elasticsearch's native BM25 full-text search capabilities, querying live
+/// at search time via the `text_search()` UDTF and `/v1/search` API.
 #[derive(Debug, Clone)]
 pub struct ElasticsearchTextIndex {
     /// The Elasticsearch client.
@@ -375,6 +372,9 @@ pub struct ElasticsearchTextIndex {
 
     /// Full source schema for extracting fields.
     pub source_schema: SchemaRef,
+
+    /// Maximum number of rows to send per Elasticsearch `_bulk` request.
+    pub batch_write_rows: usize,
 }
 
 #[async_trait]
@@ -391,7 +391,15 @@ impl SearchIndex for ElasticsearchTextIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(record)
+        write::write_text(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            self.batch_write_rows,
+            &record,
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     }
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
@@ -435,5 +443,15 @@ impl Index for ElasticsearchTextIndex {
         let mut cols: Vec<_> = self.primary_key.iter().map(|f| f.name().clone()).collect();
         cols.push(self.search_column_name.clone());
         cols
+    }
+
+    async fn compute_index(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        // Elasticsearch is queried live at search time; there is no local index to build.
+        // Pass batches through unchanged so the accelerated table refresh pipeline
+        // sees a consistent row count.
+        Ok(batches)
     }
 }

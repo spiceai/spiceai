@@ -104,3 +104,97 @@ pub(crate) fn add_full_text_search_to_table(
 
     Ok(tbl.add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>))
 }
+
+/// Adds an [`ElasticsearchTextIndex`] to a [`TableProvider`] for each FTS-enabled column.
+///
+/// Unlike the Tantivy path, this function builds a live Elasticsearch client and
+/// creates one index per search field. Elasticsearch is queried live at search time.
+#[cfg(feature = "elasticsearch")]
+pub(crate) async fn add_elasticsearch_fts_to_table(
+    inner_table_provider: Arc<dyn TableProvider>,
+    columns: &[spicepod::semantic::Column],
+    tbl: &datafusion::sql::TableReference,
+    fts_params: &crate::search::full_text::elasticsearch::ElasticsearchFtsParams,
+) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::component::column::full_text_search_config;
+    use crate::component::dataset::FullTextSearchDatasetConfig;
+    use crate::embeddings::index::elasticsearch::{
+        ensure_index_with_text_mapping, get_fts_client, normalize_es_data_type,
+    };
+    use arrow_schema::{DataType, Field};
+    use search::index::elasticsearch::ElasticsearchTextIndex;
+
+    let Some(FullTextSearchDatasetConfig {
+        search_fields,
+        primary_key,
+        ..
+    }) = full_text_search_config(columns, tbl)
+    else {
+        return Err(Box::from(format!(
+            "Attempted to add Elasticsearch FTS to '{tbl}', but no FTS column configuration found"
+        )));
+    };
+
+    let client = get_fts_client(&fts_params.params)?;
+
+    // Normalize LargeUtf8 → Utf8 in the source schema (ES always returns Utf8).
+    let raw_schema = inner_table_provider.schema();
+    let normalized_fields: Vec<Arc<arrow_schema::Field>> = raw_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let normalized = normalize_es_data_type(f.data_type());
+            if &normalized == f.data_type() {
+                Arc::clone(f)
+            } else {
+                Arc::new(Field::new(f.name(), normalized, f.is_nullable()))
+            }
+        })
+        .collect();
+    let source_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        normalized_fields,
+        raw_schema.metadata().clone(),
+    ));
+
+    // Resolve primary key fields from schema, normalizing types.
+    let pk_fields: Vec<Field> = primary_key
+        .iter()
+        .map(|name| {
+            raw_schema
+                .field_with_name(name)
+                .map(|f| {
+                    let dt = normalize_es_data_type(f.data_type());
+                    Field::new(f.name(), dt, f.is_nullable())
+                })
+                .unwrap_or_else(|_| Field::new(name, DataType::Utf8, true))
+        })
+        .collect();
+
+    // Ensure the ES index exists with text mappings for all search fields.
+    ensure_index_with_text_mapping(client.as_ref(), &fts_params.es_index, &search_fields).await?;
+
+    let mut provider: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
+        .as_any()
+        .downcast_ref::<IndexedTableProvider>(
+    ) {
+        idx_tbl.clone()
+    } else {
+        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+    };
+
+    // Create one ElasticsearchTextIndex per search field.
+    for search_field in &search_fields {
+        let index = Arc::new(ElasticsearchTextIndex {
+            client: Arc::clone(&client),
+            es_index: fts_params.es_index.clone(),
+            search_column_name: search_field.clone(),
+            search_fields: vec![search_field.clone()],
+            primary_key: pk_fields.clone(),
+            source_schema: Arc::clone(&source_schema),
+            batch_write_rows: 1000,
+        });
+        provider = provider.add_index(index as Arc<dyn Index + Send + Sync>);
+    }
+
+    Ok(provider)
+}

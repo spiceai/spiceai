@@ -392,7 +392,7 @@ fn parse_duration_param(
     )
 }
 
-fn build_client_options(
+pub(crate) fn build_client_options(
     params: &Parameters,
 ) -> Result<ClientOptions, Box<dyn std::error::Error + Send + Sync>> {
     let mut opts = ClientOptions::default();
@@ -575,7 +575,7 @@ async fn ensure_index_with_mapping(
 
 /// Check whether an error from `create_index` indicates the index already exists
 /// (e.g. because another runtime instance created it concurrently).
-fn is_index_already_exists_error(error: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_index_already_exists_error(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(err) = current {
         let message = err.to_string();
@@ -619,7 +619,7 @@ fn arrow_type_to_es_mapping(dt: &DataType) -> serde_json::Value {
 /// - `LargeUtf8` → `Utf8`: ES always deserializes strings as `StringArray` (Utf8).
 /// - `FixedSizeList` with any inner field → `FixedSizeList` with `Field::new("item", Float32, false)`:
 ///   `build_dense_vector_array` always produces this exact inner field.
-fn normalize_es_data_type(dt: &DataType) -> DataType {
+pub(crate) fn normalize_es_data_type(dt: &DataType) -> DataType {
     match dt {
         DataType::LargeUtf8 | DataType::Utf8View => DataType::Utf8,
         DataType::FixedSizeList(_, dim) => DataType::FixedSizeList(
@@ -630,7 +630,7 @@ fn normalize_es_data_type(dt: &DataType) -> DataType {
     }
 }
 
-fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
+pub(crate) fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
     p.get(key).expose().ok()
 }
 
@@ -656,4 +656,85 @@ async fn get_store_params(
     .await?;
 
     Ok(params)
+}
+
+/// Build an Elasticsearch client from a raw params map.
+/// Used by the FTS connector path which reads params from `dataset.params`.
+pub(crate) fn get_fts_client(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<Arc<dyn Elasticsearch>, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = params.get("endpoint").ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "Missing required parameter 'endpoint' for Elasticsearch FTS.",
+        )
+    })?;
+    let user = params
+        .get("user")
+        .map(String::as_str)
+        .map(ToString::to_string);
+    let pass = params
+        .get("pass")
+        .map(String::as_str)
+        .map(ToString::to_string);
+
+    let mut opts = ClientOptions::default();
+    if let Some(s) = params.get("client_timeout") {
+        if let Ok(d) = duration_parse::parse_duration(s) {
+            opts.request_timeout = d;
+        }
+    }
+    if let Some(s) = params.get("connect_timeout") {
+        if let Ok(d) = duration_parse::parse_duration(s) {
+            opts.connect_timeout = d;
+        }
+    }
+
+    let client = Client::new_with_options(endpoint, user, pass, &opts)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+    Ok(Arc::new(client) as Arc<dyn Elasticsearch>)
+}
+
+/// Ensure the Elasticsearch index exists with `text` field mappings for the given fields.
+/// Does NOT create a `dense_vector` field. Best-effort: if the index already exists, leaves it.
+pub(crate) async fn ensure_index_with_text_mapping(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    text_fields: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut properties = serde_json::Map::new();
+    for field in text_fields {
+        properties.insert(
+            field.clone(),
+            serde_json::json!({
+                "type": "text",
+                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+            }),
+        );
+    }
+
+    let exists = client
+        .index_exists(es_index)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+    let mapping_body = serde_json::json!({ "properties": properties });
+
+    if exists {
+        if let Err(e) = client.put_mapping(es_index, &mapping_body).await {
+            tracing::warn!(
+                "Elasticsearch FTS index '{es_index}' exists but mapping update failed (continuing): {e}"
+            );
+        }
+        return Ok(());
+    }
+
+    let create_body = serde_json::json!({ "mappings": { "properties": properties } });
+    match client.create_index(es_index, &create_body).await {
+        Ok(_) => {
+            tracing::info!("Created Elasticsearch FTS index '{es_index}'.");
+            Ok(())
+        }
+        Err(e) if is_index_already_exists_error(&e) => Ok(()),
+        Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+    }
 }

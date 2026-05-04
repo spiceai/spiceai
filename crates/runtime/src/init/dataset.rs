@@ -1092,7 +1092,22 @@ impl Runtime {
         }
 
         if ds.has_full_text_column() {
-            data_connector = Arc::new(FullTextConnector::new(data_connector));
+            #[cfg(feature = "elasticsearch")]
+            if ds.params.get("full_text_search_engine").map(String::as_str) == Some("elasticsearch")
+            {
+                use crate::search::full_text::elasticsearch::ElasticsearchFullTextConnector;
+                data_connector = Arc::new(
+                    ElasticsearchFullTextConnector::try_new(data_connector, &ds, self.secrets())
+                        .await
+                        .context(UnableToInitializeDataConnectorSnafu)?,
+                );
+            } else {
+                data_connector = Arc::new(FullTextConnector::new(data_connector));
+            }
+            #[cfg(not(feature = "elasticsearch"))]
+            {
+                data_connector = Arc::new(FullTextConnector::new(data_connector));
+            }
         }
 
         if data_connector.initialization().is_on_trigger() {

@@ -24,6 +24,9 @@ pub mod connector;
 pub mod table;
 pub mod udtf;
 
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
+
 /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
 pub async fn as_candidate_generations(
     database_index: &FullTextDatabaseIndex,
