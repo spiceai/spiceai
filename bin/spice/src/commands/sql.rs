@@ -19,6 +19,7 @@ limitations under the License.
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use clap::Args;
+use spice_cloud_client::endpoints::flight_endpoint as spice_cloud_flight_endpoint;
 
 /// Arguments for the sql command.
 #[derive(Args, Debug)]
@@ -91,7 +92,7 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         .map_or_else(
             || {
                 if let Some(region) = ctx.cloud_region() {
-                    format!("https://{region}-prod-aws-flight.spiceai.io")
+                    spice_cloud_flight_endpoint(region)
                 } else {
                     "http://localhost:50051".to_string()
                 }

@@ -24,8 +24,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpiceToolsOptions {
-    /// Automatically use all available builtin tools.
+    /// Automatically choose between direct configured tools and searchable discovery.
     Auto,
+
+    /// Use built-in and Spicepod-configured tools directly.
+    All,
+
+    /// Use a searchable registry over built-in and Spicepod-configured tools.
+    #[serde(rename = "search_registry")]
+    SearchRegistry,
 
     /// Use builtin tools relevant for text-to-SQL.
     Nsql,
@@ -42,15 +49,28 @@ impl SpiceToolsOptions {
     #[must_use]
     pub fn can_use_tools(&self) -> bool {
         match self {
-            SpiceToolsOptions::Auto | SpiceToolsOptions::Nsql => true,
+            SpiceToolsOptions::Auto
+            | SpiceToolsOptions::All
+            | SpiceToolsOptions::SearchRegistry
+            | SpiceToolsOptions::Nsql => true,
             SpiceToolsOptions::Disabled => false,
             SpiceToolsOptions::Specific(t) => !t.is_empty(),
         }
     }
 
+    #[must_use]
+    pub(crate) fn includes_all_available_tools(&self) -> bool {
+        matches!(
+            self,
+            SpiceToolsOptions::Auto | SpiceToolsOptions::All | SpiceToolsOptions::SearchRegistry
+        )
+    }
+
     pub(crate) fn tools_by_name(&self) -> Vec<&str> {
         match self {
-            SpiceToolsOptions::Auto => vec![
+            SpiceToolsOptions::Auto
+            | SpiceToolsOptions::All
+            | SpiceToolsOptions::SearchRegistry => vec![
                 "search",
                 "table_schema",
                 "sql",
@@ -73,6 +93,11 @@ impl SpiceToolsOptions {
                 .iter()
                 // Handle nested groupings. e.g: `spiced_tools: nsql, my_other_tool`.
                 .flat_map(|s| match s.parse() {
+                    Ok(
+                        SpiceToolsOptions::Auto
+                        | SpiceToolsOptions::All
+                        | SpiceToolsOptions::SearchRegistry,
+                    ) => SpiceToolsOptions::All.tools_by_name(),
                     Ok(SpiceToolsOptions::Nsql) => SpiceToolsOptions::Nsql.tools_by_name(),
                     _ => vec![s.as_str()],
                 })
@@ -88,6 +113,8 @@ impl FromStr for SpiceToolsOptions {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_lowercase().as_str() {
             "auto" => Ok(SpiceToolsOptions::Auto),
+            "all" => Ok(SpiceToolsOptions::All),
+            "search_registry" => Ok(SpiceToolsOptions::SearchRegistry),
             "nsql" => Ok(SpiceToolsOptions::Nsql),
             "disabled" => Ok(SpiceToolsOptions::Disabled),
             _ => Ok(SpiceToolsOptions::Specific(
@@ -133,6 +160,63 @@ mod tests {
             tools.len(),
             tools.iter().unique().count(),
             "'SpiceToolsOptions::tools_by_name' should not produce duplicates"
+        );
+
+        assert_eq!(
+            SpiceToolsOptions::Specific(vec![
+                "search_registry".to_string(),
+                "my_other_tool".to_string(),
+            ])
+            .tools_by_name(),
+            SpiceToolsOptions::All
+                .tools_by_name()
+                .into_iter()
+                .chain(["my_other_tool"])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_all_tool_opts() {
+        assert!(SpiceToolsOptions::All.can_use_tools());
+        assert!(SpiceToolsOptions::All.includes_all_available_tools());
+        assert_eq!(
+            SpiceToolsOptions::All.tools_by_name(),
+            SpiceToolsOptions::Auto.tools_by_name()
+        );
+
+        assert!(matches!(
+            "all"
+                .parse::<SpiceToolsOptions>()
+                .expect("all should parse as a tool option"),
+            SpiceToolsOptions::All
+        ));
+    }
+
+    #[test]
+    fn test_search_registry_tool_opts() {
+        assert!(SpiceToolsOptions::SearchRegistry.can_use_tools());
+        assert!(SpiceToolsOptions::SearchRegistry.includes_all_available_tools());
+        assert_eq!(
+            SpiceToolsOptions::SearchRegistry.tools_by_name(),
+            SpiceToolsOptions::Auto.tools_by_name()
+        );
+
+        assert!(matches!(
+            "search_registry"
+                .parse::<SpiceToolsOptions>()
+                .expect("search_registry should parse as a tool option"),
+            SpiceToolsOptions::SearchRegistry
+        ));
+    }
+
+    #[test]
+    fn test_search_tool_name_is_specific_tool() {
+        let option = "search"
+            .parse::<SpiceToolsOptions>()
+            .expect("search should parse as a specific tool name");
+        assert!(
+            matches!(option, SpiceToolsOptions::Specific(tools) if tools == vec!["search".to_string()])
         );
     }
 }

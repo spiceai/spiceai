@@ -212,7 +212,7 @@ impl IndividualToolFactory for BuiltinToolCatalog {
 impl SpiceToolCatalog for BuiltinToolCatalog {
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         let mut tools = vec![];
-        for t in SpiceToolsOptions::Auto.tools_by_name() {
+        for t in SpiceToolsOptions::All.tools_by_name() {
             match self.construct_builtin(t, None, None, &HashMap::new()) {
                 Ok(tool) => tools.push(tool),
                 Err(e) => tracing::warn!("Failed to construct builtin tool: '{}'. Error: {}", t, e),

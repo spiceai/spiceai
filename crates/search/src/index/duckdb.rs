@@ -242,13 +242,19 @@ impl DuckDBVectorIndex {
         conn.execute("SET hnsw_enable_experimental_persistence = true", [])
             .map_err(to_execution_error)?;
         let index_name = DuckDBHnswOptions::index_name_for(table_name, &embedding_column);
-        conn.execute(
-            &self
-                .hnsw
-                .create_index_sql(table_name, &embedding_column, &index_name),
-            [],
-        )
-        .map_err(to_execution_error)?;
+        let create_sql = self
+            .hnsw
+            .create_index_sql(table_name, &embedding_column, &index_name);
+        conn.execute(&create_sql, []).map_err(to_execution_error)?;
+
+        tracing::debug!(
+            table = %table_name,
+            index = %index_name,
+            column = %embedding_column,
+            sql = %create_sql,
+            "HNSW index created successfully"
+        );
+
         Ok(())
     }
 
@@ -371,6 +377,10 @@ impl Index for DuckDBVectorIndex {
     /// init time; DuckDB VSS maintains it automatically on subsequent inserts.
     async fn on_write_complete(&self) -> DataFusionResult<()> {
         let Some(ctx) = &self.query_context else {
+            tracing::debug!(
+                column = %self.embedded_column,
+                "on_write_complete skipped: no query context for HNSW index"
+            );
             return Ok(());
         };
         let index = self.clone();

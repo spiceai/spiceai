@@ -150,6 +150,9 @@ pub struct SearchResponseResult {
     // `matches` is left as a generic JSON value (`serde_json::Value`) instead of a strongly typed struct.
     // The search API can return different sets of fields here depending on dataset or configuration
     pub matches: serde_json::Value,
+    // The runtime serializes this field as `_score` (see `crates/runtime/src/search/types.rs`).
+    // Accept the legacy `score` name as an alias to stay compatible with older runtimes.
+    #[serde(rename = "_score", alias = "score")]
     pub score: f64,
     pub dataset: String,
     /// Primary key can be different types depending on the dataset. Default to empty map, if not present.

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+#![recursion_limit = "256"]
 
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
@@ -500,6 +501,7 @@ pub struct Runtime {
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     /// Per-model rate controllers for AI UDF concurrency control.
     model_rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
     // LLMs that support the OpenAI Responses API
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
@@ -631,6 +633,13 @@ impl Runtime {
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         Arc::clone(&self.model_rate_controllers)
+    }
+
+    #[must_use]
+    pub fn http_rate_control_registry(
+        &self,
+    ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+        Arc::clone(&self.http_rate_control_registry)
     }
 
     #[must_use]
@@ -1565,7 +1574,7 @@ impl Runtime {
                 .collect::<HashSet<_>>();
             for (name, tooling) in tool_lock.iter() {
                 match tooling {
-                    Tooling::Tool(tool) => {
+                    Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
                     Tooling::Catalog(catalog) => {
@@ -1592,7 +1601,8 @@ impl Runtime {
                 };
                 return catalog.get(name).await;
             } else {
-                let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
+                let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name)
+                else {
                     return None;
                 };
                 Arc::clone(tool)

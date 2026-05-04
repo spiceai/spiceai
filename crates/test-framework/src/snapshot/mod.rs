@@ -69,6 +69,7 @@ pub async fn record_explain_plan(
             (CAYENNE_PATH_FILTER_PATTERN, CAYENNE_PATH_FILTER_REPLACEMENT),
             (VORTEX_RANGE_FILTER_PATTERN, VORTEX_RANGE_FILTER_REPLACEMENT),
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
+            (r"partition_sizes=\[[^\]]*\]", "partition_sizes=[<redacted>]"),
             (r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#, "<GROUPING_PAIR>"),
             (r#"grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\),\s*grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\)"#, "<GROUPING_PAIR>")
         ],
