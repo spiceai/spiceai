@@ -149,7 +149,7 @@ impl RateLimiter for HttpRateLimiter {
             }
 
             let wait_duration = retry_after.saturating_duration_since(now);
-            tracing::warn!(
+            tracing::debug!(
                 wait_duration_ms = wait_duration.as_millis(),
                 "HTTP rate limit exceeded. Waiting before sending another request."
             );
