@@ -16060,6 +16060,7 @@ dependencies = [
  "jsonwebtoken 10.3.0",
  "linkme",
  "llms",
+ "logos",
  "mediatype",
  "model_components",
  "moka",
