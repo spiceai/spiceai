@@ -183,8 +183,8 @@ pub struct PaginationConfig {
     /// When set, only the array at this path is returned as data rows.
     pub data_pointer: Option<String>,
 
-    /// Maximum number of pages to fetch. Default: 100
-    pub max_pages: usize,
+    /// Maximum number of pages to fetch. Default: 100. `None` disables the limit.
+    pub max_pages: Option<usize>,
 
     /// When `true`, if the data at `data_pointer` (or the top-level response) is a JSON
     /// object/map, extract its values as rows instead of treating it as a single row.
@@ -209,7 +209,7 @@ impl Default for PaginationConfig {
             use_link_header: true,
             token_param: None,
             data_pointer: None,
-            max_pages: DEFAULT_PAGINATION_MAX_PAGES,
+            max_pages: Some(DEFAULT_PAGINATION_MAX_PAGES),
             data_map_to_array: false,
             query_params: None,
             page_size: None,
@@ -770,12 +770,14 @@ impl HttpTableProvider {
                 });
             }
         }
-        ensure!(
-            config.max_pages > 0,
-            ConfigurationSnafu {
-                message: "pagination_max_pages must be greater than 0".to_string()
-            }
-        );
+        if let Some(max_pages) = config.max_pages {
+            ensure!(
+                max_pages > 0,
+                ConfigurationSnafu {
+                    message: "pagination_max_pages must be greater than 0".to_string()
+                }
+            );
+        }
         if let Some(ref pointer) = config.next_pointer {
             ensure!(
                 pointer.starts_with('/'),
@@ -2015,10 +2017,12 @@ impl ExecutionPlan for HttpExec {
                             DataFusionError::Internal("Pagination config missing".to_string())
                         })?;
 
-                        if state.page >= config.max_pages {
+                        if let Some(max_pages) = config.max_pages
+                            && state.page >= max_pages
+                        {
                             tracing::warn!(
                                 "HTTP pagination reached the configured safety limit of {} pages. Increase `pagination_max_pages` to fetch additional pages.",
-                                config.max_pages
+                                max_pages
                             );
                             return Ok(None);
                         }
@@ -5175,7 +5179,7 @@ mod tests {
                 query_params: Some("offset={offset}&limit={limit}".to_string()),
                 page_size: Some(3),
                 data_pointer: Some("/docs".to_string()),
-                max_pages: 2,
+                max_pages: Some(2),
                 use_link_header: false,
                 ..Default::default()
             })
@@ -5480,6 +5484,40 @@ mod tests {
             ..Default::default()
         });
         assert!(result.is_ok(), "should accept link_header pagination");
+    }
+
+    #[test]
+    fn test_pagination_config_valid_with_no_max_pages_limit() {
+        let provider = base_provider();
+        let result = provider.with_pagination(PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            use_link_header: false,
+            max_pages: None,
+            ..Default::default()
+        });
+        assert!(result.is_ok(), "should accept no max-pages limit");
+    }
+
+    #[test]
+    fn test_pagination_config_rejects_zero_max_pages() {
+        let provider = base_provider();
+        let error = provider
+            .with_pagination(PaginationConfig {
+                next_pointer: Some("/next".to_string()),
+                use_link_header: false,
+                max_pages: Some(0),
+                ..Default::default()
+            })
+            .expect_err("zero max_pages should fail");
+        match error {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("pagination_max_pages"),
+                    "error should mention pagination_max_pages: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
     }
 
     #[test]

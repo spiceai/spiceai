@@ -58,6 +58,24 @@ use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 
+fn parse_pagination_max_pages(value: &str) -> Option<usize> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("nolimit") {
+        return None;
+    }
+
+    match trimmed.parse::<usize>() {
+        Ok(max_pages) => Some(max_pages),
+        Err(_) => {
+            tracing::warn!(
+                "Invalid pagination_max_pages value '{}': expected a positive integer or 'nolimit'. The parameter will be ignored.",
+                value
+            );
+            Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
@@ -456,8 +474,10 @@ impl Https {
                 .get("pagination_max_pages")
                 .expose()
                 .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES);
+                .map_or(
+                    Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES),
+                    parse_pagination_max_pages,
+                );
 
             let data_map_to_array = self
                 .params
@@ -942,6 +962,9 @@ impl Https {
         }
 
         if let Some(pagination_config) = pagination {
+            let max_pages = pagination_config
+                .max_pages
+                .map_or_else(|| "nolimit".to_string(), |max_pages| max_pages.to_string());
             tracing::trace!(
                 "Enabling pagination for {}: next_pointer={:?}, link_header={}, token_param={:?}, data_pointer={:?}, max_pages={}, data_map_to_array={}, query_params={:?}, page_size={:?}",
                 dataset.name,
@@ -949,7 +972,7 @@ impl Https {
                 pagination_config.use_link_header,
                 pagination_config.token_param,
                 pagination_config.data_pointer,
-                pagination_config.max_pages,
+                max_pages,
                 pagination_config.data_map_to_array,
                 pagination_config.query_params,
                 pagination_config.page_size,
@@ -1186,7 +1209,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_data_pointer")
             .description("JSON pointer (RFC 6901) to the data array in each page's response (e.g., '/data', '/results', '/items'). When set, only the array at this path is returned as data rows."),
         ParameterSpec::runtime("pagination_max_pages")
-            .description("Maximum number of pages to fetch for pagination. Default: 100."),
+            .description("Maximum number of pages to fetch for pagination. Default: 100. Set to 'nolimit' to disable the limit."),
         ParameterSpec::runtime("pagination_data_map_to_array")
             .description("When 'enabled', if the data at pagination_data_pointer (or the top-level response) is a JSON object/map, extract its values as rows instead of treating it as a single row. Default: 'disabled'.")
             .one_of(&["enabled", "disabled"]),
@@ -1922,6 +1945,48 @@ mod tests {
         );
         assert_eq!(params.request_filters.max_headers_length, 2048);
         assert_eq!(params.max_request_partitions, Some(7000));
+    }
+
+    #[tokio::test]
+    async fn resolve_http_provider_params_parses_finite_pagination_max_pages() {
+        let connector =
+            test_connector_with(&[("pagination", "enabled"), ("pagination_max_pages", "250")])
+                .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("pagination params should be valid");
+
+        assert_eq!(
+            params
+                .pagination
+                .expect("pagination should be configured")
+                .max_pages,
+            Some(250)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_http_provider_params_parses_nolimit_pagination_max_pages() {
+        let connector = test_connector_with(&[
+            ("pagination", "enabled"),
+            ("pagination_max_pages", "nolimit"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("pagination params should be valid");
+
+        assert_eq!(
+            params
+                .pagination
+                .expect("pagination should be configured")
+                .max_pages,
+            None
+        );
     }
 
     #[tokio::test]
