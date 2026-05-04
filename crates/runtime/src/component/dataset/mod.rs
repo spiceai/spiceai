@@ -37,6 +37,7 @@ use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Dur
 
 pub mod acceleration;
 pub mod builder;
+pub mod declared_type;
 pub mod metadata;
 pub mod replication;
 

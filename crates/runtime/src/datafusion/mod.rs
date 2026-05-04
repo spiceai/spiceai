@@ -19,6 +19,7 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
+use crate::accelerated_table::snapshots::SnapshotRefreshState;
 use crate::accelerated_table::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
@@ -28,8 +29,10 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
+use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::dataaccelerator::swappable::SwappableTableProvider;
 use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
@@ -459,6 +462,36 @@ pub enum Error {
     ))]
     UnsupportedAccelerationEngineForSnapshots,
 
+    #[snafu(display(
+        "refresh_mode: snapshot requires snapshot bootstrap to be enabled \
+         (set `acceleration.snapshots: enabled` or `bootstrap_only`); \
+         `disabled` and `create_only` are not sufficient because the dataset \
+         must be able to load from a snapshot."
+    ))]
+    SnapshotRefreshModeRequiresSnapshots,
+
+    #[snafu(display(
+        "refresh_mode: snapshot requires a snapshot-capable file-based engine \
+         (DuckDB, SQLite, Cayenne, or Turso); engine '{engine}' is not supported."
+    ))]
+    SnapshotRefreshModeUnsupportedEngine { engine: String },
+
+    #[snafu(display(
+        "refresh_mode: snapshot requires the accelerator to support snapshot reload, but \
+         engine '{engine}' does not implement `reload_from_snapshot`."
+    ))]
+    SnapshotRefreshModeReloadUnsupported { engine: String },
+
+    #[snafu(display("Failed to construct snapshot manager for refresh_mode: snapshot."))]
+    SnapshotRefreshModeManagerUnavailable,
+
+    #[snafu(display(
+        "refresh_mode: snapshot could not resolve the accelerator file layout: {source}"
+    ))]
+    SnapshotRefreshModeLayoutUnavailable {
+        source: crate::dataaccelerator::FilePathError,
+    },
+
     #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {source}"))]
     PreRefreshPartitionDiscoveryFailed {
         table_name: String,
@@ -560,6 +593,12 @@ fn remap_constraints_to_refresh_schema(
 
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
 const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
+
+/// Default polling interval for `refresh_mode: snapshot` when the user does
+/// not specify `refresh_check_interval` explicitly. Picked to be slightly
+/// shorter than the default snapshot creation interval so a freshly created
+/// snapshot is picked up promptly without aggressive object-store load.
+const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 
 pub enum Table {
     Accelerated {
@@ -1847,6 +1886,30 @@ impl DataFusion {
             .await
             .context(UnableToCreateDataAcceleratorSnafu)?;
 
+        // For RefreshMode::Snapshot, wrap the accelerator in a SwappableTableProvider
+        // so the underlying provider can be replaced atomically when a newer snapshot
+        // is loaded. The snapshot refresh state captures everything `RefreshTask` needs
+        // to query the snapshot store and rebuild the provider on reload.
+        let (accelerated_table_provider, snapshot_refresh_state) =
+            if matches!(refresh_mode, RefreshMode::Snapshot) {
+                let snapshot_state = build_snapshot_refresh_state(
+                    self,
+                    dataset,
+                    Arc::clone(&refresh_schema),
+                    constraints.clone(),
+                    &acceleration_settings,
+                    Arc::clone(&secrets),
+                    Arc::clone(&accelerated_table_provider),
+                    bootstrap_status.loaded_snapshot_id(),
+                )
+                .await?;
+                let swappable: Arc<dyn TableProvider> =
+                    Arc::clone(&snapshot_state.swappable_provider) as Arc<dyn TableProvider>;
+                (swappable, Some(snapshot_state))
+            } else {
+                (accelerated_table_provider, None)
+            };
+
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
@@ -1897,6 +1960,16 @@ impl DataFusion {
         }
         if let Some(check_interval) = dataset.refresh_check_interval() {
             refresh = refresh.check_interval(check_interval);
+        } else if matches!(refresh_mode, RefreshMode::Snapshot) {
+            // Snapshot mode polls the snapshot store for newer snapshots; if the
+            // user did not configure a polling interval, fall back to a sensible
+            // default so the dataset stays current without requiring manual config.
+            tracing::info!(
+                dataset = %dataset.name,
+                interval_secs = DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL.as_secs(),
+                "refresh_mode: snapshot - using default refresh_check_interval"
+            );
+            refresh = refresh.check_interval(DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL);
         }
         if let Some(max_jitter) = dataset.refresh_max_jitter() {
             refresh = refresh.max_jitter(max_jitter);
@@ -2063,11 +2136,23 @@ impl DataFusion {
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
                 if layout.is_enabled() {
+                    // Resolve any engine-specific snapshot engine override
+                    // (e.g. CayenneSnapshotEngine) so the upload pipeline
+                    // ships the engine's preferred archive format.
+                    let snapshot_engine_override = match self
+                        .accelerator_engine_registry
+                        .get_accelerator_engine(acceleration_settings.engine)
+                        .await
+                    {
+                        Some(accel) => accel.snapshot_engine_for_source(dataset).await,
+                        None => None,
+                    };
                     if let Some(snapshot_config) = build_snapshot_creation_config(
                         dataset,
                         &acceleration_settings,
                         refresh_mode,
                         layout.clone(),
+                        snapshot_engine_override,
                     )
                     .await?
                     {
@@ -2086,6 +2171,8 @@ impl DataFusion {
                 );
             }
         }
+
+        accelerated_table_builder.snapshot_refresh_state(snapshot_refresh_state);
 
         // Pass the acceleration layout for size metrics
         if let Some(layout) = acceleration_layout {
@@ -2268,6 +2355,7 @@ impl DataFusion {
                         layout,
                         accel_engine,
                         Arc::clone(&existing_schema),
+                        None,
                     )
                     .await;
                 }
@@ -3453,6 +3541,9 @@ async fn build_snapshot_creation_config(
     acceleration_settings: &Acceleration,
     refresh_mode: RefreshMode,
     acceleration_layout: AccelerationLayout,
+    snapshot_engine_override: Option<
+        Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
+    >,
 ) -> Result<Option<SnapshotCreationConfig>> {
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
@@ -3586,8 +3677,155 @@ async fn build_snapshot_creation_config(
     .await
     .map(|sm| {
         let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
+        let sm = if let Some(engine) = snapshot_engine_override {
+            sm.with_snapshot_engine(engine)
+        } else {
+            sm
+        };
         SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
     }))
+}
+
+/// Build the per-dataset state required to drive `RefreshMode::Snapshot`.
+///
+/// Validates that the configuration is sound (snapshots enabled, supported
+/// engine, supported reload), constructs a [`SnapshotManager`] for the
+/// dataset, wraps the freshly-created accelerator provider in a
+/// [`SwappableTableProvider`], and captures a [`ReloadProviderFactory`] that
+/// re-runs `create_accelerator_table` on each reload.
+#[expect(clippy::too_many_arguments)]
+async fn build_snapshot_refresh_state(
+    df: &DataFusion,
+    dataset: &Dataset,
+    refresh_schema: SchemaRef,
+    constraints: Option<datafusion::common::Constraints>,
+    acceleration_settings: &Acceleration,
+    secrets: Arc<TokioRwLock<Secrets>>,
+    initial_provider: Arc<dyn TableProvider>,
+    bootstrap_loaded_id: Option<u64>,
+) -> Result<SnapshotRefreshState> {
+    // 1. snapshots must be enabled.
+    if !acceleration_settings.snapshot_behavior.bootstrap_enabled() {
+        return SnapshotRefreshModeRequiresSnapshotsSnafu.fail();
+    }
+
+    // 2. engine must be snapshot-capable (file-based with a known layout).
+    let acceleration_engine = engine_to_acceleration_engine(acceleration_settings.engine)
+        .ok_or_else(|| Error::SnapshotRefreshModeUnsupportedEngine {
+            engine: acceleration_settings.engine.to_string(),
+        })?;
+
+    // 3. accelerator must support reload_from_snapshot.
+    let accelerator = df
+        .accelerator_engine_registry
+        .get_accelerator_engine(acceleration_settings.engine)
+        .await
+        .ok_or_else(|| Error::SnapshotRefreshModeUnsupportedEngine {
+            engine: acceleration_settings.engine.to_string(),
+        })?;
+    if !accelerator.supports_snapshot_reload() {
+        return SnapshotRefreshModeReloadUnsupportedSnafu {
+            engine: acceleration_settings.engine.to_string(),
+        }
+        .fail();
+    }
+
+    // 4. obtain (or warn) a SnapshotManager for this dataset.
+    let acceleration_layout = get_acceleration_layout(dataset)
+        .await
+        .context(SnapshotRefreshModeLayoutUnavailableSnafu)?;
+    if !acceleration_layout.is_enabled() {
+        return Err(Error::SnapshotRefreshModeManagerUnavailable);
+    }
+
+    let manager = SnapshotManager::try_new(
+        dataset.name.to_string(),
+        acceleration_settings.snapshot_behavior.clone(),
+        acceleration_layout,
+        acceleration_engine,
+    )
+    .await
+    .ok_or(Error::SnapshotRefreshModeManagerUnavailable)?;
+    // Apply any engine-specific snapshot-engine override (e.g. CayenneSnapshotEngine).
+    let manager = match accelerator.snapshot_engine_for_source(dataset).await {
+        Some(engine) => manager.with_snapshot_engine(engine),
+        None => manager,
+    };
+    // Build a checkpointer factory mirroring the bootstrap path so the
+    // refresh-time `download_latest_snapshot` call can succeed (it requires a
+    // factory to materialize a checkpoint for restore).
+    let source_for_checkpointer: Arc<dyn crate::dataaccelerator::AccelerationSource> =
+        Arc::new(dataset.clone());
+    let snapshot_behavior_for_checkpointer = acceleration_settings.snapshot_behavior.clone();
+    let checkpoint_factory =
+        runtime_acceleration::dataset_checkpoint::make_checkpointer_factory(move || {
+            let source = Arc::clone(&source_for_checkpointer);
+            let snapshot_behavior = snapshot_behavior_for_checkpointer.clone();
+            async move {
+                use crate::dataaccelerator::spice_sys::OpenOption;
+                use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+                use snafu::ResultExt;
+                DatasetCheckpoint::try_new(source.as_ref(), OpenOption::OpenExisting)
+                    .await
+                    .boxed()
+                    .map(|checkpoint| {
+                        checkpoint
+                            .with_snapshot_behavior(snapshot_behavior)
+                            .to_arc()
+                    })
+            }
+        });
+    let manager = manager
+        .with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy)
+        .with_checkpointer_factory(checkpoint_factory);
+    let manager = Arc::new(manager);
+
+    // 5. clone everything the reload factory needs into 'static state.
+    let registry = Arc::clone(&df.accelerator_engine_registry);
+    let dataset_owned = Arc::new(dataset.clone());
+    let acceleration_settings_owned = acceleration_settings.clone();
+    let ctx_owned = Arc::clone(&df.ctx);
+    let secrets_for_factory = Arc::clone(&secrets);
+    let table_name = dataset.name.clone();
+    let schema_for_factory = Arc::clone(&refresh_schema);
+    let constraints_for_factory = constraints;
+
+    let provider_factory: ReloadProviderFactory = Arc::new(move || {
+        let registry = Arc::clone(&registry);
+        let dataset_owned = Arc::clone(&dataset_owned);
+        let acceleration_settings_owned = acceleration_settings_owned.clone();
+        let ctx_owned = Arc::clone(&ctx_owned);
+        let secrets_for_factory = Arc::clone(&secrets_for_factory);
+        let table_name = table_name.clone();
+        let schema_for_factory = Arc::clone(&schema_for_factory);
+        let constraints_for_factory = constraints_for_factory.clone();
+        Box::pin(async move {
+            registry
+                .create_accelerator_table(
+                    table_name,
+                    schema_for_factory,
+                    constraints_for_factory.as_ref(),
+                    &acceleration_settings_owned,
+                    secrets_for_factory,
+                    Some(dataset_owned.as_ref()),
+                    ctx_owned,
+                )
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        })
+    });
+
+    let swappable_provider = SwappableTableProvider::new(initial_provider);
+    let current_snapshot_id = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_loaded_id));
+
+    Ok(SnapshotRefreshState {
+        manager,
+        accelerator,
+        source: Arc::new(dataset.clone()),
+        swappable_provider,
+        provider_factory,
+        current_snapshot_id,
+    })
 }
 
 #[cfg(test)]
@@ -3802,6 +4040,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3826,6 +4065,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3863,6 +4103,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3900,6 +4141,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3932,6 +4174,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3964,6 +4207,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3996,6 +4240,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -4024,6 +4269,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -4052,6 +4298,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -4083,6 +4330,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
