@@ -116,7 +116,6 @@ User-facing characteristics:
 spice cloud login pat --token <TOKEN>
 SPICE_CLOUD_PAT=... spice cloud login pat
 spice cloud login pat                    # interactive prompt
-spice cloud login token                  # alias
 ```
 
 Long-lived token issued from the Spice Cloud dashboard, scoped to the user
@@ -156,7 +155,6 @@ SPICE_CLOUD_CLIENT_SECRET=... \
 spice cloud login api
 
 spice cloud login api                    # interactive prompts
-spice cloud login client                 # alias
 ```
 
 OAuth 2.0 `client_credentials` grant, intended for **service principals /
@@ -193,9 +191,10 @@ Characteristics:
 
 ## OAuth host resolution
 
-OAuth endpoints (`/v1/auth/device`, `/v1/auth/device/exchange`,
-`/api/oauth/token`) live on the **non-API** host. The data-plane API base URL
-contains an `api` segment that must be stripped before building OAuth URLs.
+The non-API OAuth host serves `/v1/auth/device` and `/api/oauth/token`. By
+contrast, `/v1/auth/device/exchange` polling uses the **API** base URL. When
+building non-API OAuth URLs, the data-plane API base URL contains an `api`
+segment that must be stripped.
 
 `CloudClient::oauth_base_url` parses with `reqwest::Url` and rewrites the
 host:
@@ -276,7 +275,7 @@ principal rather than a person.
 
 ## Adding a new login method
 
-If we ever add a fifth method (e.g. an SSO/SAML corporate login, a
+If we ever add another method (e.g. an SSO/SAML corporate login, a
 short-lived OIDC token from CI, etc.):
 
 1. Add a new variant to `LoginMethod` with its own args struct. Keep its
