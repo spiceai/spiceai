@@ -66,7 +66,7 @@ pub mod refresh_task;
 mod refresh_task_runner;
 mod retention;
 pub(crate) mod sink;
-mod snapshots;
+pub(crate) mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
 pub mod write;
@@ -338,6 +338,9 @@ pub struct Builder {
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
     snapshot_creation_config: Option<SnapshotCreationConfig>,
+    /// Per-dataset state for `RefreshMode::Snapshot`. Required when the
+    /// refresh mode is Snapshot; ignored otherwise.
+    snapshot_refresh_state: Option<snapshots::SnapshotRefreshState>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -386,6 +389,7 @@ impl Builder {
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
+            snapshot_refresh_state: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -568,6 +572,16 @@ impl Builder {
         self
     }
 
+    /// Configure per-dataset state for `RefreshMode::Snapshot`. Required when
+    /// the refresh mode is Snapshot.
+    pub fn snapshot_refresh_state(
+        &mut self,
+        state: Option<snapshots::SnapshotRefreshState>,
+    ) -> &mut Self {
+        self.snapshot_refresh_state = state;
+        self
+    }
+
     /// Set the TTL for cache mode
     pub fn caching_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
         self.caching_ttl = ttl;
@@ -739,6 +753,16 @@ impl Builder {
                     Some(start_refresh),
                 )
             }
+            RefreshMode::Snapshot => {
+                // Snapshot mode is interval-driven and supports manual refresh triggers
+                // to force a poll of the snapshot store outside the regular cadence.
+                let (start_refresh, on_start_refresh) =
+                    mpsc::channel::<Option<RefreshOverrides>>(1);
+                (
+                    refresh::AccelerationRefreshMode::Snapshot(on_start_refresh),
+                    Some(start_refresh),
+                )
+            }
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
@@ -781,6 +805,7 @@ impl Builder {
         }
 
         refresher.with_snapshot_creation_config(self.snapshot_creation_config);
+        refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
         refresher.set_bootstrap_status(self.bootstrap_status);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
@@ -1444,6 +1469,19 @@ impl TableProvider for AcceleratedTable {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // In `refresh_mode: snapshot`, the accelerator is a read-only mirror
+        // of the snapshot store. Accepting writes here would either be
+        // silently overwritten by the next snapshot reload (data loss) or
+        // race with the file replacement performed during refresh. Reject
+        // explicitly so callers fail loudly rather than observing surprising
+        // behavior.
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "writes to accelerated table {} are not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {

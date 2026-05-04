@@ -99,6 +99,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::inference::get,
         v1::inference::post,
         v1::tools::list,
+        v1::tools::search,
         v1::tools::post,
         v1::iceberg::get_config,
         v1::iceberg::get_namespaces,
@@ -333,6 +334,7 @@ pub(crate) fn routes(
         let tools_auth_message = "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
         let tools_router = Router::new()
             .route("/v1/tools", get(v1::tools::list))
+            .route("/v1/tools/search", get(v1::tools::search))
             .route("/v1/tools/{*name}", post(v1::tools::post))
             // Deprecated, use /v1/tools/:name instead
             .route("/v1/tool/{name}", post(v1::tools::post))
