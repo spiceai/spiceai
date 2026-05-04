@@ -170,13 +170,15 @@ pub enum Volatility {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Signature {
-    /// Positional argument list. Empty for niladic functions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args: Vec<FunctionArg>,
-
     /// Table inputs consumed by table-function backends that accept relational input.
+    /// When a table function accepts table and scalar arguments, table inputs
+    /// are the leading arguments and scalar arguments follow them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<FunctionTableArg>,
+
+    /// Positional scalar argument list. Empty for niladic functions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<FunctionArg>,
 
     /// Return Arrow type for scalar functions, or output columns for table functions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,8 +394,8 @@ body: SELECT doc AS line, 1 AS line_no FROM args
             kind: FunctionKind::Scalar,
             volatility: Volatility::Immutable,
             signature: Signature {
-                args: vec![],
                 tables: vec![],
+                args: vec![],
                 returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: Some("1".into()),

@@ -707,6 +707,7 @@ mod tests {
             kind: FunctionKind::Scalar,
             volatility: Volatility::Immutable,
             signature: YamlSignature {
+                tables: vec![],
                 args: args
                     .into_iter()
                     .map(|(n, t)| FunctionArg {
@@ -714,7 +715,6 @@ mod tests {
                         arrow_type: t.into(),
                     })
                     .collect(),
-                tables: vec![],
                 returns: Some(FunctionReturns::Scalar(ret.into())),
             },
             body: Some(body.into()),
@@ -736,11 +736,11 @@ mod tests {
             kind: FunctionKind::Table,
             volatility: Volatility::Immutable,
             signature: YamlSignature {
+                tables: vec![],
                 args: vec![FunctionArg {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
-                tables: vec![],
                 returns: Some(FunctionReturns::Table(vec![
                     FunctionArg {
                         name: "value".into(),

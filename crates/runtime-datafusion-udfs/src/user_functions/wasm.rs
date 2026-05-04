@@ -28,7 +28,10 @@ limitations under the License.
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "wasm-functions-compile")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "wasm-functions-compile")]
 use std::process::Command;
 use std::sync::Arc;
 
@@ -37,12 +40,13 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, Result as DataFusionResult};
-use datafusion::datasource::{MemTable, TableType};
+use datafusion::common::{Column, DataFusionError, Result as DataFusionResult};
+use datafusion::datasource::TableType;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
+use datafusion::sql::TableReference;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use serde_json::Value;
@@ -52,7 +56,9 @@ use util::session_state::builder_from_existing;
 use wasmtime::{Engine, Instance, Module, Store, TypedFunc};
 
 const DEFAULT_ENTRYPOINT: &str = "spice_transform";
+#[cfg(feature = "wasm-functions-compile")]
 const DEFAULT_LANGUAGE: &str = "rust";
+#[cfg(feature = "wasm-functions-compile")]
 const DEFAULT_TARGET: &str = "wasm32-unknown-unknown";
 const INPUT_TABLE_PARAM: &str = "input_table";
 const MODULE_PARAM: &str = "module";
@@ -82,7 +88,7 @@ pub enum WasmBuildError {
     TooManyInputTables,
 
     #[snafu(display(
-        "WASM table function requires exactly one input source: set `params.input_table` or provide SQL in `body` / `body_ref`"
+        "WASM table function requires an input source: pass the declared table input as the first argument, set `params.input_table`, or provide SQL in `body` / `body_ref`"
     ))]
     MissingInputSource,
 
@@ -194,7 +200,7 @@ pub type Result<T, E = WasmBuildError> = std::result::Result<T, E>;
 #[derive(Clone, Debug)]
 enum InputSource {
     Sql(String),
-    Table(String),
+    Table(TableReference),
 }
 
 #[derive(Clone)]
@@ -226,11 +232,19 @@ pub async fn build_table_udtf(
     let input_schema = declared_input_schema(decl)?;
     let output_schema = table_return_schema(decl)?;
     let arg_schema = function_arg_schema(&decl.signature.args)?;
-    let input_source = input_source(&config, input_sql)?;
+    let input_source = configured_input_source(&config, input_sql)?;
+    if input_source.is_none() && input_schema.is_none() {
+        return MissingInputSourceSnafu.fail();
+    }
+    #[cfg(feature = "wasm-functions-compile")]
     let module_path = resolve_module_path(&config).await?;
-    let module_bytes = std::fs::read(&module_path).context(ReadModuleSnafu {
-        path: module_path.display().to_string(),
-    })?;
+    #[cfg(not(feature = "wasm-functions-compile"))]
+    let module_path = resolve_module_path(&config)?;
+    let module_bytes = tokio::fs::read(&module_path)
+        .await
+        .context(ReadModuleSnafu {
+            path: module_path.display().to_string(),
+        })?;
     let engine = Engine::default();
     let module = Module::from_binary(&engine, &module_bytes).context(CompileModuleSnafu {
         path: module_path.display().to_string(),
@@ -241,7 +255,7 @@ pub async fn build_table_udtf(
         arg_schema,
         input_schema,
         output_schema,
-        input_source,
+        configured_input_source: input_source,
         runner: Arc::new(WasmRunner {
             engine,
             module: Arc::new(module),
@@ -256,7 +270,7 @@ struct WasmTableFunc {
     arg_schema: SchemaRef,
     input_schema: Option<SchemaRef>,
     output_schema: SchemaRef,
-    input_source: InputSource,
+    configured_input_source: Option<InputSource>,
     runner: Arc<WasmRunner>,
 }
 
@@ -267,23 +281,69 @@ impl Debug for WasmTableFunc {
             .field("arg_schema", &self.arg_schema)
             .field("input_schema", &self.input_schema)
             .field("output_schema", &self.output_schema)
-            .field("input_source", &self.input_source)
+            .field("configured_input_source", &self.configured_input_source)
             .finish_non_exhaustive()
     }
 }
 
 impl TableFunctionImpl for WasmTableFunc {
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let args = table_arg_values(&self.name, self.arg_schema.as_ref(), exprs)?;
+        let (input_source, scalar_exprs) = self.input_source_and_scalar_exprs(exprs)?;
+        let args = table_arg_values(&self.name, self.arg_schema.as_ref(), scalar_exprs)?;
         Ok(Arc::new(WasmTableProvider {
             name: self.name.clone(),
             arg_schema: Arc::clone(&self.arg_schema),
             input_schema: self.input_schema.as_ref().map(Arc::clone),
             output_schema: Arc::clone(&self.output_schema),
-            input_source: self.input_source.clone(),
+            input_source,
             runner: Arc::clone(&self.runner),
             args,
         }))
+    }
+}
+
+impl WasmTableFunc {
+    fn input_source_and_scalar_exprs<'a>(
+        &self,
+        exprs: &'a [Expr],
+    ) -> DataFusionResult<(InputSource, &'a [Expr])> {
+        let scalar_arg_count = self.arg_schema.fields().len();
+        let declares_input_table = self.input_schema.is_some();
+
+        if declares_input_table && exprs.len() == scalar_arg_count + 1 {
+            if self.configured_input_source.is_some() {
+                return Err(DataFusionError::Plan(format!(
+                    "WASM table function '{}' received a table as the first argument but also has a configured input source; use either the first table argument or `params.input_table` / SQL body, not both",
+                    self.name
+                )));
+            }
+            let input_source = table_input_source_from_expr(&self.name, &exprs[0])?;
+            return Ok((input_source, &exprs[1..]));
+        }
+
+        if exprs.len() != scalar_arg_count {
+            let expected = if declares_input_table {
+                format!(
+                    "{scalar_arg_count} scalar argument(s), or 1 table argument followed by {scalar_arg_count} scalar argument(s)"
+                )
+            } else {
+                format!("{scalar_arg_count} scalar argument(s)")
+            };
+            return Err(DataFusionError::Plan(format!(
+                "WASM table function '{}' expected {expected}, got {} argument(s)",
+                self.name,
+                exprs.len()
+            )));
+        }
+
+        let Some(input_source) = self.configured_input_source.clone() else {
+            return Err(DataFusionError::Plan(format!(
+                "WASM table function '{}' requires a table input as the first argument, `params.input_table`, or SQL `body` / `body_ref`",
+                self.name
+            )));
+        };
+
+        Ok((input_source, exprs))
     }
 }
 
@@ -327,9 +387,9 @@ impl TableProvider for WasmTableProvider {
         }
 
         let args_batch = args_record_batch(Arc::clone(&self.arg_schema), &self.args)?;
-        let input_ipc = encode_ipc(Arc::clone(&input_schema), &input_batches)
+        let input_ipc = encode_ipc(&input_schema, &input_batches)
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-        let args_ipc = encode_ipc(Arc::clone(&self.arg_schema), &[args_batch])
+        let args_ipc = encode_ipc(&self.arg_schema, &[args_batch])
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         let runner = Arc::clone(&self.runner);
         let output_ipc = tokio::task::spawn_blocking(move || runner.invoke(&input_ipc, &args_ipc))
@@ -390,10 +450,10 @@ impl WasmRunner {
             .call(
                 &mut store,
                 (
-                    input.ptr_i32(),
-                    input.len_i32(),
-                    args.ptr_i32(),
-                    args.len_i32(),
+                    input.ptr_i32()?,
+                    input.len_i32()?,
+                    args.ptr_i32()?,
+                    args.len_i32()?,
                 ),
             )
             .context(CallExportSnafu {
@@ -414,29 +474,36 @@ struct GuestAllocation {
 
 impl GuestAllocation {
     fn from_packed(packed: i64) -> Self {
-        let packed = packed as u64;
+        let bytes = packed.to_be_bytes();
         Self {
-            ptr: (packed >> 32) as u32,
-            len: (packed & u64::from(u32::MAX)) as u32,
+            ptr: u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            len: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
         }
     }
 
     fn packed(ptr: i32, len: usize) -> Result<Self> {
+        let len_for_error = u32::try_from(len).unwrap_or(u32::MAX);
         let ptr = u32::try_from(ptr).map_err(|_| WasmBuildError::InvalidMemoryRange {
-            ptr: ptr as u32,
-            len: u32::try_from(len).unwrap_or(u32::MAX),
+            ptr: 0,
+            len: len_for_error,
         })?;
         let len = u32::try_from(len)
             .map_err(|_| WasmBuildError::InvalidMemoryRange { ptr, len: u32::MAX })?;
         Ok(Self { ptr, len })
     }
 
-    fn ptr_i32(self) -> i32 {
-        self.ptr as i32
+    fn ptr_i32(self) -> Result<i32> {
+        i32::try_from(self.ptr).map_err(|_| WasmBuildError::InvalidMemoryRange {
+            ptr: self.ptr,
+            len: self.len,
+        })
     }
 
-    fn len_i32(self) -> i32 {
-        self.len as i32
+    fn len_i32(self) -> Result<i32> {
+        i32::try_from(self.len).map_err(|_| WasmBuildError::InvalidMemoryRange {
+            ptr: self.ptr,
+            len: self.len,
+        })
     }
 }
 
@@ -486,7 +553,7 @@ fn dealloc_unique(
     for allocation in allocations {
         if seen.insert(*allocation) {
             dealloc
-                .call(&mut *store, (allocation.ptr_i32(), allocation.len_i32()))
+                .call(&mut *store, (allocation.ptr_i32()?, allocation.len_i32()?))
                 .context(CallExportSnafu {
                     name: "spice_dealloc".to_string(),
                 })?;
@@ -498,12 +565,17 @@ fn dealloc_unique(
 #[derive(Debug)]
 struct WasmConfig {
     module: Option<PathBuf>,
+    #[cfg(feature = "wasm-functions-compile")]
     source: Option<PathBuf>,
+    #[cfg(feature = "wasm-functions-compile")]
     language: String,
     entrypoint: String,
     input_table: Option<String>,
+    #[cfg(feature = "wasm-functions-compile")]
     cache_dir: Option<PathBuf>,
+    #[cfg(feature = "wasm-functions-compile")]
     artifact: Option<String>,
+    #[cfg(feature = "wasm-functions-compile")]
     target: String,
 }
 
@@ -518,22 +590,33 @@ impl WasmConfig {
             return MissingModuleOrSourceSnafu.fail();
         }
 
-        let language = param_string(&decl.params, "language")?
-            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string())
-            .to_ascii_lowercase();
-        if source.is_some() && language != DEFAULT_LANGUAGE {
-            return UnsupportedLanguageSnafu { language }.fail();
-        }
+        #[cfg(feature = "wasm-functions-compile")]
+        let language = {
+            let language = param_string(&decl.params, "language")?
+                .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string())
+                .to_ascii_lowercase();
+            if source.is_some() && language != DEFAULT_LANGUAGE {
+                return UnsupportedLanguageSnafu { language }.fail();
+            }
+            language
+        };
+        #[cfg(not(feature = "wasm-functions-compile"))]
+        let _ = param_string(&decl.params, "language")?;
 
         Ok(Self {
             module,
+            #[cfg(feature = "wasm-functions-compile")]
             source,
+            #[cfg(feature = "wasm-functions-compile")]
             language,
             entrypoint: param_string(&decl.params, "entrypoint")?
                 .unwrap_or_else(|| DEFAULT_ENTRYPOINT.to_string()),
             input_table: param_string(&decl.params, INPUT_TABLE_PARAM)?,
+            #[cfg(feature = "wasm-functions-compile")]
             cache_dir: param_path(&decl.params, "cache_dir")?,
+            #[cfg(feature = "wasm-functions-compile")]
             artifact: param_string(&decl.params, "artifact")?,
+            #[cfg(feature = "wasm-functions-compile")]
             target: param_string(&decl.params, "target")?
                 .unwrap_or_else(|| DEFAULT_TARGET.to_string()),
         })
@@ -557,42 +640,77 @@ fn param_path(params: &HashMap<String, Value>, key: &str) -> Result<Option<PathB
     Ok(param_string(params, key)?.map(PathBuf::from))
 }
 
-fn input_source(config: &WasmConfig, input_sql: Option<String>) -> Result<InputSource> {
+fn configured_input_source(
+    config: &WasmConfig,
+    input_sql: Option<String>,
+) -> Result<Option<InputSource>> {
     match (config.input_table.as_ref(), input_sql) {
         (Some(_), Some(_)) => ConflictingInputSourceSnafu.fail(),
-        (Some(table), None) => Ok(InputSource::Table(table.clone())),
-        (None, Some(sql)) => Ok(InputSource::Sql(sql)),
-        (None, None) => MissingInputSourceSnafu.fail(),
+        (Some(table), None) => Ok(Some(InputSource::Table(TableReference::parse_str(table)))),
+        (None, Some(sql)) => Ok(Some(InputSource::Sql(sql))),
+        (None, None) => Ok(None),
     }
 }
 
+fn table_input_source_from_expr(function_name: &str, expr: &Expr) -> DataFusionResult<InputSource> {
+    match expr {
+        Expr::Column(column) => Ok(InputSource::Table(table_ref_from_column_expr(column))),
+        Expr::Literal(ScalarValue::Utf8(Some(table)), _) => {
+            Ok(InputSource::Table(TableReference::parse_str(table)))
+        }
+        other => Err(DataFusionError::Plan(format!(
+            "WASM table function '{function_name}' requires a table reference as the first argument, got: {other:?}"
+        ))),
+    }
+}
+
+fn table_ref_from_column_expr(column: &Column) -> TableReference {
+    let table: Arc<str> = column.name.clone().into();
+    let schema = column.relation.as_ref().map(TableReference::table);
+    let catalog = column.relation.as_ref().and_then(TableReference::schema);
+    match (catalog, schema) {
+        (None | Some(_), None) => TableReference::Bare { table },
+        (None, Some(schema)) => TableReference::Partial {
+            schema: schema.into(),
+            table,
+        },
+        (Some(catalog), Some(schema)) => TableReference::Full {
+            catalog: catalog.into(),
+            schema: schema.into(),
+            table,
+        },
+    }
+}
+
+#[cfg(not(feature = "wasm-functions-compile"))]
+fn resolve_module_path(config: &WasmConfig) -> Result<PathBuf> {
+    if let Some(module) = &config.module {
+        return Ok(module.clone());
+    }
+
+    SourceCompileDisabledSnafu.fail()
+}
+
+#[cfg(feature = "wasm-functions-compile")]
 async fn resolve_module_path(config: &WasmConfig) -> Result<PathBuf> {
     if let Some(module) = &config.module {
         return Ok(module.clone());
     }
 
-    #[cfg(not(feature = "wasm-functions-compile"))]
-    {
-        SourceCompileDisabledSnafu.fail()
-    }
-
-    #[cfg(feature = "wasm-functions-compile")]
-    {
-        let source = config
-            .source
-            .clone()
-            .ok_or(WasmBuildError::MissingModuleOrSource)?;
-        let compile_config = CompileConfig {
-            source,
-            cache_dir: config.cache_dir.clone(),
-            artifact: config.artifact.clone(),
-            target: config.target.clone(),
-            language: config.language.clone(),
-        };
-        tokio::task::spawn_blocking(move || compile_rust_source(&compile_config))
-            .await
-            .context(CompileTaskSnafu)?
-    }
+    let source = config
+        .source
+        .clone()
+        .ok_or(WasmBuildError::MissingModuleOrSource)?;
+    let compile_config = CompileConfig {
+        source,
+        cache_dir: config.cache_dir.clone(),
+        artifact: config.artifact.clone(),
+        target: config.target.clone(),
+        language: config.language.clone(),
+    };
+    tokio::task::spawn_blocking(move || compile_rust_source(&compile_config))
+        .await
+        .context(CompileTaskSnafu)?
 }
 
 fn function_arg_schema(args: &[FunctionArg]) -> Result<SchemaRef> {
@@ -718,20 +836,19 @@ async fn execute_input(
     ctx: &SessionContext,
     source: &InputSource,
 ) -> DataFusionResult<(SchemaRef, Vec<RecordBatch>)> {
-    let sql = match source {
-        InputSource::Sql(sql) => sql.clone(),
-        InputSource::Table(table) => format!("SELECT * FROM {table}"),
+    let df = match source {
+        InputSource::Sql(sql) => ctx.sql(sql).await?,
+        InputSource::Table(table) => ctx.table(table.clone()).await?,
     };
-    let df = ctx.sql(&sql).await?;
     let schema = Arc::new(df.schema().as_arrow().clone());
     let batches = df.collect().await?;
     Ok((schema, batches))
 }
 
-fn encode_ipc(schema: SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+fn encode_ipc(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut bytes, &schema).context(EncodeArrowSnafu)?;
+        let mut writer = StreamWriter::try_new(&mut bytes, schema).context(EncodeArrowSnafu)?;
         for batch in batches {
             writer.write(batch).context(EncodeArrowSnafu)?;
         }
@@ -792,7 +909,6 @@ fn truncate_batches(batches: &mut Vec<RecordBatch>, limit: usize) {
         if rows > remaining {
             *batch = batch.slice(0, remaining);
             keep += 1;
-            remaining = 0;
             break;
         }
         remaining -= rows;
@@ -990,9 +1106,11 @@ fn manifest_path(source: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use arrow::array::Int64Array;
+    use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
     use spicepod::component::function::{FunctionKind, FunctionTableArg, Signature, Volatility};
     use std::collections::HashMap;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn identity_wasm(dir: &TempDir) -> PathBuf {
@@ -1047,7 +1165,6 @@ mod tests {
             kind: FunctionKind::Table,
             volatility: Volatility::Stable,
             signature: Signature {
-                args: vec![],
                 tables: vec![FunctionTableArg {
                     name: "input".into(),
                     columns: vec![FunctionArg {
@@ -1055,6 +1172,7 @@ mod tests {
                         arrow_type: "int64".into(),
                     }],
                 }],
+                args: vec![],
                 returns: Some(FunctionReturns::Table(vec![FunctionArg {
                     name: "value".into(),
                     arrow_type: "int64".into(),
@@ -1147,5 +1265,48 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 values");
         assert_eq!(values.values(), &[2_i64, 3]);
+    }
+
+    #[tokio::test]
+    async fn wasm_table_udtf_accepts_input_table_as_first_argument() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+        let mut decl = wasm_identity_decl(&module);
+        decl.params.remove(INPUT_TABLE_PARAM);
+        decl.signature.args.push(FunctionArg {
+            name: "unused".into(),
+            arrow_type: "int64".into(),
+        });
+        let udtf = build_table_udtf(&decl, None).await.expect("builds");
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .expect("record batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table("numbers", Arc::new(table))
+            .expect("register table");
+        ctx.register_udtf(&decl.name, udtf);
+
+        let results = ctx
+            .sql("SELECT value FROM wasm_identity(numbers, 7) ORDER BY value")
+            .await
+            .expect("sql compiles")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[1_i64, 2, 3]);
     }
 }

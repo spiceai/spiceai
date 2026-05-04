@@ -204,6 +204,7 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
 	cargo check $(CARGO_PROFILE) --no-default-features --features http-functions
 	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions
+	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions-compile
 	cargo check $(CARGO_PROFILE) --no-default-features --features aws-secrets-manager
 	cargo check $(CARGO_PROFILE) --no-default-features --features databricks
 	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake

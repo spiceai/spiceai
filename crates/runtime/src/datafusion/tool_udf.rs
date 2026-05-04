@@ -333,11 +333,11 @@ mod tests {
     #[test]
     fn build_fails_without_signature_returns() {
         let sig = YamlSignature {
+            tables: vec![],
             args: vec![FunctionArg {
                 name: "x".into(),
                 arrow_type: "int64".into(),
             }],
-            tables: vec![],
             returns: None,
         };
         let err = build_scalar_udf(Arc::new(StubTool), "stub", &sig).expect_err("missing return");
@@ -347,6 +347,7 @@ mod tests {
     #[test]
     fn build_rejects_duplicate_arg_names() {
         let sig = YamlSignature {
+            tables: vec![],
             args: vec![
                 FunctionArg {
                     name: "x".into(),
@@ -357,7 +358,6 @@ mod tests {
                     arrow_type: "float64".into(),
                 },
             ],
-            tables: vec![],
             returns: Some(FunctionReturns::Scalar("int64".into())),
         };
 

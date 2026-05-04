@@ -30,6 +30,7 @@ The Spice open source project provides multiple distribution variants to support
 | ODBC connector          | Local build only | ✅           | ✅          |
 | Acceleration snapshots  | Local build only | ✅           | ✅          |
 | HTTP function servers   | Local build only | ✅           | ✅          |
+| WASM user functions     | Local build only | ✅           | ✅          |
 | OIDC Token Verification | ❌                | ✅           | ✅          |
 
 ## Default Distribution
@@ -49,6 +50,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 
 - Acceleration snapshots (`snapshots` feature)
 - HTTP-backed function servers (`http-functions` feature)
+- WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
 
 > **Note:** The PostgreSQL data accelerator is only available in nightly builds. The PostgreSQL data connector is included in all distributions.
 
@@ -244,6 +246,7 @@ The following production-ready features are available with the [Spice Cloud Plat
 
 - **Acceleration Snapshots** - Bootstrap accelerated datasets from durable snapshot storage for fast cold starts, recovery after ephemeral storage loss, and controlled rollback to a previous acceleration state. Local open source builds can enable this with `snapshots`.
 - **Function Servers** - Run HTTP-backed user-defined scalar and table functions from `functions:` declarations. The default open source distribution supports inline SQL functions only; local builds can enable HTTP-backed function servers with `http-functions`.
+- **WASM Functions** - Run sandboxed WebAssembly table functions from `functions:` declarations using Arrow IPC batches as the data ABI. Local open source builds can enable precompiled modules with `wasm-functions`; compiling Rust sources to WASM at startup additionally requires `wasm-functions-compile`.
 - **OIDC Token Verification** - Validate identity tokens from enterprise providers (Okta, Azure AD, Auth0, Google, etc.) for secure access to Spice runtime endpoints.
 - **Native Windows Runtime Support** - Run `spiced` natively on Windows in managed enterprise deployments. Open source users on Windows should use WSL.
 
@@ -267,6 +270,12 @@ SPICED_CUSTOM_FEATURES="duckdb,postgres,sqlite,models" make build-runtime
 
 # Build with HTTP-backed function servers
 SPICED_NON_DEFAULT_FEATURES="http-functions" make install
+
+# Build with precompiled WASM user functions
+SPICED_NON_DEFAULT_FEATURES="wasm-functions" make install
+
+# Build with Rust source-to-WASM compilation for user functions
+SPICED_NON_DEFAULT_FEATURES="wasm-functions-compile" make install
 
 # Build with acceleration snapshots
 SPICED_NON_DEFAULT_FEATURES="snapshots" make install

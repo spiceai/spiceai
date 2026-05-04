@@ -15887,6 +15887,7 @@ dependencies = [
  "simsimd",
  "snafu",
  "spicepod",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -44,6 +44,7 @@ governor.workspace = true
 insta.workspace = true
 tracing-subscriber.workspace = true
 tracing-test = "0.2"
+tempfile.workspace = true
 wat.workspace = true
 
 [features]

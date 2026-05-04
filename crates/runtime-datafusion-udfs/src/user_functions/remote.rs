@@ -996,11 +996,11 @@ mod tests {
             kind: FunctionKind::Scalar,
             volatility: Volatility::Volatile,
             signature: YamlSig {
+                tables: vec![],
                 args: vec![FunctionArg {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
-                tables: vec![],
                 returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: None,
@@ -1025,11 +1025,11 @@ mod tests {
             kind: FunctionKind::Table,
             volatility: Volatility::Volatile,
             signature: YamlSig {
+                tables: vec![],
                 args: vec![FunctionArg {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
-                tables: vec![],
                 returns: Some(FunctionReturns::Table(vec![
                     FunctionArg {
                         name: "value".into(),

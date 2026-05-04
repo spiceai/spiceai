@@ -826,11 +826,11 @@ mod tests {
             kind: FunctionKind::Scalar,
             volatility: Volatility::Immutable,
             signature: Signature {
+                tables: vec![],
                 args: vec![FunctionArg {
                     name: "x".to_string(),
                     arrow_type: "int64".to_string(),
                 }],
-                tables: vec![],
                 returns: Some(FunctionReturns::Scalar("int64".to_string())),
             },
             body: Some("x".to_string()),
