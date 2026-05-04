@@ -60,10 +60,7 @@ use std::{
 };
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
-const LOCAL_LLM_MAX_SEQS: NonZeroUsize = match NonZeroUsize::new(5) {
-    Some(value) => value,
-    None => panic!("local LLM max sequences must be non-zero"),
-};
+const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
