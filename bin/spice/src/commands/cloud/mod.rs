@@ -756,6 +756,15 @@ fn resolve_string_or_prompt_with_terminal(
         return Ok(value.to_string());
     }
 
+    // The chooser path constructs args structs with all fields set to None,
+    // bypassing Clap's env-var resolution. Re-resolve here so chooser-based
+    // PAT/API logins respect the configured env vars.
+    if let Ok(env_value) = std::env::var(env_var) {
+        if !env_value.is_empty() {
+            return Ok(env_value);
+        }
+    }
+
     if !is_terminal {
         return InvalidArgumentSnafu {
             message: format!("{label} is required. Provide {flag} or set {env_var}."),
@@ -1695,5 +1704,29 @@ mod tests {
             ),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_falls_back_to_env_var() {
+        // Use a unique env var name so the test does not depend on host state.
+        let env_var = "SPICE_CLOUD_TEST_RESOLVE_FALLBACK";
+        // SAFETY: Setting environment variable for test purposes only.
+        unsafe { std::env::set_var(env_var, "from-env") };
+
+        let value = resolve_string_or_prompt_with_terminal(
+            None,
+            "test value",
+            "--test",
+            env_var,
+            "test value",
+            false,
+            false,
+        )
+        .expect("env var should be used when value is None");
+
+        // SAFETY: Removing environment variable for test purposes only.
+        unsafe { std::env::remove_var(env_var) };
+
+        assert_eq!(value, "from-env");
     }
 }
