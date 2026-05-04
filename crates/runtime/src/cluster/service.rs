@@ -995,6 +995,12 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
+    use runtime_proto::{
+        cluster_service_client::ClusterServiceClient, cluster_service_server::ClusterServiceServer,
+    };
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::{Channel, Server};
 
     async fn make_test_service() -> ClusterServiceImpl {
         let runtime = crate::Runtime::builder().build().await;
@@ -1051,24 +1057,56 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_internal_get_metrics_allows_repeated_requests() {
+    async fn make_test_client() -> (ClusterServiceClient<Channel>, CancellationToken) {
         let service = make_test_service().await;
-
-        // Internal cluster RPCs are intentionally not rate-limited; the Prometheus HTTP
-        // metrics endpoint applies the external scrape limit.
-        ClusterService::get_metrics(&service, Request::new(GetMetricsRequest {}))
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("first metrics request should succeed");
+            .expect("test cluster service listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test cluster service listener should have a local address");
+        let shutdown = CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
 
-        ClusterService::get_metrics(&service, Request::new(GetMetricsRequest {}))
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(ClusterServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    shutdown_signal.cancelled().await
+                })
+                .await
+                .expect("test cluster service server should run");
+        });
+
+        let client = ClusterServiceClient::connect(format!("http://{address}"))
             .await
-            .expect("second metrics request should also succeed");
+            .expect("test cluster service client should connect");
+
+        (client, shutdown)
     }
 
     #[tokio::test]
-    async fn test_internal_get_task_history_allows_repeated_requests() {
-        let service = make_test_service().await;
+    async fn test_internal_get_metrics_transport_allows_repeated_requests() {
+        let (mut client, shutdown) = make_test_client().await;
+
+        // Internal cluster RPCs are intentionally not rate-limited; the Prometheus HTTP
+        // metrics endpoint applies the external scrape limit.
+        client
+            .get_metrics(Request::new(GetMetricsRequest {}))
+            .await
+            .expect("first metrics request should succeed");
+
+        client
+            .get_metrics(Request::new(GetMetricsRequest {}))
+            .await
+            .expect("second metrics request should also succeed");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_internal_get_task_history_transport_allows_repeated_requests() {
+        let (mut client, shutdown) = make_test_client().await;
         let request = || {
             Request::new(GetTaskHistoryRequest {
                 sql: format!(
@@ -1077,13 +1115,17 @@ mod tests {
             })
         };
 
-        ClusterService::get_task_history(&service, request())
+        client
+            .get_task_history(request())
             .await
             .expect("first task history request should succeed");
 
-        ClusterService::get_task_history(&service, request())
+        client
+            .get_task_history(request())
             .await
             .expect("second task history request should also succeed");
+
+        shutdown.cancel();
     }
 
     #[test]
