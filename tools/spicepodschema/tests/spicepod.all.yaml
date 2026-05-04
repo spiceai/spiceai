@@ -392,10 +392,10 @@ datasets:
       enabled: true
       engine: elasticsearch
       params:
-        endpoint: https://my-cluster.es.io:9200
-        index: spice-docs
-        user: ${secrets:ES_USER}
-        pass: ${secrets:ES_PASS}
+        elasticsearch_endpoint: http://localhost:9200
+        elasticsearch_index: articles_index
+        elasticsearch_user: ${secrets:ES_USER}
+        elasticsearch_pass: ${secrets:ES_PASS}
     acceleration:
       enabled: true
       engine: duckdb
