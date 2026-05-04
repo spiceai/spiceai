@@ -335,6 +335,10 @@ pub enum SnapshotDownloadError {
     CheckpointerSchema {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    #[snafu(display("Failed to bootstrap dataset checkpoint from snapshot metadata: {source}"))]
+    CheckpointerBootstrap {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[snafu(display("Snapshot {path} is missing a schema in its checkpoint"))]
     MissingSchema { path: String },
     #[snafu(display("Snapshot schema for dataset {dataset} is missing in metadata"))]
@@ -1837,44 +1841,67 @@ impl SnapshotManager {
                 source,
             })?;
 
-        if let Some(schema) = checkpointer
+        let local_schema = checkpointer
             .get_schema()
             .await
-            .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?
-        {
+            .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?;
+        let final_schema = if let Some(schema) = local_schema {
             if schema.as_ref() != metadata_schema.as_ref() {
                 return Err(SnapshotDownloadError::SchemaMismatch {
                     dataset: self.dataset_name.clone(),
                 });
             }
-
-            let local_path_display = self
-                .layout
-                .primary_path()
-                .map_or_else(|| "<directories>".to_string(), |p| p.display().to_string());
-            tracing::info!(
-                dataset = %self.dataset_name,
-                snapshot = %entry.snapshot,
-                size_bytes = actual_size,
-                sha = %actual_checksum,
-                "Snapshot restored to {local_path_display}"
-            );
-            Ok(SnapshotDownloadInfo {
-                snapshot_id: entry.snapshot_id,
-                schema,
-                bytes_downloaded: actual_size,
-                checksum: actual_checksum,
-                last_updated_at: entry.snapshot_last_updated_at_ms,
-            })
+            schema
         } else {
-            tracing::warn!(
+            // The downloaded snapshot didn't carry a populated
+            // `_dataset_checkpoint` row. This is the steady-state for
+            // engines whose archive doesn't ship the spice_sys checkpoint
+            // alongside the live data — most notably Cayenne, where the
+            // archive ships the per-dataset metastore slice instead of
+            // the raw `cayenne.db`. The metadata-recorded schema has
+            // already been verified to round-trip via `to_schema_ref()`,
+            // so we can safely materialize it into the checkpoint table
+            // to bring the local DB in line with the snapshot.
+            //
+            // For engines whose snapshot *does* normally include the
+            // checkpoint row (DuckDB / SQLite / Turso), this branch is
+            // unreachable in practice; if a corrupted snapshot reaches
+            // it the self-heal is harmless because we trust the metadata
+            // schema (it's the same one we just validated above for
+            // any other branch).
+            //
+            // Closes spiceai/spiceai#10658.
+            tracing::debug!(
                 dataset = %self.dataset_name,
                 snapshot = %entry.snapshot,
                 sha = %entry.snapshot_checksum,
-                "Snapshot schema not found"
+                "Bootstrapping dataset checkpoint from snapshot metadata"
             );
-            Err(SnapshotDownloadError::MissingSchema { path: path_display })
-        }
+            checkpointer
+                .checkpoint(&metadata_schema, None)
+                .await
+                .map_err(|source| SnapshotDownloadError::CheckpointerBootstrap { source })?;
+            metadata_schema
+        };
+
+        let local_path_display = self
+            .layout
+            .primary_path()
+            .map_or_else(|| "<directories>".to_string(), |p| p.display().to_string());
+        tracing::info!(
+            dataset = %self.dataset_name,
+            snapshot = %entry.snapshot,
+            size_bytes = actual_size,
+            sha = %actual_checksum,
+            "Snapshot restored to {local_path_display}"
+        );
+        Ok(SnapshotDownloadInfo {
+            snapshot_id: entry.snapshot_id,
+            schema: final_schema,
+            bytes_downloaded: actual_size,
+            checksum: actual_checksum,
+            last_updated_at: entry.snapshot_last_updated_at_ms,
+        })
     }
 
     /// Downloads a snapshot directly to a single file (for file-based accelerators).

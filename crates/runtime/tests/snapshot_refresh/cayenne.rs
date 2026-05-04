@@ -22,17 +22,11 @@ use super::{EngineKind, run_bootstrap_then_refresh_cycle};
 // the reader's bootstrap path imports the slice into its local metastore.
 //
 // The wholesale-replace import correctly rebuilds the cayenne-domain tables
-// (`cayenne_table`, `cayenne_partition`, `cayenne_delete_file`), but does
-// **not** populate the spice_sys `_dataset_checkpoint` table that
-// `download_latest_snapshot` queries via `Checkpointer::get_schema`. The
-// resulting `MissingSchema` error is the last blocker to enabling this
-// test by default. Tracked in spiceai/spiceai#10658.
-//
-// The supporting code (per-dataset slice format, `CayenneSnapshotEngine`
-// pipeline wiring, multi-dataset shared metastore validation lift) all
-// lands in this PR; only the schema-handoff to spice_sys is deferred.
+// (`cayenne_table`, `cayenne_partition`, `cayenne_delete_file`); the
+// spice_sys `_dataset_checkpoint` schema row is bootstrapped from the
+// snapshot metadata by `download_latest_snapshot` (closes
+// spiceai/spiceai#10658), so this test now runs by default.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "snapshot_refresh for cayenne requires checkpoint schema handoff after slice import; see spiceai/spiceai#10658"]
 async fn snapshot_refresh_cayenne_bootstrap_then_refresh() -> Result<(), anyhow::Error> {
     run_bootstrap_then_refresh_cycle("snapshot_refresh_cayenne", EngineKind::Cayenne).await
 }
