@@ -1072,7 +1072,7 @@ mod tests {
             Server::builder()
                 .add_service(ClusterServiceServer::new(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                    shutdown_signal.cancelled().await
+                    shutdown_signal.cancelled().await;
                 })
                 .await
                 .expect("test cluster service server should run");
