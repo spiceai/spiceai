@@ -89,6 +89,8 @@ mod nsql {
                         }],
                         description: None,
                         full_text_search: None,
+                        r#type: None,
+                        nullable: None,
                         metadata: HashMap::new(),
                 }];
 
