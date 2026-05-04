@@ -1093,8 +1093,7 @@ impl Runtime {
 
         if ds.has_full_text_column() {
             #[cfg(feature = "elasticsearch")]
-            if ds.params.get("full_text_search_engine").map(String::as_str) == Some("elasticsearch")
-            {
+            if ds.fts_engine() == Some("elasticsearch") {
                 use crate::search::full_text::elasticsearch::ElasticsearchFullTextConnector;
                 data_connector = Arc::new(
                     ElasticsearchFullTextConnector::try_new(data_connector, &ds, self.secrets())
@@ -1495,6 +1494,12 @@ pub struct RegisterDatasetContext {
 #[expect(clippy::result_large_err)]
 fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     if ds.has_full_text_column() && !ds.is_accelerated() {
+        // Elasticsearch-backed FTS stores the index externally — no local
+        // acceleration is needed to build or query the index.
+        #[cfg(feature = "elasticsearch")]
+        if ds.fts_engine() == Some("elasticsearch") {
+            return Ok(());
+        }
         return Err(FullTextSearchRequiresAccelerationSnafu {
             dataset_name: ds.name.to_string(),
         }

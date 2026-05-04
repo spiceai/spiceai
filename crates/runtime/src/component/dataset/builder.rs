@@ -33,6 +33,7 @@ use spicepod::{
         dataset::{self as spicepod_dataset},
         embeddings::ColumnEmbeddingConfig,
     },
+    fts::FtsStore,
     metric::Metrics,
     param::Params,
     semantic::Column,
@@ -62,6 +63,7 @@ pub struct DatasetBuilder {
     pub metrics: Metrics,
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
+    pub full_text_search: Option<FtsStore>,
     pub check_availability: CheckAvailability,
     pub load: Load,
 }
@@ -151,6 +153,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             metrics: dataset.metrics.unwrap_or_default(),
             runtime: None,
             vectors: dataset.vectors,
+            full_text_search: dataset.full_text_search,
             check_availability: CheckAvailability::from(dataset.check_availability),
             load: Load::from(dataset.load),
         })
@@ -183,6 +186,7 @@ impl DatasetBuilder {
             metrics: Metrics::default(),
             runtime: None,
             vectors: None,
+            full_text_search: None,
             check_availability: CheckAvailability::default(),
             load: Load::default(),
         })
@@ -281,6 +285,7 @@ impl DatasetBuilder {
             metrics: self.metrics,
             runtime,
             vectors: self.vectors,
+            full_text_search: self.full_text_search,
             check_availability: self.check_availability,
             load: self.load,
         };

@@ -19,7 +19,6 @@ limitations under the License.
 //! their dataset params.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -43,7 +42,7 @@ use runtime_secrets::Secrets;
 #[derive(Clone)]
 pub(crate) struct ElasticsearchFtsParams {
     /// Resolved (secrets-injected) params map.
-    pub params: HashMap<String, String>,
+    pub params: std::collections::HashMap<String, String>,
     /// Elasticsearch index name for full-text search documents.
     pub es_index: String,
 }
@@ -62,36 +61,41 @@ impl std::fmt::Debug for ElasticsearchFullTextConnector {
 }
 
 impl ElasticsearchFullTextConnector {
-    /// Construct the connector, resolving secrets from `dataset.params`.
+    /// Construct the connector, resolving secrets from `dataset.full_text_search.params`.
     ///
-    /// Required params (in `dataset.params`):
-    /// - `full_text_search_endpoint` — Elasticsearch cluster URL
-    /// - `full_text_search_index` — ES index name (optional; defaults to dataset name)
+    /// Required params (in `dataset.full_text_search.params`):
+    /// - `endpoint` — Elasticsearch cluster URL
+    /// - `index` — ES index name (optional; defaults to dataset name)
     ///
     /// Optional params:
-    /// - `full_text_search_user`, `full_text_search_pass`
-    /// - `full_text_search_client_timeout`, `full_text_search_connect_timeout`
+    /// - `user`, `pass`
+    /// - `client_timeout`, `connect_timeout`
     pub async fn try_new(
         inner_connector: Arc<dyn DataConnector>,
         dataset: &Dataset,
         secrets: Arc<RwLock<Secrets>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Extract all `full_text_search_*` prefixed params and strip the prefix
-        // so downstream code can use plain keys like "endpoint", "user", etc.
-        let raw_params: HashMap<String, String> = dataset
-            .params
-            .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("full_text_search_")
-                    .map(|stripped| (stripped.to_string(), v.clone()))
-            })
-            .collect();
+        let fts_store = dataset
+            .full_text_search
+            .as_ref()
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::from(format!(
+                    "Dataset '{}': full_text_search block is required when fts_engine is 'elasticsearch'",
+                    dataset.name
+                ))
+            })?;
 
-        // Resolve secrets for all extracted params.
+        let raw_params: std::collections::HashMap<String, String> = fts_store
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+
+        // Resolve secrets for all params.
         let resolved =
             runtime_secrets::get_params_with_secrets(Arc::clone(&secrets), &raw_params).await;
 
-        let params: HashMap<String, String> = resolved
+        let params: std::collections::HashMap<String, String> = resolved
             .into_iter()
             .map(|(k, v)| (k, v.expose_secret().to_string()))
             .collect();

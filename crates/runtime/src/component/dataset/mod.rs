@@ -299,6 +299,7 @@ pub struct Dataset {
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
+    pub full_text_search: Option<spicepod::fts::FtsStore>,
     pub check_availability: CheckAvailability,
     pub load: Load,
 }
@@ -325,6 +326,7 @@ impl std::fmt::Debug for Dataset {
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
+            .field("full_text_search", &self.full_text_search)
             .field("check_availability", &self.check_availability)
             .field("load", &self.load)
             .finish_non_exhaustive()
@@ -351,6 +353,7 @@ impl PartialEq for Dataset {
             && self.columns == other.columns
             && self.metrics == other.metrics
             && self.vectors == other.vectors
+            && self.full_text_search == other.full_text_search
             && self.check_availability == other.check_availability
             && self.load == other.load
     }
@@ -663,6 +666,16 @@ impl Dataset {
         self.columns
             .iter()
             .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
+    }
+
+    /// Returns the dataset-level FTS engine name if configured and enabled.
+    /// e.g. `Some("elasticsearch")` when `full_text_search.engine: elasticsearch`.
+    #[must_use]
+    pub fn fts_engine(&self) -> Option<&str> {
+        self.full_text_search
+            .as_ref()
+            .filter(|fts| fts.enabled)
+            .and_then(|fts| fts.engine.as_deref())
     }
 
     /// Find any primary keys explicitly defined in the [`Dataset`]. Order of precedence:
