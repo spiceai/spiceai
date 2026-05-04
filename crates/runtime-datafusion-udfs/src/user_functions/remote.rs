@@ -262,7 +262,7 @@ impl Debug for RemoteTableFunc {
 
 impl TableFunctionImpl for RemoteTableFunc {
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let args = table_arg_values(&self.name, Arc::clone(&self.arg_schema), exprs)?;
+        let args = table_arg_values(&self.name, self.arg_schema.as_ref(), exprs)?;
         Ok(Arc::new(RemoteTableProvider {
             name: self.name.clone(),
             arg_schema: Arc::clone(&self.arg_schema),
@@ -312,7 +312,7 @@ impl TableProvider for RemoteTableProvider {
         if let Some(limit) = limit {
             rows.truncate(limit);
         }
-        let batch = decode_table_rows(rows, Arc::clone(&self.schema), &self.name)?;
+        let batch = decode_table_rows(&rows, Arc::clone(&self.schema), &self.name)?;
         let memory_source = MemorySourceConfig::try_new(
             &[vec![batch]],
             Arc::clone(&self.schema),
@@ -791,7 +791,7 @@ fn table_return_schema(decl: &Function) -> Result<SchemaRef> {
 
 fn table_arg_values(
     function_name: &str,
-    schema: SchemaRef,
+    schema: &Schema,
     exprs: &[Expr],
 ) -> DataFusionResult<Vec<ScalarValue>> {
     let fields = schema.fields();
@@ -830,7 +830,7 @@ fn table_arg_values(
                 fields[index].name()
             )));
         }
-        values[index] = Some(cast_scalar_arg(scalar, fields[index].data_type())?);
+        values[index] = Some(cast_scalar_arg(&scalar, fields[index].data_type())?);
     }
 
     values
@@ -864,11 +864,11 @@ fn literal_arg(
     )))
 }
 
-fn cast_scalar_arg(value: ScalarValue, data_type: &DataType) -> DataFusionResult<ScalarValue> {
+fn cast_scalar_arg(value: &ScalarValue, data_type: &DataType) -> DataFusionResult<ScalarValue> {
     if matches!(value, ScalarValue::Null) {
-        return ScalarValue::try_from(data_type).map_err(DataFusionError::from);
+        return ScalarValue::try_from(data_type);
     }
-    value.cast_to(data_type).map_err(DataFusionError::from)
+    value.cast_to(data_type)
 }
 
 fn encode_single_args_row(
@@ -886,7 +886,7 @@ fn encode_single_args_row(
 }
 
 fn decode_table_rows(
-    rows: Vec<Value>,
+    rows: &[Value],
     schema: SchemaRef,
     function_name: &str,
 ) -> DataFusionResult<RecordBatch> {
@@ -902,7 +902,7 @@ fn decode_table_rows(
                 "remote table function '{function_name}' failed to build JSON response decoder: {e}"
             ))
         })?;
-    decoder.serialize(&rows).map_err(|e| {
+    decoder.serialize(rows).map_err(|e| {
         DataFusionError::Execution(format!(
             "remote table function '{function_name}' response rows did not match declared return schema: {e}"
         ))
@@ -1114,7 +1114,7 @@ mod tests {
     fn builds_valid_table_decl() {
         let d = sample_table_decl("http://example.com/udtf");
         let udtf = build_table_udtf(&d).expect("builds");
-        assert_eq!(format!("{udtf:?}").contains("remote_rows"), true);
+        assert!(format!("{udtf:?}").contains("remote_rows"));
     }
 
     #[test]

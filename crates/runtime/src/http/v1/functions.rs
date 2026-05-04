@@ -67,8 +67,8 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
         return (StatusCode::OK, Json(Vec::<ListFunctionElement>::new())).into_response();
     }
 
-    let registered_udfs = rt.df.ctx.udfs();
-    let registered_udtfs = rt
+    let scalar_function_names = rt.df.ctx.udfs();
+    let table_function_names = rt
         .df
         .ctx
         .state()
@@ -82,10 +82,10 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
         .filter(|decl| {
             decl.enabled
                 && match decl.kind {
-                    spicepod::component::function::FunctionKind::Scalar => registered_udfs
+                    spicepod::component::function::FunctionKind::Scalar => scalar_function_names
                         .iter()
                         .any(|name| name.eq_ignore_ascii_case(&decl.name)),
-                    spicepod::component::function::FunctionKind::Table => registered_udtfs
+                    spicepod::component::function::FunctionKind::Table => table_function_names
                         .iter()
                         .any(|name| name.eq_ignore_ascii_case(&decl.name)),
                 }
