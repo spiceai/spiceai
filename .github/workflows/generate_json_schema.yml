@@ -29,7 +29,9 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - run: rustup toolchain install 1.94.1 --profile minimal
 
@@ -77,7 +79,7 @@ jobs:
           if [[ $(git diff --exit-code .schema/spicepod.schema.json) ]]; then
             git add .schema/spicepod.schema.json
             git commit -m "Update spicepod.schema.json"
-            git push origin schema/${GITHUB_RUN_ID}
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:schema/${GITHUB_RUN_ID}
             gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID}
           else
             echo "No changes detected"

@@ -95,8 +95,9 @@ jobs:
     name: Build Test Binary
     runs-on: spiceai-macos
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
+          persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
@@ -129,7 +130,9 @@ jobs:
     permissions: read-all
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - name: Download test binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:

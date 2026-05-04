@@ -30,28 +30,28 @@ description: "Query: tpch_q13"
 |               |                     SchemaCastScanExec                                                                                                                                      |
 |               |                       PartitionedUnionExec                                                                                                                                  |
 |               |                         BytesProcessedExec                                                                                                                                  |
-|               |                           DataSourceExec: partitions=1, partition_sizes=[19]                                                                                                |
+|               |                           DataSourceExec: partitions=1, partition_sizes=[<redacted>]                                                                                                |
 |               |                         BytesProcessedExec                                                                                                                                  |
-|               |                           DataSourceExec: partitions=1, partition_sizes=[19]                                                                                                |
+|               |                           DataSourceExec: partitions=1, partition_sizes=[<redacted>]                                                                                                |
 |               |                         BytesProcessedExec                                                                                                                                  |
-|               |                           DataSourceExec: partitions=1, partition_sizes=[19]                                                                                                |
+|               |                           DataSourceExec: partitions=1, partition_sizes=[<redacted>]                                                                                                |
 |               |                         BytesProcessedExec                                                                                                                                  |
-|               |                           DataSourceExec: partitions=1, partition_sizes=[19]                                                                                                |
+|               |                           DataSourceExec: partitions=1, partition_sizes=[<redacted>]                                                                                                |
 |               |                         BytesProcessedExec                                                                                                                                  |
-|               |                           DataSourceExec: partitions=1, partition_sizes=[19]                                                                                                |
+|               |                           DataSourceExec: partitions=1, partition_sizes=[<redacted>]                                                                                                |
 |               |                   RepartitionExec: partitioning=Hash([o_custkey@1], 32), input_partitions=160                                                                               |
 |               |                     FilterExec: o_comment@2 NOT LIKE %special%requests%, projection=[o_orderkey@0, o_custkey@1]                                                             |
 |               |                       SchemaCastScanExec                                                                                                                                    |
 |               |                         PartitionedUnionExec                                                                                                                                |
 |               |                           BytesProcessedExec                                                                                                                                |
-|               |                             DataSourceExec: partitions=32, partition_sizes=[6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 5, 6, 5] |
+|               |                             DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |                           BytesProcessedExec                                                                                                                                |
-|               |                             DataSourceExec: partitions=32, partition_sizes=[6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 5, 6, 5] |
+|               |                             DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |                           BytesProcessedExec                                                                                                                                |
-|               |                             DataSourceExec: partitions=32, partition_sizes=[6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 6, 5, 5] |
+|               |                             DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |                           BytesProcessedExec                                                                                                                                |
-|               |                             DataSourceExec: partitions=32, partition_sizes=[6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 6, 5, 5] |
+|               |                             DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |                           BytesProcessedExec                                                                                                                                |
-|               |                             DataSourceExec: partitions=32, partition_sizes=[6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 6, 5, 5] |
+|               |                             DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |                                                                                                                                                                             |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

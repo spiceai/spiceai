@@ -24,9 +24,7 @@ limitations under the License.
 
 use app::AppBuilder;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::runtime::{
-    PartitionManagement, Runtime as SpicepodRuntime, Scheduler as SchedulerConfig,
-};
+use spicepod::component::runtime::{Runtime as SpicepodRuntime, Scheduler as SchedulerConfig};
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     partitioning::PartitionedBy,
@@ -523,7 +521,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 "baseline should return 10 rows with 2 executors"
             );
 
-            // Shut down executor[0].  The scheduler's PartitionManagementTask (1s interval)
+            // Shut down executor[0].  The scheduler's PartitionAssignmentTask (1s interval)
             // will detect the disconnect and reassign its buckets to executor[1].
             harness.executors[0].shutdown().await;
             harness
@@ -605,11 +603,8 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                         // Limit each executor to 2 of the 4 partitions per table so
                         // that partitions are forced to split across the 2 executors,
                         // producing a UnionExec in the query plan.
-                        cfg.partition_management = Some(PartitionManagement {
-                            interval: "1s".to_string(),
-                            max_partitions_per_executor: 2,
-                            ..Default::default()
-                        });
+                        cfg.partition_assignment_interval = "1s".to_string();
+                        cfg.max_partitions_per_executor = 2;
                         cfg
                     }),
                     ..SpicepodRuntime::default()
@@ -1107,10 +1102,11 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
                 ("s3_auth".to_string(), "key".to_string()),
             ]),
         )),
-        partition_management: Some(PartitionManagement {
-            max_partitions_per_executor,
-            interval: "1s".to_string(),
-            ..Default::default()
-        }),
+        partition_assignment_interval: "1s".to_string(),
+        max_partition_assignments_per_interval:
+            spicepod::component::runtime::default_max_partition_assignments_per_interval(),
+        max_partitions_per_executor,
+        partition_discovery_timeout:
+            spicepod::component::runtime::default_partition_discovery_timeout(),
     }
 }

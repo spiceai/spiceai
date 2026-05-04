@@ -2,7 +2,7 @@
 description = "S3 Vector metadata filtering for DataFusion"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "s3_vectors_metadata_filter"
 repository.workspace = true
 rust-version.workspace = true

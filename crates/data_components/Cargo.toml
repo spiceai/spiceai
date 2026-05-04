@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "data_components"
 repository.workspace = true
 rust-version.workspace = true
@@ -172,6 +172,9 @@ postgres = [
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 scylladb = ["dep:scylla", "datafusion-table-providers/federation"]
 sharepoint = ["dep:graph-rs-sdk"]
+# Enables graph-rs-sdk's `test-util` feature so `GraphClient::use_test_endpoint`
+# accepts non-Microsoft hosts (e.g. localhost mocks). Intended for tests only.
+sharepoint-mock-host = ["sharepoint", "graph-rs-sdk/test-util"]
 snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation", "db_connection_pool/snowflake"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [

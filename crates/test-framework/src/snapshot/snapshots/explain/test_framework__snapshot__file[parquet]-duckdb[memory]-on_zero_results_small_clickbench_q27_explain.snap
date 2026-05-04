@@ -22,6 +22,6 @@ description: "Query: clickbench_q27"
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                   |
 |               |                     CooperativeExec                                                                                                       |
 |               |                       BytesProcessedExec                                                                                                  |
-|               |                         DuckSqlExec sql= SELECT "EventTime", "SearchPhrase" FROM "hits"                                                   |
+|               |                         DuckSqlExec sql= SELECT "EventTime", "SearchPhrase" FROM "hits" WHERE (CAST("SearchPhrase" AS VARCHAR) <> '')     |
 |               |                                                                                                                                           |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------+

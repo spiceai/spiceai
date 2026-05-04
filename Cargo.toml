@@ -64,6 +64,7 @@ members = [
     "crates/workers",
     "crates/yaml",
     "crates/scheduler",
+    "crates/smb",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
     "tools/flight-cookie-server/",
@@ -86,7 +87,7 @@ resolver = "2"
 edition = "2024"
 exclude = [".github/"]
 homepage = "https://spice.ai"
-license = "Apache-2.0"
+license-file = "LICENSE"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.94.1"
 version = "2.0.0-unstable"
@@ -107,7 +108,7 @@ arrow-json = "57.0.0"
 arrow-odbc = { git = "https://github.com/pacman82/arrow-odbc", rev = "7316b13" }
 arrow-row = "57.0.0"
 arrow-schema = "57.0.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "7d5d31718143bf847cbc46286d4be26f035b58a0", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "8dbb88bcd14b70dfd92ddd02aeb9f31112c7b63b", features = [
     "byot",
     "embedding",
     "chat-completion",
@@ -416,7 +417,7 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "faaaf61c1fbd66064500bcc2c908b95235b2fc9d" } # spiceai-52
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "915f03870eff972dab671aa3481a3b55a289d2b9" } # spiceai-52
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "383e165a080d648c313a2530a3a53eae6077fdba" }      # spiceai-52.5
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "383e165a080d648c313a2530a3a53eae6077fdba" } # spiceai-52.5

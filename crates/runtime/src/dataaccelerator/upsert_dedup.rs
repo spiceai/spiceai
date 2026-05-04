@@ -169,6 +169,15 @@ impl TableProvider for UpsertDedupTableProvider {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         self.inner.delete_from(state, filters).await
     }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
 }
 
 /// An execution plan that applies deduplication to batches before passing them downstream.

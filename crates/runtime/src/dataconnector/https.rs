@@ -16,7 +16,12 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::metrics::MetricsProvider;
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
+use crate::dataconnector::http_rate_control::{
+    self, HttpRateControlConfig, HttpRateControlMetricSource, HttpRateControlMetrics,
+    HttpRateControlMetricsProvider,
+};
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
 };
@@ -25,11 +30,13 @@ use data_components::http::auth::{
     ClientAuthMethod, HttpAuthenticator, RefreshTokenAuth, RefreshTokenConfig,
 };
 use data_components::http::json_nest::HttpJsonNesting;
+use data_components::rate_limit::RateLimiter;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::semantic::Column;
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -54,6 +61,11 @@ const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
+    runtime_rate_control_params: Option<HashMap<String, String>>,
+    rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
+    metrics: Arc<HttpRateControlMetrics>,
+    emit_rate_control_metrics: bool,
+    rate_control_metric_source: Option<HttpRateControlMetricSource>,
 }
 
 impl std::fmt::Display for Https {
@@ -63,6 +75,37 @@ impl std::fmt::Display for Https {
 }
 
 impl Https {
+    fn shared_rate_control_metrics_for_dataset(
+        rate_control_registry: &http_rate_control::HttpRateControlRegistry,
+        rate_control_registry_arc: &Arc<http_rate_control::HttpRateControlRegistry>,
+        dataset: &Dataset,
+        structured_format: bool,
+    ) -> (
+        Arc<HttpRateControlMetrics>,
+        bool,
+        Option<HttpRateControlMetricSource>,
+    ) {
+        if structured_format {
+            return (Arc::new(HttpRateControlMetrics::default()), false, None);
+        }
+
+        Url::parse(dataset.from.as_str()).map_or_else(
+            |_| (Arc::new(HttpRateControlMetrics::default()), false, None),
+            |url| {
+                let metric_source = HttpRateControlMetricSource::new(
+                    Arc::clone(rate_control_registry_arc),
+                    url.clone(),
+                    dataset.name.to_string(),
+                );
+                (
+                    rate_control_registry.shared_metrics(&url),
+                    true,
+                    Some(metric_source),
+                )
+            },
+        )
+    }
+
     /// Determines if the dataset uses a structured file format (parquet, csv, json, etc.)
     /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
     fn is_structured_format(&self, dataset: &Dataset) -> bool {
@@ -148,6 +191,13 @@ impl Https {
             .ok()
             .is_some_and(util::parse_enabled);
 
+        let has_header_filters = self
+            .params
+            .get("request_header_filters")
+            .expose()
+            .ok()
+            .is_some_and(util::parse_enabled);
+
         let has_pagination = self
             .params
             .get("pagination")
@@ -167,8 +217,44 @@ impl Https {
             .iter()
             .any(|key| self.params.get(key).expose().ok().is_some());
 
-        has_allowed_paths || has_query_filters || has_body_filters || has_pagination
+        has_allowed_paths
+            || has_query_filters
+            || has_body_filters
+            || has_header_filters
+            || has_pagination
     }
+
+    fn ensure_rate_control_supported_for_structured_dataset(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<()> {
+        let rate_control = http_rate_control::resolve_config(
+            &self.params,
+            self.runtime_rate_control_params.as_ref(),
+            dataset,
+            "https",
+        )?;
+
+        if rate_control.is_enabled() {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "HTTP rate-control parameters are not supported for structured HTTP file datasets that use the listing connector. Remove max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, and rate_control_jitter_max, or use a dynamic JSON HTTP API dataset.".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+struct RequestFilterParams {
+    allow_query_filters: bool,
+    max_query_length: usize,
+    allow_body_filters: bool,
+    max_body_bytes: usize,
+    allow_header_filters: bool,
+    max_headers_length: usize,
+    request_header_allowlist: Vec<String>,
 }
 
 struct HttpProviderParams {
@@ -180,16 +266,18 @@ struct HttpProviderParams {
     retry_jitter: f64,
     custom_headers: HeaderMap,
     allowed_paths: Vec<String>,
-    allow_query_filters: bool,
-    max_query_length: usize,
-    allow_body_filters: bool,
-    max_body_bytes: usize,
+    request_filters: RequestFilterParams,
+    rate_control: HttpRateControlConfig,
+    max_request_partitions: Option<usize>,
     health_probe: Option<String>,
     pagination: Option<data_components::http::provider::PaginationConfig>,
 }
 
 impl Https {
-    fn resolve_http_provider_params(&self, dataset: &Dataset) -> HttpProviderParams {
+    fn resolve_http_provider_params(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<HttpProviderParams> {
         let file_format = self
             .params
             .get("file_format")
@@ -273,6 +361,50 @@ impl Https {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(data_components::http::provider::DEFAULT_MAX_BODY_BYTES);
+
+        let allow_header_filters = self
+            .params
+            .get("request_header_filters")
+            .expose()
+            .ok()
+            .is_some_and(util::parse_enabled);
+
+        let max_headers_length = self
+            .params
+            .get("max_request_headers_length")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(data_components::http::provider::DEFAULT_MAX_HEADERS_LENGTH);
+
+        let request_header_allowlist = self
+            .params
+            .get("request_header_allowlist")
+            .expose()
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|header_name| header_name.trim().to_string())
+                    .filter(|header_name| !header_name.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let rate_control = http_rate_control::resolve_config(
+            &self.params,
+            self.runtime_rate_control_params.as_ref(),
+            dataset,
+            "https",
+        )?;
+
+        let max_request_partitions = self
+            .params
+            .get("max_request_partitions")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|value| *value > 0);
 
         let health_probe = self
             .params
@@ -393,7 +525,7 @@ impl Https {
             }
         };
 
-        HttpProviderParams {
+        Ok(HttpProviderParams {
             file_format,
             acceleration_enabled: dataset.is_accelerated(),
             max_retries,
@@ -402,13 +534,20 @@ impl Https {
             retry_jitter,
             custom_headers,
             allowed_paths,
-            allow_query_filters,
-            max_query_length,
-            allow_body_filters,
-            max_body_bytes,
+            request_filters: RequestFilterParams {
+                allow_query_filters,
+                max_query_length,
+                allow_body_filters,
+                max_body_bytes,
+                allow_header_filters,
+                max_headers_length,
+                request_header_allowlist,
+            },
+            rate_control,
+            max_request_partitions,
             health_probe,
             pagination,
-        }
+        })
     }
 
     fn apply_allowed_paths(
@@ -695,16 +834,25 @@ impl Https {
             retry_jitter,
             custom_headers,
             allowed_paths,
+            request_filters,
+            rate_control,
+            max_request_partitions,
+            health_probe,
+            pagination,
+        } = self.resolve_http_provider_params(dataset)?;
+
+        let RequestFilterParams {
             allow_query_filters,
             max_query_length,
             allow_body_filters,
             max_body_bytes,
-            health_probe,
-            pagination,
-        } = self.resolve_http_provider_params(dataset);
+            allow_header_filters,
+            max_headers_length,
+            request_header_allowlist,
+        } = request_filters;
 
         let mut provider = data_components::http::provider::HttpTableProvider::new(
-            base_url,
+            base_url.clone(),
             client,
             file_format,
             acceleration_enabled,
@@ -714,6 +862,7 @@ impl Https {
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
+        .with_max_request_partitions(max_request_partitions)
         .with_health_probe(health_probe)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: "https".to_string(),
@@ -755,10 +904,12 @@ impl Https {
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
         tracing::trace!(
-            "HTTP provider configuration for {}: allow_query_filters={}, allow_body_filters={}",
+            "HTTP provider configuration for {}: allow_query_filters={}, allow_body_filters={}, allow_header_filters={}, max_request_partitions={:?}",
             dataset.name,
             allow_query_filters,
-            allow_body_filters
+            allow_body_filters,
+            allow_header_filters,
+            max_request_partitions
         );
 
         if allow_query_filters {
@@ -772,6 +923,22 @@ impl Https {
         if allow_body_filters {
             tracing::trace!("Enabling body filters with max_bytes={}", max_body_bytes);
             provider = provider.enable_body_filters(max_body_bytes);
+        }
+
+        if allow_header_filters {
+            tracing::trace!(
+                "Enabling header filters with max_length={} and {} allowed header names",
+                max_headers_length,
+                request_header_allowlist.len()
+            );
+            provider = provider
+                .enable_header_filters(max_headers_length, request_header_allowlist)
+                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                    dataconnector: "https".to_string(),
+                    message: format!("Invalid request header filter configuration: {e}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e.into(),
+                })?;
         }
 
         if let Some(pagination_config) = pagination {
@@ -797,7 +964,27 @@ impl Https {
             })?;
         }
 
+        let rate_limiter = self
+            .rate_control_registry
+            .shared_rate_limiter(&base_url)
+            .await;
+        self.metrics.set_rate_limiter(&rate_limiter);
+        let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
+        let rate_controller = Arc::clone(&self.rate_control_registry)
+            .reserve_shared_rate_controller(&base_url, &rate_control, dataset, "https")
+            .await?;
+        self.metrics.set_config(&rate_controller.shared().config);
+        self.metrics
+            .set_rate_controller(rate_controller.shared().controller.as_ref());
+        provider = provider
+            .with_rate_limiter(Some(rate_limiter))
+            .with_rate_controller(rate_controller.shared().controller.clone());
+
         let provider = Arc::new(provider);
+        if let Some(metric_source) = &self.rate_control_metric_source {
+            let _ = metric_source.claim_owner();
+        }
+        rate_controller.commit().await;
         Self::spawn_endpoint_validation(Arc::clone(&provider), dataset.name.to_string());
 
         Ok(provider)
@@ -869,6 +1056,7 @@ impl DataConnector for Https {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
+            self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
             // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
             // which properly handles file parsing with correct schemas
             let listing_connector =
@@ -896,6 +1084,18 @@ impl DataConnector for Https {
 
         // For JSON API endpoints and other formats, use HttpTableProvider
         self.create_http_table_provider(dataset).await
+    }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        if !self.emit_rate_control_metrics {
+            return None;
+        }
+
+        Some(Arc::new(HttpRateControlMetricsProvider::new(
+            "http",
+            Arc::clone(&self.metrics),
+            self.rate_control_metric_source.clone(),
+        )))
     }
 
     fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
@@ -962,6 +1162,15 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("max_request_body_bytes")
             .description("Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB)."),
+        ParameterSpec::runtime("request_header_filters")
+            .description("Set to 'enabled' or 'disabled' to control whether request_headers filters can be pushed down as dynamic HTTP request headers.")
+            .one_of(&["enabled", "disabled"]),
+        ParameterSpec::runtime("request_header_allowlist")
+            .description("Comma-separated list of HTTP request header names that request_headers filters may set. Required when request_header_filters is enabled."),
+        ParameterSpec::runtime("max_request_headers_length")
+            .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
+        ParameterSpec::runtime("max_request_partitions")
+            .description("Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped."),
         ParameterSpec::runtime("health_probe")
             .description("Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted."),
         ParameterSpec::runtime("pagination")
@@ -1002,6 +1211,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("auth_client_auth")
             .description("How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive."),
     ]);
+    all_parameters.extend_from_slice(&http_rate_control::parameter_specs());
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
 });
@@ -1016,8 +1226,44 @@ impl DataConnectorFactory for HttpsFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
+            let runtime_rate_control_params =
+                params.app.as_ref().map(|app| app.runtime.params.clone());
+            let rate_control_registry = params
+                .runtime
+                .as_ref()
+                .map_or_else(http_rate_control::global_registry, |runtime| {
+                    runtime.http_rate_control_registry()
+                });
+            let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
+                if let ConnectorComponent::Dataset(dataset) = &params.component {
+                    let structured_format = {
+                        let connector = Https {
+                            params: params.parameters.clone(),
+                            runtime_rate_control_params: runtime_rate_control_params.clone(),
+                            rate_control_registry: Arc::clone(&rate_control_registry),
+                            metrics: Arc::new(HttpRateControlMetrics::default()),
+                            emit_rate_control_metrics: false,
+                            rate_control_metric_source: None,
+                        };
+                        connector.is_structured_format(dataset)
+                    };
+                    Https::shared_rate_control_metrics_for_dataset(
+                        &rate_control_registry,
+                        &rate_control_registry,
+                        dataset,
+                        structured_format,
+                    )
+                } else {
+                    (Arc::new(HttpRateControlMetrics::default()), false, None)
+                };
+
             Ok(Arc::new(Https {
                 params: params.parameters,
+                runtime_rate_control_params,
+                rate_control_registry,
+                metrics,
+                emit_rate_control_metrics,
+                rate_control_metric_source,
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -1146,6 +1392,7 @@ mod tests {
     use crate::secrets::Secrets;
     use app::AppBuilder;
     use secrecy::SecretString;
+    use std::collections::HashMap;
     use tokio::sync::RwLock;
 
     async fn test_connector(file_format: Option<&str>) -> Https {
@@ -1157,6 +1404,13 @@ mod tests {
     }
 
     async fn test_connector_with(extra: &[(&str, &str)]) -> Https {
+        test_connector_with_runtime_params(extra, &[]).await
+    }
+
+    async fn test_connector_with_runtime_params(
+        extra: &[(&str, &str)],
+        runtime_params: &[(&str, &str)],
+    ) -> Https {
         let mut params: Vec<(String, SecretString)> = vec![
             ("client_timeout".to_string(), "1".to_string().into()),
             ("connect_timeout".to_string(), "1".to_string().into()),
@@ -1176,7 +1430,23 @@ mod tests {
         .await
         .expect("test connector parameters should be valid");
 
-        Https { params }
+        Https {
+            params,
+            runtime_rate_control_params: if runtime_params.is_empty() {
+                None
+            } else {
+                Some(
+                    runtime_params
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                        .collect::<HashMap<_, _>>(),
+                )
+            },
+            rate_control_registry: http_rate_control::global_registry(),
+            metrics: Arc::new(HttpRateControlMetrics::default()),
+            emit_rate_control_metrics: true,
+            rate_control_metric_source: None,
+        }
     }
 
     async fn test_dataset(
@@ -1216,6 +1486,18 @@ mod tests {
         }
     }
 
+    fn assert_conflicting_rate_control_error(error: DataConnectorError) {
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("different rate-control settings"),
+                    "expected shared-origin rate-control conflict, got: {message}"
+                );
+            }
+            other => panic!("expected shared-origin rate-control conflict, got: {other}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_http_full_refresh_requires_refresh_sql_for_unstructured_endpoints() {
         let connector = test_connector(None).await;
@@ -1248,6 +1530,334 @@ mod tests {
             .expect_err("append mode should continue to provider validation");
 
         assert_invalid_url_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_parameters_parse() {
+        let connector = test_connector_with(&[
+            ("max_concurrent_requests", "4"),
+            ("requests_per_second_limit", "2"),
+            ("requests_per_minute_limit", "60"),
+            ("rate_control_jitter_min", "2ms"),
+            ("rate_control_jitter_max", "8ms"),
+        ])
+        .await;
+        let dataset = test_dataset("https://api.example.com/data", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("rate-control parameters should parse");
+
+        assert_eq!(params.rate_control.max_concurrent_requests, Some(4));
+        assert_eq!(
+            params
+                .rate_control
+                .requests_per_second
+                .map(std::num::NonZeroU32::get),
+            Some(2)
+        );
+        assert_eq!(
+            params
+                .rate_control
+                .requests_per_minute
+                .map(std::num::NonZeroU32::get),
+            Some(60)
+        );
+        assert_eq!(params.rate_control.jitter_min, Duration::from_millis(2));
+        assert_eq!(params.rate_control.jitter_max, Duration::from_millis(8));
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_uses_runtime_defaults() {
+        let connector = test_connector_with_runtime_params(
+            &[],
+            &[
+                ("http_max_concurrent_requests", "5"),
+                ("http_requests_per_second_limit", "3"),
+                ("http_requests_per_minute_limit", "90"),
+                ("http_rate_control_jitter_min", "1ms"),
+                ("http_rate_control_jitter_max", "4ms"),
+            ],
+        )
+        .await;
+        let dataset = test_dataset(
+            "https://runtime-defaults.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("runtime rate-control defaults should parse");
+
+        assert_eq!(params.rate_control.max_concurrent_requests, Some(5));
+        assert_eq!(
+            params
+                .rate_control
+                .requests_per_second
+                .map(std::num::NonZeroU32::get),
+            Some(3)
+        );
+        assert_eq!(
+            params
+                .rate_control
+                .requests_per_minute
+                .map(std::num::NonZeroU32::get),
+            Some(90)
+        );
+        assert_eq!(params.rate_control.jitter_min, Duration::from_millis(1));
+        assert_eq!(params.rate_control.jitter_max, Duration::from_millis(4));
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_dataset_params_override_runtime_defaults() {
+        let connector = test_connector_with_runtime_params(
+            &[("max_concurrent_requests", "2")],
+            &[("http_max_concurrent_requests", "5")],
+        )
+        .await;
+        let dataset = test_dataset(
+            "https://runtime-override.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("dataset rate-control override should parse");
+
+        assert_eq!(params.rate_control.max_concurrent_requests, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_metrics_are_available() {
+        let connector = test_connector_with(&[
+            ("max_concurrent_requests", "4"),
+            ("requests_per_second_limit", "2"),
+            ("requests_per_minute_limit", "60"),
+            ("rate_control_jitter_min", "2ms"),
+            ("rate_control_jitter_max", "8ms"),
+        ])
+        .await;
+        let dataset = test_dataset(
+            "https://metrics.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        connector
+            .create_http_table_provider(&dataset)
+            .await
+            .expect("HTTP provider should be created");
+
+        assert_eq!(connector.metrics.max_concurrent_requests(), 4);
+        assert_eq!(connector.metrics.requests_per_second_limit(), 2);
+        assert_eq!(connector.metrics.requests_per_minute_limit(), 60);
+        assert_eq!(connector.metrics.available_permits(), 4);
+
+        let metrics_provider = DataConnector::metrics_provider(&connector)
+            .expect("HTTP connector should expose metrics");
+        for metric_name in [
+            "inflight_operations",
+            "rate_control_max_concurrent_requests",
+            "rate_control_requests_per_second_limit",
+            "rate_control_requests_per_minute_limit",
+            "rate_control_jitter_min_ms",
+            "rate_control_jitter_max_ms",
+            "rate_control_available_permits",
+            "rate_control_acquisitions_total",
+            "rate_control_acquire_errors_total",
+            "rate_control_wait_duration_ms",
+            "rate_limit_retry_after_updates_total",
+            "rate_limit_retry_after_remaining_ms",
+        ] {
+            let metric = metrics_provider
+                .get_metric(metric_name)
+                .unwrap_or_else(|| panic!("metric {metric_name} should be registered"));
+            assert!(
+                metric.auto_register,
+                "metric {metric_name} should auto-register"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_rejects_zero_limits() {
+        let connector = test_connector_with(&[("requests_per_second_limit", "0")]).await;
+        let dataset = test_dataset(
+            "https://zero-limit.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+            panic!("zero rate-control limits should be rejected");
+        };
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("must be greater than 0"),
+                    "expected zero-limit validation error, got: {message}"
+                );
+            }
+            other => panic!("expected zero-limit validation error, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_rejects_invalid_jitter_range() {
+        let connector = test_connector_with(&[
+            ("requests_per_minute_limit", "60"),
+            ("rate_control_jitter_min", "20ms"),
+            ("rate_control_jitter_max", "10ms"),
+        ])
+        .await;
+        let dataset = test_dataset(
+            "https://invalid-jitter.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+            panic!("invalid rate-control jitter ranges should be rejected");
+        };
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("must be less than or equal"),
+                    "expected jitter range validation error, got: {message}"
+                );
+            }
+            other => panic!("expected jitter range validation error, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_does_not_persist_after_failed_provider_validation() {
+        let failing = test_connector_with(&[
+            ("max_concurrent_requests", "2"),
+            ("health_probe", "not-an-absolute-path"),
+        ])
+        .await;
+        let failing_dataset = test_dataset(
+            "https://failed-provider-validation.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        failing
+            .create_http_table_provider(&failing_dataset)
+            .await
+            .expect_err("invalid health_probe should fail provider validation");
+
+        let succeeding = test_connector_with(&[]).await;
+        let succeeding_dataset = test_dataset(
+            "https://failed-provider-validation.example.com/other",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        succeeding
+            .create_http_table_provider(&succeeding_dataset)
+            .await
+            .expect("failed provider validation should not leave stale origin config");
+    }
+
+    #[tokio::test]
+    async fn test_http_structured_dataset_rejects_runtime_rate_control_defaults() {
+        let connector = test_connector_with_runtime_params(
+            &[("file_format", "csv")],
+            &[("http_max_concurrent_requests", "5")],
+        )
+        .await;
+        let dataset = test_dataset(
+            "https://structured-rate-control.example.com/data.csv",
+            RefreshMode::Full,
+            None,
+        )
+        .await;
+
+        let Err(error) = connector.read_provider(&dataset).await else {
+            panic!("structured HTTP file datasets should reject HTTP rate-control defaults");
+        };
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("not supported for structured HTTP file datasets"),
+                    "expected structured dataset rate-control validation error, got: {message}"
+                );
+            }
+            other => {
+                panic!("expected structured dataset rate-control validation error, got: {other}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_control_rejects_mixed_origin_configuration() {
+        let configured = test_connector_with(&[("max_concurrent_requests", "2")]).await;
+        let unconfigured = test_connector_with(&[]).await;
+        let configured_dataset = test_dataset(
+            "https://mixed-origin-enabled-first.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+        let unconfigured_dataset = test_dataset(
+            "https://mixed-origin-enabled-first.example.com/other",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        configured
+            .create_http_table_provider(&configured_dataset)
+            .await
+            .expect("configured HTTP provider should be created");
+        let Err(error) = unconfigured
+            .create_http_table_provider(&unconfigured_dataset)
+            .await
+        else {
+            panic!("mixed configured/unconfigured origin should be rejected");
+        };
+        assert_conflicting_rate_control_error(error);
+
+        let unconfigured = test_connector_with(&[]).await;
+        let configured = test_connector_with(&[("max_concurrent_requests", "2")]).await;
+        let unconfigured_dataset = test_dataset(
+            "https://mixed-origin-disabled-first.example.com/data",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+        let configured_dataset = test_dataset(
+            "https://mixed-origin-disabled-first.example.com/other",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+
+        unconfigured
+            .create_http_table_provider(&unconfigured_dataset)
+            .await
+            .expect("unconfigured HTTP provider should be created");
+        let Err(error) = configured
+            .create_http_table_provider(&configured_dataset)
+            .await
+        else {
+            panic!("mixed unconfigured/configured origin should be rejected");
+        };
+        assert_conflicting_rate_control_error(error);
     }
 
     #[tokio::test]
@@ -1288,6 +1898,30 @@ mod tests {
             result.is_none(),
             "expected None when no auth params are configured"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_http_provider_params_parses_request_header_filters() {
+        let connector = test_connector_with(&[
+            ("request_header_filters", "enabled"),
+            ("request_header_allowlist", "x-sandbox-id, x-region"),
+            ("max_request_headers_length", "2048"),
+            ("max_request_partitions", "7000"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("request header filter params should be valid");
+
+        assert!(params.request_filters.allow_header_filters);
+        assert_eq!(
+            params.request_filters.request_header_allowlist,
+            vec!["x-sandbox-id", "x-region"]
+        );
+        assert_eq!(params.request_filters.max_headers_length, 2048);
+        assert_eq!(params.max_request_partitions, Some(7000));
     }
 
     #[tokio::test]
