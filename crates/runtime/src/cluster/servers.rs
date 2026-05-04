@@ -23,6 +23,7 @@ use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
 use crate::flight::{Error, Service as SpiceFlightService, is_address_in_use_error, session_auth};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
+use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use std::sync::Arc;
