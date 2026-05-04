@@ -43,6 +43,7 @@ use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{Column, DataFusionError, Result as DataFusionResult};
 use datafusion::datasource::TableType;
 use datafusion::execution::SessionState;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
@@ -201,6 +202,7 @@ pub type Result<T, E = WasmBuildError> = std::result::Result<T, E>;
 enum InputSource {
     Sql(String),
     Table(TableReference),
+    Plan(Arc<LogicalPlan>),
 }
 
 #[derive(Clone)]
@@ -658,8 +660,16 @@ fn table_input_source_from_expr(function_name: &str, expr: &Expr) -> DataFusionR
         Expr::Literal(ScalarValue::Utf8(Some(table)), _) => {
             Ok(InputSource::Table(TableReference::parse_str(table)))
         }
+        Expr::ScalarSubquery(subquery) => {
+            if !subquery.outer_ref_columns.is_empty() {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "WASM table function '{function_name}' does not support correlated dynamic table inputs"
+                )));
+            }
+            Ok(InputSource::Plan(Arc::clone(&subquery.subquery)))
+        }
         other => Err(DataFusionError::Plan(format!(
-            "WASM table function '{function_name}' requires a table reference as the first argument, got: {other:?}"
+            "WASM table function '{function_name}' requires a table reference or dynamic table input as the first argument, got: {other:?}"
         ))),
     }
 }
@@ -839,6 +849,7 @@ async fn execute_input(
     let df = match source {
         InputSource::Sql(sql) => ctx.sql(sql).await?,
         InputSource::Table(table) => ctx.table(table.clone()).await?,
+        InputSource::Plan(plan) => ctx.execute_logical_plan((**plan).clone()).await?,
     };
     let schema = Arc::new(df.schema().as_arrow().clone());
     let batches = df.collect().await?;
@@ -1106,7 +1117,9 @@ fn manifest_path(source: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use arrow::array::Int64Array;
+    use datafusion::common::Spans;
     use datafusion::datasource::MemTable;
+    use datafusion::logical_expr::Subquery;
     use datafusion::prelude::{SessionContext, col, lit};
     use spicepod::component::function::{FunctionKind, FunctionTableArg, Signature, Volatility};
     use std::collections::HashMap;
@@ -1311,6 +1324,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wasm_table_udtf_accepts_dynamic_input_from_sql_subquery() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+        let mut decl = wasm_identity_decl(&module);
+        decl.params.remove(INPUT_TABLE_PARAM);
+        let udtf = build_table_udtf(&decl, None).await.expect("builds");
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .expect("record batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table("numbers", Arc::new(table))
+            .expect("register table");
+        ctx.register_udtf(&decl.name, udtf);
+
+        let results = ctx
+            .sql(
+                "WITH filtered AS (SELECT value FROM numbers WHERE value > 1) \
+                 SELECT value FROM wasm_identity((SELECT value FROM filtered)) ORDER BY value",
+            )
+            .await
+            .expect("sql compiles")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[2_i64, 3]);
+    }
+
+    #[tokio::test]
     async fn wasm_table_udtf_accepts_input_table_via_dataframe_api() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let module = identity_wasm(&temp_dir);
@@ -1364,5 +1419,73 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 values");
         assert_eq!(values.values(), &[1_i64, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn wasm_table_udtf_accepts_dynamic_input_via_dataframe_api() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+        let mut decl = wasm_identity_decl(&module);
+        decl.params.remove(INPUT_TABLE_PARAM);
+        decl.signature.args.push(FunctionArg {
+            name: "unused".into(),
+            arrow_type: "int64".into(),
+        });
+        let udtf = build_table_udtf(&decl, None).await.expect("builds");
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .expect("record batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table("numbers", Arc::new(table))
+            .expect("register table");
+        ctx.register_udtf(&decl.name, udtf);
+
+        let input_df = ctx
+            .table("numbers")
+            .await
+            .expect("table exists")
+            .filter(col("value").gt(lit(1_i64)))
+            .expect("filters")
+            .select(vec![col("value")])
+            .expect("projects");
+        let input_expr = Expr::ScalarSubquery(Subquery {
+            subquery: Arc::new(input_df.into_unoptimized_plan()),
+            outer_ref_columns: vec![],
+            spans: Spans::new(),
+        });
+        let provider = ctx
+            .table_function(&decl.name)
+            .expect("registered UDTF")
+            .create_table_provider(&[input_expr, lit(7_i64)])
+            .expect("creates table provider");
+        ctx.register_table("wasm_identity_dynamic_result", provider)
+            .expect("register UDTF result");
+
+        let results = ctx
+            .table("wasm_identity_dynamic_result")
+            .await
+            .expect("table exists")
+            .sort_by(vec![col("value")])
+            .expect("sorts")
+            .select(vec![col("value")])
+            .expect("projects")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[2_i64, 3]);
     }
 }
