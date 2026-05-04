@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
+use crate::rate_limit::RateLimiter;
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -43,6 +44,7 @@ use reqwest::{
     Client,
     header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
+use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::{
@@ -70,6 +72,9 @@ pub enum Error {
 
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
+
+    #[snafu(display("HTTP request was rate limited: {message}"))]
+    RateLimited { message: String },
 
     #[snafu(display(
         "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
@@ -117,6 +122,9 @@ impl From<Error> for DataFusionError {
                     "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
                 ))))
             }
+            Error::RateLimited { message } => DataFusionError::External(Box::new(
+                std::io::Error::other(format!("HTTP request was rate limited: {message}")),
+            )),
             // All other errors are internal/external errors
             Error::HttpRequest { source } => DataFusionError::External(Box::new(source)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
@@ -426,6 +434,8 @@ pub struct HttpTableProvider {
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
     auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
+    rate_limiter: Option<Arc<dyn RateLimiter>>,
+    rate_controller: Option<Arc<RateController>>,
     /// When set, JSON response rows are decomposed into the declared
     /// static columns plus a catch-all JSON column. Schema is replaced
     /// with the user-declared columns (all `Utf8`).
@@ -474,8 +484,22 @@ impl HttpTableProvider {
             health_probe: None,
             pagination: None,
             auth: None,
+            rate_limiter: None,
+            rate_controller: None,
             json_nesting: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_rate_limiter(mut self, rate_limiter: Option<Arc<dyn RateLimiter>>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Option<Arc<RateController>>) -> Self {
+        self.rate_controller = rate_controller;
+        self
     }
 
     /// Configure JSON schema decomposition. Replaces the provider's
@@ -851,8 +875,12 @@ impl HttpTableProvider {
 
         tracing::debug!("Validating HTTP endpoint: {test_url}");
 
+        let _rate_control_permit = self.acquire_rate_control_permit().await?;
+
         match self.client.get(test_url.clone()).send().await {
             Ok(response) => {
+                self.update_rate_limiter_from_headers(response.headers())
+                    .await;
                 let status = response.status();
                 if self.health_probe.is_some() {
                     tracing::debug!(
@@ -1009,6 +1037,35 @@ impl HttpTableProvider {
         Ok(url)
     }
 
+    async fn acquire_rate_control_permit(&self) -> Result<Option<Permit>> {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter
+                .check_rate_limit()
+                .await
+                .map_err(|e| Error::RateLimited {
+                    message: e.to_string(),
+                })?;
+        }
+
+        if let Some(rate_controller) = &self.rate_controller {
+            return rate_controller
+                .acquire()
+                .await
+                .map(Some)
+                .map_err(|e| Error::RateLimited {
+                    message: e.to_string(),
+                });
+        }
+
+        Ok(None)
+    }
+
+    async fn update_rate_limiter_from_headers(&self, headers: &HeaderMap) {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter.update_from_headers(headers).await;
+        }
+    }
+
     async fn cache_response(
         &self,
         path: &str,
@@ -1104,6 +1161,11 @@ impl HttpTableProvider {
         path_label: &str,
         accept_retryable: bool,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        let _rate_control_permit = self
+            .acquire_rate_control_permit()
+            .await
+            .map_err(RetryError::transient)?;
+
         let mut request_builder = if let Some(body_content) = body {
             let mut req = self.client.post(url.clone());
             let ct = self.content_type.as_deref().unwrap_or("application/json");
@@ -1137,6 +1199,9 @@ impl HttpTableProvider {
         })?;
 
         let status_code = response.status().as_u16();
+        let response_headers = response.headers().clone();
+        self.update_rate_limiter_from_headers(&response_headers)
+            .await;
 
         // 5xx/429: retry with backoff (transient server issue or rate limiting)
         // After retries exhausted, we'll accept the response as valid data.
