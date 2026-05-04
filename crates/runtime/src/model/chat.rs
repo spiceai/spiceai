@@ -43,6 +43,7 @@ use crate::{
     parameters::Parameters,
     tools::{
         options::SpiceToolsOptions,
+        registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools},
         utils::{create_table_allowlist, get_tools_with_allowlist},
     },
 };
@@ -110,16 +111,27 @@ pub async fn try_to_chat_model(
         // Prevent infinite recursion in case of circular tool calls.
         .or(Some(DEFAULT_SPICE_TOOL_RECURSION_LIMIT));
 
-    // Create table allowlist from model's datasets if specified
-    let table_allowlist = create_table_allowlist(&component.datasets);
+    let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
 
     let tool_model = match spice_tool_opt {
-        Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingChat::new(
-            model,
-            Arc::clone(&rt),
-            get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await,
-            spice_recursion_limit,
-        )),
+        Some(opts) if opts.can_use_tools() => {
+            let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
+                LlmError::ModelParameterFailed {
+                    model: component.name.clone(),
+                    source: e,
+                }
+            })?;
+            let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
+            let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
+                .await
+                .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+            Arc::new(ToolUsingChat::new(
+                model,
+                Arc::clone(&rt),
+                tools,
+                spice_recursion_limit,
+            ))
+        }
         Some(_) | None => model,
     };
     Ok(tool_model)
