@@ -316,6 +316,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("on_refresh_sort_columns"),
     ParameterSpec::runtime("partitioned_write_buffer"),
     ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
+    ParameterSpec::runtime("caching_ttl")
+        .description("Time-to-live for cached entries in caching refresh mode (e.g. '30s', '5m')."),
+    ParameterSpec::runtime("caching_stale_while_revalidate_ttl")
+        .description("Extra window after TTL expiry during which stale cached data is served while a background refresh is triggered."),
+    ParameterSpec::runtime("caching_allowed_request_headers")
+        .description("Comma-separated list of HTTP request header names to include in the cache key when using caching refresh mode."),
 ];
 
 #[async_trait]

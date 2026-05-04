@@ -1193,8 +1193,18 @@ impl CacheRefreshHelper {
         );
         let task_ctx = Arc::new(TaskContext::default());
 
-        // Execute and collect all batches
-        let all_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
+        // Capture the current RequestContext so that sensitive header sentinels stored in the
+        // cache (SHA-256 hashes) can be recovered back to their raw values when the upstream
+        // HTTP call is made inside `parse_request_headers`. Without this, the hashed sentinel
+        // is forwarded as the actual header value and the upstream server rejects the request.
+        use runtime_request_context::{AsyncMarker, RequestContext};
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+
+        // Execute and collect all batches, with the RequestContext in scope so that
+        // any DataFusion task spawned during execution can recover sensitive header values.
+        let all_batches = request_context
+            .scope(datafusion::physical_plan::collect(plan, task_ctx))
+            .await?;
 
         tracing::debug!(
             "Federated source returned {} batches for dataset={}",

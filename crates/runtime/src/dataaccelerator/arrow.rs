@@ -56,6 +56,12 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Enable hash index for fast primary key lookups. Set to 'enabled' to enable (requires primary_key). Default: disabled."),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+    ParameterSpec::runtime("caching_ttl")
+        .description("Time-to-live for cached entries in caching refresh mode (e.g. '30s', '5m')."),
+    ParameterSpec::runtime("caching_stale_while_revalidate_ttl")
+        .description("Extra window after TTL expiry during which stale cached data is served while a background refresh is triggered."),
+    ParameterSpec::runtime("caching_allowed_request_headers")
+        .description("Comma-separated list of HTTP request header names to include in the cache key when using caching refresh mode."),
 ];
 
 #[async_trait]
