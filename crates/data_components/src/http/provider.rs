@@ -2039,7 +2039,6 @@ impl ExecutionPlan for HttpExec {
                         // Fetch this page
                         let fetch_result = if state.page == 0 {
                             let path_val = state.path.clone().unwrap_or_default();
-                            let body_val = state.body.as_deref();
                             let merged_query = if let Some(ref template) = config.query_params {
                                 let page_size = config.page_size.unwrap_or(0);
                                 let expanded =
@@ -2062,6 +2061,7 @@ impl ExecutionPlan for HttpExec {
                                 .map_err(DataFusionError::from)?;
                             state.last_page_path = state.path.clone();
                             state.last_page_query = merged_query.clone();
+                            let body_val = state.body.as_deref();
                             provider
                                 .get_response(
                                     &path_val,
