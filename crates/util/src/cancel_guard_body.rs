@@ -102,6 +102,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
+    use futures::task::noop_waker_ref;
     use http_body::{Body, Frame, SizeHint};
     use tokio_util::sync::CancellationToken;
 
@@ -151,7 +152,7 @@ mod tests {
     }
 
     fn test_context() -> Context<'static> {
-        Context::from_waker(std::task::Waker::noop())
+        Context::from_waker(noop_waker_ref())
     }
 
     #[test]

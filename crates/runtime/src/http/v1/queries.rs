@@ -743,9 +743,14 @@ pub(crate) async fn cancel_active(
     tag = "SQL",
     responses(
         (status = 200, description = "List of active sync queries", body = ListActiveQueriesResponse),
+        (status = 403, description = "API key does not allow write access"),
     )
 ))]
 pub(crate) async fn list_active(Extension(rt): Extension<Arc<Runtime>>) -> Response {
+    if let Some(response) = super::require_write_access().await {
+        return response;
+    }
+
     let registry = rt.df.query_cancel_registry();
     let queries: Vec<ActiveQuerySummary> = registry
         .list()
@@ -994,7 +999,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use runtime_request_context::Protocol;
+    use app::spicepod::component::runtime::ApiKey;
+    use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+    use runtime_request_context::{Protocol, RequestContextBuilder};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -1007,6 +1014,21 @@ mod tests {
             .await
             .expect("response body should be readable");
         serde_json::from_slice(&body).expect("response body should be valid JSON")
+    }
+
+    #[tokio::test]
+    async fn list_active_requires_write_access() {
+        let rt = test_runtime().await;
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Http).build());
+        context
+            .set_auth_principal(Arc::new(ApiKey::ReadOnly {
+                key: "read-only".to_string(),
+            }) as AuthPrincipalRef)
+            .expect("auth principal should be set");
+
+        let response = context.scope(list_active(Extension(rt))).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
