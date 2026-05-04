@@ -559,7 +559,7 @@ fn resolve_acceleration_base_table(conn: &duckdb::Connection, table_name: &str) 
             continue;
         };
         if latest.as_ref().is_none_or(|(_, prev_ts)| ts > *prev_ts) {
-            latest = Some((row.clone(), ts));
+            latest = Some((row, ts));
         }
     }
 
