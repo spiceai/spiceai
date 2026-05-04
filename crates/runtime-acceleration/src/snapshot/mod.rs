@@ -60,7 +60,7 @@ pub mod directory_archive;
 mod engine;
 pub mod metrics;
 pub use crate::layout::AccelerationLayout;
-pub use behavior::SnapshotBehavior;
+pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior};
 use engine::{SnapshotEngine, create_snapshot_engine};
 
 /// Public API types for snapshot information exposed via HTTP endpoints.
@@ -802,27 +802,14 @@ impl SnapshotManager {
             }
         };
 
-        let (store, path): (Arc<dyn ObjectStore>, _) = if let ("s3", path) = (
-            snapshots_location_url.scheme(),
-            snapshots_location_url.path(),
-        ) {
-            let store = build_s3_object_store(
-                &snapshots_location_url,
-                secrets,
-                snapshot_config.params.as_ref().map(Params::as_string_map),
-                io_runtime,
-            )
-            .await
-            .inspect_err(|e| {
-                tracing::error!(dataset = %dataset_name, location = %snapshots_location_url, error = %e, "Failed to connect to S3 snapshot location");
-            })
-            .ok()?;
-            let path = object_store::path::Path::from(path);
-            (store, path)
-        } else {
-            let (store, path) = object_store::parse_url(&snapshots_location_url).ok()?;
-            (store.into(), path)
-        };
+        let (store, path) = build_snapshot_object_store(
+            &snapshots_location_url,
+            &snapshot_config,
+            secrets,
+            io_runtime,
+            &dataset_name,
+        )
+        .await?;
 
         let snapshot_engine = create_snapshot_engine(&engine, compaction_enabled);
 
@@ -898,27 +885,14 @@ impl SnapshotManager {
             }
         };
 
-        let (store, path): (Arc<dyn ObjectStore>, _) = if let ("s3", path) = (
-            snapshots_location_url.scheme(),
-            snapshots_location_url.path(),
-        ) {
-            let store = build_s3_object_store(
-                &snapshots_location_url,
-                secrets,
-                snapshot_config.params.as_ref().map(Params::as_string_map),
-                io_runtime,
-            )
-            .await
-            .inspect_err(|e| {
-                tracing::error!(dataset = %dataset_name, location = %snapshots_location_url, error = %e, "Failed to connect to S3 snapshot location");
-            })
-            .ok()?;
-            let path = object_store::path::Path::from(path);
-            (store, path)
-        } else {
-            let (store, path) = object_store::parse_url(&snapshots_location_url).ok()?;
-            (store.into(), path)
-        };
+        let (store, path) = build_snapshot_object_store(
+            &snapshots_location_url,
+            &snapshot_config,
+            secrets,
+            io_runtime,
+            &dataset_name,
+        )
+        .await?;
 
         // Use a no-op layout and engine for metadata-only queries
         let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
@@ -2558,6 +2532,107 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
 enum S3ObjectStoreError {
     #[snafu(display("Failed to build S3 object store: {source}"))]
     BuilderError { source: S3ObjectStoreBuilderError },
+}
+
+/// Build the object store backing a snapshot location, dispatching on the
+/// URL scheme to the correct credential-aware builder.
+///
+/// Returns `None` on failure after logging the error — matching the existing
+/// behavior of snapshot construction, which treats a failed store as "no
+/// snapshots available" rather than propagating.
+async fn build_snapshot_object_store(
+    snapshots_location_url: &Url,
+    snapshot_config: &spicepod::component::snapshot::Snapshots,
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+    dataset_name: &str,
+) -> Option<(Arc<dyn ObjectStore>, ObjectPath)> {
+    match snapshots_location_url.scheme() {
+        "s3" => {
+            let store = build_s3_object_store(
+                snapshots_location_url,
+                secrets,
+                snapshot_config.params.as_ref().map(Params::as_string_map),
+                io_runtime,
+            )
+            .await
+            .inspect_err(|e| {
+                tracing::error!(
+                    dataset = %dataset_name,
+                    location = %snapshots_location_url,
+                    error = %e,
+                    "Failed to connect to S3 snapshot location",
+                );
+            })
+            .ok()?;
+            let path = ObjectPath::from(snapshots_location_url.path());
+            Some((store, path))
+        }
+        "abfss" | "abfs" => {
+            let params = snapshot_config
+                .params
+                .as_ref()
+                .map(Params::as_string_map)
+                .unwrap_or_default();
+            let store = runtime_object_store::build_azure_object_store(
+                snapshots_location_url,
+                &params,
+                io_runtime,
+            )
+            .inspect_err(|e| {
+                tracing::error!(
+                    dataset = %dataset_name,
+                    location = %snapshots_location_url,
+                    error = %e,
+                    "Failed to connect to Azure ADLS snapshot location",
+                );
+            })
+            .ok()?;
+            let path = ObjectPath::from(snapshots_location_url.path().trim_start_matches('/'));
+            Some((store, path))
+        }
+        "gs" | "gcs" => {
+            let Some(bucket_name) = snapshots_location_url.host_str() else {
+                tracing::error!(
+                    dataset = %dataset_name,
+                    location = %snapshots_location_url,
+                    "GCS snapshot location is missing a bucket name",
+                );
+                return None;
+            };
+            let params = snapshot_config
+                .params
+                .as_ref()
+                .map(Params::as_string_map)
+                .unwrap_or_default();
+            let store =
+                runtime_object_store::build_gcs_object_store(bucket_name, &params, io_runtime)
+                    .inspect_err(|e| {
+                        tracing::error!(
+                            dataset = %dataset_name,
+                            location = %snapshots_location_url,
+                            error = %e,
+                            "Failed to connect to GCS snapshot location",
+                        );
+                    })
+                    .ok()?;
+            let path = ObjectPath::from(snapshots_location_url.path().trim_start_matches('/'));
+            Some((store, path))
+        }
+        _ => {
+            let (store, path) = object_store::parse_url(snapshots_location_url)
+                .inspect_err(|e| {
+                    tracing::error!(
+                        dataset = %dataset_name,
+                        location = %snapshots_location_url,
+                        error = %e,
+                        "Failed to build snapshot object store",
+                    );
+                })
+                .ok()?;
+            Some((store.into(), path))
+        }
+    }
 }
 
 async fn build_s3_object_store(

@@ -69,13 +69,13 @@ env:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         id: setup-matrix
         with:
           script: |
@@ -94,7 +94,7 @@ jobs:
 
             // Tagged releases use GitHub hosted runners, others use spiceai runners
             const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
-            const linuxRunner = isTaggedRelease ? "ubuntu-22.04" : "spiceai-dev-runners";
+            const linuxRunner = isTaggedRelease ? "ubuntu-24.04" : "spiceai-dev-runners";
 
             // Use minio for spiceai runners (trunk, release branches, manual dispatch on non-tagged)
             const useMinio = !isTaggedRelease;
@@ -182,7 +182,9 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -226,9 +228,7 @@ jobs:
           echo "RUSTFLAGS=-L /opt/homebrew/lib" >> $GITHUB_ENV
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       # Default flavor - build both spiced and spice CLI together (runtime not built on Windows - use WSL)
       # Non-release builds include postgres-accel for benchmark testing
@@ -254,7 +254,7 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -287,7 +287,7 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')
         with:
           name: spiced_odbc_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -320,7 +320,7 @@ jobs:
         if: matrix.target.target_os == 'darwin'
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os == 'darwin'
         with:
           name: spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -353,13 +353,13 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spice.exe version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -394,9 +394,11 @@ jobs:
           - target_os: windows
             target_arch: x86_64
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py

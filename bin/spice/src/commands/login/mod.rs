@@ -184,7 +184,14 @@ async fn login_spiceai(
 
     // Poll for auth status
     let client = reqwest::Client::builder()
-        .user_agent(format!("spice/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
+        .user_agent(format!(
+            "spice/{} ({}; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let exchange_url = format!("{base_url}/auth/token/exchange");
@@ -290,7 +297,7 @@ fn get_spice_base_url() -> String {
 
 /// Generate a random 8-character auth code.
 fn generate_auth_code() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::rng();
 
@@ -354,7 +361,14 @@ async fn get_spice_auth_context(
     }
 
     let client = reqwest::Client::builder()
-        .user_agent(format!("spice/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
+        .user_agent(format!(
+            "spice/{} ({}; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let response = client

@@ -23,7 +23,7 @@ use std::{
 use app::AppBuilder;
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use runtime::{auth::EndpointAuth, config::Config};
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
@@ -79,7 +79,7 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
             Arc::clone(&rt).load_components().await;
 
             // Verify sink table exist after components are loaded.
-            if !rt.datafusion().table_exists("scp.task_history".into()) {
+            if !rt.datafusion().table_exists(&"scp.task_history".into()) {
                 return Err(anyhow::anyhow!("There is no 'scp.task_history' table created"));
             }
 

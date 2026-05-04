@@ -29,8 +29,9 @@ use std::{fmt::Debug, path::PathBuf};
 use std::sync::Arc;
 
 use component::{
-    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, model::Model, runtime::Runtime,
-    secret::Secret, snapshot::Snapshots, tool::Tool, view::View, worker::Worker,
+    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, function::Function, model::Model,
+    rerankers::Reranker, runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool,
+    view::View, worker::Worker,
 };
 
 use crate::component::Nameable;
@@ -136,9 +137,13 @@ pub struct Spicepod {
 
     pub embeddings: Vec<Embeddings>,
 
+    pub rerankers: Vec<Reranker>,
+
     pub tools: Vec<Tool>,
 
     pub workers: Vec<Worker>,
+
+    pub functions: Vec<Function>,
 
     pub runtime: Runtime,
 
@@ -269,6 +274,15 @@ impl Spicepod {
         .await
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_rerankers = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.rerankers,
+            "rerankers",
+        )
+        .await
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         let resolved_tools =
             component::resolve_component_references(fs, &path, &spicepod_definition.tools, "tools")
                 .await
@@ -283,13 +297,24 @@ impl Spicepod {
         .await
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_functions = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.functions,
+            "functions",
+        )
+        .await
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         detect_duplicate_component_names("secrets", &spicepod_definition.secrets[..])?;
         detect_duplicate_component_names("dataset", &resolved_datasets[..])?;
         detect_duplicate_component_names("view", &resolved_views[..])?;
         detect_duplicate_component_names("model", &resolved_models[..])?;
         detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
+        detect_duplicate_component_names("reranker", &resolved_rerankers[..])?;
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
         detect_duplicate_component_names("worker", &resolved_workers[..])?;
+        detect_duplicate_component_names("function", &resolved_functions[..])?;
 
         check_for_reserved_keywords(&resolved_datasets[..])?;
 
@@ -299,9 +324,11 @@ impl Spicepod {
             resolved_datasets,
             resolved_views,
             resolved_embeddings,
+            resolved_rerankers,
             resolved_tools,
             resolved_models,
             resolved_workers,
+            resolved_functions,
         ))
     }
 
@@ -387,9 +414,11 @@ fn from_definition(
     datasets: Vec<Dataset>,
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
+    rerankers: Vec<Reranker>,
     tools: Vec<Tool>,
     models: Vec<Model>,
     workers: Vec<Worker>,
+    functions: Vec<Function>,
 ) -> Spicepod {
     Spicepod {
         name: spicepod_definition.name,
@@ -401,8 +430,10 @@ fn from_definition(
         views,
         models,
         embeddings,
+        rerankers,
         tools,
         workers,
+        functions,
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,
         management: spicepod_definition.management,
@@ -432,6 +463,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_spicepod_with_functions_loads() {
+        let pod = Spicepod::load_exact(&PathBuf::from("./tests/spicepod_with_functions.yaml"))
+            .await
+            .expect("Should load spicepod with functions");
+        assert_eq!(pod.functions.len(), 5);
+        let names: Vec<&str> = pod.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "double_it",
+                "haversine_km",
+                "shout",
+                "classify_intent",
+                "internal_hash"
+            ]
+        );
+
+        let double_it = &pod.functions[0];
+        assert_eq!(double_it.from, "sql");
+        assert_eq!(double_it.signature.args.len(), 1);
+        assert_eq!(double_it.signature.args[0].name, "x");
+        assert_eq!(double_it.signature.args[0].arrow_type, "int64");
+        assert_eq!(double_it.signature.returns.as_deref(), Some("int64"));
+        assert_eq!(double_it.body.as_deref(), Some("x * 2"));
+        // Defaults to being exposed as a tool.
+        assert!(double_it.as_tool);
+
+        let classify = &pod.functions[3];
+        assert_eq!(classify.from, "http://classifier.internal/v1/classify");
+        assert!(classify.body.is_none());
+        assert_eq!(classify.params.len(), 2);
+
+        let internal = &pod.functions[4];
+        assert_eq!(internal.name, "internal_hash");
+        assert!(!internal.as_tool, "internal_hash should be SQL-only");
+
+        // Tool with as_sql: true is visible on the resolved Spicepod.
+        assert_eq!(pod.tools.len(), 1);
+        let geocode = &pod.tools[0];
+        assert_eq!(geocode.name, "geocode");
+        assert!(geocode.as_sql);
+        let sig = geocode.signature.as_ref().expect("signature");
+        assert_eq!(sig.args.len(), 1);
+        assert_eq!(sig.args[0].arrow_type, "utf8");
+    }
+
     /// Verify that both v1 and v2 spicepod schemas are parsed correctly.
     #[tokio::test]
     async fn test_v1_and_v2_versions() {
@@ -457,7 +535,7 @@ mod tests {
 /// - v1 uses top-level `runtime.memory_limit`/`runtime.temp_directory`,
 ///   v2 uses `runtime.query.memory_limit`/`runtime.query.temp_directory`
 /// - v2 adds `runtime.ready_state`, `runtime.flight.do_put_rate_limit_enabled`,
-///   `runtime.scheduler.partition_management`
+///   `runtime.scheduler` partition assignment fields
 /// - v2 adds `read_write_create` access mode
 /// - v2 adds `stale_while_revalidate_ttl` and `encoding` to `SQLResultsCacheConfig`
 #[cfg(test)]
@@ -805,9 +883,9 @@ mod version_tests {
         assert_eq!(sql_results.encoding, Encoding::Zstd);
     }
 
-    /// v2 scheduler with `partition_management`.
+    /// v2 scheduler with partition assignment fields.
     #[tokio::test]
-    async fn test_v2_scheduler_with_partition_management() {
+    async fn test_v2_scheduler_with_partition_assignment() {
         let pod = Spicepod::load_exact(&PathBuf::from("./tests/v2_with_scheduler.yaml"))
             .await
             .expect("Should load v2 scheduler spicepod");
@@ -819,15 +897,10 @@ mod version_tests {
             .as_ref()
             .expect("scheduler should be present");
         assert_eq!(scheduler.state_location, "s3://my-bucket/scheduler-state");
-
-        let pm = scheduler
-            .partition_management
-            .as_ref()
-            .expect("partition_management should be present");
-        assert_eq!(pm.interval, "15s");
-        assert_eq!(pm.max_assignments_per_cycle, 50);
-        assert_eq!(pm.max_partitions_per_executor, 500);
-        assert_eq!(pm.discovery_timeout, "120s");
+        assert_eq!(scheduler.partition_assignment_interval, "15s");
+        assert_eq!(scheduler.max_partition_assignments_per_interval, 50);
+        assert_eq!(scheduler.max_partitions_per_executor, 500);
+        assert_eq!(scheduler.partition_discovery_timeout, "120s");
     }
 
     // ========================================================================
@@ -872,14 +945,18 @@ mod version_tests {
         assert!(!flight.do_put_rate_limit_enabled);
     }
 
-    /// `partition_management` defaults.
+    /// Scheduler defaults for partition assignment fields.
     #[test]
-    fn test_partition_management_defaults() {
-        let pm = component::runtime::PartitionManagement::default();
-        assert_eq!(pm.interval, "30s");
-        assert_eq!(pm.max_assignments_per_cycle, 100);
-        assert_eq!(pm.max_partitions_per_executor, 1000);
-        assert_eq!(pm.discovery_timeout, "60s");
+    fn test_partition_assignment_defaults() {
+        let yaml = r"
+            state_location: s3://bucket/state
+        ";
+        let scheduler: component::runtime::Scheduler =
+            yaml::from_str(yaml).expect("Should parse Scheduler");
+        assert_eq!(scheduler.partition_assignment_interval, "30s");
+        assert_eq!(scheduler.max_partition_assignments_per_interval, 100);
+        assert_eq!(scheduler.max_partitions_per_executor, 1000);
+        assert_eq!(scheduler.partition_discovery_timeout, "60s");
     }
 
     /// `read_write_create` access mode deserializes.
@@ -1260,18 +1337,18 @@ mod version_tests {
         );
     }
 
-    /// v1 `Scheduler` works without `partition_management` (v2-only field).
+    /// v1 `Scheduler` works with only `state_location` (partition assignment fields default).
     #[test]
-    fn test_v1_scheduler_without_partition_management() {
+    fn test_v1_scheduler_without_partition_assignment() {
         let yaml = r"
             state_location: s3://bucket/state
         ";
         let scheduler: component::runtime::Scheduler =
             yaml::from_str(yaml).expect("Should parse Scheduler");
         assert_eq!(scheduler.state_location, "s3://bucket/state");
-        assert!(
-            scheduler.partition_management.is_none(),
-            "v1 scheduler should have no partition_management"
+        assert_eq!(
+            scheduler.max_partitions_per_executor, 1000,
+            "partition assignment fields should default when not specified"
         );
     }
 

@@ -38,6 +38,7 @@ use util::format_datafusion_error;
 use std::{any::Any, sync::Arc};
 pub mod connection_manager;
 mod convert;
+pub mod dialect;
 mod execution_plan;
 
 #[derive(Debug, Snafu)]
@@ -72,6 +73,11 @@ pub enum Error {
 
     #[snafu(display("Failed to process SQL Server query result: unsupported type '{mssql_type}'"))]
     FailedToDowncastBuilder { mssql_type: String },
+
+    #[snafu(display(
+        "Failed to convert SQL Server timestamp {v} to Arrow nanosecond timestamp: value is outside the supported range (~1677-2262)"
+    ))]
+    FailedToConvertTimestampToNanos { v: String },
 
     #[snafu(display(
         "Failed to generate SQL for SQL Server query: {}",
@@ -180,25 +186,7 @@ impl TableProvider for SqlServerTableProvider {
         let mut results = Vec::with_capacity(filters.len());
 
         for filter in filters {
-            match filter {
-                Expr::BinaryExpr(binary_expr) => match binary_expr.op {
-                    Operator::Eq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq => {
-                        if is_time_related_expr(&binary_expr.left)
-                            || is_time_related_expr(&binary_expr.right)
-                        {
-                            results.push(TableProviderFilterPushDown::Unsupported);
-                        } else {
-                            results.push(TableProviderFilterPushDown::Exact);
-                        }
-                    }
-                    _ => results.push(TableProviderFilterPushDown::Unsupported),
-                },
-                _ => results.push(TableProviderFilterPushDown::Unsupported),
-            }
+            results.push(classify_mssql_filter(filter));
         }
         Ok(results)
     }
@@ -236,6 +224,73 @@ pub fn project_schema(
         None => Arc::clone(schema),
     };
     Ok(schema)
+}
+
+fn classify_mssql_filter(filter: &Expr) -> TableProviderFilterPushDown {
+    match filter {
+        Expr::BinaryExpr(binary_expr) => match binary_expr.op {
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq => {
+                if is_time_related_expr(&binary_expr.left)
+                    || is_time_related_expr(&binary_expr.right)
+                {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Exact
+                }
+            }
+            Operator::And | Operator::Or => {
+                let left = classify_mssql_filter(&binary_expr.left);
+                let right = classify_mssql_filter(&binary_expr.right);
+                if left == TableProviderFilterPushDown::Unsupported
+                    || right == TableProviderFilterPushDown::Unsupported
+                {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            }
+            _ => TableProviderFilterPushDown::Unsupported,
+        },
+        Expr::Not(inner) => classify_mssql_filter(inner),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            if is_time_related_expr(inner) {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        Expr::Like(like) => {
+            if is_time_related_expr(&like.expr) {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        Expr::Between(between) => {
+            if is_time_related_expr(&between.expr)
+                || is_time_related_expr(&between.low)
+                || is_time_related_expr(&between.high)
+            {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        Expr::InList(in_list) => {
+            if is_time_related_expr(&in_list.expr) || in_list.list.iter().any(is_time_related_expr)
+            {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        _ => TableProviderFilterPushDown::Unsupported,
+    }
 }
 
 fn is_time_related_expr(expr: &Expr) -> bool {

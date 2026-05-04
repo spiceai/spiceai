@@ -44,9 +44,9 @@ use crate::{
     config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
-    timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 
 use super::{
     Service, flightsql, flightsql::prepared_statement_query, metrics,
@@ -190,7 +190,7 @@ pub(crate) async fn handle(
         2 => TableReference::partial(path_vec[0].as_str(), path_vec[1].as_str()),
         _ => TableReference::parse_str(&path_vec.join(".")),
     };
-    let path = normalize_path_table_reference(path, &datafusion);
+    let path = datafusion.normalize_table_reference(path);
 
     // Initializing tracking here so that both counter and duration have consistent path dimensions
     let start = metrics::track_flight_request("do_put", Some(&path.to_string())).await;
@@ -203,7 +203,7 @@ pub(crate) async fn handle(
 
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
-    if let Some(executor_registry) = datafusion.executor_registry.as_ref()
+    if let Some(executor_registry) = datafusion.executor_registry()
         && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|e| Status::internal(format!(
             "Failed to resolve partition expression for table `{path}` in distributed Cayenne write via Flight: {e}"
         )))?
@@ -212,7 +212,7 @@ pub(crate) async fn handle(
             Some(ClusterRole::Scheduler)
         )
     {
-        if executor_registry.flight_sql_clients.read().await.is_empty() {
+        if !executor_registry.has_flight_sql_clients().await {
             return Err(Status::unavailable(
                 "No executors available to write data to. Ensure that at least one executor is connected to the cluster and try again.",
             ));
@@ -284,79 +284,6 @@ pub(crate) async fn handle(
 fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
     datafusion.cluster_config.effective_role() == Some(ClusterRole::Executor)
         && datafusion.cluster_config.tls_config().is_some()
-}
-
-fn normalize_path_table_reference(path: TableReference, datafusion: &DataFusion) -> TableReference {
-    // NOTE: this uses synchronous `table_exist` checks on schema providers. These
-    // checks are expected to be in-memory lookups in current catalog implementations.
-    match path {
-        TableReference::Full { .. } => path,
-        TableReference::Partial { schema, table } => {
-            let matching_catalogs = datafusion
-                .ctx
-                .catalog_names()
-                .into_iter()
-                .filter(|catalog_name| {
-                    datafusion
-                        .ctx
-                        .catalog(catalog_name)
-                        .and_then(|catalog| catalog.schema(schema.as_ref()))
-                        .is_some_and(|schema_provider| {
-                            schema_provider.table_exist(table.as_ref())
-                                || datafusion.is_catalog_writable(catalog_name)
-                        })
-                })
-                .collect::<Vec<_>>();
-
-            if matching_catalogs.len() == 1 {
-                return TableReference::full(
-                    matching_catalogs[0].clone(),
-                    schema.to_string(),
-                    table.to_string(),
-                );
-            }
-
-            TableReference::partial(schema, table)
-        }
-        TableReference::Bare { table } => {
-            let table_name = table.to_string();
-            let matching_tables = datafusion
-                .ctx
-                .catalog_names()
-                .into_iter()
-                .flat_map(|catalog_name| {
-                    let table_name_for_catalog = table_name.clone();
-                    datafusion
-                        .ctx
-                        .catalog(&catalog_name)
-                        .into_iter()
-                        .flat_map(move |catalog| {
-                            let catalog_name = catalog_name.clone();
-                            let table_name = table_name_for_catalog.clone();
-                            catalog
-                                .schema_names()
-                                .into_iter()
-                                .filter_map(move |schema_name| {
-                                    let table_name = table_name.clone();
-                                    catalog
-                                        .schema(&schema_name)
-                                        .filter(|schema_provider| {
-                                            schema_provider.table_exist(table_name.as_str())
-                                        })
-                                        .map(|_| (catalog_name.clone(), schema_name, table_name))
-                                })
-                        })
-                })
-                .collect::<Vec<_>>();
-
-            if matching_tables.len() == 1 {
-                let (catalog, schema, table_name) = matching_tables[0].clone();
-                return TableReference::full(catalog, schema, table_name);
-            }
-
-            TableReference::bare(table_name)
-        }
-    }
 }
 
 fn create_response_stream(

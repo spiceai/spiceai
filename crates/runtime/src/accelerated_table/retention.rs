@@ -27,7 +27,6 @@ use crate::{
 };
 use arrow::array::UInt64Array;
 use cache::Caching;
-use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 use datafusion::{
     catalog::TableProvider,
     logical_expr::Operator,
@@ -57,125 +56,115 @@ impl super::AcceleratedTable {
             // Lock the accelerator to protect concurrent access to the accelerator during cache/snapshot operations
             let _lock_guard = accelerator_write_mutex.lock().await;
 
-            if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
-                let mut exprs = Vec::new();
+            let mut exprs = Vec::new();
 
-                // convert retention filters into data eviction expressions
-                for filter in &retention.filters {
-                    match filter {
-                        DataRetentionFilter::Expression { delete_expr } => {
-                            log_retention_action(&dataset_name, "using SQL expression");
-                            exprs.push(delete_expr.clone());
-                        }
-                        DataRetentionFilter::Time {
-                            period,
+            // convert retention filters into data eviction expressions
+            for filter in &retention.filters {
+                match filter {
+                    DataRetentionFilter::Expression { delete_expr } => {
+                        log_retention_action(&dataset_name, "using SQL expression");
+                        exprs.push(delete_expr.clone());
+                    }
+                    DataRetentionFilter::Time {
+                        period,
+                        time_column,
+                        time_format,
+                        time_partition_column,
+                        time_partition_format,
+                    } => {
+                        let Some(converter) = create_timestamp_filter_converter(
+                            &accelerator,
                             time_column,
-                            time_format,
-                            time_partition_column,
-                            time_partition_format,
-                        } => {
-                            let Some(converter) = create_timestamp_filter_converter(
-                                &accelerator,
-                                time_column,
-                                *time_format,
-                                time_partition_column.as_ref(),
-                                *time_partition_format,
-                            ) else {
-                                tracing::error!(
-                                    "[retention] Failed to create timestamp filter converter for retention for dataset {dataset_name}",
-                                );
-                                continue;
-                            };
-
-                            let start = SystemTime::now() - *period;
-                            let timestamp = refresh::get_timestamp(start);
-                            let expr = converter.convert(timestamp, Operator::Lt);
-
-                            let timestamp = if let Some(value) = chrono::DateTime::from_timestamp(
-                                (timestamp / 1_000_000_000) as i64,
-                                0,
-                            ) {
-                                value.to_rfc3339()
-                            } else {
-                                tracing::warn!("[retention] Unable to convert timestamp");
-                                continue;
-                            };
-
-                            log_retention_action(
-                                &dataset_name,
-                                &format!("where {time_column} < {timestamp}"),
+                            *time_format,
+                            time_partition_column.as_ref(),
+                            *time_partition_format,
+                        ) else {
+                            tracing::error!(
+                                "[retention] Failed to create timestamp filter converter for retention for dataset {dataset_name}",
                             );
-                            exprs.push(Box::new(expr));
-                        }
+                            continue;
+                        };
+
+                        let start = SystemTime::now() - *period;
+                        let timestamp = refresh::get_timestamp(start);
+                        let expr = converter.convert(timestamp, Operator::Lt);
+
+                        let timestamp = if let Some(value) =
+                            chrono::DateTime::from_timestamp((timestamp / 1_000_000_000) as i64, 0)
+                        {
+                            value.to_rfc3339()
+                        } else {
+                            tracing::warn!("[retention] Unable to convert timestamp");
+                            continue;
+                        };
+
+                        log_retention_action(
+                            &dataset_name,
+                            &format!("where {time_column} < {timestamp}"),
+                        );
+                        exprs.push(Box::new(expr));
                     }
                 }
+            }
 
-                // Combine all expressions into a single OR expression as time and SQL expressions are applied independently
-                let Some(expr) = exprs.into_iter().map(|e| *e).reduce(Expr::or) else {
-                    tracing::warn!(
-                        "[retention] No valid retention filters found for dataset {dataset_name}"
+            // Combine all expressions into a single OR expression as time and SQL expressions are applied independently
+            let Some(expr) = exprs.into_iter().map(|e| *e).reduce(Expr::or) else {
+                tracing::warn!(
+                    "[retention] No valid retention filters found for dataset {dataset_name}"
+                );
+                continue;
+            };
+
+            tracing::trace!("[retention] Expr before simplification: {expr:?}");
+
+            let expr = match util::expr::simplify_expr(expr.clone(), &accelerator.schema()) {
+                Ok(simplified) => simplified,
+                Err(e) => {
+                    tracing::error!(
+                        "[retention] Upon checking retention policy for table '{dataset_name}', an error occurred when attempting to simplify the relevant retention expression '{expr:?}'. Error: {e}"
                     );
                     continue;
-                };
+                }
+            };
 
-                tracing::trace!("[retention] Expr before simplification: {expr:?}");
+            tracing::debug!("[retention] Expr: {expr:?}");
 
-                let expr = match util::expr::simplify_expr(expr.clone(), &accelerator.schema()) {
-                    Ok(simplified) => simplified,
-                    Err(e) => {
-                        tracing::error!(
-                            "[retention] Upon checking retention policy for table '{dataset_name}', an error occurred when attempting to simplify the relevant retention expression '{expr:?}'. Error: {e}"
-                        );
-                        continue;
-                    }
-                };
+            let ctx = SessionContext::new_with_config_rt(
+                get_df_default_config(),
+                default_runtime_env(io_runtime.clone()),
+            );
 
-                tracing::debug!("[retention] Expr: {expr:?}");
-
-                let ctx = SessionContext::new_with_config_rt(
-                    get_df_default_config(),
-                    default_runtime_env(io_runtime.clone()),
-                );
-
-                let plan = DeletionTableProvider::delete_from(
-                    deleted_table_provider.as_ref(),
-                    &ctx.state(),
-                    &[expr],
-                )
-                .await;
-                match plan {
-                    Ok(plan) => match collect(plan, ctx.task_ctx()).await {
-                        Err(e) => {
-                            tracing::error!("[retention] Error running retention check: {e}");
-                        }
-                        Ok(deleted) => {
-                            let num_records = deleted.first().map_or(0, |f| {
-                                f.column(0)
-                                    .as_any()
-                                    .downcast_ref::<UInt64Array>()
-                                    .map_or(0, |v| v.values().first().map_or(0, |f| *f))
-                            });
-
-                            log_retention_result(&dataset_name, num_records);
-
-                            if num_records > 0
-                                && let Some(cache_provider) = caching.as_ref()
-                                && let Err(e) =
-                                    cache_provider.invalidate_for_table(dataset_name.clone())
-                            {
-                                tracing::error!(
-                                    "Failed to invalidate cached results for dataset {}: {e}",
-                                    &dataset_name
-                                );
-                            }
-                        }
-                    },
+            let plan = accelerator.delete_from(&ctx.state(), vec![expr]).await;
+            match plan {
+                Ok(plan) => match collect(plan, ctx.task_ctx()).await {
                     Err(e) => {
                         tracing::error!("[retention] Error running retention check: {e}");
                     }
+                    Ok(deleted) => {
+                        let num_records = deleted.first().map_or(0, |f| {
+                            f.column(0)
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .map_or(0, |v| v.values().first().map_or(0, |f| *f))
+                        });
+
+                        log_retention_result(&dataset_name, num_records);
+
+                        if num_records > 0
+                            && let Some(cache_provider) = caching.as_ref()
+                            && let Err(e) =
+                                cache_provider.invalidate_for_table(dataset_name.clone())
+                        {
+                            tracing::error!(
+                                "Failed to invalidate cached results for dataset {}: {e}",
+                                &dataset_name
+                            );
+                        }
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("[retention] Error running retention check: {e}");
                 }
-            } else {
-                tracing::error!("[retention] Accelerated table does not support delete");
             }
         }
     }
@@ -236,8 +225,8 @@ mod tests {
         array::{BooleanArray, Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
     };
-    use data_components::{arrow::write::MemTable, delete::DeletionTableProviderAdapter};
-    use datafusion::{physical_plan::collect, prelude::SessionContext};
+    use data_components::arrow::write::MemTable;
+    use datafusion::{catalog::TableProvider, physical_plan::collect, prelude::SessionContext};
     use tokio::time::{Duration, sleep};
 
     fn create_test_schema() -> Arc<Schema> {
@@ -311,8 +300,7 @@ mod tests {
         let mem_table =
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
 
-        let accelerator = Arc::new(DeletionTableProviderAdapter::new(Arc::new(mem_table)))
-            as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(mem_table) as Arc<dyn TableProvider>;
 
         // Create retention configuration
         let retention_delete_expr = retention_sql.map(|sql| {

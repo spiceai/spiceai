@@ -8,11 +8,11 @@ select
     s_phone,
     s_comment
 from
-    mssql.public.part,
-    mssql.public.supplier,
-    mssql.public.partsupp,
-    mssql.public.nation,
-    mssql.public.region
+    mssql.dbo.part,
+    mssql.dbo.supplier,
+    mssql.dbo.partsupp,
+    mssql.dbo.nation,
+    mssql.dbo.region
 where
         p_partkey = ps_partkey
   and s_suppkey = ps_suppkey
@@ -25,10 +25,10 @@ where
     select
         min(ps_supplycost)
     from
-        mssql.public.partsupp,
-        mssql.public.supplier,
-        mssql.public.nation,
-        mssql.public.region
+        mssql.dbo.partsupp,
+        mssql.dbo.supplier,
+        mssql.dbo.nation,
+        mssql.dbo.region
     where
             p_partkey = ps_partkey
       and s_suppkey = ps_suppkey

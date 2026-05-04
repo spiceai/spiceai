@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     Runtime, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE,
-    model::provider_models::get_available_models_hint, status, timing::TimeMeasurement,
+    model::provider_models::get_available_models_hint, status,
 };
 use app::App;
 use model_components::model::Model;
@@ -26,6 +26,7 @@ use opentelemetry::KeyValue;
 use runtime_secrets::get_params_with_secrets;
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
+use telemetry::timing::TimeMeasurement;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -125,16 +126,26 @@ impl Runtime {
         let result: Result<(), Error> = match model_type {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params.clone()).await {
                 Ok((completions_model, Some(responses_model))) => {
+                    let rate_controller =
+                        crate::model::rate_limit::build_model_rate_controller(m, &params);
                     let mut llm_map = self.completion_llms.write().await;
                     llm_map.insert(m.name.clone(), completions_model);
                     drop(llm_map);
                     let mut responses_llm_map = self.responses_llms.write().await;
                     responses_llm_map.insert(m.name.clone(), responses_model);
+                    drop(responses_llm_map);
+                    let mut rc_map = self.model_rate_controllers.write().await;
+                    rc_map.insert(m.name.clone(), rate_controller);
                     Ok(())
                 }
                 Ok((model, None)) => {
+                    let rate_controller =
+                        crate::model::rate_limit::build_model_rate_controller(m, &params);
                     let mut llm_map = self.completion_llms.write().await;
                     llm_map.insert(m.name.clone(), model);
+                    drop(llm_map);
+                    let mut rc_map = self.model_rate_controllers.write().await;
+                    rc_map.insert(m.name.clone(), rate_controller);
                     Ok(())
                 }
                 Err(e) => Err(Error::FailedToLoadLLM {
@@ -205,6 +216,12 @@ impl Runtime {
             Some(ModelType::Llm) => {
                 let mut llm_map = self.completion_llms.write().await;
                 llm_map.remove(&m.name);
+                drop(llm_map);
+                let mut responses_map = self.responses_llms.write().await;
+                responses_map.remove(&m.name);
+                drop(responses_map);
+                let mut rc_map = self.model_rate_controllers.write().await;
+                rc_map.remove(&m.name);
             }
             None => return,
         }

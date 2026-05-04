@@ -24,6 +24,7 @@ use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
 use crate::datafusion::error::{SpiceExternalError, format_datafusion_error};
 use crate::datafusion::is_spice_internal_dataset;
+use crate::datafusion::udf::deny_spice_specific_functions;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use ::cache::Caching;
@@ -68,6 +69,9 @@ pub(crate) mod sink;
 mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
+pub mod write;
+
+pub(crate) use write::WriteMode;
 
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
@@ -177,6 +181,12 @@ pub enum Error {
     #[snafu(display("Failed to construct data for the accelerated dataset: {source}"))]
     FailedToBuildRecordBatch { source: ArrowError },
 
+    #[snafu(display("Failed to process upsert batch for dataset {dataset_name}: {reason}"))]
+    InvalidUpsertPrimaryKeys {
+        dataset_name: String,
+        reason: String,
+    },
+
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
 }
@@ -239,9 +249,8 @@ pub struct AcceleratedTable {
     refresh_mode: RefreshMode,
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
-    /// If true, writes only go to the accelerator table (not replicated to source).
-    /// This is set when `on_conflict` is configured - the accelerator handles writes locally.
-    write_to_accelerator_only: bool,
+    /// Controls where writes (INSERT INTO) are directed.
+    write_mode: WriteMode,
     synchronized_with: Option<SynchronizedTable>,
     /// Child accelerators that should receive cached data when this parent stores new cache entries (caching mode only)
     synchronized_children: Arc<RwLock<Vec<Arc<dyn TableProvider>>>>,
@@ -272,6 +281,7 @@ impl std::fmt::Debug for AcceleratedTable {
             .field("ready_state", &self.ready_state)
             .field("refresh_params", &self.refresh_params)
             .field("disable_federation", &self.disable_federation)
+            .field("write_mode", &self.write_mode)
             .field("synchronized_with", &self.synchronized_with)
             .finish_non_exhaustive()
     }
@@ -321,6 +331,8 @@ pub struct Builder {
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
     write_to_accelerator_only: bool,
+    write_through: bool,
+    write_back: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
@@ -369,6 +381,8 @@ impl Builder {
             synchronize_with: None,
             disable_federation: false,
             write_to_accelerator_only: false,
+            write_through: false,
+            write_back: false,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
@@ -434,6 +448,20 @@ impl Builder {
     /// This is used when `on_conflict` is configured - writes go only to the accelerator.
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {
         self.write_to_accelerator_only = true;
+        self
+    }
+
+    /// Enable write-through mode: writes go simultaneously to both the federated source
+    /// and the local Cayenne accelerator using staged append/commit/rollback semantics.
+    pub fn write_through(&mut self) -> &mut Self {
+        self.write_through = true;
+        self
+    }
+
+    /// Enable write-back mode: writes commit to the local accelerator first,
+    /// then asynchronously persist to the federated source.
+    pub fn write_back(&mut self) -> &mut Self {
+        self.write_back = true;
         self
     }
 
@@ -827,9 +855,68 @@ impl Builder {
         }
 
         // If the table should be ready immediately, mark it as ready.
-        if self.ready_state == ReadyState::OnRegistration {
-            self.runtime_status
-                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+        // For `OnSchemaResolved`, the dataset is marked ready once the federated source's schema
+        // has been resolved (its `TableProvider` has been successfully resolved, which also implies
+        // access to the source has been verified). For an immediate federated table this has already
+        // occurred synchronously before the builder ran, so we can mark it ready here. For a deferred
+        // federated table we spawn a background task that waits for the deferred provider to resolve
+        // before marking the dataset ready.
+        match self.ready_state {
+            ReadyState::OnRegistration => {
+                self.runtime_status
+                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+            }
+            ReadyState::OnSchemaResolved => match &*self.federated {
+                FederatedTable::Immediate(_) => {
+                    self.runtime_status
+                        .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+                }
+                FederatedTable::Deferred(_) => {
+                    let runtime_status = Arc::clone(&self.runtime_status);
+                    let dataset_name = self.dataset_name.clone();
+                    let federated = Arc::clone(&self.federated);
+                    let wait_handle = tokio::spawn(async move {
+                        // Wait for the deferred federated table provider to resolve. Only mark
+                        // the dataset ready if the deferred provider actually connected (its
+                        // schema was resolved and access was verified). If resolution failed
+                        // (e.g. shutdown or task panic), `try_wait_table_provider` returns
+                        // `Err(FederatedResolutionError::Unavailable, ..)`; leave the status
+                        // untouched so the caller surfaces the error through the refresh path
+                        // instead of a misleading `Ready`.
+                        match federated.try_wait_table_provider().await {
+                            Err((
+                                crate::federated_table::FederatedResolutionError::Unavailable,
+                                _,
+                            )) => {
+                                tracing::warn!(
+                                    "Deferred federated provider for dataset {dataset_name} did not resolve successfully; leaving dataset status unchanged"
+                                );
+                            }
+                            Ok(_) => {
+                                // If the refresh path has already marked the dataset as `Error`
+                                // (e.g. the initial refresh failed quickly), don't overwrite it
+                                // with `Ready` — schema-resolution readiness must not mask refresh
+                                // failures that are surfaced via dataset status and metrics.
+                                let current_status = runtime_status
+                                    .get_component_status(&format!("dataset:{dataset_name}"));
+                                if matches!(current_status, Some(status::ComponentStatus::Error(_)))
+                                {
+                                    tracing::debug!(
+                                        "Deferred federated provider for dataset {dataset_name} resolved successfully, but dataset status is already Error; leaving dataset status unchanged"
+                                    );
+                                } else {
+                                    runtime_status.update_dataset(
+                                        &dataset_name,
+                                        status::ComponentStatus::Ready,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                    handlers.push(wait_handle);
+                }
+            },
+            ReadyState::OnLoad => {}
         }
 
         // For caching mode with synchronization, register the child with the parent immediately
@@ -882,6 +969,16 @@ impl Builder {
             }
         }
 
+        let write_mode = if self.write_through {
+            WriteMode::resolve_write_through(&self.accelerator, &self.federated)?
+        } else if self.write_back {
+            WriteMode::WriteBack
+        } else if self.write_to_accelerator_only {
+            WriteMode::AcceleratorOnly
+        } else {
+            WriteMode::FederatedOnly
+        };
+
         Ok(AcceleratedTable {
             dataset_name: self.dataset_name,
             accelerator: self.accelerator,
@@ -894,7 +991,7 @@ impl Builder {
             refresh_mode,
             refresher,
             disable_federation: self.disable_federation,
-            write_to_accelerator_only: self.write_to_accelerator_only,
+            write_mode,
             synchronized_with: self.synchronize_with,
             synchronized_children: Arc::new(RwLock::new(Vec::new())),
             cache_ttl: self.caching_ttl,
@@ -994,8 +1091,22 @@ impl AcceleratedTable {
     }
 
     #[must_use]
+    pub fn is_write_through(&self) -> bool {
+        self.write_mode.is_write_through()
+    }
+
+    #[must_use]
     pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.accelerator)
+    }
+
+    #[must_use]
+    pub(crate) fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.accelerator
+    }
+
+    pub(crate) fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        self.accelerator = accelerator;
     }
 
     /// Add a child accelerator that should receive cached data when this parent stores new cache entries.
@@ -1138,8 +1249,24 @@ impl TableProvider for AcceleratedTable {
         }
 
         match self.zero_results_action {
-            ZeroResultsAction::ReturnEmpty => self.accelerator.supports_filters_pushdown(filters),
+            ZeroResultsAction::ReturnEmpty => {
+                let mut results = self.accelerator.supports_filters_pushdown(filters)?;
+                let function_support = deny_spice_specific_functions();
+                for (i, filter) in filters.iter().enumerate() {
+                    if !matches!(results[i], TableProviderFilterPushDown::Unsupported)
+                        && !function_support.supports(filter)
+                    {
+                        results[i] = TableProviderFilterPushDown::Unsupported;
+                    }
+                }
+                Ok(results)
+            }
             ZeroResultsAction::UseSource => {
+                // In UseSource mode, all filters must still flow into scan() so that
+                // FallbackOnZeroResultsScanExec receives the full predicate set and can use
+                // its internal filter_plan to evaluate those predicates before making a
+                // correct fallback decision. Unsupported-function filters are therefore kept
+                // out of accelerator SQL pushdown, but still participate in the fallback check.
                 Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
             }
         }
@@ -1171,9 +1298,10 @@ impl TableProvider for AcceleratedTable {
                         SpiceExternalError::acceleration_not_ready(self.dataset_name.to_string()),
                     ));
                 }
-                ReadyState::OnRegistration => {
-                    // Getting the federated_provider should always return immediately here, because by definition an accelerated table has
-                    // completed its initial load if it has a previous checkpoint.
+                ReadyState::OnRegistration | ReadyState::OnSchemaResolved => {
+                    // Before the initial accelerated load completes, these ready states fall back
+                    // to the federated source. Resolving the federated provider is still
+                    // asynchronous here and may await the deferred provider becoming available.
                     let federated_provider = self.federated.table_provider().await;
                     metrics::READY_STATE_FALLBACK.add(
                         1,
@@ -1195,10 +1323,20 @@ impl TableProvider for AcceleratedTable {
             None
         };
         let scan_projection = extended_projection.as_ref().or(projection);
-        let input = self
-            .accelerator
-            .scan(state, scan_projection, filters, limit)
-            .await?;
+        // For UseSource mode, the scan is handled inside the match arm below (with filter
+        // splitting). For all other modes, perform the accelerator scan upfront.
+        let input = if matches!(
+            (is_caching_mode, &self.zero_results_action),
+            (false, ZeroResultsAction::UseSource)
+        ) {
+            None
+        } else {
+            Some(
+                self.accelerator
+                    .scan(state, scan_projection, filters, limit)
+                    .await?,
+            )
+        };
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
             let federated = Arc::clone(&federated);
@@ -1208,6 +1346,11 @@ impl TableProvider for AcceleratedTable {
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
                 // Caching mode: wrap with cache execution plan to handle staleness and background refresh
+                let input = input.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "accelerator scan input missing in caching mode".to_string(),
+                    )
+                })?;
 
                 // Check which filters the accelerator doesn't fully support and need to be re-applied.
                 // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
@@ -1241,13 +1384,37 @@ impl TableProvider for AcceleratedTable {
                     batch_write_tx,
                 ))
             }
-            (false, ZeroResultsAction::ReturnEmpty) => input,
-            (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
-                self.dataset_name.clone(),
-                input,
-                fallback_fn,
-                TableScanParams::new(state, projection, filters, limit),
-            )),
+            (false, ZeroResultsAction::ReturnEmpty) => input.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "accelerator scan input missing in ReturnEmpty mode".to_string(),
+                )
+            })?,
+            (false, ZeroResultsAction::UseSource) => {
+                let filter_refs: Vec<&Expr> = filters.iter().collect();
+                let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
+                let accelerator_filters = filters_for_accelerator_scan(filters, &pushdown_support)?;
+
+                let accelerator_limit = if accelerator_filters.len() == filters.len() {
+                    limit
+                } else {
+                    None
+                };
+                let input = self
+                    .accelerator
+                    .scan(
+                        state,
+                        scan_projection,
+                        &accelerator_filters,
+                        accelerator_limit,
+                    )
+                    .await?;
+                Arc::new(FallbackOnZeroResultsScanExec::new(
+                    self.dataset_name.clone(),
+                    input,
+                    fallback_fn,
+                    TableScanParams::new(state, projection, filters, limit),
+                ))
+            }
         };
 
         // Compute the target schema based on user's original projection.
@@ -1279,21 +1446,126 @@ impl TableProvider for AcceleratedTable {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         self.update_last_updated_at();
 
-        // When on_conflict is configured, writes go only to the accelerator
-        // (the federated source may not support writes, e.g., file connector).
-        if self.write_to_accelerator_only {
-            let accelerated_insert_plan = self
-                .accelerator
-                .insert_into(state, input, overwrite)
-                .await?;
-            self.refresher().set_initial_load_completed(true);
-            return Ok(accelerated_insert_plan);
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => {
+                // When on_conflict is configured, writes go only to the accelerator
+                // (the federated source may not support writes, e.g., file connector).
+                let accelerated_insert_plan = self
+                    .accelerator
+                    .insert_into(state, input, overwrite)
+                    .await?;
+                self.refresher().set_initial_load_completed(true);
+                Ok(accelerated_insert_plan)
+            }
+            WriteMode::FederatedOnly => {
+                // Writes go to the federated source. The acceleration refresh
+                // mechanism will pick up the new data on its next cycle.
+                let federated_table = self.federated.table_provider().await;
+                federated_table.insert_into(state, input, overwrite).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::validate_insert_op(overwrite)?;
+                write::write_back::insert_write_back(
+                    state,
+                    input,
+                    overwrite,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                    Arc::clone(&self.refresher),
+                    self.schema(),
+                )
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => write::write_through::insert_write_through(
+                input,
+                overwrite,
+                cayenne_target.as_ref(),
+                Arc::clone(federated_provider),
+                &self.refresher,
+                self.schema(),
+            ),
         }
+    }
 
-        // Writes go to the federated source. The acceleration refresh
-        // mechanism will pick up the new data on its next cycle.
-        let federated_table = self.federated.table_provider().await;
-        federated_table.insert_into(state, input, overwrite).await
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => self.accelerator.delete_from(state, filters).await,
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.delete_from(state, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::delete_write_back(
+                    state,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::delete_write_through(
+                    state,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => {
+                self.accelerator.update(state, assignments, filters).await
+            }
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.update(state, assignments, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::update_write_back(
+                    state,
+                    assignments,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::update_write_through(
+                    state,
+                    assignments,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -1313,6 +1585,33 @@ fn extend_projection_for_caching(
     let mut extended = proj.clone();
     extended.push(idx);
     Some(extended)
+}
+
+fn filters_for_accelerator_scan(
+    filters: &[Expr],
+    pushdown_support: &[TableProviderFilterPushDown],
+) -> DataFusionResult<Vec<Expr>> {
+    if filters.len() != pushdown_support.len() {
+        return Err(DataFusionError::Internal(format!(
+            "accelerator filter support length mismatch: expected {}, got {}",
+            filters.len(),
+            pushdown_support.len()
+        )));
+    }
+
+    let function_support = deny_spice_specific_functions();
+    let mut accelerator_filters = Vec::with_capacity(filters.len());
+
+    for (filter, support) in filters.iter().zip(pushdown_support.iter()) {
+        let function_supported = function_support.supports(filter);
+        let can_run_in_accelerator =
+            function_supported && !matches!(support, TableProviderFilterPushDown::Unsupported);
+        if can_run_in_accelerator {
+            accelerator_filters.push(filter.clone());
+        }
+    }
+
+    Ok(accelerator_filters)
 }
 
 #[derive(Debug)]
@@ -1476,6 +1775,9 @@ impl Retention {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::prelude::{col, lit};
+    use datafusion_functions_json::udfs::json_get_str_udf;
 
     fn schema_with_fetched_at() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1488,6 +1790,18 @@ mod tests {
                 true,
             ),
         ]))
+    }
+
+    fn expr_strings(filters: &[Expr]) -> Vec<String> {
+        filters.iter().map(ToString::to_string).collect()
+    }
+
+    fn json_get_str_filter() -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            json_get_str_udf(),
+            vec![col("content"), lit("key")],
+        ))
+        .eq(lit("needle"))
     }
 
     #[test]
@@ -1533,6 +1847,45 @@ mod tests {
             extended,
             vec![2, 3],
             "Should add fetched_at to single column"
+        );
+    }
+
+    #[test]
+    fn test_filters_for_accelerator_scan_excludes_local_only_filters() {
+        let exact_filter = col("id").eq(lit(42_i64));
+        let inexact_filter = col("name").eq(lit("espresso"));
+        let unsupported_filter = col("content").eq(lit("local only"));
+        let denied_filter = json_get_str_filter();
+        let filters = vec![
+            exact_filter.clone(),
+            inexact_filter.clone(),
+            unsupported_filter,
+            denied_filter,
+        ];
+        let pushdown_support = vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Unsupported,
+            TableProviderFilterPushDown::Exact,
+        ];
+
+        let accelerator_filters = filters_for_accelerator_scan(&filters, &pushdown_support)
+            .expect("filter split should succeed");
+        let expected_accelerator_filters = expr_strings(&[exact_filter, inexact_filter]);
+
+        assert_eq!(
+            expr_strings(&accelerator_filters),
+            expected_accelerator_filters
+        );
+    }
+
+    #[test]
+    fn test_filters_for_accelerator_scan_validates_support_length() {
+        let err = filters_for_accelerator_scan(&[col("id").eq(lit(42_i64))], &[])
+            .expect_err("mismatched filter support should fail");
+
+        assert!(
+            matches!(err, DataFusionError::Internal(message) if message.contains("accelerator filter support length mismatch"))
         );
     }
 }

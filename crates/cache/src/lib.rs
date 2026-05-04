@@ -59,6 +59,17 @@ pub use utils::filter_transient_error_responses;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
+/// Stable [`datafusion::logical_expr::UserDefinedLogicalNodeCore::name`] values for
+/// every Spice logical-plan extension node that performs (or dispatches) a write,
+/// a schema mutation, or any other side-effect that must not be reachable via a
+/// read-only SQL path and must not be served from or populated into the SQL
+/// results cache.
+///
+/// Keep this list in sync with:
+/// - `datafusion_ddl::DdlExtensionNode` → `"DdlExtension"`
+/// - `datafusion_dml::DmlExtensionNode` → `"DmlExtension"`
+pub const WRITE_CAPABLE_EXTENSION_NAMES: &[&str] = &["DdlExtension", "DmlExtension"];
+
 use crate::result::embeddings::CachedEmbeddingResult;
 
 #[derive(Debug, Snafu)]
@@ -551,6 +562,11 @@ impl QueryResultsCacheProvider {
                 | LogicalPlan::Dml(..)
                 | LogicalPlan::Copy { .. }
                 | LogicalPlan::Statement(..) => return false,
+                LogicalPlan::Extension(ext)
+                    if WRITE_CAPABLE_EXTENSION_NAMES.contains(&ext.node.name()) =>
+                {
+                    return false;
+                }
                 _ => {}
             }
 

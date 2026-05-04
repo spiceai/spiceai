@@ -28,8 +28,10 @@ use spicepod::{
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
+        function::Function,
         management::Management,
         model::Model,
+        rerankers::Reranker,
         runtime::{CorsConfig, Runtime, TlsConfig},
         secret::Secret,
         snapshot::Snapshots,
@@ -61,9 +63,13 @@ pub struct App {
 
     pub embeddings: Vec<Embeddings>,
 
+    pub rerankers: Vec<Reranker>,
+
     pub tools: Vec<Tool>,
 
     pub workers: Vec<Worker>,
+
+    pub functions: Vec<Function>,
 
     pub spicepods: Vec<Spicepod>,
 
@@ -97,8 +103,10 @@ impl Default for App {
             views: vec![],
             models: vec![],
             embeddings: vec![],
+            rerankers: vec![],
             tools: vec![],
             workers: vec![],
+            functions: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
             management: None,
@@ -127,8 +135,10 @@ pub struct AppBuilder {
     views: Vec<View>,
     models: Vec<Model>,
     embeddings: Vec<Embeddings>,
+    rerankers: Vec<Reranker>,
     tools: Vec<Tool>,
     workers: Vec<Worker>,
+    functions: Vec<Function>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
     management: Option<Management>,
@@ -146,8 +156,10 @@ impl AppBuilder {
             views: vec![],
             models: vec![],
             embeddings: vec![],
+            rerankers: vec![],
             tools: vec![],
             workers: vec![],
+            functions: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
             management: None,
@@ -170,8 +182,10 @@ impl AppBuilder {
         self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
+        self.rerankers.extend(spicepod.rerankers.clone());
         self.tools.extend(spicepod.tools.clone());
         self.workers.extend(spicepod.workers.clone());
+        self.functions.extend(spicepod.functions.clone());
         self.spicepods.push(spicepod);
         self
     }
@@ -265,6 +279,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_function(mut self, function: Function) -> AppBuilder {
+        self.functions.push(function);
+        self
+    }
+
+    #[must_use]
     pub fn with_sql_cache(mut self, sql_results: SQLResultsCacheConfig) -> AppBuilder {
         self.runtime.caching.sql_results = Some(sql_results);
         self
@@ -335,8 +355,10 @@ impl AppBuilder {
             views: self.views,
             models: self.models,
             embeddings: self.embeddings,
+            rerankers: self.rerankers,
             tools: self.tools,
             workers: self.workers,
+            functions: self.functions,
             spicepods: self.spicepods,
             runtime: self.runtime,
             management: self.management,
@@ -364,8 +386,10 @@ impl AppBuilder {
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
+        let mut rerankers: Vec<Reranker> = vec![];
         let mut tools: Vec<Tool> = vec![];
         let mut workers: Vec<Worker> = vec![];
+        let mut functions: Vec<Function> = vec![];
 
         for catalog in &spicepod.catalogs {
             catalogs.push(catalog.clone());
@@ -387,12 +411,20 @@ impl AppBuilder {
             embeddings.push(embedding.clone());
         }
 
+        for reranker in &spicepod.rerankers {
+            rerankers.push(reranker.clone());
+        }
+
         for tool in &spicepod.tools {
             tools.push(tool.clone());
         }
 
         for worker in &spicepod.workers {
             workers.push(worker.clone());
+        }
+
+        for function in &spicepod.functions {
+            functions.push(function.clone());
         }
 
         let root_spicepod_name = spicepod.name.clone();
@@ -422,12 +454,20 @@ impl AppBuilder {
                 embeddings.push(embedding.clone());
             }
 
+            for reranker in &dependent_spicepod.rerankers {
+                rerankers.push(reranker.clone());
+            }
+
             for tool in &dependent_spicepod.tools {
                 tools.push(tool.clone());
             }
 
             for worker in &dependent_spicepod.workers {
                 workers.push(worker.clone());
+            }
+
+            for function in &dependent_spicepod.functions {
+                functions.push(function.clone());
             }
 
             if dependent_spicepod.runtime != Runtime::default() {
@@ -468,8 +508,10 @@ impl AppBuilder {
             views,
             models,
             embeddings,
+            rerankers,
             tools,
             workers,
+            functions,
             spicepods,
             runtime,
             management,

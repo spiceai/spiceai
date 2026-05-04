@@ -1,7 +1,7 @@
 [package]
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "spicepod"
 repository.workspace = true
 rust-version.workspace = true
@@ -19,7 +19,6 @@ schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde-value = "0.7.0"
 serde_json.workspace = true
-secrecy.workspace = true
 yaml = { path = "../yaml" }
 snafu.workspace = true
 subtle = "2.6"

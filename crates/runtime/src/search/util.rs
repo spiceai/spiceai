@@ -90,6 +90,14 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
 pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
+    // `AcceleratedTable` is a concrete TableProvider underneath `FederatedTableProviderAdaptor`.
+    if let Some(accelerated_table) = find_concrete_table_provider::<AcceleratedTable>(tbl)
+        && let Some(indexes) =
+            find_index_in_table_provider::<T>(accelerated_table.get_accelerator_ref())
+    {
+        return Some(indexes);
+    }
+
     let mut indexed_table_opt = find_concrete_table_provider::<IndexedTableProvider>(tbl);
     while let Some(indexed_table) = indexed_table_opt {
         let indexes = indexed_table.get_indexes::<T>();
@@ -232,6 +240,26 @@ pub async fn embedding_columns_from_table(
     if let Some((indexes, _)) = find_index_in_table_provider::<ChunkedSearchIndex>(&table_provider)
     {
         embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    {
+        use search::index::elasticsearch::ElasticsearchIndex;
+        if let Some((indexes, _)) =
+            find_index_in_table_provider::<ElasticsearchIndex>(&table_provider)
+        {
+            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    {
+        use search::index::duckdb::DuckDBVectorIndex;
+        if let Some((indexes, _)) =
+            find_index_in_table_provider::<DuckDBVectorIndex>(&table_provider)
+        {
+            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+        }
     }
 
     Some(embedding_columns.into_iter().collect())

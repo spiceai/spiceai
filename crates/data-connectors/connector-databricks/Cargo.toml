@@ -19,7 +19,7 @@ name = "connector-databricks"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Databricks data and catalog connector for Spice.ai runtime"
 
 [dependencies]
@@ -29,6 +29,7 @@ data_components = { path = "../../data_components", features = ["databricks"] }
 datafusion.workspace = true
 futures.workspace = true
 linkme.workspace = true
+opentelemetry.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime", features = ["databricks"] }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
@@ -37,7 +38,13 @@ snafu.workspace = true
 token_provider = { path = "../../token_provider" }
 tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [features]
 default = []
 spark = []
+
+[dev-dependencies]
+app = { path = "../../app" }
+spicepod = { path = "../../spicepod" }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }

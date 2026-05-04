@@ -39,6 +39,7 @@ use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
+use runtime::secrets::ExposeSecret;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
@@ -50,6 +51,9 @@ use tokio::runtime::Handle;
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
 use yaml::Value;
+
+#[cfg(feature = "anonymous_telemetry")]
+const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -104,6 +108,13 @@ pub async fn register_external_connectors() {
     register_connector_factory(
         connector_duckdb::CONNECTOR_NAME,
         connector_duckdb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "elasticsearch")]
+    register_connector_factory(
+        connector_elasticsearch::CONNECTOR_NAME,
+        connector_elasticsearch::factory(),
     )
     .await;
 
@@ -301,7 +312,8 @@ pub struct Args {
     #[arg(long, value_name = "key.pem")]
     pub tls_key_file: Option<String>,
 
-    /// Enable/disable anonymous telemetry collection.
+    /// Enable anonymous telemetry collection. In Open Source builds that include anonymous telemetry,
+    /// `false` is ignored; build without the `anonymous_telemetry` feature to remove anonymous usage telemetry.
     #[arg(long)]
     pub telemetry_enabled: Option<bool>,
 
@@ -533,23 +545,61 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    if let Some(ref metrics_registry) = prometheus_registry {
-        let otel_config = telemetry_config
+    let otel_config = telemetry_config
+        .get()
+        .and_then(|c| c.otel_exporter.as_ref())
+        .filter(|c| c.enabled);
+
+    let needs_metrics =
+        prometheus_registry.is_some() || otel_config.is_some() || metrics_reader.is_some();
+
+    if needs_metrics {
+        // Resolve secrets in OTEL exporter headers before initializing metrics
+        let resolved_otel_headers = if let Some(config) = otel_config {
+            let mut resolved = std::collections::HashMap::new();
+            let secrets = rt.secrets();
+            let secrets_guard = secrets.read().await;
+            for (key, value) in &config.headers {
+                let resolved_value = secrets_guard
+                    .inject_secrets(key, runtime::secrets::ParamStr(value.as_ref()))
+                    .await;
+                resolved.insert(key.clone(), resolved_value.expose_secret().to_string());
+            }
+            drop(secrets_guard);
+            resolved
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Pre-build resource attributes from `runtime.telemetry.properties`.
+        // In standalone and scheduler modes the SetOnce is already filled at
+        // this point. In executor mode the SetOnce is resolved later, after
+        // the executor fetches the app definition from the scheduler — same
+        // as `otel_config` above. Executors emit metrics through the cluster
+        // on-demand reader and inherit attribution from the scheduler-side
+        // pipeline, so the empty-resource case here is consistent with the
+        // surrounding executor config flow.
+        let resource_attributes: Vec<KeyValue> = telemetry_config
             .get()
-            .and_then(|c| c.otel_exporter.as_ref())
-            .filter(|c| c.enabled);
+            .map(|c| {
+                c.properties
+                    .iter()
+                    .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let metric_prefix = telemetry_config.get().and_then(|c| c.metric_prefix.clone());
 
         init_metrics(
             &rt.datafusion(),
-            metrics_registry.clone(),
+            prometheus_registry.clone(),
             otel_config,
+            resolved_otel_headers,
             metrics_reader,
+            resource_attributes,
+            metric_prefix,
         )
         .context(UnableToInitializeMetricsSnafu)?;
-    } else if let Some(reader) = metrics_reader {
-        // In cluster mode without --metrics, we still need to register the MetricsReader
-        // so executors can respond to metrics requests from schedulers
-        init_cluster_metrics_only(reader);
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -569,8 +619,9 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let rt = Arc::new(rt);
+    rt.install_on_demand_loader();
 
-    if prometheus_registry.is_some() {
+    if needs_metrics {
         rt.init_cache_metrics();
     }
 
@@ -664,44 +715,113 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
     Ok((app, spicepod_load_error))
 }
 
+/// Initializes the global [`SdkMeterProvider`] with whichever metric sinks the
+/// caller has configured. Each reader is attached independently; any
+/// combination is valid as long as at least one source is present.
+///
+/// Sinks and how they are turned on:
+/// - **Prometheus scrape** (`registry` is `Some`): enabled by passing
+///   `--metrics <addr>` on the command line. Also attaches the `spice_metrics`
+///   periodic reader that writes runtime metrics into `DataFusion` for the local
+///   task-history / observability tables.
+/// - **Cluster on-demand OTLP** (`metrics_reader` is `Some`): enabled when
+///   spiced runs as a cluster executor. The reader lets a scheduler pull
+///   metrics over the control stream even when neither `--metrics` nor
+///   `otel_exporter` is configured — this subsumes the former
+///   `init_cluster_metrics_only` path.
+/// - **OTEL push exporter** (`otel_config` is `Some` and enabled): enabled
+///   purely by `runtime.telemetry.otel_exporter` in `spicepod.yaml`. No
+///   command-line flag is required; works standalone or alongside the other
+///   sinks. `resolved_otel_headers` must already have secret templates
+///   resolved by the caller.
+///
+/// Caller is expected to short-circuit (not invoke this fn) when none of the
+/// three sources is configured — otherwise an empty `MeterProvider` would be
+/// installed.
 fn init_metrics(
     df: &Arc<DataFusion>,
-    registry: prometheus::Registry,
+    registry: Option<prometheus::Registry>,
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
+    resolved_otel_headers: std::collections::HashMap<String, String>,
     metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    resource_attributes: Vec<KeyValue>,
+    metric_prefix: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resource = Resource::builder().build();
+    // Apply user-configured `runtime.telemetry.properties` as OpenTelemetry
+    // resource attributes so they appear as dimensions/tags on every metric
+    // exported by any of the readers attached below (Prometheus scrape,
+    // cluster on-demand OTLP, OTEL push). Standard env vars such as
+    // `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are still merged in
+    // by `Resource::builder()`; explicit attributes here take precedence over
+    // env-derived ones with the same key.
+    let mut resource_builder = Resource::builder();
+    if !resource_attributes.is_empty() {
+        resource_builder = resource_builder.with_attributes(resource_attributes);
+    }
+    let resource = resource_builder.build();
 
-    let prometheus_exporter = opentelemetry_prometheus::exporter()
-        .with_registry(registry)
-        .without_scope_info()
-        .without_units()
-        .without_counter_suffixes()
-        .without_target_info()
-        .build()?;
+    let mut provider_builder = SdkMeterProvider::builder().with_resource(resource);
 
-    let spice_metrics_exporter =
-        OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
+    // Optional metric name prefix (e.g. "spiceai.") configured under
+    // `runtime.telemetry.metric_prefix`. Applied via an OTel View on the
+    // MeterProvider, so the rename happens once at the SDK layer and is
+    // observed by every reader attached below (Prometheus scrape, cluster
+    // on-demand OTLP, OTEL push). The prefix is intentionally placed at the
+    // telemetry level rather than under any single exporter because
+    // OpenTelemetry 0.31's SDK does not support per-reader name transforms.
+    if let Some(prefix) = metric_prefix.filter(|p| !p.is_empty()) {
+        tracing::info!(prefix = %prefix, "OTEL metrics name prefix enabled");
+        provider_builder = provider_builder.with_view(
+            move |instrument: &opentelemetry_sdk::metrics::Instrument| {
+                let new_name = format!("{prefix}{}", instrument.name());
+                match opentelemetry_sdk::metrics::Stream::builder()
+                    .with_name(new_name.clone())
+                    .build()
+                {
+                    Ok(stream) => Some(stream),
+                    Err(e) => {
+                        tracing::warn!(
+                            instrument = %instrument.name(),
+                            new_name = %new_name,
+                            error = %e,
+                            "Failed to apply OTEL metric prefix; instrument will keep its original name"
+                        );
+                        None
+                    }
+                }
+            },
+        );
+    }
 
-    let spice_metrics_reader =
-        PeriodicReader::builder(spice_metrics_exporter, opentelemetry_sdk::runtime::Tokio)
-            .with_interval(Duration::from_secs(30))
-            .build();
+    // Case 1: Prometheus scrape
+    if let Some(registry) = registry {
+        let prometheus_exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry)
+            .without_scope_info()
+            .without_units()
+            .without_counter_suffixes()
+            .without_target_info()
+            .build()?;
+        provider_builder = provider_builder.with_reader(prometheus_exporter);
 
-    let mut provider_builder = SdkMeterProvider::builder()
-        .with_resource(resource)
-        .with_reader(prometheus_exporter)
-        .with_reader(spice_metrics_reader);
+        let spice_metrics_exporter =
+            OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
+        let spice_metrics_reader =
+            PeriodicReader::builder(spice_metrics_exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_interval(Duration::from_secs(30))
+                .build();
+        provider_builder = provider_builder.with_reader(spice_metrics_reader);
+    }
 
-    // Add cluster metrics reader for on-demand OTLP collection in cluster mode
+    // Case 2: Cluster on-demand OTLP
     if let Some(reader) = metrics_reader {
         provider_builder = provider_builder.with_reader(reader);
         tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection");
     }
 
-    // Add OTEL push exporter if configured
+    // Case 3: OTEL push exporter
     if let Some(config) = otel_config {
-        match create_otel_reader(config) {
+        match create_otel_reader(config, resolved_otel_headers) {
             Ok(otel_reader) => {
                 provider_builder = provider_builder.with_reader(otel_reader);
                 let protocol = if config.is_http() { "http" } else { "grpc" };
@@ -709,6 +829,7 @@ fn init_metrics(
                     endpoint = %config.endpoint,
                     protocol = protocol,
                     push_interval = %config.push_interval,
+                    temporality = ?config.temporality,
                     "OTEL metrics exporter enabled"
                 );
             }
@@ -724,33 +845,19 @@ fn init_metrics(
     Ok(())
 }
 
-/// Initializes metrics collection for cluster mode without Prometheus.
-///
-/// This is used by executors that don't have `--metrics` enabled but still need to
-/// respond to metrics requests from schedulers via the control stream.
-fn init_cluster_metrics_only(metrics_reader: runtime::metrics_reader::MetricsReader) {
-    let resource = Resource::builder().build();
-
-    let provider = SdkMeterProvider::builder()
-        .with_resource(resource)
-        .with_reader(metrics_reader)
-        .build();
-
-    global::set_meter_provider(provider);
-    tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection (no Prometheus)");
-}
-
 /// Creates an OTEL periodic reader from the spicepod config
 fn create_otel_reader(
     config: &app::spicepod::component::runtime::OtelExporterConfig,
+    resolved_headers: std::collections::HashMap<String, String>,
 ) -> Result<runtime::otel_push_exporter::OtelPeriodicReader, runtime::otel_push_exporter::Error> {
-    runtime::otel_push_exporter::create_otel_periodic_reader(config)
+    runtime::otel_push_exporter::create_otel_periodic_reader(config, resolved_headers)
 }
 
 async fn start_anonymous_telemetry(
     telemetry_enabled: Option<bool>,
     telemetry_config: Arc<SetOnce<TelemetryConfig>>,
-    spicepod_name: Option<&String>,
+    #[cfg(feature = "anonymous_telemetry")] spicepod_name: Option<&String>,
+    #[cfg(not(feature = "anonymous_telemetry"))] _spicepod_name: Option<&String>,
 ) {
     // Always log hardware info at debug level regardless of telemetry settings
     // Use async version to avoid blocking the async runtime
@@ -759,32 +866,51 @@ async fn start_anonymous_telemetry(
         .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
     hardware_info.log_debug();
 
-    // CLI flag takes immediate priority.
-    if telemetry_enabled == Some(false) {
-        return;
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    {
+        let _ = (telemetry_enabled, telemetry_config);
     }
-
-    // Wait for the spicepod telemetry config to be resolved.  For schedulers
-    // and standalone instances this is already set; for executors it will be
-    // set once the app definition is fetched from the scheduler.
-    let config = telemetry_config.wait().await;
-
-    if telemetry_enabled != Some(true) && !config.enabled {
-        return;
-    }
-
-    let telemetry_properties: Vec<KeyValue> = config
-        .properties
-        .iter()
-        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
-        .collect();
 
     #[cfg(feature = "anonymous_telemetry")]
-    telemetry::anonymous::start(
-        spicepod_name.map_or_else(|| "unknown", String::as_str),
-        telemetry_properties,
-    )
-    .await;
+    {
+        // Wait for the spicepod telemetry config to be resolved.  For schedulers
+        // and standalone instances this is already set; for executors it will be
+        // set once the app definition is fetched from the scheduler.
+        let config = telemetry_config.wait().await;
+
+        if should_warn_telemetry_disabled_setting_ignored(telemetry_enabled, config) {
+            tracing::warn!("{TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE}");
+        }
+
+        let telemetry_properties: Vec<KeyValue> = config
+            .properties
+            .iter()
+            .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+            .collect();
+
+        telemetry::anonymous::start(
+            spicepod_name.map_or_else(|| "unknown", String::as_str),
+            telemetry_properties,
+        )
+        .await;
+    }
+}
+
+#[cfg(any(test, feature = "anonymous_telemetry"))]
+fn should_warn_telemetry_disabled_setting_ignored(
+    telemetry_enabled: Option<bool>,
+    config: &TelemetryConfig,
+) -> bool {
+    #[cfg(feature = "anonymous_telemetry")]
+    {
+        telemetry_enabled == Some(false) || (telemetry_enabled.is_none() && !config.enabled)
+    }
+
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    {
+        let _ = (telemetry_enabled, config);
+        false
+    }
 }
 
 fn parse_set_string(s: &str) -> Result<(String, String), String> {
@@ -892,4 +1018,101 @@ fn apply_override(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "anonymous_telemetry")]
+    #[test]
+    fn warns_when_spicepod_disables_telemetry_without_cli_override() {
+        let config = TelemetryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert!(should_warn_telemetry_disabled_setting_ignored(
+            None, &config
+        ));
+    }
+
+    #[cfg(feature = "anonymous_telemetry")]
+    #[test]
+    fn warns_when_cli_disables_telemetry() {
+        let config = TelemetryConfig::default();
+
+        assert!(should_warn_telemetry_disabled_setting_ignored(
+            Some(false),
+            &config
+        ));
+    }
+
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    #[test]
+    fn does_not_warn_when_anonymous_telemetry_is_not_compiled() {
+        let config = TelemetryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert!(!should_warn_telemetry_disabled_setting_ignored(
+            None, &config
+        ));
+
+        assert!(!should_warn_telemetry_disabled_setting_ignored(
+            Some(false),
+            &config
+        ));
+    }
+
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    #[tokio::test]
+    async fn returns_without_telemetry_config_when_anonymous_telemetry_is_not_compiled() {
+        let telemetry_config = Arc::new(SetOnce::new());
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            start_anonymous_telemetry(None, telemetry_config, None),
+        )
+        .await
+        .expect("anonymous telemetry should return without waiting for telemetry config when the feature is disabled");
+    }
+
+    #[test]
+    fn does_not_warn_when_spicepod_enables_telemetry() {
+        let config = TelemetryConfig::default();
+
+        assert!(!should_warn_telemetry_disabled_setting_ignored(
+            None, &config
+        ));
+    }
+
+    #[test]
+    fn does_not_warn_when_cli_enables_telemetry() {
+        let config = TelemetryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert!(!should_warn_telemetry_disabled_setting_ignored(
+            Some(true),
+            &config
+        ));
+    }
+
+    #[cfg(feature = "anonymous_telemetry")]
+    #[test]
+    fn telemetry_disabled_message_mentions_supported_disable_paths() {
+        assert!(TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE.contains("anonymous and aggregated"));
+        assert!(TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE.contains(
+            "runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry"
+        ));
+        assert!(TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE.contains("--telemetry-enabled=false"));
+        assert!(
+            TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE
+                .contains("without the anonymous_telemetry feature")
+        );
+        assert!(TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE.contains("Spice.ai Enterprise"));
+    }
 }

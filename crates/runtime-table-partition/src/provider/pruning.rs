@@ -82,6 +82,41 @@ fn collect_conditions(
     }
 }
 
+/// Collects literal values from OR/AND chains where each condition compares
+/// a partition expression to a literal.  For example, given `bucket(3, user_id) = 0
+/// OR bucket(3, user_id) = 1`, returns `Some(vec![0, 1])` when
+/// `partition_by` is `bucket(3, user_id)`.
+fn collect_partition_expr_conditions(
+    expr: &Expr,
+    combining_op: Operator,
+    condition_op: Operator,
+    partition_by: &Expr,
+) -> Option<Vec<ScalarValue>> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == combining_op => {
+            let left_result =
+                collect_partition_expr_conditions(left, combining_op, condition_op, partition_by);
+            let right_result =
+                collect_partition_expr_conditions(right, combining_op, condition_op, partition_by);
+            match (left_result, right_result) {
+                (Some(mut left_lits), Some(right_lits)) => {
+                    left_lits.extend(right_lits);
+                    Some(left_lits)
+                }
+                _ => None,
+            }
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == condition_op => {
+            match (left.as_ref(), right.as_ref()) {
+                (expr, Expr::Literal(lit, _)) if expr == partition_by => Some(vec![lit.clone()]),
+                (Expr::Literal(lit, _), expr) if expr == partition_by => Some(vec![lit.clone()]),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Transforms `partition_by` expression by replacing column with `filter_value` and evaluates it.
 fn transform_and_evaluate(
     partition_by: &Expr,
@@ -324,6 +359,18 @@ pub(crate) fn prune_partition(
                                     return Ok(true);
                                 }
                             }
+                        } else if let Some(literals) =
+                            // OR-chain of partition expression = literal:
+                            // e.g. bucket(50, org_id) = '5' OR bucket(50, org_id) = '13'
+                            collect_partition_expr_conditions(
+                                filter,
+                                Operator::Or,
+                                Operator::Eq,
+                                partition_by,
+                            )
+                            && !literals.iter().any(|lit| partition_value == lit)
+                        {
+                            return Ok(true);
                         }
                     }
                 }
@@ -765,13 +812,16 @@ fn evaluate_date_trunc_inequality(
         return Ok(false); // Conservative: don't prune if granularity not a string
     };
 
-    // Extract timestamp from partition_value
-    let partition_ts = match partition_value {
-        ScalarValue::TimestampNanosecond(Some(ts), _) => *ts,
-        ScalarValue::TimestampMicrosecond(Some(ts), _) => ts * 1_000,
-        ScalarValue::TimestampMillisecond(Some(ts), _) => ts * 1_000_000,
-        ScalarValue::TimestampSecond(Some(ts), _) => ts * NANOS_PER_SECOND,
+    // Extract timestamp from partition_value, converting to nanoseconds.
+    // Use checked arithmetic to avoid overflow for timestamps beyond ~year 2262.
+    let Some(partition_ts) = (match partition_value {
+        ScalarValue::TimestampNanosecond(Some(ts), _) => Some(*ts),
+        ScalarValue::TimestampMicrosecond(Some(ts), _) => ts.checked_mul(1_000),
+        ScalarValue::TimestampMillisecond(Some(ts), _) => ts.checked_mul(1_000_000),
+        ScalarValue::TimestampSecond(Some(ts), _) => ts.checked_mul(NANOS_PER_SECOND),
         _ => return Ok(false), // Conservative: not a timestamp
+    }) else {
+        return Ok(false); // Overflow: don't prune
     };
 
     // Compute the upper bound based on granularity
@@ -786,7 +836,9 @@ fn evaluate_date_trunc_inequality(
         _ => return Ok(false), // Unknown granularity, be conservative
     };
 
-    let partition_upper_ts = partition_ts + nanos_in_granularity;
+    let Some(partition_upper_ts) = partition_ts.checked_add(nanos_in_granularity) else {
+        return Ok(false); // Overflow: don't prune
+    };
 
     // Create upper bound ScalarValue matching the partition_value type
     let partition_upper = match partition_value {
@@ -2520,6 +2572,33 @@ mod tests {
                 "Partition {partition_value} should not be pruned for user_id != 42 (bucket partitioning)",
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_date_trunc_timestamp_overflow_does_not_prune()
+    -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]);
+        let partition_by = date_trunc(lit("year"), col("ts"));
+
+        // i64::MAX seconds (~year 292 billion) overflows when converted to nanoseconds.
+        // The partition should NOT be pruned (conservative behavior), not panic or wrap.
+        let overflow_ts = i64::MAX;
+        let partition_value = ScalarValue::TimestampSecond(Some(overflow_ts), None);
+
+        let filter_value = ScalarValue::TimestampSecond(Some(1_000_000_000), None);
+        let filters = &[col("ts").gt(lit(filter_value))];
+
+        let pruned = prune_partition(&filters[..], &partition_by, &partition_value, &schema)?;
+        assert!(
+            !pruned,
+            "Partition with overflowing timestamp should not be pruned (conservative)"
+        );
 
         Ok(())
     }

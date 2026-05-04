@@ -17,13 +17,18 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::delta_lake::DeltaTableFactory;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::TableProvider;
+use datafusion::datasource::listing::ListingTableUrl;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use runtime::component::dataset::Dataset;
+use runtime::dataconnector::listing::build_table_parquet_options;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
+use secrecy::ExposeSecret;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -33,14 +38,22 @@ use tokio::runtime::Handle;
 #[derive(Debug)]
 pub struct DeltaLake {
     delta_table_factory: DeltaTableFactory,
+    /// Retained so `register_object_stores` can encode the AWS/Azure/GCS
+    /// params into the executor's object store registry URL fragment.
+    params: Parameters,
 }
 
 impl DeltaLake {
     #[must_use]
-    #[expect(clippy::needless_pass_by_value)]
-    pub fn new(params: Parameters, io_runtime: Handle) -> Self {
+    pub fn new(
+        params: Parameters,
+        io_runtime: Handle,
+        table_parquet_options: TableParquetOptions,
+    ) -> Self {
         Self {
-            delta_table_factory: DeltaTableFactory::new(params.to_secret_map(), io_runtime),
+            delta_table_factory: DeltaTableFactory::new(params.to_secret_map(), io_runtime)
+                .with_table_parquet_options(table_parquet_options),
+            params,
         }
     }
 }
@@ -116,6 +129,12 @@ impl DataConnectorFactory for DeltaLakeFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        let aws_region = params
+            .parameters
+            .get("aws_region")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
         let param_map = params.parameters.to_secret_map();
         Box::pin(async move {
             // Initialize AWS SDK credentials if not using explicit credentials
@@ -123,14 +142,22 @@ impl DataConnectorFactory for DeltaLakeFactory {
                 &param_map,
                 "aws_access_key_id",
                 "aws_secret_access_key",
-            ) && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+            ) && let Err(err) =
+                aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(aws_region.as_deref())
+                    .await
             {
                 tracing::warn!(
                     "Unable to initialize AWS credentials for Delta Lake connector: {err}"
                 );
             }
 
-            let delta = DeltaLake::new(params.parameters, params.io_runtime);
+            let parquet_opts = build_table_parquet_options(params.runtime.as_deref()).await?;
+
+            tracing::debug!(
+                ?parquet_opts,
+                "Creating Delta Lake connector with parquet options"
+            );
+            let delta = DeltaLake::new(params.parameters, params.io_runtime, parquet_opts);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })
     }
@@ -162,6 +189,101 @@ impl DataConnector for DeltaLake {
                 source: e,
             }),
         }
+    }
+
+    /// Registers the underlying object store (S3/Azure/GCS) on the executor's
+    /// `RuntimeEnv` so decoded `ParquetSource` plans, which lose their
+    /// per-scan `parquet_file_reader_factory` during proto round-trip, can
+    /// resolve the bucket via `runtime_env().object_store(url)` with the
+    /// correct region/credentials.
+    ///
+    /// Without this, executors fall back to a default S3 store with no region
+    /// set, which surfaces as `Received redirect without LOCATION` against
+    /// buckets outside `us-east-1`.
+    async fn register_object_stores(
+        &self,
+        dataset: &Dataset,
+        runtime_env: &Arc<RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        let storage_location = dataset.path();
+
+        // Delta tables backed by a local filesystem (file://, file paths,
+        // or relative paths like `my_delta_table`) don't need an object
+        // store registration. Match the listing connector's behavior:
+        // emit a warning so misconfigured cluster setups are diagnosable,
+        // then no-op rather than failing executor startup.
+        let parsed = match url::Url::parse(storage_location) {
+            Ok(parsed) => parsed,
+            Err(url::ParseError::RelativeUrlWithoutBase) => {
+                tracing::warn!(
+                    "Dataset {} delta_lake path `{}` is not an absolute URL; \
+                     skipping cluster object store registration. Cluster \
+                     executors will not be able to resolve this path without \
+                     a shared mount.",
+                    dataset.name,
+                    storage_location,
+                );
+                return Ok(());
+            }
+            Err(source) => {
+                return Err(DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "delta_lake".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(source),
+                });
+            }
+        };
+
+        if parsed.scheme() == "file" {
+            tracing::warn!(
+                "Dataset {} has a file:// scheme and may not be resolvable on cluster executors without a shared mount.",
+                dataset.name,
+            );
+            return Ok(());
+        }
+
+        // Encode the connector's storage params as the URL fragment so
+        // `SpiceObjectStoreRegistry::get_store` can build the right object
+        // store. `storage_registry_params` returns just the AWS/Azure/GCS
+        // entries with their prefixed names rewritten to the registry's
+        // canonical names.
+        let storage_params = self.params.storage_registry_params();
+        if storage_params.is_empty() {
+            // Nothing connector-specific to register; leave the default
+            // registry behavior in place.
+            return Ok(());
+        }
+
+        let mut parsed = parsed;
+        let mut fragment_builder = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in storage_params {
+            fragment_builder.append_pair(&key, value.expose_secret());
+        }
+        parsed.set_fragment(Some(fragment_builder.finish().as_str()));
+
+        let listing_url = ListingTableUrl::parse(parsed).map_err(|source| {
+            DataConnectorError::UnableToConnectInternal {
+                dataconnector: "delta_lake".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(source),
+            }
+        })?;
+
+        runtime_env.object_store(&listing_url).map_err(|source| {
+            DataConnectorError::UnableToConnectInternal {
+                dataconnector: "delta_lake".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(source),
+            }
+        })?;
+
+        let mut redacted = <ListingTableUrl as AsRef<url::Url>>::as_ref(&listing_url).clone();
+        redacted.set_fragment(None);
+        tracing::debug!(
+            "Configured object storage for Delta Lake Dataset {} ({redacted})",
+            dataset.name,
+        );
+        Ok(())
     }
 }
 

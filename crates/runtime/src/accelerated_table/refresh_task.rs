@@ -30,10 +30,8 @@ use crate::datafusion::filter_converter::create_timestamp_filter_convert;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
 use crate::datafusion::refresh_sql;
-use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::metrics::telemetry::track_bytes_processed;
-use crate::timing::MultiTimeMeasurement;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
@@ -49,6 +47,7 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
+use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionContext;
@@ -64,6 +63,7 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use datafusion_optimizer_rules::physical_plan::HttpParamsPushdown;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
@@ -85,6 +85,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
+use telemetry::timing::MultiTimeMeasurement;
 use tokio::{
     runtime::Handle,
     sync::{Mutex, RwLock, Semaphore, oneshot},
@@ -1137,6 +1138,7 @@ impl RefreshTask {
             ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
             .with_optimizer_rule(Arc::new(AvoidDerivedVectorColumnOnIndexRule {}))
+            .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
@@ -1162,6 +1164,21 @@ impl RefreshTask {
             Err(_) => {
                 unreachable!("The default catalog should always exist");
             }
+        }
+
+        if let Some(catalog_name) = dataset_name.catalog()
+            && ctx.catalog(catalog_name).is_none()
+        {
+            ctx.register_catalog(catalog_name, Arc::new(MemoryCatalogProvider::new()));
+        }
+
+        let target_catalog = dataset_name.catalog().unwrap_or(&default_catalog);
+        if let Err(e) = schema::ensure_schema_exists(&ctx, target_catalog, dataset_name) {
+            tracing::error!(
+                "Unable to ensure schema exists for refresh context {}.{}: {e}",
+                target_catalog,
+                dataset_name.schema().unwrap_or_default()
+            );
         }
 
         if let Err(e) = ctx.register_table(dataset_name.clone(), federated_provider) {
@@ -1223,7 +1240,10 @@ impl RefreshTask {
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?;
 
-        let filter_schema = BaseSchema::get_schema(&federated_provider);
+        // Use the update stream's schema for dedup comparison, not the full federated
+        // provider schema.  When `refresh_sql` selects a column subset, the incoming
+        // batches and accelerated table only contain those columns.
+        let filter_schema = update.data.schema();
         let update_type = update.update_type.clone();
 
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(
@@ -1404,7 +1424,7 @@ impl RefreshTask {
                     reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
                 })?;
 
-            if array.is_empty() {
+            if array.is_empty() || array.is_null(0) {
                 return Ok(None);
             }
 
@@ -1918,12 +1938,21 @@ fn schema_evolution_mismatch_refresh_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, Int64Array, UInt32Array, UInt64Array};
+    use crate::dataupdate::{StreamingDataUpdate, UpdateType};
+    use crate::federated_table::FederatedTable;
+    use arrow::array::{
+        Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+        TimestampNanosecondArray, UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::TimeUnit;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
+    use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
     use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[test]
     fn test_data_load_tracing_tracks_bytes_and_rows() {
@@ -2081,8 +2110,6 @@ mod tests {
     /// for utf8 columns, which avoids the Vortex/Cayenne cast kernel issue.
     #[tokio::test]
     async fn test_max_timestamp_df_utf8_no_cast() {
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time_col",
             DataType::Utf8,
@@ -2111,12 +2138,9 @@ mod tests {
     /// Verifies that `max_timestamp_df` still uses CAST+sort for non-string columns.
     #[tokio::test]
     async fn test_max_timestamp_df_timestamp_uses_cast() {
-        use arrow::array::TimestampNanosecondArray;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time_col",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
             false,
         )]));
         let batch = RecordBatch::try_new(
@@ -2178,9 +2202,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_timestamp_iso8601_utf8() {
-        use arrow::array::StringArray;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -2200,9 +2221,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_timestamp_iso8601_large_utf8() {
-        use arrow::array::LargeStringArray;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new(
             "t",
             DataType::LargeUtf8,
@@ -2226,9 +2244,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_timestamp_iso8601_utf8_view() {
-        use arrow::array::StringViewArray;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new(
             "t",
             DataType::Utf8View,
@@ -2253,8 +2268,6 @@ mod tests {
     /// Verifies that `max_timestamp_df` does NOT use CAST for integer columns (`UnixSeconds`).
     #[tokio::test]
     async fn test_max_timestamp_df_int64_no_cast() {
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time_col",
             DataType::Int64,
@@ -2307,9 +2320,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_timestamp_df_int64_extraction() {
-        use arrow::array::Int64Array;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -2324,9 +2334,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_timestamp_df_uint64_extraction() {
-        use arrow::array::UInt64Array;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::UInt64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -2341,9 +2348,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_timestamp_df_int32_extraction() {
-        use arrow::array::Int32Array;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -2358,9 +2362,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_timestamp_df_uint32_extraction() {
-        use arrow::array::UInt32Array;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::UInt32, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -2375,9 +2376,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_timestamp_df_float64_extraction() {
-        use arrow::array::Float64Array;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -2392,12 +2390,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_timestamp_df_timestamp_ns_extraction() {
-        use arrow::array::TimestampNanosecondArray;
-        use data_components::arrow::write::MemTable;
-
         let schema = Arc::new(Schema::new(vec![Field::new(
             "t",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
             false,
         )]));
         let batch = RecordBatch::try_new(
@@ -2416,5 +2411,130 @@ mod tests {
             collect_numeric_from_max_df(&mem, "t").await,
             Some(3_000_000_000)
         );
+    }
+
+    /// When `refresh_sql` selects a column subset, `filter_records` must use the
+    /// update data's schema (not the full source schema) to compare incoming rows
+    /// against existing rows.
+    #[tokio::test]
+    async fn test_except_existing_records_column_subset() {
+        // Federated (source) schema is wider: ts + id + extra_col
+        let federated_schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("id", DataType::Int32, false),
+            Field::new("extra_col", DataType::Int32, false),
+        ]));
+        let federated_batch = RecordBatch::try_new(
+            Arc::clone(&federated_schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000, 2_000, 3_000])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .expect("federated batch");
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&federated_schema), vec![vec![federated_batch]])
+                .expect("federated MemTable"),
+        ) as Arc<dyn TableProvider>;
+
+        // Accelerator schema is the subset: ts + id (no extra_col)
+        let accel_schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        // Pre-populate the accelerator with one existing row (ts=1000, id=1)
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&accel_schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .expect("existing batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&accel_schema), vec![vec![existing_batch]])
+                .expect("accelerator MemTable"),
+        ) as Arc<dyn TableProvider>;
+
+        // Build the RefreshTask with the wider federated schema
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated_table)));
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_subset"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        // The refresh must have a time_column so the dedup path is entered.
+        // append_overlap of 1s ensures the overlap window includes the existing
+        // row at ts=1000ns (query becomes ts > max_ts - 1s = ts > 0).
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .append_overlap(Duration::from_secs(1));
+
+        // Build the update stream with the SUBSET schema (only ts + id, no extra_col)
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&accel_schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000, 2_000])),
+                Arc::new(Int32Array::from(vec![1, 4])),
+            ],
+        )
+        .expect("update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&accel_schema), None)
+                .expect("update stream"),
+        );
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
+
+        let result = task
+            .except_existing_records_from(&refresh, update)
+            .await
+            .expect("except_existing_records_from should succeed with column subset");
+
+        let collected = result
+            .collect_data()
+            .await
+            .expect("collecting filtered data should succeed");
+
+        // Row (ts=1000, id=1) matches existing data and should be filtered out.
+        // Only row (ts=2000, id=4) should remain.
+        assert_eq!(collected.data.len(), 1, "should have one output batch");
+        assert_eq!(
+            collected.data[0].num_rows(),
+            1,
+            "should have one row after dedup"
+        );
+        let id_col = collected.data[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be Int32");
+        assert_eq!(id_col.value(0), 4, "remaining row should be id=4");
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_timestamp_ns_all_null_returns_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                None, None, None,
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, None);
     }
 }

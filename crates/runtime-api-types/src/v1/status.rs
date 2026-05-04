@@ -206,6 +206,9 @@ pub enum ComponentStatus {
 
     /// The component is in the process of shutting down
     ShuttingDown,
+
+    /// The component is configured but not loaded yet
+    NotLoaded,
 }
 
 impl ComponentStatus {
@@ -220,6 +223,7 @@ impl ComponentStatus {
             ComponentStatus::Error(_) => 3,
             ComponentStatus::Refreshing => 4,
             ComponentStatus::ShuttingDown => 5,
+            ComponentStatus::NotLoaded => 6,
         }
     }
 
@@ -270,6 +274,7 @@ impl Display for ComponentStatus {
             ComponentStatus::Error(_) => write!(f, "Error"),
             ComponentStatus::Refreshing => write!(f, "Refreshing"),
             ComponentStatus::ShuttingDown => write!(f, "ShuttingDown"),
+            ComponentStatus::NotLoaded => write!(f, "NotLoaded"),
         }
     }
 }
@@ -300,6 +305,7 @@ impl<'de> Deserialize<'de> for ComponentStatus {
             "Error" => Ok(ComponentStatus::Error(None)),
             "Refreshing" => Ok(ComponentStatus::Refreshing),
             "ShuttingDown" => Ok(ComponentStatus::ShuttingDown),
+            "NotLoaded" => Ok(ComponentStatus::NotLoaded),
             other => Err(serde::de::Error::unknown_variant(
                 other,
                 &[
@@ -309,6 +315,7 @@ impl<'de> Deserialize<'de> for ComponentStatus {
                     "Error",
                     "Refreshing",
                     "ShuttingDown",
+                    "NotLoaded",
                 ],
             )),
         }
@@ -390,5 +397,32 @@ mod tests {
         );
         assert_eq!(model_unknown.error_type, ComponentErrorType::Unknown);
         assert_eq!(model_unknown.code, "model.unknown");
+    }
+
+    #[test]
+    fn test_databricks_permission_error_classifies_as_permission() {
+        // A representative message from DataConnectorError::InsufficientPermissions
+        // as produced by the Databricks connector's UC permission check.
+        let msg = "Insufficient permissions to access the catalog.schema.table dataset (databricks). Grant SELECT or ALL PRIVILEGES on the table";
+        let error = ComponentError::from_status_message(ComponentErrorCategory::Dataset, Some(msg));
+        assert_eq!(
+            error.error_type,
+            ComponentErrorType::Permission,
+            "Databricks permission denial message should classify as Permission"
+        );
+        assert_eq!(error.code, "dataset.permission");
+    }
+
+    #[test]
+    fn test_error_type_priority_permission_before_auth() {
+        // "permission" should match Permission, not fall through to Auth
+        // (which also matches "token").
+        let msg = "permission denied for token-based access";
+        let error_type = ComponentErrorType::from_message(Some(msg));
+        assert_eq!(
+            error_type,
+            ComponentErrorType::Permission,
+            "Permission keywords should take precedence over auth keywords"
+        );
     }
 }

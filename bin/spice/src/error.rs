@@ -41,9 +41,17 @@ pub enum Error {
     #[snafu(display("The Spice runtime is unavailable at {endpoint}. Is it running?"))]
     RuntimeUnavailable { endpoint: String },
 
-    /// Unauthorized access to the runtime API
-    #[snafu(display("unauthorized: invalid or missing Spice API key"))]
+    /// Unauthorized access to the runtime API (401 — credentials missing/invalid)
+    #[snafu(display(
+        "unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
+    ))]
     Unauthorized,
+
+    /// Forbidden (403 — authenticated but not allowed)
+    #[snafu(display(
+        "forbidden: your API key is valid but does not have permission for this resource. Check API key scopes or contact your org admin."
+    ))]
+    PermissionDenied,
 
     /// Runtime returned an unexpected HTTP status
     #[snafu(display("request to runtime failed with HTTP {status}: {body}"))]
@@ -146,7 +154,7 @@ pub async fn check_response(
     }
 
     if status == StatusCode::FORBIDDEN {
-        return Err(UnauthorizedSnafu.build());
+        return Err(PermissionDeniedSnafu.build());
     }
 
     // For connection-related errors or 502/503/504, report the runtime as unavailable
@@ -178,7 +186,7 @@ mod tests {
         let err = UnauthorizedSnafu.build();
         assert_eq!(
             err.to_string(),
-            "unauthorized: invalid or missing Spice API key"
+            "unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
         );
     }
 
@@ -243,7 +251,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "unauthorized: invalid or missing Spice API key"
+            "unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
         );
     }
 
@@ -260,11 +268,11 @@ mod tests {
             .expect("GET request should succeed");
         let result = check_response(response, &mock_server.uri()).await;
         let Err(err) = result else {
-            panic!("expected Unauthorized error for 403 response");
+            panic!("expected PermissionDenied error for 403 response");
         };
         assert!(
-            matches!(err, Error::Unauthorized),
-            "Expected Unauthorized for 403, got: {err}"
+            matches!(err, Error::PermissionDenied),
+            "Expected PermissionDenied for 403, got: {err}"
         );
     }
 

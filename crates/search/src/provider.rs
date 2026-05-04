@@ -57,13 +57,15 @@ pub enum UdtfSource {
         limit: Option<usize>,
         include_score: Option<bool>,
     },
-    /// Created by `vector_search(tbl, query, [col], [limit], [include_score])`
+    /// Created by `vector_search(tbl, query, [col], [limit], [include_score], [distance_metric => "cosine" | "l2"])`
     VectorSearch {
         table: String,
         query: String,
         column: Option<String>,
         limit: Option<usize>,
         include_score: Option<bool>,
+        /// Distance metric name ("cosine" or "l2"). `None` = default (cosine).
+        distance_metric: Option<String>,
     },
 }
 
@@ -77,6 +79,10 @@ pub struct SearchQueryProvider {
     pub primary_key: Vec<String>,
     pub constraints: Option<Constraints>,
     pub pre_limit: Option<usize>,
+    /// When `false`, the [`SEARCH_SCORE_COLUMN_NAME`] column is projected out of
+    /// both the advertised schema and the scan result. When `true` (default),
+    /// the score column is exposed so callers can order/inspect results.
+    pub include_score: bool,
     /// Optional callback invoked before a table scan is performed.
     ///
     /// This callback can be used to perform custom actions (such as logging, metrics, or side effects)
@@ -117,6 +123,7 @@ impl SearchQueryProvider {
             search_column,
             primary_key,
             pre_limit,
+            include_score: true,
             scan_callback: None,
             constraints: None,
             udtf_source: None,
@@ -154,6 +161,32 @@ impl SearchQueryProvider {
     #[must_use]
     pub fn with_udtf_source(mut self, source: UdtfSource) -> Self {
         self.udtf_source = Some(source);
+        self
+    }
+
+    /// When set to `false`, the advertised schema and scan output exclude the
+    /// internal score column ([`SEARCH_SCORE_COLUMN_NAME`]).
+    #[must_use]
+    pub fn with_include_score(mut self, include_score: bool) -> Self {
+        self.include_score = include_score;
+        // Schema field ordering depends on `include_score` (the `_score`
+        // column is removed when `false`), and stored constraints reference
+        // positional indices into the advertised schema. Recompute so PK
+        // indices stay consistent with the current `schema()`.
+        self.constraints = Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+            self.schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    if self.primary_key.contains(f.name()) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        )]));
         self
     }
 
@@ -456,6 +489,13 @@ impl TableProvider for SearchQueryProvider {
             }
         }
 
+        // When `include_score = false`, drop the internal score column from the
+        // advertised schema so callers of `SELECT * FROM text_search(..., include_score => false)`
+        // don't see it.
+        if !self.include_score {
+            fields_map.remove(SEARCH_SCORE_COLUMN_NAME);
+        }
+
         // Add `match` only if its a chunked search field (chunking offsets must be from this search index).
         if self
             .search_index_query
@@ -535,29 +575,37 @@ impl TableProvider for SearchQueryProvider {
             proj2
         });
 
-        let mut search_lp = LogicalPlanBuilder::new_from_arc(Arc::clone(&self.search_index_query))
-            .alias("search_index")?
-            .limit(0, self.pre_limit)?;
+        // Build search index base plan WITHOUT pre_limit so that filters can be added
+        // below the limit. DataFusion cannot push filters past a Limit node, so adding
+        // filters after the limit prevents them from reaching the underlying search index
+        // (e.g. S3VectorsQueryExec), causing both worse performance and incorrect results
+        // (top-K-then-filter vs top-K-of-filtered).
+        let search_base = LogicalPlanBuilder::new_from_arc(Arc::clone(&self.search_index_query))
+            .alias("search_index")?;
 
         let just_use_index = self.search_index_table_is_sufficient(
             &Arc::clone(self.search_index_query.schema()),
             inner_proj.as_ref(),
             filters,
         )?;
-        search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
-            (true, None) => search_lp.limit(0, limit)?,
-            (true, Some(filter)) => search_lp.filter(filter)?.limit(0, limit)?,
+        let search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
+            (true, None) => search_base.limit(0, self.pre_limit)?.limit(0, limit)?,
+            (true, Some(filter)) => search_base
+                .filter(filter)?
+                .limit(0, self.pre_limit)?
+                .limit(0, limit)?,
             (false, _) => {
-                // Pushdown indexes to search index
+                // Add supported filters BEFORE the pre_limit so they can be pushed down
+                // into the search index scan by DataFusion's PushDownFilter optimizer.
                 let search_index = if let Some(filter) =
-                    exprs_supported(filters, search_lp.schema())
+                    exprs_supported(filters, search_base.schema())
                         .iter()
                         .cloned()
                         .reduce(Expr::and)
                 {
-                    search_lp.filter(filter)?
+                    search_base.filter(filter)?.limit(0, self.pre_limit)?
                 } else {
-                    search_lp
+                    search_base.limit(0, self.pre_limit)?
                 };
 
                 self.join_with_base(inner_proj.as_ref(), search_index, filters)?

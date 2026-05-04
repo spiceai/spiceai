@@ -175,6 +175,7 @@ impl ClusterHarness {
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         loop {
+            sleep(Duration::from_millis(200)).await;
             let count = self
                 .executor_manager
                 .get_executor_state()
@@ -186,7 +187,7 @@ impl ClusterHarness {
             // `connections` but not yet in `flight_sql_clients` during initial
             // connection setup, which causes INSERT forwarding to fail.
             let flight_clients_ready = if let Some(ref registry) = self.executor_registry {
-                registry.flight_sql_clients.read().await.len() >= expected
+                registry.flight_sql_clients_count().await >= expected
             } else {
                 true
             };
@@ -199,7 +200,6 @@ impl ClusterHarness {
                     "Timed out waiting for {expected} executors; found {count}"
                 )));
             }
-            sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -443,7 +443,7 @@ impl ClusterHarnessBuilder {
             .executor_manager
             .clone();
 
-        let executor_registry = scheduler_rt.datafusion().executor_registry.clone();
+        let executor_registry = scheduler_rt.datafusion().executor_registry().cloned();
 
         Ok(ClusterHarness {
             scheduler: scheduler_rt,

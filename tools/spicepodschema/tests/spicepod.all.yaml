@@ -99,6 +99,7 @@ runtime:
       enabled: true
       endpoint: http://localhost:4317
       push_interval: 60s
+      temporality: delta # delta (default, required by Datadog), cumulative, or low_memory
       metrics:
         - runtime.query_duration_ms
         - runtime.memory_usage_bytes
@@ -107,6 +108,7 @@ runtime:
   task_history:
     enabled: true
     captured_output: truncated # none, truncated, full
+    captured_context: redacted # redacted, truncated, full
     retention_period: 24h
     retention_check_interval: 30m
     min_sql_duration: 100ms
@@ -147,6 +149,12 @@ runtime:
   # Runtime params
   params:
     custom_runtime_param: value
+    http_max_concurrent_requests: '8'
+    http_requests_per_second_limit: '10'
+    http_requests_per_minute_limit: '300'
+    http_rate_control_jitter_min: 2ms
+    http_rate_control_jitter_max: 8ms
+    github_max_concurrent_connections: '5'
 
 # =============================================================================
 # MANAGEMENT CONFIGURATION
@@ -322,7 +330,7 @@ datasets:
     time_format: timestamp # timestamp, timestamptz, unix_seconds, unix_millis, ISO8601
     time_partition_column: partition_date
     time_partition_format: ISO8601
-    ready_state: on_load # on_load, on_registration
+    ready_state: on_load # on_load, on_registration, on_schema_resolved
     check_availability: auto # auto, disabled
     unsupported_type_action: warn # error, warn, ignore, string
     replication:
@@ -789,6 +797,7 @@ datasets:
       github_max_comments_fetched: '100'
       github_include_commits: 'true'
       github_workflow_logs: 'true'
+      max_concurrent_requests: '6'
       include: '*.md'
 
   # ---------------------------------------------------------------------------
@@ -815,6 +824,16 @@ datasets:
       graphql_query: 'query { users { id name } }'
       json_pointer: /data/users
       unnest_depth: '2'
+      max_concurrent_requests: '4'
+      requests_per_second_limit: '2'
+      requests_per_minute_limit: '60'
+      rate_control_jitter_min: 2ms
+      rate_control_jitter_max: 8ms
+    metrics:
+      - name: rate_control_acquisitions_total
+      - name: rate_control_wait_duration_ms
+      - name: rate_limit_retry_after_waits_total
+      - name: rate_limit_retry_after_remaining_ms
 
   # ---------------------------------------------------------------------------
   # HTTP/HTTPS connector
@@ -834,6 +853,11 @@ datasets:
       retry_backoff_method: fibonacci
       retry_max_duration: '60s'
       retry_jitter: '0.3'
+      max_concurrent_requests: '4'
+      requests_per_second_limit: '2'
+      requests_per_minute_limit: '60'
+      rate_control_jitter_min: 2ms
+      rate_control_jitter_max: 8ms
       allowed_request_paths: '/api/v1,/api/v2'
       request_query_filters: enabled # enabled, disabled
       max_request_query_length: '2048'
@@ -841,6 +865,11 @@ datasets:
       max_request_body_bytes: '32768'
       health_probe: /health
       file_format: json
+    metrics:
+      - name: rate_control_acquisitions_total
+      - name: rate_control_wait_duration_ms
+      - name: rate_limit_retry_after_waits_total
+      - name: rate_limit_retry_after_remaining_ms
 
   # ---------------------------------------------------------------------------
   # Iceberg connector

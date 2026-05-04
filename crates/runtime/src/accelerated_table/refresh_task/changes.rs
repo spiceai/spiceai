@@ -22,7 +22,6 @@ use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, U
 use arrow::datatypes::DataType;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
-use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 #[cfg(feature = "dynamodb")]
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
@@ -180,11 +179,7 @@ impl RefreshTask {
         for (op_type, row_indices) in sub_batches {
             match op_type {
                 ChangeOperationType::Delete => {
-                    let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
-                        .context(
-                            crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu,
-                        )?;
-                    self.process_delete_batch(&change_batch, &row_indices, &deletion_provider)
+                    self.process_delete_batch(&change_batch, &row_indices)
                         .await?;
                     had_change = true;
                 }
@@ -194,7 +189,8 @@ impl RefreshTask {
                     had_change = true;
                 }
                 ChangeOperationType::Truncate => {
-                    tracing::warn!("Truncate operation not yet implemented for {dataset_name}");
+                    self.process_truncate().await?;
+                    had_change = true;
                 }
                 ChangeOperationType::Unknown => {
                     tracing::error!("Unknown change operation type for {dataset_name}");
@@ -282,11 +278,37 @@ impl RefreshTask {
         Ok(())
     }
 
+    async fn process_truncate(&self) -> crate::accelerated_table::Result<()> {
+        let dataset_name = &self.dataset_name;
+        tracing::info!("Processing TRUNCATE for {dataset_name}");
+
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
+        // Some accelerator impls (notably DuckDB) treat an empty filter list as
+        // a no-op to guard against accidental full-table deletes. To get
+        // uniform "wipe the whole table" semantics we pass an always-true
+        // literal, which is emitted as `DELETE FROM <table> WHERE TRUE` and
+        // applied consistently across engines.
+        let delete_plan = self
+            .accelerator
+            .delete_from(&session_state, vec![lit(true)])
+            .await
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        collect(delete_plan, ctx.task_ctx())
+            .await
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+        self.update_last_updated_at();
+        Ok(())
+    }
+
     async fn process_delete_batch(
         &self,
         change_batch: &ChangeBatch,
         row_indices: &[usize],
-        deletion_provider: &Arc<dyn DeletionTableProvider>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
 
@@ -306,14 +328,12 @@ impl RefreshTask {
             let session_state = ctx.state();
 
             let _lock_guard = self.accelerator_write_mutex.lock().await;
-            let delete_plan = DeletionTableProvider::delete_from(
-                deletion_provider.as_ref(),
-                &session_state,
-                &[combined],
-            )
-            .await
-            .map_err(find_datafusion_root)
-            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            let delete_plan = self
+                .accelerator
+                .delete_from(&session_state, vec![combined])
+                .await
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
             collect(delete_plan, ctx.task_ctx())
                 .await
                 .map_err(find_datafusion_root)
@@ -324,20 +344,6 @@ impl RefreshTask {
 
         Ok(())
     }
-}
-
-fn get_primary_key_log_fmt(
-    data: &RecordBatch,
-    primary_keys: &[String],
-) -> crate::accelerated_table::Result<String> {
-    primary_keys
-        .iter()
-        .map(|key| {
-            let (value, _) = get_primary_key_value(data, key)?;
-            Ok(format!("{key}={value}"))
-        })
-        .collect::<crate::accelerated_table::Result<Vec<String>>>()
-        .map(|keys| keys.join(", "))
 }
 
 pub(crate) fn get_primary_key_value(
@@ -375,30 +381,46 @@ pub(crate) fn get_primary_key_value(
 /// Returns a vector of (`operation_type`, `row_indices`) tuples
 #[must_use]
 fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationType, Vec<usize>)> {
-    if change_batch.record.num_rows() == 0 {
+    let num_rows = change_batch.record.num_rows();
+    if num_rows == 0 {
         return vec![];
     }
+
+    // Extract data batch and PK column indices once, instead of per-row.
+    let data_batch = change_batch.data_batch();
+    let pk_column_names = change_batch.primary_keys(0);
+    let pk_col_indices: Vec<usize> = pk_column_names
+        .iter()
+        .filter_map(|name| data_batch.schema().index_of(name).ok())
+        .collect();
 
     let mut sub_batches = Vec::new();
     let mut current_batch_indices = Vec::new();
     let mut current_op_type: Option<ChangeOperationType> = None;
     let mut seen_primary_keys: HashSet<String> = HashSet::new();
 
-    for row_id in 0..change_batch.record.num_rows() {
-        let row = change_batch.data(row_id);
+    for row_id in 0..num_rows {
         let op = change_batch.op(row_id);
         let op_type = ChangeOperationType::from_operation(&op);
-        let primary_keys_columns = change_batch.primary_keys(row_id);
-        let primary_keys = match get_primary_key_log_fmt(&row, &primary_keys_columns) {
-            Ok(pk) => pk,
-            Err(e) => {
-                tracing::error!("Failed to get primary key log format for row {row_id}: {e}");
-                continue;
-            }
+
+        // Build PK string directly from column arrays — no per-row RecordBatch allocation.
+        // If there are no PK columns (e.g., Kafka append-only), skip dedup tracking entirely.
+        let has_pks = !pk_col_indices.is_empty();
+        let primary_keys = if has_pks {
+            pk_col_indices
+                .iter()
+                .filter_map(|&col_idx| {
+                    arrow::util::display::array_value_to_string(data_batch.column(col_idx), row_id)
+                        .ok()
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            String::new()
         };
 
         let should_split = if let Some(current_type) = current_op_type {
-            current_type != op_type || (seen_primary_keys.contains(&primary_keys))
+            current_type != op_type || (has_pks && seen_primary_keys.contains(&primary_keys))
         } else {
             false
         };
@@ -418,7 +440,9 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
         }
 
         current_batch_indices.push(row_id);
-        seen_primary_keys.insert(primary_keys);
+        if has_pks {
+            seen_primary_keys.insert(primary_keys);
+        }
     }
 
     if !current_batch_indices.is_empty()
@@ -539,7 +563,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
-    use data_components::delete::DeletionTableProviderAdapter;
     use datafusion::datasource::TableProvider;
 
     use std::sync::Arc;
@@ -879,8 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_change_delete_returns_data_written() {
-        let adapter = Arc::new(DeletionTableProviderAdapter::new(make_mem_table()));
-        let task = make_refresh_task(adapter as Arc<dyn TableProvider>);
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let change_batch =
             create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
         assert_eq!(
@@ -902,5 +924,51 @@ mod tests {
                 .expect("write_change should succeed"),
             WriteChangeResult::NoChange
         );
+    }
+
+    #[test]
+    fn test_group_into_sub_batches_no_pks_single_batch() {
+        let batch = create_test_change_batch(
+            vec!["c", "c", "c"],
+            &[vec![], vec![], vec![]],
+            vec![1, 2, 3],
+            vec![Some("a"), Some("b"), Some("c")],
+        );
+
+        let result = group_into_sub_batches(&batch);
+
+        // No PKs + all same op → 1 sub-batch with all rows
+        assert_eq!(result.len(), 1, "Should produce 1 sub-batch when no PKs");
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(result[0].1, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_group_into_sub_batches_no_pks_mixed_ops() {
+        // Mixed ops with no PKs: should split only on op type boundaries
+        let ops = vec!["c", "c", "c", "d", "d", "c", "c"];
+        let primary_keys: Vec<Vec<&str>> = vec![vec![]; 7];
+        let ids = vec![1, 2, 3, 4, 5, 6, 7];
+        let names = vec![
+            Some("a"),
+            Some("b"),
+            Some("c"),
+            Some("d"),
+            Some("e"),
+            Some("f"),
+            Some("g"),
+        ];
+        let batch = create_test_change_batch(ops, &primary_keys, ids, names);
+
+        let result = group_into_sub_batches(&batch);
+
+        // Should split into 3 groups: [c,c,c], [d,d], [c,c]
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(result[0].1.len(), 3);
+        assert_eq!(result[1].0, ChangeOperationType::Delete);
+        assert_eq!(result[1].1.len(), 2);
+        assert_eq!(result[2].0, ChangeOperationType::Upsert);
+        assert_eq!(result[2].1.len(), 2);
     }
 }

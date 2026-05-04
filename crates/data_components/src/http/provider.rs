@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::json_nest::{HttpJsonNesting, decompose_json_row};
+use crate::rate_limit::RateLimiter;
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -40,14 +42,16 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
     Client,
-    header::{CACHE_CONTROL, HeaderMap},
+    header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
+use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::{
     any::Any,
     borrow::ToOwned,
     fmt,
+    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -69,6 +73,9 @@ pub enum Error {
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
+    #[snafu(display("HTTP request was rate limited: {message}"))]
+    RateLimited { message: String },
+
     #[snafu(display(
         "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
     ))]
@@ -88,6 +95,12 @@ pub enum Error {
 
     #[snafu(display("HTTP provider configuration error: {message}"))]
     Configuration { message: String },
+
+    #[snafu(display("HTTP pagination error: {message}"))]
+    Pagination { message: String },
+
+    #[snafu(display("Failed to decompose HTTP response row into declared columns: {source}"))]
+    JsonNesting { source: super::json_nest::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -109,13 +122,20 @@ impl From<Error> for DataFusionError {
                     "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
                 ))))
             }
+            Error::RateLimited { message } => DataFusionError::External(Box::new(
+                std::io::Error::other(format!("HTTP request was rate limited: {message}")),
+            )),
             // All other errors are internal/external errors
             Error::HttpRequest { source } => DataFusionError::External(Box::new(source)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
+            err @ Error::JsonNesting { .. } => DataFusionError::External(Box::new(err)),
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
+            }
+            Error::Pagination { message } => {
+                DataFusionError::External(Box::new(std::io::Error::other(message)))
             }
         }
     }
@@ -123,8 +143,79 @@ impl From<Error> for DataFusionError {
 
 pub const DEFAULT_MAX_QUERY_LENGTH: usize = 1024;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
+pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
+pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
-type PartitionSpec = (Option<String>, Option<String>, Option<String>);
+pub type PartitionSpec = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Configuration for paginated HTTP API requests.
+///
+/// Supports three modes:
+/// - **URL mode**: The response body (via `next_pointer`) or HTTP `Link` header contains
+///   the full URL for the next page.
+/// - **Token mode**: The response contains a cursor/token (via `next_pointer`) that is
+///   passed as a query parameter (specified by `token_param`) in the next request.
+/// - **Query-parameter mode**: The client drives pagination by expanding a template
+///   (`query_params`) with `{offset}`, `{limit}`, and `{page}` variables, stopping
+///   when a page returns fewer rows than `page_size`.
+#[derive(Clone, Debug)]
+pub struct PaginationConfig {
+    /// JSON pointer (RFC 6901) to the next page URL or cursor in the response body.
+    /// Example: `/next`, `/pagination/cursor`, `/links/next`
+    pub next_pointer: Option<String>,
+
+    /// Use the HTTP `Link` header with `rel="next"` for pagination. Default: `true`.
+    /// Set to `false` to disable Link header auto-detection.
+    pub use_link_header: bool,
+
+    /// When set, the value from `next_pointer` is treated as a cursor/token
+    /// and passed as this query parameter name in subsequent requests.
+    /// When not set, the value is treated as a full URL.
+    pub token_param: Option<String>,
+
+    /// JSON pointer (RFC 6901) to the data array in each page's response.
+    /// Example: `/data`, `/results`, `/items`
+    /// When set, only the array at this path is returned as data rows.
+    pub data_pointer: Option<String>,
+
+    /// Maximum number of pages to fetch. Default: 100
+    pub max_pages: usize,
+
+    /// When `true`, if the data at `data_pointer` (or the top-level response) is a JSON
+    /// object/map, extract its values as rows instead of treating it as a single row.
+    pub data_map_to_array: bool,
+
+    /// Query parameter template for client-driven pagination.
+    /// Supports `{offset}`, `{limit}`, and `{page}` variables.
+    /// Example: `"offset={offset}&limit={limit}"`
+    /// Requires `page_size` to be set.
+    pub query_params: Option<String>,
+
+    /// Number of items per page for query-parameter pagination.
+    /// Used to expand `{limit}` in `query_params` and to detect the last page
+    /// (fewer results than `page_size` means done).
+    pub page_size: Option<usize>,
+}
+
+impl Default for PaginationConfig {
+    fn default() -> Self {
+        Self {
+            next_pointer: None,
+            use_link_header: true,
+            token_param: None,
+            data_pointer: None,
+            max_pages: DEFAULT_PAGINATION_MAX_PAGES,
+            data_map_to_array: false,
+            query_params: None,
+            page_size: None,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct CachedResponse {
@@ -146,14 +237,28 @@ impl CachedResponse {
     }
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum RequestFilterKind {
+    Path,
+    Query,
+    Body,
+    Headers,
+}
+
 #[derive(Default)]
 struct PartitionAccumulator {
     paths: HashSet<String>,
     queries: Vec<Option<String>>,
     bodies: Vec<Option<String>>,
-    has_path_filter: bool,
-    has_query_filter: bool,
-    has_body_filter: bool,
+    headers: Vec<Option<String>>,
+    seen_filters: HashSet<RequestFilterKind>,
+}
+
+struct PartitionValues {
+    paths: Vec<String>,
+    queries: Vec<Option<String>>,
+    bodies: Vec<Option<String>>,
+    headers: Vec<Option<String>>,
 }
 
 impl PartitionAccumulator {
@@ -161,9 +266,13 @@ impl PartitionAccumulator {
         Self::default()
     }
 
+    fn has_filter(&self, kind: RequestFilterKind) -> bool {
+        self.seen_filters.contains(&kind)
+    }
+
     fn record_path(&mut self, value: String) {
         self.paths.insert(value);
-        self.has_path_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Path);
     }
 
     fn record_query(&mut self, value: String) {
@@ -171,7 +280,7 @@ impl PartitionAccumulator {
         if !self.queries.contains(&entry) {
             self.queries.push(entry);
         }
-        self.has_query_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Query);
     }
 
     fn record_body(&mut self, value: String) {
@@ -179,11 +288,24 @@ impl PartitionAccumulator {
         if !self.bodies.contains(&entry) {
             self.bodies.push(entry);
         }
-        self.has_body_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Body);
     }
 
-    fn finalize(mut self) -> (Vec<String>, Vec<Option<String>>, Vec<Option<String>>) {
-        let mut paths: Vec<String> = if self.has_path_filter {
+    fn record_headers(&mut self, value: String) {
+        let entry = Some(value);
+        if !self.headers.contains(&entry) {
+            self.headers.push(entry);
+        }
+        self.seen_filters.insert(RequestFilterKind::Headers);
+    }
+
+    fn finalize(mut self) -> PartitionValues {
+        let has_path_filter = self.has_filter(RequestFilterKind::Path);
+        let has_query_filter = self.has_filter(RequestFilterKind::Query);
+        let has_body_filter = self.has_filter(RequestFilterKind::Body);
+        let has_header_filter = self.has_filter(RequestFilterKind::Headers);
+
+        let mut paths: Vec<String> = if has_path_filter {
             self.paths.into_iter().collect()
         } else {
             vec![String::new()]
@@ -191,13 +313,52 @@ impl PartitionAccumulator {
         // Sort paths for deterministic ordering
         paths.sort();
 
-        if !self.has_query_filter {
+        if !has_query_filter {
             self.queries.push(None);
         }
-        if !self.has_body_filter {
+        if !has_body_filter {
             self.bodies.push(None);
         }
-        (paths, self.queries, self.bodies)
+        if !has_header_filter {
+            self.headers.push(None);
+        }
+        PartitionValues {
+            paths,
+            queries: self.queries,
+            bodies: self.bodies,
+            headers: self.headers,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequestFilterOptions {
+    enabled_filters: HashSet<RequestFilterKind>,
+    max_query_length: usize,
+    max_body_bytes: usize,
+    max_headers_length: usize,
+    allowed_headers: HashSet<HeaderName>,
+}
+
+impl Default for RequestFilterOptions {
+    fn default() -> Self {
+        Self {
+            enabled_filters: HashSet::new(),
+            max_query_length: DEFAULT_MAX_QUERY_LENGTH,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_headers_length: DEFAULT_MAX_HEADERS_LENGTH,
+            allowed_headers: HashSet::new(),
+        }
+    }
+}
+
+impl RequestFilterOptions {
+    fn enable(&mut self, kind: RequestFilterKind) {
+        self.enabled_filters.insert(kind);
+    }
+
+    fn is_enabled(&self, kind: RequestFilterKind) -> bool {
+        self.enabled_filters.contains(&kind)
     }
 }
 
@@ -219,6 +380,41 @@ impl HttpFetchResult {
     }
 }
 
+enum CacheWriteMode {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct CacheKey {
+    path: String,
+    query: Option<String>,
+    body: Option<String>,
+    request_headers: Option<String>,
+}
+
+impl CacheKey {
+    fn new(
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Self {
+        Self {
+            path: path.to_string(),
+            query: query.map(ToString::to_string),
+            body: body.map(ToString::to_string),
+            request_headers: request_headers.map(ToString::to_string),
+        }
+    }
+
+    fn redacted_label(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        format!("http-cache-key:{:016x}", hasher.finish())
+    }
+}
+
 /// A table provider that fetches data from HTTP endpoints based on path and query filters
 #[derive(Clone)]
 pub struct HttpTableProvider {
@@ -227,17 +423,23 @@ pub struct HttpTableProvider {
     file_format: String,
     schema: SchemaRef,
     constraints: Constraints,
-    cache: Arc<RwLock<HashMap<String, CachedResponse>>>,
+    cache: Arc<RwLock<HashMap<CacheKey, CachedResponse>>>,
     acceleration_enabled: bool,
     retry_strategy: RetryBackoff,
     content_type: Option<String>,
     custom_headers: HeaderMap,
     allowed_paths: Option<(GlobSet, Vec<String>)>,
-    allow_query_filters: bool,
-    max_query_length: usize,
-    allow_body_filters: bool,
-    max_body_bytes: usize,
+    request_filter_options: RequestFilterOptions,
+    max_request_partitions: Option<usize>,
     health_probe: Option<String>,
+    pagination: Option<PaginationConfig>,
+    auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
+    rate_limiter: Option<Arc<dyn RateLimiter>>,
+    rate_controller: Option<Arc<RateController>>,
+    /// When set, JSON response rows are decomposed into the declared
+    /// static columns plus a catch-all JSON column. Schema is replaced
+    /// with the user-declared columns (all `Utf8`).
+    json_nesting: Option<HttpJsonNesting>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -246,6 +448,7 @@ impl std::fmt::Debug for HttpTableProvider {
             .field("base_url", &self.base_url)
             .field("file_format", &self.file_format)
             .field("acceleration_enabled", &self.acceleration_enabled)
+            .field("pagination", &self.pagination)
             .finish_non_exhaustive()
     }
 }
@@ -276,12 +479,43 @@ impl HttpTableProvider {
             content_type: None,
             custom_headers: HeaderMap::new(),
             allowed_paths: None,
-            allow_query_filters: false,
-            max_query_length: DEFAULT_MAX_QUERY_LENGTH,
-            allow_body_filters: false,
-            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            request_filter_options: RequestFilterOptions::default(),
+            max_request_partitions: None,
             health_probe: None,
+            pagination: None,
+            auth: None,
+            rate_limiter: None,
+            rate_controller: None,
+            json_nesting: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_rate_limiter(mut self, rate_limiter: Option<Arc<dyn RateLimiter>>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Option<Arc<RateController>>) -> Self {
+        self.rate_controller = rate_controller;
+        self
+    }
+
+    /// Configure JSON schema decomposition. Replaces the provider's
+    /// schema with one built from the user-declared columns (all
+    /// `Utf8`, nullable). Each scanned JSON response row is decomposed
+    /// at query time via [`decompose_json_row`].
+    #[must_use]
+    pub fn with_json_nesting(mut self, nesting: HttpJsonNesting) -> Self {
+        let fields: Vec<Field> = nesting
+            .column_order
+            .iter()
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .collect();
+        self.schema = Arc::new(Schema::new(fields));
+        self.json_nesting = Some(nesting);
+        self
     }
 
     pub fn with_allowed_paths<I, S>(mut self, paths: I) -> Result<Self>
@@ -337,15 +571,67 @@ impl HttpTableProvider {
 
     #[must_use]
     pub fn enable_query_filters(mut self, max_length: usize) -> Self {
-        self.allow_query_filters = true;
-        self.max_query_length = max_length.min(DEFAULT_MAX_QUERY_LENGTH * 4);
+        self.request_filter_options.enable(RequestFilterKind::Query);
+        self.request_filter_options.max_query_length = max_length.min(DEFAULT_MAX_QUERY_LENGTH * 4);
         self
     }
 
     #[must_use]
     pub fn enable_body_filters(mut self, max_bytes: usize) -> Self {
-        self.allow_body_filters = true;
-        self.max_body_bytes = max_bytes.min(DEFAULT_MAX_BODY_BYTES * 4);
+        self.request_filter_options.enable(RequestFilterKind::Body);
+        self.request_filter_options.max_body_bytes = max_bytes.min(DEFAULT_MAX_BODY_BYTES * 4);
+        self
+    }
+
+    pub fn enable_header_filters<I, S>(mut self, max_length: usize, header_names: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut allowed_headers = HashSet::new();
+        for header_name in header_names {
+            let raw = header_name.as_ref().trim();
+            ensure!(
+                !raw.is_empty(),
+                ConfigurationSnafu {
+                    message: "request_header_allowlist entries cannot be empty".to_string()
+                }
+            );
+            let parsed = HeaderName::try_from(raw).map_err(|e| Error::Configuration {
+                message: format!("Invalid request_header_allowlist entry '{raw}': {e}"),
+            })?;
+            ensure!(
+                !(self.auth.is_some() && parsed == AUTHORIZATION),
+                ConfigurationSnafu {
+                    message: "request_header_allowlist cannot include 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_header_allowlist or disable HTTP authentication.".to_string()
+                }
+            );
+            allowed_headers.insert(parsed);
+        }
+
+        ensure!(
+            !allowed_headers.is_empty(),
+            ConfigurationSnafu {
+                message: "request_header_filters requires request_header_allowlist to contain at least one header name".to_string()
+            }
+        );
+
+        self.request_filter_options
+            .enable(RequestFilterKind::Headers);
+        self.request_filter_options.max_headers_length =
+            max_length.min(DEFAULT_MAX_HEADERS_LENGTH * 4);
+        self.request_filter_options.allowed_headers = allowed_headers;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.max_request_partitions
+    }
+
+    #[must_use]
+    pub fn with_max_request_partitions(mut self, max_request_partitions: Option<usize>) -> Self {
+        self.max_request_partitions = max_request_partitions;
         self
     }
 
@@ -404,6 +690,21 @@ impl HttpTableProvider {
         self
     }
 
+    /// Read-only access to the currently configured custom headers.
+    #[must_use]
+    pub fn custom_headers(&self) -> &HeaderMap {
+        &self.custom_headers
+    }
+
+    /// Attach an [`HttpAuthenticator`](super::auth::HttpAuthenticator) that decorates
+    /// every outgoing data request (e.g. to apply a bearer token refreshed in the
+    /// background by [`RefreshTokenAuth`](super::auth::RefreshTokenAuth)).
+    #[must_use]
+    pub fn with_auth(mut self, auth: Arc<dyn super::auth::HttpAuthenticator>) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
     pub fn with_health_probe(mut self, health_probe: Option<String>) -> Result<Self> {
         if let Some(ref path) = health_probe {
             // Basic validation for health probe path
@@ -428,12 +729,89 @@ impl HttpTableProvider {
         Ok(self)
     }
 
+    /// Configure pagination for this HTTP table provider.
+    ///
+    /// At least one of `next_pointer`, `use_link_header`, or `query_params` must be set.
+    pub fn with_pagination(mut self, config: PaginationConfig) -> Result<Self> {
+        if let Some(ref template) = config.query_params {
+            // Query-param pagination mode
+            if config.page_size.is_none() || config.page_size == Some(0) {
+                return Err(Error::Configuration {
+                    message:
+                        "pagination_query_params requires pagination_page_size to be set (and > 0)."
+                            .to_string(),
+                });
+            }
+            if config.next_pointer.is_some() || config.token_param.is_some() {
+                return Err(Error::Configuration {
+                    message: "pagination_query_params is mutually exclusive with pagination_next_pointer and pagination_token_param.".to_string(),
+                });
+            }
+            if !template.contains("{offset}") && !template.contains("{page}") {
+                return Err(Error::Configuration {
+                    message: "pagination_query_params must contain at least one pagination variable ({offset} or {page}) to advance between pages.".to_string(),
+                });
+            }
+        } else {
+            if config.page_size.is_some() {
+                return Err(Error::Configuration {
+                    message:
+                        "pagination_page_size requires pagination_query_params to be configured."
+                            .to_string(),
+                });
+            }
+            if config.next_pointer.is_none() && !config.use_link_header {
+                return Err(Error::Configuration {
+                    message: "Pagination requires either 'pagination_next_pointer', 'pagination_link_header', or 'pagination_query_params' to be configured.".to_string(),
+                });
+            } else if config.token_param.is_some() && config.next_pointer.is_none() {
+                return Err(Error::Configuration {
+                    message: "Pagination 'pagination_token_param' requires 'pagination_next_pointer' to be configured.".to_string(),
+                });
+            }
+        }
+        ensure!(
+            config.max_pages > 0,
+            ConfigurationSnafu {
+                message: "pagination_max_pages must be greater than 0".to_string()
+            }
+        );
+        if let Some(ref pointer) = config.next_pointer {
+            ensure!(
+                pointer.starts_with('/'),
+                ConfigurationSnafu {
+                    message: format!(
+                        "pagination_next_pointer must be a valid JSON Pointer starting with '/': got '{pointer}'"
+                    )
+                }
+            );
+        }
+        if let Some(ref pointer) = config.data_pointer {
+            ensure!(
+                pointer.starts_with('/'),
+                ConfigurationSnafu {
+                    message: format!(
+                        "pagination_data_pointer must be a valid JSON Pointer starting with '/': got '{pointer}'"
+                    )
+                }
+            );
+        }
+        self.pagination = Some(config);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn is_paginated(&self) -> bool {
+        self.pagination.is_some()
+    }
+
     #[must_use]
     pub fn base_table_schema() -> Schema {
         Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
+            Field::new("request_headers", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
             Field::new("response_status", DataType::UInt16, false),
             Field::new(
@@ -460,13 +838,13 @@ impl HttpTableProvider {
     }
 
     /// Extract path and query from filters
-    fn get_cache_key(path: &str, query: Option<&str>, body: Option<&str>) -> String {
-        format!(
-            "{}?{}&body={}",
-            path,
-            query.unwrap_or(""),
-            body.unwrap_or("")
-        )
+    fn get_cache_key(
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> CacheKey {
+        CacheKey::new(path, query, body, request_headers)
     }
 
     /// Validates the HTTP endpoint by attempting a request to a custom health probe path if configured,
@@ -479,7 +857,7 @@ impl HttpTableProvider {
             test_url.set_path(health_probe_path);
             test_url
         } else {
-            use rand::Rng;
+            use rand::RngExt;
             use rand::distr::Alphanumeric;
 
             // Generate a random path that should return 404
@@ -497,8 +875,12 @@ impl HttpTableProvider {
 
         tracing::debug!("Validating HTTP endpoint: {test_url}");
 
+        let _rate_control_permit = self.acquire_rate_control_permit().await?;
+
         match self.client.get(test_url.clone()).send().await {
             Ok(response) => {
+                self.update_rate_limiter_from_headers(response.headers())
+                    .await;
                 let status = response.status();
                 if self.health_probe.is_some() {
                     tracing::debug!(
@@ -655,14 +1037,44 @@ impl HttpTableProvider {
         Ok(url)
     }
 
+    async fn acquire_rate_control_permit(&self) -> Result<Option<Permit>> {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter
+                .check_rate_limit()
+                .await
+                .map_err(|e| Error::RateLimited {
+                    message: e.to_string(),
+                })?;
+        }
+
+        if let Some(rate_controller) = &self.rate_controller {
+            return rate_controller
+                .acquire()
+                .await
+                .map(Some)
+                .map_err(|e| Error::RateLimited {
+                    message: e.to_string(),
+                });
+        }
+
+        Ok(None)
+    }
+
+    async fn update_rate_limiter_from_headers(&self, headers: &HeaderMap) {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter.update_from_headers(headers).await;
+        }
+    }
+
     async fn cache_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
         result: &HttpFetchResult,
     ) {
-        let cache_key = Self::get_cache_key(path, query, body);
+        let cache_key = Self::get_cache_key(path, query, body, request_headers);
         let cached_response = CachedResponse {
             content: Arc::new(result.content.clone()),
             cached_at: SystemTime::now(),
@@ -681,23 +1093,32 @@ impl HttpTableProvider {
         &self,
         url: Url,
         body: Option<&str>,
+        request_headers: Option<&HeaderMap>,
         path_label: &str,
     ) -> Result<HttpFetchResult> {
         let retry_strategy = self.retry_strategy.clone();
         let this = self.clone();
         let url_clone = url.clone();
         let body_owned = body.map(ToOwned::to_owned);
+        let request_headers_owned = request_headers.cloned();
         let path_owned = path_label.to_string();
 
         let result = retry(retry_strategy, || {
             let this = this.clone();
             let url = url_clone.clone();
             let body = body_owned.clone();
+            let request_headers = request_headers_owned.clone();
             let path = path_owned.clone();
 
             async move {
-                this.perform_single_request(&url, body.as_deref(), &path, false)
-                    .await
+                this.perform_single_request(
+                    &url,
+                    body.as_deref(),
+                    request_headers.as_ref(),
+                    &path,
+                    false,
+                )
+                .await
             }
         })
         .await;
@@ -711,7 +1132,7 @@ impl HttpTableProvider {
             tracing::debug!(
                 "Retries exhausted for {url}, making final attempt accepting any status"
             );
-            self.perform_single_request(&url, body, path_label, true)
+            self.perform_single_request(&url, body, request_headers, path_label, true)
                 .await
                 .map_err(|e| match e {
                     RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
@@ -736,9 +1157,15 @@ impl HttpTableProvider {
         &self,
         url: &Url,
         body: Option<&str>,
+        request_headers: Option<&HeaderMap>,
         path_label: &str,
         accept_retryable: bool,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        let _rate_control_permit = self
+            .acquire_rate_control_permit()
+            .await
+            .map_err(RetryError::transient)?;
+
         let mut request_builder = if let Some(body_content) = body {
             let mut req = self.client.post(url.clone());
             let ct = self.content_type.as_deref().unwrap_or("application/json");
@@ -748,8 +1175,22 @@ impl HttpTableProvider {
             self.client.get(url.clone())
         };
 
-        for (name, value) in &self.custom_headers {
-            request_builder = request_builder.header(name, value);
+        if let Some(request_headers) = request_headers {
+            let mut merged_headers = self.custom_headers.clone();
+            for (name, value) in request_headers {
+                merged_headers.insert(name.clone(), value.clone());
+            }
+            for (name, value) in &merged_headers {
+                request_builder = request_builder.header(name, value);
+            }
+        } else {
+            for (name, value) in &self.custom_headers {
+                request_builder = request_builder.header(name, value);
+            }
+        }
+
+        if let Some(auth) = self.auth.as_ref() {
+            request_builder = auth.apply(request_builder);
         }
 
         let response = request_builder.send().await.map_err(|e| {
@@ -758,6 +1199,9 @@ impl HttpTableProvider {
         })?;
 
         let status_code = response.status().as_u16();
+        let response_headers = response.headers().clone();
+        self.update_rate_limiter_from_headers(&response_headers)
+            .await;
 
         // 5xx/429: retry with backoff (transient server issue or rate limiting)
         // After retries exhausted, we'll accept the response as valid data.
@@ -835,26 +1279,39 @@ impl HttpTableProvider {
         })
     }
 
-    async fn fetch_and_cache(
+    async fn fetch_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
+        cache_write_mode: CacheWriteMode,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
         let query_owned = query.map(ToOwned::to_owned);
         let body_owned = body.map(ToOwned::to_owned);
+        let request_headers_owned = request_headers.map(ToOwned::to_owned);
+        let parsed_request_headers = request_headers_owned
+            .as_deref()
+            .map(|headers| self.parse_request_headers(headers))
+            .transpose()?;
 
         let fetch_result = self
-            .perform_request_with_retry(url, body_owned.as_deref(), &path_owned)
+            .perform_request_with_retry(
+                url,
+                body_owned.as_deref(),
+                parsed_request_headers.as_ref(),
+                &path_owned,
+            )
             .await?;
 
-        if fetch_result.should_cache() {
+        if matches!(cache_write_mode, CacheWriteMode::Enabled) && fetch_result.should_cache() {
             self.cache_response(
                 &path_owned,
                 query_owned.as_deref(),
                 body_owned.as_deref(),
+                request_headers_owned.as_deref(),
                 &fetch_result,
             )
             .await;
@@ -863,18 +1320,32 @@ impl HttpTableProvider {
         Ok(fetch_result)
     }
 
+    async fn fetch_and_cache(
+        &self,
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Result<HttpFetchResult> {
+        self.fetch_response(path, query, body, request_headers, CacheWriteMode::Enabled)
+            .await
+    }
+
     async fn get_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
     ) -> Result<HttpFetchResult> {
-        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it
+        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
-            return self.fetch_and_cache(path, query, body).await;
+            return self
+                .fetch_response(path, query, body, request_headers, CacheWriteMode::Disabled)
+                .await;
         }
 
-        let cache_key = Self::get_cache_key(path, query, body);
+        let cache_key = Self::get_cache_key(path, query, body, request_headers);
 
         // Try to get from cache
         let cached = {
@@ -885,14 +1356,17 @@ impl HttpTableProvider {
         if let Some(cached_response) = cached
             && cached_response.is_fresh()
         {
-            if let Some(ref format) = cached_response.detected_format {
-                tracing::debug!(
-                    "Returning fresh cached content for {} (detected format: {})",
-                    cache_key,
-                    format
-                );
-            } else {
-                tracing::debug!("Returning fresh cached content for {}", cache_key);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let cache_key_label = cache_key.redacted_label();
+                if let Some(ref format) = cached_response.detected_format {
+                    tracing::debug!(
+                        "Returning fresh cached content for {} (detected format: {})",
+                        cache_key_label,
+                        format
+                    );
+                } else {
+                    tracing::debug!("Returning fresh cached content for {}", cache_key_label);
+                }
             }
             return Ok(HttpFetchResult {
                 content: (*cached_response.content).clone(),
@@ -905,7 +1379,8 @@ impl HttpTableProvider {
         }
 
         // Fetch fresh content
-        self.fetch_and_cache(path, query, body).await
+        self.fetch_and_cache(path, query, body, request_headers)
+            .await
     }
 
     fn get_projected_schema(
@@ -914,8 +1389,14 @@ impl HttpTableProvider {
     ) -> DataFusionResult<SchemaRef> {
         let mut projected_schema = project_schema(schema, projection)?;
         if projected_schema.fields.is_empty() {
-            let idx = schema.index_of("content")?;
-            projected_schema = SchemaRef::from(schema.project(&[idx])?);
+            // Fall back to a single column so downstream operators
+            // (e.g. COUNT(*)) have something to scan. Prefer `content`
+            // for the default schema; otherwise use the first field
+            // (e.g. when `with_json_nesting` has replaced the schema).
+            let idx = schema.index_of("content").unwrap_or(0);
+            if !schema.fields.is_empty() {
+                projected_schema = SchemaRef::from(schema.project(&[idx])?);
+            }
         }
         Ok(projected_schema)
     }
@@ -1004,9 +1485,42 @@ pub struct HttpExec {
     partitions: Vec<PartitionSpec>,
     limit: Option<usize>,
     properties: PlanProperties,
+    /// When `true`, the partitions are a template that will be expanded
+    /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
+    deferred_partitions: bool,
 }
 
 impl HttpExec {
+    /// Returns the provider used by this exec.
+    #[must_use]
+    pub fn provider(&self) -> &Arc<HttpTableProvider> {
+        &self.provider
+    }
+
+    /// Returns the maximum number of request partitions allowed, if configured.
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.provider.max_request_partitions()
+    }
+
+    /// Returns the partition specs.
+    #[must_use]
+    pub fn partitions(&self) -> &[PartitionSpec] {
+        &self.partitions
+    }
+
+    /// Returns the limit.
+    #[must_use]
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Returns the projected schema.
+    #[must_use]
+    pub fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
     #[must_use]
     pub fn new(
         projected_schema: SchemaRef,
@@ -1026,7 +1540,83 @@ impl HttpExec {
             partitions,
             limit,
             properties,
+            deferred_partitions: false,
         }
+    }
+
+    /// Mark this `HttpExec` as having dynamic partitions that will be
+    /// expanded at runtime. Affects EXPLAIN display only.
+    #[must_use]
+    pub fn with_deferred_partitions(mut self) -> Self {
+        self.deferred_partitions = true;
+        self
+    }
+
+    /// Create a new `HttpExec` whose partitions are the cross-product of the
+    /// current partitions and the given `values`, injected into the column
+    /// identified by `col_name` (`request_path`, `request_query`,
+    /// `request_body`, or `request_headers`).
+    ///
+    /// Returns an error if the resulting partition count would exceed
+    /// `max_request_partitions`.
+    pub fn with_expanded_params(
+        &self,
+        col_name: &str,
+        values: &[String],
+    ) -> DataFusionResult<Self> {
+        let existing = &self.partitions;
+        let new_count = existing.len() * values.len();
+
+        if let Some(max) = self.max_request_partitions()
+            && new_count > max
+        {
+            return Err(DataFusionError::Plan(format!(
+                "HttpExec: expanding params would create {new_count} partitions (existing {} x {} values), which exceeds max_request_partitions={max}. Reduce the number of dynamic values or increase max_request_partitions.",
+                existing.len(),
+                values.len(),
+            )));
+        }
+
+        let mut new_partitions = Vec::with_capacity(new_count);
+
+        for partition in existing {
+            for value in values {
+                let mut p = partition.clone();
+                match col_name {
+                    "request_path" => {
+                        p.0 = Some(self.provider.ensure_allowed_path(value)?);
+                    }
+                    "request_query" => {
+                        p.1 = Some(self.provider.ensure_allowed_query(value)?);
+                    }
+                    "request_body" => {
+                        p.2 = Some(self.provider.ensure_allowed_body(value)?);
+                    }
+                    "request_headers" => {
+                        p.3 = Some(self.provider.ensure_allowed_headers(value)?);
+                    }
+                    other => {
+                        return Err(DataFusionError::Internal(format!(
+                            "HttpExec::with_expanded_params: unsupported column '{other}'. Expected one of: request_path, request_query, request_body, request_headers"
+                        )));
+                    }
+                }
+                new_partitions.push(p);
+            }
+        }
+
+        tracing::debug!(
+            "HttpExec::with_expanded_params: replacing partitions with {} (was {}) for column '{col_name}'",
+            new_partitions.len(),
+            existing.len(),
+        );
+
+        Ok(Self::new(
+            Arc::clone(&self.projected_schema),
+            Arc::clone(&self.provider),
+            new_partitions,
+            self.limit,
+        ))
     }
 
     async fn fetch_and_create_batch(
@@ -1034,60 +1624,90 @@ impl HttpExec {
         provider: &HttpTableProvider,
         partition: usize,
     ) -> DataFusionResult<RecordBatch> {
-        let (path, query, body) = &self.partitions[partition];
+        let (path, query, body, request_headers) = &self.partitions[partition];
 
         // Use the filter path or empty string (base URL only)
         let path_val = path.as_deref().unwrap_or("");
         let query_val = query.as_deref();
         let body_val = body.as_deref();
+        let request_headers_val = request_headers.as_deref();
 
         tracing::debug!(
-            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}",
+            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}, request_headers_present={}",
             partition,
             path_val,
             query_val,
-            body_val
+            body_val,
+            request_headers_val.is_some()
         );
 
         // Fetch content with path, query, and body
         let result = provider
-            .get_response(path_val, query_val, body_val)
+            .get_response(path_val, query_val, body_val, request_headers_val)
             .await
             .map_err(DataFusionError::from)?;
 
-        let HttpFetchResult {
-            content,
-            response_date,
-            response_status,
-            response_headers,
-            ..
-        } = result;
-
-        // Store the actual values from the partition for the primary key
-        let path_for_batch = path.as_deref().unwrap_or("");
-        let query_for_batch = query.as_deref().unwrap_or("");
-        let body_for_batch = body.as_deref().unwrap_or("");
-
-        tracing::debug!(
-            "Creating batch with request_path={:?}, content_len={}",
-            path_for_batch,
-            content.len()
-        );
-
         // Parse content to determine how many rows we'll create
-        let content_rows = Self::parse_content(&content, self.limit);
+        let map_to_array = provider
+            .pagination
+            .as_ref()
+            .is_some_and(|p| p.data_map_to_array);
+        let content_rows =
+            parse_content_with_map_to_array(&result.content, self.limit, map_to_array);
+
+        self.create_batch_from_rows(
+            path.as_deref(),
+            query.as_deref(),
+            body.as_deref(),
+            request_headers.as_deref(),
+            &content_rows,
+            &result,
+        )
+    }
+
+    /// Create a `RecordBatch` from pre-parsed content rows and HTTP response metadata.
+    fn create_batch_from_rows(
+        &self,
+        path: Option<&str>,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+        content_rows: &[String],
+        fetch_result: &HttpFetchResult,
+    ) -> DataFusionResult<RecordBatch> {
         let num_rows = content_rows.len();
 
         if num_rows == 0 {
-            tracing::warn!("No rows found in HTTP response for partition {}", partition);
-            return Err(DataFusionError::Execution(
-                "No rows found in HTTP response".to_string(),
-            ));
+            return RecordBatch::try_new(
+                Arc::clone(&self.projected_schema),
+                self.projected_schema
+                    .fields()
+                    .iter()
+                    .map(|f| arrow::array::new_empty_array(f.data_type()))
+                    .collect(),
+            )
+            .map_err(DataFusionError::from);
         }
 
-        // Create columns with the same number of rows
+        if let Some(nesting) = &self.provider.json_nesting {
+            return self.create_batch_from_rows_nested(content_rows, nesting);
+        }
+
+        // Store the actual values from the partition for the primary key
+        let path_for_batch = path.unwrap_or("");
+        let query_for_batch = query.unwrap_or("");
+        let body_for_batch = body.unwrap_or("");
+        let headers_for_batch = request_headers.unwrap_or("");
+
+        tracing::debug!(
+            "Creating batch with request_path={:?}, content_len={}, num_rows={}",
+            path_for_batch,
+            fetch_result.content.len(),
+            num_rows
+        );
+
         // Use response Date header if available, otherwise use current time
-        let timestamp_nanos = if let Some(date) = response_date {
+        let timestamp_nanos = if let Some(date) = fetch_result.response_date {
             i64::try_from(
                 date.duration_since(std::time::UNIX_EPOCH)
                     .map_err(|e| DataFusionError::Execution(format!("Invalid response date: {e}")))?
@@ -1118,10 +1738,17 @@ impl HttpExec {
                 "request_body" => {
                     Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
                 }
-                "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
-                "response_status" => {
-                    Ok(Arc::new(UInt16Array::from(vec![response_status; num_rows])) as ArrayRef)
+                "request_headers" => {
+                    Ok(Arc::new(StringArray::from(vec![headers_for_batch; num_rows])) as ArrayRef)
                 }
+                "content" => Ok(Arc::new(StringArray::from_iter_values(
+                    content_rows.iter().map(String::as_str),
+                )) as ArrayRef),
+                "response_status" => Ok(Arc::new(UInt16Array::from(vec![
+                    fetch_result
+                        .response_status;
+                    num_rows
+                ])) as ArrayRef),
                 "response_headers" => {
                     let mut builder = MapBuilder::new(
                         Some(MapFieldNames {
@@ -1133,7 +1760,7 @@ impl HttpExec {
                         StringBuilder::new(),
                     );
                     for _ in 0..num_rows {
-                        for (k, v) in &response_headers {
+                        for (k, v) in &fetch_result.response_headers {
                             builder.keys().append_value(k);
                             builder.values().append_value(v);
                         }
@@ -1160,6 +1787,63 @@ impl HttpExec {
         let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
             .map_err(DataFusionError::from)?;
         Ok(batch)
+    }
+
+    /// Create a `RecordBatch` for the user-declared columns by
+    /// decomposing each JSON response row according to the nesting
+    /// configuration. All output columns are `Utf8`.
+    ///
+    /// Fast path: when the catch-all column is not in the projected
+    /// schema we skip building the catch-all `BTreeMap` and re-
+    /// serializing it, which is the dominant cost for wide JSON rows.
+    /// Non-object rows still fall through to `decompose_json_row` so
+    /// static columns become NULL and no data is dropped.
+    fn create_batch_from_rows_nested(
+        &self,
+        content_rows: &[String],
+        nesting: &HttpJsonNesting,
+    ) -> DataFusionResult<RecordBatch> {
+        let fields = self.projected_schema.fields();
+        let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+        let catchall_projected = field_names.contains(&nesting.json_field_name.as_str());
+
+        let mut builders: Vec<StringBuilder> = std::iter::repeat_with(StringBuilder::new)
+            .take(fields.len())
+            .collect();
+
+        for row in content_rows {
+            if !catchall_projected
+                && let Ok(serde_json::Value::Object(obj)) =
+                    serde_json::from_str::<serde_json::Value>(row)
+            {
+                for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+                    match obj.get(*name) {
+                        None | Some(serde_json::Value::Null) => builder.append_null(),
+                        Some(serde_json::Value::String(s)) => builder.append_value(s),
+                        Some(other) => builder.append_value(other.to_string()),
+                    }
+                }
+                continue;
+            }
+
+            let decomposed = decompose_json_row(row, nesting).map_err(|source| {
+                DataFusionError::External(Box::new(Error::JsonNesting { source }))
+            })?;
+            for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+                match decomposed.get(*name).and_then(|v| v.as_deref()) {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+        }
+
+        let columns: Vec<ArrayRef> = builders
+            .into_iter()
+            .map(|mut b| Arc::new(b.finish()) as ArrayRef)
+            .collect();
+
+        RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
+            .map_err(DataFusionError::from)
     }
 
     /// Parse content into individual rows
@@ -1232,20 +1916,27 @@ impl DisplayAs for HttpExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "HttpExec: base_url={}, format={}, partitions=[",
+            "HttpExec: base_url={}, format={}, ",
             self.provider.base_url, self.provider.file_format
         )?;
 
-        for (i, (path, query, body)) in self.partitions.iter().enumerate() {
+        if self.deferred_partitions {
+            return write!(f, "partitions=deferred");
+        }
+
+        write!(f, "partitions=[")?;
+
+        for (i, (path, query, body, request_headers)) in self.partitions.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
             write!(
                 f,
-                "(path={:?}, query={:?}, body={:?})",
+                "(path={:?}, query={:?}, body={:?}, request_headers_present={})",
                 path.as_deref().unwrap_or(""),
                 query.as_deref().unwrap_or(""),
-                body.as_deref().unwrap_or("")
+                body.as_deref().unwrap_or(""),
+                request_headers.is_some()
             )?;
         }
 
@@ -1292,32 +1983,695 @@ impl ExecutionPlan for HttpExec {
         let provider = Arc::clone(&self.provider);
         let schema = Arc::clone(&self.projected_schema);
 
-        // Use futures::stream::once to create a stream from a single async operation
-        let stream = futures::stream::once(async move {
-            tracing::trace!("Fetching partition {}", partition);
-            let batch = exec.fetch_and_create_batch(&provider, partition).await?;
-            tracing::trace!(
-                "Yielding batch for partition {}: {} rows",
-                partition,
-                batch.num_rows()
-            );
-            Ok(batch)
-        });
+        if provider.is_paginated() {
+            let (path, query, body, request_headers) = self.partitions[partition].clone();
+            let limit = self.limit;
 
-        let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
-        Ok(Box::pin(stream_adapter))
+            let initial_state = PaginationState {
+                page: 0,
+                next_info: None,
+                rows_fetched: 0,
+                path,
+                query,
+                body,
+                request_headers,
+                limit,
+                done: false,
+                last_page_path: None,
+                last_page_query: None,
+            };
+
+            let stream = futures::stream::try_unfold(initial_state, move |mut state| {
+                let exec = Arc::clone(&exec);
+                let provider = Arc::clone(&provider);
+
+                async move {
+                    loop {
+                        if state.done {
+                            return Ok::<_, DataFusionError>(None);
+                        }
+
+                        let config = provider.pagination.as_ref().ok_or_else(|| {
+                            DataFusionError::Internal("Pagination config missing".to_string())
+                        })?;
+
+                        if state.page >= config.max_pages {
+                            tracing::warn!(
+                                "HTTP pagination reached the configured safety limit of {} pages. Increase `pagination_max_pages` to fetch additional pages.",
+                                config.max_pages
+                            );
+                            return Ok(None);
+                        }
+
+                        if let Some(limit) = state.limit
+                            && state.rows_fetched >= limit
+                        {
+                            return Ok(None);
+                        }
+
+                        let page_limit = state.limit.map(|l| l.saturating_sub(state.rows_fetched));
+
+                        // Fetch this page
+                        let fetch_result = if state.page == 0 {
+                            let path_val = state.path.as_deref().unwrap_or("");
+                            let body_val = state.body.as_deref();
+                            let merged_query = if let Some(ref template) = config.query_params {
+                                let page_size = config.page_size.unwrap_or(0);
+                                let expanded =
+                                    expand_query_params_template(template, 0, page_size)?;
+                                Some(merge_base_and_partition_queries_with_override(
+                                    provider.base_url.query(),
+                                    state.query.as_deref(),
+                                    &expanded,
+                                ))
+                            } else {
+                                merge_base_and_partition_queries(
+                                    provider.base_url.query(),
+                                    state.query.as_deref(),
+                                )
+                            };
+                            state.last_page_path = state.path.clone();
+                            state.last_page_query = merged_query.clone();
+                            provider
+                                .get_response(
+                                    path_val,
+                                    merged_query.as_deref(),
+                                    body_val,
+                                    state.request_headers.as_deref(),
+                                )
+                                .await
+                                .map_err(DataFusionError::from)?
+                        } else {
+                            let parsed_request_headers = state
+                                .request_headers
+                                .as_deref()
+                                .map(|headers| provider.parse_request_headers(headers))
+                                .transpose()
+                                .map_err(DataFusionError::from)?;
+
+                            // Subsequent pages bypass the HTTP cache intentionally:
+                            // each page has unique content that shouldn't be cached
+                            // under the same key as the base request.
+                            match &state.next_info {
+                                Some(NextPageInfo::Url(url)) => {
+                                    if let Some((globset, patterns)) = &provider.allowed_paths
+                                        && !globset.is_match(url.path())
+                                    {
+                                        return Err(DataFusionError::External(Box::new(
+                                            Error::Pagination {
+                                                message: format!(
+                                                    "Next page URL path '{}' does not match any allowed path patterns: [{}]. Update 'allowed_request_paths' to include a matching pattern.",
+                                                    url.path(),
+                                                    patterns
+                                                        .iter()
+                                                        .map(|p| format!("'{p}'"))
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                ),
+                                            },
+                                        )));
+                                    }
+                                    state.last_page_path = Some(url.path().to_string());
+                                    state.last_page_query = url.query().map(ToString::to_string);
+                                    provider
+                                        .perform_request_with_retry(
+                                            url.clone(),
+                                            state.body.as_deref(),
+                                            parsed_request_headers.as_ref(),
+                                            &format!("page_{}", state.page),
+                                        )
+                                        .await
+                                        .map_err(DataFusionError::from)?
+                                }
+                                Some(NextPageInfo::Token(token)) => {
+                                    let path_val = state.path.as_deref().unwrap_or("");
+                                    let token_param =
+                                        config.token_param.as_deref().unwrap_or("cursor");
+                                    let base_query = provider.base_url.query();
+                                    let merged_query = merge_queries(
+                                        base_query,
+                                        state.query.as_deref(),
+                                        token_param,
+                                        token,
+                                    );
+                                    state.last_page_path = state.path.clone();
+                                    state.last_page_query = Some(merged_query.clone());
+                                    let url = provider
+                                        .build_request_url(path_val, Some(&merged_query))
+                                        .map_err(DataFusionError::from)?;
+                                    provider
+                                        .perform_request_with_retry(
+                                            url,
+                                            state.body.as_deref(),
+                                            parsed_request_headers.as_ref(),
+                                            &format!("page_{}", state.page),
+                                        )
+                                        .await
+                                        .map_err(DataFusionError::from)?
+                                }
+                                Some(NextPageInfo::QueryParams { page }) => {
+                                    let path_val = state.path.as_deref().unwrap_or("");
+                                    let template = config.query_params.as_deref().unwrap_or("");
+                                    let page_size = config.page_size.unwrap_or(0);
+                                    let expanded =
+                                        expand_query_params_template(template, *page, page_size)?;
+                                    let merged_query =
+                                        merge_base_and_partition_queries_with_override(
+                                            provider.base_url.query(),
+                                            state.query.as_deref(),
+                                            &expanded,
+                                        );
+                                    state.last_page_path = state.path.clone();
+                                    state.last_page_query = Some(merged_query.clone());
+                                    let url = provider
+                                        .build_request_url(path_val, Some(&merged_query))
+                                        .map_err(DataFusionError::from)?;
+                                    provider
+                                        .perform_request_with_retry(
+                                            url,
+                                            state.body.as_deref(),
+                                            parsed_request_headers.as_ref(),
+                                            &format!("page_{}", state.page),
+                                        )
+                                        .await
+                                        .map_err(DataFusionError::from)?
+                                }
+                                None => {
+                                    return Err(DataFusionError::Internal(
+                                        "page > 0 but no next page info".to_string(),
+                                    ));
+                                }
+                            }
+                        };
+
+                        // Parse response JSON once for both next-page and data extraction
+                        let parsed_json = if config.next_pointer.is_some()
+                            || config.data_pointer.is_some()
+                        {
+                            Some(
+                                    serde_json::from_str::<serde_json::Value>(
+                                        &fetch_result.content,
+                                    )
+                                    .map_err(|source| {
+                                        let pointers: Vec<&str> = [
+                                            config.next_pointer.as_deref(),
+                                            config.data_pointer.as_deref(),
+                                        ]
+                                        .into_iter()
+                                        .flatten()
+                                        .collect();
+                                        DataFusionError::Execution(format!(
+                                            "Failed to parse paginated HTTP response as JSON for pointer(s) {pointers:?}: {source}"
+                                        ))
+                                    })?,
+                                )
+                        } else {
+                            None
+                        };
+
+                        // Extract next page info first (before checking rows)
+                        let next_info = extract_next_page_info(
+                            parsed_json.as_ref(),
+                            &fetch_result.response_headers,
+                            config,
+                            &provider.base_url,
+                            state.page,
+                        )
+                        .map_err(DataFusionError::from)?;
+
+                        // Extract data rows using data_pointer if configured
+                        let content_rows = extract_page_data(
+                            &fetch_result.content,
+                            parsed_json.as_ref(),
+                            config,
+                            page_limit,
+                        )?;
+
+                        // Update pagination state
+                        state.page += 1;
+                        state.next_info = next_info;
+                        if state.next_info.is_none() {
+                            state.done = true;
+                        }
+
+                        // Query-param pagination stop condition: fewer rows than page_size = last page
+                        if config.query_params.is_some()
+                            && config
+                                .page_size
+                                .is_some_and(|page_size| content_rows.len() < page_size)
+                        {
+                            state.done = true;
+                        }
+
+                        // Skip empty pages internally — loop again instead of yielding
+                        if content_rows.is_empty() {
+                            if state.done {
+                                return Ok(None);
+                            }
+                            continue;
+                        }
+
+                        let num_rows = content_rows.len();
+                        let batch = exec.create_batch_from_rows(
+                            state.last_page_path.as_deref(),
+                            state.last_page_query.as_deref(),
+                            state.body.as_deref(),
+                            state.request_headers.as_deref(),
+                            &content_rows,
+                            &fetch_result,
+                        )?;
+
+                        state.rows_fetched += num_rows;
+
+                        tracing::debug!(
+                            "Pagination page {}: {} rows fetched, total so far: {}",
+                            state.page - 1,
+                            num_rows,
+                            state.rows_fetched
+                        );
+
+                        return Ok(Some((batch, state)));
+                    }
+                }
+            });
+
+            let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
+            Ok(Box::pin(stream_adapter))
+        } else {
+            // Non-paginated: single fetch
+            let stream = futures::stream::once(async move {
+                tracing::trace!("Fetching partition {}", partition);
+                let batch = exec.fetch_and_create_batch(&provider, partition).await?;
+                tracing::trace!(
+                    "Yielding batch for partition {}: {} rows",
+                    partition,
+                    batch.num_rows()
+                );
+                Ok(batch)
+            });
+
+            let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
+            Ok(Box::pin(stream_adapter))
+        }
     }
 }
 
+// --- Pagination types and helpers ---
+
+#[derive(Clone, Debug)]
+enum NextPageInfo {
+    /// Full URL for the next page.
+    Url(Url),
+    /// Cursor/token to add as a query parameter.
+    Token(String),
+    /// Client-driven query-parameter pagination; carries the next page number.
+    QueryParams { page: usize },
+}
+
+struct PaginationState {
+    page: usize,
+    next_info: Option<NextPageInfo>,
+    rows_fetched: usize,
+    path: Option<String>,
+    query: Option<String>,
+    body: Option<String>,
+    request_headers: Option<String>,
+    limit: Option<usize>,
+    done: bool,
+    /// The actual path/query used for the most recent page fetch.
+    /// Used to populate accurate `request_path`/`request_query` columns.
+    last_page_path: Option<String>,
+    last_page_query: Option<String>,
+}
+
+/// Resolve a next-page URL string (absolute or relative) against the base URL
+/// and validate same-origin for SSRF protection.
+fn resolve_and_validate_url(raw: &str, base_url: &Url, context: &str) -> Result<Url> {
+    // Try absolute first, fall back to resolving relative against base
+    let resolved = Url::parse(raw)
+        .or_else(|_| base_url.join(raw))
+        .map_err(|e| Error::Pagination {
+            message: format!("Invalid next page URL in {context}: '{raw}': {e}"),
+        })?;
+    if resolved.origin() != base_url.origin() {
+        return Err(Error::Pagination {
+            message: format!(
+                "{context} URL origin '{}' does not match base URL origin '{}'. The next page URL must stay on the same origin.",
+                resolved.origin().ascii_serialization(),
+                base_url.origin().ascii_serialization(),
+            ),
+        });
+    }
+    Ok(resolved)
+}
+
+/// Extract the next page info from an HTTP response body and/or headers.
+///
+/// When `next_pointer` finds an explicit termination signal (null or empty string),
+/// pagination stops immediately. When the pointer path is missing from the response,
+/// we fall through to check the `Link` header (if configured) before giving up.
+///
+/// In query-params mode, always returns `QueryParams { page: current_page + 1 }`;
+/// the stop condition (row count < `page_size`) is checked separately in the loop.
+fn extract_next_page_info(
+    parsed_json: Option<&serde_json::Value>,
+    response_headers: &[(String, String)],
+    config: &PaginationConfig,
+    base_url: &Url,
+    current_page: usize,
+) -> Result<Option<NextPageInfo>> {
+    // Query-param pagination: always return next page; stop is checked by row count
+    if config.query_params.is_some() {
+        return Ok(Some(NextPageInfo::QueryParams {
+            page: current_page + 1,
+        }));
+    }
+
+    // Try response body JSON pointer first
+    if let Some(ref pointer) = config.next_pointer {
+        let parsed = parsed_json.ok_or_else(|| Error::Pagination {
+            message: format!("JSON not parsed but next_pointer '{pointer}' is configured"),
+        })?;
+
+        if let Some(value) = parsed.pointer(pointer) {
+            match value {
+                serde_json::Value::String(next_str) if !next_str.is_empty() => {
+                    if config.token_param.is_some() {
+                        return Ok(Some(NextPageInfo::Token(next_str.clone())));
+                    }
+                    let next_url = resolve_and_validate_url(
+                        next_str,
+                        base_url,
+                        &format!("JSON pointer '{pointer}'"),
+                    )?;
+                    return Ok(Some(NextPageInfo::Url(next_url)));
+                }
+                serde_json::Value::Number(n) => {
+                    // Numeric values (e.g. page numbers) are only valid in token mode.
+                    let token = n.to_string();
+                    if config.token_param.is_some() {
+                        return Ok(Some(NextPageInfo::Token(token)));
+                    }
+                    return PaginationSnafu {
+                        message: format!(
+                            "Failed to extract pagination value from JSON pointer '{pointer}': numeric values require 'pagination_token_param' to be configured"
+                        ),
+                    }
+                    .fail();
+                }
+                serde_json::Value::Null | serde_json::Value::String(_) => {
+                    // Null or empty string is an explicit end of pagination.
+                    return Ok(None);
+                }
+                _ => {
+                    return PaginationSnafu {
+                        message: format!(
+                            "Failed to extract pagination value from JSON pointer '{pointer}': expected a string, number, or null"
+                        ),
+                    }
+                    .fail();
+                }
+            }
+        }
+        // Pointer path not found in response — fall through to Link header
+        // (the API may not include the field on the last page)
+    }
+
+    // Try HTTP Link header with rel="next"
+    if config.use_link_header {
+        for (name, value) in response_headers {
+            if name.eq_ignore_ascii_case("link")
+                && let Some(next_url_str) = parse_link_header_next(value)
+            {
+                let next_url = resolve_and_validate_url(&next_url_str, base_url, "Link header")?;
+                return Ok(Some(NextPageInfo::Url(next_url)));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Split a Link header value on a delimiter only when it appears at the
+/// top level — outside `<...>` URI references and `"..."` quoted strings.
+fn split_link_header_top_level(value: &str, delimiter: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_angle = false;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (idx, ch) in value.char_indices() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_quotes = true,
+            '<' => in_angle = true,
+            '>' => in_angle = false,
+            _ if ch == delimiter && !in_angle => {
+                parts.push(value[start..idx].trim());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    parts.push(value[start..].trim());
+    parts
+}
+
+/// Parse an HTTP `Link` header to find a URI with `rel="next"`.
+/// Handles quoted (`rel="next"`), single-quoted (`rel='next'`), and
+/// unquoted (`rel=next`) forms, as well as multi-value rel lists
+/// (e.g., `rel="next prev"`).
+///
+/// Splits on commas and semicolons only at the top level (outside `<...>`
+/// and `"..."`) so that URIs containing commas are handled correctly per
+/// RFC 8288.
+fn parse_link_header_next(header_value: &str) -> Option<String> {
+    for link in split_link_header_top_level(header_value, ',') {
+        let link = link.trim();
+        if !link.starts_with('<') {
+            continue;
+        }
+
+        let end = link.find('>')?;
+        let url_part = &link[1..end];
+        let params = link[end + 1..].trim();
+
+        let is_next = split_link_header_top_level(params, ';')
+            .into_iter()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .any(|param| {
+                let Some((name, value)) = param.split_once('=') else {
+                    return false;
+                };
+                if !name.trim().eq_ignore_ascii_case("rel") {
+                    return false;
+                }
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                value
+                    .split_whitespace()
+                    .any(|relation| relation.eq_ignore_ascii_case("next"))
+            });
+
+        if is_next {
+            return Some(url_part.to_string());
+        }
+    }
+    None
+}
+
+/// Extract data rows from a page response, using `data_pointer` if configured.
+fn extract_page_data(
+    content: &str,
+    parsed_json: Option<&serde_json::Value>,
+    config: &PaginationConfig,
+    limit: Option<usize>,
+) -> DataFusionResult<Vec<String>> {
+    if let Some(ref pointer) = config.data_pointer {
+        let json = parsed_json.ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "JSON not parsed but data_pointer '{pointer}' is configured"
+            ))
+        })?;
+
+        let data = json.pointer(pointer).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "Failed to extract paginated HTTP response data: configured data pointer '{pointer}' was not found in the response"
+            ))
+        })?;
+
+        if let Some(arr) = data.as_array() {
+            return Ok(arr
+                .iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(std::string::ToString::to_string)
+                .collect());
+        }
+        if config.data_map_to_array
+            && let Some(obj) = data.as_object()
+        {
+            return Ok(obj
+                .values()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(std::string::ToString::to_string)
+                .collect());
+        }
+        // Not an array (and not a map-to-array) — return as a single row
+        return Ok(vec![data.to_string()]);
+    }
+
+    // No data_pointer — use normal parse_content logic
+    Ok(parse_content_with_map_to_array(
+        content,
+        limit,
+        config.data_map_to_array,
+    ))
+}
+
+/// Like `HttpExec::parse_content` but when `data_map_to_array` is `true`,
+/// a top-level JSON object has its values extracted as rows.
+fn parse_content_with_map_to_array(
+    content: &str,
+    limit: Option<usize>,
+    data_map_to_array: bool,
+) -> Vec<String> {
+    if data_map_to_array {
+        let trimmed = content.trim();
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            return map
+                .values()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(std::string::ToString::to_string)
+                .collect();
+        }
+    }
+    HttpExec::parse_content(content, limit)
+}
+
+/// Merge base URL query params, partition query params, and a pagination token
+/// into a single query string. Base URL params come first, then partition params
+/// (overriding any base duplicates), then the token param (overriding any existing).
+/// Merge base URL query params with partition query params.
+/// Partition params override base params with the same key.
+/// Returns `None` if both inputs are `None`.
+fn merge_base_and_partition_queries(
+    base_query: Option<&str>,
+    partition_query: Option<&str>,
+) -> Option<String> {
+    if base_query.is_none() && partition_query.is_none() {
+        return None;
+    }
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    if let Some(base) = base_query {
+        pairs.extend(
+            url::form_urlencoded::parse(base.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned())),
+        );
+    }
+
+    if let Some(partition) = partition_query {
+        for (key, value) in url::form_urlencoded::parse(partition.as_bytes()) {
+            let key_str: &str = &key;
+            pairs.retain(|(k, _)| k != key_str);
+            pairs.push((key.into_owned(), value.into_owned()));
+        }
+    }
+
+    Some(
+        url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs)
+            .finish(),
+    )
+}
+
+fn merge_queries(
+    base_query: Option<&str>,
+    partition_query: Option<&str>,
+    token_param: &str,
+    token: &str,
+) -> String {
+    let override_params = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair(token_param, token)
+        .finish();
+    merge_base_and_partition_queries_with_override(base_query, partition_query, &override_params)
+}
+
+/// Expand `{offset}`, `{limit}`, and `{page}` variables in a query-param template.
+fn expand_query_params_template(
+    template: &str,
+    page: usize,
+    page_size: usize,
+) -> DataFusionResult<String> {
+    let offset = page.checked_mul(page_size).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "Pagination offset overflow: page ({page}) * page_size ({page_size}) exceeds maximum"
+        ))
+    })?;
+    Ok(template
+        .replace("{offset}", &offset.to_string())
+        .replace("{limit}", &page_size.to_string())
+        .replace("{page}", &page.to_string()))
+}
+
+/// Merge base + partition queries, then override with additional query params.
+/// Override params replace any base/partition params with the same key.
+fn merge_base_and_partition_queries_with_override(
+    base_query: Option<&str>,
+    partition_query: Option<&str>,
+    override_params: &str,
+) -> String {
+    let merged = merge_base_and_partition_queries(base_query, partition_query).unwrap_or_default();
+
+    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(merged.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    for (key, value) in url::form_urlencoded::parse(override_params.as_bytes()) {
+        let key_str: &str = &key;
+        pairs.retain(|(k, _)| k != key_str);
+        pairs.push((key.into_owned(), value.into_owned()));
+    }
+
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
+}
+
 impl HttpTableProvider {
-    /// Extract paths from filters for creating partitions. Query and body filters are validated but not used for partitioning.
+    /// Extract request partition values from filters.
+    ///
+    /// Path, query, body, and header filters are all used to build the partition
+    /// cross product, with each unique combination producing a separate HTTP
+    /// request partition.
     fn extract_partitions(&self, filters: &[Expr]) -> DataFusionResult<Vec<PartitionSpec>> {
         tracing::trace!(
-            "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}",
+            "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}, allow_header_filters={}",
             filters.len(),
             self.allowed_paths,
-            self.allow_query_filters,
-            self.allow_body_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Query),
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Body),
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Headers)
         );
 
         let mut accumulator = PartitionAccumulator::new();
@@ -1328,30 +2682,42 @@ impl HttpTableProvider {
         }
 
         tracing::trace!(
-            "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}",
-            accumulator.has_path_filter,
-            accumulator.has_query_filter,
-            accumulator.has_body_filter
+            "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}, has_header_filter={}",
+            accumulator.has_filter(RequestFilterKind::Path),
+            accumulator.has_filter(RequestFilterKind::Query),
+            accumulator.has_filter(RequestFilterKind::Body),
+            accumulator.has_filter(RequestFilterKind::Headers)
         );
 
-        let (paths, queries, bodies) = accumulator.finalize();
+        let partition_values = accumulator.finalize();
 
         tracing::trace!(
-            "After finalize: paths={:?}, queries={:?}, bodies={:?}",
-            paths,
-            queries,
-            bodies
+            "After finalize: paths={:?}, queries={:?}, bodies={:?}, headers_count={}",
+            partition_values.paths,
+            partition_values.queries,
+            partition_values.bodies,
+            partition_values.headers.len()
         );
 
+        self.ensure_request_partition_count(
+            partition_values.paths.len(),
+            partition_values.queries.len(),
+            partition_values.bodies.len(),
+            partition_values.headers.len(),
+        )?;
+
         let mut partitions = vec![];
-        for p in &paths {
-            for q in &queries {
-                for b in &bodies {
-                    partitions.push((
-                        if p.is_empty() { None } else { Some(p.clone()) },
-                        q.clone(),
-                        b.clone(),
-                    ));
+        for p in &partition_values.paths {
+            for q in &partition_values.queries {
+                for b in &partition_values.bodies {
+                    for h in &partition_values.headers {
+                        partitions.push((
+                            if p.is_empty() { None } else { Some(p.clone()) },
+                            q.clone(),
+                            b.clone(),
+                            h.clone(),
+                        ));
+                    }
                 }
             }
         }
@@ -1378,11 +2744,64 @@ impl HttpTableProvider {
     ) -> Result<()> {
         match expr.op {
             Operator::Eq => self.handle_equality_expr(expr, accumulator),
-            Operator::Or | Operator::And => {
+            Operator::And => {
+                self.extract_filter_values(expr.left.as_ref(), accumulator)?;
+                self.extract_filter_values(expr.right.as_ref(), accumulator)
+            }
+            Operator::Or => {
+                // OR within a single HTTP virtual filter column is treated as
+                // an IN list (alternative values). OR across different
+                // columns would be silently rewritten as a cross product
+                // (AND) by the partition accumulator, causing the connector
+                // to issue combined HTTP requests instead of separate ones.
+                // Reject the cross-column case explicitly. (Note: SQL
+                // `IN (...)` is sometimes pre-rewritten by DataFusion into a
+                // chain of OR-of-equality, which is why same-column OR must
+                // still be accepted.)
+                let mut columns = HashSet::new();
+                Self::collect_http_filter_columns(expr.left.as_ref(), &mut columns);
+                Self::collect_http_filter_columns(expr.right.as_ref(), &mut columns);
+                if columns.len() > 1 {
+                    let mut names: Vec<&str> = columns.into_iter().collect();
+                    names.sort_unstable();
+                    return Err(Error::FilterRejected {
+                        message: format!(
+                            "OR across different HTTP filter columns ({}) is not supported because the connector would otherwise issue combined HTTP requests instead of separate ones. Use IN (...) to enumerate values on a single column, or run separate queries (e.g. UNION ALL) for alternative requests.",
+                            names.join(", ")
+                        ),
+                    });
+                }
                 self.extract_filter_values(expr.left.as_ref(), accumulator)?;
                 self.extract_filter_values(expr.right.as_ref(), accumulator)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Walk an expression tree and collect the names of any HTTP virtual
+    /// filter columns (`request_path`, `request_query`, `request_body`,
+    /// `request_headers`) referenced anywhere inside it.
+    fn collect_http_filter_columns(expr: &Expr, columns: &mut HashSet<&'static str>) {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+                Self::collect_http_filter_columns(left.as_ref(), columns);
+                Self::collect_http_filter_columns(right.as_ref(), columns);
+            }
+            Expr::InList(in_list) => {
+                Self::collect_http_filter_columns(in_list.expr.as_ref(), columns);
+            }
+            Expr::Column(column) => {
+                if let Some(static_name) = match column.name.as_str() {
+                    "request_path" => Some("request_path"),
+                    "request_query" => Some("request_query"),
+                    "request_body" => Some("request_body"),
+                    "request_headers" => Some("request_headers"),
+                    _ => None,
+                } {
+                    columns.insert(static_name);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1407,7 +2826,7 @@ impl HttpTableProvider {
         if let Expr::Column(column) = in_list.expr.as_ref()
             && matches!(
                 column.name.as_str(),
-                "request_path" | "request_query" | "request_body"
+                "request_path" | "request_query" | "request_body" | "request_headers"
             )
         {
             for expr in &in_list.list {
@@ -1425,11 +2844,19 @@ impl HttpTableProvider {
         value: &str,
         accumulator: &mut PartitionAccumulator,
     ) -> Result<()> {
-        tracing::trace!(
-            "apply_literal_filter: column={}, value={}",
-            column_name,
-            value
-        );
+        if column_name == "request_headers" {
+            tracing::trace!(
+                "apply_literal_filter: column={}, value=<redacted {} bytes>",
+                column_name,
+                value.len()
+            );
+        } else {
+            tracing::trace!(
+                "apply_literal_filter: column={}, value={}",
+                column_name,
+                value
+            );
+        }
         match column_name {
             "request_path" => {
                 let normalized = self.ensure_allowed_path(value)?;
@@ -1446,6 +2873,11 @@ impl HttpTableProvider {
                 tracing::trace!("Body filter validated and normalized: {}", normalized);
                 accumulator.record_body(normalized);
             }
+            "request_headers" => {
+                let normalized = self.ensure_allowed_headers(value)?;
+                tracing::trace!("Header filter validated: {} bytes", normalized.len());
+                accumulator.record_headers(normalized);
+            }
             _ => {
                 tracing::debug!("Ignoring filter on column: {}", column_name);
             }
@@ -1454,7 +2886,7 @@ impl HttpTableProvider {
     }
 
     /// Check if a filter expression can be pushed down to HTTP requests
-    /// Note: This returns true if the filter is on `request_path`, `request_query`, or `request_body` columns.
+    /// Note: This returns true if the filter is on `request_path`, `request_query`, `request_body`, or `request_headers` columns.
     /// Actual validation (whether the feature is enabled/configured) happens in `extract_partitions` with user-friendly errors.
     fn can_pushdown_filter(filter: &Expr) -> bool {
         match filter {
@@ -1464,7 +2896,7 @@ impl HttpTableProvider {
                     if let Expr::Literal(ScalarValue::Utf8(Some(_value)), _) = right.as_ref() {
                         matches!(
                             col.name.as_str(),
-                            "request_path" | "request_query" | "request_body"
+                            "request_path" | "request_query" | "request_body" | "request_headers"
                         )
                     } else {
                         false
@@ -1478,7 +2910,7 @@ impl HttpTableProvider {
                 if let Expr::Column(col) = in_list.expr.as_ref() {
                     matches!(
                         col.name.as_str(),
-                        "request_path" | "request_query" | "request_body"
+                        "request_path" | "request_query" | "request_body" | "request_headers"
                     )
                 } else {
                     false
@@ -1558,22 +2990,26 @@ impl HttpTableProvider {
         tracing::debug!(
             "ensure_allowed_query called with raw={}, allow_query_filters={}",
             raw,
-            self.allow_query_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Query)
         );
 
-        if !self.allow_query_filters {
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Query)
+        {
             tracing::warn!("Query filter attempted but allow_query_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_query' because query filtering is disabled for this dataset. To enable, set the 'request_query_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
-        if raw.len() > self.max_query_length {
+        if raw.len() > self.request_filter_options.max_query_length {
             return Err(Error::FilterRejected {
                 message: format!(
                     "The 'request_query' value is too long ({} characters). Maximum allowed length is {} characters. You can increase this limit using the 'max_request_query_length' parameter.",
                     raw.len(),
-                    self.max_query_length
+                    self.request_filter_options.max_query_length
                 ),
             });
         }
@@ -1597,27 +3033,157 @@ impl HttpTableProvider {
         tracing::debug!(
             "ensure_allowed_body called with raw={}, allow_body_filters={}",
             raw,
-            self.allow_body_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Body)
         );
 
-        if !self.allow_body_filters {
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Body)
+        {
             tracing::warn!("Body filter attempted but allow_body_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_body' because body filtering is disabled for this dataset. To enable, set the 'request_body_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
-        if raw.len() > self.max_body_bytes {
+        if raw.len() > self.request_filter_options.max_body_bytes {
             return Err(Error::FilterRejected {
                 message: format!(
                     "The 'request_body' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_body_bytes' parameter.",
                     raw.len(),
-                    self.max_body_bytes
+                    self.request_filter_options.max_body_bytes
                 ),
             });
         }
 
         Ok(raw.to_string())
+    }
+
+    fn ensure_allowed_headers(&self, raw: &str) -> Result<String> {
+        tracing::debug!(
+            "ensure_allowed_headers called with allow_header_filters={}, bytes={}",
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Headers),
+            raw.len()
+        );
+
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Headers)
+        {
+            tracing::warn!("Header filter attempted but allow_header_filters is false");
+            return Err(Error::FilterRejected {
+                message:
+                    "Cannot filter by 'request_headers' because header filtering is disabled for this dataset. To enable, set the 'request_header_filters' parameter to 'enabled' and configure 'request_header_allowlist' with the header names that may vary."
+                        .to_string(),
+            });
+        }
+        if raw.len() > self.request_filter_options.max_headers_length {
+            return Err(Error::FilterRejected {
+                message: format!(
+                    "The 'request_headers' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_headers_length' parameter.",
+                    raw.len(),
+                    self.request_filter_options.max_headers_length
+                ),
+            });
+        }
+
+        self.parse_request_headers(raw)?;
+        Ok(raw.to_string())
+    }
+
+    fn parse_request_headers(&self, raw: &str) -> Result<HeaderMap> {
+        let parsed = serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
+            Error::FilterRejected {
+                message: format!(
+                    "The 'request_headers' value must be a JSON object with string header values. Failed to parse JSON: {e}"
+                ),
+            }
+        })?;
+
+        let serde_json::Value::Object(headers_object) = parsed else {
+            return Err(Error::FilterRejected {
+                message: "The 'request_headers' value must be a JSON object with string header values, such as '{\"x-sandbox-id\":\"sandbox-1\"}'.".to_string(),
+            });
+        };
+
+        let mut headers = HeaderMap::new();
+        for (name, value) in headers_object {
+            let header_name = HeaderName::try_from(name.as_str()).map_err(|e| {
+                Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' object contains invalid HTTP header name '{name}': {e}"
+                    ),
+                }
+            })?;
+
+            if !self
+                .request_filter_options
+                .allowed_headers
+                .contains(&header_name)
+            {
+                return Err(Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' object contains header '{name}', which is not in request_header_allowlist. Add '{name}' to request_header_allowlist or remove it from the filter."
+                    ),
+                });
+            }
+
+            if self.auth.is_some() && header_name == AUTHORIZATION {
+                return Err(Error::FilterRejected {
+                    message: "The 'request_headers' object cannot set 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_headers or disable HTTP authentication.".to_string(),
+                });
+            }
+
+            let Some(header_value) = value.as_str() else {
+                return Err(Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' value for header '{name}' must be a string."
+                    ),
+                });
+            };
+
+            let header_value = HeaderValue::from_str(header_value).map_err(|_| {
+                Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' value for header '{name}' is not a valid HTTP header value."
+                    ),
+                }
+            })?;
+            headers.insert(header_name, header_value);
+        }
+
+        Ok(headers)
+    }
+
+    fn ensure_request_partition_count(
+        &self,
+        path_count: usize,
+        query_count: usize,
+        body_count: usize,
+        header_count: usize,
+    ) -> Result<()> {
+        let partition_count = path_count
+            .checked_mul(query_count)
+            .and_then(|count| count.checked_mul(body_count))
+            .and_then(|count| count.checked_mul(header_count))
+            .ok_or_else(|| Error::FilterRejected {
+                message: "The HTTP request partition count overflowed while combining request_path, request_query, request_body, and request_headers filters. Reduce the number of filter values.".to_string(),
+            })?;
+
+        if let Some(max_request_partitions) = self.max_request_partitions {
+            ensure!(
+                partition_count <= max_request_partitions,
+                FilterRejectedSnafu {
+                    message: format!(
+                        "The HTTP connector would create {partition_count} request partitions, which exceeds max_request_partitions={max_request_partitions}. Reduce the number of request_path, request_query, request_body, or request_headers filter values, or increase max_request_partitions."
+                    )
+                }
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -1633,6 +3199,65 @@ mod tests {
     use std::time::Duration;
     use url::Url;
 
+    #[derive(Debug)]
+    struct TestAuthenticator;
+
+    impl super::super::auth::HttpAuthenticator for TestAuthenticator {
+        fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            builder.header(AUTHORIZATION, "Bearer token")
+        }
+    }
+
+    /// Build a query string by adding or replacing a token parameter.
+    fn build_query_with_token(existing_query: Option<&str>, param: &str, token: &str) -> String {
+        merge_queries(None, existing_query, param, token)
+    }
+
+    /// Test helper: parse content and call `extract_next_page_info`
+    fn extract_next_page_info(
+        content: &str,
+        headers: &[(String, String)],
+        config: &PaginationConfig,
+        base_url: &Url,
+    ) -> super::Result<Option<NextPageInfo>> {
+        extract_next_page_info_at_page(content, headers, config, base_url, 0)
+    }
+
+    fn extract_next_page_info_at_page(
+        content: &str,
+        headers: &[(String, String)],
+        config: &PaginationConfig,
+        base_url: &Url,
+        current_page: usize,
+    ) -> super::Result<Option<NextPageInfo>> {
+        let parsed = if config.next_pointer.is_some() {
+            Some(
+                serde_json::from_str::<serde_json::Value>(content)
+                    .expect("test content should be valid JSON"),
+            )
+        } else {
+            None
+        };
+        super::extract_next_page_info(parsed.as_ref(), headers, config, base_url, current_page)
+    }
+
+    /// Test helper: parse content and call `extract_page_data`
+    fn extract_page_data(
+        content: &str,
+        config: &PaginationConfig,
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<Vec<String>> {
+        let parsed = if config.data_pointer.is_some() {
+            Some(
+                serde_json::from_str::<serde_json::Value>(content)
+                    .expect("test content should be valid JSON"),
+            )
+        } else {
+            None
+        };
+        super::extract_page_data(content, parsed.as_ref(), config, limit)
+    }
+
     fn base_provider() -> HttpTableProvider {
         HttpTableProvider::new(
             Url::parse("https://api.example.com").expect("valid URL"),
@@ -1640,6 +3265,12 @@ mod tests {
             "json".to_string(),
             false,
         )
+    }
+
+    fn header_provider() -> HttpTableProvider {
+        base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id", "x-region"])
+            .expect("header filters should enable")
     }
 
     #[test]
@@ -1670,13 +3301,14 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Only path creates partition, query is validated but not used for partitioning
+        // Path and query filters together produce one partition tuple containing both values.
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
             (
                 Some("/singlesearch/shows".to_string()),
                 Some("q=South%20Park".to_string()),
+                None,
                 None
             )
         );
@@ -1699,7 +3331,10 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/data".to_string()), None, None));
+        assert_eq!(
+            partitions[0],
+            (Some("/api/data".to_string()), None, None, None)
+        );
     }
 
     #[test]
@@ -1711,7 +3346,7 @@ mod tests {
             .expect("partitions");
 
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (None, None, None));
+        assert_eq!(partitions[0], (None, None, None, None));
     }
 
     #[test]
@@ -1741,8 +3376,8 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/path1".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/path2".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/path1".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/path2".to_string()), None, None, None)));
     }
 
     #[test]
@@ -1766,8 +3401,8 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/api/v1/users".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/api/v1/posts".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/api/v1/users".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/api/v1/posts".to_string()), None, None, None)));
     }
 
     #[test]
@@ -1785,11 +3420,17 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Query filters don't create partitions, only path filters do
-        // This will create a single partition with no path
+        // Query filters in an IN list produce one extracted partition tuple per query value.
+        // These partitions do not constrain the path, so `request_path` remains `None`.
         assert_eq!(partitions.len(), 2);
-        assert_eq!(partitions[0], (None, Some("limit=10".to_string()), None));
-        assert_eq!(partitions[1], (None, Some("limit=20".to_string()), None));
+        assert_eq!(
+            partitions[0],
+            (None, Some("limit=10".to_string()), None, None)
+        );
+        assert_eq!(
+            partitions[1],
+            (None, Some("limit=20".to_string()), None, None)
+        );
     }
 
     #[test]
@@ -1821,8 +3462,84 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/api/v1".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/api/v2".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/api/v1".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/api/v2".to_string()), None, None, None)));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_query_filters(64);
+        // request_path = '/a' OR request_query = 'b=1'
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_query"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("b=1".to_string())),
+                    None,
+                )),
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("OR across different HTTP filter columns"),
+            "unexpected error message: {message}"
+        );
+        assert!(message.contains("request_path"));
+        assert!(message.contains("request_query"));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_nested_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id".to_string()])
+            .expect("enable header filters");
+        // request_path = '/a' OR request_headers IN ('{"x-sandbox-id":"a"}')
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::InList(InList {
+                expr: Box::new(Expr::Column(Column::from_name("request_headers"))),
+                list: vec![Expr::Literal(
+                    ScalarValue::Utf8(Some(r#"{"x-sandbox-id":"a"}"#.to_string())),
+                    None,
+                )],
+                negated: false,
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        assert!(
+            err.to_string()
+                .contains("OR across different HTTP filter columns")
+        );
     }
 
     #[test]
@@ -1853,13 +3570,14 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Only path creates partition; query filters are validated but don't create separate partitions
+        // The path filter is crossed with each query value to produce separate partitions.
         assert_eq!(partitions.len(), 2);
         assert_eq!(
             partitions[0],
             (
                 Some("/api/users".to_string()),
                 Some("limit=10".to_string()),
+                None,
                 None
             )
         );
@@ -1868,6 +3586,7 @@ mod tests {
             (
                 Some("/api/users".to_string()),
                 Some("limit=20".to_string()),
+                None,
                 None
             )
         );
@@ -1989,6 +3708,164 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_partitions_with_request_headers_in_list() {
+        let provider = header_provider();
+        let headers_1 = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
+        let headers_2 = r#"{"x-sandbox-id":"sandbox-2","x-region":"us-west"}"#.to_string();
+        let filters = vec![Expr::InList(InList::new(
+            Box::new(Expr::Column(Column::from_name("request_headers"))),
+            vec![
+                Expr::Literal(ScalarValue::Utf8(Some(headers_1.clone())), None),
+                Expr::Literal(ScalarValue::Utf8(Some(headers_2.clone())), None),
+            ],
+            false,
+        ))];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0], (None, None, None, Some(headers_1)));
+        assert_eq!(partitions[1], (None, None, None, Some(headers_2)));
+    }
+
+    #[test]
+    fn test_request_headers_filter_needs_enable() {
+        let provider = base_provider();
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"x-sandbox-id":"sandbox-1"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("request_header_filters"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_headers_filter_rejects_unallowlisted_header() {
+        let provider = header_provider();
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"authorization":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("request_header_allowlist"));
+                assert!(message.contains("authorization"));
+                assert!(!message.contains("secret"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_headers_filter_rejects_authorization_with_auth() {
+        let provider = base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["authorization"])
+            .expect("authorization should be allowlisted before auth is configured")
+            .with_auth(Arc::new(TestAuthenticator));
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"authorization":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("authorization"));
+                assert!(message.contains("HTTP authentication"));
+                assert!(!message.contains("secret"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_headers_filter_rejects_invalid_json() {
+        let provider = header_provider();
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("not json".to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("JSON object"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_max_request_partitions_rejects_large_cross_product() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/users".to_string(), "/api/posts".to_string()])
+            .expect("allowed paths")
+            .enable_query_filters(64)
+            .with_max_request_partitions(Some(3));
+        let filters = vec![
+            Expr::InList(InList::new(
+                Box::new(Expr::Column(Column::from_name("request_path"))),
+                vec![
+                    Expr::Literal(ScalarValue::Utf8(Some("/api/users".to_string())), None),
+                    Expr::Literal(ScalarValue::Utf8(Some("/api/posts".to_string())), None),
+                ],
+                false,
+            )),
+            Expr::InList(InList::new(
+                Box::new(Expr::Column(Column::from_name("request_query"))),
+                vec![
+                    Expr::Literal(ScalarValue::Utf8(Some("status=active".to_string())), None),
+                    Expr::Literal(ScalarValue::Utf8(Some("status=inactive".to_string())), None),
+                ],
+                false,
+            )),
+        ];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected partition cap rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("4 request partitions"));
+                assert!(message.contains("max_request_partitions=3"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_url_construction_with_base_path() {
         // Test that path from filter is appended to base URL path
         let base_url = Url::parse("https://api.example.com/v1").expect("valid URL");
@@ -2062,18 +3939,33 @@ mod tests {
 
     #[test]
     fn test_cache_key_generation() {
-        let key1 = HttpTableProvider::get_cache_key("/path", Some("query"), None);
-        let key2 = HttpTableProvider::get_cache_key("/path", None, None);
-        let key3 = HttpTableProvider::get_cache_key("/other", Some("query"), None);
-        let key4 = HttpTableProvider::get_cache_key("/path", Some("query"), Some("body"));
+        let key1 = HttpTableProvider::get_cache_key("/path", Some("query"), None, None);
+        let key2 = HttpTableProvider::get_cache_key("/path", None, None, None);
+        let key3 = HttpTableProvider::get_cache_key("/other", Some("query"), None, None);
+        let key4 = HttpTableProvider::get_cache_key("/path", Some("query"), Some("body"), None);
+        let key5 = HttpTableProvider::get_cache_key(
+            "/path",
+            Some("query"),
+            Some("body"),
+            Some(r#"{"x-sandbox-id":"sandbox-1"}"#),
+        );
+        let collision_candidate_1 =
+            HttpTableProvider::get_cache_key("/path", Some("q&body=b"), Some(""), None);
+        let collision_candidate_2 =
+            HttpTableProvider::get_cache_key("/path", Some("q"), Some("b&body="), None);
 
-        assert_eq!(key1, "/path?query&body=");
-        assert_eq!(key2, "/path?&body=");
-        assert_eq!(key3, "/other?query&body=");
-        assert_eq!(key4, "/path?query&body=body");
-        assert_ne!(key1, key2);
-        assert_ne!(key1, key3);
-        assert_ne!(key1, key4);
+        assert!(key1 == CacheKey::new("/path", Some("query"), None, None));
+        assert!(key1 != key2);
+        assert!(key1 != key3);
+        assert!(key1 != key4);
+        assert!(key4 != key5);
+        assert!(collision_candidate_1 != collision_candidate_2);
+
+        let redacted_label = key5.redacted_label();
+        assert!(redacted_label.starts_with("http-cache-key:"));
+        assert!(!redacted_label.contains("/path"));
+        assert!(!redacted_label.contains("body"));
+        assert!(!redacted_label.contains("sandbox-1"));
     }
 
     #[test]
@@ -2127,39 +4019,43 @@ mod tests {
     fn test_base_table_schema() {
         let schema = HttpTableProvider::base_table_schema();
 
-        assert_eq!(schema.fields().len(), 7);
+        assert_eq!(schema.fields().len(), 8);
         assert_eq!(schema.field(0).name(), "request_path");
         assert_eq!(schema.field(1).name(), "request_query");
         assert_eq!(schema.field(2).name(), "request_body");
-        assert_eq!(schema.field(3).name(), "content");
-        assert_eq!(schema.field(4).name(), "response_status");
-        assert_eq!(schema.field(5).name(), "response_headers");
-        assert_eq!(schema.field(6).name(), "fetched_at");
+        assert_eq!(schema.field(3).name(), "request_headers");
+        assert_eq!(schema.field(4).name(), "content");
+        assert_eq!(schema.field(5).name(), "response_status");
+        assert_eq!(schema.field(6).name(), "response_headers");
+        assert_eq!(schema.field(7).name(), "fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
-        assert_eq!(*schema.field(4).data_type(), DataType::UInt16);
+        assert_eq!(*schema.field(4).data_type(), DataType::Utf8);
+        assert_eq!(*schema.field(5).data_type(), DataType::UInt16);
         assert!(matches!(
-            schema.field(5).data_type(),
+            schema.field(6).data_type(),
             DataType::Map(_, false)
         ));
         assert_eq!(
-            *schema.field(6).data_type(),
+            *schema.field(7).data_type(),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
         );
         assert!(!schema.field(0).is_nullable()); // request_path is not nullable
         assert!(schema.field(1).is_nullable()); // request_query is nullable
         assert!(schema.field(2).is_nullable()); // request_body is nullable
-        assert!(!schema.field(3).is_nullable()); // content is not nullable
-        assert!(!schema.field(4).is_nullable()); // response_status is not nullable
-        assert!(schema.field(5).is_nullable()); // response_headers is nullable
-        assert!(schema.field(6).is_nullable()); // fetched_at is nullable
+        assert!(schema.field(3).is_nullable()); // request_headers is nullable
+        assert!(!schema.field(4).is_nullable()); // content is not nullable
+        assert!(!schema.field(5).is_nullable()); // response_status is not nullable
+        assert!(schema.field(6).is_nullable()); // response_headers is nullable
+        assert!(schema.field(7).is_nullable()); // fetched_at is nullable
     }
 
     #[tokio::test]
     async fn test_fetch_and_create_batch_includes_response_headers() {
         let provider = Arc::new(base_provider());
+        let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
             max_age: Duration::from_secs(60),
@@ -2172,13 +4068,18 @@ mod tests {
             ],
         };
         provider
-            .cache_response("/posts", None, None, &fetch_result)
+            .cache_response("/posts", None, None, Some(&request_headers), &fetch_result)
             .await;
 
         let exec = HttpExec::new(
             HttpTableProvider::base_table_schema().into(),
             Arc::clone(&provider),
-            vec![(Some("/posts".to_string()), None, None)],
+            vec![(
+                Some("/posts".to_string()),
+                None,
+                None,
+                Some(request_headers.clone()),
+            )],
             None,
         );
 
@@ -2193,8 +4094,16 @@ mod tests {
             "JSON array content should yield two rows"
         );
 
+        let request_headers_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("request_headers should be a StringArray");
+        assert_eq!(request_headers_col.value(0), request_headers);
+        assert_eq!(request_headers_col.value(1), request_headers);
+
         let headers_col = batch
-            .column(5)
+            .column(6)
             .as_any()
             .downcast_ref::<arrow::array::MapArray>()
             .expect("response_headers should be a MapArray");
@@ -2403,7 +4312,10 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+        assert_eq!(
+            partitions[0],
+            (Some("/api/users".to_string()), None, None, None)
+        );
     }
 
     #[test]
@@ -2426,7 +4338,7 @@ mod tests {
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
-            (Some("/api/v1/users/123".to_string()), None, None)
+            (Some("/api/v1/users/123".to_string()), None, None, None)
         );
     }
 
@@ -2450,7 +4362,7 @@ mod tests {
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
-            (Some("/api/v1/users".to_string()), None, None)
+            (Some("/api/v1/users".to_string()), None, None, None)
         );
     }
 
@@ -2593,8 +4505,8 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/api/users".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/v1/search".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/api/users".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/v1/search".to_string()), None, None, None)));
     }
 
     #[test]
@@ -2615,7 +4527,10 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("should match");
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+        assert_eq!(
+            partitions[0],
+            (Some("/api/users".to_string()), None, None, None)
+        );
     }
 
     #[test]
@@ -3244,5 +5159,1454 @@ mod tests {
 
         let count = count_col.value(0);
         assert_eq!(count, 2, "Should have counted exactly 2 rows for 2 shows");
+    }
+
+    /// Integration test: Open Library search API with query-parameter pagination.
+    /// Uses `pagination_query_params` with `offset={offset}&limit={limit}` to
+    /// paginate through search results, and `pagination_data_pointer` to extract
+    /// the `docs` array from each page.
+    #[tokio::test]
+    async fn test_integration_openlibrary_query_param_pagination() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://openlibrary.org/search.json?q=tolkien").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_pagination(PaginationConfig {
+                query_params: Some("offset={offset}&limit={limit}".to_string()),
+                page_size: Some(3),
+                data_pointer: Some("/docs".to_string()),
+                max_pages: 2,
+                use_link_header: false,
+                ..Default::default()
+            })
+            .expect("pagination config");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("books", Arc::new(provider))
+            .expect("register table");
+
+        let df = ctx
+            .sql("SELECT content FROM books")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+
+        // With page_size=3 and max_pages=2, we expect up to 6 rows.
+        // If the last page has fewer than 3 rows, we get fewer.
+        assert!(
+            total_rows >= 4,
+            "Should have fetched multiple pages of results, got {total_rows}"
+        );
+        assert!(
+            total_rows <= 6,
+            "Should not exceed 2 pages * 3 items = 6 rows, got {total_rows}"
+        );
+
+        // Verify content looks like book records
+        let content_col = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+        let first_row = content_col.value(0);
+        assert!(
+            first_row.contains("title"),
+            "Book records should contain a title field: {first_row}"
+        );
+    }
+
+    // --- Pagination tests ---
+
+    #[test]
+    fn test_parse_link_header_next() {
+        assert_eq!(
+            parse_link_header_next(
+                r#"<https://api.example.com/items?page=2>; rel="next", <https://api.example.com/items?page=1>; rel="prev""#
+            ),
+            Some("https://api.example.com/items?page=2".to_string())
+        );
+
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/items?page=3>; rel="next""#),
+            Some("https://api.example.com/items?page=3".to_string())
+        );
+
+        // No rel="next"
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/items?page=1>; rel="prev""#),
+            None
+        );
+
+        // Empty header
+        assert_eq!(parse_link_header_next(""), None);
+    }
+
+    #[test]
+    fn test_extract_next_page_info_json_pointer_url() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1, 2], "next": "https://api.example.com/items?page=2"}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Url(url)) => {
+                assert_eq!(url.as_str(), "https://api.example.com/items?page=2");
+            }
+            other => panic!("Expected Url, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_json_pointer_token() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/cursor".to_string()),
+            token_param: Some("cursor".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1, 2], "cursor": "abc123"}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Token(token)) => {
+                assert_eq!(token, "abc123");
+            }
+            other => panic!("Expected Token, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_null_means_no_more_pages() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1, 2], "next": null}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        assert!(result.is_none(), "null next should mean no more pages");
+    }
+
+    #[test]
+    fn test_extract_next_page_info_missing_pointer_means_no_more_pages() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next_url".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1, 2]}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        assert!(
+            result.is_none(),
+            "missing pointer should mean no more pages"
+        );
+    }
+
+    #[test]
+    fn test_extract_next_page_info_ssrf_protection() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1], "next": "https://evil.com/steal-data"}"#;
+        let headers = vec![];
+
+        let result = extract_next_page_info(content, &headers, &config, &base_url);
+        assert!(result.is_err(), "should reject cross-origin next page URLs");
+        let err_msg = result.expect_err("expected error").to_string();
+        assert!(
+            err_msg.contains("does not match"),
+            "error should mention origin mismatch: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_extract_next_page_info_link_header() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            use_link_header: true,
+            ..Default::default()
+        };
+        let content = r"[1, 2, 3]";
+        let headers = vec![(
+            "link".to_string(),
+            r#"<https://api.example.com/items?page=2>; rel="next""#.to_string(),
+        )];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Url(url)) => {
+                assert_eq!(url.as_str(), "https://api.example.com/items?page=2");
+            }
+            other => panic!("Expected Url from Link header, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_page_data_with_data_pointer() {
+        let config = PaginationConfig {
+            data_pointer: Some("/results".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"results": [{"id": 1}, {"id": 2}], "next": "url"}"#;
+        let rows = extract_page_data(content, &config, None).expect("should extract page data");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], r#"{"id":1}"#);
+        assert_eq!(rows[1], r#"{"id":2}"#);
+    }
+
+    #[test]
+    fn test_extract_page_data_with_limit() {
+        let config = PaginationConfig {
+            data_pointer: Some("/items".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"items": [{"id": 1}, {"id": 2}, {"id": 3}]}"#;
+        let rows = extract_page_data(content, &config, Some(2)).expect("should extract page data");
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_page_data_without_data_pointer() {
+        let config = PaginationConfig::default();
+        let content = r#"[{"id": 1}, {"id": 2}]"#;
+        let rows = extract_page_data(content, &config, None).expect("should extract page data");
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_page_data_missing_pointer() {
+        let config = PaginationConfig {
+            data_pointer: Some("/nonexistent".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"results": [1, 2, 3]}"#;
+        let result = extract_page_data(content, &config, None);
+        assert!(result.is_err(), "missing pointer should return error");
+    }
+
+    #[test]
+    fn test_build_query_with_token_no_existing() {
+        let result = build_query_with_token(None, "cursor", "abc123");
+        assert_eq!(result, "cursor=abc123");
+    }
+
+    #[test]
+    fn test_build_query_with_token_append() {
+        let result = build_query_with_token(Some("sort=date&limit=10"), "cursor", "abc123");
+        assert_eq!(result, "sort=date&limit=10&cursor=abc123");
+    }
+
+    #[test]
+    fn test_build_query_with_token_replace() {
+        let result =
+            build_query_with_token(Some("sort=date&cursor=old_token"), "cursor", "new_token");
+        assert_eq!(result, "sort=date&cursor=new_token");
+    }
+
+    #[test]
+    fn test_pagination_config_validation_requires_next_source() {
+        let provider = base_provider();
+        let result = provider.with_pagination(PaginationConfig {
+            use_link_header: false,
+            ..Default::default()
+        });
+        assert!(
+            result.is_err(),
+            "should require next_pointer or link_header"
+        );
+    }
+
+    #[test]
+    fn test_pagination_default_enables_link_header() {
+        let provider = base_provider();
+        let result = provider.with_pagination(PaginationConfig::default());
+        assert!(
+            result.is_ok(),
+            "default config with link_header=true should be valid"
+        );
+    }
+
+    #[test]
+    fn test_pagination_config_validation_token_needs_pointer() {
+        let provider = base_provider();
+        let result = provider.with_pagination(PaginationConfig {
+            use_link_header: true,
+            token_param: Some("cursor".to_string()),
+            ..Default::default()
+        });
+        assert!(
+            result.is_err(),
+            "token_param without next_pointer should fail"
+        );
+    }
+
+    #[test]
+    fn test_pagination_config_valid_with_next_pointer() {
+        let provider = base_provider();
+        let result = provider.with_pagination(PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        });
+        assert!(result.is_ok(), "should accept valid pagination config");
+        assert!(
+            result.expect("valid config").is_paginated(),
+            "should report as paginated"
+        );
+    }
+
+    #[test]
+    fn test_pagination_config_valid_with_link_header() {
+        let provider = base_provider();
+        let result = provider.with_pagination(PaginationConfig {
+            use_link_header: true,
+            ..Default::default()
+        });
+        assert!(result.is_ok(), "should accept link_header pagination");
+    }
+
+    #[test]
+    fn test_extract_next_page_info_nested_pointer() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/pagination/next_url".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [], "pagination": {"next_url": "https://api.example.com/items?offset=20"}}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Url(url)) => {
+                assert_eq!(url.as_str(), "https://api.example.com/items?offset=20");
+            }
+            other => panic!("Expected Url from nested pointer, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_empty_string_means_no_more_pages() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1], "next": ""}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        assert!(
+            result.is_none(),
+            "empty string next should mean no more pages"
+        );
+    }
+
+    #[test]
+    fn test_extract_next_page_info_relative_url() {
+        let base_url = Url::parse("https://api.example.com/v1").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1], "next": "/v1/items?page=2"}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Url(url)) => {
+                assert_eq!(url.as_str(), "https://api.example.com/v1/items?page=2");
+            }
+            other => panic!("Expected Url from relative path, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_relative_link_header() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            use_link_header: true,
+            ..Default::default()
+        };
+        let content = r"[1, 2]";
+        let headers = vec![(
+            "link".to_string(),
+            r#"</items?page=3>; rel="next""#.to_string(),
+        )];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Url(url)) => {
+                assert_eq!(url.as_str(), "https://api.example.com/items?page=3");
+            }
+            other => panic!("Expected Url from relative Link header, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_pointer_missing_falls_through_to_link_header() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/pagination/next_url".to_string()),
+            use_link_header: true,
+            ..Default::default()
+        };
+        // Response has no /pagination/next_url field, but does have a Link header
+        let content = r#"{"data": [1, 2]}"#;
+        let headers = vec![(
+            "link".to_string(),
+            r#"<https://api.example.com/items?page=2>; rel="next""#.to_string(),
+        )];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Url(url)) => {
+                assert_eq!(
+                    url.as_str(),
+                    "https://api.example.com/items?page=2",
+                    "should fall through to Link header when pointer is missing"
+                );
+            }
+            other => panic!("Expected Url from Link header fallthrough, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_query_with_token_special_chars() {
+        // Tokens with special characters should be properly percent-encoded
+        let result = build_query_with_token(None, "cursor", "abc 123&foo=bar");
+        // url::form_urlencoded encodes spaces as + and & as %26
+        assert!(
+            result.contains("cursor="),
+            "should contain cursor param: {result}"
+        );
+        assert!(
+            !result.contains("&foo="),
+            "special chars in token should be encoded, not treated as params: {result}"
+        );
+    }
+
+    #[test]
+    fn test_extract_next_page_info_json_parse_error() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        // When next_pointer is set but parsed_json is None, it should error
+        let headers = vec![];
+
+        let result = super::extract_next_page_info(None, &headers, &config, &base_url, 0);
+        assert!(
+            result.is_err(),
+            "missing parsed JSON should return error when next_pointer is configured"
+        );
+    }
+
+    #[test]
+    fn test_extract_next_page_info_numeric_pointer_as_token() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/page".to_string()),
+            token_param: Some("page".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1, 2], "page": 3}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Token(token)) => {
+                assert_eq!(token, "3");
+            }
+            other => panic!("Expected Token with numeric value, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_numeric_pointer_without_token_param_errors() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/page".to_string()),
+            // No token_param — numeric values should error in URL mode
+            ..Default::default()
+        };
+        let content = r#"{"data": [1, 2], "page": 3}"#;
+        let headers = vec![];
+
+        let result = extract_next_page_info(content, &headers, &config, &base_url);
+        assert!(
+            result.is_err(),
+            "numeric pointer without token_param should error"
+        );
+    }
+
+    #[test]
+    fn test_extract_next_page_info_non_string_non_number_pointer_value_errors() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        // Boolean value is not a valid pagination pointer
+        let content = r#"{"next": true}"#;
+        let headers = vec![];
+
+        let result = extract_next_page_info(content, &headers, &config, &base_url);
+        assert!(
+            result.is_err(),
+            "non-string/non-number pointer value should return error"
+        );
+    }
+
+    #[test]
+    fn test_extract_page_data_missing_json() {
+        let config = PaginationConfig {
+            data_pointer: Some("/results".to_string()),
+            ..Default::default()
+        };
+        // When data_pointer is set but parsed_json is None, it should error
+        let result = super::extract_page_data("", None, &config, None);
+        assert!(
+            result.is_err(),
+            "missing parsed JSON should return error when data_pointer is configured"
+        );
+    }
+
+    #[test]
+    fn test_with_pagination_invalid_next_pointer() {
+        let provider = HttpTableProvider::new(
+            Url::parse("https://example.com").expect("valid URL"),
+            Client::new(),
+            "json".to_string(),
+            false,
+        );
+        let result = provider.with_pagination(PaginationConfig {
+            next_pointer: Some("next".to_string()),
+            use_link_header: false,
+            ..Default::default()
+        });
+        assert!(
+            result.is_err(),
+            "next_pointer without leading '/' should fail"
+        );
+    }
+
+    #[test]
+    fn test_with_pagination_invalid_data_pointer() {
+        let provider = HttpTableProvider::new(
+            Url::parse("https://example.com").expect("valid URL"),
+            Client::new(),
+            "json".to_string(),
+            false,
+        );
+        let result = provider.with_pagination(PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            data_pointer: Some("results".to_string()),
+            use_link_header: false,
+            ..Default::default()
+        });
+        assert!(
+            result.is_err(),
+            "data_pointer without leading '/' should fail"
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_unquoted_rel() {
+        assert_eq!(
+            parse_link_header_next("<https://api.example.com/items?page=2>; rel=next"),
+            Some("https://api.example.com/items?page=2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_multi_rel() {
+        // rel with multiple values: "next prev"
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/items?page=2>; rel="next prev""#),
+            Some("https://api.example.com/items?page=2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_uri_with_comma() {
+        // URI containing a comma inside <...> must not be split
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/items?a=1,2&page=2>; rel="next""#),
+            Some("https://api.example.com/items?a=1,2&page=2".to_string())
+        );
+
+        // Multiple links where the first URI contains a comma
+        assert_eq!(
+            parse_link_header_next(
+                r#"<https://api.example.com/items?x=a,b>; rel="prev", <https://api.example.com/items?page=3>; rel="next""#
+            ),
+            Some("https://api.example.com/items?page=3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_split_link_header_top_level_basic() {
+        // Comma outside angle brackets splits normally
+        let result = split_link_header_top_level("<a>; rel=prev, <b>; rel=next", ',');
+        assert_eq!(result, vec!["<a>; rel=prev", "<b>; rel=next"]);
+
+        // Comma inside angle brackets is preserved
+        let result = split_link_header_top_level("<a?x=1,2>; rel=next", ',');
+        assert_eq!(result, vec!["<a?x=1,2>; rel=next"]);
+
+        // Semicolons inside quoted strings are not split
+        let result = split_link_header_top_level(r#"<a>; title="a;b"; rel=next"#, ';');
+        assert_eq!(result, vec!["<a>", r#"title="a;b""#, "rel=next"]);
+    }
+
+    #[test]
+    fn test_split_link_header_top_level_escaped_quotes() {
+        // Escaped quote inside a quoted string should not close the string
+        let result =
+            split_link_header_top_level(r#"<a>; title="has \"escaped\" quotes"; rel=next"#, ';');
+        assert_eq!(
+            result,
+            vec!["<a>", r#"title="has \"escaped\" quotes""#, "rel=next"]
+        );
+    }
+
+    #[test]
+    fn test_split_link_header_top_level_empty_and_single() {
+        assert_eq!(split_link_header_top_level("", ','), vec![""]);
+        assert_eq!(
+            split_link_header_top_level("<a>; rel=next", ','),
+            vec!["<a>; rel=next"]
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_case_insensitive_rel() {
+        // REL and NEXT should be matched case-insensitively
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/page2>; REL="NEXT""#),
+            Some("https://api.example.com/page2".to_string())
+        );
+
+        assert_eq!(
+            parse_link_header_next("<https://api.example.com/page2>; Rel=Next"),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_extra_params() {
+        // Link with additional params like type and title
+        assert_eq!(
+            parse_link_header_next(
+                r#"<https://api.example.com/page2>; rel="next"; type="application/json"; title="Next Page""#
+            ),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_whitespace_variations() {
+        // No spaces around semicolons
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/page2>;rel="next""#),
+            Some("https://api.example.com/page2".to_string())
+        );
+
+        // Extra whitespace
+        assert_eq!(
+            parse_link_header_next(r#"  <https://api.example.com/page2> ;  rel="next"  "#),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_malformed() {
+        // Missing angle brackets
+        assert_eq!(
+            parse_link_header_next(r#"https://api.example.com/page2; rel="next""#),
+            None
+        );
+
+        // No rel param at all
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/page2>; type="text/html""#),
+            None
+        );
+
+        // rel="last" only
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/page2>; rel="last""#),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_next_is_second_link() {
+        // rel="next" is on the second link, not the first
+        assert_eq!(
+            parse_link_header_next(
+                r#"<https://api.example.com/page1>; rel="first", <https://api.example.com/page2>; rel="next", <https://api.example.com/page99>; rel="last""#
+            ),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_semicolon_in_quoted_title() {
+        // Semicolons inside quoted title param must not break parsing
+        assert_eq!(
+            parse_link_header_next(
+                r#"<https://api.example.com/page2>; title="Page; 2"; rel="next""#
+            ),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_queries_all_sources() {
+        let result = merge_queries(
+            Some("api_key=secret"),
+            Some("filter=active"),
+            "cursor",
+            "abc123",
+        );
+        assert!(
+            result.contains("api_key=secret"),
+            "should include base URL params: {result}"
+        );
+        assert!(
+            result.contains("filter=active"),
+            "should include partition params: {result}"
+        );
+        assert!(
+            result.contains("cursor=abc123"),
+            "should include token: {result}"
+        );
+    }
+
+    #[test]
+    fn test_merge_queries_partition_overrides_base() {
+        let result = merge_queries(
+            Some("page=1&api_key=secret"),
+            Some("page=5"),
+            "cursor",
+            "abc",
+        );
+        // "page" from partition should override base
+        let page_count = result.matches("page=").count();
+        assert_eq!(
+            page_count, 1,
+            "partition should override base param, got: {result}"
+        );
+        assert!(
+            result.contains("page=5"),
+            "partition value should win: {result}"
+        );
+    }
+
+    #[test]
+    fn test_merge_queries_no_base() {
+        let result = merge_queries(None, Some("filter=active"), "cursor", "abc123");
+        assert!(
+            result.contains("filter=active"),
+            "should include partition params: {result}"
+        );
+        assert!(
+            result.contains("cursor=abc123"),
+            "should include token: {result}"
+        );
+    }
+
+    #[test]
+    fn test_merge_queries_no_partition() {
+        let result = merge_queries(Some("api_key=secret"), None, "cursor", "abc123");
+        assert!(
+            result.contains("api_key=secret"),
+            "should include base params: {result}"
+        );
+        assert!(
+            result.contains("cursor=abc123"),
+            "should include token: {result}"
+        );
+    }
+
+    #[test]
+    fn test_merge_base_and_partition_queries() {
+        // Both present — partition overrides base
+        let result =
+            merge_base_and_partition_queries(Some("api_key=secret&page=1"), Some("page=2"));
+        let result = result.expect("should return Some");
+        assert!(result.contains("api_key=secret"), "base param: {result}");
+        assert!(result.contains("page=2"), "partition override: {result}");
+        assert_eq!(
+            result.matches("page=").count(),
+            1,
+            "no duplicates: {result}"
+        );
+
+        // Only base
+        let result = merge_base_and_partition_queries(Some("api_key=secret"), None);
+        let result = result.expect("should return Some");
+        assert!(result.contains("api_key=secret"), "base only: {result}");
+
+        // Only partition
+        let result = merge_base_and_partition_queries(None, Some("filter=active"));
+        let result = result.expect("should return Some");
+        assert!(result.contains("filter=active"), "partition only: {result}");
+
+        // Neither
+        assert!(
+            merge_base_and_partition_queries(None, None).is_none(),
+            "both None should return None"
+        );
+    }
+
+    // --- Tests for data_map_to_array ---
+
+    #[test]
+    fn test_extract_page_data_map_to_array() {
+        let content = r#"{"data": {"1": {"id": "1", "name": "a"}, "2": {"id": "2", "name": "b"}}}"#;
+        let config = PaginationConfig {
+            data_pointer: Some("/data".to_string()),
+            data_map_to_array: true,
+            ..Default::default()
+        };
+        let rows = extract_page_data(content, &config, None).expect("should extract");
+        assert_eq!(rows.len(), 2);
+        // Values should be the inner objects
+        for row in &rows {
+            assert!(row.contains("\"id\""), "row should contain id: {row}");
+        }
+    }
+
+    #[test]
+    fn test_extract_page_data_map_to_array_disabled() {
+        let content = r#"{"data": {"1": {"id": "1"}, "2": {"id": "2"}}}"#;
+        let config = PaginationConfig {
+            data_pointer: Some("/data".to_string()),
+            data_map_to_array: false,
+            ..Default::default()
+        };
+        let rows = extract_page_data(content, &config, None).expect("should extract");
+        // Without map_to_array, the object is returned as a single row
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_content_map_to_array() {
+        let content = r#"{"1": {"id": "1"}, "2": {"id": "2"}, "3": {"id": "3"}}"#;
+        let rows = parse_content_with_map_to_array(content, None, true);
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert!(row.contains("\"id\""), "row should contain id: {row}");
+        }
+
+        // With limit
+        let rows = parse_content_with_map_to_array(content, Some(2), true);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_content_map_to_array_disabled_is_single_row() {
+        let content = r#"{"1": {"id": "1"}, "2": {"id": "2"}}"#;
+        let rows = parse_content_with_map_to_array(content, None, false);
+        assert_eq!(rows.len(), 1, "without flag, object is a single row");
+    }
+
+    #[test]
+    fn test_parse_content_map_to_array_array_still_works() {
+        let content = r#"[{"id": 1}, {"id": 2}]"#;
+        let rows = parse_content_with_map_to_array(content, None, true);
+        assert_eq!(rows.len(), 2, "array input still works with flag enabled");
+    }
+
+    // --- Tests for query_params pagination ---
+
+    #[test]
+    fn test_expand_query_params_template() {
+        let result = expand_query_params_template("offset={offset}&limit={limit}", 0, 100)
+            .expect("page 0 should not overflow");
+        assert_eq!(result, "offset=0&limit=100");
+
+        let result = expand_query_params_template("offset={offset}&limit={limit}", 3, 50)
+            .expect("page 3 should not overflow");
+        assert_eq!(result, "offset=150&limit=50");
+
+        let result = expand_query_params_template("page={page}&size={limit}", 2, 25)
+            .expect("page 2 should not overflow");
+        assert_eq!(result, "page=2&size=25");
+
+        // Overflow should return an error
+        expand_query_params_template("offset={offset}", usize::MAX, 2)
+            .expect_err("usize::MAX * 2 should overflow");
+    }
+
+    #[test]
+    fn test_pagination_config_query_params_requires_page_size() {
+        let config = PaginationConfig {
+            query_params: Some("offset={offset}&limit={limit}".to_string()),
+            page_size: None,
+            use_link_header: false,
+            ..Default::default()
+        };
+        let err = base_provider()
+            .with_pagination(config)
+            .expect_err("should fail without page_size");
+        match err {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("pagination_page_size"),
+                    "error should mention page_size: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pagination_config_query_params_mutually_exclusive_with_token() {
+        let config = PaginationConfig {
+            query_params: Some("offset={offset}&limit={limit}".to_string()),
+            page_size: Some(100),
+            token_param: Some("cursor".to_string()),
+            next_pointer: Some("/next".to_string()),
+            use_link_header: false,
+            ..Default::default()
+        };
+        let err = base_provider()
+            .with_pagination(config)
+            .expect_err("should fail with both query_params and token_param");
+        match err {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("mutually exclusive"),
+                    "error should mention mutual exclusion: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pagination_config_query_params_valid() {
+        let config = PaginationConfig {
+            query_params: Some("offset={offset}&limit={limit}".to_string()),
+            page_size: Some(100),
+            use_link_header: false,
+            ..Default::default()
+        };
+        base_provider()
+            .with_pagination(config)
+            .expect("should succeed with query_params and page_size");
+    }
+
+    #[test]
+    fn test_pagination_config_page_size_requires_query_params() {
+        let config = PaginationConfig {
+            page_size: Some(100),
+            ..Default::default()
+        };
+        let err = base_provider()
+            .with_pagination(config)
+            .expect_err("should fail with page_size but no query_params");
+        match err {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("pagination_query_params"),
+                    "error should mention query_params: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pagination_config_query_params_requires_pagination_variable() {
+        let config = PaginationConfig {
+            query_params: Some("limit=100".to_string()),
+            page_size: Some(100),
+            use_link_header: false,
+            ..Default::default()
+        };
+        let err = base_provider()
+            .with_pagination(config)
+            .expect_err("should fail without pagination variable");
+        match err {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("{offset}") || message.contains("{page}"),
+                    "error should mention pagination variables: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_query_params_mode() {
+        let config = PaginationConfig {
+            query_params: Some("offset={offset}&limit={limit}".to_string()),
+            page_size: Some(100),
+            use_link_header: false,
+            ..Default::default()
+        };
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let result =
+            extract_next_page_info_at_page("{}", &[], &config, &base_url, 2).expect("should work");
+        match result {
+            Some(NextPageInfo::QueryParams { page }) => {
+                assert_eq!(page, 3);
+            }
+            other => panic!("Expected QueryParams, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_merge_base_and_partition_queries_with_override() {
+        // Override replaces existing keys
+        let result = merge_base_and_partition_queries_with_override(
+            Some("api_key=secret&offset=0"),
+            None,
+            "offset=100&limit=50",
+        );
+        assert!(
+            result.contains("api_key=secret"),
+            "base param kept: {result}"
+        );
+        assert!(result.contains("offset=100"), "offset overridden: {result}");
+        assert!(result.contains("limit=50"), "limit added: {result}");
+        assert_eq!(
+            result.matches("offset=").count(),
+            1,
+            "no duplicates: {result}"
+        );
+    }
+
+    fn nested_exec(column_order: &[&str], json_field: &str) -> (HttpExec, HttpJsonNesting) {
+        let nesting = HttpJsonNesting::new(
+            column_order.iter().map(|s| (*s).to_string()).collect(),
+            json_field.to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        (exec, nesting)
+    }
+
+    fn string_col(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+        let idx = batch
+            .schema()
+            .index_of(name)
+            .expect("column should exist in batch");
+        let arr = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column should be StringArray");
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i).to_string())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_decomposes_object_rows() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![
+            r#"{"id":"1","name":"alpha","extra":"x"}"#.to_string(),
+            r#"{"id":"2","name":"beta","k":42}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(
+            string_col(&batch, "id"),
+            vec![Some("1".to_string()), Some("2".to_string())]
+        );
+        assert_eq!(
+            string_col(&batch, "name"),
+            vec![Some("alpha".to_string()), Some("beta".to_string())]
+        );
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some(r#"{"extra":"x"}"#));
+        assert_eq!(details[1].as_deref(), Some(r#"{"k":42}"#));
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_missing_key_is_null() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![r#"{"id":"1"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(string_col(&batch, "id"), vec![Some("1".to_string())]);
+        assert_eq!(string_col(&batch, "name"), vec![None]);
+        assert_eq!(string_col(&batch, "details"), vec![None]);
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_missing_keys_become_null() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![
+            r#"{"id":"1","extra":"x"}"#.to_string(),
+            r#"{"name":"beta"}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+
+        assert_eq!(string_col(&batch, "id"), vec![Some("1".to_string()), None]);
+        assert_eq!(
+            string_col(&batch, "name"),
+            vec![None, Some("beta".to_string())]
+        );
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some(r#"{"extra":"x"}"#));
+        assert!(details[1].is_none());
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_non_object_rows_go_to_catchall() {
+        let (exec, nesting) = nested_exec(&["id", "details"], "details");
+        let rows = vec![
+            "[1,2,3]".to_string(),
+            "\"scalar\"".to_string(),
+            "42".to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 3);
+        for v in string_col(&batch, "id") {
+            assert!(
+                v.is_none(),
+                "non-object rows should have NULL for static fields"
+            );
+        }
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some("[1,2,3]"));
+        assert_eq!(details[1].as_deref(), Some("\"scalar\""));
+        assert_eq!(details[2].as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_empty_catchall_is_null_when_all_keys_declared() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![r#"{"id":"1","name":"alpha"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(string_col(&batch, "id")[0].as_deref(), Some("1"));
+        assert_eq!(string_col(&batch, "name")[0].as_deref(), Some("alpha"));
+        assert!(
+            string_col(&batch, "details")[0].is_none(),
+            "catch-all should be NULL when no non-declared keys are present"
+        );
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_fast_path_when_catchall_not_projected() {
+        // Projection keeps only a static column; the catch-all column
+        // should never be built.
+        let nesting = HttpJsonNesting::new(
+            vec!["id".to_string(), "name".to_string(), "details".to_string()],
+            "details".to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        // Project only static columns, not "details".
+        let full_schema = provider.schema();
+        let projected = Arc::new(
+            full_schema
+                .project(&[
+                    full_schema.index_of("id").expect("id in schema"),
+                    full_schema.index_of("name").expect("name in schema"),
+                ])
+                .expect("projection should succeed"),
+        );
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
+        let rows = vec![r#"{"id":"42","name":"fast","extra":"ignored"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("fast-path batch should be created");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(string_col(&batch, "id"), vec![Some("42".to_string())]);
+        assert_eq!(string_col(&batch, "name"), vec![Some("fast".to_string())]);
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_fast_path_falls_through_on_non_object_rows() {
+        // When catch-all isn't projected but a row isn't a JSON object,
+        // the fast path must not apply blindly — decompose_json_row still
+        // runs and yields NULL for static fields.
+        let nesting = HttpJsonNesting::new(
+            vec!["id".to_string(), "details".to_string()],
+            "details".to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let full_schema = provider.schema();
+        let id_idx = full_schema.index_of("id").expect("id in schema");
+        let projected = datafusion::common::project_schema(&full_schema, Some(&vec![id_idx]))
+            .expect("project schema");
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
+        let rows = vec!["[1,2,3]".to_string(), r#"{"id":"x"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 1);
+        let id = string_col(&batch, "id");
+        assert!(id[0].is_none(), "non-object row: id should be NULL");
+        assert_eq!(id[1].as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn create_batch_from_rows_empty_projection_nested_falls_back_to_first_column() {
+        let nesting = HttpJsonNesting::new(
+            vec!["id".to_string(), "details".to_string()],
+            "details".to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let full_schema = provider.schema();
+        let projected =
+            HttpTableProvider::get_projected_schema(&full_schema, Some(&vec![])).expect("schema");
+        assert_eq!(
+            projected.fields().len(),
+            1,
+            "empty projection should fall back to a single field"
+        );
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
+        let rows = vec![
+            r#"{"id":"1","extra":"x"}"#.to_string(),
+            r#"{"id":"2"}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn create_batch_from_rows_dispatches_to_nested_when_configured() {
+        let (exec, _nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![
+            r#"{"id":"1","name":"alpha","extra":"x"}"#.to_string(),
+            r#"{"id":"2","name":"beta"}"#.to_string(),
+        ];
+        let fetch_result = HttpFetchResult {
+            content: String::new(),
+            max_age: Duration::from_secs(0),
+            detected_format: "json".to_string(),
+            response_date: None,
+            response_status: 200,
+            response_headers: Vec::new(),
+        };
+        let batch = exec
+            .create_batch_from_rows(None, None, None, None, &rows, &fetch_result)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(field_names, vec!["id", "name", "details"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_expanded_params unit tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an `HttpExec` with the given partitions and optional max.
+    ///
+    /// Enables all filter types (path, query, body, headers) so that
+    /// `with_expanded_params` validation passes for any column.
+    fn make_exec(
+        partitions: Vec<PartitionSpec>,
+        max_request_partitions: Option<usize>,
+    ) -> HttpExec {
+        let provider = base_provider()
+            .with_allowed_paths(["/*"])
+            .expect("valid path glob")
+            .enable_query_filters(DEFAULT_MAX_QUERY_LENGTH)
+            .enable_body_filters(DEFAULT_MAX_BODY_BYTES)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-test"])
+            .expect("header filters should enable")
+            .with_max_request_partitions(max_request_partitions);
+        HttpExec::new(
+            HttpTableProvider::base_table_schema().into(),
+            Arc::new(provider),
+            partitions,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_with_expanded_params_request_path() {
+        let exec = make_exec(vec![(None, None, None, None)], None);
+        let result = exec
+            .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
+            .expect("expand should succeed");
+
+        assert_eq!(result.partitions.len(), 2);
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/b".to_string()));
+        // Other tuple positions remain None.
+        assert_eq!(result.partitions[0].1, None);
+        assert_eq!(result.partitions[0].2, None);
+        assert_eq!(result.partitions[0].3, None);
+    }
+
+    #[test]
+    fn test_with_expanded_params_cross_product() {
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            None,
+        );
+        let result = exec
+            .with_expanded_params(
+                "request_query",
+                &["q1".to_string(), "q2".to_string(), "q3".to_string()],
+            )
+            .expect("expand should succeed");
+
+        // 2 existing × 3 values = 6 partitions
+        assert_eq!(result.partitions.len(), 6);
+
+        // First existing partition (/a) crossed with all three values
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[0].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[2].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[2].1, Some("q3".to_string()));
+
+        // Second existing partition (/b) crossed with all three values
+        assert_eq!(result.partitions[3].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[3].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[4].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[4].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[5].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[5].1, Some("q3".to_string()));
+    }
+
+    #[test]
+    fn test_with_expanded_params_exceeds_max() {
+        // max=3, but 2 partitions × 2 query values = 4 → should fail
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            Some(3),
+        );
+
+        _ = exec
+            .with_expanded_params("request_query", &["q=1".to_string(), "q=2".to_string()])
+            .expect_err("should exceed max_request_partitions");
+    }
+
+    type PartitionAccessor = Box<dyn Fn(&PartitionSpec) -> &Option<String>>;
+
+    #[test]
+    fn test_with_expanded_params_all_columns() {
+        // Values must satisfy each column's validation rules:
+        // - request_path: must start with '/'
+        // - request_query: plain query string
+        // - request_body: plain body text
+        // - request_headers: JSON with allowed header names
+        let cases: Vec<(&str, &str, PartitionAccessor)> = vec![
+            ("/val", "request_path", Box::new(|p: &PartitionSpec| &p.0)),
+            ("val", "request_query", Box::new(|p: &PartitionSpec| &p.1)),
+            ("val", "request_body", Box::new(|p: &PartitionSpec| &p.2)),
+            (
+                r#"{"x-test":"val"}"#,
+                "request_headers",
+                Box::new(|p: &PartitionSpec| &p.3),
+            ),
+        ];
+
+        for (test_value, col_name, accessor) in &cases {
+            let exec = make_exec(vec![(None, None, None, None)], None);
+            let result = exec
+                .with_expanded_params(col_name, &[test_value.to_string()])
+                .unwrap_or_else(|e| panic!("expand for {col_name} should succeed: {e}"));
+
+            assert_eq!(
+                result.partitions.len(),
+                1,
+                "one partition expected for {col_name}"
+            );
+            assert_eq!(
+                *accessor(&result.partitions[0]),
+                Some(test_value.to_string()),
+                "{col_name} should be set"
+            );
+
+            // Verify the OTHER positions are still None.
+            let all_accessors: Vec<PartitionAccessor> = vec![
+                Box::new(|p: &PartitionSpec| &p.0),
+                Box::new(|p: &PartitionSpec| &p.1),
+                Box::new(|p: &PartitionSpec| &p.2),
+                Box::new(|p: &PartitionSpec| &p.3),
+            ];
+            let col_names = [
+                "request_path",
+                "request_query",
+                "request_body",
+                "request_headers",
+            ];
+            for (other_name, other_accessor) in col_names.iter().zip(all_accessors.iter()) {
+                if *other_name != *col_name {
+                    assert_eq!(
+                        *other_accessor(&result.partitions[0]),
+                        None,
+                        "{other_name} should remain None when expanding {col_name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_expanded_params_unknown_column_errors() {
+        let exec = make_exec(vec![(Some("/orig".to_string()), None, None, None)], None);
+        let _ = exec
+            .with_expanded_params("nonexistent_column", &["x".to_string()])
+            .expect_err("unknown column should error");
     }
 }

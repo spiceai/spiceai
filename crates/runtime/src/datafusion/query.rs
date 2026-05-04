@@ -14,14 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, sync::Arc};
+use std::{fmt::Display, fmt::Write as _, sync::Arc};
 
 use ::cache::{
     AsTableRefs, get_logical_plan_input_tables,
     key::CacheKey,
     result::{CacheStatus, query::QueryResult},
 };
-use arrow::{array::RecordBatch, datatypes::Schema};
+use arrow::{
+    array::{
+        Array, FixedSizeListArray, LargeListArray, MapArray, RecordBatch, StructArray, UnionArray,
+    },
+    datatypes::Schema,
+};
+use arrow_json::writer::JsonArray;
 use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
@@ -34,9 +40,12 @@ use datafusion::{
         ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     },
+    scalar::ScalarValue,
     sql::TableReference,
 };
+use datafusion_functions_json::{JsonUnionEncoder, JsonUnionValue};
 use error_code::ErrorCode;
+use serde_json::{Map, Number, Value};
 use snafu::{ResultExt, Snafu};
 use tokio::time::Instant;
 use tracing::Span;
@@ -72,7 +81,9 @@ use super::{
 
 use super::managed_runtime;
 use crate::datafusion::{
-    DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
+    DataFusion,
+    query::cache::RequestCacheManager,
+    sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
@@ -158,6 +169,8 @@ impl Error {
 }
 
 pub enum QueryMethod {
+    /// A pre-parsed logical plan with no associated SQL. The cache key is
+    /// derived from the plan hash. Used by [`Query::from_logical_plan`].
     Plan(Box<LogicalPlan>),
     Text {
         sql: Arc<str>,
@@ -165,6 +178,11 @@ pub enum QueryMethod {
 
         /// An optional allowlist of tables that can be accessed by this query. When [`Option::is_some`], no SQL results caching is performed. [`LogicalPlan`] caching can still occur (since allowlisting is done post-plan).
         table_allowlist: Option<ResolvedTableAwareAllowlist>,
+
+        /// A pre-parsed logical plan to use instead of re-parsing `sql`.
+        /// The SQL string is still used for results-cache key computation so
+        /// cached entries are shared with equivalent plain `Text` executions.
+        pre_parsed_plan: Option<Box<LogicalPlan>>,
     },
 }
 
@@ -181,6 +199,11 @@ pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
     tracker: Option<QueryTracker>,
+    /// When true, the validator additionally rejects DDL, DML, COPY, or any
+    /// `LogicalPlan::Statement` node (including PREPARE/EXECUTE/DEALLOCATE),
+    /// regardless of per-catalog writability. Set via [`QueryBuilder::read_only`];
+    /// used by `/v1/tools/sql` and `/v1/nsql` to contain LLM-generated SQL.
+    read_only: bool,
 }
 
 macro_rules! handle_error {
@@ -298,10 +321,15 @@ impl Query {
         // Get logical plan and cache key, reusing existing cache infrastructure
         let (plan, mut tracker, cache_key) = match &self.sql {
             QueryMethod::Text {
-                sql, parameters, ..
+                sql,
+                parameters,
+                pre_parsed_plan,
+                ..
             } => {
                 // Use the existing get_plan_or_cached which handles all cache control,
-                // stale-while-revalidate, and query tracking
+                // stale-while-revalidate, and query tracking. `read_only` is
+                // threaded through so cached results cannot bypass
+                // `validate_sql_query_read_only` below.
                 match Query::get_plan_or_cached(
                     &self.df,
                     &session,
@@ -309,6 +337,8 @@ impl Query {
                     sql,
                     parameters.clone(),
                     tracker,
+                    self.read_only,
+                    pre_parsed_plan.clone(),
                 )
                 .await?
                 {
@@ -377,6 +407,12 @@ impl Query {
 
         // Validate query operations
         if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
+            let e = find_datafusion_root(e);
+            return Err(Error::UnableToExecuteQuery { source: e });
+        }
+        if self.read_only
+            && let Err(e) = validate_sql_query_read_only(&plan)
+        {
             let e = find_datafusion_root(e);
             return Err(Error::UnableToExecuteQuery { source: e });
         }
@@ -523,34 +559,39 @@ impl Query {
                         sql,
                         parameters,
                         table_allowlist: Some(allowlist),
+                        pre_parsed_plan,
                     } => {
                         let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
                             .as_raw_key(Query::plan_hasher(&ctx.df));
-                        let plan = match Self::get_plan(
-                            &ctx.df,
-                            &session,
-                            sql,
-                            &raw_cache_key,
-                            parameters.clone(),
-                        )
-                        .await
-                        {
-                            Ok(plan) => plan,
-                            Err(e) => match e {
-                                Error::UnableToExecuteQuery { source } => {
-                                    let code = ErrorCode::from(&source);
-                                    let snafu_err = Error::UnableToExecuteQuery { source };
-                                    if let Some(t) = tracker {
-                                        t.finish_with_error(
-                                            &request_context,
-                                            snafu_err.to_string(),
-                                            code,
-                                        );
+                        let plan = if let Some(plan) = pre_parsed_plan {
+                            plan.clone()
+                        } else {
+                            match Self::get_plan(
+                                &ctx.df,
+                                &session,
+                                sql,
+                                &raw_cache_key,
+                                parameters.clone(),
+                            )
+                            .await
+                            {
+                                Ok(plan) => Box::new(plan),
+                                Err(e) => match e {
+                                    Error::UnableToExecuteQuery { source } => {
+                                        let code = ErrorCode::from(&source);
+                                        let snafu_err = Error::UnableToExecuteQuery { source };
+                                        if let Some(t) = tracker {
+                                            t.finish_with_error(
+                                                &request_context,
+                                                snafu_err.to_string(),
+                                                code,
+                                            );
+                                        }
+                                        return Err(snafu_err);
                                     }
-                                    return Err(snafu_err);
-                                }
-                                _ => return Err(e),
-                            },
+                                    _ => return Err(e),
+                                },
+                            }
                         };
                         let tables_referenced = plan.as_table_refs();
                         if let Some(disallowed_table) = tables_referenced
@@ -563,7 +604,7 @@ impl Query {
                         }
 
                         (
-                            Box::new(plan),
+                            plan,
                             tracker,
                             RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
                         )
@@ -572,6 +613,7 @@ impl Query {
                         sql,
                         parameters,
                         table_allowlist: None,
+                        pre_parsed_plan,
                     } => {
                         match Self::get_plan_or_cached(
                             &ctx.df,
@@ -580,6 +622,8 @@ impl Query {
                             sql,
                             parameters.clone(),
                             tracker,
+                            ctx.read_only,
+                            pre_parsed_plan.clone(),
                         )
                         .await?
                         {
@@ -600,6 +644,19 @@ impl Query {
                 };
 
                 if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
+                    let e = find_datafusion_root(e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        ErrorCode::QueryPlanningError,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+
+                if ctx.read_only
+                    && let Err(e) = validate_sql_query_read_only(&plan)
+                {
                     let e = find_datafusion_root(e);
                     handle_error!(
                         tracker,
@@ -869,6 +926,7 @@ impl Query {
             df: Arc::clone(df),
             sql: QueryMethod::Plan(Box::new(plan.clone())),
             tracker: None,
+            read_only: false,
         }
     }
 
@@ -902,7 +960,11 @@ impl Query {
         };
 
         let plan = match self.sql {
-            QueryMethod::Plan(ref plan) => plan.clone(),
+            QueryMethod::Plan(ref plan)
+            | QueryMethod::Text {
+                pre_parsed_plan: Some(ref plan),
+                ..
+            } => plan.clone(),
             QueryMethod::Text { ref sql, .. } => {
                 match self.df.create_logical_plan(&session, sql).await {
                     Ok(plan) => Box::new(plan),
@@ -917,6 +979,13 @@ impl Query {
 
         // Verify the plan against the restricted options
         if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
+            let e = find_datafusion_root(e);
+            self.handle_schema_error(&request_context, &e);
+            return Err(e);
+        }
+        if self.read_only
+            && let Err(e) = validate_sql_query_read_only(&plan)
+        {
             let e = find_datafusion_root(e);
             self.handle_schema_error(&request_context, &e);
             return Err(e);
@@ -1234,13 +1303,391 @@ fn strip_root_order_preserving_repartition(
 pub fn write_to_json_string(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if data.iter().any(record_batch_has_union_columns) {
+        serde_json::to_string(&write_union_batches_to_json_value(data)?).boxed()
+    } else {
+        String::from_utf8(write_to_json_bytes_with_arrow(data)?).boxed()
+    }
+}
+
+pub fn write_to_json_value(
+    data: &[RecordBatch],
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    if data.iter().any(record_batch_has_union_columns) {
+        write_union_batches_to_json_value(data)
+    } else {
+        write_to_json_value_with_arrow(data)
+    }
+}
+
+fn write_union_batches_to_json_value(
+    data: &[RecordBatch],
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let rows = data
+        .iter()
+        .map(record_batch_to_json_rows)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .map(Value::Object)
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+fn write_to_json_value_with_arrow(
+    data: &[RecordBatch],
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    serde_json::from_slice(write_to_json_bytes_with_arrow(data)?.as_slice()).boxed()
+}
+
+fn write_to_json_bytes_with_arrow(
+    data: &[RecordBatch],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(buf);
+    let mut writer = arrow_json::WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<_, JsonArray>(buf);
 
     writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
     writer.finish()?;
 
-    String::from_utf8(writer.into_inner()).boxed()
+    Ok(writer.into_inner())
+}
+
+fn record_batch_has_union_columns(batch: &RecordBatch) -> bool {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|field| data_type_contains_union(field.data_type()))
+}
+
+fn data_type_contains_union(data_type: &arrow::datatypes::DataType) -> bool {
+    match data_type {
+        arrow::datatypes::DataType::Union(_, _) => true,
+        arrow::datatypes::DataType::List(field)
+        | arrow::datatypes::DataType::LargeList(field)
+        | arrow::datatypes::DataType::FixedSizeList(field, _)
+        | arrow::datatypes::DataType::ListView(field)
+        | arrow::datatypes::DataType::LargeListView(field)
+        | arrow::datatypes::DataType::Map(field, _) => data_type_contains_union(field.data_type()),
+        arrow::datatypes::DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| data_type_contains_union(field.data_type())),
+        arrow::datatypes::DataType::Dictionary(_, value_type) => {
+            data_type_contains_union(value_type)
+        }
+        arrow::datatypes::DataType::RunEndEncoded(_, value_field) => {
+            data_type_contains_union(value_field.data_type())
+        }
+        _ => false,
+    }
+}
+
+fn record_batch_to_json_rows(
+    batch: &RecordBatch,
+) -> Result<Vec<Map<String, Value>>, Box<dyn std::error::Error + Send + Sync>> {
+    let custom_indices: Vec<usize> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| data_type_contains_union(field.data_type()).then_some(index))
+        .collect();
+
+    if custom_indices.is_empty() {
+        return json_value_to_rows(write_to_json_value_with_arrow(std::slice::from_ref(batch))?);
+    }
+
+    let mut is_custom_index = vec![false; batch.num_columns()];
+    for &custom_index in &custom_indices {
+        is_custom_index[custom_index] = true;
+    }
+
+    let non_union_indices: Vec<usize> = (0..batch.num_columns())
+        .filter(|index| !is_custom_index[*index])
+        .collect();
+
+    let mut rows = if non_union_indices.is_empty() {
+        vec![Map::new(); batch.num_rows()]
+    } else {
+        let projected_batch = batch.project(&non_union_indices)?;
+        json_value_to_rows(write_to_json_value_with_arrow(std::slice::from_ref(
+            &projected_batch,
+        ))?)?
+    };
+
+    for custom_index in custom_indices {
+        let column_values = column_to_json_values(batch.column(custom_index).as_ref())?;
+        let field_name = batch.schema().field(custom_index).name().clone();
+
+        for (row, value) in rows.iter_mut().zip(column_values) {
+            row.insert(field_name.clone(), value);
+        }
+    }
+
+    Ok(rows)
+}
+
+fn column_to_json_values(
+    array: &dyn Array,
+) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    if matches!(array.data_type(), arrow::datatypes::DataType::Union(_, _)) {
+        return union_array_to_json_values(array);
+    }
+
+    (0..array.len())
+        .map(|index| array_value_to_json(array, index))
+        .collect()
+}
+
+fn json_value_to_rows(
+    value: Value,
+) -> Result<Vec<Map<String, Value>>, Box<dyn std::error::Error + Send + Sync>> {
+    let Value::Array(rows) = value else {
+        return Err("Expected JSON array of rows".into());
+    };
+
+    rows.into_iter()
+        .map(|row| match row {
+            Value::Object(map) => Ok(map),
+            _ => Err("Expected each JSON row to be an object".into()),
+        })
+        .collect()
+}
+
+fn union_array_to_json_values(
+    array: &dyn Array,
+) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let union_array = array
+        .as_any()
+        .downcast_ref::<UnionArray>()
+        .ok_or_else(|| "Expected UnionArray for Union-typed column".to_string())?;
+
+    if let Some(encoder) = JsonUnionEncoder::from_union(union_array.clone()) {
+        return (0..encoder.len())
+            .map(|index| {
+                let value = encoder.get_value(index);
+                json_union_value_to_json(&value)
+            })
+            .collect();
+    }
+
+    (0..union_array.len())
+        .map(|index| scalar_to_json_value(&ScalarValue::try_from_array(union_array, index)?))
+        .collect()
+}
+
+fn json_union_value_to_json(
+    value: &JsonUnionValue<'_>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    match value {
+        JsonUnionValue::JsonNull => Ok(Value::Null),
+        JsonUnionValue::Bool(value) => Ok(Value::Bool(*value)),
+        JsonUnionValue::Int(value) => Ok(Value::Number(Number::from(*value))),
+        JsonUnionValue::Float(value) => number_to_json(*value),
+        JsonUnionValue::Str(value) => Ok(Value::String((*value).to_owned())),
+        JsonUnionValue::Array(value) | JsonUnionValue::Object(value) => {
+            serde_json::from_str(value).boxed()
+        }
+    }
+}
+
+fn array_value_to_json(
+    array: &dyn Array,
+    index: usize,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(union_array) = array.as_any().downcast_ref::<UnionArray>()
+        && let Some(encoder) = JsonUnionEncoder::from_union(union_array.clone())
+    {
+        let value = encoder.get_value(index);
+        return json_union_value_to_json(&value);
+    }
+
+    scalar_to_json_value(&ScalarValue::try_from_array(array, index)?)
+}
+
+fn scalar_to_json_value(
+    value: &ScalarValue,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    match value {
+        ScalarValue::Boolean(value) => Ok(value.map(Value::Bool).unwrap_or(Value::Null)),
+        ScalarValue::Float16(Some(value)) => number_to_json(f64::from(f32::from(*value))),
+        ScalarValue::Float32(Some(value)) => number_to_json(f64::from(*value)),
+        ScalarValue::Float64(Some(value)) => number_to_json(*value),
+        ScalarValue::Int8(Some(value)) => Ok(Value::Number(Number::from(*value))),
+        ScalarValue::Int16(Some(value)) => Ok(Value::Number(Number::from(*value))),
+        ScalarValue::Int32(Some(value)) => Ok(Value::Number(Number::from(*value))),
+        ScalarValue::Int64(Some(value)) => Ok(Value::Number(Number::from(*value))),
+        ScalarValue::UInt8(Some(value)) => Ok(Value::Number(Number::from(*value))),
+        ScalarValue::UInt16(Some(value)) => Ok(Value::Number(Number::from(*value))),
+        ScalarValue::UInt32(Some(value)) => Ok(Value::Number(Number::from(*value))),
+        ScalarValue::UInt64(Some(value)) => Ok(Value::Number(Number::from(*value))),
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Ok(Value::String(value.clone())),
+        ScalarValue::Binary(Some(value))
+        | ScalarValue::BinaryView(Some(value))
+        | ScalarValue::LargeBinary(Some(value))
+        | ScalarValue::FixedSizeBinary(_, Some(value)) => {
+            Ok(Value::String(bytes_to_hex(value.as_slice())))
+        }
+        ScalarValue::FixedSizeList(array) => single_row_fixed_size_list_to_json(array),
+        ScalarValue::List(array) => single_row_list_to_json(array),
+        ScalarValue::LargeList(array) => single_row_large_list_to_json(array),
+        ScalarValue::Struct(array) => single_row_struct_to_json(array),
+        ScalarValue::Map(array) => single_row_map_to_json(array),
+        ScalarValue::Union(Some((_type_id, value)), _, _) => scalar_to_json_value(value),
+        ScalarValue::Dictionary(_, value) => scalar_to_json_value(value),
+        ScalarValue::Null
+        | ScalarValue::Float16(None)
+        | ScalarValue::Float32(None)
+        | ScalarValue::Float64(None)
+        | ScalarValue::Int8(None)
+        | ScalarValue::Int16(None)
+        | ScalarValue::Int32(None)
+        | ScalarValue::Int64(None)
+        | ScalarValue::UInt8(None)
+        | ScalarValue::UInt16(None)
+        | ScalarValue::UInt32(None)
+        | ScalarValue::UInt64(None)
+        | ScalarValue::Utf8(None)
+        | ScalarValue::Utf8View(None)
+        | ScalarValue::LargeUtf8(None)
+        | ScalarValue::Binary(None)
+        | ScalarValue::BinaryView(None)
+        | ScalarValue::LargeBinary(None)
+        | ScalarValue::FixedSizeBinary(_, None)
+        | ScalarValue::Union(None, _, _) => Ok(Value::Null),
+        ScalarValue::Decimal32(..)
+        | ScalarValue::Decimal64(..)
+        | ScalarValue::Decimal128(..)
+        | ScalarValue::Decimal256(..)
+        | ScalarValue::Date32(..)
+        | ScalarValue::Date64(..)
+        | ScalarValue::Time32Second(..)
+        | ScalarValue::Time32Millisecond(..)
+        | ScalarValue::Time64Microsecond(..)
+        | ScalarValue::Time64Nanosecond(..)
+        | ScalarValue::TimestampSecond(..)
+        | ScalarValue::TimestampMillisecond(..)
+        | ScalarValue::TimestampMicrosecond(..)
+        | ScalarValue::TimestampNanosecond(..)
+        | ScalarValue::IntervalYearMonth(..)
+        | ScalarValue::IntervalDayTime(..)
+        | ScalarValue::IntervalMonthDayNano(..)
+        | ScalarValue::DurationSecond(..)
+        | ScalarValue::DurationMillisecond(..)
+        | ScalarValue::DurationMicrosecond(..)
+        | ScalarValue::DurationNanosecond(..) => Ok(Value::String(value.to_string())),
+    }
+}
+
+fn single_row_list_to_json(
+    array: &arrow::array::ListArray,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    single_row_nested_array_to_json(array, 0)
+}
+
+fn single_row_large_list_to_json(
+    array: &LargeListArray,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    single_row_nested_array_to_json(array, 0)
+}
+
+fn single_row_fixed_size_list_to_json(
+    array: &FixedSizeListArray,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    single_row_nested_array_to_json(array, 0)
+}
+
+fn single_row_nested_array_to_json(
+    array: &dyn Array,
+    index: usize,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    if !array.is_valid(index) {
+        return Ok(Value::Null);
+    }
+
+    let values = if let Some(list_array) = array.as_any().downcast_ref::<arrow::array::ListArray>()
+    {
+        list_array.value(index)
+    } else if let Some(list_array) = array.as_any().downcast_ref::<LargeListArray>() {
+        list_array.value(index)
+    } else if let Some(list_array) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+        list_array.value(index)
+    } else {
+        return Err("Expected a list-like Arrow array".into());
+    };
+
+    let items = (0..values.len())
+        .map(|value_index| array_value_to_json(values.as_ref(), value_index))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Array(items))
+}
+
+fn single_row_struct_to_json(
+    array: &StructArray,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    if !array.is_valid(0) {
+        return Ok(Value::Null);
+    }
+
+    let mut object = Map::with_capacity(array.num_columns());
+    for (field, column) in array.fields().iter().zip(array.columns()) {
+        object.insert(
+            field.name().clone(),
+            array_value_to_json(column.as_ref(), 0)?,
+        );
+    }
+
+    Ok(Value::Object(object))
+}
+
+fn single_row_map_to_json(
+    array: &MapArray,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    if !array.is_valid(0) {
+        return Ok(Value::Null);
+    }
+
+    let entries = array.value(0);
+    let keys = entries.column(0);
+    let values = entries.column(1);
+
+    let mut object = Map::with_capacity(entries.len());
+    for index in 0..entries.len() {
+        let key = scalar_to_json_key(&ScalarValue::try_from_array(keys.as_ref(), index)?)?;
+        object.insert(key, array_value_to_json(values.as_ref(), index)?);
+    }
+
+    Ok(Value::Object(object))
+}
+
+fn scalar_to_json_key(
+    value: &ScalarValue,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match scalar_to_json_value(value)? {
+        Value::String(value) => Ok(value),
+        Value::Null => Ok("null".to_string()),
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(value.to_string()),
+        other => Ok(other.to_string()),
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn number_to_json(value: f64) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    Number::from_f64(value)
+        .map(Value::Number)
+        .ok_or_else(|| format!("Unable to represent floating point value {value} as JSON").into())
 }
 
 /// Reconciles the nullability of a result stream with the logical plan schema.
@@ -1313,50 +1760,23 @@ fn reconcile_stream_nullability(
 
 /// Extract the target table reference from a DML logical plan.
 ///
-/// Handles both standard `DataFusion` `LogicalPlan::Dml` nodes and
-/// distributed Cayenne DML extension nodes.
+/// Handles both standard `DataFusion` `LogicalPlan::Dml` nodes and generic
+/// `datafusion_dml::DmlExtensionNode` values.
 fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
     match plan {
         LogicalPlan::Dml(dml) => Some(dml.table_name.clone()),
-        #[cfg(not(windows))]
         LogicalPlan::Extension(ext) => {
-            use super::cayenne_ddl::logical_nodes::{
-                DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
-                DistributedCayenneMergeNode, DistributedCayenneUpdateNode,
-            };
-            use super::planner::logical_nodes::CayenneMergeNode;
-            if let Some(n) = ext
+            let dml = ext
                 .node
                 .as_any()
-                .downcast_ref::<DistributedCayenneDeleteNode>()
-            {
-                return Some(n.table_name.clone());
-            }
-            if let Some(n) = ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneUpdateNode>()
-            {
-                return Some(n.table_name.clone());
-            }
-            if let Some(n) = ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneInsertNode>()
-            {
-                return Some(n.table_name.clone());
-            }
-            if let Some(n) = ext.node.as_any().downcast_ref::<CayenneMergeNode>() {
-                return Some(n.target_table.clone());
-            }
-            if let Some(n) = ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneMergeNode>()
-            {
-                return Some(n.target_table.clone());
-            }
-            None
+                .downcast_ref::<datafusion_dml::DmlExtensionNode>()?;
+
+            Some(match &dml.op {
+                datafusion_dml::DmlNodeOp::Delete(params) => params.table_name.clone(),
+                datafusion_dml::DmlNodeOp::Update(params) => params.table_name.clone(),
+                datafusion_dml::DmlNodeOp::Insert(params) => params.table_name.clone(),
+                datafusion_dml::DmlNodeOp::Merge(params) => params.target_table.clone(),
+            })
         }
         _ => None,
     }
@@ -1367,53 +1787,34 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
 /// Used to skip schema verification for DML extension nodes, whose output
 /// schema may differ from the logical plan's schema.
 fn is_dml_extension(plan: &LogicalPlan) -> bool {
-    #[cfg(not(windows))]
-    if let LogicalPlan::Extension(ext) = plan {
-        use super::cayenne_ddl::logical_nodes::{
-            DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
-            DistributedCayenneMergeNode, DistributedCayenneUpdateNode,
-        };
-        use super::planner::logical_nodes::CayenneMergeNode;
-        if ext
-            .node
-            .as_any()
-            .downcast_ref::<DistributedCayenneDeleteNode>()
-            .is_some()
-            || ext
+    matches!(
+        plan,
+        LogicalPlan::Extension(ext)
+            if ext
                 .node
                 .as_any()
-                .downcast_ref::<DistributedCayenneUpdateNode>()
+                .downcast_ref::<datafusion_dml::DmlExtensionNode>()
                 .is_some()
-            || ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneInsertNode>()
-                .is_some()
-            || ext
-                .node
-                .as_any()
-                .downcast_ref::<CayenneMergeNode>()
-                .is_some()
-            || ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneMergeNode>()
-                .is_some()
-        {
-            return true;
-        }
-    }
-    false
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use ::cache::{Caching, QueryResultsCacheProvider, result::CacheStatus};
-    use arrow::array::Int64Array;
+    use arrow::{
+        array::{
+            ArrayRef, BooleanArray, Int64Array, NullArray, RecordBatch, StringArray, StructArray,
+            UnionArray,
+        },
+        buffer::Buffer,
+        datatypes::{DataType, Field, Schema, UnionMode},
+    };
+    use datafusion::logical_expr::Extension;
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
+    use datafusion_functions_json::JSON_UNION_DATA_TYPE;
     use serde_json::json;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use std::any::Any;
@@ -1426,6 +1827,57 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug)]
+    struct NoopDmlHandler;
+
+    #[async_trait::async_trait]
+    impl datafusion_dml::CatalogDmlHandler for NoopDmlHandler {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn test_extract_dml_target_table_from_generic_delete_extension() {
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(datafusion_dml::DmlExtensionNode::new_with_count_output(
+                datafusion_dml::DmlNodeOp::Delete(datafusion_dml::DeleteParams {
+                    table_name: TableReference::parse_str("catalog.schema.target"),
+                    filters: vec![],
+                }),
+                Arc::new(NoopDmlHandler),
+                vec![],
+            )),
+        });
+
+        let target = extract_dml_target_table(&plan).expect("should find DML target");
+        assert_eq!(target.to_string(), "catalog.schema.target");
+        assert!(is_dml_extension(&plan));
+    }
+
+    #[test]
+    fn test_extract_dml_target_table_from_generic_merge_extension() {
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(datafusion_dml::DmlExtensionNode::new_with_count_output(
+                datafusion_dml::DmlNodeOp::Merge(Box::new(datafusion_dml::MergeParams {
+                    target_table: TableReference::parse_str("catalog.schema.target"),
+                    source_table: TableReference::parse_str("catalog.schema.source"),
+                    target_qualifier: "t".to_string(),
+                    source_qualifier: "s".to_string(),
+                    on_keys: vec![("id".to_string(), "id".to_string())],
+                    assignments: vec![],
+                    original_sql: None,
+                })),
+                Arc::new(NoopDmlHandler),
+                vec![],
+            )),
+        });
+
+        let target = extract_dml_target_table(&plan).expect("should find MERGE target");
+        assert_eq!(target.to_string(), "catalog.schema.target");
+        assert!(is_dml_extension(&plan));
+    }
 
     #[tokio::test]
     async fn parameterized_query() {
@@ -1698,6 +2150,167 @@ mod tests {
         assert_eq!(
             param_names,
             vec!["$1", "$2", "$10", "another_param", "non_numeric_param"]
+        );
+    }
+
+    #[test]
+    fn test_write_to_json_value_keeps_null_fields() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("last_modified_by", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Option::<&str>::None])) as ArrayRef,
+            ],
+        )
+        .expect("to create record batch");
+
+        let value = write_to_json_value(&[batch]).expect("to serialize JSON");
+
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "id": 1,
+                    "last_modified_by": null
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn test_write_to_json_value_handles_json_union_fields() {
+        let DataType::Union(fields, UnionMode::Sparse) = &*JSON_UNION_DATA_TYPE else {
+            panic!("JSON union data type should be a sparse union");
+        };
+
+        let union_array = UnionArray::try_new(
+            fields.clone(),
+            Buffer::from_vec(vec![6_i8, 4_i8, 0_i8]).into(),
+            None,
+            vec![
+                Arc::new(NullArray::new(3)) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![None, None, None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![None, None, None])) as ArrayRef,
+                Arc::new(arrow::array::Float64Array::from(vec![None, None, None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Option::<&str>::None,
+                    Some("draft"),
+                    Option::<&str>::None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"enabled":true}"#),
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                ])) as ArrayRef,
+            ],
+        )
+        .expect("to create JSON union array");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("sandbox", JSON_UNION_DATA_TYPE.clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64, 3_i64])) as ArrayRef,
+                Arc::new(union_array) as ArrayRef,
+            ],
+        )
+        .expect("to create record batch");
+
+        let value = write_to_json_value(&[batch]).expect("to serialize JSON");
+
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "id": 1,
+                    "sandbox": {
+                        "enabled": true
+                    }
+                },
+                {
+                    "id": 2,
+                    "sandbox": "draft"
+                },
+                {
+                    "id": 3,
+                    "sandbox": null
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn test_write_to_json_value_handles_nested_json_union_fields() {
+        let DataType::Union(fields, UnionMode::Sparse) = &*JSON_UNION_DATA_TYPE else {
+            panic!("JSON union data type should be a sparse union");
+        };
+
+        let union_array = UnionArray::try_new(
+            fields.clone(),
+            Buffer::from_vec(vec![6_i8]).into(),
+            None,
+            vec![
+                Arc::new(NullArray::new(1)) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+                Arc::new(arrow::array::Float64Array::from(vec![None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Option::<&str>::None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Option::<&str>::None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some(r#"{"enabled":true}"#)])) as ArrayRef,
+            ],
+        )
+        .expect("to create JSON union array");
+
+        let payload_fields = vec![Arc::new(Field::new(
+            "sandbox",
+            JSON_UNION_DATA_TYPE.clone(),
+            true,
+        ))];
+        let payload_array = StructArray::new(
+            payload_fields.clone().into(),
+            vec![Arc::new(union_array) as ArrayRef],
+            None,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Struct(payload_fields.into()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+                Arc::new(payload_array) as ArrayRef,
+            ],
+        )
+        .expect("to create record batch");
+
+        let value = write_to_json_value(&[batch]).expect("to serialize JSON");
+
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "id": 1,
+                    "payload": {
+                        "sandbox": {
+                            "enabled": true
+                        }
+                    }
+                }
+            ])
         );
     }
 

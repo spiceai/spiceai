@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "telemetry"
 repository.workspace = true
 rust-version.workspace = true
@@ -16,11 +16,13 @@ hostname = "0.4.2"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
+pin-project.workspace = true
 sha2.workspace = true
 snafu.workspace = true
 sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
 [features]

@@ -169,13 +169,14 @@ async fn send_nsql_request(
         .await
 }
 
-const SPECIAL_COMMANDS: [&str; 8] = [
+const SPECIAL_COMMANDS: [&str; 9] = [
     ".exit",
     "exit",
     "quit",
     "q",
     ".error",
     "help",
+    "?",
     ".clear",
     ".clear history",
 ];
@@ -427,8 +428,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
     rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
 
-    println!("Welcome to the Spice.ai SQL REPL! Type 'help' for help.\n");
-    println!("show tables; -- list available tables");
+    println!("Welcome to the Spice.ai SQL REPL! Type `help` or `?` for commands.\n");
+    println!("Examples:");
+    println!("  show tables;              -- list available tables");
+    println!("  describe <table_name>;    -- show column types");
+    println!("  nql <question>            -- natural language to SQL (requires a model)");
+    println!();
 
     let mut last_error: Option<Status> = None;
 
@@ -492,9 +497,15 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 continue;
             }
             ".clear" => {
-                // Clear the screen using ANSI escape codes
-                print!("\x1B[H\x1B[2J");
-                let _ = std::io::stdout().flush();
+                // Clear-screen only makes sense on a real terminal; gate on the TTY
+                // directly rather than on the colour heuristic (NO_COLOR should still
+                // let the escape codes through on a TTY, and FORCE_COLOR shouldn't
+                // push them into a pipe).
+                use std::io::IsTerminal;
+                if std::io::stdout().is_terminal() {
+                    print!("\x1B[H\x1B[2J");
+                    let _ = std::io::stdout().flush();
+                }
                 continue;
             }
             ".clear history" => {
@@ -512,28 +523,131 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let _ = std::io::stdout().flush();
                 continue;
             }
-            "help" => {
-                println!("Available commands:\n");
+            "help" | "?" => {
+                println!("Meta-commands:\n");
                 println!(
-                    "{} Exit the REPL",
-                    PROMPT_COLOR.paint(".exit, exit, quit, q:")
+                    "  {} Exit the REPL",
+                    PROMPT_COLOR.paint(".exit, exit, quit, q")
                 );
                 println!(
-                    "{} Show details of the last error",
-                    PROMPT_COLOR.paint(".error:")
+                    "  {} Show details of the last error",
+                    PROMPT_COLOR.paint(".error                ")
                 );
-                println!("{} Clear the screen", PROMPT_COLOR.paint(".clear:"));
                 println!(
-                    "{} Clear the query history",
-                    PROMPT_COLOR.paint(".clear history:")
+                    "  {} Clear the screen",
+                    PROMPT_COLOR.paint(".clear                ")
                 );
-                println!("{} Show this help message", PROMPT_COLOR.paint("help:"));
-                println!("\nOther lines will be interpreted as SQL");
+                println!(
+                    "  {} Clear persisted query history",
+                    PROMPT_COLOR.paint(".clear history        ")
+                );
+                println!(
+                    "  {} Show this help message",
+                    PROMPT_COLOR.paint("help, ?               ")
+                );
+                println!();
+                println!("SQL shortcuts (queries end with `;`, multi-line supported):");
+                println!(
+                    "  {} list all tables visible to the runtime",
+                    PROMPT_COLOR.paint("show tables;          ")
+                );
+                println!(
+                    "  {} list schemas (databases)",
+                    PROMPT_COLOR.paint("show schemas;         ")
+                );
+                println!(
+                    "  {} show a table's column names and types",
+                    PROMPT_COLOR.paint("describe <table>;     ")
+                );
+                println!();
+                println!("Natural language:");
+                println!(
+                    "  {} translate a question to SQL and run it",
+                    PROMPT_COLOR.paint("nql <question>        ")
+                );
+                println!();
+                println!("Any other line is run as SQL.");
                 let _ = std::io::stdout().flush();
                 continue;
             }
             "show tables" | "show tables;" => {
                 "select table_catalog, table_schema, table_name, table_type from information_schema.tables where table_schema != 'information_schema';"
+            }
+            "show schemas" | "show schemas;" | "show databases" | "show databases;" => {
+                "select catalog_name, schema_name from information_schema.schemata where schema_name != 'information_schema';"
+            }
+            line if {
+                // Match the `describe`/`desc` keyword case-insensitively but keep
+                // the identifier token in its original case.
+                let without_semi = line.trim_end_matches(';').trim();
+                let mut parts = without_semi.splitn(2, char::is_whitespace);
+                let first = parts.next().unwrap_or_default();
+                let rest = parts.next().unwrap_or_default().trim();
+                let kw =
+                    first.eq_ignore_ascii_case("describe") || first.eq_ignore_ascii_case("desc");
+                kw && !rest.is_empty() && !rest.contains(char::is_whitespace)
+            } =>
+            {
+                // Rewrite `describe <table>` into an information_schema.columns lookup.
+                // Schema-qualified names (`schema.table`) are split; bare names match any schema.
+                // Identifiers keep their original case so quoted/mixed-case tables work.
+                // Single quotes are escaped (SQL standard `''`) before they're interpolated
+                // into the string literals to avoid query injection/syntax errors.
+                fn unquote(s: &str) -> &str {
+                    s.trim_matches('"').trim_matches('\'')
+                }
+                fn esc(s: &str) -> String {
+                    s.replace('\'', "''")
+                }
+                let without_semi = line.trim_end_matches(';').trim();
+                let mut parts = without_semi.splitn(2, char::is_whitespace);
+                let _kw = parts.next();
+                let raw_ident = parts.next().unwrap_or_default().trim();
+                // Quotes need stripping per identifier segment, not just the whole token:
+                // `describe schema."MyTable"` should split into (`schema`, `MyTable`), not
+                // (`schema`, `"MyTable"`). Unquote each side after the split.
+                let rewritten = if let Some((schema, name)) = raw_ident.split_once('.') {
+                    let schema = unquote(schema);
+                    let name = unquote(name);
+                    format!(
+                        "select column_name, data_type, is_nullable from information_schema.columns where table_schema = '{}' and table_name = '{}' order by ordinal_position;",
+                        esc(schema),
+                        esc(name)
+                    )
+                } else {
+                    let ident = unquote(raw_ident);
+                    format!(
+                        "select table_schema, column_name, data_type, is_nullable from information_schema.columns where table_name = '{}' order by table_schema, ordinal_position;",
+                        esc(ident)
+                    )
+                };
+                let _ = rl.add_history_entry(line);
+                let start_time = Instant::now();
+                match get_records(
+                    client.clone(),
+                    &rewritten,
+                    repl_config.api_key.as_ref(),
+                    &user_agent,
+                    repl_config.cache_control,
+                )
+                .await
+                {
+                    Ok((records, total_rows, from_cache)) => {
+                        display_records(&records, start_time, total_rows, from_cache)?;
+                    }
+                    Err(FlightError::Tonic(status)) => {
+                        display_grpc_error(&status);
+                        last_error = Some(*status);
+                    }
+                    Err(e) => {
+                        println!(
+                            "{} Unexpected Flight error: {e}.",
+                            Color::Red.paint("Error:")
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                continue;
             }
             line if line.to_lowercase().starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);
@@ -773,7 +887,10 @@ async fn get_and_display_nql_records(
     let start_time = Instant::now();
 
     let resp = send_nsql_request(
-        &Client::new(),
+        &Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?,
         endpoint,
         query,
         LlmRuntime::Openai,

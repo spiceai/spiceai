@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "spice"
 repository.workspace = true
 rust-version.workspace = true
@@ -77,7 +77,7 @@ rustyline = "17"
 dialoguer = "0.12"
 
 # Random number generation (for auth codes)
-rand = "0.9"
+rand = "0.10"
 
 # Open URLs in browser
 open = "5"
@@ -117,7 +117,10 @@ release = []
 
 [dev-dependencies]
 assert_cmd = "2"
+insta = { workspace = true, features = ["filters", "json"] }
 predicates = "3"
 rstest = "0.26.1"
+serde_json.workspace = true
 tempfile.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 wiremock = "0.6"

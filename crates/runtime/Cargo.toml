@@ -2,7 +2,7 @@
 description = "The spiced runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "runtime"
 repository.workspace = true
 rust-version.workspace = true
@@ -50,6 +50,8 @@ datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
+datafusion-ddl = { path = "../datafusion-ddl" }
+datafusion-dml = { path = "../datafusion-dml" }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true }
 datafusion-spark.workspace = true
@@ -82,6 +84,7 @@ iceberg-datafusion.workspace = true
 iceberg-storage-opendal.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
+logos.workspace = true
 opendal.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
@@ -97,7 +100,7 @@ object_store_occ = { path = "../object_store_occ" }
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.31", features = [
+opentelemetry-proto = { version = "0.31", default-features = false, features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",
@@ -118,18 +121,17 @@ regex.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
     "client",
-    "reqwest",
     "server",
-    "transport-sse-server",
     "transport-io",
-    "transport-sse-client",
     "transport-child-process",
     "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
 ] }
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-auth = { path = "../runtime-auth" }
+runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
@@ -143,6 +145,8 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
+elasticsearch = { path = "../elasticsearch", optional = true }
+duration-parse = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
@@ -158,6 +162,7 @@ serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
+spice-cloud-client.workspace = true
 spicepod = { path = "../spicepod" }
 sysinfo.workspace = true
 telemetry = { path = "../telemetry" }
@@ -182,12 +187,13 @@ twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = ">=8.1.1", features = [
+utoipa-swagger-ui = { version = "9", features = [
     "axum",
+    "vendored",
 ], optional = true }
 
 gethostname.workspace = true
-uuid = { workspace = true, features = ["v7"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
 
@@ -225,6 +231,7 @@ connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
+tokio-postgres = { workspace = true }
 connector-sftp = { path = "../data-connectors/connector-sftp" }
 connector-sharepoint = { path = "../data-connectors/connector-sharepoint" }
 connector-smb = { path = "../data-connectors/connector-smb" }
@@ -259,26 +266,37 @@ yaml = { path = "../yaml" }
 [features]
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "dep:sha2", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
+azure-keyvault = ["runtime-secrets/azure-keyvault"]
+hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
 bedrock = []
 clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
+cosmosdb = ["data_components/cosmosdb"]
 cuda = ["llms/cuda"]
-databricks = ["data_components/databricks"]
+databricks = ["data_components/databricks", "dep:duration-parse"]
 debezium = ["kafka", "data_components/debezium"]
 default = [
     "keyring-secret-store",
     "aws-secrets-manager",
+    "hashicorp_vault",
     "sharepoint",
     "bedrock",
 ]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
+elasticsearch = [
+    "data_components/elasticsearch",
+    "dep:elasticsearch",
+    "dep:duration-parse",
+    "search/elasticsearch",
+]
 duckdb = [
     "dep:duckdb",
     "db_connection_pool/duckdb",
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
+    "search/duckdb",
 ]
 dynamodb = [
     "dep:aws-sdk-dynamodb",
@@ -322,7 +340,7 @@ postgres = [
     "datafusion-table-providers/postgres",
 ]
 postgres-accel = ["postgres"]
-postgres-write = []
+
 s3_vectors = [
     "data_components/s3_vectors",
     "dep:s3_vectors",
@@ -364,3 +382,7 @@ vortex-datafusion.workspace = true
 [[bench]]
 harness = false
 name = "prepared_statement"
+
+[[bench]]
+harness = false
+name = "flatten_json_properties"

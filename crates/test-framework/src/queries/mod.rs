@@ -606,6 +606,8 @@ pub enum QueryOverrides {
     PostgresCatalog,
     MysqlCatalog,
     MSSqlCatalog,
+    OracleCatalog,
+    DucklakeCatalog,
     Spicecloud,
     DynamoDB,
     Arrow,
@@ -894,6 +896,68 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             simple_q6,
             simple_q7
         ),
+        Some(QueryOverrides::DucklakeCatalog) => generate_tpch_queries_override!(
+            "ducklake_catalog",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
+        ),
+        Some(QueryOverrides::OracleCatalog) => generate_tpch_queries_override!(
+            "oracle_catalog",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
+        ),
         Some(QueryOverrides::DuckDBPartitioned) => remove_tpch_query!(
             queries,
             17, // Correlated scalar subquery can only be used in Projection; https://github.com/spiceai/spiceai/issues/8384
@@ -903,25 +967,14 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Turso) => remove_tpch_query!(
             queries,
             2, // Correlated scalar subquery not supported; DF limitation, Turso tests are not cross-table federated
-            4, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
-            16, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
             17, // Correlated scalar subquery not supported
-            18, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
-            20, // Correlated scalar subquery not supported
-            21, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
-            22 // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
+            21  // Correlated scalar subquery not supported
         ),
         Some(QueryOverrides::BigQuery) => {
             let mut queries: Vec<Query> = remove_tpch_query!(
                 queries,
                 1, // Rewritten: CAST sum_charge to FLOAT64 to avoid BIGNUMERIC overflow in ADBC Decimal128(38,27); https://github.com/spiceai/spiceai/issues/9971
-                2, // Unsupported subquery with table in join predicate; https://github.com/spiceai/spiceai/issues/9954
-                6, // Rewritten: explicit BETWEEN 0.05 AND 0.07 to avoid BigQuery float arithmetic precision issue
-                16, // IN subquery not supported inside join predicate; https://github.com/spiceai/spiceai/issues/9954
-                17, // Unsupported subquery with table in join predicate; https://github.com/spiceai/spiceai/issues/9954
-                18, // IN subquery not supported inside join predicate; https://github.com/spiceai/spiceai/issues/9954
-                20, // IN subquery not supported inside join predicate; https://github.com/spiceai/spiceai/issues/9954
-                21 // EXISTS subquery not supported inside join predicate; https://github.com/spiceai/spiceai/issues/9954
+                6 // Rewritten: explicit BETWEEN 0.05 AND 0.07 to avoid BigQuery float arithmetic precision issue
             );
             queries.extend(generate_tpch_queries_override!("bigquery", q1, q6));
             queries

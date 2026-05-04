@@ -62,6 +62,11 @@ impl Runtime {
             "Task history enabled: retention_period={retention_period_secs}s, retention_check_interval={retention_check_interval_secs}s"
         );
 
+        if app.runtime.task_history.captured_context.as_ref() != "truncated" {
+            let captured_context = &app.runtime.task_history.captured_context;
+            let _ = write!(config_details, ", captured_context={captured_context}");
+        }
+
         // Add min_sql_duration if configured
         if let Some(min_sql_duration) = &app.runtime.task_history.min_sql_duration {
             let _ = write!(config_details, ", min_sql_duration={min_sql_duration}");
@@ -80,7 +85,7 @@ impl Runtime {
 
         tracing::info!("{}", config_details);
 
-        // Determine if we're in cluster mode (scheduler_id column needed)
+        // Determine if we're in cluster mode (node_id column needed)
         let effective_role = self.df.cluster_config.effective_role();
         let is_cluster_mode = effective_role.is_some();
 
@@ -98,11 +103,15 @@ impl Runtime {
         // to enable cluster-wide task history queries, and also register the local table
         // separately for use by the GetTaskHistory RPC handler
         let table_to_register: Arc<dyn TableProvider> = match &self.distributed {
-            Some(DistributedNode::Scheduler { peers, .. }) => {
+            Some(DistributedNode::Scheduler {
+                peers,
+                executor_registry,
+                ..
+            }) => {
                 let schema = local_table.schema();
 
-                // Compute scheduler_id: {advertise_host}:{bind_port}
-                let scheduler_id =
+                // Compute node_id: {advertise_host}:{bind_port}
+                let node_id =
                     if let Some(advertise_host) = self.df.cluster_config.node_advertise_address() {
                         let bind_port = self.df.cluster_config.node_bind_address().port();
                         format!("{advertise_host}:{bind_port}")
@@ -111,9 +120,7 @@ impl Runtime {
                         self.df.cluster_config.node_bind_address().to_string()
                     };
 
-                tracing::debug!(
-                    "Registering federated task_history table with scheduler_id={scheduler_id}"
-                );
+                tracing::debug!("Registering federated task_history table with node_id={node_id}");
 
                 // Register the local table under a separate name for RPC handlers to use
                 // This avoids infinite recursion when peers query each other
@@ -133,8 +140,9 @@ impl Runtime {
                     schema,
                     local_table_provider,
                     Arc::clone(peers),
+                    executor_registry.flight_sql_clients_handle(),
                     self.df.cluster_config.client_tls_config().cloned(),
-                    scheduler_id,
+                    node_id,
                 );
                 Arc::new(federated)
             }

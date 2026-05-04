@@ -164,7 +164,7 @@ impl S3SingleFileCached {
                 .unwrap_or_else(|| "unknown".to_string());
             let version = normalize_optional_string(current_metadata.version.as_ref())
                 .unwrap_or_else(|| "unknown".to_string());
-            tracing::info!(
+            tracing::debug!(
                 "Skipping refresh for {} (location: {}, size_bytes: {}, last_modified: {}, etag: {}, version: {})",
                 self.dataset_name,
                 current_metadata.location,

@@ -26,6 +26,26 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
+/// A stream of [`ChangeEnvelope`] items produced by a CDC connector.
+///
+/// # Readiness contract
+///
+/// It is the responsibility of each connector implementation to indicate when
+/// the dataset can be considered ready for queries by producing at least one
+/// [`ChangeEnvelope`] with [`ChangeEnvelope::is_dataset_ready`] returning
+/// `true`. The runtime treats the dataset as not ready and rejects queries
+/// (with `AccelerationNotReady`) until that signal arrives.
+///
+/// Connectors MUST emit a ready signal even when the source has no new data
+/// (e.g. on restart with an already-populated accelerator, or against a quiet
+/// topic). For sources that may stay quiet indefinitely, use
+/// [`build_ready_signal_envelope`] to emit a zero-row, no-op envelope as soon
+/// as the connector determines it has caught up to the source (for example,
+/// when Kafka consumer lag reaches zero, or when a Postgres logical
+/// replication slot resumes from an existing position).
+///
+/// Failing to honor this contract causes the runtime to wait for an event
+/// that may never arrive — see <https://github.com/spiceai/spiceai/issues/5201>.
 pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
 
 #[derive(Debug, Snafu)]
@@ -131,10 +151,68 @@ impl ChangeEnvelope {
         }
     }
 
+    /// Returns `true` if processing this envelope means the dataset can be
+    /// marked ready for queries.
+    ///
+    /// See the [`ChangesStream`] documentation for the connector readiness
+    /// contract.
     #[must_use]
     pub fn is_dataset_ready(&self) -> bool {
         self.is_dataset_ready
     }
+}
+
+/// A [`CommitChange`] implementation that does nothing. Useful when emitting
+/// synthetic envelopes (e.g. ready signals) that have no underlying source
+/// offset to commit.
+pub struct NoOpCommitter;
+
+#[async_trait]
+impl CommitChange for NoOpCommitter {
+    async fn commit(&self) -> Result<(), CommitError> {
+        Ok(())
+    }
+}
+
+/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
+/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
+/// committer.
+///
+/// Connectors should emit one of these envelopes once they consider
+/// themselves caught up to the source if no real change events are available
+/// to carry the ready signal. See the [`ChangesStream`] documentation for the
+/// readiness contract.
+pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+    // Build zero-row versions of each dataset column.
+    let empty_data_columns: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow::array::new_empty_array(f.data_type()))
+        .collect();
+    let data_struct = StructArray::new(schema.fields().clone(), empty_data_columns, None);
+
+    let op_array: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+    let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
+    let pk_list = ListArray::new(
+        Arc::clone(&pk_field),
+        OffsetBuffer::new(vec![0i32].into()),
+        Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+        None,
+    );
+
+    let wrapper_schema = Arc::new(changes_schema(schema));
+    let record = RecordBatch::try_new(
+        wrapper_schema,
+        vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
+    )
+    .context(ArrowSnafu)?;
+    let batch = ChangeBatch::try_new(record)?;
+
+    Ok(ChangeEnvelope::new(
+        Box::new(NoOpCommitter),
+        batch,
+        true, // is_dataset_ready
+    ))
 }
 
 /// The Arrow schema that represents a `ChangeEvent`

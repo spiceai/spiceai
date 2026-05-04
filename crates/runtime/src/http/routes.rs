@@ -38,9 +38,9 @@ use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 #[cfg(feature = "mcp")]
-use rmcp::transport::SseServer;
-#[cfg(feature = "mcp")]
-use rmcp::transport::sse_server::SseServerConfig;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
+};
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -65,7 +65,7 @@ use axum::{
     response::IntoResponse,
     routing::{Router, get, post},
 };
-use runtime_auth::layer::http::AuthLayer;
+use runtime_auth::{AuthRequestContext, layer::http::AuthLayer};
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -118,69 +118,122 @@ pub(crate) struct ApiDoc;
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn get_api_doc() -> utoipa::openapi::OpenApi {
-    use utoipa::openapi::{
-        Required,
-        path::{Parameter, ParameterIn},
-    };
-
     let mut openai = ApiDoc::openapi();
 
     #[cfg(feature = "mcp")]
     {
+        use utoipa::openapi::{
+            Required,
+            path::{Parameter, ParameterIn},
+        };
+
+        let session_header = Parameter::builder()
+            .name("Mcp-Session-Id")
+            .parameter_in(ParameterIn::Header)
+            .description(Some(
+                "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            ))
+            .required(Required::False)
+            .build();
+
         openai.paths.add_path_operation(
-            "/v1/mcp/sse",
-            vec![HttpMethod::Get],
-            Operation::builder()
-                .operation_id(Some("operation_id"))
-                .tag("mcp")
-                .summary(Some("Establish an MCP SSE Connection"))
-                .description(Some(
-                    "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n
-             Once connected, clients can send messages via `POST /v1/mcp/sse` and receive responses through this SSE stream.",
-                ))
-                .build(),
-        );
-        openai.paths.add_path_operation(
-            "/v1/mcp/sse",
+            "/v1/mcp",
             vec![HttpMethod::Post],
             Operation::builder()
-                .operation_id(Some("mcp_event"))
+                .operation_id(Some("mcp_message"))
                 .tag("mcp")
-                .summary(Some("Send message to MCP server"))
+                .summary(Some("Send a Model Context Protocol message"))
                 .description(Some(
-                    "Send message to the MCP endoint, for a given session.",
+                    "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. \
+The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), \
+selected via the `Accept` header. Session continuity is carried via the `Mcp-Session-Id` header.",
                 ))
-                .parameter(
-                    Parameter::builder()
-                        .name("sessionId")
-                        .parameter_in(ParameterIn::Query)
-                        .required(Required::True)
+                .parameter(session_header.clone())
+                .response(
+                    "200",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "JSON-RPC response. Returned as `application/json` for a single response or `text/event-stream` when the server streams additional messages.",
+                        )
                         .build(),
                 )
                 .response(
                     "202",
                     utoipa::openapi::ResponseBuilder::new()
-                        .description("Message accepted. Response will stream via SSE.")
+                        .description(
+                            "Message accepted (for JSON-RPC notifications / responses that do not require a reply).",
+                        )
+                        .build(),
+                )
+                .response(
+                    "400",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Malformed JSON-RPC payload.")
                         .build(),
                 )
                 .response(
                     "404",
                     utoipa::openapi::ResponseBuilder::new()
                         .description(
-                            "Session not found. No active session for the given `session_id`.",
+                            "Unknown or expired `Mcp-Session-Id`.",
                         )
                         .build(),
                 )
                 .response(
                     "413",
                     utoipa::openapi::ResponseBuilder::new()
-                        .description("Payload too large. Maximum allowed size is 4MB.")
+                        .description("Payload too large. Maximum allowed size is 32 MiB.")
+                        .build(),
+                )
+                .build(),
+        );
+        openai.paths.add_path_operation(
+            "/v1/mcp",
+            vec![HttpMethod::Get],
+            Operation::builder()
+                .operation_id(Some("mcp_stream"))
+                .tag("mcp")
+                .summary(Some("Open an MCP server-to-client SSE stream"))
+                .description(Some(
+                    "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport. \
+The `Mcp-Session-Id` header must identify an existing session created via `POST /v1/mcp`.",
+                ))
+                .parameter(session_header.clone())
+                .response(
+                    "200",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("SSE stream (`text/event-stream`) of server-originated MCP messages.")
                         .build(),
                 )
                 .response(
-                    "500",
+                    "404",
                     utoipa::openapi::ResponseBuilder::new()
-                        .description("Internal server error. An unexpected issue occurred.")
+                        .description("Unknown or expired `Mcp-Session-Id`.")
+                        .build(),
+                )
+                .build(),
+        );
+        openai.paths.add_path_operation(
+            "/v1/mcp",
+            vec![HttpMethod::Delete],
+            Operation::builder()
+                .operation_id(Some("mcp_terminate_session"))
+                .tag("mcp")
+                .summary(Some("Terminate an MCP Streamable HTTP session"))
+                .description(Some(
+                    "Terminate the MCP session identified by the `Mcp-Session-Id` header. Subsequent requests bearing the same session id will receive `404 Not Found`.",
+                ))
+                .parameter(session_header)
+                .response(
+                    "204",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Session terminated.")
+                        .build(),
+                )
+                .response(
+                    "404",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Unknown or already-terminated `Mcp-Session-Id`.")
                         .build(),
                 )
                 .build(),
@@ -194,7 +247,7 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
 // 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for all authenticated endpoints (queries, chat, embeddings)
 //    Applied as a route layer to the entire authenticated router to allow reasonable payload sizes for SQL INSERT operations and LLM requests
 // 2. MCP_REQUEST_BODY_LIMIT (32 MiB) - for Model Context Protocol (MCP) endpoints
-//    Applied to /v1/mcp/sse routes to support MCP message payloads while preventing excessive memory usage
+//    Applied to /v1/mcp routes to support MCP message payloads while preventing excessive memory usage
 // 3. HEALTH_REQUEST_BODY_LIMIT (128 KiB) - strict limit for unauthenticated endpoints (health checks, ready checks)
 //    Applied to unauthenticated routes to prevent DoS via health check endpoints
 const DEFAULT_REQUEST_BODY_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
@@ -213,6 +266,7 @@ pub(crate) fn routes(
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
+        .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
@@ -263,6 +317,24 @@ pub(crate) fn routes(
     }
 
     if cfg!(feature = "models") {
+        // Tool invocation routes require authentication to be configured on the runtime.
+        // `/v1/tools/{name}` forwards the raw request body to `tool.call`, which for
+        // built-in tools like `sql` and `websearch` is equivalent to arbitrary query /
+        // egress. When no `runtime.auth` provider is attached the request would be
+        // anonymous, so we refuse these routes at the edge with a 401 rather than
+        // relying on each tool to enforce its own safety posture. Configure
+        // `runtime.auth.api_key` (or any future provider) to re-enable this surface.
+        let tools_auth_required = auth_layer.is_some();
+        let tools_auth_message = "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
+        let tools_router = Router::new()
+            .route("/v1/tools", get(v1::tools::list))
+            .route("/v1/tools/{*name}", post(v1::tools::post))
+            // Deprecated, use /v1/tools/:name instead
+            .route("/v1/tool/{name}", post(v1::tools::post))
+            .route_layer(middleware::from_fn(move |req, next| {
+                require_auth_configured(tools_auth_required, tools_auth_message, req, next)
+            }));
+
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/{name}/predict", get(v1::inference::get))
@@ -278,10 +350,7 @@ pub(crate) fn routes(
             )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
-            .route("/v1/tools", get(v1::tools::list))
-            .route("/v1/tools/{*name}", post(v1::tools::post))
-            // Deprecated, use /v1/tools/:name instead
-            .route("/v1/tool/{name}", post(v1::tools::post))
+            .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(Arc::clone(&rt.completion_llms)))
             .layer(Extension(Arc::clone(&rt.models)))
@@ -319,24 +388,27 @@ pub(crate) fn routes(
 
     #[cfg(feature = "mcp")]
     {
-        let (sse_server, mcp_router) = SseServer::new(SseServerConfig {
-            bind: config.http_bind_address,
-            sse_path: "/v1/mcp/sse".to_string(),
-            post_path: "/v1/mcp/sse".to_string(),
-            ct: tokio_util::sync::CancellationToken::new(),
-            sse_keep_alive: None,
-        });
-
+        // Streamable HTTP transport endpoint per MCP 2025-11-25 spec.
+        // This replaces the legacy SSE transport that was removed in rmcp 1.x.
         let runtime_arc = Arc::clone(rt);
-        let _cancellation_token =
-            sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+        let mcp_service = StreamableHttpService::new(
+            move || Ok(RuntimeServer::from(&runtime_arc)),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
 
-        // Apply MCP-specific request body limit before merging
         tracing::debug!(
             "MCP request body size limit set to {} bytes",
             MCP_REQUEST_BODY_LIMIT
         );
-        let mcp_router = mcp_router.route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
+        let mcp_auth_required = auth_layer.is_some();
+        let mcp_auth_message = "MCP endpoint (/v1/mcp) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
+        let mcp_router = Router::new()
+            .nest_service("/v1/mcp", mcp_service)
+            .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT))
+            .route_layer(middleware::from_fn(move |req, next| {
+                require_auth_configured(mcp_auth_required, mcp_auth_message, req, next)
+            }));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
@@ -377,7 +449,7 @@ async fn track_metrics(
     State(df): State<Arc<DataFusion>>,
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     headers: http::HeaderMap,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
     let app_lock = app.read().await;
@@ -395,6 +467,9 @@ async fn track_metrics(
             .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
             .build(),
     );
+    let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> =
+        Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>;
+    req.extensions_mut().insert(auth_request_context);
 
     let request_dimensions = request_context.to_dimensions();
 
@@ -480,4 +555,28 @@ async fn check_shutdown(
     }
 
     next.run(req).await
+}
+
+/// Reject a request with 401 unless the runtime has an authentication provider attached.
+///
+/// Used to gate routes whose behavior is unsafe anonymously (`/v1/tools/*`: the raw
+/// request body is handed to `tool.call`, which for built-ins like `sql` and
+/// `websearch` is equivalent to arbitrary query / outbound fetch).
+async fn require_auth_configured(
+    auth_configured: bool,
+    message: &'static str,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    if auth_configured {
+        return next.run(req).await;
+    }
+
+    (
+        http::StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({
+            "message": message
+        })),
+    )
+        .into_response()
 }

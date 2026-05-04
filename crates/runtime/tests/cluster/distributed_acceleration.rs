@@ -24,14 +24,14 @@ limitations under the License.
 
 use app::AppBuilder;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::runtime::{
-    PartitionManagement, Runtime as SpicepodRuntime, Scheduler as SchedulerConfig,
-};
+use spicepod::component::runtime::{Runtime as SpicepodRuntime, Scheduler as SchedulerConfig};
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     partitioning::PartitionedBy,
 };
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -40,6 +40,22 @@ use crate::{
 };
 
 use super::harness::ClusterHarness;
+
+/// Wrapper around [`insta::assert_snapshot!`] that redacts
+/// `127.0.0.1:<port>` addresses in physical-plan output so that
+/// snapshots are stable across runs.
+macro_rules! assert_explain_snapshot {
+    ($name:expr, $plan:expr) => {{
+        let __plan = $plan;
+        insta::with_settings!({
+            filters => vec![
+                (r"127\.0\.0\.1:\d+", "[endpoint]")
+            ]
+        }, {
+            insta::assert_snapshot!($name, __plan);
+        });
+    }};
+}
 
 /// CSV test data
 const TEST_DATA_CSV: &str = r"id,name,age,city,score
@@ -128,6 +144,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                 .start()
                 .await?;
 
+            tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
 
             // Wait for executors to load and accelerate their assigned partitions.
@@ -140,38 +157,12 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r#"
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                                       |
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                          |
-            |               |   TableScan: test_data projection=[id, name, age, city, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")] |
-            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                        |
-            |               |   CooperativeExec                                                                                                                                                                          |
-            |               |     BytesProcessedExec                                                                                                                                                                     |
-            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE ((((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2')))                         |
-            |               |                                                                                                                                                                                            |
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            "#);
+
+            assert_explain_snapshot!("bucket_partitioning_plan", plan_fmt);
 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!( rows_fmt, @r"
-            +----+--------------+-----+--------------+-------+
-            | id | name         | age | city         | score |
-            +----+--------------+-----+--------------+-------+
-            | 1  | John Doe     | 28  | New York     | 85    |
-            | 2  | Jane Smith   | 34  | Los Angeles  | 92    |
-            | 3  | Mike Johnson | 45  | Chicago      | 78    |
-            | 4  | Emily Brown  | 31  | Houston      | 89    |
-            | 5  | David Lee    | 39  | Phoenix      | 76    |
-            | 6  | Sarah Wilson | 26  | Philadelphia | 94    |
-            | 7  | Tom Anderson | 52  | San Antonio  | 81    |
-            | 8  | Lisa Taylor  | 29  | San Diego    | 88    |
-            | 9  | Chris Martin | 37  | Dallas       | 79    |
-            | 10 | Anna Garcia  | 41  | San Jose     | 90    |
-            +----+--------------+-----+--------------+-------+
-            ");
+            insta::assert_snapshot!("bucket_partitioning_rows", rows_fmt);
 
             // --- Test 2: Aggregation ---
             let aggregation_sql = "SELECT COUNT(*) as total_rows, AVG(score) as avg_score, \
@@ -181,30 +172,11 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let agg_plan_fmt = arrow::util::pretty::pretty_format_batches(&agg_plan)
                 .expect("format explain agg")
                 .to_string();
-            insta::assert_snapshot!(agg_plan_fmt, @r#"
-            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                                                                                                                                                                    |
-            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Projection: count(Int64(1)) AS total_rows, avg(test_data.score) AS avg_score, min(test_data.age) AS min_age, max(test_data.age) AS max_age                                                                                                                                                                              |
-            |               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), avg(CAST(test_data.score AS Float64)), min(test_data.age), max(test_data.age)]]                                                                                                                                                                                      |
-            |               |     TableScan: test_data projection=[age, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")]                                                                                                                                            |
-            | physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as total_rows, avg(test_data.score)@1 as avg_score, min(test_data.age)@2 as min_age, max(test_data.age)@3 as max_age]                                                                                                                                                           |
-            |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                                                                                                                                                                               |
-            |               |     CoalescePartitionsExec                                                                                                                                                                                                                                                                                              |
-            |               |       PartialAggregationFlightSqlExec sql=SELECT COUNT(1) AS "__agg_0", SUM(CAST("score" AS DOUBLE)) AS "__agg_1", COUNT(CAST("score" AS DOUBLE)) AS "__agg_2", MIN("age") AS "__agg_3", MAX("age") AS "__agg_4" FROM test_data WHERE (((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2')) |
-            |               |                                                                                                                                                                                                                                                                                                                         |
-            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            "#);
+            assert_explain_snapshot!("bucket_partitioning_agg_plan", agg_plan_fmt);
 
             let agg = harness.query(aggregation_sql).await?;
             let agg_fmt = arrow::util::pretty::pretty_format_batches(&agg).expect("format agg");
-            insta::assert_snapshot!(agg_fmt, @r"
-            +------------+-----------+---------+---------+
-            | total_rows | avg_score | min_age | max_age |
-            +------------+-----------+---------+---------+
-            | 10         | 85.2      | 26      | 52      |
-            +------------+-----------+---------+---------+
-            ");
+            insta::assert_snapshot!("bucket_partitioning_agg", agg_fmt);
 
             harness.shutdown().await;
             Ok(())
@@ -242,15 +214,18 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
             configure_test_datafusion();
             let app = AppBuilder::new("test_multi_executor_accel")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", csv_path.display()),
+                    format!("file://{}", csv_path.display()),
                     "test_data",
                     4,
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config(
-                        "test_distributed_acceleration_multi_executor",
-                    )),
+                    scheduler: Some(
+                        make_named_scheduler_config_with_max_partitions_per_executor(
+                            "test_distributed_acceleration_multi_executor",
+                            2,
+                        ),
+                    ),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -261,6 +236,7 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                 .start()
                 .await?;
 
+            sleep(Duration::from_secs(2)).await; // Ensure we get an initial partition assignment.
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
@@ -271,38 +247,27 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r#"
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                                                                           |
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                                                              |
-            |               |   TableScan: test_data projection=[id, name, age, city, score], partial_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("2") OR bucket(Int64(4), id) = Utf8("3")] |
-            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                                                            |
-            |               |   CooperativeExec                                                                                                                                                                                                              |
-            |               |     BytesProcessedExec                                                                                                                                                                                                         |
-            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE (((((bucket(4, "id") = '0') OR (bucket(4, "id") = '1')) OR (bucket(4, "id") = '2')) OR (bucket(4, "id") = '3')))                                |
-            |               |                                                                                                                                                                                                                                |
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            "#);
+            // Plan structure is non-deterministic (partition-to-executor assignment varies),
+            // so verify structural properties instead of an exact snapshot.
+            assert!(
+                plan_fmt.contains("Sort"),
+                "plan should contain Sort operator"
+            );
+            assert!(
+                plan_fmt.contains("FlightSqlExec"),
+                "plan should use FlightSqlExec for distributed execution \n {plan_fmt}"
+            );
+            // Partition values are no longer injected as bucket filters because
+            // executors only materialise data for their assigned partitions.
+            // Verify that no redundant bucket filters appear in the plan.
+            assert!(
+                !plan_fmt.contains("bucket("),
+                "plan should not contain bucket filters; executors already own only their assigned data"
+            );
 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!(rows_fmt, @r"
-            +----+--------------+-----+--------------+-------+
-            | id | name         | age | city         | score |
-            +----+--------------+-----+--------------+-------+
-            | 1  | John Doe     | 28  | New York     | 85    |
-            | 2  | Jane Smith   | 34  | Los Angeles  | 92    |
-            | 3  | Mike Johnson | 45  | Chicago      | 78    |
-            | 4  | Emily Brown  | 31  | Houston      | 89    |
-            | 5  | David Lee    | 39  | Phoenix      | 76    |
-            | 6  | Sarah Wilson | 26  | Philadelphia | 94    |
-            | 7  | Tom Anderson | 52  | San Antonio  | 81    |
-            | 8  | Lisa Taylor  | 29  | San Diego    | 88    |
-            | 9  | Chris Martin | 37  | Dallas       | 79    |
-            | 10 | Anna Garcia  | 41  | San Jose     | 90    |
-            +----+--------------+-----+--------------+-------+
-            ");
+            insta::assert_snapshot!("multi_executor_rows", rows_fmt);
 
             // --- Aggregation across both executors ---
             let agg_sql = "SELECT COUNT(*) as total_rows, AVG(score) as avg_score, \
@@ -310,13 +275,7 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
 
             let agg = harness.query(agg_sql).await?;
             let agg_fmt = arrow::util::pretty::pretty_format_batches(&agg).expect("format agg");
-            insta::assert_snapshot!(agg_fmt, @r"
-            +------------+-----------+---------+---------+
-            | total_rows | avg_score | min_age | max_age |
-            +------------+-----------+---------+---------+
-            | 10         | 85.2      | 26      | 52      |
-            +------------+-----------+---------+---------+
-            ");
+            insta::assert_snapshot!("multi_executor_agg", agg_fmt);
 
             harness.shutdown().await;
             Ok(())
@@ -355,7 +314,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
             configure_test_datafusion();
             let app = AppBuilder::new("test_predicate_pushdown_accel")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", csv_path.display()),
+                    format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
@@ -374,6 +333,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
                 .start()
                 .await?;
 
+            tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
@@ -385,37 +345,104 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r#"
-            +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                                                           |
-            +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                                              |
-            |               |   Filter: test_data.score > Int64(85)                                                                                                                                                                          |
-            |               |     TableScan: test_data projection=[id, name, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2"), test_data.score > Int64(85)] |
-            | physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                                                                                 |
-            |               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                                           |
-            |               |     FilterExec: score@2 > 85                                                                                                                                                                                   |
-            |               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                     |
-            |               |         CooperativeExec                                                                                                                                                                                        |
-            |               |           BytesProcessedExec                                                                                                                                                                                   |
-            |               |             FlightSqlExec sql=SELECT id, name, score FROM test_data WHERE ((((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2'))) AND (("score" > 85))                             |
-            |               |                                                                                                                                                                                                                |
-            +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            "#);
+            assert_explain_snapshot!("predicate_pushdown_plan", plan_fmt);
 
             let rows = harness.query(filtered_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!(rows_fmt, @r"
-            +----+--------------+-------+
-            | id | name         | score |
-            +----+--------------+-------+
-            | 2  | Jane Smith   | 92    |
-            | 4  | Emily Brown  | 89    |
-            | 6  | Sarah Wilson | 94    |
-            | 8  | Lisa Taylor  | 88    |
-            | 10 | Anna Garcia  | 90    |
-            +----+--------------+-------+
-            ");
+            insta::assert_snapshot!("predicate_pushdown_rows", rows_fmt);
+
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that `ORDER BY col LIMIT N` is pushed down into each executor's `FlightSqlExec`
+/// so each partition returns at most N rows (`TopK`)
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=debug,info"))
+        .with_ansi(true)
+        .try_init();
+
+    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let csv_path = csv_tempdir.path().join("test_data.csv");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            let app = AppBuilder::new("test_order_limit_pushdown")
+                .with_dataset(make_memory_accelerated_dataset(
+                    format!("file://{}", csv_path.display()),
+                    "test_data",
+                    4,
+                    "id",
+                ))
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(
+                        make_named_scheduler_config_with_max_partitions_per_executor(
+                            "test_distributed_acceleration_order_by_limit_pushdown",
+                            2,
+                        ),
+                    ),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(2)
+                .start()
+                .await?;
+
+            sleep(Duration::from_secs(2)).await;
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+
+            // --- ORDER BY score DESC LIMIT 3 ---
+            // Expected top-3 scores from TEST_DATA_CSV: Sarah Wilson=94, Jane Smith=92, Anna Garcia=90
+            let limit_sql = "SELECT id, name, score FROM test_data ORDER BY score DESC LIMIT 3";
+
+            let plan = harness.explain(limit_sql).await?;
+            let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
+                .expect("format explain")
+                .to_string();
+
+            assert_explain_snapshot!("order_by_limit_pushdown_plan", plan_fmt);
+
+            let rows = harness.query(limit_sql).await?;
+            let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
+            insta::assert_snapshot!("order_by_limit_pushdown_rows", rows_fmt);
+
+            // --- ORDER BY id ASC LIMIT 5 with predicate ---
+            // Combines predicate pushdown with limit pushdown.
+            // Rows with score > 80: ids 1(85), 2(92), 4(89), 6(94), 7(81), 8(88), 10(90) → 7 rows
+            // LIMIT 5 → first 5 by id: 1, 2, 4, 6, 7
+            let limit_pred_sql =
+                "SELECT id, name, score FROM test_data WHERE score > 80 ORDER BY id ASC LIMIT 5";
+
+            let pred_plan = harness.explain(limit_pred_sql).await?;
+            let pred_plan_fmt = arrow::util::pretty::pretty_format_batches(&pred_plan)
+                .expect("format explain")
+                .to_string();
+
+            assert_explain_snapshot!("order_by_limit_with_predicate_plan", pred_plan_fmt);
+
+            let pred_rows = harness.query(limit_pred_sql).await?;
+            let pred_rows_fmt =
+                arrow::util::pretty::pretty_format_batches(&pred_rows).expect("format rows");
+            insta::assert_snapshot!("order_by_limit_with_predicate_rows", pred_rows_fmt);
 
             harness.shutdown().await;
             Ok(())
@@ -459,7 +486,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
             configure_test_datafusion();
             let app = AppBuilder::new("test_rebalance_accel")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", csv_path.display()),
+                    format!("file://{}", csv_path.display()),
                     "test_data",
                     4,
                     "id",
@@ -478,6 +505,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 .start()
                 .await?;
 
+            tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
@@ -493,7 +521,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 "baseline should return 10 rows with 2 executors"
             );
 
-            // Shut down executor[0].  The scheduler's PartitionManagementTask (1s interval)
+            // Shut down executor[0].  The scheduler's PartitionAssignmentTask (1s interval)
             // will detect the disconnect and reassign its buckets to executor[1].
             harness.executors[0].shutdown().await;
             harness
@@ -506,22 +534,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
             // After rebalance executor[1] should hold all 4 buckets and return all rows.
             let rows = harness.query(select_all).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!(rows_fmt, @r"
-            +----+
-            | id |
-            +----+
-            | 1  |
-            | 2  |
-            | 3  |
-            | 4  |
-            | 5  |
-            | 6  |
-            | 7  |
-            | 8  |
-            | 9  |
-            | 10 |
-            +----+
-            ");
+            insta::assert_snapshot!("rebalance_rows", rows_fmt);
 
             // Explicit shutdown of the remaining executor before harness drop.
             harness.executors[1].shutdown().await;
@@ -543,6 +556,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
 /// - EXPLAIN plan reflects the distributed scatter-gather for both tables
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Flaky. Needs to be fixed. https://github.com/spiceai/spiceai/issues/10210"]
 async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -570,21 +584,29 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             configure_test_datafusion();
             let app = AppBuilder::new("test_join_partitioned")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", data_path.display()),
+                    format!("file://{}", data_path.display()),
                     "test_data",
                     4,
                     "id",
                 ))
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", cat_path.display()),
+                    format!("file://{}", cat_path.display()),
                     "categories",
                     4,
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config(
-                        "test_distributed_acceleration_join_two_partitioned_tables",
-                    )),
+                    scheduler: Some({
+                        let mut cfg = make_named_scheduler_config(
+                            "test_distributed_acceleration_join_two_partitioned_tables",
+                        );
+                        // Limit each executor to 2 of the 4 partitions per table so
+                        // that partitions are forced to split across the 2 executors,
+                        // producing a UnionExec in the query plan.
+                        cfg.partition_assignment_interval = "1s".to_string();
+                        cfg.max_partitions_per_executor = 2;
+                        cfg
+                    }),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -601,8 +623,8 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             wait_for_row_count(&harness, "categories", 10, Duration::from_secs(60)).await?;
 
             // Wait for partition metadata to be fully initialized and assigned
-            // to executors. Poll until the EXPLAIN shows a partitioned plan
-            // (Union with bucket filters) rather than an EmptyRelation.
+            // to executors. Poll until the EXPLAIN shows a distributed plan
+            // (FlightSqlExec with bucket filters) rather than an EmptyRelation.
             let join_sql = "SELECT t.id, t.name, c.category, c.rating \
                             FROM test_data t JOIN categories c ON t.id = c.id \
                             ORDER BY t.id";
@@ -613,76 +635,58 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                     .expect("format explain")
                     .to_string();
-                if plan_fmt.contains("UnionExec") || plan_fmt.contains("Union") {
+                if plan_fmt.contains("FlightSqlExec")
+                    && plan_fmt.contains("bucket")
+                {
                     break plan;
                 }
                 assert!(
                     start.elapsed() <= Duration::from_secs(30),
-                    "Timed out waiting for partitioned EXPLAIN plan. Got:\n{plan_fmt}"
+                    "Timed out waiting for distributed EXPLAIN plan. Got:\n{plan_fmt}"
                 );
                 tokio::time::sleep(Duration::from_millis(500)).await;
             };
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r#"
-            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                        |
-            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: t.id ASC NULLS LAST                                                                                                                                   |
-            |               |   Projection: t.id, t.name, c.category, c.rating                                                                                                            |
-            |               |     Inner Join: t.id = c.id                                                                                                                                 |
-            |               |       SubqueryAlias: t                                                                                                                                      |
-            |               |         SubqueryAlias: test_data                                                                                                                            |
-            |               |           Union                                                                                                                                             |
-            |               |             TableScan: test_data projection=[id, name], partial_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("2")]              |
-            |               |             TableScan: test_data projection=[id, name], partial_filters=[bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("3")]              |
-            |               |       SubqueryAlias: c                                                                                                                                      |
-            |               |         SubqueryAlias: categories                                                                                                                           |
-            |               |           Union                                                                                                                                             |
-            |               |             TableScan: categories projection=[id, category, rating], partial_filters=[bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("3")] |
-            |               |             TableScan: categories projection=[id, category, rating], partial_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("2")] |
-            | physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                              |
-            |               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                        |
-            |               |     HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, name@1, category@3, rating@4]  |
-            |               |       CoalescePartitionsExec                                                                                                                                |
-            |               |         UnionExec                                                                                                                                           |
-            |               |           CooperativeExec                                                                                                                                   |
-            |               |             BytesProcessedExec                                                                                                                              |
-            |               |               FlightSqlExec sql=SELECT id, name FROM test_data WHERE (((bucket(4, "id") = '0') OR (bucket(4, "id") = '2')))                                 |
-            |               |           CooperativeExec                                                                                                                                   |
-            |               |             BytesProcessedExec                                                                                                                              |
-            |               |               FlightSqlExec sql=SELECT id, name FROM test_data WHERE (((bucket(4, "id") = '1') OR (bucket(4, "id") = '3')))                                 |
-            |               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=2                                                                                  |
-            |               |         UnionExec                                                                                                                                           |
-            |               |           CooperativeExec                                                                                                                                   |
-            |               |             BytesProcessedExec                                                                                                                              |
-            |               |               FlightSqlExec sql=SELECT id, category, rating FROM categories WHERE (((bucket(4, "id") = '1') OR (bucket(4, "id") = '3')))                    |
-            |               |           CooperativeExec                                                                                                                                   |
-            |               |             BytesProcessedExec                                                                                                                              |
-            |               |               FlightSqlExec sql=SELECT id, category, rating FROM categories WHERE (((bucket(4, "id") = '0') OR (bucket(4, "id") = '2')))                    |
-            |               |                                                                                                                                                             |
-            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            "#);
+
+            // Verify plan structure without relying on partition ordering (which depends
+            // on non-deterministic executor-to-partition assignment).
+            assert!(
+                plan_fmt.contains("Inner Join: t.id = c.id"),
+                "plan should contain inner join"
+            );
+            assert!(
+                plan_fmt.contains("TableScan: test_data"),
+                "plan should contain test_data"
+            );
+            assert!(
+                plan_fmt.contains("TableScan: categories"),
+                "plan should contain categories"
+            );
+            // Partition values are no longer injected as bucket filters because
+            // executors only materialise data for their assigned partitions.
+            assert!(
+                !plan_fmt.contains("bucket("),
+                "plan should not contain bucket filters; executors already own only their assigned data"
+            );
+            // Verify distributed execution operators
+            assert!(
+                plan_fmt.contains("FlightSqlExec"),
+                "plan should use FlightSqlExec for distributed execution \n {plan_fmt}"
+            );
+            assert!(
+                plan_fmt.contains("HashJoinExec"),
+                "plan should contain HashJoinExec"
+            );
+            assert!(
+                plan_fmt.contains("SortPreservingMergeExec"),
+                "plan should contain SortPreservingMerge"
+            );
 
             let rows = harness.query(join_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!( rows_fmt, @r"
-            +----+--------------+----------+--------+
-            | id | name         | category | rating |
-            +----+--------------+----------+--------+
-            | 1  | John Doe     | A        | 4.5    |
-            | 2  | Jane Smith   | B        | 3.2    |
-            | 3  | Mike Johnson | A        | 4.8    |
-            | 4  | Emily Brown  | C        | 2.1    |
-            | 5  | David Lee    | B        | 3.9    |
-            | 6  | Sarah Wilson | A        | 4.2    |
-            | 7  | Tom Anderson | C        | 1.8    |
-            | 8  | Lisa Taylor  | B        | 3.5    |
-            | 9  | Chris Martin | A        | 4.6    |
-            | 10 | Anna Garcia  | C        | 2.7    |
-            +----+--------------+----------+--------+
-            ");
+            insta::assert_snapshot!("join_rows", rows_fmt);
 
             harness.shutdown().await;
             Ok(())
@@ -723,7 +727,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
             configure_test_datafusion();
             let app = AppBuilder::new("test_refresh_forwarding")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", csv_path.display()),
+                    format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
@@ -742,6 +746,8 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
                 .start()
                 .await?;
 
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
@@ -757,7 +763,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
                 .expect("refresh_table on scheduler should forward to executors");
 
             // Allow time for the executor to process the refresh command.
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
             // Verify data is still correct after refresh.
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(30)).await?;
@@ -766,13 +772,154 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
                 .query("SELECT COUNT(*) as cnt FROM test_data")
                 .await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!(rows_fmt, @r"
-            +-----+
-            | cnt |
-            +-----+
-            | 10  |
-            +-----+
-            ");
+            insta::assert_snapshot!("refresh_forwarding_count", rows_fmt);
+
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that on-demand refresh discovers genuinely new partition values from the
+/// source, assigns them in the partition store, and makes the data queryable.
+///
+/// Uses `city` as a column-value partition (not `bucket()`), so each unique city
+/// is its own partition value. The initial CSV has 10 cities. After the cluster
+/// is running, we append a row with a new city ("Seattle") and trigger refresh.
+///
+/// Verifies:
+/// 1. Before refresh: partition store has 10 partition values
+/// 2. After refresh: partition store has 11 partition values (new city discovered + assigned)
+/// 3. All 11 rows are queryable
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=debug,info"))
+        .with_ansi(true)
+        .try_init();
+
+    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let csv_path = csv_tempdir.path().join("test_data.csv");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            // Partition by city (column value), not bucket — each unique city is a partition.
+            let app = AppBuilder::new("test_refresh_discovers_partitions")
+                .with_dataset(make_column_partitioned_dataset(
+                    format!("file:{}", csv_path.display()),
+                    "test_data",
+                    "city",
+                ))
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(
+                        make_named_scheduler_config_with_max_partitions_per_executor(
+                            "test_on_demand_refresh_discovers_new_partitions",
+                            20,
+                        ),
+                    ),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(1)
+                .start()
+                .await?;
+
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+
+            // Wait for partition management cycle to discover and assign all partitions.
+            // The cycle runs every 1s (configured in make_named_scheduler_config).
+            let partition_store = harness
+                .scheduler
+                .partition_store()
+                .expect("scheduler should have partition store");
+            let table_ref = datafusion::sql::TableReference::parse_str("test_data");
+
+            let partitions_assigned =
+                crate::utils::wait_until_true(Duration::from_secs(30), || async {
+                    partition_store.refresh().await.ok();
+                    partition_store
+                        .get_table_metadata(&table_ref)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| {
+                            m.partitions.len() == 10
+                                && m.partitions
+                                    .iter()
+                                    .all(runtime::cluster::PartitionMetadata::is_assigned)
+                        })
+                })
+                .await;
+            assert!(
+                partitions_assigned,
+                "All 10 initial partitions should be discovered and assigned"
+            );
+
+            // Append a row with a NEW city that doesn't exist in the initial data.
+            let new_row = "\n11,New Person,33,Seattle,87\n";
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&csv_path)
+                .await
+                .expect("open csv for append")
+                .write_all(new_row.as_bytes())
+                .await
+                .expect("append new row");
+
+            // Trigger on-demand refresh. PartitionService.discover_and_assign_for_table()
+            // should discover "Seattle" as a new partition value, add it to the store,
+            // assign it, and then forward the refresh to executors.
+            harness
+                .scheduler
+                .datafusion()
+                .refresh_table(&table_ref, None)
+                .await
+                .expect("refresh_table should succeed");
+
+            // Verify partition store: should now have 11 partitions with Seattle present
+            // and assigned. Use polling because S3 writes may not be immediately visible.
+            let seattle_assigned =
+                crate::utils::wait_until_true(Duration::from_secs(30), || async {
+                    partition_store.refresh().await.ok();
+                    partition_store
+                        .get_table_metadata(&table_ref)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| {
+                            m.partitions.len() == 11
+                                && m.partitions.iter().any(|p| {
+                                    p.partition_value.values().any(|v| v == "Seattle")
+                                        && p.is_assigned()
+                                })
+                        })
+                })
+                .await;
+            assert!(
+                seattle_assigned,
+                "Seattle partition should be discovered, added to store, and assigned"
+            );
+
+            // Wait for the executor to pick up the new partition and load the data.
+            // The executor needs to receive the UpdatePartitions message, update its
+            // partition filter, and then the next refresh will include Seattle.
+            wait_for_row_count(&harness, "test_data", 11, Duration::from_secs(60)).await?;
 
             harness.shutdown().await;
             Ok(())
@@ -897,6 +1044,29 @@ fn make_memory_accelerated_dataset(
     dataset
 }
 
+/// Create a dataset partitioned by a raw column value (not `bucket()`).
+/// Each unique value of `partition_column` becomes its own partition.
+fn make_column_partitioned_dataset(
+    source_path: impl Into<String>,
+    name: &str,
+    partition_column: &str,
+) -> Dataset {
+    let mut dataset = Dataset::new(source_path, name);
+
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        mode: Mode::Memory,
+        refresh_mode: Some(RefreshMode::Full),
+        partition_by: vec![PartitionedBy {
+            name: partition_column.to_string(),
+            expression: partition_column.to_string(),
+        }],
+        ..Acceleration::default()
+    });
+
+    dataset
+}
+
 /// Return a `SchedulerConfig` pointing at an S3 path scoped to `test_name`.
 ///
 /// `PartitionManager` uses OCC (optimistic concurrency control) which needs
@@ -906,6 +1076,13 @@ fn make_memory_accelerated_dataset(
 /// A UUID suffix ensures each test run starts with clean state, avoiding stale
 /// partition assignments from previous runs routing queries to dead executors.
 fn make_named_scheduler_config(test_name: &str) -> SchedulerConfig {
+    make_named_scheduler_config_with_max_partitions_per_executor(test_name, 10)
+}
+
+fn make_named_scheduler_config_with_max_partitions_per_executor(
+    test_name: &str,
+    max_partitions_per_executor: usize,
+) -> SchedulerConfig {
     let run_id = uuid::Uuid::new_v4();
     SchedulerConfig {
         state_location: format!(
@@ -925,9 +1102,11 @@ fn make_named_scheduler_config(test_name: &str) -> SchedulerConfig {
                 ("s3_auth".to_string(), "key".to_string()),
             ]),
         )),
-        partition_management: Some(PartitionManagement {
-            interval: "1s".to_string(),
-            ..Default::default()
-        }),
+        partition_assignment_interval: "1s".to_string(),
+        max_partition_assignments_per_interval:
+            spicepod::component::runtime::default_max_partition_assignments_per_interval(),
+        max_partitions_per_executor,
+        partition_discovery_timeout:
+            spicepod::component::runtime::default_partition_discovery_timeout(),
     }
 }

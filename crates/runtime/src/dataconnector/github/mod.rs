@@ -21,7 +21,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
-use commits::CommitsTableArgs;
+use commits::{CommitsTableArgs, CommitsTableProvider};
 use data_components::graphql::client::UnnestBehavior;
 use data_components::{
     github::{self, GithubFilesTableProvider, GithubRestClient},
@@ -29,7 +29,7 @@ use data_components::{
         self, FilterPushdownResult, GraphQLContext,
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
-        provider::GraphQLTableProviderBuilder,
+        provider::{GraphQLTableProvider, GraphQLTableProviderBuilder},
     },
     rate_limit::RateLimiter,
 };
@@ -77,7 +77,9 @@ mod stargazers;
 mod workflow_runs;
 mod workflows;
 
-static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
+type GitHubConcurrencyLimits = HashMap<String, (usize, Arc<Semaphore>)>;
+
+static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<GitHubConcurrencyLimits>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
@@ -254,6 +256,16 @@ impl Github {
         repo: Option<&str>,
         resource_type: &str,
     ) -> Result<(), String> {
+        // Skip validation when token-based auth is used (token takes precedence over app auth).
+        // The `installation_id` parameter may be present due to secret autoloading from .env,
+        // even when the dataset was explicitly configured with a token.
+        if self.params.get("token").ok().is_some() {
+            tracing::debug!(
+                "Skipping GitHub App access validation because token-based auth is active"
+            );
+            return Ok(());
+        }
+
         // Check if we're using a GitHub App token provider with an installation ID
         let installation_id = self.params.get("installation_id").expose().ok();
 
@@ -290,7 +302,7 @@ impl Github {
             };
 
             let client = reqwest::Client::builder()
-                .user_agent(format!("spiceai/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
+                .user_agent(util::spiceai_user_agent())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -370,12 +382,7 @@ impl Github {
         let rate_controller = get_github_auth_context_rate_controller(auth_context).await;
 
         let client = reqwest::Client::builder()
-            .user_agent(format!(
-                "spiceai/{} ({}; {})",
-                env!("CARGO_PKG_VERSION"),
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            ))
+            .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .gzip(true)
@@ -435,6 +442,17 @@ impl Github {
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        self.build_gql_table_provider(table_args, context, health_check_query_string)
+            .await
+            .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
+    }
+
+    async fn build_gql_table_provider(
+        &self,
+        table_args: Arc<dyn GitHubTableArgs>,
+        context: Option<Arc<dyn GraphQLContext>>,
+        health_check_query_string: String,
+    ) -> super::DataConnectorResult<GraphQLTableProvider> {
         let connector_component_name = format!("{}", table_args.get_component());
         let graphql_values = table_args.get_graphql_values();
         let client = self.create_graphql_client(&table_args).await.context(
@@ -467,7 +485,7 @@ impl Github {
             .build(graphql_values.query.as_ref())
             .await
         {
-            Ok(provider) => return Ok(Arc::new(provider) as Arc<dyn TableProvider>),
+            Ok(provider) => return Ok(provider),
             Err(e) => e,
         };
 
@@ -496,7 +514,6 @@ impl Github {
 
             return fallback_builder
                 .build_without_validation(graphql_values.query.as_ref())
-                .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
                 .map_err(|e| DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
                     connector_component: table_args.get_component(),
@@ -593,6 +610,48 @@ impl Github {
                 }
             })?,
         ))
+    }
+
+    async fn create_commits_table_provider(
+        &self,
+        owner: &str,
+        repo: &str,
+        requested_ref: Option<&str>,
+        dataset: &Dataset,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let table_args = Arc::new(CommitsTableArgs {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            requested_ref: requested_ref.map(ToString::to_string),
+            component: ConnectorComponent::from(dataset),
+        });
+
+        let gql_table_args = Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>;
+        let gql_context = Arc::clone(&table_args) as Arc<dyn GraphQLContext>;
+
+        let delegate_provider = self
+            .build_gql_table_provider(
+                Arc::clone(&gql_table_args),
+                Some(gql_context),
+                Github::get_health_check_for_owner_and_repo(owner, repo),
+            )
+            .await?;
+        let client = delegate_provider.client();
+        let delegate = Arc::new(delegate_provider) as Arc<dyn TableProvider>;
+
+        let rest_client =
+            self.create_rest_client()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "github".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                })?;
+
+        Ok(Arc::new(CommitsTableProvider::new(
+            delegate,
+            client,
+            rest_client,
+            table_args,
+        )) as Arc<dyn TableProvider>)
     }
 }
 
@@ -710,6 +769,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("workflow_logs")
         .description("Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run. Defaults to 'disabled'.")
         .default("disabled"),
+    ParameterSpec::runtime("max_concurrent_requests")
+        .description("Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.params.github_max_concurrent_connections or the connector default."),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -744,7 +805,45 @@ impl DataConnectorFactory for GithubFactory {
             .ok()
             .map(ToString::to_string);
 
-        let max_concurrent_connections = params
+        let connector_component = params.component.clone();
+
+        let dataset_max_concurrent_requests = match params
+            .parameters
+            .get("max_concurrent_requests")
+            .expose()
+            .ok()
+            .map(str::trim)
+        {
+            Some("") | None => None,
+            Some(value) => match value.parse::<usize>() {
+                Ok(0) => {
+                    let error = DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component,
+                        message: format!(
+                            "The '{}' parameter must be greater than 0.",
+                            params.parameters.user_param("max_concurrent_requests")
+                        ),
+                    };
+                    return Box::pin(async move { Err(Box::new(error) as _) });
+                }
+                Ok(value) => Some(value),
+                Err(source) => {
+                    let error = DataConnectorError::InvalidConfiguration {
+                        dataconnector: "github".to_string(),
+                        message: format!(
+                            "The '{}' parameter must be a positive integer.",
+                            params.parameters.user_param("max_concurrent_requests")
+                        ),
+                        connector_component,
+                        source: source.into(),
+                    };
+                    return Box::pin(async move { Err(Box::new(error) as _) });
+                }
+            },
+        };
+
+        let app_max_concurrent_connections = params
             .app
             .and_then(|app| {
                 app.runtime
@@ -753,6 +852,10 @@ impl DataConnectorFactory for GithubFactory {
                     .cloned()
             })
             .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0);
+
+        let max_concurrent_connections = dataset_max_concurrent_requests
+            .or(app_max_concurrent_connections)
             .unwrap_or(GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS);
 
         Box::pin(async move {
@@ -782,11 +885,27 @@ impl DataConnectorFactory for GithubFactory {
 
             let semaphore = if let Some(key) = semaphore_key {
                 let mut limits = GITHUB_CONCURRENCY_LIMITS.lock().await;
-                Arc::clone(
-                    limits
-                        .entry(key)
-                        .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent_connections))),
-                )
+                match limits.get(&key) {
+                    Some((existing_limit, semaphore))
+                        if *existing_limit == max_concurrent_connections =>
+                    {
+                        Arc::clone(semaphore)
+                    }
+                    Some((existing_limit, _)) => {
+                        return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                            dataconnector: "github".to_string(),
+                            connector_component,
+                            message: format!(
+                                "Multiple GitHub datasets share the same authentication context with different concurrency limits ({existing_limit} and {max_concurrent_connections}). Use the same max_concurrent_requests value for datasets sharing a GitHub token or installation."
+                            ),
+                        }) as _);
+                    }
+                    None => {
+                        let semaphore = Arc::new(Semaphore::new(max_concurrent_connections));
+                        limits.insert(key, (max_concurrent_connections, Arc::clone(&semaphore)));
+                        semaphore
+                    }
+                }
             } else {
                 Arc::new(Semaphore::new(max_concurrent_connections))
             };
@@ -843,6 +962,19 @@ fn warn_if_provided(
     }
 }
 
+/// Default number of comments fetched per pull request when the user does
+/// not override `github_max_comments_fetched`.
+///
+/// Lowered from the previous hard cap of 75 to 25 to keep the GitHub GraphQL
+/// node count well under the 500,000 node hard limit for queries that enable
+/// `include_comments` (each PR page multiplies this by up to 20 review threads).
+///
+/// See: <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit>
+const DEFAULT_MAX_COMMENTS_FETCHED: u32 = 25;
+
+/// Hard upper bound on `github_max_comments_fetched`. Values above this cap
+/// are clamped to protect against GitHub secondary rate limits and the 500,000
+/// node hard limit on a single GraphQL query.
 const MAX_COMMENTS_FETCHED: u32 = 75;
 
 // Organization-level resources (2 segments: owner/resource_type)
@@ -1001,7 +1133,7 @@ impl DataConnector for Github {
 
         match (parsed.resource_type, parsed.repo) {
             ("pulls", Some(repo)) => {
-                let max_comments_fetched = match max_comments_fetched.unwrap_or(MAX_COMMENTS_FETCHED) {
+                let max_comments_fetched = match max_comments_fetched.unwrap_or(DEFAULT_MAX_COMMENTS_FETCHED) {
                     value if value > MAX_COMMENTS_FETCHED => {
                         tracing::warn!(
                             "Due to GitHub API rate limits, the number of comments fetched for {component} per pull request is limited to {MAX_COMMENTS_FETCHED}."
@@ -1015,10 +1147,21 @@ impl DataConnector for Github {
                     owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
-                    component,
+                    component: component.clone(),
                     include_comments: include_comments.unwrap_or(PullRequestCommentType::None),
                     max_comments_fetched,
                 });
+
+                // Validate that the computed query stays under GitHub's 500K
+                // node hard limit before we bother opening a connection.
+                table_args.check_node_limit().map_err(|message| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component: component.clone(),
+                        message,
+                    }
+                })?;
+
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
@@ -1028,17 +1171,11 @@ impl DataConnector for Github {
             }
             ("commits", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "commits", &component);
-
-                let table_args = Arc::new(CommitsTableArgs {
-                    owner: parsed.owner.to_string(),
-                    repo: repo.to_string(),
-                    requested_ref: parsed.remaining.clone(),
-                    component,
-                });
-                self.create_gql_table_provider(
-                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
-                    Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                self.create_commits_table_provider(
+                    parsed.owner,
+                    repo,
+                    parsed.remaining.as_deref(),
+                    dataset,
                 )
                 .await
             }
@@ -1386,6 +1523,15 @@ static GITHUB_FILTER_PUSHDOWNS_SUPPORTED: LazyLock<HashMap<&'static str, GitHubP
         m
     });
 
+pub(crate) fn scalar_utf8_value(scalar: &ScalarValue) -> Option<&str> {
+    match scalar {
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::LargeUtf8(Some(v))
+        | ScalarValue::Utf8View(Some(v)) => Some(v.as_str()),
+        _ => None,
+    }
+}
+
 pub(crate) fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
@@ -1464,16 +1610,18 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             column.name.as_str()
         };
 
-        let value = match value {
-            ScalarValue::Utf8(Some(v)) => {
+        let value = match &value {
+            ScalarValue::Utf8(Some(v))
+            | ScalarValue::LargeUtf8(Some(v))
+            | ScalarValue::Utf8View(Some(v)) => {
                 if column.name == "state" {
                     v.to_lowercase()
                 } else {
-                    v
+                    v.clone()
                 }
             }
             ScalarValue::TimestampMillisecond(Some(millis), _) => {
-                let dt = Utc.timestamp_millis_opt(millis);
+                let dt = Utc.timestamp_millis_opt(*millis);
                 match dt {
                     LocalResult::Single(dt) => match column_name {
                         "updated" | "created" | "closed" | "merged" => dt.to_rfc3339(),
@@ -1690,7 +1838,75 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_github_path, sanitize_github_validation_body};
+    use super::{GithubFactory, PARAMETERS, parse_github_path, sanitize_github_validation_body};
+    use crate::Runtime;
+    use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataconnector::{
+        ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
+    };
+    use crate::parameters::Parameters;
+    use runtime_secrets::Secrets;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn github_connector_params(
+        dataset_name: &str,
+        token: &str,
+        extra: &[(&str, &str)],
+    ) -> ConnectorParams {
+        let mut params = vec![("github_token".to_string(), token.to_string().into())];
+        params.extend(
+            extra
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string().into())),
+        );
+
+        let parameters = Parameters::try_new(
+            "connector github",
+            params,
+            "github",
+            Arc::new(RwLock::new(Secrets::default())),
+            PARAMETERS,
+        )
+        .await
+        .expect("test GitHub parameters should be valid");
+
+        let app = app::AppBuilder::new(dataset_name.to_string()).build();
+        let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
+        let app = Arc::new(app);
+        let dataset = DatasetBuilder::try_new(
+            "github:github.com/spiceai/spiceai/issues".to_string(),
+            dataset_name,
+        )
+        .expect("test GitHub dataset should be valid")
+        .with_app(Arc::clone(&app))
+        .with_runtime(Arc::clone(&runtime))
+        .build()
+        .expect("test GitHub dataset should build");
+
+        ConnectorParams {
+            parameters,
+            unsupported_type_action: None,
+            component: ConnectorComponent::from(&dataset),
+            app: Some(app),
+            runtime: Some(runtime),
+            io_runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn expect_invalid_configuration_message(
+        error: Box<dyn std::error::Error + Send + Sync>,
+    ) -> String {
+        let error = error
+            .downcast::<DataConnectorError>()
+            .expect("error should be a DataConnectorError");
+
+        match *error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. }
+            | DataConnectorError::InvalidConfiguration { message, .. } => message,
+            other => panic!("expected GitHub invalid configuration error, got: {other}"),
+        }
+    }
 
     #[test]
     fn test_sanitize_github_validation_body_normalizes_crlf() {
@@ -1720,5 +1936,58 @@ mod tests {
         assert_eq!(parsed.repo, Some("spiceai"));
         assert_eq!(parsed.resource_type, "files");
         assert!(parsed.remaining.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_github_rejects_invalid_max_concurrent_requests() {
+        let params = github_connector_params(
+            "github_invalid_concurrency",
+            "github-invalid-concurrency-token",
+            &[("max_concurrent_requests", "0")],
+        )
+        .await;
+
+        let Err(error) = GithubFactory::new().create(params).await else {
+            panic!("zero GitHub max_concurrent_requests should be rejected");
+        };
+        let message = expect_invalid_configuration_message(error);
+
+        assert!(
+            message.contains("must be greater than 0"),
+            "expected zero-limit validation error, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_github_rejects_conflicting_shared_auth_concurrency_limits() {
+        let factory = GithubFactory::new();
+        let token = "github-conflicting-concurrency-token";
+
+        let first = github_connector_params(
+            "github_conflicting_concurrency_first",
+            token,
+            &[("max_concurrent_requests", "2")],
+        )
+        .await;
+        factory
+            .create(first)
+            .await
+            .expect("first GitHub connector should be created");
+
+        let second = github_connector_params(
+            "github_conflicting_concurrency_second",
+            token,
+            &[("max_concurrent_requests", "3")],
+        )
+        .await;
+        let Err(error) = factory.create(second).await else {
+            panic!("conflicting GitHub concurrency limits should be rejected");
+        };
+        let message = expect_invalid_configuration_message(error);
+
+        assert!(
+            message.contains("different concurrency limits"),
+            "expected shared auth concurrency conflict, got: {message}"
+        );
     }
 }

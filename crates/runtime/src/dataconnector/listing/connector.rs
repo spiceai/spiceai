@@ -850,38 +850,16 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        let mut table_parquet_options = TableParquetOptions::new();
-        table_parquet_options
-            .set("pushdown_filters", "true")
+        let runtime = self.get_runtime();
+        build_table_parquet_options(runtime.as_ref())
+            .await
             .map_err(
                 |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
                     dataconnector: format!("{self}"),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
                 },
-            )?;
-
-        if let Some(runtime) = self.get_runtime() {
-            let page_index_options = parquet_page_index_options(&runtime).await;
-
-            table_parquet_options
-                .set(
-                    "enable_page_index",
-                    &page_index_options.enable_page_index.to_string(),
-                )
-                .map_err(
-                    |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                        dataconnector: format!("{self}"),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: Box::new(e),
-                    },
-                )?;
-
-            // Note: tolerate_missing_page_index was removed in DataFusion v51.
-            // Page index reading now handles missing indexes gracefully by default.
-        }
-
-        Ok(table_parquet_options)
+            )
     }
 
     /// A hook that is called when an accelerated table is registered to the
@@ -1239,6 +1217,47 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         }
     }
 
+    async fn register_object_stores(
+        &self,
+        dataset: &Dataset,
+        runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        let url = self.get_object_store_url(dataset, None)?;
+        if url.scheme() == "file" {
+            tracing::warn!(
+                "Dataset {} has a file:// scheme and may not be resolvable on cluster executors without a shared mount.",
+                dataset.name
+            );
+            return Ok(());
+        }
+
+        let listing_url = ListingTableUrl::parse(url).boxed().context(
+            crate::dataconnector::UnableToConnectInternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        )?;
+
+        // Triggers SpiceObjectStoreRegistry::get_store, which builds an object
+        // store from the URL fragment params (already secret-expanded by
+        // ConnectorParamsBuilder when the connector was created) and registers
+        // it on the runtime env keyed by the bare URL.
+        runtime_env.object_store(&listing_url).boxed().context(
+            crate::dataconnector::UnableToConnectInternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        )?;
+
+        let mut redacted = <ListingTableUrl as AsRef<url::Url>>::as_ref(&listing_url).clone();
+        redacted.set_fragment(None);
+        tracing::debug!(
+            "Configured object storage for Dataset {} ({redacted})",
+            dataset.name,
+        );
+        Ok(())
+    }
+
     /// A hook that is called when an accelerated table is registered to the
     /// `DataFusion` context for this data connector.
     ///
@@ -1504,6 +1523,29 @@ impl SensitiveListingTableUrl {
     fn sanitized_url(&self) -> &Url {
         &self.sanitized_url
     }
+}
+
+/// Builds [`TableParquetOptions`] from the runtime configuration.
+///
+/// Always sets `pushdown_filters = true`. When a runtime is provided, reads
+/// `runtime.params.parquet_page_index` (`required` | `auto` | `skip`) and
+/// sets `enable_page_index` accordingly. When no runtime is available,
+/// `enable_page_index` retains the `DataFusion` default (`true`).
+pub async fn build_table_parquet_options(
+    runtime: Option<&Runtime>,
+) -> std::result::Result<TableParquetOptions, DataFusionError> {
+    let mut opts = TableParquetOptions::new();
+    opts.set("pushdown_filters", "true")?;
+
+    if let Some(rt) = runtime {
+        let page_index_options = parquet_page_index_options(rt).await;
+        opts.set(
+            "enable_page_index",
+            &page_index_options.enable_page_index.to_string(),
+        )?;
+    }
+
+    Ok(opts)
 }
 
 struct ParquetPageIndexOptions {

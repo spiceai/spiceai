@@ -19,7 +19,7 @@ name = "connector-graphql"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "GraphQL data connector for Spice.ai runtime"
 
 [dependencies]
@@ -33,6 +33,10 @@ runtime = { path = "../../runtime" }
 snafu.workspace = true
 token_provider = { path = "../../token_provider" }
 url.workspace = true
+
+[dev-dependencies]
+app = { path = "../../app" }
+tokio.workspace = true
 
 [features]
 default = []

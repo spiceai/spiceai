@@ -35,7 +35,7 @@ use datafusion::assert_batches_eq;
 use datafusion::sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
-use rand::Rng as _;
+use rand::RngExt as _;
 use runtime::auth::EndpointAuth;
 use runtime::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 use runtime::config::Config;
@@ -751,7 +751,6 @@ async fn doput_to_table(
             .collect(),
     );
 
-    #[expect(clippy::needless_collect)]
     let flight_data_stream = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(flight_descriptor))
         .build(futures::stream::iter(
@@ -1212,8 +1211,10 @@ async fn test_cayenne_dml_comprehensive() -> Result<(), String> {
     let data_dir = temp_dir.path().join("data");
     let metadata_dir = temp_dir.path().join("metadata");
 
+    // Box::pin the inner future to heap-allocate it. The 17 test scenarios
+    // produce a state machine struct too large for the default thread stack.
     test_request_context()
-        .scope(async {
+        .scope(Box::pin(async {
             let mut h = CayenneTestHarness::new(&data_dir, &metadata_dir).await?;
 
             // ---------------------------------------------------------------
@@ -1959,6 +1960,6 @@ async fn test_cayenne_dml_comprehensive() -> Result<(), String> {
             .await?;
 
             Ok(())
-        })
+        }))
         .await
 }

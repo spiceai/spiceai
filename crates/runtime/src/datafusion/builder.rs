@@ -24,8 +24,8 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
+use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
-use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
@@ -57,6 +57,7 @@ use {
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
+use crate::cluster::partition::service::PartitionService;
 #[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 #[cfg(feature = "duckdb")]
@@ -66,7 +67,7 @@ use datafusion_optimizer_rules::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
-        EmptyHashJoinExecPhysicalOptimization,
+        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
     },
 };
@@ -135,6 +136,7 @@ pub struct DataFusionBuilder {
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
+    partition_service: Option<Arc<PartitionService>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -180,6 +182,7 @@ impl DataFusionBuilder {
             url_tables_enabled: false,
             additional_analyzer_rules: vec![],
             executor_registry: None,
+            partition_service: None,
         }
     }
 
@@ -280,6 +283,13 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Sets the partition service for discovery and assignment of partitions (scheduler mode only).
+    #[must_use]
+    pub fn with_partition_service(mut self, service: Arc<PartitionService>) -> Self {
+        self.partition_service = Some(service);
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
@@ -298,9 +308,10 @@ impl DataFusionBuilder {
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
+            // Replace the default analyzer rules with an empty set so we can add our own predefined list later (see `AnalyzerRulesBuilder`).
+            .with_analyzer_rules(vec![])
             .with_query_planner(Arc::new(
                 ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners(
-                    Arc::clone(&datafusion_ref),
                     self.executor_registry.clone(),
                     self.io_runtime.clone(),
                 )),
@@ -309,12 +320,7 @@ impl DataFusionBuilder {
                 self.memory_limit,
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
-            ))
-            .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
-
-        for rule in self.additional_analyzer_rules {
-            state = state.with_analyzer_rule(rule);
-        }
+            ));
 
         #[cfg(feature = "duckdb")]
         {
@@ -338,6 +344,7 @@ impl DataFusionBuilder {
         }
 
         state = state
+            .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
                 Arc::new(Box::new(track_bytes_processed)),
@@ -358,15 +365,6 @@ impl DataFusionBuilder {
 
         if let Err(e) = datafusion_spark::register_all(&mut state) {
             panic!("Unable to register Spark functions: {e}");
-        }
-
-        let ctx = SessionContext::new_with_state(state);
-
-        // Add cache invalidation optimizer rule if caching is enabled
-        if let Some(caching) = &self.caching {
-            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
-                Arc::downgrade(caching),
-            )));
         }
 
         let catalog = MemoryCatalogProvider::new();
@@ -414,6 +412,14 @@ impl DataFusionBuilder {
             }
         }
 
+        let ctx = SessionContext::new_with_state(state);
+
+        // Add cache invalidation optimizer rule if caching is enabled
+        if let Some(caching) = &self.caching {
+            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
+                Arc::downgrade(caching),
+            )));
+        }
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
         // Enable URL-based table resolution (e.g., SELECT * FROM 's3://bucket/data.parquet')
@@ -434,58 +440,87 @@ impl DataFusionBuilder {
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 
         let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
-        let ddl_extension_store = super::ddl::acceleration_options::new_shared_store();
+        let ddl_extension_store =
+            datafusion_ddl::new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
 
-        // Add partitioned table scan rewrite rules for distributed query execution.
-        // Must be added after context creation so the SessionContext (with UDFs) is
-        // available for parsing partition expression strings into Exprs.
-        if let Some(executor_registry) = &self.executor_registry {
-            use crate::cluster::FederatedPartitionProvider;
+        let cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>> =
+            // How we handle Cayenne DDL depends if its single node vs distributed.
+            if let Some(executor_registry) = &self.executor_registry {
+                use crate::cluster::{AcceleratedPartitionProvider, FederatedPartitionProvider};
 
-            // Accelerated tables
-            ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
-                &ctx,
-            )));
 
-            // Federated tables (e.g. Cayenne)
-            ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                Arc::new(FederatedPartitionProvider::from_registry(executor_registry))
-                    as Arc<dyn TablePartitionProvider>,
-                &ctx,
+                // Rules only for distributed query
+                // Accelerated tables
+                ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
+                    Arc::new(AcceleratedPartitionProvider::from_registry(Arc::clone(executor_registry)))
+                        as Arc<dyn TablePartitionProvider>,
+                    &ctx,
+                )));
+
+                // Federated tables (e.g. Cayenne)
+                ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
+                    Arc::new(FederatedPartitionProvider::from_registry(executor_registry))
+                        as Arc<dyn TablePartitionProvider>,
+                    &ctx,
+                )));
+
+                // Distributed Cayenne DDL analyzer rule.
+                #[cfg(not(windows))]
+                {
+                    Some(
+                        Arc::new(super::cayenne_ddl::DistributedCayenneDdlHandler::new(
+                            Arc::clone(executor_registry),
+                        )) as Arc<dyn datafusion_ddl::CatalogDdlHandler>,
+                    )
+                }
+                #[cfg(windows)]
+                None
+            } else {
+                // Single node spice uses default [`cayenne::CayenneDdlHandler`].
+                if cfg!(windows) {
+                    None
+                } else {
+                    Some(Arc::new(cayenne::CayenneDdlHandler {})
+                        as Arc<dyn datafusion_ddl::CatalogDdlHandler>)
+                }
+            };
+
+        if let Some(ref cayenne_ddl_handler) = cayenne_ddl_handler {
+            ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+                Arc::clone(&ddl_extension_store),
+                Arc::clone(cayenne_ddl_handler),
+                SPICE_DEFAULT_SCHEMA,
+                SPICE_DEFAULT_CATALOG,
             )));
         }
 
-        // Add the Iceberg DDL analyzer rule after context creation so it can
-        // reference the catalog list and DDL-enabled catalogs.
-        // Uses Weak references to avoid reference cycles (SessionContext owns
-        // the analyzer rules, so Arc refs back would create a cycle).
-        ctx.add_analyzer_rule(Arc::new(
-            super::iceberg_ddl::analyzer_rule::IcebergDdlAnalyzerRule::new(
-                ctx.state().catalog_list(),
-                &ddl_enabled_catalogs,
-                Arc::clone(&ddl_extension_store),
-            ),
-        ));
+        // Add these analyzer rules after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
+        for rule in AnalyzerRulesBuilder::default().build() {
+            ctx.add_analyzer_rule(rule);
+        }
+        for rule in self.additional_analyzer_rules {
+            ctx.add_analyzer_rule(rule);
+        }
 
-        // Add the Cayenne DDL analyzer rule.
-        #[cfg(not(windows))]
-        ctx.add_analyzer_rule(Arc::new(
-            super::cayenne_ddl::analyzer_rule::CayenneDdlAnalyzerRule::new(
-                ctx.state_weak_ref(),
-                ctx.state().catalog_list(),
-                &ddl_enabled_catalogs,
-                Arc::clone(&ddl_extension_store),
-                self.cluster_config.as_ref().is_some_and(|cfg| {
-                    matches!(cfg.effective_role(), Some(ClusterRole::Scheduler))
-                }),
-            ),
-        ));
+        // Iceberg DDL analyzer rule.
+        ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
+            ctx.state().catalog_list(),
+            &ddl_enabled_catalogs,
+            Arc::clone(&ddl_extension_store),
+            Arc::new(super::iceberg_ddl::IcebergDdlHandler::new(Arc::clone(
+                &datafusion_ref,
+            ))),
+            SPICE_DEFAULT_SCHEMA,
+            SPICE_DEFAULT_CATALOG,
+        )));
 
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
+            data_update_broadcaster: crate::dataupdate::DataUpdateBroadcaster::new(),
             writable_catalogs: RwLock::new(HashSet::new()),
             ddl_enabled_catalogs,
             ddl_extension_store,
@@ -494,6 +529,7 @@ impl DataFusionBuilder {
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
+            on_demand_table_loader: RwLock::new(None),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
@@ -508,7 +544,9 @@ impl DataFusionBuilder {
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
-            executor_registry: self.executor_registry,
+            partition_service: self.partition_service,
+            #[cfg(not(windows))]
+            cayenne_ddl_handler,
         }
     }
 }
@@ -623,30 +661,31 @@ pub(crate) fn runtime_env(
 }
 
 pub(crate) fn default_extension_planners(
-    datafusion_ref: super::iceberg_ddl::SharedDataFusionRef,
-    executor_registry: Option<Arc<ExecutorRegistry>>,
-    io_runtime: tokio::runtime::Handle,
+    _executor_registry: Option<Arc<ExecutorRegistry>>,
+    _io_runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
-    vec![
+    let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
-        Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(datafusion_ref)),
-        #[cfg(not(windows))]
-        Arc::new(
-            super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new(
-                executor_registry,
-                Some(io_runtime),
-            ),
-        ),
+        // One stateless DDL planner handles all DdlExtensionNodes from any handler.
+        Arc::new(datafusion_ddl::DdlExtensionPlanner),
+        // One stateless DML planner handles all DmlExtensionNodes from any handler.
+        Arc::new(datafusion_dml::DmlExtensionPlanner),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
-    ]
+    ];
+    planners
 }
 
 #[cfg(test)]
 mod tests {
     use datafusion::optimizer::Analyzer;
+
+    use super::DataFusionBuilder;
+    use crate::dataaccelerator::AcceleratorEngineRegistry;
+    use crate::status;
+    use std::sync::Arc;
 
     /// Verifies that the default analyzer rules are in the expected order.
     ///
@@ -667,5 +706,42 @@ mod tests {
                 "Default analyzer rule order has changed"
             );
         }
+    }
+
+    /// Builds a full `DataFusion` instance and verifies the analyzer rules on
+    /// the resulting `SessionContext` have the correct ordering.
+    ///
+    /// Skipped on Windows because the Cayenne DDL analyzer rule is not registered
+    /// there, resulting in a different rule list.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_analyzer_rule_ordering() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        let state = df.ctx.state();
+        let rule_names: Vec<&str> = state.analyzer().rules.iter().map(|r| r.name()).collect();
+
+        assert_eq!(
+            rule_names,
+            vec![
+                "spice_ddl_rewrite",
+                "federation_optimizer_rule",
+                "resolve_grouping_function",
+                "type_coercion",
+                "spice_ddl_rewrite",
+            ],
+            "Analyzer rule list or ordering has changed"
+        );
     }
 }

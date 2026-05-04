@@ -16,6 +16,7 @@ limitations under the License.
 pub mod candidate;
 pub mod full_text;
 pub mod request;
+pub mod rerank;
 pub mod rrf;
 pub mod search_engine;
 pub mod types;

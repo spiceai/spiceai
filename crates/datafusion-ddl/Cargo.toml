@@ -1,0 +1,15 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "datafusion-ddl"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+spicepod = { path = "../spicepod" }

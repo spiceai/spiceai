@@ -17,11 +17,10 @@ limitations under the License.
 //! `PostgreSQL` data connector for Spice.ai runtime.
 //!
 //! This crate provides the `PostgreSQL` connector implementation, allowing
-//! Spice.ai to connect to `PostgreSQL` databases as data sources.
-//!
-//! This connector is extracted from the runtime crate to enable faster
-//! incremental builds - changes to this connector only require rebuilding
-//! this crate, not the entire runtime.
+//! Spice.ai to connect to `PostgreSQL` databases as data sources. It also
+//! exposes a direct WAL-based `ChangesStream`, so users can set
+//! `acceleration.refresh_mode: changes` on a Postgres dataset and get
+//! change-by-change replication into the local accelerator without Debezium.
 
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -32,6 +31,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
 };
 use runtime::component::dataset::Dataset;
+use runtime::component::metrics::MetricsProvider;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -44,6 +44,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod replication;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
@@ -52,7 +54,10 @@ pub enum Error {
 
 /// `PostgreSQL` data connector.
 pub struct Postgres {
-    postgres_factory: PostgresTableFactory,
+    factory: PostgresTableFactory,
+    params: runtime::parameters::Parameters,
+    replication_metrics:
+        std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
 }
 
 impl std::fmt::Debug for Postgres {
@@ -77,21 +82,90 @@ impl PostgresFactory {
     }
 }
 
+const POSTGRES_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/postgres";
+
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("connection_string").secret(),
-    ParameterSpec::component("user").secret(),
-    ParameterSpec::component("pass").secret(),
-    ParameterSpec::component("host"),
-    ParameterSpec::component("port"),
-    ParameterSpec::component("db"),
-    ParameterSpec::component("sslmode"),
-    ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("connection_string")
+        .description(
+            "Full libpq-style connection string. Overrides other connection params if set.",
+        )
+        .examples(&["host=db.example.com port=5432 dbname=app user=ro sslmode=require"])
+        .help_link(POSTGRES_DOCS)
+        .secret(),
+    ParameterSpec::component("user")
+        .description("PostgreSQL username.")
+        .examples(&["postgres", "spice_reader"])
+        .help_link(POSTGRES_DOCS)
+        .secret(),
+    ParameterSpec::component("pass")
+        .description("PostgreSQL password.")
+        .help_link(POSTGRES_DOCS)
+        .secret(),
+    ParameterSpec::component("host")
+        .description("PostgreSQL server hostname or IP.")
+        .examples(&["db.internal", "10.0.0.5"])
+        .help_link(POSTGRES_DOCS),
+    ParameterSpec::component("port")
+        .description("PostgreSQL TCP port.")
+        .examples(&["5432"])
+        .help_link(POSTGRES_DOCS),
+    ParameterSpec::component("db")
+        .description("Database name.")
+        .examples(&["app", "analytics"])
+        .help_link(POSTGRES_DOCS),
+    ParameterSpec::component("sslmode")
+        .description("libpq SSL mode: disable, allow, prefer, require, verify-ca, verify-full.")
+        .one_of(&[
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full",
+        ])
+        .help_link(POSTGRES_DOCS),
+    ParameterSpec::component("sslrootcert")
+        .description(
+            "Path to, or inline PEM content for, a CA certificate used when sslmode is verify-ca/verify-full.",
+        )
+        .help_link(POSTGRES_DOCS),
     ParameterSpec::component("connection_pool_min_idle")
         .description("The minimum number of idle connections to keep open in the pool.")
-        .default("1"),
+        .default("1")
+        .help_link(POSTGRES_DOCS),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections created in the connection pool.")
-        .default("5"),
+        .default("5")
+        .help_link(POSTGRES_DOCS),
+    // --- Logical replication (WAL streaming) ---
+    ParameterSpec::component("replication_slot").description(
+        "Name of the Postgres replication slot to create/reuse for this dataset. \
+         Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Each Spice replica \
+         MUST have its own unique slot.",
+    ),
+    ParameterSpec::component("publication").description(
+        "Name of the Postgres publication to create/reuse for this dataset. \
+         Defaults to `spice_<dataset>_<dataset-hash>_pub`. Shared across replicas for the \
+         same dataset.",
+    ),
+    ParameterSpec::component("replication_initial_snapshot")
+        .description(
+            "Whether to take an initial snapshot of the table's existing rows on first \
+             connection, before streaming WAL changes. Default: true.",
+        )
+        .default("true"),
+    ParameterSpec::component("replication_temporary_slot")
+        .description(
+            "If true, create a temporary replication slot that is dropped when the \
+             Spice process disconnects. Default: false (durable slot).",
+        )
+        .default("false"),
+    ParameterSpec::component("replication_status_interval")
+        .description(
+            "How often to send StandbyStatusUpdate to Postgres (e.g. '10s'). \
+             Default: 10s.",
+        )
+        .default("10s"),
 ];
 
 impl DataConnectorFactory for PostgresFactory {
@@ -111,6 +185,8 @@ impl DataConnectorFactory for PostgresFactory {
                 SecretBox::from(format!("Spice.ai {}", env!("CARGO_PKG_VERSION"))),
             );
 
+            let params_for_replication = params.parameters.clone();
+
             match PostgresConnectionPool::new(param_map).await {
                 Ok(pool) => {
                     let unsupported_type_action = params
@@ -118,8 +194,14 @@ impl DataConnectorFactory for PostgresFactory {
                         .unwrap_or(datafusion_table_providers::UnsupportedTypeAction::String);
                     let pool = pool.with_unsupported_type_action(unsupported_type_action);
 
-                    let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
-                    Ok(Arc::new(Postgres { postgres_factory }) as Arc<dyn DataConnector>)
+                    let factory = PostgresTableFactory::new(Arc::new(pool));
+                    Ok(Arc::new(Postgres {
+                        factory,
+                        params: params_for_replication,
+                        replication_metrics:
+                            data_components::postgres_replication::ReplicationMetricsCollector::new(
+                            ),
+                    }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {
                     postgrespool::Error::InvalidUsernameOrPassword { .. } => Err(
@@ -172,13 +254,12 @@ impl DataConnector for Postgres {
         self
     }
 
-    #[cfg(feature = "postgres-write")]
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self
-            .postgres_factory
+            .factory
             .read_write_table_provider(dataset.path().into())
             .await
         {
@@ -224,11 +305,7 @@ impl DataConnector for Postgres {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        match self
-            .postgres_factory
-            .table_provider(dataset.path().into())
-            .await
-        {
+        match self.factory.table_provider(dataset.path().into()).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(err_source) = e.source() {
@@ -265,6 +342,34 @@ impl DataConnector for Postgres {
                 })
             }
         }
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        true
+    }
+
+    fn changes_stream(
+        &self,
+        federated_table: Arc<runtime::federated_table::FederatedTable>,
+        dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
+    ) -> Option<data_components::cdc::ChangesStream> {
+        Some(replication::build_changes_stream(
+            &self.params,
+            dataset,
+            federated_table,
+            Arc::clone(&self.replication_metrics),
+        ))
+    }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        Some(Arc::new(replication::PostgresMetricsProvider::new(
+            data_components::postgres_replication::ReplicationMetrics::new(Arc::clone(
+                &self.replication_metrics,
+            )),
+        )))
     }
 }
 

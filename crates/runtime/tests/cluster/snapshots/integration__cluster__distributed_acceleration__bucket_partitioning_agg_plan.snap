@@ -1,0 +1,17 @@
+---
+source: crates/runtime/tests/cluster/distributed_acceleration.rs
+expression: agg_plan_fmt
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                            |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: count(Int64(1)) AS total_rows, avg(test_data.score) AS avg_score, min(test_data.age) AS min_age, max(test_data.age) AS max_age                                                                                      |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), avg(CAST(test_data.score AS Float64)), min(test_data.age), max(test_data.age)]]                                                                                              |
+|               |     SubqueryAlias: test_data                                                                                                                                                                                                    |
+|               |       TableScan: test_data projection=[age, score]                                                                                                                                                                              |
+| physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as total_rows, avg(test_data.score)@1 as avg_score, min(test_data.age)@2 as min_age, max(test_data.age)@3 as max_age]                                                                   |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                                                                                       |
+|               |     CoalescePartitionsExec                                                                                                                                                                                                      |
+|               |       PartialAggregationFlightSqlExec sql=SELECT COUNT(1) AS "__agg_0", SUM(CAST("score" AS DOUBLE)) AS "__agg_1", COUNT(CAST("score" AS DOUBLE)) AS "__agg_2", MIN("age") AS "__agg_3", MAX("age") AS "__agg_4" FROM test_data |
+|               |                                                                                                                                                                                                                                 |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

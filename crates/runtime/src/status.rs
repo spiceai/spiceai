@@ -171,6 +171,13 @@ impl RuntimeStatus {
         self.update_component_status(&format!("embedding:{model_name}"), status);
         metrics::embeddings::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
+
+    pub fn update_reranker(&self, model_name: &str, status: ComponentStatus) {
+        let model_name = model_name.to_string();
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("reranker:{model_name}"), status);
+        metrics::rerankers::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+    }
     pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
         let view_name = view_name.to_string();
         let metric_value = status.discriminant();
@@ -193,7 +200,7 @@ impl RuntimeStatus {
         // Record cluster node status metric
         // Map ComponentStatus to cluster status values: 0=Unknown, 1=Healthy, 2=Unhealthy, 3=Draining
         let status_value = match &status {
-            ComponentStatus::Initializing => 0,
+            ComponentStatus::Initializing | ComponentStatus::NotLoaded => 0,
             ComponentStatus::Ready | ComponentStatus::Refreshing => 1, // Refreshing is still healthy
             ComponentStatus::Disabled | ComponentStatus::Error(_) => 2,
             ComponentStatus::ShuttingDown => 3, // Draining

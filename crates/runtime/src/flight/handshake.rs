@@ -25,8 +25,9 @@ use tonic::{
     metadata::{MetadataMap, MetadataValue},
 };
 
-use crate::{datafusion::request_context_extension::get_current_datafusion, timing::TimedStream};
+use crate::datafusion::request_context_extension::get_current_datafusion;
 use runtime_auth::layer::flight as flight_auth;
+use telemetry::timing::TimedStream;
 
 use super::{SessionStore, metrics::track_flight_request};
 
@@ -56,9 +57,8 @@ pub(crate) async fn handle(
         session_store.create_session(&datafusion.ctx, auth_token.as_deref());
 
     tracing::debug!(
-        "Created new Flight SQL session: {} (auth_token={:?})",
-        session_id,
-        auth_token
+        authenticated = auth_token.is_some(),
+        "Created new Flight SQL session: {session_id}"
     );
 
     // Return the session ID in the response payload

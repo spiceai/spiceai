@@ -48,9 +48,9 @@ use crate::{
         Service, metrics, to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
-    timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 
 /// Arrow `DataType` to SQL type name conversion for CAST expressions.
 ///
@@ -356,6 +356,13 @@ pub(crate) async fn do_get(
 
     // Use the standard flow with the (possibly rewritten) SQL
     // Ensure the query execution happens within the request context scope
+    let pre_parsed_plan = super::super::check_read_only_sql(
+        &context,
+        &datafusion,
+        &sql_to_execute,
+        param_values.as_ref(),
+    )
+    .await?;
     let context_clone = Arc::clone(&context);
     let (output, from_cache) = context_clone
         .scope(async {
@@ -363,6 +370,7 @@ pub(crate) async fn do_get(
                 datafusion,
                 &sql_to_execute,
                 param_values,
+                pre_parsed_plan,
             ))
             .await
         })

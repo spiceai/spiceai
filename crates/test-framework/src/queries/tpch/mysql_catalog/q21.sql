@@ -2,10 +2,10 @@ SELECT
     s_name,
     COUNT(*) AS numwait
 FROM
-    mysql.public.supplier,
-    mysql.public.lineitem l1,
-    mysql.public.orders,
-    mysql.public.nation
+    mysql.tpch_sf1.supplier,
+    mysql.tpch_sf1.lineitem l1,
+    mysql.tpch_sf1.orders,
+    mysql.tpch_sf1.nation
 WHERE
     s_suppkey = l1.l_suppkey
     AND o_orderkey = l1.l_orderkey
@@ -15,7 +15,7 @@ WHERE
         SELECT
             *
         FROM
-            mysql.public.lineitem l2
+            mysql.tpch_sf1.lineitem l2
         WHERE
             l2.l_orderkey = l1.l_orderkey
             AND l2.l_suppkey <> l1.l_suppkey
@@ -24,7 +24,7 @@ WHERE
         SELECT
             *
         FROM
-            mysql.public.lineitem l3
+            mysql.tpch_sf1.lineitem l3
         WHERE
             l3.l_orderkey = l1.l_orderkey
             AND l3.l_suppkey <> l1.l_suppkey

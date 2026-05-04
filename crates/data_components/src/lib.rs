@@ -23,6 +23,8 @@ use datafusion::{catalog::CatalogProvider, datasource::TableProvider, sql::Table
 pub mod arrow;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+#[cfg(feature = "cosmosdb")]
+pub mod cosmosdb;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 #[cfg(feature = "debezium")]
@@ -37,6 +39,8 @@ pub mod duckdb;
 pub mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
@@ -55,10 +59,14 @@ pub mod odbc;
 pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres_replication;
 pub mod refresh_skip;
+pub mod resilient_http;
 pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
+pub mod schema_discovery;
 #[cfg(feature = "scylladb")]
 pub mod scylladb;
 pub mod sql_expr;

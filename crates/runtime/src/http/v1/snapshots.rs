@@ -25,6 +25,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+#[cfg(not(feature = "snapshots"))]
+use runtime_acceleration::snapshot::SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE;
 use runtime_acceleration::snapshot::{SnapshotApiError, SnapshotBehavior, SnapshotManager, api};
 use serde::{Deserialize, Serialize};
 use spicepod::component::snapshot::Snapshots;
@@ -32,7 +34,31 @@ use tokio::sync::RwLock;
 
 use crate::Runtime;
 
+use super::require_write_access;
+
 const DEFAULT_SNAPSHOTS_LIMIT: usize = 10;
+
+#[cfg(feature = "snapshots")]
+fn snapshots_feature_response() -> Option<Response> {
+    None
+}
+
+#[cfg(not(feature = "snapshots"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "mirrors the snapshots-on impl which returns Option"
+)]
+fn snapshots_feature_response() -> Option<Response> {
+    Some(
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(MessageResponse {
+                message: SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE.to_string(),
+            }),
+        )
+            .into_response(),
+    )
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ListSnapshotsQuery {
@@ -53,6 +79,9 @@ pub async fn list_snapshots(
     Path(dataset_name): Path<String>,
     Query(query): Query<ListSnapshotsQuery>,
 ) -> Response {
+    if let Some(resp) = snapshots_feature_response() {
+        return resp;
+    }
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
@@ -135,6 +164,9 @@ pub async fn get_snapshot(
     Extension(rt): Extension<Arc<Runtime>>,
     Path((dataset_name, snapshot_id)): Path<(String, u64)>,
 ) -> Response {
+    if let Some(resp) = snapshots_feature_response() {
+        return resp;
+    }
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
@@ -216,6 +248,13 @@ pub async fn set_current_snapshot(
     Path(dataset_name): Path<String>,
     Json(request): Json<api::SetCurrentSnapshotRequest>,
 ) -> Response {
+    if let Some(resp) = snapshots_feature_response() {
+        return resp;
+    }
+    if let Some(response) = require_write_access().await {
+        return response;
+    }
+
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
@@ -348,5 +387,64 @@ fn snapshot_api_error_to_response(error: &SnapshotApiError) -> Response {
             }),
         )
             .into_response(),
+    }
+}
+
+#[cfg(all(test, not(feature = "snapshots")))]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    async fn assert_enterprise_only_response(response: Response) {
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("Failed to collect snapshots response body")
+            .to_bytes();
+        let body: MessageResponse =
+            serde_json::from_slice(&body_bytes).expect("Failed to deserialize message response");
+
+        assert_eq!(body.message, SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn snapshot_handlers_return_enterprise_only_response_without_feature() {
+        let app = Arc::new(RwLock::new(None));
+        let runtime = Arc::new(Runtime::builder().build().await);
+
+        assert_enterprise_only_response(
+            list_snapshots(
+                Extension(Arc::clone(&app)),
+                Extension(Arc::clone(&runtime)),
+                Path("test_dataset".to_string()),
+                Query(ListSnapshotsQuery { limit: None }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_enterprise_only_response(
+            get_snapshot(
+                Extension(Arc::clone(&app)),
+                Extension(Arc::clone(&runtime)),
+                Path(("test_dataset".to_string(), 1)),
+            )
+            .await,
+        )
+        .await;
+
+        assert_enterprise_only_response(
+            set_current_snapshot(
+                Extension(app),
+                Extension(runtime),
+                Path("test_dataset".to_string()),
+                Json(api::SetCurrentSnapshotRequest { snapshot_id: 1 }),
+            )
+            .await,
+        )
+        .await;
     }
 }

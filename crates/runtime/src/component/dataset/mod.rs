@@ -37,6 +37,7 @@ use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Dur
 
 pub mod acceleration;
 pub mod builder;
+pub mod declared_type;
 pub mod metadata;
 pub mod replication;
 
@@ -194,6 +195,10 @@ pub enum ReadyState {
     OnLoad,
     /// The table is ready immediately, with fallback to federated table for queries until the initial load completes.
     OnRegistration,
+    /// The table is ready once the federated source's schema has been resolved (which also implies access
+    /// to the source has been verified), without waiting for the initial data refresh to complete. Queries
+    /// fall back to the federated source until the initial load completes.
+    OnSchemaResolved,
 }
 
 impl From<spicepod_dataset::ReadyState> for ReadyState {
@@ -201,6 +206,7 @@ impl From<spicepod_dataset::ReadyState> for ReadyState {
         match ready_state {
             spicepod_dataset::ReadyState::OnLoad => ReadyState::OnLoad,
             spicepod_dataset::ReadyState::OnRegistration => ReadyState::OnRegistration,
+            spicepod_dataset::ReadyState::OnSchemaResolved => ReadyState::OnSchemaResolved,
         }
     }
 }
@@ -210,6 +216,7 @@ impl Display for ReadyState {
         match self {
             ReadyState::OnLoad => write!(f, "on_load"),
             ReadyState::OnRegistration => write!(f, "on_registration"),
+            ReadyState::OnSchemaResolved => write!(f, "on_schema_resolved"),
         }
     }
 }
@@ -242,6 +249,34 @@ impl Display for CheckAvailability {
     }
 }
 
+/// Controls when a dataset is loaded by the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Load {
+    /// Load the dataset during runtime startup.
+    #[default]
+    OnStartup,
+    /// Load the dataset when it is first queried or explicitly refreshed.
+    OnDemand,
+}
+
+impl From<spicepod_dataset::Load> for Load {
+    fn from(load: spicepod_dataset::Load) -> Self {
+        match load {
+            spicepod_dataset::Load::OnStartup => Load::OnStartup,
+            spicepod_dataset::Load::OnDemand => Load::OnDemand,
+        }
+    }
+}
+
+impl Display for Load {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Load::OnStartup => write!(f, "on_startup"),
+            Load::OnDemand => write!(f, "on_demand"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Dataset {
     pub from: String,
@@ -265,6 +300,7 @@ pub struct Dataset {
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
     pub check_availability: CheckAvailability,
+    pub load: Load,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -290,6 +326,7 @@ impl std::fmt::Debug for Dataset {
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
             .field("check_availability", &self.check_availability)
+            .field("load", &self.load)
             .finish_non_exhaustive()
     }
 }
@@ -315,6 +352,7 @@ impl PartialEq for Dataset {
             && self.metrics == other.metrics
             && self.vectors == other.vectors
             && self.check_availability == other.check_availability
+            && self.load == other.load
     }
 }
 

@@ -127,30 +127,59 @@ impl S3Factory {
     }
 }
 
+pub(crate) const S3_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/s3";
+
 pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[
-            ParameterSpec::component("region").secret(),
-            ParameterSpec::component("endpoint").secret(),
+            ParameterSpec::component("region")
+                .description("AWS region for the S3 bucket (e.g. 'us-east-1').")
+                .examples(&["us-east-1", "eu-west-1"])
+                .help_link(S3_DOCS)
+                .secret(),
+            ParameterSpec::component("endpoint")
+                .description("Custom S3-compatible endpoint URL. Leave empty for AWS S3.")
+                .examples(&["https://s3.us-east-1.amazonaws.com", "http://minio.local:9000"])
+                .help_link(S3_DOCS)
+                .secret(),
             ParameterSpec::component("url_style")
                 .description("Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.")
-                .one_of(&["vhost", "path"]),
-            ParameterSpec::component("key").secret(),
-            ParameterSpec::component("secret").secret(),
-            ParameterSpec::component("session_token").secret(),
+                .one_of(&["vhost", "path"])
+                .help_link(S3_DOCS),
+            ParameterSpec::component("key")
+                .description("AWS access key ID (used when auth='key').")
+                .help_link(S3_DOCS)
+                .secret(),
+            ParameterSpec::component("secret")
+                .description("AWS secret access key (used when auth='key').")
+                .help_link(S3_DOCS)
+                .secret(),
+            ParameterSpec::component("session_token")
+                .description("Temporary AWS session token (used with STS credentials).")
+                .help_link(S3_DOCS)
+                .secret(),
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
+                .one_of(&["public", "iam_role", "key"])
+                .examples(&["iam_role", "key"])
+                .help_link(S3_DOCS)
                 .secret(),
             ParameterSpec::component("iam_role_source")
                 .description("IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
-                .one_of(&["auto", "metadata", "env"]),
+                .one_of(&["auto", "metadata", "env"])
+                .help_link(S3_DOCS),
             ParameterSpec::component("versioning")
                 .description("Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.")
-                .default("enabled"),
+                .default("enabled")
+                .help_link(S3_DOCS),
             ParameterSpec::runtime("client_timeout")
-                .description("The timeout setting for S3 client."),
+                .description("The timeout setting for S3 client.")
+                .examples(&["30s"])
+                .help_link(S3_DOCS),
             ParameterSpec::runtime("allow_http")
                 .description("Allow HTTP protocol for S3 endpoint.")
+                .is_boolean()
+                .help_link(S3_DOCS),
         ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
@@ -200,20 +229,37 @@ impl DataConnectorFactory for S3Factory {
                 // Skip AWS SDK initialization - use explicit auth method directly
             } else {
                 let iam_role_source = params.parameters.get("iam_role_source").expose().ok();
-                match iam_role_source {
-                    Some("metadata" | "env") => {
-                        // Restricted IAM role source - build a custom config instead
-                        // of using the global SDK config. The object store registry
-                        // will handle the restricted source when building credentials.
-                    }
-                    _ => {
-                        // Initialize global AWS SDK for default credential chain.
-                        if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
-                        {
-                            tracing::warn!(
-                                "Unable to initialize AWS credentials for S3 connector: {err}"
-                            );
-                        }
+                if let Some("metadata" | "env") = iam_role_source {
+                    // Restricted IAM role source - build a custom config instead
+                    // of using the global SDK config. The object store registry
+                    // will handle the restricted source when building credentials.
+                } else {
+                    let region = params
+                        .parameters
+                        .get("region")
+                        .expose()
+                        .ok()
+                        .map(ToString::to_string);
+                    // Always probe the default AWS credential chain so env-only setups
+                    // (IRSA, EC2 IMDS, AWS_ACCESS_KEY_ID/AWS_REGION env vars, etc.) keep
+                    // working when the user did not put `region` into spicepod params.
+                    // The bridge logs internal probe failures at debug level, so we only
+                    // surface a WARN here when the user explicitly configured a `region`
+                    // (signalling AWS auth intent) but no credentials were resolved.
+                    if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(
+                        region.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Unable to initialize AWS credentials for S3 connector: {err}"
+                        );
+                    } else if region.is_some()
+                        && aws_sdk_credential_bridge::get_sdk_config().is_none()
+                    {
+                        tracing::warn!(
+                            "S3 connector configured with `region` but no AWS credentials were resolved from the environment; falling back to anonymous access. Set `auth: public` to silence this warning, or configure AWS credentials (env vars, ~/.aws/credentials, IAM role)."
+                        );
                     }
                 }
             }

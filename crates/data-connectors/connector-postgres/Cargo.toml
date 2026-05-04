@@ -19,19 +19,23 @@ name = "connector-postgres"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "PostgreSQL data connector for Spice.ai runtime"
 
 [dependencies]
+async-stream.workspace = true
 async-trait.workspace = true
+data_components = { path = "../../data_components", features = ["postgres"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["postgres", "postgres-federation"] }
-linkme.workspace = true
-paste.workspace = true
+fundu.workspace = true
+futures.workspace = true
+opentelemetry.workspace = true
 runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
 
 [features]
 default = []
-postgres-write = []

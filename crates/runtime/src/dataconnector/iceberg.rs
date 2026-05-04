@@ -23,11 +23,14 @@ use async_trait::async_trait;
 use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::iceberg::catalog::hadoop::{HadoopCatalogBuilder, MetadataMode};
 use datafusion::catalog::TableProvider;
-use iceberg::{Catalog, NamespaceIdent, TableIdent, io::StorageFactory};
+use iceberg::{Catalog, TableIdent, io::StorageFactory};
 use iceberg_datafusion::IcebergTableProvider;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use util::concat_arrays;
+
+#[cfg(feature = "iceberg-write")]
+use iceberg::NamespaceIdent;
 
 use super::DataConnectorFactory;
 use crate::{
@@ -104,8 +107,11 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
 /// Holds the components needed for both read and read-write Iceberg providers.
 struct IcebergTableParts {
     provider: Arc<dyn TableProvider>,
+    #[cfg(feature = "iceberg-write")]
     catalog: Arc<dyn Catalog>,
+    #[cfg(feature = "iceberg-write")]
     namespace: NamespaceIdent,
+    #[cfg(feature = "iceberg-write")]
     table_name: String,
 }
 
@@ -270,8 +276,11 @@ impl IcebergDataConnector {
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),
+            #[cfg(feature = "iceberg-write")]
             catalog: catalog_client,
+            #[cfg(feature = "iceberg-write")]
             namespace: table_identifier.namespace().clone(),
+            #[cfg(feature = "iceberg-write")]
             table_name,
         })
     }
@@ -293,6 +302,7 @@ impl IcebergDataConnector {
             })?;
 
         // Load the specific table
+        #[cfg(feature = "iceberg-write")]
         let table_name_str = table_name.clone();
         let table_identifier = TableIdent::new(namespace.name().clone(), table_name);
 
@@ -349,8 +359,11 @@ impl IcebergDataConnector {
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),
+            #[cfg(feature = "iceberg-write")]
             catalog: catalog_client,
+            #[cfg(feature = "iceberg-write")]
             namespace: table_identifier.namespace().clone(),
+            #[cfg(feature = "iceberg-write")]
             table_name: table_name_str,
         })
     }
@@ -380,18 +393,14 @@ impl DataConnector for IcebergDataConnector {
             Err(e) => return Some(Err(e)),
         };
 
-        // Wrap in IcebergDeletionProvider for DELETE FROM support, then in
-        // DeletionTableProviderAdapter so get_deletion_provider can find it.
+        // Wrap in IcebergDeletionProvider for DELETE FROM support.
         let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
             parts.catalog,
             parts.namespace,
             parts.table_name,
             parts.provider,
         );
-        let adapted: Arc<dyn TableProvider> = Arc::new(
-            data_components::delete::DeletionTableProviderAdapter::new(Arc::new(deletion_provider)),
-        );
-        Some(Ok(adapted))
+        Some(Ok(Arc::new(deletion_provider)))
     }
 }
 

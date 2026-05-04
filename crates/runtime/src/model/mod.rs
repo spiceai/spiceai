@@ -28,6 +28,8 @@ mod metrics;
 mod model_context;
 pub mod params;
 pub(crate) mod provider_models;
+pub(crate) mod rate_limit;
+pub mod rerank;
 mod responses;
 mod tool_use;
 mod tool_use_responses;
@@ -39,6 +41,7 @@ pub use embed::{EmbeddingModelStore, try_to_embedding};
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
+pub use rerank::{RerankerModelStore, try_to_rerank_model};
 pub use responses::{LLMResponsesModelStore, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
 pub use tool_use_responses::ToolUsingResponses;

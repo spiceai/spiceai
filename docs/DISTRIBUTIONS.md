@@ -4,7 +4,7 @@ The Spice open source project provides multiple distribution variants to support
 
 > **Note:** The Spice runtime is **64-bit only**. 32-bit platforms are not supported.
 
-> **Note:** Variant distributions (data, allocators, CUDA) are only available in **nightly images** for the open source project. All features and distributions are available in the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://spice.ai/pricing).
+> **Note:** Variant distributions (data, allocators, CUDA) are only available in **nightly images** for the open source project. All features and distributions are available in the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise).
 
 ## Supported Platforms & Hardware Requirements
 
@@ -19,15 +19,16 @@ The Spice open source project provides multiple distribution variants to support
 
 ## Distribution Availability
 
-| Distribution / Variant | Open Source      | Spice Cloud | Enterprise |
-| ---------------------- | ---------------- | ----------- | ---------- |
-| Default (Data + AI)    | ✅                | ✅           | ✅          |
-| Data-only              | Nightly only     | ✅           | ✅          |
-| NAS (SMB + NFS)        | Nightly only     | ❌           | ✅          |
-| Metal (macOS)          | ✅                | ✅           | ✅          |
-| CUDA (Linux)           | Nightly only     | ✅           | ✅          |
-| Allocator variants     | Nightly only     | ✅           | ✅          |
-| ODBC connector         | Local build only | ✅           | ✅          |
+| Distribution / Variant  | Open Source      | Spice Cloud | Enterprise |
+| ----------------------- | ---------------- | ----------- | ---------- |
+| Default (Data + AI)     | ✅                | ✅           | ✅          |
+| Data-only               | Nightly only     | ✅           | ✅          |
+| NAS (SMB + NFS)         | Nightly only     | ❌           | ✅          |
+| Metal (macOS)           | ✅                | ✅           | ✅          |
+| CUDA (Linux)            | Nightly only     | ✅           | ✅          |
+| Allocator variants      | Nightly only     | ✅           | ✅          |
+| ODBC connector          | Local build only | ✅           | ✅          |
+| OIDC Token Verification | ❌                | ✅           | ✅          |
 
 ## Default Distribution
 
@@ -61,7 +62,7 @@ docker pull spiceai/spiceai:latest
 
 The data distribution excludes AI/ML model support, resulting in a smaller binary size and reduced attack surface. Use this when you only need data federation and acceleration capabilities without AI features.
 
-> **Open Source:** Available in nightly builds only. **[Cloud Platform & Enterprise](https://spice.ai/pricing):** Production-ready data distribution available.
+> **Open Source:** Available in nightly builds only. **[Cloud Platform](https://spice.ai/pricing) & [Enterprise](https://docs.spice.ai/docs/enterprise):** Production-ready data distribution available.
 
 **Included Features:**
 
@@ -108,7 +109,7 @@ make install-metal
 
 For Linux systems with NVIDIA GPUs, CUDA distributions enable GPU-accelerated AI/ML inference. Multiple CUDA compute capability versions are available.
 
-> **Open Source:** Available in nightly builds only. **[Cloud Platform & Enterprise](https://spice.ai/pricing):** Production-ready CUDA distribution available.
+> **Open Source:** Available in nightly builds only. **[Cloud Platform](https://spice.ai/pricing) & [Enterprise](https://docs.spice.ai/docs/enterprise):** Production-ready CUDA distribution available.
 
 **Included Features:**
 
@@ -139,7 +140,7 @@ CUDA_COMPUTE_CAP=89 make install-cuda
 
 The NAS (Network Attached Storage) distribution adds support for SMB and NFS data connectors, enabling federated queries against data stored on network file shares.
 
-> **[Enterprise](https://spice.ai/pricing):** The NAS distribution is available in nightly builds and with Spice.ai Enterprise.
+> **[Enterprise](https://docs.spice.ai/docs/enterprise):** The NAS distribution is available in nightly builds and with Spice.ai Enterprise.
 
 **Included Features:**
 
@@ -157,7 +158,7 @@ make install-nas
 
 Different memory allocators can significantly impact performance depending on workload characteristics.
 
-> **Open Source:** Allocator variants are available in nightly builds only for testing and benchmarking. **[Cloud Platform & Enterprise](https://spice.ai/pricing):** Production-ready allocator variants available.
+> **Open Source:** Allocator variants are available in nightly builds only for testing and benchmarking. **[Cloud Platform](https://spice.ai/pricing) & [Enterprise](https://docs.spice.ai/docs/enterprise):** Production-ready allocator variants available.
 
 ### snmalloc (Default)
 
@@ -203,7 +204,7 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 | Windows (WSL)                 | ✅       | Nightly         | Nightly         | ❌     | Nightly         |
 | Windows (Native)              | ❌       | Enterprise only | Enterprise only | ❌     | Enterprise only |
 
-> **Note:** Native Windows support for the Spice runtime is available with the [Spice Cloud Platform and Spice.ai Enterprise](https://spice.ai/pricing). Open source users on Windows should use Windows Subsystem for Linux (WSL).
+> **Note:** Native Windows support for the Spice runtime is available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise). Open source users on Windows should use Windows Subsystem for Linux (WSL).
 
 ## Choosing a Distribution
 
@@ -218,7 +219,7 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 
 ## Additional Connectors
 
-Some connectors require additional dependencies and are available with the [Spice Cloud Platform and Spice.ai Enterprise](https://spice.ai/pricing):
+Some connectors require additional dependencies and are available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise):
 
 - **ODBC** - Connect to any ODBC-compatible data source
 
@@ -227,6 +228,12 @@ These can be built locally for development and testing:
 ```bash
 make install-odbc
 ```
+
+## Enterprise Authentication
+
+The following authentication features are available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise):
+
+- **OIDC Token Verification** - Validate identity tokens from enterprise providers (Okta, Azure AD, Auth0, Google, etc.) for secure access to Spice runtime endpoints.
 
 ### Linux arm64 Notes
 

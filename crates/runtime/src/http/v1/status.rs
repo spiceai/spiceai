@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use csv::Writer;
+use flight_client::{Credentials, FlightClient};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json,
@@ -160,16 +161,46 @@ fn convert_details_to_csv(
 }
 
 async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
-    match flight_client::can_connect(format!("http://{flight_addr}"), None).await {
-        Ok(()) => ComponentStatus::Ready,
-        Err(e) => ComponentStatus::error_with_message(e.to_string()),
+    tracing::trace!("Checking flight status at {flight_addr}");
+    match FlightClient::try_new(
+        format!("http://{flight_addr}").into(),
+        Credentials::anonymous(),
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(_) => ComponentStatus::Ready,
+        Err(e) => {
+            tracing::error!("Error connecting to flight when checking status: {e}");
+            ComponentStatus::error_with_message(e.to_string())
+        }
     }
 }
 
 async fn get_metrics_status(
     metrics_addr: &str,
 ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
-    let resp = reqwest::get(format!("http://{metrics_addr}/health")).await?;
+    use std::sync::LazyLock;
+
+    static METRICS_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> =
+        LazyLock::new(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .build()
+        });
+
+    let client = METRICS_CLIENT.as_ref().map_err(|e| {
+        Box::new(std::io::Error::other(format!(
+            "Failed to build metrics HTTP client: {e}"
+        ))) as Box<dyn std::error::Error>
+    })?;
+
+    let resp = client
+        .get(format!("http://{metrics_addr}/health"))
+        .send()
+        .await?;
     if resp.status().is_success() && resp.text().await? == "OK" {
         Ok(ComponentStatus::Ready)
     } else {

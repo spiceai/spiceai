@@ -148,7 +148,7 @@ use snafu::prelude::*;
 use turso::{Builder, Connection, Database, Value as TursoValue};
 use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, JOURNAL_MODE_SQL_LITERAL};
 
-use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+use crate::delete::{DeletionExec, DeletionSink};
 
 /// Conversion constants for timestamp storage and conversion.
 ///
@@ -693,18 +693,19 @@ impl TursoTableProvider {
                                 })
                             }
                             TursoValue::Text(rfc3339_str) => {
-                                // RFC3339 TEXT format: Parse and convert to target unit
+                                // RFC3339 TEXT format: Parse and convert to target unit.
+                                // Use unit-appropriate methods to avoid i64 nanosecond overflow
+                                // for dates outside ~1677-2262.
                                 use chrono::DateTime;
 
                                 // Parse RFC3339 string
                                 if let Ok(dt) = DateTime::parse_from_rfc3339(rfc3339_str) {
-                                    let timestamp_nanos = dt.timestamp_nanos_opt().unwrap_or(0);
-                                    Some(match unit {
-                                        TimeUnit::Second => timestamp_nanos / 1_000_000_000,
-                                        TimeUnit::Millisecond => timestamp_nanos / 1_000_000,
-                                        TimeUnit::Microsecond => timestamp_nanos / 1_000,
-                                        TimeUnit::Nanosecond => timestamp_nanos,
-                                    })
+                                    match unit {
+                                        TimeUnit::Second => Some(dt.timestamp()),
+                                        TimeUnit::Millisecond => Some(dt.timestamp_millis()),
+                                        TimeUnit::Microsecond => Some(dt.timestamp_micros()),
+                                        TimeUnit::Nanosecond => dt.timestamp_nanos_opt(),
+                                    }
                                 } else {
                                     // Parse failed, return NULL (lenient read behavior)
                                     None
@@ -1120,6 +1121,23 @@ impl TursoTableProvider {
             Ok(ast)
         })
     }
+
+    /// Returns `true` if the expression contains any subquery or outer reference column.
+    fn contains_subquery_or_outer_ref(expr: &Expr) -> bool {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        let mut found = false;
+        let _ = expr.apply(|e| match e {
+            Expr::ScalarSubquery(_)
+            | Expr::InSubquery(_)
+            | Expr::Exists(_)
+            | Expr::OuterReferenceColumn(_, _) => {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            }
+            _ => Ok(TreeNodeRecursion::Continue),
+        });
+        found
+    }
 }
 
 #[async_trait]
@@ -1145,10 +1163,20 @@ impl TableProvider for TursoTableProvider {
 
         let mut filter_push_down = vec![];
         for filter in filters {
-            match unparser.expr_to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
-                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
-            }
+            // Expressions containing subqueries or outer references must not be pushed down.
+            // For federated providers, subqueries are handled at the plan level and pushing them
+            // into `TableScan.full_filters` is not beneficial. Subqueries may also reference tables
+            // in other databases not accessible from this Turso connection, and outer references
+            // refer to columns from an enclosing query that the table provider cannot resolve.
+            let pushdown = if Self::contains_subquery_or_outer_ref(filter) {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                match unparser.expr_to_sql(filter) {
+                    Ok(_) => TableProviderFilterPushDown::Exact,
+                    Err(_) => TableProviderFilterPushDown::Unsupported,
+                }
+            };
+            filter_push_down.push(pushdown);
         }
         Ok(filter_push_down)
     }
@@ -1202,23 +1230,15 @@ impl TableProvider for TursoTableProvider {
         // Wrap in DataSinkExec to execute the insertion
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
-}
 
-#[async_trait]
-impl DeletionTableProvider for TursoTableProvider {
     async fn delete_from(
         &self,
         _state: &dyn Session,
-        filters: &[Expr],
+        filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeletionExec::new(
-            Arc::new(TursoDeletionSink::new(
-                Arc::clone(&self.pool),
-                self.table_name.clone(),
-                filters,
-            )),
-            &self.schema(),
-        )))
+        Ok(Arc::new(DeletionExec::new(Arc::new(
+            TursoDeletionSink::new(Arc::clone(&self.pool), self.table_name.clone(), &filters),
+        ))))
     }
 }
 
@@ -1454,7 +1474,7 @@ impl TursoExec {
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("({ast})")))
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
@@ -1603,7 +1623,7 @@ impl DeletionSink for TursoDeletionSink {
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("({ast})")))
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
@@ -1861,11 +1881,21 @@ fn convert_timestamp_to_turso(
             // Convert to RFC3339 string format
             use chrono::{DateTime, Utc};
 
-            // Convert value to nanoseconds
+            // Convert value to nanoseconds (checked to prevent overflow for dates beyond ~year 2262)
             let nanos = match unit {
-                TimeUnit::Second => value * timestamp_conversion::NANOS_PER_SECOND,
-                TimeUnit::Millisecond => value * timestamp_conversion::NANOS_PER_MILLI,
-                TimeUnit::Microsecond => value * 1_000,
+                TimeUnit::Second => value
+                    .checked_mul(timestamp_conversion::NANOS_PER_SECOND)
+                    .ok_or_else(|| {
+                        format!("Timestamp value {value}s overflows nanosecond conversion")
+                    })?,
+                TimeUnit::Millisecond => value
+                    .checked_mul(timestamp_conversion::NANOS_PER_MILLI)
+                    .ok_or_else(|| {
+                    format!("Timestamp value {value}ms overflows nanosecond conversion")
+                })?,
+                TimeUnit::Microsecond => value.checked_mul(1_000).ok_or_else(|| {
+                    format!("Timestamp value {value}us overflows nanosecond conversion")
+                })?,
                 TimeUnit::Nanosecond => value,
             };
 
@@ -2129,24 +2159,50 @@ fn scalar_value_to_turso(
 /// ```
 /// into:
 /// ```sql
-///   CAST(expr AS REAL) >= CAST(low AS REAL)
-///     AND CAST(expr AS REAL) <= CAST(high AS REAL)
+///   ROUND(expr, 10) >= ROUND(low, 10)
+///     AND ROUND(expr, 10) <= ROUND(high, 10)
 /// ```
 /// (with the obvious inversion for `NOT BETWEEN`).
+///
+/// `ROUND(..., 10)` normalizes both sides to 10 decimal places, which
+/// eliminates float arithmetic precision issues. For example, float64
+/// `0.06 + 0.01 = 0.06999...` is less than the stored `0.07`, but
+/// `ROUND(0.06 + 0.01, 10) = 0.07` matches `ROUND(0.07, 10)` exactly.
 ///
 /// Only expressions where *both* bounds appear numeric (literal numbers,
 /// unary-minus numbers, or arithmetic on numbers) are rewritten.
 struct TursoBetweenVisitor;
 
+/// Number of decimal places used by `ROUND()` to normalize float values.
+const TURSO_ROUND_DECIMAL_PLACES: u8 = 10;
+
 impl TursoBetweenVisitor {
-    /// Wrap `expr` in `CAST(expr AS REAL)`.
-    fn cast_to_real(expr: sqlast::Expr) -> sqlast::Expr {
-        sqlast::Expr::Cast {
-            kind: sqlast::CastKind::Cast,
-            expr: Box::new(expr),
-            data_type: sqlast::DataType::Real,
-            format: None,
-        }
+    /// Wrap `expr` in `ROUND(expr, N)`.
+    fn round_expr(expr: sqlast::Expr) -> sqlast::Expr {
+        sqlast::Expr::Function(sqlast::Function {
+            name: sqlast::ObjectName(vec![sqlast::ObjectNamePart::Identifier(
+                sqlast::Ident::new("ROUND"),
+            )]),
+            args: sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![
+                    sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)),
+                    sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                        sqlast::Expr::value(sqlast::Value::Number(
+                            TURSO_ROUND_DECIMAL_PLACES.to_string(),
+                            false,
+                        )),
+                    )),
+                ],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: sqlast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        })
     }
 
     /// Returns `true` if the expression looks like a numeric value or
@@ -2181,39 +2237,39 @@ impl VisitorMut for TursoBetweenVisitor {
             && Self::is_numeric_expr(high)
         {
             let negated = *negated;
-            let cast_expr_low = Self::cast_to_real(*between_expr.clone());
-            let cast_expr_high = Self::cast_to_real(*between_expr.clone());
-            let cast_low = Self::cast_to_real(*low.clone());
-            let cast_high = Self::cast_to_real(*high.clone());
+            let round_expr_low = Self::round_expr(*between_expr.clone());
+            let round_expr_high = Self::round_expr(*between_expr.clone());
+            let round_low = Self::round_expr(*low.clone());
+            let round_high = Self::round_expr(*high.clone());
 
             if negated {
                 // NOT BETWEEN  →  expr < low OR expr > high
                 *expr = sqlast::Expr::BinaryOp {
                     left: Box::new(sqlast::Expr::BinaryOp {
-                        left: Box::new(cast_expr_low),
+                        left: Box::new(round_expr_low),
                         op: sqlast::BinaryOperator::Lt,
-                        right: Box::new(cast_low),
+                        right: Box::new(round_low),
                     }),
                     op: sqlast::BinaryOperator::Or,
                     right: Box::new(sqlast::Expr::BinaryOp {
-                        left: Box::new(cast_expr_high),
+                        left: Box::new(round_expr_high),
                         op: sqlast::BinaryOperator::Gt,
-                        right: Box::new(cast_high),
+                        right: Box::new(round_high),
                     }),
                 };
             } else {
                 // BETWEEN  →  expr >= low AND expr <= high
                 *expr = sqlast::Expr::BinaryOp {
                     left: Box::new(sqlast::Expr::BinaryOp {
-                        left: Box::new(cast_expr_low),
+                        left: Box::new(round_expr_low),
                         op: sqlast::BinaryOperator::GtEq,
-                        right: Box::new(cast_low),
+                        right: Box::new(round_low),
                     }),
                     op: sqlast::BinaryOperator::And,
                     right: Box::new(sqlast::Expr::BinaryOp {
-                        left: Box::new(cast_expr_high),
+                        left: Box::new(round_expr_high),
                         op: sqlast::BinaryOperator::LtEq,
-                        right: Box::new(cast_high),
+                        right: Box::new(round_high),
                     }),
                 };
             }
@@ -2246,12 +2302,12 @@ mod tests {
             "BETWEEN should be rewritten, got: {result}"
         );
         assert!(
-            result.contains("CAST(x AS REAL) >= CAST(0.05 AS REAL)"),
-            "should cast to REAL: {result}"
+            result.contains("ROUND(x, 10) >= ROUND(0.05, 10)"),
+            "should use ROUND: {result}"
         );
         assert!(
-            result.contains("CAST(x AS REAL) <= CAST(0.07 AS REAL)"),
-            "should cast to REAL: {result}"
+            result.contains("ROUND(x, 10) <= ROUND(0.07, 10)"),
+            "should use ROUND: {result}"
         );
     }
 
@@ -2263,7 +2319,7 @@ mod tests {
             !result.contains("BETWEEN"),
             "BETWEEN with arithmetic bounds should be rewritten, got: {result}"
         );
-        assert!(result.contains("CAST"), "should contain CAST: {result}");
+        assert!(result.contains("ROUND"), "should contain ROUND: {result}");
     }
 
     #[test]
@@ -2297,6 +2353,123 @@ mod tests {
         assert!(
             !result.contains("BETWEEN"),
             "BETWEEN with negative bounds should be rewritten, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rfc3339_timestamp_outside_nanos_range() {
+        use arrow::datatypes::{DataType, Field, TimeUnit};
+
+        // Year 2300 is outside the i64 nanosecond range (~1677-2262).
+        // Previously, timestamp_nanos_opt().unwrap_or(0) silently returned epoch 0.
+        let rfc3339_date = "2300-01-01T00:00:00Z";
+        let rows = vec![vec![TursoValue::Text(rfc3339_date.to_string())]];
+
+        // Second unit should work for any reasonable date
+        let schema_second = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_second)
+            .expect("should succeed for Second unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampSecondArray>()
+            .expect("should be TimestampSecondArray");
+        assert!(
+            !arr.is_null(0),
+            "Second-precision timestamp should not be NULL for year 2300"
+        );
+        // 2300-01-01T00:00:00Z in seconds since epoch
+        assert!(
+            arr.value(0) > 10_000_000_000,
+            "timestamp should be far in the future, not epoch 0"
+        );
+
+        // Millisecond unit should also work
+        let schema_millis = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_millis)
+            .expect("should succeed for Millisecond unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .expect("should be TimestampMillisecondArray");
+        assert!(
+            !arr.is_null(0),
+            "Millisecond-precision timestamp should not be NULL for year 2300"
+        );
+        assert!(
+            arr.value(0) > 10_000_000_000_000,
+            "timestamp should be far in the future, not epoch 0"
+        );
+
+        // Microsecond unit should also work
+        let schema_micros = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_micros)
+            .expect("should succeed for Microsecond unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("should be TimestampMicrosecondArray");
+        assert!(
+            !arr.is_null(0),
+            "Microsecond-precision timestamp should not be NULL for year 2300"
+        );
+        assert!(
+            arr.value(0) > 10_000_000_000_000_000,
+            "timestamp should be far in the future, not epoch 0"
+        );
+
+        // Nanosecond unit should return NULL (overflow) instead of epoch 0
+        let schema_nanos = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_nanos)
+            .expect("should succeed for Nanosecond unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .expect("should be TimestampNanosecondArray");
+        // Nanosecond cannot represent year 2300 — should be NULL, not epoch 0
+        assert!(
+            arr.is_null(0),
+            "Nanosecond-precision timestamp should be NULL for year 2300 (overflow)"
+        );
+    }
+
+    #[test]
+    fn test_convert_timestamp_to_turso_rfc3339_overflow_returns_error() {
+        let result =
+            convert_timestamp_to_turso(i64::MAX, TimeUnit::Second, None, TimestampFormat::Rfc3339);
+        assert!(
+            result.is_err(),
+            "TimestampSecond i64::MAX should overflow when converting to nanoseconds"
+        );
+
+        let result = convert_timestamp_to_turso(
+            i64::MAX,
+            TimeUnit::Millisecond,
+            None,
+            TimestampFormat::Rfc3339,
+        );
+        assert!(
+            result.is_err(),
+            "TimestampMillisecond i64::MAX should overflow when converting to nanoseconds"
         );
     }
 }

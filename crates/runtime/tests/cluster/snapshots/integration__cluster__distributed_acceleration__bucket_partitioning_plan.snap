@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/cluster/distributed_acceleration.rs
+expression: plan_fmt
+---
++---------------+---------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                 |
+|               |   SubqueryAlias: test_data                                                                        |
+|               |     TableScan: test_data projection=[id, name, age, city, score]                                  |
+| physical_plan | CooperativeExec                                                                                   |
+|               |   BytesProcessedExec                                                                              |
+|               |     FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data ORDER BY id ASC NULLS LAST |
+|               |                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------+

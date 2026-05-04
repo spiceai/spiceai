@@ -58,6 +58,38 @@ pub enum DuplicateBehavior {
     Error,
 }
 
+/// Fallback page size used by the gateway-error shrink path when the query
+/// has no declared pagination argument. In practice this should never be hit
+/// because the shrink path is only entered for paginated queries, but it
+/// provides a safe upper bound if it ever is.
+const GATEWAY_SHRINK_DEFAULT_PAGE_SIZE: usize = 100;
+
+/// Absolute lower bound the gateway-error shrink path will apply. GitHub's
+/// GraphQL API requires a pagination value of at least 1.
+const GATEWAY_SHRINK_MIN_PAGE_SIZE: usize = 1;
+
+/// Returns the next smaller page size along a reverse-Fibonacci sequence.
+///
+/// Mapping highest-to-lowest: `100 -> 55 -> 34 -> 21 -> 13 -> 8 -> 5 -> 3 -> 2 -> 1`.
+///
+/// Input values that don't exactly match a step land on the nearest smaller
+/// step; values at or below the minimum return the minimum. The sequence is
+/// chosen to shrink aggressively on the first retry and then taper off as the
+/// page size approaches 1, since GitHub's GraphQL backend typically succeeds
+/// well before reaching the lower bound.
+#[must_use]
+fn reverse_fibonacci_shrink(current: usize) -> usize {
+    // Reverse-Fibonacci ladder (descending).
+    const LADDER: [usize; 10] = [100, 55, 34, 21, 13, 8, 5, 3, 2, 1];
+
+    for &step in &LADDER {
+        if step < current {
+            return step;
+        }
+    }
+    GATEWAY_SHRINK_MIN_PAGE_SIZE
+}
+
 type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send + Sync>;
 
 pub enum UnnestBehavior {
@@ -285,10 +317,32 @@ struct FieldArguments {
 
 impl PaginationParameters {
     #[must_use]
-    fn parameters_string(&self, limit: Option<usize>, cursor: Option<String>) -> FieldArguments {
+    fn parameters_string(
+        &self,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        page_size_override: Option<usize>,
+    ) -> FieldArguments {
+        // Apply the page size override (if any) BEFORE the user-visible limit so we
+        // never ask for more rows per page than `page_size_override`, even when the
+        // caller's remaining `limit` is larger.
+        //
+        // Clamp the page-size-override path to a minimum of 1 (GitHub GraphQL and
+        // most connection-style APIs reject `first: 0` / `last: 0`), but never
+        // clamp an explicit user-provided `limit` — in particular, `Some(0)`
+        // must be preserved to honor `LIMIT 0` semantics rather than silently
+        // fetching a row.
+        let effective_limit = match (limit, page_size_override) {
+            (Some(0), _) => Some(0),
+            (Some(l), Some(p)) => Some(std::cmp::max(std::cmp::min(l, p), 1)),
+            (Some(l), None) => Some(l),
+            (None, Some(p)) => Some(std::cmp::max(p, 1)),
+            (None, None) => None,
+        };
+
         let pagination_argument = self
             .pagination_argument
-            .with_limit(limit.unwrap_or(usize::MAX));
+            .with_limit(effective_limit.unwrap_or(usize::MAX));
 
         if self.other_arguments.is_empty() {
             FieldArguments {
@@ -514,13 +568,19 @@ impl PaginationParameters {
         (None, None)
     }
 
-    fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> Result<String> {
+    fn apply(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        page_size_override: Option<usize>,
+    ) -> Result<String> {
         let pattern = format!(r"{}\s*\(.*\)", self.resource_name);
         let regex = Regex::new(&pattern).context(InvalidPaginationRegexSnafu {
             resource_name: self.resource_name.clone(),
         })?;
 
-        let arguments = self.parameters_string(limit, cursor);
+        let arguments = self.parameters_string(limit, cursor, page_size_override);
 
         let new_query = regex.replace(
             query,
@@ -734,11 +794,27 @@ impl GraphQLQuery {
     }
 
     pub fn to_string(&self, limit: Option<usize>, cursor: Option<String>) -> Result<String> {
+        self.to_string_with_page_size(limit, cursor, None)
+    }
+
+    /// Render the query to a string, optionally overriding the per-page size
+    /// of the top-level paginated connection.
+    ///
+    /// `page_size_override` clamps the effective `first:` / `last:` value so
+    /// that a single page never requests more than `page_size_override` rows.
+    /// Unlike `limit`, it does not bound the total number of rows returned
+    /// across all pages; cursor-driven pagination still continues normally.
+    pub fn to_string_with_page_size(
+        &self,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        page_size_override: Option<usize>,
+    ) -> Result<String> {
         let query = self.ast.to_string();
 
         Ok(
             if let Some(pagination_parameters) = &self.pagination_parameters {
-                pagination_parameters.apply(&query, limit, cursor)?
+                pagination_parameters.apply(&query, limit, cursor, page_size_override)?
             } else {
                 query
             },
@@ -878,6 +954,7 @@ impl GraphQLClient {
             error_checker,
             query_cost,
             false,
+            None,
         )
         .await
     }
@@ -893,6 +970,7 @@ impl GraphQLClient {
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
         close_connection: bool,
+        page_size_override: Option<usize>,
     ) -> Result<GraphQLQueryResult> {
         // Validate cursor if present
         if let Some(ref cursor_val) = cursor {
@@ -932,7 +1010,8 @@ impl GraphQLClient {
             None
         };
 
-        let query_string = query.to_string(limit, cursor.clone())?;
+        let query_string =
+            query.to_string_with_page_size(limit, cursor.clone(), page_size_override)?;
 
         // Validate query string is not empty
         if query_string.trim().is_empty() {
@@ -953,7 +1032,7 @@ impl GraphQLClient {
         // timeouts to match the original client — GitHub requires a User-Agent header.
         let http_client = if close_connection {
             reqwest::Client::builder()
-                .user_agent(format!("spiceai/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
+                .user_agent(util::spiceai_user_agent())
                 .pool_max_idle_per_host(0)
                 .build()
                 .context(ReqwestInternalSnafu)?
@@ -1301,6 +1380,13 @@ impl GraphQLClient {
     ///
     /// Note: Rate limit handling (waiting until reset time) is done proactively by the
     /// `RateLimiter` trait via `check_rate_limit()` before each request.
+    ///
+    /// On gateway errors (HTTP 502/504) the next retry is sent with a smaller
+    /// per-page size, shrinking along a reverse-Fibonacci sequence. A 502 from
+    /// an upstream proxy commonly means the GitHub GraphQL backend timed out
+    /// while resolving an oversized query; requesting a smaller page gives the
+    /// backend a chance to complete within its per-request deadline instead of
+    /// replaying the exact same failing query.
     async fn execute_with_retry(
         client: &Arc<Self>,
         query: &GraphQLQuery,
@@ -1316,12 +1402,27 @@ impl GraphQLClient {
 
         let close_connection = Arc::new(AtomicBool::new(false));
 
+        // Seed the shrink sequence with the query's declared page size (if any).
+        // `None` means "no override" for the first attempt; the query's own
+        // hard-coded `first:` value is used. On the first gateway error we seed
+        // the override from `pagination_argument.size()` and then reverse-Fib
+        // downward on subsequent gateway errors.
+        let page_size_override: Arc<std::sync::Mutex<Option<usize>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
         retry(backoff, || {
             let schema = schema.clone();
             let cursor = cursor.clone();
             let error_checker = error_checker.clone();
             let should_close = close_connection.swap(false, Ordering::Relaxed);
             let close_conn = Arc::clone(&close_connection);
+            let page_size_override_current = {
+                let guard = page_size_override
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard
+            };
+            let page_size_override_ref = Arc::clone(&page_size_override);
 
             async move {
                 client
@@ -1333,12 +1434,32 @@ impl GraphQLClient {
                         error_checker,
                         query_cost,
                         should_close,
+                        page_size_override_current,
                     )
                     .await
                     .map_err(|e| {
                         if is_retriable_error(&e) {
                             if is_gateway_error(&e) {
                                 close_conn.store(true, Ordering::Relaxed);
+                                // Shrink the per-page size for the next retry.
+                                // Seed from the query's declared page size on
+                                // the first gateway error, then reverse-Fib.
+                                let mut guard = page_size_override_ref
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let current = guard.unwrap_or_else(|| {
+                                    query
+                                        .pagination_parameters
+                                        .as_ref()
+                                        .map_or(GATEWAY_SHRINK_DEFAULT_PAGE_SIZE, |p| {
+                                            p.pagination_argument.size()
+                                        })
+                                });
+                                let next = reverse_fibonacci_shrink(current);
+                                tracing::warn!(
+                                    "Gateway error; shrinking GraphQL page size for retry: {current} -> {next}"
+                                );
+                                *guard = Some(next);
                             }
                             tracing::warn!("Page fetch failed, will retry: {e}");
                             RetryError::transient(e)
@@ -1871,6 +1992,81 @@ mod tests {
 }
 "#;
         assert_eq!(new_query, expected_query);
+    }
+
+    #[test]
+    fn test_page_size_override_reduces_first_below_query_default() {
+        // Page size override should reduce a hard-coded `first: 100` down to 25
+        // without requiring the caller to pass a `limit`.
+        let query = r"query {
+            users(first: 100) {
+                name
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }";
+
+        let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
+        let new_query = query
+            .to_string_with_page_size(None, None, Some(25))
+            .expect("Should build query");
+        assert!(
+            new_query.contains("first: 25"),
+            "Expected first: 25, got: {new_query}"
+        );
+        assert!(
+            !new_query.contains("first: 100"),
+            "Expected first: 100 to be replaced, got: {new_query}"
+        );
+    }
+
+    #[test]
+    fn test_page_size_override_does_not_exceed_limit() {
+        // When both a limit and an override are given, the smaller wins.
+        let query = r"query {
+            users(first: 100) {
+                name
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }";
+
+        let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
+        let new_query = query
+            .to_string_with_page_size(Some(10), None, Some(50))
+            .expect("Should build query");
+        assert!(
+            new_query.contains("first: 10"),
+            "limit should win over override when smaller; got: {new_query}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_fibonacci_shrink() {
+        use super::reverse_fibonacci_shrink;
+
+        // Exact ladder steps should descend to the next smaller step.
+        assert_eq!(reverse_fibonacci_shrink(100), 55);
+        assert_eq!(reverse_fibonacci_shrink(55), 34);
+        assert_eq!(reverse_fibonacci_shrink(34), 21);
+        assert_eq!(reverse_fibonacci_shrink(21), 13);
+        assert_eq!(reverse_fibonacci_shrink(13), 8);
+        assert_eq!(reverse_fibonacci_shrink(8), 5);
+        assert_eq!(reverse_fibonacci_shrink(5), 3);
+        assert_eq!(reverse_fibonacci_shrink(3), 2);
+        assert_eq!(reverse_fibonacci_shrink(2), 1);
+        assert_eq!(reverse_fibonacci_shrink(1), 1);
+        assert_eq!(reverse_fibonacci_shrink(0), 1);
+
+        // Non-exact values should snap down to the nearest smaller step.
+        assert_eq!(reverse_fibonacci_shrink(200), 100);
+        assert_eq!(reverse_fibonacci_shrink(60), 55);
+        assert_eq!(reverse_fibonacci_shrink(25), 21);
+        assert_eq!(reverse_fibonacci_shrink(10), 8);
     }
 
     #[test]

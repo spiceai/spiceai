@@ -21,6 +21,18 @@ Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and
 
 **This principle supersedes all other considerations including performance, developer experience, and feature velocity.**
 
+### Git Workflow
+
+**Never force push** — not on `trunk`, not on feature branches, not even with `--force-with-lease`. Always merge or rebase normally, then push without force.
+
+- **Why force-push is banned**: It silently destroys collaborator commits and orphans PR review history (comments lose their anchor, reviewers re-read the entire diff, CI re-runs). `--force-with-lease` only protects against the *latest fetch* — it cannot see commits a collaborator pushed since you fetched, so it does not make force-push safe on shared branches.
+- **What to do instead of force-push**:
+  - Branch out of date with `trunk`? `git pull --rebase` or `git merge trunk`, then `git push` normally.
+  - Want to fix history on a branch with open review? Add a follow-up commit and squash on merge — don't rewrite published commits.
+  - Pre-commit hook failed and the commit didn't actually land? Re-stage, fix, create a *new* commit. Never `--amend` after pushing.
+- **Never bypass hooks** (`--no-verify`, etc.). If a hook fails, fix the underlying issue — these checks exist because earlier failures escaped review. Likewise, don't bypass required commit signing (e.g. `--no-gpg-sign`) just to get a commit through.
+- **Investigate before destroying**: unfamiliar files, branches, or lock files may represent in-progress work. Don't `git reset --hard`, `checkout --`, or `clean -f` to "make it go away" — find the root cause first.
+
 ### Runtime Architecture - Separate Tokio Runtimes
 
 **Separate runtime instances for:**
@@ -53,9 +65,9 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 
 ### Rust Version Baseline
 
-- **Workspace Rust version is 1.93.1**: Treat Rust 1.93.1 as the minimum supported compiler version for workspace code unless a specific crate or integration explicitly documents a different constraint.
-- **Use stable Rust features through 1.93.1**: Prefer stable language, standard library, and Cargo features available in Rust 1.93.1 when they improve correctness, clarity, ergonomics, or maintainability.
-- **Do not code to an older Rust subset by default**: Avoid workarounds for pre-1.93 compilers unless there is a concrete compatibility requirement.
+- **Workspace Rust version is 1.94.1**: Treat Rust 1.94.1 as the minimum supported compiler version for workspace code unless a specific crate or integration explicitly documents a different constraint.
+- **Use stable Rust features through 1.94.1**: Prefer stable language, standard library, and Cargo features available in Rust 1.94.1 when they improve correctness, clarity, ergonomics, or maintainability.
+- **Do not code to an older Rust subset by default**: Avoid workarounds for pre-1.94 compilers unless there is a concrete compatibility requirement.
 - **Prefer modern std APIs over manual patterns**: When a newer stable standard-library API expresses the intent more clearly or avoids extra allocation or unsafe code, use it.
 
 ### Error Handling (CRITICAL)
@@ -63,10 +75,11 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 - **Use SNAFU**: Derive `Snafu` and `Debug` on error enums
 - **NO `.unwrap()`/`.expect()` in non-test code**: Use `?` operator or `match`
 - **In tests**: Use `.expect("descriptive message")` instead of `.unwrap()`
-- **Use `unreachable!()`**: Only for provably impossible cases
+- **`unreachable!()` / `unimplemented!()` / `todo!()`**: Only for *provably unreachable* code. Never for unfinished-but-callable code — they panic at runtime, which violates the data-correctness rule of failing safely with a structured error. For not-yet-implemented method bodies, return a typed error (`DataFusionError::NotImplemented("...")`, an `Err(NotImplementedSnafu { ... })` variant, etc.) so callers can degrade gracefully or surface a useful message
 - **Use `ensure!` macro**: Preferred over `if` + `return Err`
 - **Define `Result` type alias**: `pub type Result<T, E = Error> = std::result::Result<T, E>;`
 - **Don't use `assert!()` (or related) macros in non-test code**: Prefer proper error handling, or marking with `unreachable!()` if the assertion is truly unreachable. Alternatively, make the assertion a `debug_assert!()` assertion to only fire in debug builds instead of release builds. `assert!()` macros can have case-by-case exceptions, for example for compile-time assertions that would prevent a build from being released to begin with.
+- **Don't `#[allow(...)]` warnings in production/library/runtime code**. `#[allow(dead_code)]`, `#[allow(unused)]`, `#[allow(unused_imports)]`, `#[allow(unused_variables)]`, `#[allow(clippy::*)]` and friends paper over real issues that the project's lint denials (`-Dwarnings`, `unwrap_used`, `expect_used`, `clone_on_ref_ptr`, `pedantic`) exist to surface. Fix the underlying issue — delete unused code, drop unused imports, restructure to satisfy the lint — rather than suppressing the warning. Well-justified `#[allow(...)]` (or preferably `#[expect(...)]`, which fails when the lint stops firing) is acceptable in **tests, benches, examples, and build scripts** when the alternative is meaningfully worse (e.g., a test fixture with intentionally unused fields, or a bench that intentionally calls `.expect()`).
 
 ```rust
 // GOOD
@@ -83,12 +96,11 @@ let value = option.context(ValueMissingSnafu)?;
 fn test() { let value = option.expect("descriptive message"); }
 ```
 
-### Logging & Streams (CRITICAL)
+### Streams
 
-- **Use `tracing::`** not `log::` (tracing::info!, tracing::error!, etc.)
-- **AVOID `stream!` macro**: Breaks rust-analyzer, hard to debug. Use manual Stream implementations or `async_stream::stream` sparingly; when unavoidable, document why.
+- **AVOID `stream!` macro**: Breaks rust-analyzer, hard to debug. Use manual `Stream` implementations or `async_stream::stream` sparingly; document why when unavoidable.
 
-## Performance & Memory (CRITICAL)
+## Performance & Memory
 
 ### Zero-Copy Operations
 
@@ -321,7 +333,7 @@ let conn = pool.get().await?; // Error only here
 let conn = create_connection().await?; // Creates new connection every time
 ```
 
-#### Arc/Rc Cloning
+### Arc/Rc Cloning
 
 - **Avoid unnecessary `Arc`/`Rc` clones** (caught by `clippy::clone_on_ref_ptr`)
 - `Arc::clone()` is cheap but not free - don't clone in hot loops unnecessarily
@@ -351,30 +363,9 @@ fn process_data(data: &Arc<RecordBatch>) { ... }
 
 ## Project Structure
 
-### Binary Targets
-
-- `bin/spiced/` - Runtime daemon (Rust)
-- `bin/spice/` - CLI (Rust)
-
-### Core Crates
-
-- `runtime/` - Orchestration, component init
-- `data_components/` - TableProvider implementations
-- `app/` - Spicepod parsing
-- `datafusion/` - DataFusion extensions
-- `llms/` - LLM inference
-- `model_components/` - ML/LLM loading
-- `search/` - Search functionality
-- `test-framework/` - Testing utilities
-
-### Runtime Sub-Crates
-
-- `runtime-acceleration/` - Arrow, DuckDB, SQLite, PostgreSQL
-- `runtime-auth/`, `runtime-datafusion-udfs/`, `runtime-secrets/`, `runtime-parameters/`
-
-### Extension Points (see `docs/EXTENSIBILITY.md`)
-
-1. Data Connector, 2. Data Accelerator, 3. Catalog Connector, 4. Secret Stores, 5. Models, 6. Embeddings
+- **Binaries**: `bin/spiced/` (runtime daemon), `bin/spice/` (CLI).
+- **Crates**: source lives in `crates/`. Most-touched: `runtime/` (orchestration), `data_components/` (`TableProvider` impls), `app/` (Spicepod parsing), `datafusion/` (DataFusion extensions), `llms/`, `search/`, `model_components/`. Acceleration engines under `runtime-acceleration/`; per-concern `runtime-*` crates (`runtime-auth`, `runtime-secrets`, `runtime-parameters`, etc.). For the authoritative current map, see workspace `members` in the root `Cargo.toml`.
+- **Extension points** (see `docs/EXTENSIBILITY.md`): Data Connector, Data Accelerator, Catalog Connector, Secret Store, Model, Embedding.
 
 ## Testing
 
@@ -394,9 +385,21 @@ testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrenc
 
 ### Snapshot Testing with Insta
 
+- **ALWAYS use named `.snap` files** for snapshot assertions — never inline snapshots (`@r"..."` syntax)
+  - Use `insta::assert_snapshot!("snapshot_name", value)` which stores snapshots in a `snapshots/` directory
+  - Named snapshots are easier to review in PRs, diff cleanly, and avoid bloating test source files
 - **NEVER manually edit snapshot files** (`.snap` files): Always use Insta to generate them
 - Run tests with `INSTA_UPDATE=1` to regenerate snapshots: `INSTA_UPDATE=1 cargo test`
 - Review generated snapshots carefully before accepting
+
+```rust
+// GOOD — named snapshot stored in snapshots/*.snap
+insta::assert_snapshot!("query_plan", plan_fmt);
+insta::assert_snapshot!("select_all_rows", rows_fmt);
+
+// BAD — inline snapshot bloats test file, hard to diff in PRs
+insta::assert_snapshot!(plan_fmt, @r#"..."#);
+```
 
 ## Feature Flags
 
@@ -439,11 +442,7 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 ### VSCode Settings
 
-```json
-"[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer", "editor.formatOnSave": true },
-"rust-analyzer.check.command": "clippy",
-"rust-analyzer.check.extraArgs": ["--", "-Dwarnings", "-Dclippy::expect_used", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr", "-Aclippy::module_name_repetitions"]
-```
+`.vscode/settings.json` is gitignored; copy `.vscode/settings.json.template` (and see `CONTRIBUTING.md`) for the canonical config. Notable: rust-analyzer runs `clippy` with `-Dclippy::pedantic`, `-Dclippy::unwrap_used`, and `-Dclippy::clone_on_ref_ptr` (and `-Aclippy::module_name_repetitions`) — i.e. clippy lints fail your local check, not just CI.
 
 ### PR Process
 
@@ -470,14 +469,33 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 ### Async Patterns
 
-- Use `tokio` runtime (see `bin/spiced/src/main.rs`)
-- Use `async_trait` for trait async methods
-- Use `CancellationToken` for shutdown (see `runtime/src/cancellable_task.rs`)
+- Use `tokio` runtime (see `bin/spiced/src/main.rs`).
+- **Trait async methods**: prefer `#[async_trait]`. Native `async fn` in traits has been stable since Rust 1.75 and is fine for traits that *don't* need to be `dyn`-compatible — but most internal traits in this codebase (`DataConnector`, `Chat`, `Embed`, `SecretStore`, `Index`, `CacheProvider`, etc.) are stored as `Arc<dyn Trait>`, and native AFIT isn't `dyn`-safe without manual workarounds. Default to `async_trait` to keep the dyn path consistent; reach for native AFIT only on non-dyn helper traits.
+- **Lazy globals**: prefer `std::sync::LazyLock` / `OnceLock` (modern stable Rust) over `lazy_static!` and `once_cell::sync::Lazy` for new code. Existing `once_cell` callsites are fine to leave.
+- Use `CancellationToken` for shutdown (see `runtime/src/cancellable_task.rs`).
 
 ## Key Files
 
 - `docs/PRINCIPLES.md`, `docs/EXTENSIBILITY.md`, `docs/dev/style_guide.md`, `docs/dev/error_handling.md`
 - `CONTRIBUTING.md`, `Makefile`, `Cargo.toml`, `crates/runtime/src/lib.rs`
+
+## Trait Evolution & Wrapper Delegation (CRITICAL)
+
+When **adding a new method to a trait** — especially one with a default implementation — audit every wrapper/decorator implementation of that trait and ensure each one **forwards the call to its inner instance**. Default impls are silent traps for wrappers: they compile cleanly but no-op the behavior, causing regressions that often only surface in specific runtime configurations (e.g. cluster executors, accelerated tables, embedded/full-text wrappers).
+
+This pattern caused real regressions, e.g. [#10460](https://github.com/spiceai/spiceai/pull/10460): `register_object_stores` was added to `DataConnector` with a no-op default impl, but `EmbeddingConnector`, `FullTextConnector`, and `DeferredConnector` were not updated to forward it. On cluster executors, object stores were silently never registered for affected datasets, causing `BareRedirect` errors against non-default-region S3 buckets.
+
+**Reviewer checklist when a PR adds or changes a trait method:**
+
+1. **Identify all wrapper/decorator impls** of the trait. Common Spice traits with wrappers include (non-exhaustive):
+   - `DataConnector` — wrapped by `EmbeddingConnector`, `FullTextConnector`, `DeferredConnector`
+   - `TableProvider` — wrapped by `AcceleratedTable`, `FederatedTable`, view providers, sink providers
+   - `Read`, `ReadWrite`, `Catalog`, `SecretStore`, `Chat`, `Embed`, `Nql` — check for newtype/decorator wrappers in `data_components/`, `runtime/`, `llms/`, `model_components/`, `search/`
+   - Search by ripgrep: `rg -n "impl\s+(\w+\s+for\s+)?<TraitName>\b" crates/`
+2. **For every wrapper, verify the new method is explicitly implemented and delegates to the inner type.** Inheriting the default impl is almost always a bug for wrappers — even when the default is a no-op, since the wrapper's inner connector may have meaningful behavior.
+3. **Flag PRs that add a defaulted trait method without touching corresponding wrapper impls.** Ask the author to confirm each wrapper has been audited, or to add explicit forwarding impls.
+4. **Prefer no default impl on traits with known wrappers** when the correct behavior cannot be "do nothing". Forcing implementors to write the method makes wrappers visible at compile time. If a default is necessary for backward compatibility, leave a comment on the trait method pointing wrapper authors at the forwarding requirement.
+5. **Call out missing test coverage**: regressions of this kind typically escape unit tests because the default impl compiles. Suggest an integration or cluster/executor test that exercises the wrapped path when feasible.
 
 ## Gotchas
 
@@ -486,7 +504,7 @@ export PATH="$PATH:$HOME/.spice/bin"
 3. Spicepod is YAML config format
 4. Integration tests need credentials (`spice login` or `.env`)
 5. testoperator is the test harness
-6. Workspace uses Rust edition 2024 and rust-version 1.93.1; use stable Rust features available through 1.93.1 by default
+6. Workspace uses Rust edition 2024 and rust-version 1.94.1; use stable Rust features available through 1.94.1 by default
 7. New files should include copyright header. The current year is 2026. Required file types: `.rs`, `.go`
 8. **Spice runtime (Rust) is 64-bit minimum**: The runtime requires at least 64-bit pointer size. Do not add 32-bit compatibility code. Code should assume `usize` is at least 64 bits but not assume it's exactly 64 bits (future 128-bit support).
 

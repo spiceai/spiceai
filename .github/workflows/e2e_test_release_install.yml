@@ -21,6 +21,10 @@ on:
       - 'install/Install.ps1'
       - '.github/workflows/e2e_test_release_install.yml'
 
+env:
+  PREVIOUS_STABLE_VERSION: v1.11.4
+  PREVIEW_UPGRADE_VERSION: v2.0.0-rc.2
+
 jobs:
   test-install:
     name: install on ${{ matrix.name }}
@@ -48,14 +52,7 @@ jobs:
         run: uname -m
 
       - name: checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
-      # The aarch64 runner does not have any tools pre-installed
-      - name: Install missing tools
-        if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
-        run: |
-          sudo apt-get update
-          sudo apt install jq -y
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: install Spice (https://install.spiceai.org)
         if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
@@ -76,6 +73,25 @@ jobs:
         run: |
           echo "$HOME/.spice/bin" >> $GITHUB_PATH
 
+      - name: resolve latest Spice release version
+        id: resolve_latest_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          auth_args=()
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            auth_args=(-H "Authorization: token $GITHUB_TOKEN")
+          fi
+
+          release_version="$(curl -fsSL "https://api.github.com/repos/spiceai/spiceai/releases/latest" "${auth_args[@]}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name", ""))')"
+
+          if [ -z "$release_version" ]; then
+            echo "Failed to resolve latest Spice release version"
+            exit 1
+          fi
+
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+
       - name: check installation
         run: |
           spice version
@@ -94,32 +110,139 @@ jobs:
         timeout-minutes: 1
 
       - name: check Spice cli and runtime version
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          latest_release_version="${{ steps.resolve_latest_release.outputs.version }}"
           version=$(spice version 2>&1)
           # CLI version may include commit hash like "v1.11.0 (f2e8ad5)" - extract just the version
           cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
-          runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
+          runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | awk '{print $1}')
 
-          release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')"
-          release_version_with_models="${release_version}+models"
-
-          echo "Release Version: $release_version"
+          echo "Latest Release Version: $latest_release_version"
           echo "CLI Version: $cli_version"
           echo "Runtime Version: $runtime_version"
 
-          # CLI does not have '+models' suffix, so compare base versions
-          if [ "$cli_version" != "$release_version" ]; then
-            echo "CLI version $cli_version does not match the latest release version $release_version."
+          if [[ "$cli_version" != "$latest_release_version" ]]; then
+            echo "CLI version $cli_version does not match the latest release version $latest_release_version."
             exit 1
           fi
 
-          # Runtime has '+models' suffix
-          if [ "$runtime_version" != "$release_version_with_models" ]; then
-            echo "Runtime version $runtime_version does not match the latest release version $release_version_with_models."
+          case "$runtime_version" in
+            "$latest_release_version"|"$latest_release_version+models")
+              ;;
+            *)
+              echo "Runtime version $runtime_version does not match the latest release version $latest_release_version."
+              exit 1
+              ;;
+          esac
+
+      - name: stop Spice runtime before version-targeted tests
+        run: |
+          pkill -x spiced || true
+          pkill -x spice || true
+
+          for _ in $(seq 1 30); do
+            if ! pgrep -x spiced >/dev/null 2>&1 && ! pgrep -x spice >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Spice runtime failed to stop"
+          exit 1
+
+      - name: install previous stable Spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          spice install "$PREVIOUS_STABLE_VERSION"
+
+      - name: check previous stable Spice runtime version
+        run: |
+          latest_release_version="${{ steps.resolve_latest_release.outputs.version }}"
+          previous_stable_version="${{ env.PREVIOUS_STABLE_VERSION }}"
+          version=$(spice version 2>&1)
+          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
+          runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | awk '{print $1}')
+
+          echo "Latest Release Version: $latest_release_version"
+          echo "CLI Version after spice install $previous_stable_version: $cli_version"
+          echo "Runtime Version after spice install $previous_stable_version: $runtime_version"
+
+          if [[ "$cli_version" != "$latest_release_version" ]]; then
+            echo "CLI version $cli_version changed unexpectedly after spice install $previous_stable_version."
             exit 1
           fi
+
+          case "$runtime_version" in
+            "$previous_stable_version"|"$previous_stable_version+models")
+              ;;
+            *)
+              echo "Runtime version $runtime_version does not match the requested version $previous_stable_version."
+              exit 1
+              ;;
+          esac
+
+      - name: upgrade Spice cli and runtime to preview release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          spice upgrade "$PREVIEW_UPGRADE_VERSION"
+
+      - name: check preview Spice cli and runtime version
+        run: |
+          preview_upgrade_version="${{ env.PREVIEW_UPGRADE_VERSION }}"
+          version=$(spice version 2>&1)
+          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
+          runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | awk '{print $1}')
+
+          echo "CLI Version after spice upgrade $preview_upgrade_version: $cli_version"
+          echo "Runtime Version after spice upgrade $preview_upgrade_version: $runtime_version"
+
+          if [[ "$cli_version" != v1.11.* ]]; then
+            if [[ "$cli_version" != "$preview_upgrade_version" ]]; then
+              echo "CLI version $cli_version does not match the requested version $preview_upgrade_version."
+              exit 1
+            fi
+          else
+            echo "::warning::Skipping CLI version check: v1.11.x CLI does not self-upgrade"
+          fi
+
+          case "$runtime_version" in
+            "$preview_upgrade_version"|"$preview_upgrade_version+models")
+              ;;
+            *)
+              echo "Runtime version $runtime_version does not match the requested version $preview_upgrade_version."
+              exit 1
+              ;;
+          esac
+
+      - name: restart Spice runtime after preview upgrade
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd app
+          spice run &
+
+      - name: wait for preview Spice runtime healthy
+        run: |
+          bash -c 'while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done' || false
+        timeout-minutes: 1
+
+      - name: cleanup Spice runtime
+        if: ${{ always() }}
+        run: |
+          pkill -x spiced || true
+          pkill -x spice || true
+
+          for _ in $(seq 1 30); do
+            if ! pgrep -x spiced >/dev/null 2>&1 && ! pgrep -x spice >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Spice runtime failed to stop"
+          exit 1
 
   # Test Windows with WSL - runtime runs in WSL, not native Windows
   test-install-windows-wsl:
@@ -127,13 +250,13 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Setup WSL
-        uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
+        uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
         with:
-          distribution: Ubuntu-22.04
-          additional-packages: curl jq
+          distribution: Ubuntu-24.04
+          additional-packages: curl
 
       - name: install Spice (https://install.spiceai.org)
         if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
@@ -157,6 +280,26 @@ jobs:
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
           spice version
+
+      - name: resolve latest Spice release version
+        id: resolve_latest_release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $headers = @{}
+          if ($env:GITHUB_TOKEN) {
+            $headers.Authorization = "token $env:GITHUB_TOKEN"
+          }
+
+          $response = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/spiceai/spiceai/releases/latest"
+          $releaseVersion = $response.tag_name
+
+          if ([string]::IsNullOrWhiteSpace($releaseVersion)) {
+            throw "Failed to resolve latest Spice release version"
+          }
+
+          "version=$releaseVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: start Spice runtime and wait for healthy
         shell: wsl-bash {0}
@@ -181,35 +324,160 @@ jobs:
 
       - name: check Spice cli and runtime version
         shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          latest_release_version="${{ steps.resolve_latest_release.outputs.version }}"
+          version=$(spice version 2>&1)
+          # CLI version may include commit hash like "v1.11.0 (f2e8ad5)" - extract just the version
+          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
+          runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | awk '{print $1}')
+
+          echo "Latest Release Version: $latest_release_version"
+          echo "CLI Version: $cli_version"
+          echo "Runtime Version: $runtime_version"
+
+          if [[ "$cli_version" != "$latest_release_version" ]]; then
+            echo "CLI version $cli_version does not match the latest release version $latest_release_version."
+            exit 1
+          fi
+
+          case "$runtime_version" in
+            "$latest_release_version"|"$latest_release_version+models")
+              ;;
+            *)
+              echo "Runtime version $runtime_version does not match the latest release version $latest_release_version."
+              exit 1
+              ;;
+          esac
+
+      - name: stop Spice runtime before version-targeted tests
+        shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+
+          pkill -x spiced || true
+          pkill -x spice || true
+
+          for i in $(seq 1 30); do
+            if ! pgrep -x spiced >/dev/null 2>&1 && ! pgrep -x spice >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Spice runtime failed to stop"
+          exit 1
+
+      - name: install previous stable Spice runtime
+        shell: wsl-bash {0}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
+          previous_stable_version="${{ env.PREVIOUS_STABLE_VERSION }}"
+          spice install "$previous_stable_version"
+
+      - name: check previous stable Spice runtime version
+        shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          latest_release_version="${{ steps.resolve_latest_release.outputs.version }}"
+          previous_stable_version="${{ env.PREVIOUS_STABLE_VERSION }}"
           version=$(spice version 2>&1)
-          # CLI version may include commit hash like "v1.11.0 (f2e8ad5)" - extract just the version
           cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
-          runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
+          runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | awk '{print $1}')
 
-          # Use bash array for optional curl args to avoid quoting issues
-          auth_args=()
-          if [ -n "${GITHUB_TOKEN:-}" ]; then
-            auth_args=(-H "Authorization: token $GITHUB_TOKEN")
-          fi
-          release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" "${auth_args[@]}" | jq -r '.tag_name')"
-          release_version_with_models="${release_version}+models"
+          echo "Latest Release Version: $latest_release_version"
+          echo "CLI Version after spice install $previous_stable_version: $cli_version"
+          echo "Runtime Version after spice install $previous_stable_version: $runtime_version"
 
-          echo "Release Version: $release_version"
-          echo "CLI Version: $cli_version"
-          echo "Runtime Version: $runtime_version"
-
-          # CLI does not have '+models' suffix, so compare base versions
-          if [ "$cli_version" != "$release_version" ]; then
-            echo "CLI version $cli_version does not match the latest release version $release_version."
+          if [[ "$cli_version" != "$latest_release_version" ]]; then
+            echo "CLI version $cli_version changed unexpectedly after spice install $previous_stable_version."
             exit 1
           fi
 
-          # Runtime has '+models' suffix
-          if [ "$runtime_version" != "$release_version_with_models" ]; then
-            echo "Runtime version $runtime_version does not match the latest release version $release_version_with_models."
-            exit 1
+          case "$runtime_version" in
+            "$previous_stable_version"|"$previous_stable_version+models")
+              ;;
+            *)
+              echo "Runtime version $runtime_version does not match the requested version $previous_stable_version."
+              exit 1
+              ;;
+          esac
+
+      - name: upgrade Spice cli and runtime to preview release
+        shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          preview_upgrade_version="${{ env.PREVIEW_UPGRADE_VERSION }}"
+          spice upgrade "$preview_upgrade_version"
+
+      - name: check preview Spice cli and runtime version
+        shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          preview_upgrade_version="${{ env.PREVIEW_UPGRADE_VERSION }}"
+          version=$(spice version 2>&1)
+          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
+          runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | awk '{print $1}')
+
+          echo "CLI Version after spice upgrade $preview_upgrade_version: $cli_version"
+          echo "Runtime Version after spice upgrade $preview_upgrade_version: $runtime_version"
+
+          if [[ "$cli_version" != v1.11.* ]]; then
+            if [[ "$cli_version" != "$preview_upgrade_version" ]]; then
+              echo "CLI version $cli_version does not match the requested version $preview_upgrade_version."
+              exit 1
+            fi
+          else
+            echo "::warning::Skipping CLI version check: v1.11.x CLI does not self-upgrade"
           fi
+
+          case "$runtime_version" in
+            "$preview_upgrade_version"|"$preview_upgrade_version+models")
+              ;;
+            *)
+              echo "Runtime version $runtime_version does not match the requested version $preview_upgrade_version."
+              exit 1
+              ;;
+          esac
+
+      - name: restart Spice runtime after preview upgrade and wait for healthy
+        shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          cd app
+          spice run &
+
+          for i in $(seq 1 60); do
+            if [ "$(curl -s http://localhost:8090/health)" = "ok" ]; then
+              echo "Spice runtime is healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Spice runtime failed to start"
+          exit 1
+        timeout-minutes: 2
+
+      - name: cleanup Spice runtime
+        if: ${{ always() }}
+        shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          pkill -x spiced || true
+          pkill -x spice || true
+
+          for i in $(seq 1 30); do
+            if ! pgrep -x spiced >/dev/null 2>&1 && ! pgrep -x spice >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Spice runtime failed to stop"
+          exit 1

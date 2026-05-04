@@ -27,6 +27,18 @@ def getReleaseByTag(owner, repo, tag):
     if releaseInfo.status_code == 404:
         return None
 
+    if not releaseInfo.ok:
+        # Non-2xx responses (e.g. transient 5xx, 403 rate limit) return an
+        # error payload that lacks the keys callers expect ("id", "assets",
+        # "upload_url"). Treat as missing so callers can retry/skip cleanly
+        # instead of crashing on KeyError downstream.
+        print(f"Failed to fetch release for tag {tag}: HTTP {releaseInfo.status_code}")
+        try:
+            print(releaseInfo.json())
+        except ValueError:
+            print(releaseInfo.text)
+        return None
+
     return releaseInfo.json()
 
 def getUploadUrl(artifactPath, originalUploadUrl):
@@ -133,11 +145,12 @@ def actionDelete(args):
         return
 
     # Step 2: For each artifact, see if it already exists as an asset on the release
+    assets = releaseInfo.get("assets", [])
     for artifact in args.artifact:
         filename = os.path.basename(artifact)
         print(f"Deleting -> {filename}")
 
-        for asset in releaseInfo["assets"]:
+        for asset in assets:
             if asset["name"] == filename:
                 deleteAsset(args.owner, args.repo, asset["id"])
 

@@ -17,24 +17,31 @@ limitations under the License.
 use crate::{AnyErrorResult, SecretStore};
 use async_trait::async_trait;
 use secrecy::SecretString;
+use std::sync::Arc;
 
 /// Trait for expanding secrets via the cluster service.
-/// This abstracts over the different channel types that may be used.
+///
+/// The success value is a [`SecretString`] so implementors own
+/// zeroize-on-drop from the moment they have the plaintext. Previously this
+/// returned `Result<String, String>` — a correct implementation had to know
+/// to immediately wrap the returned `String` before doing anything else,
+/// which is exactly the kind of implicit contract secret-handling APIs
+/// should avoid.
 #[async_trait]
 pub trait ClusterSecretExpander: Send + Sync {
-    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String>;
+    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<SecretString, String>;
 }
 
 /// Used by cluster mode to resolve secrets declared in the scheduler
 /// via the internal cluster gRPC service.
 pub struct SchedulerRPCSecretStore {
     executor_id: String,
-    expander: Box<dyn ClusterSecretExpander>,
+    expander: Arc<dyn ClusterSecretExpander>,
 }
 
 impl SchedulerRPCSecretStore {
     #[must_use]
-    pub fn new(expander: Box<dyn ClusterSecretExpander>, executor_id: String) -> Self {
+    pub fn new(expander: Arc<dyn ClusterSecretExpander>, executor_id: String) -> Self {
         Self {
             executor_id,
             expander,
@@ -53,6 +60,6 @@ impl SecretStore for SchedulerRPCSecretStore {
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        Ok(Some(SecretString::from(value)))
+        Ok(Some(value))
     }
 }
