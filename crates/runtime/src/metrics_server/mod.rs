@@ -224,8 +224,9 @@ async fn handle_http_request<B>(
     let mut response = Response::new(if req.uri().path() == "/health" {
         "OK".into()
     } else {
-        // Check rate limit for metrics requests (not /health).
-        if let Some(Err(wait_time)) = rate_limiter.map(DirectRateLimiter::check) {
+        if req.uri().path() == "/metrics"
+            && let Some(Err(wait_time)) = rate_limiter.map(DirectRateLimiter::check)
+        {
             let retry_after =
                 retry_after_seconds(wait_time.wait_time_from(DefaultClock::default().now()));
             let mut resp = Response::new(Full::from(format!(
@@ -853,6 +854,34 @@ mod tests {
             .parse::<u64>()
             .expect("Retry-After header should be an integer");
         assert!(retry_after >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_http_request_rate_limit_ignores_non_metrics_paths() {
+        let registry = prometheus::Registry::new();
+        let rate_limiter = RateLimiter::direct(Quota::per_minute(
+            NonZeroU32::new(1).expect("test quota must be non-zero"),
+        ));
+        let root_request = Request::builder()
+            .uri("/")
+            .body(())
+            .expect("test request should build");
+        let metrics_request = Request::builder()
+            .uri("/metrics")
+            .body(())
+            .expect("test request should build");
+
+        let root_response =
+            handle_http_request(&registry, None, Some(&rate_limiter), &root_request).await;
+        assert_eq!(root_response.status(), StatusCode::OK);
+
+        let first_metrics =
+            handle_http_request(&registry, None, Some(&rate_limiter), &metrics_request).await;
+        assert_eq!(first_metrics.status(), StatusCode::OK);
+
+        let second_metrics =
+            handle_http_request(&registry, None, Some(&rate_limiter), &metrics_request).await;
+        assert_eq!(second_metrics.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

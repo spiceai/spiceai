@@ -1052,9 +1052,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_metrics_allows_repeated_requests() {
+    async fn test_internal_get_metrics_allows_repeated_requests() {
         let service = make_test_service().await;
 
+        // Internal cluster RPCs are intentionally not rate-limited; the Prometheus HTTP
+        // metrics endpoint applies the external scrape limit.
         ClusterService::get_metrics(&service, Request::new(GetMetricsRequest {}))
             .await
             .expect("first metrics request should succeed");
@@ -1065,7 +1067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_task_history_allows_repeated_requests() {
+    async fn test_internal_get_task_history_allows_repeated_requests() {
         let service = make_test_service().await;
         let request = || {
             Request::new(GetTaskHistoryRequest {
