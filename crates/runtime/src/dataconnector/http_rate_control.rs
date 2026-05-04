@@ -137,6 +137,7 @@ impl HttpRateControlMetricSource {
         }
     }
 
+    #[must_use]
     pub fn claim_owner(&self) -> bool {
         self.registry
             .claim_metrics_owner(&self.base_url, self.owner.as_str())
@@ -386,7 +387,7 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
         macro_rules! observe_metric {
             ($value:expr) => {{
                 Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    if should_observe_metrics(&metric_source) {
+                    if should_observe_metrics(metric_source.as_ref()) {
                         observer.observe($value, &attributes);
                     }
                 })))
@@ -441,10 +442,8 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
     }
 }
 
-fn should_observe_metrics(metric_source: &Option<HttpRateControlMetricSource>) -> bool {
-    metric_source
-        .as_ref()
-        .is_none_or(HttpRateControlMetricSource::is_owner)
+fn should_observe_metrics(metric_source: Option<&HttpRateControlMetricSource>) -> bool {
+    metric_source.is_none_or(HttpRateControlMetricSource::is_owner)
 }
 
 #[must_use]
@@ -998,12 +997,17 @@ mod tests {
     use super::*;
     use crate::component::dataset::builder::DatasetBuilder;
 
-    fn test_dataset() -> Dataset {
+    async fn test_dataset() -> Dataset {
+        let app = Arc::new(app::AppBuilder::new("rate_control_registry_test".to_string()).build());
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
         DatasetBuilder::try_new(
             "https://rate-control-registry.example.com/data".to_string(),
             "rate_control_registry_test",
         )
         .expect("test dataset builder should be valid")
+        .with_app(app)
+        .with_runtime(runtime)
         .build()
         .expect("test dataset should build")
     }
@@ -1023,7 +1027,7 @@ mod tests {
         let registry = Arc::new(HttpRateControlRegistry::default());
         let url = Url::parse("https://rate-control-registry.example.com/data")
             .expect("test URL should parse");
-        let dataset = test_dataset();
+        let dataset = test_dataset().await;
 
         let reservation = Arc::clone(&registry)
             .reserve_shared_rate_controller(&url, &test_config(2), &dataset, "https")
@@ -1045,7 +1049,7 @@ mod tests {
         let registry = Arc::new(HttpRateControlRegistry::default());
         let url = Url::parse("https://rate-control-registry-conflict.example.com/data")
             .expect("test URL should parse");
-        let dataset = test_dataset();
+        let dataset = test_dataset().await;
 
         let reservation = Arc::clone(&registry)
             .reserve_shared_rate_controller(&url, &test_config(2), &dataset, "https")

@@ -311,7 +311,7 @@ impl DataConnector for GraphQL {
         match GraphQLTableProviderBuilder::new(client).build(query).await {
             Ok(provider) => {
                 if let Some(metric_source) = &self.rate_control_metric_source {
-                    metric_source.claim_owner();
+                    let _ = metric_source.claim_owner();
                 }
                 rate_controller.commit().await;
                 Ok(Arc::new(provider))

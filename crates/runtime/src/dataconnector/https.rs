@@ -982,7 +982,7 @@ impl Https {
 
         let provider = Arc::new(provider);
         if let Some(metric_source) = &self.rate_control_metric_source {
-            metric_source.claim_owner();
+            let _ = metric_source.claim_owner();
         }
         rate_controller.commit().await;
         Self::spawn_endpoint_validation(Arc::clone(&provider), dataset.name.to_string());
