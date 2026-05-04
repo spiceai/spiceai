@@ -23,6 +23,7 @@ use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::datafusion::OnDemandTableLoader;
+use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
     AcceleratorInitializationFailedSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
@@ -598,9 +599,16 @@ impl Runtime {
         }
 
         let runtime = ds.runtime();
-        runtime
-            .register_loaded_dataset(ds, connector, None, bootstrap_status, load_semaphore)
-            .await
+        DatasetInitialization::plan_eager(
+            ds,
+            runtime,
+            connector,
+            bootstrap_status,
+            load_semaphore,
+            None,
+        )
+        .initialize()
+        .await
     }
 
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
@@ -654,7 +662,7 @@ impl Runtime {
         }
     }
 
-    async fn register_loaded_dataset(
+    pub(crate) async fn register_loaded_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
@@ -910,15 +918,16 @@ impl Runtime {
                     .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                     .await;
 
-                if let Err(e) = Arc::clone(&self)
-                    .register_loaded_dataset(
-                        Arc::clone(&ds),
-                        Arc::clone(&connector),
-                        None,
-                        BootstrapStatus::None,
-                        None,
-                    )
-                    .await
+                if let Err(e) = DatasetInitialization::plan_eager(
+                    Arc::clone(&ds),
+                    Arc::clone(&self),
+                    Arc::clone(&connector),
+                    BootstrapStatus::None,
+                    None,
+                    None,
+                )
+                .initialize()
+                .await
                 {
                     self.status.update_dataset(
                         &ds.name,
@@ -1026,13 +1035,15 @@ impl Runtime {
         tracing::debug!("Accelerated table for dataset {} is ready", ds.name);
 
         // Hot reload doesn't bootstrap from snapshot
-        self.register_loaded_dataset(
+        DatasetInitialization::plan_eager(
             ds,
+            Arc::clone(&self),
             Arc::clone(&connector),
-            Some(accelerated_table),
             BootstrapStatus::None,
             None,
+            Some(accelerated_table),
         )
+        .initialize()
         .await?;
 
         Ok(())

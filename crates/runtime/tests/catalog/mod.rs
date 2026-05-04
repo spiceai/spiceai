@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use runtime::Runtime;
 use runtime::extension::ExtensionFactory;
 use spice_cloud::SpiceExtensionFactory;
-use spicepod::component::catalog::Catalog;
+use spicepod::{component::catalog::Catalog, param::Params};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -40,11 +40,10 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
+            let mut catalog = Catalog::new("spice.ai/spiceai/tpch".to_string(), "spc".to_string());
+            catalog.params = Some(spiceai_catalog_params());
             let app = AppBuilder::new("spiceai_catalog_test")
-                .with_catalog(Catalog::new(
-                    "spice.ai/spiceai/tpch".to_string(),
-                    "spc".to_string(),
-                ))
+                .with_catalog(catalog)
                 .build();
 
             configure_test_datafusion();
@@ -90,6 +89,7 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
     test_request_context()
         .scope(async {
             let mut catalog = Catalog::new("spice.ai/spiceai/tpch".to_string(), "spc".to_string());
+            catalog.params = Some(spiceai_catalog_params());
             catalog.include = vec!["tpch.customer".to_string(), "tpch.part*".to_string()];
             let app = AppBuilder::new("spiceai_catalog_test")
                 .with_catalog(catalog)
@@ -150,4 +150,11 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
             Ok(())
         })
         .await
+}
+
+fn spiceai_catalog_params() -> Params {
+    Params::from_string_map(HashMap::from([(
+        "spiceai_region".to_string(),
+        "us-east-1".to_string(),
+    )]))
 }

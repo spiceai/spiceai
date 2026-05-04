@@ -17,10 +17,12 @@ limitations under the License.
 //! HTTP client for the Spice Cloud API.
 //!
 //! This crate provides [`CloudClient`], a typed HTTP client for the Spice Cloud
-//! REST API. It is intended to be shared by the Spice CLI (`bin/spice`) and
-//! other tools such as `spidapter`.
+//! REST API, and shared helpers for Spice Cloud runtime endpoints. It is
+//! intended to be shared by the Spice CLI (`bin/spice`) and other tools such as
+//! `spidapter`.
 
 mod client;
+pub mod endpoints;
 pub mod error;
 pub mod types;
 
