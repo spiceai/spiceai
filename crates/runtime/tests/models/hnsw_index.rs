@@ -20,12 +20,11 @@ limitations under the License.
 //! and confirm that the HNSW index exists on the correct underlying table.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::Context as _;
 use app::AppBuilder;
 use arrow::array::{RecordBatch, StringArray};
-use arrow::util::pretty::pretty_format_batches;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -39,11 +38,15 @@ use spicepod::component::embeddings::Embeddings;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 use spicepod::vector::VectorStore;
-use tokio::sync::Notify;
+use tokio::sync::Mutex;
 
 use crate::models::create_api_bindings_config;
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 use crate::{configure_test_datafusion, init_tracing};
+
+/// Serializes HNSW tests because `Runtime::shutdown()` calls `unregister_all()`,
+/// which clears the global connector registry and breaks parallel tests.
+static HNSW_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn cleanup_db_path(db_path: &str) {
     for suffix in ["", ".wal"] {
@@ -69,7 +72,7 @@ fn hnsw_dataset(name: &str, db_path: &str, refresh_mode: RefreshMode) -> Dataset
             .collect(),
     ));
 
-    let mut accel_params: HashMap<String, String> =
+    let accel_params: HashMap<String, String> =
         HashMap::from([("duckdb_file".to_string(), db_path.to_string())]);
     // Don't set HNSW params on acceleration — they go in vectors.params
     dataset.acceleration = Some(Acceleration {
@@ -195,9 +198,9 @@ async fn query_native_duckdb_indexes(
 /// Verifies HNSW index exists after initial load and survives a full (overwrite) refresh.
 /// After shutdown, queries the DuckDB file directly to confirm the index is on the correct
 /// internal data table.
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn test_hnsw_index_created_after_full_refresh() -> Result<(), anyhow::Error> {
+    let _test_lock = HNSW_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some(
         "integration_models=debug,runtime=debug,search=debug,info",
     ));
@@ -281,10 +284,87 @@ async fn test_hnsw_index_created_after_full_refresh() -> Result<(), anyhow::Erro
         .await
 }
 
+/// Verifies HNSW index is created after initial append refresh.
+/// Uses a local JSONL file (with a `created_at` timestamp for `time_column`).
+#[tokio::test]
+async fn test_hnsw_index_created_after_append_refresh() -> Result<(), anyhow::Error> {
+    let _test_lock = HNSW_TEST_MUTEX.lock().await;
+    let _tracing = init_tracing(Some(
+        "integration_models=debug,runtime=debug,search=debug,info",
+    ));
+
+    let db_path = "./test_hnsw_append_refresh.db";
+    let ds_name = "hnsw_append_ds";
+
+    cleanup_db_path(db_path);
+
+    let test_data = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/models/test_data/mega-science-sample.jsonl");
+    let source = format!("file://{}", test_data.display());
+
+    test_request_context()
+        .scope(async {
+            let mut dataset = hnsw_dataset(ds_name, db_path, RefreshMode::Append);
+            dataset.from = source;
+            dataset.time_column = Some("created_at".to_string());
+            dataset.time_format = Some(spicepod::component::dataset::TimeFormat::ISO8601);
+            dataset.params = None; // Remove client_timeout, not supported for file connector
+
+            let app = AppBuilder::new("hnsw_append_refresh_test")
+                .with_embedding(model2vec_embedding())
+                .with_dataset(dataset)
+                .build();
+
+            let rt = start_runtime(app).await;
+
+            // Verify vector search works after initial append load
+            let batches = execute_sql(
+                &rt,
+                &format!(
+                    "SELECT id, _score FROM vector_search({ds_name}, 'second') ORDER BY _score DESC LIMIT 4"
+                ),
+            )
+            .await?;
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            anyhow::ensure!(
+                total_rows == 4,
+                "Expected 4 rows from vector_search after append refresh, got {total_rows}"
+            );
+            tracing::info!("Append refresh vector search returned {total_rows} rows");
+
+            // Shutdown runtime and verify index via native DuckDB connection
+            rt.shutdown().await;
+            drop(rt);
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+            let indexes = query_native_duckdb_indexes(db_path).await?;
+            tracing::info!("Native DuckDB indexes after append refresh: {indexes:?}");
+
+            anyhow::ensure!(
+                !indexes.is_empty(),
+                "Expected at least one __spice_vss_ HNSW index after append refresh"
+            );
+
+            for (index_name, table_name) in &indexes {
+                anyhow::ensure!(
+                    index_name.contains("question_embedding"),
+                    "Index name {index_name} should reference question_embedding column"
+                );
+                tracing::info!(
+                    "Verified HNSW index {index_name} on table {table_name}"
+                );
+            }
+
+            cleanup_db_path(db_path);
+            Ok(())
+        })
+        .await
+}
+
 /// Verifies HNSW index survives multiple consecutive full refreshes.
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn test_hnsw_index_survives_multiple_refreshes() -> Result<(), anyhow::Error> {
+    let _test_lock = HNSW_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some(
         "integration_models=debug,runtime=debug,search=debug,info",
     ));
@@ -328,7 +408,7 @@ async fn test_hnsw_index_survives_multiple_refreshes() -> Result<(), anyhow::Err
                 tracing::info!("Refresh #{i}: vector search OK ({total_rows} rows)");
             }
 
-            // Shutdown and verify native
+            // Shutdown runtime and verify native DuckDB indexes
             rt.shutdown().await;
             drop(rt);
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;

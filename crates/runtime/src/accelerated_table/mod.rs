@@ -453,7 +453,7 @@ impl Builder {
     /// Replace the accelerator provider.
     ///
     /// This must be called **before** [`build`](Self::build) so that the
-    /// [`Refresher`] (created during build) receives the updated provider.
+    /// refresher (created during build) receives the updated provider.
     pub fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
         self.accelerator = accelerator;
     }
@@ -1117,10 +1117,6 @@ impl AcceleratedTable {
     #[must_use]
     pub(crate) fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
         &self.accelerator
-    }
-
-    pub(crate) fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
-        self.accelerator = accelerator;
     }
 
     /// Add a child accelerator that should receive cached data when this parent stores new cache entries.
