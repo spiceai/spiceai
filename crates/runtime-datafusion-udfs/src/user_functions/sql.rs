@@ -39,24 +39,30 @@ use std::sync::{
 use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{DFSchema, DataFusionError, Result as DataFusionResult};
+use datafusion::catalog::{
+    Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
+};
+use datafusion::common::{Column, DFSchema, DataFusionError, Result as DataFusionResult, Spans};
 use datafusion::datasource::{MemTable, TableType};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    Volatility as DfVolatility,
+    ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
+    TableScan, Volatility as DfVolatility,
+    simplify::{ExprSimplifyResult, SimplifyInfo},
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::{PhysicalExpr, expressions::CastExpr};
 use datafusion::prelude::{DataFrame, Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::{
+    TableReference,
     parser::DFParser,
     sqlparser::{ast, dialect::PostgreSqlDialect},
 };
 use snafu::{ResultExt, Snafu};
-use spicepod::component::function::{Function, FunctionArg, FunctionReturns, Volatility};
+use spicepod::component::function::{
+    Function, FunctionArg, FunctionReturns, FunctionTableArg, Volatility,
+};
 use util::session_state::builder_from_existing;
 
 const SQL_TABLE_ARGS_TABLE_NAME: &str = "args";
@@ -100,6 +106,14 @@ pub enum SqlBuildError {
     #[snafu(display("duplicate output column '{column}' in SQL table function return schema"))]
     DuplicateOutputColumn { column: String },
 
+    #[snafu(display("duplicate input table '{table}' in SQL function signature"))]
+    DuplicateInputTable { table: String },
+
+    #[snafu(display(
+        "SQL function input table name '{table}' conflicts with reserved scalar argument table name '{reserved}'"
+    ))]
+    ReservedInputTableName { table: String, reserved: String },
+
     #[snafu(display("failed to build schema for arguments: {source}"))]
     BuildSchema { source: DataFusionError },
 
@@ -136,6 +150,9 @@ pub enum SqlBuildError {
         "SQL table function body schema does not match declared return schema: {details}"
     ))]
     ReturnSchemaMismatch { details: String },
+
+    #[snafu(display("SQL function table argument schema does not match declaration: {details}"))]
+    InputSchemaMismatch { details: String },
 }
 
 pub type Result<T, E = SqlBuildError> = std::result::Result<T, E>;
@@ -150,6 +167,10 @@ pub type Result<T, E = SqlBuildError> = std::result::Result<T, E>;
 /// parsed or lowered to a physical expression, or the body's computed
 /// return type is not coercible to the declared return type.
 pub fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
+    if !decl.signature.tables.is_empty() {
+        return build_scalar_table_arg_udf(decl, body);
+    }
+
     let arg_specs = decl
         .signature
         .args
@@ -212,6 +233,33 @@ pub fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
     Ok(Arc::new(ScalarUDF::from(udf_impl)))
 }
 
+fn build_scalar_table_arg_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
+    validate_table_body_syntax(body)?;
+    let arg_schema = function_arg_schema(&decl.signature.args)?;
+    let table_args = table_arg_specs(&decl.signature.tables)?;
+    let return_type = scalar_return_type(decl)?;
+    let output_schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        return_type.clone(),
+        true,
+    )]));
+    let table_func = Arc::new(SqlTableFunc {
+        name: decl.name.clone(),
+        arg_schema,
+        table_args,
+        output_schema,
+        body: body.to_string(),
+    });
+    let udf_impl = SqlScalarTableArgUdf {
+        id: NEXT_UDF_ID.fetch_add(1, Ordering::Relaxed),
+        name: decl.name.clone(),
+        signature: Signature::variadic_any(map_volatility(decl.volatility)),
+        return_type,
+        table_func,
+    };
+    Ok(Arc::new(ScalarUDF::from(udf_impl)))
+}
+
 #[derive(Debug)]
 struct SqlScalarUdf {
     id: u64,
@@ -220,6 +268,80 @@ struct SqlScalarUdf {
     return_type: DataType,
     arrow_schema: Arc<Schema>,
     physical_expr: Arc<dyn PhysicalExpr>,
+}
+
+#[derive(Debug)]
+struct SqlScalarTableArgUdf {
+    id: u64,
+    name: String,
+    signature: Signature,
+    return_type: DataType,
+    table_func: Arc<SqlTableFunc>,
+}
+
+impl PartialEq for SqlScalarTableArgUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for SqlScalarTableArgUdf {}
+
+impl Hash for SqlScalarTableArgUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl ScalarUDFImpl for SqlScalarTableArgUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, DataFusionError> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(
+        &self,
+        _args: ScalarFunctionArgs,
+    ) -> Result<ColumnarValue, DataFusionError> {
+        Err(DataFusionError::Execution(format!(
+            "SQL scalar function '{}' with table arguments must be rewritten to a scalar subquery before execution",
+            self.name
+        )))
+    }
+
+    fn simplify(
+        &self,
+        args: Vec<Expr>,
+        _info: &dyn SimplifyInfo,
+    ) -> Result<ExprSimplifyResult, DataFusionError> {
+        let provider = self.table_func.call(&args)?;
+        let table_source = provider_as_source(provider);
+        let table_scan = TableScan::try_new(
+            TableReference::bare(format!("{}_result", self.name)),
+            table_source,
+            None,
+            vec![],
+            None,
+        )?;
+        Ok(ExprSimplifyResult::Simplified(Expr::ScalarSubquery(
+            Subquery {
+                subquery: Arc::new(LogicalPlan::TableScan(table_scan)),
+                outer_ref_columns: vec![],
+                spans: Spans::new(),
+            },
+        )))
+    }
 }
 
 impl PartialEq for SqlScalarUdf {
@@ -277,11 +399,12 @@ impl ScalarUDFImpl for SqlScalarUdf {
 /// `args` table.
 pub async fn build_table_udtf(decl: &Function, body: &str) -> Result<Arc<dyn TableFunctionImpl>> {
     let arg_schema = function_arg_schema(&decl.signature.args)?;
+    let table_args = table_arg_specs(&decl.signature.tables)?;
     let output_schema = table_return_schema(decl)?;
     validate_table_body_syntax(body)?;
 
     let validation_args = typed_null_args(arg_schema.as_ref()).context(BuildTableArgsSnafu)?;
-    let ctx = context_with_args(None, Arc::clone(&arg_schema), &validation_args)
+    let ctx = validation_context(Arc::clone(&arg_schema), &validation_args, &table_args)
         .context(BuildTableArgsSnafu)?;
     match ctx.sql(body).await {
         Ok(df) => {
@@ -295,15 +418,36 @@ pub async fn build_table_udtf(decl: &Function, body: &str) -> Result<Arc<dyn Tab
     Ok(Arc::new(SqlTableFunc {
         name: decl.name.clone(),
         arg_schema,
+        table_args,
         output_schema,
         body: body.to_string(),
     }))
+}
+
+#[derive(Clone, Debug)]
+struct TableArgSpec {
+    name: String,
+    schema: SchemaRef,
+}
+
+#[derive(Clone, Debug)]
+enum DynamicTableSource {
+    Table(TableReference),
+    Plan(Arc<LogicalPlan>),
+}
+
+#[derive(Clone, Debug)]
+struct TableArgValue {
+    name: String,
+    schema: SchemaRef,
+    source: DynamicTableSource,
 }
 
 #[derive(Clone)]
 struct SqlTableFunc {
     name: String,
     arg_schema: SchemaRef,
+    table_args: Vec<TableArgSpec>,
     output_schema: SchemaRef,
     body: String,
 }
@@ -313,6 +457,7 @@ impl Debug for SqlTableFunc {
         f.debug_struct("SqlTableFunc")
             .field("name", &self.name)
             .field("arg_schema", &self.arg_schema)
+            .field("table_args", &self.table_args)
             .field("output_schema", &self.output_schema)
             .finish_non_exhaustive()
     }
@@ -320,10 +465,17 @@ impl Debug for SqlTableFunc {
 
 impl TableFunctionImpl for SqlTableFunc {
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let args = table_arg_values(&self.name, self.arg_schema.as_ref(), exprs)?;
+        let (table_args, scalar_exprs) = split_table_and_scalar_exprs(
+            &self.name,
+            &self.table_args,
+            self.arg_schema.as_ref(),
+            exprs,
+        )?;
+        let args = table_arg_values(&self.name, self.arg_schema.as_ref(), scalar_exprs)?;
         Ok(Arc::new(SqlTableProvider {
             name: self.name.clone(),
             arg_schema: Arc::clone(&self.arg_schema),
+            table_args,
             schema: Arc::clone(&self.output_schema),
             body: self.body.clone(),
             args,
@@ -335,6 +487,7 @@ impl TableFunctionImpl for SqlTableFunc {
 struct SqlTableProvider {
     name: String,
     arg_schema: SchemaRef,
+    table_args: Vec<TableArgValue>,
     schema: SchemaRef,
     body: String,
     args: Vec<ScalarValue>,
@@ -361,7 +514,14 @@ impl TableProvider for SqlTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let ctx = context_with_args(Some(state), Arc::clone(&self.arg_schema), &self.args)?;
+        let ctx = context_with_args_and_tables(
+            Some(state),
+            Arc::clone(&self.arg_schema),
+            &self.args,
+            &self.table_args,
+            &self.name,
+        )
+        .await?;
         let mut df = ctx.sql(&self.body).await?;
         validate_output_schema(&self.name, df.schema().as_arrow(), self.schema.as_ref())
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -415,6 +575,40 @@ fn table_return_schema(decl: &Function) -> Result<SchemaRef> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn scalar_return_type(decl: &Function) -> Result<DataType> {
+    match decl.signature.returns.as_ref() {
+        Some(FunctionReturns::Scalar(arrow_type)) => parse_arrow_type(arrow_type),
+        Some(FunctionReturns::Table(_)) => ExpectedScalarReturnTypeSnafu.fail(),
+        None => MissingReturnTypeSnafu.fail(),
+    }
+}
+
+fn table_arg_specs(tables: &[FunctionTableArg]) -> Result<Vec<TableArgSpec>> {
+    let mut names = HashSet::with_capacity(tables.len());
+    tables
+        .iter()
+        .map(|table| {
+            if table.name.eq_ignore_ascii_case(SQL_TABLE_ARGS_TABLE_NAME) {
+                return ReservedInputTableNameSnafu {
+                    table: table.name.clone(),
+                    reserved: SQL_TABLE_ARGS_TABLE_NAME.to_string(),
+                }
+                .fail();
+            }
+            if !names.insert(table.name.to_ascii_lowercase()) {
+                return DuplicateInputTableSnafu {
+                    table: table.name.clone(),
+                }
+                .fail();
+            }
+            Ok(TableArgSpec {
+                name: table.name.clone(),
+                schema: function_arg_schema(&table.columns)?,
+            })
+        })
+        .collect()
 }
 
 fn typed_null_args(schema: &Schema) -> DataFusionResult<Vec<ScalarValue>> {
@@ -516,6 +710,81 @@ fn table_arg_values(
         .collect()
 }
 
+fn split_table_and_scalar_exprs<'a>(
+    function_name: &str,
+    table_args: &[TableArgSpec],
+    scalar_schema: &Schema,
+    exprs: &'a [Expr],
+) -> DataFusionResult<(Vec<TableArgValue>, &'a [Expr])> {
+    if exprs.len() < table_args.len() {
+        return Err(DataFusionError::Plan(format!(
+            "SQL function '{function_name}' expected {} table argument(s) followed by {} scalar argument(s), got {} total argument(s)",
+            table_args.len(),
+            scalar_schema.fields().len(),
+            exprs.len()
+        )));
+    }
+
+    let scalar_exprs = &exprs[table_args.len()..];
+    let table_values = table_args
+        .iter()
+        .zip(&exprs[..table_args.len()])
+        .map(|(arg, expr)| {
+            Ok(TableArgValue {
+                name: arg.name.clone(),
+                schema: Arc::clone(&arg.schema),
+                source: dynamic_table_source_from_expr(function_name, &arg.name, expr)?,
+            })
+        })
+        .collect::<DataFusionResult<Vec<_>>>()?;
+
+    Ok((table_values, scalar_exprs))
+}
+
+fn dynamic_table_source_from_expr(
+    function_name: &str,
+    table_arg_name: &str,
+    expr: &Expr,
+) -> DataFusionResult<DynamicTableSource> {
+    match expr {
+        Expr::Column(column) => Ok(DynamicTableSource::Table(table_ref_from_column_expr(
+            column,
+        ))),
+        Expr::Literal(ScalarValue::Utf8(Some(table)), _) => {
+            Ok(DynamicTableSource::Table(TableReference::parse_str(table)))
+        }
+        Expr::ScalarSubquery(subquery) => {
+            if !subquery.outer_ref_columns.is_empty() {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "SQL function '{function_name}' does not support correlated dynamic table input for argument '{table_arg_name}'"
+                )));
+            }
+            Ok(DynamicTableSource::Plan(Arc::clone(&subquery.subquery)))
+        }
+        other => Err(DataFusionError::Plan(format!(
+            "SQL function '{function_name}' requires table argument '{table_arg_name}' to be a table reference or dynamic table input, got: {other:?}"
+        ))),
+    }
+}
+
+fn table_ref_from_column_expr(column: &Column) -> TableReference {
+    let table: Arc<str> = column.name.clone().into();
+    let schema = column.relation.as_ref().map(TableReference::table);
+    let catalog = column.relation.as_ref().and_then(TableReference::schema);
+    match (catalog, schema) {
+        (None | Some(_), None) => TableReference::Bare { table },
+        (None, Some(schema)) => TableReference::Partial {
+            schema: schema.into(),
+            table,
+        },
+        (Some(catalog), Some(schema)) => TableReference::Full {
+            catalog: catalog.into(),
+            schema: schema.into(),
+            table,
+        },
+    }
+}
+
 fn literal_arg(
     function_name: &str,
     expr: &Expr,
@@ -562,6 +831,49 @@ fn context_with_args(
     let table = MemTable::try_new(schema, vec![vec![batch]])?;
     let _ = ctx.deregister_table(SQL_TABLE_ARGS_TABLE_NAME);
     ctx.register_table(SQL_TABLE_ARGS_TABLE_NAME, Arc::new(table))?;
+    Ok(ctx)
+}
+
+fn validation_context(
+    arg_schema: SchemaRef,
+    values: &[ScalarValue],
+    table_args: &[TableArgSpec],
+) -> DataFusionResult<SessionContext> {
+    let ctx = context_with_args(None, arg_schema, values)?;
+    for table_arg in table_args {
+        let table = MemTable::try_new(
+            Arc::clone(&table_arg.schema),
+            vec![vec![RecordBatch::new_empty(Arc::clone(&table_arg.schema))]],
+        )?;
+        let _ = ctx.deregister_table(&table_arg.name);
+        ctx.register_table(&table_arg.name, Arc::new(table))?;
+    }
+    Ok(ctx)
+}
+
+async fn context_with_args_and_tables(
+    state: Option<&dyn Session>,
+    arg_schema: SchemaRef,
+    values: &[ScalarValue],
+    table_args: &[TableArgValue],
+    function_name: &str,
+) -> DataFusionResult<SessionContext> {
+    let ctx = context_with_args(state, arg_schema, values)?;
+    for table_arg in table_args {
+        let df = match &table_arg.source {
+            DynamicTableSource::Table(table) => ctx.table(table.clone()).await?,
+            DynamicTableSource::Plan(plan) => ctx.execute_logical_plan((**plan).clone()).await?,
+        };
+        validate_input_schema(
+            function_name,
+            &table_arg.name,
+            df.schema().as_arrow(),
+            table_arg.schema.as_ref(),
+        )
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let _ = ctx.deregister_table(&table_arg.name);
+        ctx.register_table(&table_arg.name, df.into_view())?;
+    }
     Ok(ctx)
 }
 
@@ -635,6 +947,45 @@ fn validate_output_schema(function_name: &str, actual: &Schema, expected: &Schem
     Ok(())
 }
 
+fn validate_input_schema(
+    function_name: &str,
+    table_arg_name: &str,
+    actual: &Schema,
+    expected: &Schema,
+) -> Result<()> {
+    let actual_fields = actual.fields();
+    let expected_fields = expected.fields();
+    if actual_fields.len() != expected_fields.len() {
+        return InputSchemaMismatchSnafu {
+            details: format!(
+                "table argument '{table_arg_name}' for function '{function_name}' expected {} column(s) [{}], got {} column(s) [{}]",
+                expected_fields.len(),
+                schema_signature(expected),
+                actual_fields.len(),
+                schema_signature(actual)
+            ),
+        }
+        .fail();
+    }
+
+    for (idx, (actual, expected)) in actual_fields.iter().zip(expected_fields.iter()).enumerate() {
+        if actual.name() != expected.name() || actual.data_type() != expected.data_type() {
+            return InputSchemaMismatchSnafu {
+                details: format!(
+                    "table argument '{table_arg_name}' for function '{function_name}' column {idx} expected '{}: {:?}', got '{}: {:?}'",
+                    expected.name(),
+                    expected.data_type(),
+                    actual.name(),
+                    actual.data_type()
+                ),
+            }
+            .fail();
+        }
+    }
+
+    Ok(())
+}
+
 fn schema_signature(schema: &Schema) -> String {
     schema
         .fields()
@@ -693,9 +1044,9 @@ mod tests {
         Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
     };
     use datafusion::arrow::datatypes::{Field as ArrowField, Int64Type, TimeUnit};
-    use datafusion::prelude::{col, lit};
+    use datafusion::prelude::{SessionContext, col, lit};
     use spicepod::component::function::{
-        FunctionArg, FunctionKind, FunctionReturns, Signature as YamlSignature,
+        FunctionArg, FunctionKind, FunctionReturns, FunctionTableArg, Signature as YamlSignature,
     };
     use std::collections::HashMap;
 
@@ -761,6 +1112,90 @@ mod tests {
             metrics: None,
             as_tool: false,
         }
+    }
+
+    fn dynamic_scalar_table_decl() -> Function {
+        let mut decl = decl(
+            "SELECT sum(value) + offset AS value FROM input CROSS JOIN args GROUP BY offset",
+            vec![("offset", "int64")],
+            "int64",
+        );
+        decl.name = "sum_values".into();
+        decl.signature.tables = vec![FunctionTableArg {
+            name: "input".into(),
+            columns: vec![FunctionArg {
+                name: "value".into(),
+                arrow_type: "int64".into(),
+            }],
+        }];
+        decl
+    }
+
+    fn dynamic_table_decl() -> Function {
+        Function {
+            name: "offset_values".into(),
+            from: "sql".into(),
+            enabled: true,
+            description: None,
+            kind: FunctionKind::Table,
+            volatility: Volatility::Immutable,
+            signature: YamlSignature {
+                tables: vec![FunctionTableArg {
+                    name: "input".into(),
+                    columns: vec![FunctionArg {
+                        name: "value".into(),
+                        arrow_type: "int64".into(),
+                    }],
+                }],
+                args: vec![FunctionArg {
+                    name: "offset".into(),
+                    arrow_type: "int64".into(),
+                }],
+                returns: Some(FunctionReturns::Table(vec![FunctionArg {
+                    name: "value".into(),
+                    arrow_type: "int64".into(),
+                }])),
+            },
+            body: Some("SELECT value + offset AS value FROM input CROSS JOIN args".into()),
+            body_ref: None,
+            metadata: HashMap::new(),
+            params: HashMap::new(),
+            depends_on: vec![],
+            metrics: None,
+            as_tool: false,
+        }
+    }
+
+    fn register_numbers(ctx: &SessionContext) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .expect("record batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table("numbers", Arc::new(table))
+            .expect("register table");
+    }
+
+    async fn filtered_numbers_expr(ctx: &SessionContext) -> Expr {
+        let input_df = ctx
+            .table("numbers")
+            .await
+            .expect("table exists")
+            .filter(col("value").gt(lit(1_i64)))
+            .expect("filters")
+            .select(vec![col("value")])
+            .expect("projects");
+        Expr::ScalarSubquery(Subquery {
+            subquery: Arc::new(input_df.into_unoptimized_plan()),
+            outer_ref_columns: vec![],
+            spans: Spans::new(),
+        })
     }
 
     #[test]
@@ -1133,6 +1568,129 @@ mod tests {
             .await
             .expect("projected query runs");
         assert_eq!(projected[0].num_columns(), 1);
+    }
+
+    #[tokio::test]
+    async fn sql_scalar_udf_accepts_dynamic_table_arg_from_sql_subquery() {
+        let decl = dynamic_scalar_table_decl();
+        let udf = build_scalar_udf(&decl, decl.body.as_deref().expect("test")).expect("builds");
+
+        let ctx = SessionContext::new();
+        register_numbers(&ctx);
+        ctx.register_udf(udf.as_ref().clone());
+
+        let results = ctx
+            .sql(
+                "WITH filtered AS (SELECT value FROM numbers WHERE value > 1) \
+                 SELECT sum_values((SELECT value FROM filtered), 10) AS total",
+            )
+            .await
+            .expect("sql compiles")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[15_i64]);
+    }
+
+    #[tokio::test]
+    async fn sql_scalar_udf_accepts_dynamic_table_arg_via_dataframe_api() {
+        let decl = dynamic_scalar_table_decl();
+        let udf = build_scalar_udf(&decl, decl.body.as_deref().expect("test")).expect("builds");
+
+        let ctx = SessionContext::new();
+        register_numbers(&ctx);
+        ctx.register_udf(udf.as_ref().clone());
+        let input_expr = filtered_numbers_expr(&ctx).await;
+
+        let results = ctx
+            .table("numbers")
+            .await
+            .expect("table exists")
+            .limit(0, Some(1))
+            .expect("limits outer input")
+            .select(vec![udf.call(vec![input_expr, lit(10_i64)]).alias("total")])
+            .expect("projects scalar UDF")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[15_i64]);
+    }
+
+    #[tokio::test]
+    async fn sql_table_udtf_accepts_dynamic_table_arg_from_sql_subquery() {
+        let decl = dynamic_table_decl();
+        let udtf = build_table_udtf(&decl, decl.body.as_deref().expect("test"))
+            .await
+            .expect("builds");
+
+        let ctx = SessionContext::new();
+        register_numbers(&ctx);
+        ctx.register_udtf(&decl.name, udtf);
+
+        let results = ctx
+            .sql(
+                "WITH filtered AS (SELECT value FROM numbers WHERE value > 1) \
+                 SELECT value FROM offset_values((SELECT value FROM filtered), 10) ORDER BY value",
+            )
+            .await
+            .expect("sql compiles")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[12_i64, 13]);
+    }
+
+    #[tokio::test]
+    async fn sql_table_udtf_accepts_dynamic_table_arg_via_dataframe_api() {
+        let decl = dynamic_table_decl();
+        let udtf = build_table_udtf(&decl, decl.body.as_deref().expect("test"))
+            .await
+            .expect("builds");
+
+        let ctx = SessionContext::new();
+        register_numbers(&ctx);
+        ctx.register_udtf(&decl.name, udtf);
+        let input_expr = filtered_numbers_expr(&ctx).await;
+        let provider = ctx
+            .table_function(&decl.name)
+            .expect("registered UDTF")
+            .create_table_provider(&[input_expr, lit(10_i64)])
+            .expect("creates table provider");
+        ctx.register_table("offset_values_result", provider)
+            .expect("register UDTF result");
+
+        let results = ctx
+            .table("offset_values_result")
+            .await
+            .expect("table exists")
+            .sort_by(vec![col("value")])
+            .expect("sorts")
+            .select(vec![col("value")])
+            .expect("projects")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+        assert_eq!(values.values(), &[12_i64, 13]);
     }
 
     #[tokio::test]
