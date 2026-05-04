@@ -28,8 +28,8 @@ use governor::{
 use http::{HeaderValue, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::{
-    body::{self, Incoming},
-    header::CONTENT_TYPE,
+    body::Incoming,
+    header::{CONTENT_TYPE, RETRY_AFTER},
     server::conn::http1::Builder,
 };
 use hyper_util::rt::TokioIo;
@@ -42,6 +42,7 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::net::ToSocketAddrs;
+use std::time::Duration;
 use std::{fmt::Debug, sync::Arc};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -53,6 +54,13 @@ const PERCENTILES: [f64; 4] = [50.0, 90.0, 95.0, 99.0];
 /// Query parameter for requesting cluster-wide metrics.
 const SCOPE_PARAM: &str = "scope";
 const SCOPE_CLUSTER: &str = "cluster";
+
+fn retry_after_seconds(wait_time: Duration) -> u64 {
+    wait_time
+        .as_secs()
+        .saturating_add(u64::from(wait_time.subsec_nanos() > 0))
+        .max(1)
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -166,7 +174,7 @@ async fn serve_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let service = hyper::service::service_fn(move |req: Request<body::Incoming>| {
+    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
         let prometheus_registry = prometheus_registry.clone();
         let cluster_collector = cluster_collector.clone();
         let rate_limiter = rate_limiter.clone();
@@ -207,28 +215,27 @@ fn parse_query_string(query: &str) -> HashMap<String, String> {
         .collect()
 }
 
-async fn handle_http_request(
+async fn handle_http_request<B>(
     prometheus_registry: &prometheus::Registry,
     cluster_collector: Option<&ClusterMetricsCollector>,
     rate_limiter: Option<&DirectRateLimiter>,
-    req: &Request<Incoming>,
+    req: &Request<B>,
 ) -> Response<Full<Bytes>> {
     let mut response = Response::new(if req.uri().path() == "/health" {
         "OK".into()
     } else {
         // Check rate limit for metrics requests (not /health).
         if let Some(Err(wait_time)) = rate_limiter.map(DirectRateLimiter::check) {
-            let retry_after = wait_time
-                .wait_time_from(DefaultClock::default().now())
-                .as_secs();
+            let retry_after =
+                retry_after_seconds(wait_time.wait_time_from(DefaultClock::default().now()));
             let mut resp = Response::new(Full::from(format!(
                 "Too many requests. Retry after {retry_after} seconds.\n"
             )));
             *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
             let headers = resp.headers_mut();
-            headers.append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
             if let Ok(val) = HeaderValue::from_str(&retry_after.to_string()) {
-                headers.append("retry-after", val);
+                headers.insert(RETRY_AFTER, val);
             }
             return resp;
         }
@@ -642,6 +649,8 @@ fn histogram_to_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use governor::Quota;
+    use std::num::NonZeroU32;
 
     fn assert_float_eq(a: f64, b: f64) {
         assert!(
@@ -816,6 +825,34 @@ mod tests {
 
         let params = parse_query_string("");
         assert!(params.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_http_request_rate_limit_returns_retry_after() {
+        let registry = prometheus::Registry::new();
+        let rate_limiter = RateLimiter::direct(Quota::per_minute(
+            NonZeroU32::new(1).expect("test quota must be non-zero"),
+        ));
+        let request = Request::builder()
+            .uri("/metrics")
+            .body(())
+            .expect("test request should build");
+
+        let first = handle_http_request(&registry, None, Some(&rate_limiter), &request).await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = handle_http_request(&registry, None, Some(&rate_limiter), &request).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let retry_after = second
+            .headers()
+            .get(RETRY_AFTER)
+            .expect("Retry-After header should be present")
+            .to_str()
+            .expect("Retry-After header should be ASCII")
+            .parse::<u64>()
+            .expect("Retry-After header should be an integer");
+        assert!(retry_after >= 1);
     }
 
     #[test]

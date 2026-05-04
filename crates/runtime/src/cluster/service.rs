@@ -64,6 +64,7 @@ use secrecy::ExposeSecret;
 use spicepod::component::runtime;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use governor::{
     RateLimiter,
@@ -181,6 +182,13 @@ impl ExecutorControlStreamRegistry {
 
 type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
 
+fn retry_after_seconds(wait_time: Duration) -> u64 {
+    wait_time
+        .as_secs()
+        .saturating_add(u64::from(wait_time.subsec_nanos() > 0))
+        .max(1)
+}
+
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
     app: Arc<TokioRwLock<Option<Arc<App>>>>,
@@ -288,9 +296,8 @@ impl ClusterServiceImpl {
     /// status if the limit is exceeded.
     fn check_metrics_rate_limit(&self) -> Result<(), Status> {
         if let Err(wait_time) = self.metrics_rate_limiter.check() {
-            let retry_after_secs = wait_time
-                .wait_time_from(DefaultClock::default().now())
-                .as_secs();
+            let retry_after_secs =
+                retry_after_seconds(wait_time.wait_time_from(DefaultClock::default().now()));
             tracing::trace!(
                 "Cluster metrics request rate-limited, retry after {retry_after_secs}s"
             );
@@ -1037,6 +1044,74 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use governor::Quota;
+    use std::num::NonZeroU32;
+
+    async fn make_test_service(metrics_limit: u32) -> ClusterServiceImpl {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = Arc::new(
+            DataFusion::builder(
+                crate::status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let cluster_state = Arc::new(runtime_cluster::ClusterStateStore::new(store, ""));
+        cluster_state
+            .bootstrap()
+            .await
+            .expect("cluster state should bootstrap");
+        let executor_registry = Arc::new(ExecutorRegistry::new(
+            Arc::new(runtime_cluster::PartitionStore::accelerations(Arc::clone(
+                &cluster_state,
+            ))),
+            Arc::new(runtime_cluster::PartitionStore::catalog(Arc::clone(
+                &cluster_state,
+            ))),
+        ));
+
+        ClusterServiceImpl::new(
+            Arc::new(TokioRwLock::new(None)),
+            Arc::new(TokioRwLock::new(Secrets::default())),
+            "127.0.0.1:0".to_string(),
+            Arc::new(TokioRwLock::new(HashMap::new())),
+            datafusion,
+            executor_registry,
+            None,
+            true,
+            RateLimiter::direct(Quota::per_minute(
+                NonZeroU32::new(metrics_limit).expect("test quota must be non-zero"),
+            )),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_rate_limit_returns_retry_after() {
+        let service = make_test_service(1).await;
+
+        ClusterService::get_metrics(&service, Request::new(GetMetricsRequest {}))
+            .await
+            .expect("first metrics request should be under quota");
+
+        let error = ClusterService::get_metrics(&service, Request::new(GetMetricsRequest {}))
+            .await
+            .expect_err("second metrics request should be rate-limited");
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        let retry_after = error
+            .metadata()
+            .get("retry-after")
+            .expect("retry-after metadata should be present")
+            .to_str()
+            .expect("retry-after metadata should be ASCII")
+            .parse::<u64>()
+            .expect("retry-after metadata should be an integer");
+        assert!(retry_after >= 1);
+    }
 
     #[test]
     fn test_rewrite_task_history_sql_simple() {

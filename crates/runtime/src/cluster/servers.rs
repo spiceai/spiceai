@@ -25,7 +25,6 @@ use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
-use runtime_auth::layer::grpc::make_interceptor;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -58,7 +57,6 @@ fn server_with_cluster_mtls(
 /// This server should only be started when running in scheduler mode.
 pub async fn start_internal_cluster_server(
     rt: Arc<Runtime>,
-    endpoint_auth: EndpointAuth,
     shutdown_signal: Option<CancellationToken>,
     executor_registry: Arc<ExecutorRegistry>,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
@@ -140,11 +138,7 @@ pub async fn start_internal_cluster_server(
         )
     };
 
-    // Wire gRPC auth interceptor when API key auth is configured.
-    // This enforces x-api-key verification on all ClusterService RPCs.
-    let interceptor = make_interceptor(endpoint_auth.grpc_auth);
-    let cluster_service_server =
-        ClusterServiceServer::with_interceptor(cluster_service, interceptor);
+    let cluster_service_server = ClusterServiceServer::new(cluster_service);
 
     let server = server
         .add_service(scheduler_grpc_server)

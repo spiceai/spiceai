@@ -1023,7 +1023,6 @@ impl Runtime {
             }) => {
                 let fut = cluster::initialize_cluster_scheduler_future(
                     &self,
-                    endpoint_auth.clone(),
                     Arc::clone(executor_registry),
                     Arc::clone(peers),
                 )

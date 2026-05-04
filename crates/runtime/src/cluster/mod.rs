@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::Error::{self, FailedToStartClusterExecutor};
-use crate::auth::EndpointAuth;
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::cluster::partition::{
     executor_request_initial_partitions,
@@ -794,7 +793,6 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 
 pub(crate) async fn initialize_cluster_scheduler_future(
     rt: &Arc<Runtime>,
-    endpoint_auth: EndpointAuth,
     scheduler_executor_registry: Arc<ExecutorRegistry>,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 ) -> crate::Result<Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'static>>>> {
@@ -808,7 +806,6 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     let internal_server_fut = async move {
         start_internal_cluster_server(
             internal_server_rt,
-            endpoint_auth,
             Some(cloned_shutdown),
             scheduler_executor_registry_clone,
             internal_server_peers,
