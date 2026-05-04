@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests verifying DuckDB HNSW vector indexes.
+//! Integration tests verifying `DuckDB` HNSW vector indexes.
 //!
 //! Uses a native `DuckDbConnectionPool` (post-shutdown) to query `duckdb_indexes()`
 //! and confirm that the HNSW index exists on the correct underlying table.
@@ -142,7 +142,7 @@ async fn refresh_table(rt: &Arc<Runtime>, table_name: &str) -> Result<(), anyhow
     Ok(())
 }
 
-/// Run a SQL query through the runtime's DataFusion context.
+/// Run a SQL query through the runtime's `DataFusion` context.
 async fn execute_sql(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let mut result = rt.datafusion().query_builder(sql).build().run().await?;
     let mut batches = Vec::new();
@@ -152,7 +152,7 @@ async fn execute_sql(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, a
     Ok(batches)
 }
 
-/// Open a native DuckDB connection and return HNSW index info.
+/// Open a native `DuckDB` connection and return HNSW index info.
 /// Must be called after the runtime is fully shut down and dropped.
 async fn query_native_duckdb_indexes(
     db_path: &str,
@@ -196,7 +196,7 @@ async fn query_native_duckdb_indexes(
 }
 
 /// Verifies HNSW index exists after initial load and survives a full (overwrite) refresh.
-/// After shutdown, queries the DuckDB file directly to confirm the index is on the correct
+/// After shutdown, queries the `DuckDB` file directly to confirm the index is on the correct
 /// internal data table.
 #[tokio::test]
 async fn test_hnsw_index_created_after_full_refresh() -> Result<(), anyhow::Error> {
