@@ -90,22 +90,28 @@
         "$ref": "#/$defs/ComponentOrReference5"
       }
     },
-    "tools": {
+    "rerankers": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference6"
       }
     },
-    "workers": {
+    "tools": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference7"
       }
     },
-    "functions": {
+    "workers": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference8"
+      }
+    },
+    "functions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ComponentOrReference9"
       }
     },
     "dependencies": {
@@ -438,6 +444,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Auth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "authorization": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Authorization"
             },
             {
               "type": "null"
@@ -940,12 +956,7 @@
           "default": "none"
         },
         "captured_context": {
-          "type": "string",
-          "enum": [
-            "redacted",
-            "truncated",
-            "full"
-          ],
+          "$ref": "#/$defs/TaskHistoryCapturedContext",
           "default": "truncated"
         },
         "retention_period": {
@@ -976,6 +987,14 @@
         }
       },
       "additionalProperties": false
+    },
+    "TaskHistoryCapturedContext": {
+      "type": "string",
+      "enum": [
+        "redacted",
+        "truncated",
+        "full"
+      ]
     },
     "Auth": {
       "type": "object",
@@ -1134,6 +1153,151 @@
             "type": "string"
           },
           "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "Authorization": {
+      "description": "Cedar-based authorization configuration.\n\nExample YAML:\n```yaml\nauthorization:\n  enabled: true\n  default: allow\n  provider: local\n  policies:\n    - name: analysts-read-only\n      cedar: |\n        permit(\n          principal in Spice::Role::\"analyst\",\n          action == Spice::Action::\"query\",\n          resource\n        );\n    - name: block-pii\n      path: ./policies/block-pii.cedar\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "default": {
+          "description": "Controls behavior when no policy matches: `allow` (default) or `deny`.",
+          "$ref": "#/$defs/AuthorizationDefault",
+          "default": "allow"
+        },
+        "provider": {
+          "description": "Policy source: `local` (inline/file), `operator`, or `cloud`.",
+          "$ref": "#/$defs/AuthorizationProvider",
+          "default": "local"
+        },
+        "policies": {
+          "description": "Inline and file-based Cedar policy definitions (used with `provider: local`).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PolicyDefinition"
+          },
+          "default": []
+        },
+        "operator": {
+          "description": "Configuration for fetching policies from the Spice K8s Operator.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OperatorPolicyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cloud": {
+          "description": "Configuration for fetching policies from Spice Cloud.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CloudPolicyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AuthorizationDefault": {
+      "description": "Controls the default authorization decision when no policy matches.",
+      "oneOf": [
+        {
+          "description": "Permit requests that no policy explicitly matches (default).",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "Deny requests that no policy explicitly permits.",
+          "type": "string",
+          "const": "deny"
+        }
+      ]
+    },
+    "AuthorizationProvider": {
+      "description": "The source of Cedar authorization policies.",
+      "oneOf": [
+        {
+          "description": "Read policies from inline Cedar text and/or local `.cedar` files.",
+          "type": "string",
+          "const": "local"
+        },
+        {
+          "description": "Fetch policies from the Spice K8s Operator API.",
+          "type": "string",
+          "const": "operator"
+        },
+        {
+          "description": "Fetch policies from the Spice Cloud Management API.",
+          "type": "string",
+          "const": "cloud"
+        }
+      ]
+    },
+    "PolicyDefinition": {
+      "description": "A single Cedar policy definition in the spicepod configuration.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "A human-readable name for this policy.",
+          "type": "string"
+        },
+        "cedar": {
+          "description": "Inline Cedar policy text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Path to a `.cedar` file (resolved relative to spicepod.yaml).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "OperatorPolicyConfig": {
+      "description": "Configuration for the K8s Operator policy provider.",
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "description": "The operator API endpoint for fetching policies.",
+          "type": "string"
+        },
+        "poll_interval": {
+          "description": "How often to poll for policy updates (e.g. `\"30s\"`).",
+          "type": "string",
+          "default": "30s"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "endpoint"
+      ]
+    },
+    "CloudPolicyConfig": {
+      "description": "Configuration for the Spice Cloud policy provider.",
+      "type": "object",
+      "properties": {
+        "poll_interval": {
+          "description": "How often to poll for policy updates (e.g. `\"60s\"`).",
+          "type": "string",
+          "default": "60s"
         }
       },
       "additionalProperties": false
@@ -1428,7 +1592,7 @@
       }
     },
     "Secret": {
-      "description": "The secrets configuration for a Spicepod.\n\nExample:\n```yaml\nsecrets:\n  - from: env\n    name: env\n  - from: kubernetes:my_secret_name\n    name: k8s\n```",
+      "description": "The secrets configuration for a Spicepod.\n\nEach entry selects a secret store via `from: <provider>[:<selector>]` and\nmay pass provider-specific configuration through `params:`.\n\n`params:` values may reference environment variables using the same\n`${ env:KEY }` / `${ secrets:KEY }` syntax used elsewhere in the\nspicepod. At this bootstrap point only the env store is loaded, so\n`secrets:KEY` resolves against env as well; references to other stores\nare rejected.\n\nExample:\n```yaml\nsecrets:\n  - from: env\n    name: env\n    params:\n      file_path: .env.local\n  - from: kubernetes:my_secret_name\n    name: k8s\n    params:\n      namespace: spice\n  - from: aws_secrets_manager:my-secret\n    name: aws\n    params:\n      region: ${ env:AWS_REGION }\n      key: ${ env:AWS_ACCESS_KEY_ID }\n      secret: ${ env:AWS_SECRET_ACCESS_KEY }\n  - from: azure_keyvault:my-vault\n    name: azure\n    params:\n      auth_method: service_principal\n      tenant_id: ${ env:AZURE_TENANT_ID }\n      client_id: ${ env:AZURE_CLIENT_ID }\n      client_secret: ${ env:AZURE_CLIENT_SECRET }\n```",
       "type": "object",
       "properties": {
         "from": {
@@ -2361,6 +2525,10 @@
             "$ref": "#/$defs/OnConflictBehavior"
           }
         },
+        "write_mode": {
+          "description": "Controls write behavior for read-write accelerated datasets.\nOnly applies when `access: read_write` and the dataset is accelerated.",
+          "$ref": "#/$defs/WriteMode"
+        },
         "metrics": {
           "anyOf": [
             {
@@ -2670,6 +2838,14 @@
         "upsert",
         "upsert_dedup",
         "upsert_dedup_by_row_id"
+      ]
+    },
+    "WriteMode": {
+      "description": "Controls the write behavior for accelerated read-write datasets.\n\n- `write_through` (default): Writes go to the federated source (e.g. Postgres)\n  synchronously. The user receives confirmation after a full ACID commit to the\n  source. The local accelerator is updated via the normal refresh mechanism\n  (e.g. WAL replication with `refresh_mode: changes`).\n\n- `write_back`: Writes commit to the local accelerator first and return after\n  that accelerator commit completes. The same mutation is then forwarded to\n  the federated source asynchronously, so the source may lag and source\n  persistence failures are logged rather than returned to the caller. This\n  mode requires `replication.enabled: true` as an explicit opt-in to those\n  asynchronous source durability semantics.",
+      "type": "string",
+      "enum": [
+        "write_through",
+        "write_back"
       ]
     },
     "PartitionedBySchema": {
@@ -3244,6 +3420,58 @@
     "ComponentOrReference6": {
       "anyOf": [
         {
+          "$ref": "#/$defs/Reranker"
+        },
+        {
+          "$ref": "#/$defs/ComponentReference"
+        }
+      ]
+    },
+    "Reranker": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "name"
+      ]
+    },
+    "ComponentOrReference7": {
+      "anyOf": [
+        {
           "$ref": "#/$defs/Tool"
         },
         {
@@ -3293,6 +3521,22 @@
               "type": "null"
             }
           ]
+        },
+        "as_sql": {
+          "description": "Whether this tool is also callable as a SQL UDF. Defaults to\n`false`; set to `true` to also register a `DataFusion` `ScalarUDF`\nthat invokes this tool per-row.\n\nRequires [`Self::signature`] to be set with typed Arrow arg /\nreturn types — a tool's free-form JSON Schema does not uniquely\nmap to a SQL signature, so the author must pin types explicitly.",
+          "type": "boolean",
+          "default": false
+        },
+        "signature": {
+          "description": "Typed signature for SQL invocation when [`Self::as_sql`] is true.\nIgnored otherwise.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Signature"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -3301,7 +3545,57 @@
         "name"
       ]
     },
-    "ComponentOrReference7": {
+    "Signature": {
+      "description": "Typed function signature.\n\nFor scalar / aggregate / window functions, `returns` names the output\nArrow type. For table functions (UDTFs), `returns_schema` names the\noutput columns instead.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "description": "Positional argument list. Empty for niladic functions.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FunctionArg"
+          }
+        },
+        "returns": {
+          "description": "Return Arrow type. Required for non-table kinds; ignored for\n[`FunctionKind::Table`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returns_schema": {
+          "description": "Output schema for table functions. Required for\n[`FunctionKind::Table`]; ignored otherwise.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FunctionArg"
+          }
+        },
+        "null_aware": {
+          "description": "Whether the function handles NULL inputs itself. When false (the\ndefault), `DataFusion` short-circuits any call with a NULL argument\nto a NULL result without invoking the function — matching Spark's\ndefault semantics and avoiding a whole class of NPE-style bugs.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "FunctionArg": {
+      "description": "A single named argument or output column.\n\nThe `type` field is an Arrow logical-type string (e.g. `float64`,\n`utf8`, `list<int32>`, `decimal(38, 10)`, `timestamp(us, utc)`). The\nparser retains it verbatim; validation happens at factory-build time\nagainst [`arrow::datatypes::DataType::try_from`].",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ]
+    },
+    "ComponentOrReference8": {
       "anyOf": [
         {
           "$ref": "#/$defs/Worker"
@@ -3415,7 +3709,7 @@
         }
       ]
     },
-    "ComponentOrReference8": {
+    "ComponentOrReference9": {
       "anyOf": [
         {
           "$ref": "#/$defs/Function"
@@ -3426,11 +3720,11 @@
       ]
     },
     "Function": {
-      "description": "A user-defined SQL function registered into the DataFusion session context.\n\nFour kinds are supported:\n  * [`FunctionKind::Scalar`]   — row-in, row-out (one result value per input row).\n  * [`FunctionKind::Aggregate`]— many-rows-in, one-value-out.\n  * [`FunctionKind::Window`]   — row-in + frame, row-out.\n  * [`FunctionKind::Table`]    — args-in, many-rows-out (UDTF).\n\nThe `from` field selects the execution tier:\n  * `sql`                           — inline SQL body (tier T0, in-process, no sandbox).\n  * `wasm:./path.wasm` | `wasm:oci://…` — WebAssembly component (tier T1, sandboxed).\n  * `http://…` | `https://…` | `grpc://…` | `flight://…` — remote endpoint (tier T2).\n\nPhase 1 implements `sql` only; additional schemes are accepted by the parser\nbut rejected at registration time with a clear error until their factories ship.",
+      "description": "A user-defined SQL function registered into the `DataFusion` session context.\n\nFour kinds are defined:\n  * [`FunctionKind::Scalar`] — row-in, row-out (one result value per input row).\n  * [`FunctionKind::Aggregate`] — many-rows-in, one-value-out.\n  * [`FunctionKind::Window`] — row-in + frame, row-out.\n  * [`FunctionKind::Table`] — args-in, many-rows-out (UDTF).\n\nToday only [`FunctionKind::Scalar`] is wired end-to-end; the other kinds\nparse but are rejected at registration time until their factories ship.\n\nThe `from` field selects the execution tier:\n  * `sql` — inline SQL body (tier T0, in-process, no sandbox).\n  * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).\n  * `wasm:./path.wasm` | `wasm:oci://…` — WebAssembly component (tier T1, sandboxed, roadmap).\n  * `grpc://…` | `flight://…` — additional remote transports (roadmap).\n\nCurrently registered at runtime: `sql`, `http://…`, `https://…`. Other\nschemes are accepted by the parser (so forward-compatible spicepods\nload) but rejected at registration time with a clear error until their\nfactories ship.",
       "type": "object",
       "properties": {
         "name": {
-          "description": "The identifier the function is registered under in the DataFusion\nsession context and referenced by in SQL queries.",
+          "description": "The identifier the function is registered under in the `DataFusion`\nsession context and referenced by in SQL queries.",
           "type": "string"
         },
         "from": {
@@ -3459,7 +3753,14 @@
           "$ref": "#/$defs/Signature"
         },
         "body": {
-          "description": "Inline function body. Required when `from: sql`; forbidden otherwise.",
+          "description": "Inline function body. Mutually exclusive with [`body_ref`].\nExactly one of the two must be set when `from: sql`; neither may be\nset for non-SQL `from:` schemes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_ref": {
+          "description": "Reference to a file whose contents are the function body. Path is\nresolved relative to the runtime's current working directory, matching\nthe convention used by every other file-path field in spicepod. Lets\nauthors keep non-trivial SQL in its own file with proper editor support\ninstead of embedding it inline.\n\nMutually exclusive with [`body`].",
           "type": [
             "string",
             "null"
@@ -3492,6 +3793,11 @@
               "type": "null"
             }
           ]
+        },
+        "as_tool": {
+          "description": "Whether this function is also exposed as an LLM tool. Defaults to\n`true` — every declared function automatically becomes callable\nboth via SQL (`SELECT my_fn(x)`) and via the tool registry (LLM\ntool-calling, `POST /v1/tools/<name>`, `/v1/tools` listing).\n\nSet to `false` to keep the function SQL-only.",
+          "type": "boolean",
+          "default": true
         }
       },
       "additionalProperties": false,
@@ -3502,7 +3808,7 @@
       ]
     },
     "FunctionKind": {
-      "description": "Distinguishes the four DataFusion UDF flavours.",
+      "description": "Distinguishes the four `DataFusion` UDF flavours.",
       "type": "string",
       "enum": [
         "scalar",
@@ -3529,56 +3835,6 @@
           "type": "string",
           "const": "volatile"
         }
-      ]
-    },
-    "Signature": {
-      "description": "Typed function signature.\n\nFor scalar / aggregate / window functions, `returns` names the output\nArrow type. For table functions (UDTFs), `returns_schema` names the\noutput columns instead.",
-      "type": "object",
-      "properties": {
-        "args": {
-          "description": "Positional argument list. Empty for niladic functions.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/FunctionArg"
-          }
-        },
-        "returns": {
-          "description": "Return Arrow type. Required for non-table kinds; ignored for\n[`FunctionKind::Table`].",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "returns_schema": {
-          "description": "Output schema for table functions. Required for\n[`FunctionKind::Table`]; ignored otherwise.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/FunctionArg"
-          }
-        },
-        "null_aware": {
-          "description": "Whether the function handles NULL inputs itself. When false (the\ndefault), DataFusion short-circuits any call with a NULL argument\nto a NULL result without invoking the function — matching Spark's\ndefault semantics and avoiding a whole class of NPE-style bugs.",
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "additionalProperties": false
-    },
-    "FunctionArg": {
-      "description": "A single named argument or output column.\n\nThe `type` field is an Arrow logical-type string (e.g. `float64`,\n`utf8`, `list<int32>`, `decimal(38, 10)`, `timestamp(us, utc)`). The\nparser retains it verbatim; validation happens at factory-build time\nagainst [`arrow::datatypes::DataType::try_from`].",
-      "type": "object",
-      "properties": {
-        "name": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "name",
-        "type"
       ]
     },
     "AbfsDataConnectorParams": {
@@ -4307,6 +4563,11 @@
           "description": "Behavior when stream lag exceeds shard retention (24h). 'error' marks dataset as Error, 'ready_before_load' marks Ready then re-bootstraps, 'ready_after_load' re-bootstraps then marks Ready",
           "type": "string",
           "default": "error"
+        },
+        "write_parallelism": {
+          "description": "Number of parallel operations for writing and deleting data to DynamoDB",
+          "type": "string",
+          "default": "10"
         }
       },
       "required": [
@@ -4857,15 +5118,25 @@
           "x-secret": true
         },
         "glue_region": {
+          "description": "AWS region for the S3 bucket (e.g. 'us-east-1').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "us-east-1",
+            "eu-west-1"
+          ],
           "x-secret": true
         },
         "glue_endpoint": {
+          "description": "Custom S3-compatible endpoint URL. Leave empty for AWS S3.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "https://s3.us-east-1.amazonaws.com",
+            "http://minio.local:9000"
+          ],
           "x-secret": true
         },
         "glue_url_style": {
-          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.",
+          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "enum": [
             "vhost",
@@ -4873,24 +5144,36 @@
           ]
         },
         "glue_key": {
+          "description": "AWS access key ID (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "glue_secret": {
+          "description": "AWS secret access key (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "glue_session_token": {
+          "description": "Temporary AWS session token (used with STS credentials).\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "glue_auth": {
-          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.",
+          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "iam_role",
+            "key"
+          ],
+          "enum": [
+            "public",
+            "iam_role",
+            "key"
+          ],
           "x-secret": true
         },
         "glue_iam_role_source": {
-          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
+          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "enum": [
             "auto",
@@ -4899,17 +5182,24 @@
           ]
         },
         "glue_versioning": {
-          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.",
+          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "default": "enabled"
         },
         "client_timeout": {
-          "description": "The timeout setting for S3 client.",
-          "type": "string"
+          "description": "The timeout setting for S3 client.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "30s"
+          ]
         },
         "allow_http": {
-          "description": "Allow HTTP protocol for S3 endpoint.",
-          "type": "string"
+          "description": "Allow HTTP protocol for S3 endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
         },
         "file_format": {
           "type": "string"
@@ -5320,6 +5610,26 @@
           "description": "Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB).",
           "type": "string"
         },
+        "request_header_filters": {
+          "description": "Set to 'enabled' or 'disabled' to control whether request_headers filters can be pushed down as dynamic HTTP request headers.",
+          "type": "string",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        },
+        "request_header_allowlist": {
+          "description": "Comma-separated list of HTTP request header names that request_headers filters may set. Required when request_header_filters is enabled.",
+          "type": "string"
+        },
+        "max_request_headers_length": {
+          "description": "Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB).",
+          "type": "string"
+        },
+        "max_request_partitions": {
+          "description": "Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped.",
+          "type": "string"
+        },
         "health_probe": {
           "description": "Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted.",
           "type": "string"
@@ -5610,6 +5920,26 @@
         },
         "max_request_body_bytes": {
           "description": "Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB).",
+          "type": "string"
+        },
+        "request_header_filters": {
+          "description": "Set to 'enabled' or 'disabled' to control whether request_headers filters can be pushed down as dynamic HTTP request headers.",
+          "type": "string",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        },
+        "request_header_allowlist": {
+          "description": "Comma-separated list of HTTP request header names that request_headers filters may set. Required when request_header_filters is enabled.",
+          "type": "string"
+        },
+        "max_request_headers_length": {
+          "description": "Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB).",
+          "type": "string"
+        },
+        "max_request_partitions": {
+          "description": "Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped.",
           "type": "string"
         },
         "health_probe": {
@@ -5950,36 +6280,50 @@
       "type": "object",
       "properties": {
         "kafka_bootstrap_servers": {
-          "description": "A list of host/port pairs for establishing the initial Kafka cluster connection.",
-          "type": "string"
+          "description": "A list of host/port pairs for establishing the initial Kafka cluster connection.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
+          "type": "string",
+          "examples": [
+            "broker1.kafka.internal:9092,broker2.kafka.internal:9092"
+          ]
         },
         "kafka_security_protocol": {
-          "description": "Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'.",
+          "description": "Security protocol for Kafka connections. Default: 'sasl_ssl'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
-          "default": "sasl_ssl"
+          "default": "sasl_ssl",
+          "enum": [
+            "plaintext",
+            "ssl",
+            "sasl_plaintext",
+            "sasl_ssl"
+          ]
         },
         "kafka_sasl_mechanism": {
-          "description": "SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'.",
+          "description": "SASL authentication mechanism. Default: 'SCRAM-SHA-512'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
-          "default": "SCRAM-SHA-512"
+          "default": "SCRAM-SHA-512",
+          "enum": [
+            "PLAIN",
+            "SCRAM-SHA-256",
+            "SCRAM-SHA-512"
+          ]
         },
         "kafka_sasl_username": {
-          "description": "SASL username.",
+          "description": "SASL username.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "x-secret": true
         },
         "kafka_sasl_password": {
-          "description": "SASL password.",
+          "description": "SASL password.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "x-secret": true
         },
         "kafka_ssl_ca_location": {
-          "description": "Path to the SSL/TLS CA certificate file for server verification.",
+          "description": "Path to the SSL/TLS CA certificate file for server verification.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "x-secret": true
         },
         "kafka_enable_ssl_certificate_verification": {
-          "description": "Enable SSL/TLS certificate verification. Default: 'true'.",
+          "description": "Enable SSL/TLS certificate verification. Default: 'true'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "true",
           "enum": [
@@ -5988,7 +6332,7 @@
           ]
         },
         "kafka_ssl_endpoint_identification_algorithm": {
-          "description": "SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'.",
+          "description": "SSL/TLS endpoint identification algorithm. Default: 'https'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "https",
           "enum": [
@@ -5997,12 +6341,12 @@
           ]
         },
         "schema_infer_max_records": {
-          "description": "Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure.",
+          "description": "Number of Kafka messages to sample for schema inference. Increase if your data has optional fields or varying structure.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "1"
         },
         "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
+          "description": "Set true to flatten nested structs in JSON as separate columns.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "enum": [
             "true",
@@ -6010,16 +6354,16 @@
           ]
         },
         "kafka_consumer_group_id": {
-          "description": "Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.",
+          "description": "Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string"
         },
         "batch_max_size": {
-          "description": "Maximum number of change events to batch together before processing",
+          "description": "Maximum number of change events to batch together before processing.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "10000"
         },
         "batch_max_duration": {
-          "description": "Maximum time to wait for a batch to fill before processing",
+          "description": "Maximum time to wait for a batch to fill before processing.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "default": "1s"
         }
@@ -6046,15 +6390,25 @@
       "type": "object",
       "properties": {
         "s3_region": {
+          "description": "AWS region for the S3 bucket (e.g. 'us-east-1').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "us-east-1",
+            "eu-west-1"
+          ],
           "x-secret": true
         },
         "s3_endpoint": {
+          "description": "Custom S3-compatible endpoint URL. Leave empty for AWS S3.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "https://s3.us-east-1.amazonaws.com",
+            "http://minio.local:9000"
+          ],
           "x-secret": true
         },
         "s3_url_style": {
-          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.",
+          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "enum": [
             "vhost",
@@ -6062,24 +6416,36 @@
           ]
         },
         "s3_key": {
+          "description": "AWS access key ID (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "s3_secret": {
+          "description": "AWS secret access key (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "s3_session_token": {
+          "description": "Temporary AWS session token (used with STS credentials).\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "x-secret": true
         },
         "s3_auth": {
-          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.",
+          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
+          "examples": [
+            "iam_role",
+            "key"
+          ],
+          "enum": [
+            "public",
+            "iam_role",
+            "key"
+          ],
           "x-secret": true
         },
         "s3_iam_role_source": {
-          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
+          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "enum": [
             "auto",
@@ -6088,17 +6454,24 @@
           ]
         },
         "s3_versioning": {
-          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.",
+          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "default": "enabled"
         },
         "client_timeout": {
-          "description": "The timeout setting for S3 client.",
-          "type": "string"
+          "description": "The timeout setting for S3 client.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "30s"
+          ]
         },
         "allow_http": {
-          "description": "Allow HTTP protocol for S3 endpoint.",
-          "type": "string"
+          "description": "Allow HTTP protocol for S3 endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
         },
         "file_format": {
           "type": "string"
@@ -6471,6 +6844,7 @@
           "type": "string"
         },
         "pg_sslrootcert": {
+          "description": "The path to, or inline PEM content for, the SSL root certificate.",
           "type": "string"
         },
         "pg_connection_pool_min": {
@@ -6753,7 +7127,11 @@
           "default": "spark_connect"
         },
         "client_timeout": {
-          "description": "The timeout setting for object store client.",
+          "description": "HTTP client request timeout. In 'delta_lake' mode, applies to the object store client. In 'sql_warehouse' mode, applies per-HTTP-call (statement submit, status poll, chunk fetch) — set to the longest expected single call, not total query duration. Accepts durations like '30s' or '5m'. Default: 30s.",
+          "type": "string"
+        },
+        "connect_timeout": {
+          "description": "Timeout for establishing TCP/TLS connections to the Databricks API. Applies in 'sql_warehouse' mode. Accepts durations like '10s'. Default: 10s.",
           "type": "string"
         },
         "databricks_cluster_id": {
@@ -7738,7 +8116,7 @@
       "type": "object",
       "properties": {
         "model_type": {
-          "description": "The architecture to load the model as. Supported values: mistral, gemma, mixtral, llama, phi2, phi3, qwen2, gemma2, starcoder2, phi3.5moe, deepseekv2, deepseekv3",
+          "description": "The architecture to load the model as. Supported text architectures: mistral, gemma, mixtral, llama, phi2, phi3, qwen2, gemma2, starcoder2, phi3.5moe, deepseekv2, deepseekv3, qwen3, glm4, glm4moelite, glm4moe, qwen3moe, smollm3, granitemoehybrid, gpt_oss, qwen3next. Supported multimodal architectures: phi3v, idefics2, llava_next, llava, vllama, qwen2vl, idefics3, minicpmo, phi4mm, qwen2_5vl, gemma3, mistral3, llama4, gemma3n, gemma4, qwen3vl, qwen3vlmoe, qwen3_5, qwen3_5moe, voxtral.",
           "type": "string"
         },
         "chat_template": {
