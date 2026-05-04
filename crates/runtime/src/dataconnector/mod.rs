@@ -168,6 +168,8 @@ pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
+#[cfg(feature = "duckdb")]
+pub mod ducklake;
 pub mod gcs;
 pub mod glue;
 pub mod iceberg;
