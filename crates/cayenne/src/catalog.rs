@@ -412,6 +412,49 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// Returns `Ok(true)` if the table was dropped, `Ok(false)` if the table didn't exist.
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool>;
+
+    /// Export the metastore rows for `dataset_name` as a portable, versioned
+    /// slice with path columns rewritten relative to `data_dir_anchor`.
+    ///
+    /// Default implementation returns [`CatalogError::InvalidOperation`].
+    /// `CayenneCatalog` overrides this with a real implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset is not present or the underlying metastore
+    /// query fails.
+    async fn export_dataset_slice(
+        &self,
+        dataset_name: &str,
+        data_dir_anchor: &std::path::Path,
+    ) -> CatalogResult<crate::metastore::snapshot::DatasetMetastoreSlice> {
+        let _ = (dataset_name, data_dir_anchor);
+        Err(CatalogError::InvalidOperationNoSource {
+            message: "export_dataset_slice is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Atomically import a dataset slice into the metastore, replacing any
+    /// prior rows for the same `dataset_name`. Path columns are re-anchored
+    /// at `data_dir_anchor`.
+    ///
+    /// Default implementation returns [`CatalogError::InvalidOperation`].
+    /// `CayenneCatalog` overrides this with a real implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the slice format is unsupported, the engine identifier
+    /// mismatches, or any DML in the underlying transaction fails.
+    async fn import_dataset_slice(
+        &self,
+        slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
+        data_dir_anchor: &std::path::Path,
+    ) -> CatalogResult<()> {
+        let _ = (slice, data_dir_anchor);
+        Err(CatalogError::InvalidOperationNoSource {
+            message: "import_dataset_slice is not supported by this catalog".to_string(),
+        })
+    }
 }
 
 /// Factory trait for creating catalog instances.
