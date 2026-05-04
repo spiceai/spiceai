@@ -147,6 +147,12 @@
         "schemaRef": "#/$defs/DebeziumDataset"
       },
       {
+        "name": "ducklake",
+        "prefix": "ducklake",
+        "paramsRef": "#/$defs/DucklakeDataConnectorParams",
+        "schemaRef": "#/$defs/DucklakeDataset"
+      },
+      {
         "name": "dynamodb",
         "prefix": "dynamodb",
         "paramsRef": "#/$defs/DynamodbDataConnectorParams",
@@ -241,6 +247,12 @@
         "prefix": "spiceai",
         "paramsRef": "#/$defs/SpiceAiDataConnectorParams",
         "schemaRef": "#/$defs/SpiceAiDataset"
+      },
+      {
+        "name": "spiceai",
+        "prefix": "spiceai",
+        "paramsRef": "#/$defs/SpiceaiDataConnectorParams",
+        "schemaRef": "#/$defs/SpiceaiDataset"
       }
     ],
     "dataAccelerators": [
@@ -540,6 +552,9 @@
               "type": "null"
             }
           ]
+        },
+        "functions": {
+          "$ref": "#/$defs/Functions"
         }
       },
       "additionalProperties": false
@@ -1445,16 +1460,29 @@
             }
           ]
         },
-        "partition_management": {
-          "description": "Partition management configuration",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PartitionManagement"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "partition_assignment_interval": {
+          "description": "How often the scheduler assigns accelerated table partitions to executors.",
+          "type": "string",
+          "default": "30s"
+        },
+        "max_partition_assignments_per_interval": {
+          "description": "Maximum number of partition assignments made per assignment interval.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 100
+        },
+        "max_partitions_per_executor": {
+          "description": "Maximum partitions assigned to a single executor (soft limit).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 1000
+        },
+        "partition_discovery_timeout": {
+          "description": "How long to wait for partition discovery before timing out.",
+          "type": "string",
+          "default": "60s"
         }
       },
       "additionalProperties": false,
@@ -1486,28 +1514,13 @@
         }
       ]
     },
-    "PartitionManagement": {
+    "Functions": {
+      "description": "Controls registration and execution surfaces for Spicepod user-defined functions.\n\nDefaults to disabled. Operators must explicitly set\n`runtime.functions.enabled: true` before the runtime registers top-level\n`functions:` entries or exposes `tools:` entries as SQL functions via\n`as_sql: true`.",
       "type": "object",
       "properties": {
-        "interval": {
-          "type": "string",
-          "default": "30s"
-        },
-        "max_assignments_per_cycle": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0,
-          "default": 100
-        },
-        "max_partitions_per_executor": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0,
-          "default": 1000
-        },
-        "discovery_timeout": {
-          "type": "string",
-          "default": "60s"
+        "enabled": {
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
@@ -1945,6 +1958,9 @@
             "check_availability": {
               "$ref": "#/$defs/CheckAvailability"
             },
+            "load": {
+              "$ref": "#/$defs/Load"
+            },
             "mode": {
               "$ref": "#/$defs/AccessMode"
             }
@@ -1988,6 +2004,18 @@
           },
           "then": {
             "$ref": "#/$defs/DebeziumDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^ducklake:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/DucklakeDataset"
           }
         },
         {
@@ -2181,6 +2209,18 @@
           "then": {
             "$ref": "#/$defs/SpiceAiDataset"
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^spiceai:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/SpiceaiDataset"
+          }
         }
       ]
     },
@@ -2194,6 +2234,20 @@
           "description": "Optional semantic details about the column",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "type": {
+          "description": "Optional column data type. Accepts Postgres-style names (e.g.\n`bigint`, `timestamptz`, `text[]`, `numeric(18,4)`) and Arrow display\nforms (e.g. `Int64`, `Utf8`, `Map<Utf8, Int64>`).\n\nStored as a raw string at the spicepod layer; parsed into an Arrow\n`DataType` by the runtime via `parse_declared_type`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "nullable": {
+          "description": "Optional nullability for the column. When omitted, the runtime\ndefaults to nullable.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -3053,6 +3107,21 @@
         }
       ]
     },
+    "Load": {
+      "description": "Controls when a dataset is loaded by the runtime.",
+      "oneOf": [
+        {
+          "description": "Load the dataset during runtime startup.",
+          "type": "string",
+          "const": "on_startup"
+        },
+        {
+          "description": "Load the dataset when it is first queried or explicitly refreshed.",
+          "type": "string",
+          "const": "on_demand"
+        }
+      ]
+    },
     "ComponentOrReference3": {
       "anyOf": [
         {
@@ -3523,7 +3592,7 @@
           ]
         },
         "as_sql": {
-          "description": "Whether this tool is also callable as a SQL UDF. Defaults to\n`false`; set to `true` to also register a `DataFusion` `ScalarUDF`\nthat invokes this tool per-row.\n\nRequires [`Self::signature`] to be set with typed Arrow arg /\nreturn types — a tool's free-form JSON Schema does not uniquely\nmap to a SQL signature, so the author must pin types explicitly.",
+          "description": "Whether this tool is also callable as a SQL UDF. Defaults to\n`false`; set to `true` to also register a `DataFusion` `ScalarUDF`\nthat invokes this tool per-row.\n\nRequires [`Self::signature`] to be set with typed Arrow arg /\nreturn types — a tool's free-form JSON Schema does not uniquely\nmap to a SQL signature, so the author must pin types explicitly.\nAlso requires `runtime.functions.enabled: true`.",
           "type": "boolean",
           "default": false
         },
@@ -3546,7 +3615,7 @@
       ]
     },
     "Signature": {
-      "description": "Typed function signature.\n\nFor scalar / aggregate / window functions, `returns` names the output\nArrow type. For table functions (UDTFs), `returns_schema` names the\noutput columns instead.",
+      "description": "Typed function signature.\n\n`returns` names the output Arrow type.",
       "type": "object",
       "properties": {
         "args": {
@@ -3557,29 +3626,17 @@
           }
         },
         "returns": {
-          "description": "Return Arrow type. Required for non-table kinds; ignored for\n[`FunctionKind::Table`].",
+          "description": "Return Arrow type. Required for scalar functions.",
           "type": [
             "string",
             "null"
           ]
-        },
-        "returns_schema": {
-          "description": "Output schema for table functions. Required for\n[`FunctionKind::Table`]; ignored otherwise.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/FunctionArg"
-          }
-        },
-        "null_aware": {
-          "description": "Whether the function handles NULL inputs itself. When false (the\ndefault), `DataFusion` short-circuits any call with a NULL argument\nto a NULL result without invoking the function — matching Spark's\ndefault semantics and avoiding a whole class of NPE-style bugs.",
-          "type": "boolean",
-          "default": false
         }
       },
       "additionalProperties": false
     },
     "FunctionArg": {
-      "description": "A single named argument or output column.\n\nThe `type` field is an Arrow logical-type string (e.g. `float64`,\n`utf8`, `list<int32>`, `decimal(38, 10)`, `timestamp(us, utc)`). The\nparser retains it verbatim; validation happens at factory-build time\nagainst [`arrow::datatypes::DataType::try_from`].",
+      "description": "A single named argument or output column.\n\nThe `type` field is an Arrow logical-type string (e.g. `float64`,\n`utf8`, `list<int32>`, `decimal(38, 10)`, `timestamp(us, utc)`). The\nparser retains it verbatim; tier-specific function factories validate\naccepted type strings when the function is registered.",
       "type": "object",
       "properties": {
         "name": {
@@ -3720,7 +3777,7 @@
       ]
     },
     "Function": {
-      "description": "A user-defined SQL function registered into the `DataFusion` session context.\n\nFour kinds are defined:\n  * [`FunctionKind::Scalar`] — row-in, row-out (one result value per input row).\n  * [`FunctionKind::Aggregate`] — many-rows-in, one-value-out.\n  * [`FunctionKind::Window`] — row-in + frame, row-out.\n  * [`FunctionKind::Table`] — args-in, many-rows-out (UDTF).\n\nToday only [`FunctionKind::Scalar`] is wired end-to-end; the other kinds\nparse but are rejected at registration time until their factories ship.\n\nThe `from` field selects the execution tier:\n  * `sql` — inline SQL body (tier T0, in-process, no sandbox).\n  * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).\n  * `wasm:./path.wasm` | `wasm:oci://…` — WebAssembly component (tier T1, sandboxed, roadmap).\n  * `grpc://…` | `flight://…` — additional remote transports (roadmap).\n\nCurrently registered at runtime: `sql`, `http://…`, `https://…`. Other\nschemes are accepted by the parser (so forward-compatible spicepods\nload) but rejected at registration time with a clear error until their\nfactories ship.",
+      "description": "A user-defined scalar SQL function registered into the `DataFusion` session context.\n\nThe `from` field selects the execution tier:\n  * `sql` — inline SQL body (tier T0, in-process, no sandbox).\n  * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).\n\nSupported at runtime: `sql`, `http://…`, `https://…`.\n\nRegistration is disabled by default. Set `runtime.functions.enabled: true`\nin the spicepod to activate declared functions.",
       "type": "object",
       "properties": {
         "name": {
@@ -3728,8 +3785,13 @@
           "type": "string"
         },
         "from": {
-          "description": "Source URI selecting the execution tier (e.g. `sql`, `wasm:./x.wasm`,\n`http://host/path`). See [`Function`] docs for the full scheme list.",
+          "description": "Source URI selecting the execution tier (e.g. `sql`, `http://host/path`).\nSee [`Function`] docs for the full scheme list.",
           "type": "string"
+        },
+        "enabled": {
+          "description": "Whether this function should be registered. Defaults to `true`.\n\nSet to `false` to keep the declaration in the spicepod without making\nit callable through SQL, tool exposure, `list_udfs()`, or\n`/v1/functions`.",
+          "type": "boolean",
+          "default": true
         },
         "description": {
           "description": "Free-form description surfaced in `list_udfs()` and the\n`/v1/functions` HTTP endpoint.",
@@ -3739,7 +3801,7 @@
           ]
         },
         "kind": {
-          "description": "Function kind — scalar, aggregate, window, or table (UDTF).\nDefaults to [`FunctionKind::Scalar`].",
+          "description": "Function kind. Only scalar functions are supported in the beta surface.\nDefaults to [`FunctionKind::Scalar`].",
           "$ref": "#/$defs/FunctionKind",
           "default": "scalar"
         },
@@ -3760,7 +3822,7 @@
           ]
         },
         "body_ref": {
-          "description": "Reference to a file whose contents are the function body. Path is\nresolved relative to the runtime's current working directory, matching\nthe convention used by every other file-path field in spicepod. Lets\nauthors keep non-trivial SQL in its own file with proper editor support\ninstead of embedding it inline.\n\nMutually exclusive with [`body`].",
+          "description": "Reference to a local filesystem file whose contents are the function\nbody. Path is resolved relative to the runtime's current working\ndirectory. `body_ref` is not read from object stores when a spicepod is\nloaded remotely; use inline [`body`] for portable remote spicepods.\nLets authors keep non-trivial SQL in its own file with proper editor\nsupport instead of embedding it inline.\n\nMutually exclusive with [`body`].",
           "type": [
             "string",
             "null"
@@ -3772,7 +3834,7 @@
           "additionalProperties": true
         },
         "params": {
-          "description": "Tier-specific parameters (e.g. transport settings for remote tiers,\ncapability grants for WASM). Supports `${ secrets:KEY }` / `${ env:KEY }`\ninterpolation at registration time.",
+          "description": "Tier-specific parameters (e.g. transport settings for remote tiers).\nSupports `${ secrets:KEY }` / `${ env:KEY }` interpolation at registration time.",
           "type": "object",
           "additionalProperties": true
         },
@@ -3808,13 +3870,10 @@
       ]
     },
     "FunctionKind": {
-      "description": "Distinguishes the four `DataFusion` UDF flavours.",
+      "description": "Function kind. The beta user-defined-function surface supports scalar functions.",
       "type": "string",
       "enum": [
-        "scalar",
-        "aggregate",
-        "window",
-        "table"
+        "scalar"
       ]
     },
     "Volatility": {
@@ -4488,6 +4547,52 @@
       ],
       "additionalProperties": true
     },
+    "DucklakeDataConnectorParams": {
+      "title": "DucklakeParams",
+      "type": "object",
+      "properties": {
+        "ducklake_connection_string": {
+          "description": "The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake').",
+          "type": "string"
+        },
+        "ducklake_name": {
+          "description": "The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'.",
+          "type": "string"
+        },
+        "ducklake_open": {
+          "description": "Optional path to an existing DuckDB file. If not provided, an in-memory DuckDB is used.",
+          "type": "string"
+        },
+        "ducklake_aws_region": {
+          "description": "The AWS region for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "ducklake_aws_access_key_id": {
+          "description": "The AWS access key ID for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "ducklake_aws_secret_access_key": {
+          "description": "The AWS secret access key for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "ducklake_aws_endpoint": {
+          "description": "Custom S3-compatible endpoint URL (e.g. for MinIO).",
+          "type": "string",
+          "x-secret": true
+        },
+        "ducklake_aws_allow_http": {
+          "description": "Allow HTTP (non-TLS) connections to S3.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ducklake_connection_string"
+      ],
+      "additionalProperties": true
+    },
     "DynamodbDataConnectorParams": {
       "title": "DynamodbParams",
       "type": "object",
@@ -5097,6 +5202,10 @@
           "description": "Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run. Defaults to 'disabled'.",
           "type": "string",
           "default": "disabled"
+        },
+        "max_concurrent_requests": {
+          "description": "Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.params.github_max_concurrent_connections or the connector default.",
+          "type": "string"
         },
         "include": {
           "description": "Include only files matching the pattern.",
@@ -5710,6 +5819,26 @@
           "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
           "type": "string"
         },
+        "max_concurrent_requests": {
+          "description": "Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled.",
+          "type": "string"
+        },
+        "requests_per_second_limit": {
+          "description": "Maximum number of HTTP requests per second to the same upstream origin. Overrides runtime.params.http_requests_per_second_limit when set. If both are unset, no per-second request rate limit is applied.",
+          "type": "string"
+        },
+        "requests_per_minute_limit": {
+          "description": "Maximum number of HTTP requests per minute to the same upstream origin. Overrides runtime.params.http_requests_per_minute_limit when set. If both are unset, no per-minute request rate limit is applied.",
+          "type": "string"
+        },
+        "rate_control_jitter_min": {
+          "description": "Minimum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms.",
+          "type": "string"
+        },
+        "rate_control_jitter_max": {
+          "description": "Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
+          "type": "string"
+        },
         "file_format": {
           "type": "string"
         },
@@ -6020,6 +6149,26 @@
         },
         "auth_client_auth": {
           "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
+          "type": "string"
+        },
+        "max_concurrent_requests": {
+          "description": "Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled.",
+          "type": "string"
+        },
+        "requests_per_second_limit": {
+          "description": "Maximum number of HTTP requests per second to the same upstream origin. Overrides runtime.params.http_requests_per_second_limit when set. If both are unset, no per-second request rate limit is applied.",
+          "type": "string"
+        },
+        "requests_per_minute_limit": {
+          "description": "Maximum number of HTTP requests per minute to the same upstream origin. Overrides runtime.params.http_requests_per_minute_limit when set. If both are unset, no per-minute request rate limit is applied.",
+          "type": "string"
+        },
+        "rate_control_jitter_min": {
+          "description": "Minimum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms.",
+          "type": "string"
+        },
+        "rate_control_jitter_max": {
+          "description": "Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
           "type": "string"
         },
         "file_format": {
@@ -6623,7 +6772,45 @@
           "type": "string",
           "x-secret": true
         },
+        "spiceai_region": {
+          "type": "string"
+        },
         "spiceai_endpoint": {
+          "type": "string"
+        },
+        "spiceai_flight_endpoint": {
+          "type": "string"
+        },
+        "spiceai_tls_ca_certificate_file": {
+          "description": "Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "SpiceaiDataConnectorParams": {
+      "title": "SpiceaiParams",
+      "type": "object",
+      "properties": {
+        "spiceai_api_key": {
+          "type": "string",
+          "x-secret": true
+        },
+        "spiceai_token": {
+          "type": "string",
+          "x-secret": true
+        },
+        "spiceai_region": {
+          "type": "string"
+        },
+        "spiceai_endpoint": {
+          "type": "string"
+        },
+        "spiceai_flight_endpoint": {
+          "type": "string"
+        },
+        "spiceai_tls_ca_certificate_file": {
+          "description": "Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates.",
           "type": "string"
         }
       },
@@ -7028,6 +7215,9 @@
           "type": "string",
           "x-secret": true
         },
+        "spiceai_region": {
+          "type": "string"
+        },
         "spiceai_endpoint": {
           "type": "string"
         },
@@ -7293,7 +7483,11 @@
           "default": ""
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -7514,7 +7708,11 @@
           "default": "disabled"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -7712,7 +7910,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -7922,7 +8124,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -8128,7 +8334,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -8338,7 +8548,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -8540,7 +8754,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -8779,7 +8997,11 @@
           ]
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -8977,7 +9199,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -9324,6 +9550,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -9491,6 +9720,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9660,6 +9892,180 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "DucklakeDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for ducklake connector. Format: ducklake:<path>",
+          "type": "string",
+          "pattern": "^ducklake:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the ducklake data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DucklakeDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -9827,6 +10233,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9996,6 +10405,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10163,6 +10575,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10332,6 +10747,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10499,6 +10917,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10668,6 +11089,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10835,6 +11259,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11004,6 +11431,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11171,6 +11601,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11340,6 +11773,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11507,6 +11943,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11676,6 +12115,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11843,6 +12285,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12012,6 +12457,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12180,6 +12628,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12347,6 +12798,180 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "SpiceaiDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for spiceai connector. Format: spiceai:<path>",
+          "type": "string",
+          "pattern": "^spiceai:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the spiceai data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpiceaiDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12525,6 +13150,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12701,6 +13329,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12879,6 +13510,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13055,6 +13689,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -13233,6 +13870,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13409,6 +14049,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -14487,6 +15130,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"

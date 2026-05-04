@@ -66,7 +66,7 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
           # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
@@ -81,7 +81,7 @@ jobs:
     needs: check_changes
     runs-on: spicehq-dev-runners
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           persist-credentials: false
@@ -113,6 +113,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/install-protoc
 
       - name: Set up sccache
@@ -229,7 +230,7 @@ jobs:
           - label: 3
             partition: 'count:3/3'
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           persist-credentials: false
@@ -381,7 +382,7 @@ jobs:
       pull-requests: write
     runs-on: spicehq-dev-runners
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -427,7 +428,7 @@ jobs:
     permissions: read-all
     runs-on: spicehq-dev-runners
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -468,7 +469,7 @@ jobs:
     permissions: read-all
     runs-on: spicehq-dev-runners
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -513,7 +514,7 @@ jobs:
     permissions: read-all
     runs-on: spicehq-dev-runners
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -544,7 +545,7 @@ jobs:
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spicehq-dev-runners
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
           fetch-depth: 1

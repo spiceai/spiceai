@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_stream::stream;
@@ -28,7 +28,145 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::{StreamExt, TryStreamExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock, broadcast};
+
+use datafusion::sql::TableReference;
+
+const DATA_UPDATE_BROADCAST_CAPACITY: usize = 100;
+
+#[derive(Clone, Debug, Default)]
+pub struct DataUpdateBroadcaster {
+    channels: Arc<RwLock<HashMap<TableReference, Arc<broadcast::Sender<DataUpdate>>>>>,
+}
+
+pub struct DataUpdateReceiver {
+    broadcaster: DataUpdateBroadcaster,
+    table_reference: TableReference,
+    receiver: Option<broadcast::Receiver<DataUpdate>>,
+}
+
+impl DataUpdateReceiver {
+    pub async fn recv(&mut self) -> Result<DataUpdate, broadcast::error::RecvError> {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return Err(broadcast::error::RecvError::Closed);
+        };
+        receiver.recv().await
+    }
+}
+
+impl Drop for DataUpdateReceiver {
+    fn drop(&mut self) {
+        self.receiver.take();
+        let broadcaster = self.broadcaster.clone();
+        let table_reference = self.table_reference.clone();
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let cleanup_task = handle.spawn(async move {
+                broadcaster.prune_unused(&table_reference).await;
+            });
+            drop(cleanup_task);
+        }
+    }
+}
+
+impl DataUpdateBroadcaster {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn subscribe(&self, table_reference: &TableReference) -> DataUpdateReceiver {
+        let receiver = if let Some(channel) = self.channels.read().await.get(table_reference) {
+            channel.subscribe()
+        } else {
+            let mut channels = self.channels.write().await;
+            channels
+                .entry(table_reference.clone())
+                .or_insert_with(|| {
+                    let (sender, _) = broadcast::channel(DATA_UPDATE_BROADCAST_CAPACITY);
+                    Arc::new(sender)
+                })
+                .subscribe()
+        };
+
+        DataUpdateReceiver {
+            broadcaster: self.clone(),
+            table_reference: table_reference.clone(),
+            receiver: Some(receiver),
+        }
+    }
+
+    pub async fn has_subscribers(&self, table_reference: &TableReference) -> bool {
+        let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
+            return false;
+        };
+
+        if channel.receiver_count() > 0 {
+            return true;
+        }
+
+        self.remove_if_unused(table_reference, &channel).await;
+        false
+    }
+
+    pub async fn publish(&self, table_reference: &TableReference, update: DataUpdate) {
+        let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
+            return;
+        };
+
+        if channel.receiver_count() == 0 {
+            self.remove_if_unused(table_reference, &channel).await;
+            return;
+        }
+
+        if let Err(err) = channel.send(update) {
+            tracing::debug!(
+                dataset = %table_reference,
+                "No active DoExchange subscribers received data update: {err}"
+            );
+            self.remove_if_unused(table_reference, &channel).await;
+        }
+    }
+
+    pub async fn close_subscribers(&self, table_reference: &TableReference) -> bool {
+        self.channels
+            .write()
+            .await
+            .remove(table_reference)
+            .is_some_and(|sender| sender.receiver_count() > 0)
+    }
+
+    pub async fn prune_unused(&self, table_reference: &TableReference) -> bool {
+        let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
+            return false;
+        };
+
+        if channel.receiver_count() > 0 {
+            return false;
+        }
+
+        self.remove_if_unused(table_reference, &channel).await;
+        true
+    }
+
+    async fn remove_if_unused(
+        &self,
+        table_reference: &TableReference,
+        channel: &Arc<broadcast::Sender<DataUpdate>>,
+    ) {
+        if channel.receiver_count() > 0 {
+            return;
+        }
+
+        let mut channels = self.channels.write().await;
+        if channels
+            .get(table_reference)
+            .is_some_and(|current| Arc::ptr_eq(current, channel) && current.receiver_count() == 0)
+        {
+            channels.remove(table_reference);
+        }
+    }
+}
 
 use crate::datafusion::error::find_datafusion_root;
 
@@ -172,5 +310,71 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
             }
         });
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::sql::TableReference;
+
+    #[tokio::test]
+    async fn data_update_broadcaster_delivers_published_updates() {
+        let broadcaster = DataUpdateBroadcaster::new();
+        let table_reference = TableReference::bare("cdc_table");
+        let mut receiver = broadcaster.subscribe(&table_reference).await;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        broadcaster
+            .publish(
+                &table_reference,
+                DataUpdate {
+                    schema: Arc::clone(&schema),
+                    data: vec![],
+                    update_type: UpdateType::Append,
+                },
+            )
+            .await;
+
+        let update = receiver
+            .recv()
+            .await
+            .expect("published update should be received");
+        assert_eq!(update.schema, schema);
+        assert!(matches!(update.update_type, UpdateType::Append));
+    }
+
+    #[tokio::test]
+    async fn data_update_broadcaster_prunes_channels_without_subscribers() {
+        let broadcaster = DataUpdateBroadcaster::new();
+        let table_reference = TableReference::bare("cdc_table");
+        let receiver = broadcaster.subscribe(&table_reference).await;
+        drop(receiver);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if broadcaster.channels.read().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped receiver should prune the channel");
+    }
+
+    #[tokio::test]
+    async fn data_update_broadcaster_close_subscribers_closes_receivers() {
+        let broadcaster = DataUpdateBroadcaster::new();
+        let table_reference = TableReference::bare("cdc_table");
+        let mut receiver = broadcaster.subscribe(&table_reference).await;
+
+        assert!(broadcaster.close_subscribers(&table_reference).await);
+        assert!(matches!(
+            receiver.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        assert!(broadcaster.channels.read().await.is_empty());
     }
 }

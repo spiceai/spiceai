@@ -40,6 +40,7 @@ use std::sync::Weak;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::utils::quote_identifier;
 use futures::TryStreamExt;
 use serde_json::{Map, Value};
 use spicepod::component::function::{Function, FunctionArg};
@@ -162,7 +163,7 @@ impl SpiceModelTool for FunctionAsTool {
             literals.push(json_to_sql_literal(v, &a.arrow_type)?);
         }
 
-        let sql = format!("SELECT {}({}) AS result", self.name, literals.join(", "));
+        let sql = function_call_sql(&self.name, &literals);
 
         let df = self.df.upgrade().ok_or_else(|| {
             Box::<dyn std::error::Error + Send + Sync>::from(
@@ -170,8 +171,11 @@ impl SpiceModelTool for FunctionAsTool {
             )
         })?;
 
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+
         let batches = df
             .query_builder(&sql)
+            .read_only(read_only)
             .build()
             .run()
             .await
@@ -186,6 +190,14 @@ impl SpiceModelTool for FunctionAsTool {
     }
 }
 
+fn function_call_sql(function_name: &str, literals: &[String]) -> String {
+    format!(
+        "SELECT {}({}) AS result",
+        quote_identifier(function_name),
+        literals.join(", ")
+    )
+}
+
 fn extract_single_cell_as_json(
     batches: &[datafusion::arrow::record_batch::RecordBatch],
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -198,14 +210,7 @@ fn extract_single_cell_as_json(
     }
     let data_type = column.data_type();
     match data_type {
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64 => {
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
             let cast = datafusion::arrow::compute::cast(column, &DataType::Int64)?;
             let arr = cast
                 .as_any()
@@ -251,7 +256,9 @@ fn extract_single_cell_as_json(
 #[derive(Debug, snafu::Snafu)]
 pub enum FunctionToolBuildError {
     #[snafu(display(
-        "cannot expose function '{function}' as a tool: arg '{arg}' has Arrow type '{arrow_type}', which is not yet JSON-encodable. Supported: int64 / float64 / utf8 / boolean. Set `as_tool: false` on the function to suppress."
+        "cannot expose function '{function}' as a tool: arg '{arg}' has Arrow type '{arrow_type}', which is not yet JSON-encodable. \
+        Supported: signed integer aliases/widths (int, int8, int16, int32, int64), float aliases/widths (float, double, float32, float64), utf8/string, boolean/bool. \
+        Set `as_tool: false` on the function to suppress."
     ))]
     UnsupportedArgType {
         function: String,
@@ -259,7 +266,9 @@ pub enum FunctionToolBuildError {
         arrow_type: String,
     },
     #[snafu(display(
-        "cannot expose function '{function}' as a tool: return Arrow type '{arrow_type}' is not yet JSON-encodable. Supported: int64 / float64 / utf8 / boolean. Set `as_tool: false` to suppress."
+        "cannot expose function '{function}' as a tool: return Arrow type '{arrow_type}' is not yet JSON-encodable. \
+        Supported: signed integer aliases/widths (int, int8, int16, int32, int64), float aliases/widths (float, double, float32, float64), utf8/string, boolean/bool. \
+        Set `as_tool: false` to suppress."
     ))]
     UnsupportedReturnType {
         function: String,
@@ -275,9 +284,7 @@ pub enum FunctionToolBuildError {
 /// the JSON Schema primitive type name, or None if unsupported for JSON.
 fn map_arrow_to_json(arrow: &str) -> Option<&'static str> {
     match arrow.trim().to_ascii_lowercase().as_str() {
-        "int8" | "int16" | "int32" | "int64" | "int" | "uint8" | "uint16" | "uint32" | "uint64" => {
-            Some("integer")
-        }
+        "int8" | "int16" | "int32" | "int64" | "int" => Some("integer"),
         "float32" | "float64" | "float" | "double" => Some("number"),
         "utf8" | "string" => Some("string"),
         "boolean" | "bool" => Some("boolean"),
@@ -375,11 +382,41 @@ mod tests {
     }
 
     #[test]
+    fn function_call_sql_quotes_function_name() {
+        let sql = function_call_sql(
+            "fn_name); SELECT secret FROM secrets; --",
+            &["1".to_string()],
+        );
+        assert_eq!(
+            sql,
+            "SELECT \"fn_name); SELECT secret FROM secrets; --\"(1) AS result"
+        );
+    }
+
+    #[test]
     fn map_arrow_to_json_coverage() {
         assert_eq!(map_arrow_to_json("int64"), Some("integer"));
+        assert_eq!(map_arrow_to_json("uint64"), None);
         assert_eq!(map_arrow_to_json("UTF8"), Some("string"));
         assert_eq!(map_arrow_to_json("boolean"), Some("boolean"));
         assert_eq!(map_arrow_to_json("float64"), Some("number"));
         assert_eq!(map_arrow_to_json("decimal(10,2)"), None);
+    }
+
+    #[test]
+    fn unsigned_integer_return_is_not_json_encoded() {
+        use datafusion::arrow::array::UInt64Array;
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::UInt64, false)])),
+            vec![Arc::new(UInt64Array::from(vec![u64::MAX]))],
+        )
+        .expect("batch");
+
+        let err = extract_single_cell_as_json(&[batch]).expect_err("uint64 unsupported");
+        assert!(err.to_string().contains("UInt64"), "{err}");
     }
 }

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
+use crate::rate_limit::RateLimiter;
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -43,6 +44,7 @@ use reqwest::{
     Client,
     header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
+use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::{
@@ -70,6 +72,9 @@ pub enum Error {
 
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
+
+    #[snafu(display("HTTP request was rate limited: {message}"))]
+    RateLimited { message: String },
 
     #[snafu(display(
         "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
@@ -117,6 +122,9 @@ impl From<Error> for DataFusionError {
                     "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
                 ))))
             }
+            Error::RateLimited { message } => DataFusionError::External(Box::new(
+                std::io::Error::other(format!("HTTP request was rate limited: {message}")),
+            )),
             // All other errors are internal/external errors
             Error::HttpRequest { source } => DataFusionError::External(Box::new(source)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
@@ -138,7 +146,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
-type PartitionSpec = (
+pub type PartitionSpec = (
     Option<String>,
     Option<String>,
     Option<String>,
@@ -426,6 +434,8 @@ pub struct HttpTableProvider {
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
     auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
+    rate_limiter: Option<Arc<dyn RateLimiter>>,
+    rate_controller: Option<Arc<RateController>>,
     /// When set, JSON response rows are decomposed into the declared
     /// static columns plus a catch-all JSON column. Schema is replaced
     /// with the user-declared columns (all `Utf8`).
@@ -474,8 +484,22 @@ impl HttpTableProvider {
             health_probe: None,
             pagination: None,
             auth: None,
+            rate_limiter: None,
+            rate_controller: None,
             json_nesting: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_rate_limiter(mut self, rate_limiter: Option<Arc<dyn RateLimiter>>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Option<Arc<RateController>>) -> Self {
+        self.rate_controller = rate_controller;
+        self
     }
 
     /// Configure JSON schema decomposition. Replaces the provider's
@@ -598,6 +622,11 @@ impl HttpTableProvider {
             max_length.min(DEFAULT_MAX_HEADERS_LENGTH * 4);
         self.request_filter_options.allowed_headers = allowed_headers;
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.max_request_partitions
     }
 
     #[must_use]
@@ -846,8 +875,12 @@ impl HttpTableProvider {
 
         tracing::debug!("Validating HTTP endpoint: {test_url}");
 
+        let _rate_control_permit = self.acquire_rate_control_permit().await?;
+
         match self.client.get(test_url.clone()).send().await {
             Ok(response) => {
+                self.update_rate_limiter_from_headers(response.headers())
+                    .await;
                 let status = response.status();
                 if self.health_probe.is_some() {
                     tracing::debug!(
@@ -1004,6 +1037,35 @@ impl HttpTableProvider {
         Ok(url)
     }
 
+    async fn acquire_rate_control_permit(&self) -> Result<Option<Permit>> {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter
+                .check_rate_limit()
+                .await
+                .map_err(|e| Error::RateLimited {
+                    message: e.to_string(),
+                })?;
+        }
+
+        if let Some(rate_controller) = &self.rate_controller {
+            return rate_controller
+                .acquire()
+                .await
+                .map(Some)
+                .map_err(|e| Error::RateLimited {
+                    message: e.to_string(),
+                });
+        }
+
+        Ok(None)
+    }
+
+    async fn update_rate_limiter_from_headers(&self, headers: &HeaderMap) {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter.update_from_headers(headers).await;
+        }
+    }
+
     async fn cache_response(
         &self,
         path: &str,
@@ -1099,6 +1161,11 @@ impl HttpTableProvider {
         path_label: &str,
         accept_retryable: bool,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        let _rate_control_permit = self
+            .acquire_rate_control_permit()
+            .await
+            .map_err(RetryError::transient)?;
+
         let mut request_builder = if let Some(body_content) = body {
             let mut req = self.client.post(url.clone());
             let ct = self.content_type.as_deref().unwrap_or("application/json");
@@ -1132,6 +1199,9 @@ impl HttpTableProvider {
         })?;
 
         let status_code = response.status().as_u16();
+        let response_headers = response.headers().clone();
+        self.update_rate_limiter_from_headers(&response_headers)
+            .await;
 
         // 5xx/429: retry with backoff (transient server issue or rate limiting)
         // After retries exhausted, we'll accept the response as valid data.
@@ -1415,9 +1485,42 @@ pub struct HttpExec {
     partitions: Vec<PartitionSpec>,
     limit: Option<usize>,
     properties: PlanProperties,
+    /// When `true`, the partitions are a template that will be expanded
+    /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
+    deferred_partitions: bool,
 }
 
 impl HttpExec {
+    /// Returns the provider used by this exec.
+    #[must_use]
+    pub fn provider(&self) -> &Arc<HttpTableProvider> {
+        &self.provider
+    }
+
+    /// Returns the maximum number of request partitions allowed, if configured.
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.provider.max_request_partitions()
+    }
+
+    /// Returns the partition specs.
+    #[must_use]
+    pub fn partitions(&self) -> &[PartitionSpec] {
+        &self.partitions
+    }
+
+    /// Returns the limit.
+    #[must_use]
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Returns the projected schema.
+    #[must_use]
+    pub fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
     #[must_use]
     pub fn new(
         projected_schema: SchemaRef,
@@ -1437,7 +1540,83 @@ impl HttpExec {
             partitions,
             limit,
             properties,
+            deferred_partitions: false,
         }
+    }
+
+    /// Mark this `HttpExec` as having dynamic partitions that will be
+    /// expanded at runtime. Affects EXPLAIN display only.
+    #[must_use]
+    pub fn with_deferred_partitions(mut self) -> Self {
+        self.deferred_partitions = true;
+        self
+    }
+
+    /// Create a new `HttpExec` whose partitions are the cross-product of the
+    /// current partitions and the given `values`, injected into the column
+    /// identified by `col_name` (`request_path`, `request_query`,
+    /// `request_body`, or `request_headers`).
+    ///
+    /// Returns an error if the resulting partition count would exceed
+    /// `max_request_partitions`.
+    pub fn with_expanded_params(
+        &self,
+        col_name: &str,
+        values: &[String],
+    ) -> DataFusionResult<Self> {
+        let existing = &self.partitions;
+        let new_count = existing.len() * values.len();
+
+        if let Some(max) = self.max_request_partitions()
+            && new_count > max
+        {
+            return Err(DataFusionError::Plan(format!(
+                "HttpExec: expanding params would create {new_count} partitions (existing {} x {} values), which exceeds max_request_partitions={max}. Reduce the number of dynamic values or increase max_request_partitions.",
+                existing.len(),
+                values.len(),
+            )));
+        }
+
+        let mut new_partitions = Vec::with_capacity(new_count);
+
+        for partition in existing {
+            for value in values {
+                let mut p = partition.clone();
+                match col_name {
+                    "request_path" => {
+                        p.0 = Some(self.provider.ensure_allowed_path(value)?);
+                    }
+                    "request_query" => {
+                        p.1 = Some(self.provider.ensure_allowed_query(value)?);
+                    }
+                    "request_body" => {
+                        p.2 = Some(self.provider.ensure_allowed_body(value)?);
+                    }
+                    "request_headers" => {
+                        p.3 = Some(self.provider.ensure_allowed_headers(value)?);
+                    }
+                    other => {
+                        return Err(DataFusionError::Internal(format!(
+                            "HttpExec::with_expanded_params: unsupported column '{other}'. Expected one of: request_path, request_query, request_body, request_headers"
+                        )));
+                    }
+                }
+                new_partitions.push(p);
+            }
+        }
+
+        tracing::debug!(
+            "HttpExec::with_expanded_params: replacing partitions with {} (was {}) for column '{col_name}'",
+            new_partitions.len(),
+            existing.len(),
+        );
+
+        Ok(Self::new(
+            Arc::clone(&self.projected_schema),
+            Arc::clone(&self.provider),
+            new_partitions,
+            self.limit,
+        ))
     }
 
     async fn fetch_and_create_batch(
@@ -1737,9 +1916,15 @@ impl DisplayAs for HttpExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "HttpExec: base_url={}, format={}, partitions=[",
+            "HttpExec: base_url={}, format={}, ",
             self.provider.base_url, self.provider.file_format
         )?;
+
+        if self.deferred_partitions {
+            return write!(f, "partitions=deferred");
+        }
+
+        write!(f, "partitions=[")?;
 
         for (i, (path, query, body, request_headers)) in self.partitions.iter().enumerate() {
             if i > 0 {
@@ -2559,11 +2744,64 @@ impl HttpTableProvider {
     ) -> Result<()> {
         match expr.op {
             Operator::Eq => self.handle_equality_expr(expr, accumulator),
-            Operator::Or | Operator::And => {
+            Operator::And => {
+                self.extract_filter_values(expr.left.as_ref(), accumulator)?;
+                self.extract_filter_values(expr.right.as_ref(), accumulator)
+            }
+            Operator::Or => {
+                // OR within a single HTTP virtual filter column is treated as
+                // an IN list (alternative values). OR across different
+                // columns would be silently rewritten as a cross product
+                // (AND) by the partition accumulator, causing the connector
+                // to issue combined HTTP requests instead of separate ones.
+                // Reject the cross-column case explicitly. (Note: SQL
+                // `IN (...)` is sometimes pre-rewritten by DataFusion into a
+                // chain of OR-of-equality, which is why same-column OR must
+                // still be accepted.)
+                let mut columns = HashSet::new();
+                Self::collect_http_filter_columns(expr.left.as_ref(), &mut columns);
+                Self::collect_http_filter_columns(expr.right.as_ref(), &mut columns);
+                if columns.len() > 1 {
+                    let mut names: Vec<&str> = columns.into_iter().collect();
+                    names.sort_unstable();
+                    return Err(Error::FilterRejected {
+                        message: format!(
+                            "OR across different HTTP filter columns ({}) is not supported because the connector would otherwise issue combined HTTP requests instead of separate ones. Use IN (...) to enumerate values on a single column, or run separate queries (e.g. UNION ALL) for alternative requests.",
+                            names.join(", ")
+                        ),
+                    });
+                }
                 self.extract_filter_values(expr.left.as_ref(), accumulator)?;
                 self.extract_filter_values(expr.right.as_ref(), accumulator)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Walk an expression tree and collect the names of any HTTP virtual
+    /// filter columns (`request_path`, `request_query`, `request_body`,
+    /// `request_headers`) referenced anywhere inside it.
+    fn collect_http_filter_columns(expr: &Expr, columns: &mut HashSet<&'static str>) {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+                Self::collect_http_filter_columns(left.as_ref(), columns);
+                Self::collect_http_filter_columns(right.as_ref(), columns);
+            }
+            Expr::InList(in_list) => {
+                Self::collect_http_filter_columns(in_list.expr.as_ref(), columns);
+            }
+            Expr::Column(column) => {
+                if let Some(static_name) = match column.name.as_str() {
+                    "request_path" => Some("request_path"),
+                    "request_query" => Some("request_query"),
+                    "request_body" => Some("request_body"),
+                    "request_headers" => Some("request_headers"),
+                    _ => None,
+                } {
+                    columns.insert(static_name);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3226,6 +3464,82 @@ mod tests {
         assert_eq!(partitions.len(), 2);
         assert!(partitions.contains(&(Some("/api/v1".to_string()), None, None, None)));
         assert!(partitions.contains(&(Some("/api/v2".to_string()), None, None, None)));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_query_filters(64);
+        // request_path = '/a' OR request_query = 'b=1'
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_query"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("b=1".to_string())),
+                    None,
+                )),
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("OR across different HTTP filter columns"),
+            "unexpected error message: {message}"
+        );
+        assert!(message.contains("request_path"));
+        assert!(message.contains("request_query"));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_nested_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id".to_string()])
+            .expect("enable header filters");
+        // request_path = '/a' OR request_headers IN ('{"x-sandbox-id":"a"}')
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::InList(InList {
+                expr: Box::new(Expr::Column(Column::from_name("request_headers"))),
+                list: vec![Expr::Literal(
+                    ScalarValue::Utf8(Some(r#"{"x-sandbox-id":"a"}"#.to_string())),
+                    None,
+                )],
+                negated: false,
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        assert!(
+            err.to_string()
+                .contains("OR across different HTTP filter columns")
+        );
     }
 
     #[test]
@@ -6128,5 +6442,171 @@ mod tests {
         let schema = batch.schema();
         let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(field_names, vec!["id", "name", "details"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_expanded_params unit tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an `HttpExec` with the given partitions and optional max.
+    ///
+    /// Enables all filter types (path, query, body, headers) so that
+    /// `with_expanded_params` validation passes for any column.
+    fn make_exec(
+        partitions: Vec<PartitionSpec>,
+        max_request_partitions: Option<usize>,
+    ) -> HttpExec {
+        let provider = base_provider()
+            .with_allowed_paths(["/*"])
+            .expect("valid path glob")
+            .enable_query_filters(DEFAULT_MAX_QUERY_LENGTH)
+            .enable_body_filters(DEFAULT_MAX_BODY_BYTES)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-test"])
+            .expect("header filters should enable")
+            .with_max_request_partitions(max_request_partitions);
+        HttpExec::new(
+            HttpTableProvider::base_table_schema().into(),
+            Arc::new(provider),
+            partitions,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_with_expanded_params_request_path() {
+        let exec = make_exec(vec![(None, None, None, None)], None);
+        let result = exec
+            .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
+            .expect("expand should succeed");
+
+        assert_eq!(result.partitions.len(), 2);
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/b".to_string()));
+        // Other tuple positions remain None.
+        assert_eq!(result.partitions[0].1, None);
+        assert_eq!(result.partitions[0].2, None);
+        assert_eq!(result.partitions[0].3, None);
+    }
+
+    #[test]
+    fn test_with_expanded_params_cross_product() {
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            None,
+        );
+        let result = exec
+            .with_expanded_params(
+                "request_query",
+                &["q1".to_string(), "q2".to_string(), "q3".to_string()],
+            )
+            .expect("expand should succeed");
+
+        // 2 existing × 3 values = 6 partitions
+        assert_eq!(result.partitions.len(), 6);
+
+        // First existing partition (/a) crossed with all three values
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[0].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[2].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[2].1, Some("q3".to_string()));
+
+        // Second existing partition (/b) crossed with all three values
+        assert_eq!(result.partitions[3].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[3].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[4].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[4].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[5].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[5].1, Some("q3".to_string()));
+    }
+
+    #[test]
+    fn test_with_expanded_params_exceeds_max() {
+        // max=3, but 2 partitions × 2 query values = 4 → should fail
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            Some(3),
+        );
+
+        _ = exec
+            .with_expanded_params("request_query", &["q=1".to_string(), "q=2".to_string()])
+            .expect_err("should exceed max_request_partitions");
+    }
+
+    type PartitionAccessor = Box<dyn Fn(&PartitionSpec) -> &Option<String>>;
+
+    #[test]
+    fn test_with_expanded_params_all_columns() {
+        // Values must satisfy each column's validation rules:
+        // - request_path: must start with '/'
+        // - request_query: plain query string
+        // - request_body: plain body text
+        // - request_headers: JSON with allowed header names
+        let cases: Vec<(&str, &str, PartitionAccessor)> = vec![
+            ("/val", "request_path", Box::new(|p: &PartitionSpec| &p.0)),
+            ("val", "request_query", Box::new(|p: &PartitionSpec| &p.1)),
+            ("val", "request_body", Box::new(|p: &PartitionSpec| &p.2)),
+            (
+                r#"{"x-test":"val"}"#,
+                "request_headers",
+                Box::new(|p: &PartitionSpec| &p.3),
+            ),
+        ];
+
+        for (test_value, col_name, accessor) in &cases {
+            let exec = make_exec(vec![(None, None, None, None)], None);
+            let result = exec
+                .with_expanded_params(col_name, &[test_value.to_string()])
+                .unwrap_or_else(|e| panic!("expand for {col_name} should succeed: {e}"));
+
+            assert_eq!(
+                result.partitions.len(),
+                1,
+                "one partition expected for {col_name}"
+            );
+            assert_eq!(
+                *accessor(&result.partitions[0]),
+                Some(test_value.to_string()),
+                "{col_name} should be set"
+            );
+
+            // Verify the OTHER positions are still None.
+            let all_accessors: Vec<PartitionAccessor> = vec![
+                Box::new(|p: &PartitionSpec| &p.0),
+                Box::new(|p: &PartitionSpec| &p.1),
+                Box::new(|p: &PartitionSpec| &p.2),
+                Box::new(|p: &PartitionSpec| &p.3),
+            ];
+            let col_names = [
+                "request_path",
+                "request_query",
+                "request_body",
+                "request_headers",
+            ];
+            for (other_name, other_accessor) in col_names.iter().zip(all_accessors.iter()) {
+                if *other_name != *col_name {
+                    assert_eq!(
+                        *other_accessor(&result.partitions[0]),
+                        None,
+                        "{other_name} should remain None when expanding {col_name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_expanded_params_unknown_column_errors() {
+        let exec = make_exec(vec![(Some("/orig".to_string()), None, None, None)], None);
+        let _ = exec
+            .with_expanded_params("nonexistent_column", &["x".to_string()])
+            .expect_err("unknown column should error");
     }
 }

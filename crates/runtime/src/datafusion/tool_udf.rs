@@ -28,10 +28,13 @@ limitations under the License.
 //! always `AsyncScalarUDF`, marked volatile, and automatically added
 //! to the federation deny-list.
 
-use std::hash::Hash;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::HashSet,
+    hash::Hash,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::tools::SpiceModelTool;
@@ -69,7 +72,14 @@ pub enum ToolUdfBuildError {
     MissingReturnType { tool: String },
 
     #[snafu(display(
-        "cannot expose tool '{tool}' as SQL: arg '{arg}' has unsupported Arrow type '{arrow_type}'. Supported: int64 / float64 / utf8 / boolean."
+        "cannot expose tool '{tool}' as SQL: duplicate argument name '{arg}' in `signature.args`"
+    ))]
+    DuplicateArgName { tool: String, arg: String },
+
+    #[snafu(display(
+        "cannot expose tool '{tool}' as SQL: arg '{arg}' has unsupported Arrow type '{arrow_type}'. \
+        Supported: signed integer aliases/widths (int, int8, int16, int32, int64; widened to int64), \
+        float aliases/widths (float, double, float32, float64; widened to float64), utf8/string, boolean/bool."
     ))]
     UnsupportedArgType {
         tool: String,
@@ -78,7 +88,9 @@ pub enum ToolUdfBuildError {
     },
 
     #[snafu(display(
-        "cannot expose tool '{tool}' as SQL: return Arrow type '{arrow_type}' is unsupported. Supported: int64 / float64 / utf8 / boolean."
+        "cannot expose tool '{tool}' as SQL: return Arrow type '{arrow_type}' is unsupported. \
+        Supported: signed integer aliases/widths (int, int8, int16, int32, int64; widened to int64), \
+        float aliases/widths (float, double, float32, float64; widened to float64), utf8/string, boolean/bool."
     ))]
     UnsupportedReturnType { tool: String, arrow_type: String },
 }
@@ -93,6 +105,16 @@ pub fn build_scalar_udf(
     tool_name: &str,
     yaml_sig: &YamlSignature,
 ) -> Result<Arc<ScalarUDF>> {
+    let mut seen_arg_names = HashSet::with_capacity(yaml_sig.args.len());
+    for arg in &yaml_sig.args {
+        if !seen_arg_names.insert(arg.name.as_str()) {
+            return Err(ToolUdfBuildError::DuplicateArgName {
+                tool: tool_name.to_string(),
+                arg: arg.name.clone(),
+            });
+        }
+    }
+
     let arg_names: Vec<String> = yaml_sig.args.iter().map(|a| a.name.clone()).collect();
     let arg_types: Vec<DataType> = yaml_sig
         .args
@@ -211,6 +233,13 @@ impl AsyncScalarUDFImpl for ToolAsScalarUdf {
         &self,
         args: ScalarFunctionArgs,
     ) -> std::result::Result<ColumnarValue, DataFusionError> {
+        if crate::http::v1::current_principal_requires_read_only().await {
+            return Err(DataFusionError::Execution(format!(
+                "tool-backed function '{}' requires a read-write API key",
+                self.name
+            )));
+        }
+
         if args.args.len() != self.arg_names.len() {
             return Err(DataFusionError::Execution(format!(
                 "tool-backed function '{}' expected {} args, got {}",
@@ -227,30 +256,17 @@ impl AsyncScalarUDFImpl for ToolAsScalarUdf {
             .map(|cv| cv.to_array(n))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // Serialise every row's args into a JSON body up-front, fanning the
-        // requests out concurrently (capped by DEFAULT_TOOL_CONCURRENCY) and
-        // collecting results back into row order via `FuturesOrdered`.
-        let mut bodies = Vec::with_capacity(n);
-        for row in 0..n {
-            let mut obj = Map::with_capacity(self.arg_names.len());
-            for (i, name) in self.arg_names.iter().enumerate() {
-                obj.insert(
-                    name.clone(),
-                    array_cell_to_json(&arrays[i], row, &self.arg_types[i])?,
-                );
-            }
-            bodies.push(Value::Object(obj).to_string());
-        }
-
         let name = self.name.clone();
         let tool = Arc::clone(&self.tool);
         let mut output = PrimitiveOutputBuilder::new(&self.return_type, n)?;
-        // `stream::iter(...).buffered(N)` dispatches up to N calls in flight
-        // while preserving row order for the consumer.
-        let mut rpc_stream = stream::iter(bodies.into_iter().map(|body| {
+        // `stream::iter(...).buffered(N)` builds and dispatches at most N row
+        // bodies at a time, while preserving row order for the consumer.
+        let mut rpc_stream = stream::iter((0..n).map(|row| {
             let tool = Arc::clone(&tool);
             let name = name.clone();
+            let body = self.encode_row_body(&arrays, row);
             async move {
+                let body = body?;
                 tool.call(&body).await.map_err(|e| {
                     DataFusionError::Execution(format!(
                         "tool-backed function '{name}' call failed: {e}"
@@ -268,43 +284,89 @@ impl AsyncScalarUDFImpl for ToolAsScalarUdf {
     }
 }
 
+impl ToolAsScalarUdf {
+    fn encode_row_body(
+        &self,
+        arrays: &[ArrayRef],
+        row: usize,
+    ) -> std::result::Result<String, DataFusionError> {
+        let mut obj = Map::with_capacity(self.arg_names.len());
+        for (i, name) in self.arg_names.iter().enumerate() {
+            obj.insert(
+                name.clone(),
+                array_cell_to_json(&arrays[i], row, &self.arg_types[i])?,
+            );
+        }
+        Ok(Value::Object(obj).to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::SpiceModelTool;
+    use spicepod::component::function::FunctionArg;
+
+    struct StubTool;
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for StubTool {
+        fn name(&self) -> std::borrow::Cow<'_, str> {
+            "stub".into()
+        }
+
+        fn description(&self) -> Option<std::borrow::Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Value::Null)
+        }
+    }
 
     #[test]
     fn build_fails_without_signature_returns() {
-        use crate::tools::SpiceModelTool;
-        use spicepod::component::function::FunctionArg;
-        struct StubTool;
-        #[async_trait::async_trait]
-        impl SpiceModelTool for StubTool {
-            fn name(&self) -> std::borrow::Cow<'_, str> {
-                "stub".into()
-            }
-            fn description(&self) -> Option<std::borrow::Cow<'_, str>> {
-                None
-            }
-            fn parameters(&self) -> Option<Value> {
-                None
-            }
-            async fn call(
-                &self,
-                _: &str,
-            ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(Value::Null)
-            }
-        }
         let sig = YamlSignature {
             args: vec![FunctionArg {
                 name: "x".into(),
                 arrow_type: "int64".into(),
             }],
             returns: None,
-            returns_schema: vec![],
-            null_aware: false,
         };
         let err = build_scalar_udf(Arc::new(StubTool), "stub", &sig).expect_err("missing return");
         assert!(matches!(err, ToolUdfBuildError::MissingReturnType { .. }));
+    }
+
+    #[test]
+    fn build_rejects_duplicate_arg_names() {
+        let sig = YamlSignature {
+            args: vec![
+                FunctionArg {
+                    name: "x".into(),
+                    arrow_type: "int64".into(),
+                },
+                FunctionArg {
+                    name: "x".into(),
+                    arrow_type: "float64".into(),
+                },
+            ],
+            returns: Some("int64".into()),
+        };
+
+        let err = build_scalar_udf(Arc::new(StubTool), "stub", &sig)
+            .expect_err("duplicate arg names should fail");
+
+        assert!(matches!(
+            err,
+            ToolUdfBuildError::DuplicateArgName { tool, arg }
+                if tool == "stub" && arg == "x"
+        ));
     }
 }

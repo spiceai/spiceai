@@ -2,6 +2,10 @@ version: v2
 kind: Spicepod
 name: spicepod_with_functions
 
+runtime:
+  functions:
+    enabled: true
+
 functions:
   - name: double_it
     from: sql
