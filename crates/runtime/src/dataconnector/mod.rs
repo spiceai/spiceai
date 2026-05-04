@@ -555,6 +555,30 @@ pub trait DataConnectorFactory: Send + Sync {
     fn reserved_keywords(&self) -> &'static [&'static str] {
         &[]
     }
+
+    /// Returns a static schema for the given dataset if this connector's
+    /// schema is fully determined by configuration and does not require
+    /// any source-facing I/O or connector construction.
+    ///
+    /// Called during dataset registration **before** the connector itself
+    /// is built (no `create` call is required first). Implementations may
+    /// consult `params` (e.g. a configured file format) and `dataset`
+    /// (e.g. declared content type, JSON column decomposition) but must
+    /// not perform any I/O.
+    ///
+    /// When `Some(schema)` is returned, the runtime is allowed to register
+    /// the dataset using that schema and defer building the connector and
+    /// calling [`DataConnector::read_provider`] until the dataset is
+    /// actually referenced. The connector is still expected to return a
+    /// `TableProvider` whose schema matches on the first `read_provider`
+    /// call; mismatches surface at first scan as a hard error rather than
+    /// being silently retried (the static schema is configuration, not
+    /// source state).
+    ///
+    /// Default: `None`. Most connectors infer schema from the source.
+    fn static_schema(&self, _params: &ConnectorParams, _dataset: &Dataset) -> Option<SchemaRef> {
+        None
+    }
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
@@ -887,6 +911,55 @@ mod tests {
         .build(secrets, Handle::current())
         .await
         .expect("failed to build connector params")
+    }
+
+    #[tokio::test]
+    async fn test_static_schema_default_returns_none() {
+        // Any factory that doesn't override `static_schema` should return
+        // None. This is the contract relied on by the deferred-dataset
+        // path: a None return falls back to the eager source-contact
+        // registration flow.
+        struct DefaultFactory;
+        impl DataConnectorFactory for DefaultFactory {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn create(
+                &self,
+                _params: ConnectorParams,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                unimplemented!("static_schema must not require create()")
+            }
+            fn prefix(&self) -> &'static str {
+                "default_factory"
+            }
+            fn parameters(&self) -> &'static [ParameterSpec] {
+                &[]
+            }
+        }
+
+        register_connector_factory("default_factory", Arc::new(DefaultFactory)).await;
+
+        let app = Arc::new(app::AppBuilder::new("test_app").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+        let dataset = DatasetBuilder::try_new("default_factory:tbl".to_string(), "tbl")
+            .expect("Failed to create builder")
+            .with_app(Arc::clone(&app))
+            .with_runtime(Arc::clone(&rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        let params = ConnectorParamsBuilder::new(
+            "default_factory".into(),
+            ConnectorComponent::Dataset(Arc::new(dataset.clone())),
+        )
+        .build(secrets, Handle::current())
+        .await
+        .expect("failed to build connector params");
+
+        let factory = DefaultFactory;
+        assert!(factory.static_schema(&params, &dataset).is_none());
     }
 
     #[tokio::test]
