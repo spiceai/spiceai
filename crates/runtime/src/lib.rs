@@ -1569,7 +1569,7 @@ impl Runtime {
                 .collect::<HashSet<_>>();
             for (name, tooling) in tool_lock.iter() {
                 match tooling {
-                    Tooling::Tool(tool) => {
+                    Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
                     Tooling::Catalog(catalog) => {
@@ -1596,7 +1596,8 @@ impl Runtime {
                 };
                 return catalog.get(name).await;
             } else {
-                let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
+                let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name)
+                else {
                     return None;
                 };
                 Arc::clone(tool)
