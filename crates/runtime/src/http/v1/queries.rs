@@ -248,7 +248,7 @@ pub struct QuerySummary {
     pub query_id: String,
     /// Current status.
     pub status: JobStatus,
-    /// SQL preview (first 100 chars).
+    /// SQL preview (up to 100 chars, including an ellipsis when truncated).
     pub sql_preview: String,
     /// When created (ISO 8601).
     pub created_at: String,
@@ -262,7 +262,7 @@ pub struct ActiveQuerySummary {
     pub query_id: String,
     /// Protocol this query was submitted through (http, flight, flightsql, internal).
     pub protocol: String,
-    /// SQL preview (first 100 chars).
+    /// SQL preview (up to 100 chars, including an ellipsis when truncated).
     pub sql_preview: String,
     /// When the query began execution, in milliseconds since epoch.
     pub started_at_ms: u64,
