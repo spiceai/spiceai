@@ -64,14 +64,6 @@ use secrecy::ExposeSecret;
 use spicepod::component::runtime;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
-use std::time::Duration;
-
-use governor::{
-    RateLimiter,
-    clock::{Clock, DefaultClock},
-    middleware::NoOpMiddleware,
-    state::{InMemoryState, NotKeyed},
-};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -180,15 +172,6 @@ impl ExecutorControlStreamRegistry {
     }
 }
 
-type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
-
-fn retry_after_seconds(wait_time: Duration) -> u64 {
-    wait_time
-        .as_secs()
-        .saturating_add(u64::from(wait_time.subsec_nanos() > 0))
-        .max(1)
-}
-
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
     app: Arc<TokioRwLock<Option<Arc<App>>>>,
@@ -202,11 +185,6 @@ pub struct ClusterServiceImpl {
     allow_secret_expansion: bool,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
-    /// Separate rate limiter for metrics/observability RPCs.
-    /// This is intentionally independent of data-path rate limits
-    /// so that clients can still retrieve observability data even
-    /// when data requests are rate-limited.
-    metrics_rate_limiter: Arc<DirectRateLimiter>,
 }
 
 impl ClusterServiceImpl {
@@ -222,7 +200,6 @@ impl ClusterServiceImpl {
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
         allow_secret_expansion: bool,
-        metrics_rate_limiter: DirectRateLimiter,
     ) -> Self {
         Self {
             app,
@@ -234,7 +211,6 @@ impl ClusterServiceImpl {
             metrics_reader,
             allow_secret_expansion,
             executor_streams: ExecutorControlStreamRegistry::new(),
-            metrics_rate_limiter: Arc::new(metrics_rate_limiter),
         }
     }
 
@@ -254,7 +230,6 @@ impl ClusterServiceImpl {
         metrics_reader: Option<MetricsReader>,
         executor_streams: ExecutorControlStreamRegistry,
         allow_secret_expansion: bool,
-        metrics_rate_limiter: DirectRateLimiter,
     ) -> Self {
         Self {
             app,
@@ -266,7 +241,6 @@ impl ClusterServiceImpl {
             metrics_reader,
             allow_secret_expansion,
             executor_streams,
-            metrics_rate_limiter: Arc::new(metrics_rate_limiter),
         }
     }
 
@@ -290,27 +264,6 @@ impl ClusterServiceImpl {
     #[must_use]
     pub fn executor_registry(&self) -> Arc<ExecutorRegistry> {
         Arc::clone(&self.executor_registry)
-    }
-
-    /// Checks the metrics-specific rate limiter and returns a gRPC `RESOURCE_EXHAUSTED`
-    /// status if the limit is exceeded.
-    fn check_metrics_rate_limit(&self) -> Result<(), Status> {
-        if let Err(wait_time) = self.metrics_rate_limiter.check() {
-            let retry_after_secs =
-                retry_after_seconds(wait_time.wait_time_from(DefaultClock::default().now()));
-            tracing::trace!(
-                "Cluster metrics request rate-limited, retry after {retry_after_secs}s"
-            );
-            let mut status = Status::resource_exhausted(format!(
-                "Too many metrics requests. Retry after {retry_after_secs} seconds."
-            ));
-            if let Ok(val) = tonic::metadata::MetadataValue::try_from(&retry_after_secs.to_string())
-            {
-                status.metadata_mut().insert("retry-after", val);
-            }
-            return Err(status);
-        }
-        Ok(())
     }
 }
 
@@ -461,8 +414,6 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<GetTaskHistoryRequest>,
     ) -> Result<Response<GetTaskHistoryResponse>, Status> {
-        self.check_metrics_rate_limit()?;
-
         let request = request.into_inner();
 
         tracing::debug!(
@@ -503,8 +454,6 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         _request: Request<GetMetricsRequest>,
     ) -> Result<Response<GetMetricsResponse>, Status> {
-        self.check_metrics_rate_limit()?;
-
         // Collect local OTLP metrics and return as protobuf bytes
         let otlp_metrics = self
             .metrics_reader
@@ -1046,10 +995,8 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
-    use governor::Quota;
-    use std::num::NonZeroU32;
 
-    async fn make_test_service(metrics_limit: u32) -> ClusterServiceImpl {
+    async fn make_test_service() -> ClusterServiceImpl {
         let runtime = crate::Runtime::builder().build().await;
         let datafusion = Arc::new(
             DataFusion::builder(
@@ -1101,39 +1048,25 @@ mod tests {
             executor_registry,
             None,
             true,
-            RateLimiter::direct(Quota::per_minute(
-                NonZeroU32::new(metrics_limit).expect("test quota must be non-zero"),
-            )),
         )
     }
 
     #[tokio::test]
-    async fn test_get_metrics_rate_limit_returns_retry_after() {
-        let service = make_test_service(1).await;
+    async fn test_get_metrics_allows_repeated_requests() {
+        let service = make_test_service().await;
 
         ClusterService::get_metrics(&service, Request::new(GetMetricsRequest {}))
             .await
-            .expect("first metrics request should be under quota");
+            .expect("first metrics request should succeed");
 
-        let error = ClusterService::get_metrics(&service, Request::new(GetMetricsRequest {}))
+        ClusterService::get_metrics(&service, Request::new(GetMetricsRequest {}))
             .await
-            .expect_err("second metrics request should be rate-limited");
-
-        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-        let retry_after = error
-            .metadata()
-            .get("retry-after")
-            .expect("retry-after metadata should be present")
-            .to_str()
-            .expect("retry-after metadata should be ASCII")
-            .parse::<u64>()
-            .expect("retry-after metadata should be an integer");
-        assert!(retry_after >= 1);
+            .expect("second metrics request should also succeed");
     }
 
     #[tokio::test]
-    async fn test_get_task_history_rate_limit_returns_retry_after() {
-        let service = make_test_service(1).await;
+    async fn test_get_task_history_allows_repeated_requests() {
+        let service = make_test_service().await;
         let request = || {
             Request::new(GetTaskHistoryRequest {
                 sql: format!(
@@ -1144,22 +1077,11 @@ mod tests {
 
         ClusterService::get_task_history(&service, request())
             .await
-            .expect("first task history request should be under quota");
+            .expect("first task history request should succeed");
 
-        let error = ClusterService::get_task_history(&service, request())
+        ClusterService::get_task_history(&service, request())
             .await
-            .expect_err("second task history request should be rate-limited");
-
-        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-        let retry_after = error
-            .metadata()
-            .get("retry-after")
-            .expect("retry-after metadata should be present")
-            .to_str()
-            .expect("retry-after metadata should be ASCII")
-            .parse::<u64>()
-            .expect("retry-after metadata should be an integer");
-        assert!(retry_after >= 1);
+            .expect("second task history request should also succeed");
     }
 
     #[test]

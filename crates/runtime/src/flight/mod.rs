@@ -665,7 +665,7 @@ pub struct RateLimits {
     /// Whether write rate limiting is enabled. When `false`, the rate limiter
     /// layer is still present but the check function always succeeds.
     flight_write_enabled: AtomicBool,
-    /// Separate rate limit for cluster metrics endpoints (`GetMetrics`, `GetTaskHistory`).
+    /// Separate rate limit for the metrics HTTP endpoint.
     /// This is independent of the data-path write limit so that clients can still
     /// retrieve observability data even when their data requests are rate-limited.
     pub cluster_metrics_limit: Quota,
@@ -713,7 +713,7 @@ impl Default for RateLimits {
                 NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
             ),
             flight_write_enabled: AtomicBool::new(true),
-            // Allow 100 cluster metrics requests every 60 seconds by default.
+            // Allow 100 metrics HTTP requests every 60 seconds by default.
             // This is a separate limiter from the data-path write limit so that
             // clients can still retrieve observability data even when data
             // requests are rate-limited.
