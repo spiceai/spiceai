@@ -1804,6 +1804,14 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 if !sorted_map.is_empty() {
                     let json_str = serde_json::to_string(&sorted_map).unwrap_or_default();
                     filters.push(col("request_headers").eq(lit(json_str)));
+                } else {
+                    // caching_allowed_request_headers is non-empty but the incoming request
+                    // carries none of those headers (e.g. unauthenticated request).
+                    // There is no cache entry that can match, so force a cache miss by
+                    // pushing a filter that can never be satisfied. The upstream source
+                    // will handle the unauthenticated request (returning an auth error).
+                    // Crucially this also prevents leaking any cached row to the caller.
+                    filters.push(col("request_headers").eq(lit("__no_matching_headers__")));
                 }
             }
 

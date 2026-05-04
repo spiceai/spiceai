@@ -1348,7 +1348,11 @@ impl TableProvider for AcceleratedTable {
         // Added columns will be automatically stripped by `SchemaCastScanExec`, similar to
         // fallback-to-source on cache miss where results return all columns.
         let extended_projection = if is_caching_mode && !filters.is_empty() {
-            extend_projection_for_caching(projection, &self.accelerator.schema())
+            extend_projection_for_caching(
+                projection,
+                &self.accelerator.schema(),
+                !self.caching_allowed_request_headers.is_empty(),
+            )
         } else {
             None
         };
@@ -1605,22 +1609,36 @@ impl TableProvider for AcceleratedTable {
     }
 }
 
-/// Extends projection to include `fetched_at` column for cache freshness checking.
+/// Extends projection to include `fetched_at` (and optionally `request_headers`) column(s)
+/// for cache freshness checking and per-token cache isolation.
 /// Returns `Some(extended_projection)` if extension was needed,
 /// or `None` if no extension needed (projection already includes it or is None).
 fn extend_projection_for_caching(
     projection: Option<&Vec<usize>>,
     schema: &SchemaRef,
+    needs_request_headers: bool,
 ) -> Option<Vec<usize>> {
     let proj = projection?;
-    let idx = schema.index_of(caching::CACHE_REFRESHED_AT_COLUMN).ok()?;
-    if proj.contains(&idx) {
-        return None;
-    }
-    // User projection doesn't include fetched_at - add it as last column
+    let fetched_at_idx = schema.index_of(caching::CACHE_REFRESHED_AT_COLUMN).ok()?;
+
     let mut extended = proj.clone();
-    extended.push(idx);
-    Some(extended)
+    let mut changed = false;
+
+    if !extended.contains(&fetched_at_idx) {
+        extended.push(fetched_at_idx);
+        changed = true;
+    }
+
+    if needs_request_headers {
+        if let Ok(rh_idx) = schema.index_of("request_headers") {
+            if !extended.contains(&rh_idx) {
+                extended.push(rh_idx);
+                changed = true;
+            }
+        }
+    }
+
+    if changed { Some(extended) } else { None }
 }
 
 fn filters_for_accelerator_scan(
@@ -1843,7 +1861,7 @@ mod tests {
     #[test]
     fn test_extend_projection_none_returns_none() {
         let schema = schema_with_fetched_at();
-        let result = extend_projection_for_caching(None, &schema);
+        let result = extend_projection_for_caching(None, &schema, false);
         assert!(result.is_none(), "None projection should return None");
     }
 
@@ -1852,7 +1870,7 @@ mod tests {
         let schema = schema_with_fetched_at();
         // Projection includes fetched_at (index 3)
         let projection = vec![0, 1, 3];
-        let result = extend_projection_for_caching(Some(&projection), &schema);
+        let result = extend_projection_for_caching(Some(&projection), &schema, false);
         assert!(
             result.is_none(),
             "Projection already including fetched_at should return None"
@@ -1864,7 +1882,7 @@ mod tests {
         let schema = schema_with_fetched_at();
         // Projection does NOT include fetched_at
         let projection = vec![0, 2]; // id, content
-        let extended = extend_projection_for_caching(Some(&projection), &schema)
+        let extended = extend_projection_for_caching(Some(&projection), &schema, false)
             .expect("Should extend projection");
         assert_eq!(
             extended,
@@ -1877,7 +1895,7 @@ mod tests {
     fn test_extend_projection_single_column() {
         let schema = schema_with_fetched_at();
         let projection = vec![2]; // just content
-        let extended = extend_projection_for_caching(Some(&projection), &schema)
+        let extended = extend_projection_for_caching(Some(&projection), &schema, false)
             .expect("Should extend projection");
         assert_eq!(
             extended,
