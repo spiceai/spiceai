@@ -60,6 +60,8 @@ use std::{
 };
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
+/// Preserve the existing local LLM scheduler concurrency. Paged attention uses
+/// the same cap so enabling cache-aware scheduling does not change request parallelism.
 const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
 
 pub struct MistralLlama {
