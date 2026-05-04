@@ -29,6 +29,7 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     error::OpenAIError,
+    traits::RequestOptionsBuilder,
     types::chat::{
         ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
         ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
@@ -70,8 +71,13 @@ impl Xai {
         }
     }
 
-    /// Changes to `req` to accomodate xAi not being `OpenAI` compatible.
-    fn alter_request(&self, mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
+    /// Changes to `req` to accommodate xAi not being `OpenAI` compatible.
+    fn alter_request(
+        &self,
+        mut req: CreateChatCompletionRequest,
+    ) -> (CreateChatCompletionRequest, Option<String>) {
+        let prompt_cache_key = req.prompt_cache_key.take();
+
         // Use name of xAI model, not spicepod model.
         req.model.clone_from(&self.model);
 
@@ -122,7 +128,7 @@ impl Xai {
             }
         }
 
-        req
+        (req, prompt_cache_key)
     }
 }
 
@@ -156,11 +162,13 @@ impl Chat for Xai {
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
-        let stream = self
-            .client
-            .chat()
-            .create_stream(self.alter_request(req))
-            .await?;
+        let (req, prompt_cache_key) = self.alter_request(req);
+        let mut chat = self.client.chat();
+        if let Some(prompt_cache_key) = prompt_cache_key {
+            chat = chat.header("x-grok-conv-id", prompt_cache_key)?;
+        }
+
+        let stream = chat.create_stream(req).await?;
 
         drop(permit);
         Ok(Box::pin(stream))
@@ -176,9 +184,34 @@ impl Chat for Xai {
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
-        let resp = self.client.chat().create(self.alter_request(req)).await?;
+        let (req, prompt_cache_key) = self.alter_request(req);
+        let mut chat = self.client.chat();
+        if let Some(prompt_cache_key) = prompt_cache_key {
+            chat = chat.header("x-grok-conv-id", prompt_cache_key)?;
+        }
+
+        let resp = chat.create(req).await?;
 
         drop(permit);
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_cache_key_is_moved_to_chat_header_value() {
+        let xai = Xai::new(Some("grok-4.3"), "test-key");
+        let req = CreateChatCompletionRequest {
+            prompt_cache_key: Some("conversation-123".to_string()),
+            ..CreateChatCompletionRequest::default()
+        };
+
+        let (req, prompt_cache_key) = xai.alter_request(req);
+
+        assert_eq!(prompt_cache_key.as_deref(), Some("conversation-123"));
+        assert!(req.prompt_cache_key.is_none());
     }
 }
