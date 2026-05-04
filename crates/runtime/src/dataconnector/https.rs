@@ -64,15 +64,14 @@ fn parse_pagination_max_pages(value: &str) -> Option<usize> {
         return None;
     }
 
-    match trimmed.parse::<usize>() {
-        Ok(max_pages) => Some(max_pages),
-        Err(_) => {
-            tracing::warn!(
-                "Invalid pagination_max_pages value '{}': expected a positive integer or 'nolimit'. The parameter will be ignored.",
-                value
-            );
-            Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES)
-        }
+    if let Ok(max_pages) = trimmed.parse::<usize>() {
+        Some(max_pages)
+    } else {
+        tracing::warn!(
+            "Invalid pagination_max_pages value '{}': expected a positive integer or 'nolimit'. The parameter will be ignored.",
+            value
+        );
+        Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES)
     }
 }
 
