@@ -824,42 +824,85 @@
         }
       }
     },
-    "/v1/mcp/sse": {
+    "/v1/mcp": {
       "get": {
         "tags": [
           "mcp"
         ],
-        "summary": "Establish an MCP SSE Connection",
-        "description": "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n\n             Once connected, clients can send messages via `POST /v1/mcp/sse` and receive responses through this SSE stream.",
-        "operationId": "operation_id",
-        "responses": {}
+        "summary": "Open an MCP server-to-client SSE stream",
+        "description": "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport. The `Mcp-Session-Id` header must identify an existing session created via `POST /v1/mcp`.",
+        "operationId": "mcp_stream",
+        "parameters": [
+          {
+            "name": "Mcp-Session-Id",
+            "in": "header",
+            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream (`text/event-stream`) of server-originated MCP messages."
+          },
+          "404": {
+            "description": "Unknown or expired `Mcp-Session-Id`."
+          }
+        }
       },
       "post": {
         "tags": [
           "mcp"
         ],
-        "summary": "Send message to MCP server",
-        "description": "Send message to the MCP endoint, for a given session.",
-        "operationId": "mcp_event",
+        "summary": "Send a Model Context Protocol message",
+        "description": "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), selected via the `Accept` header. Session continuity is carried via the `Mcp-Session-Id` header.",
+        "operationId": "mcp_message",
         "parameters": [
           {
-            "name": "sessionId",
-            "in": "query",
-            "required": true
+            "name": "Mcp-Session-Id",
+            "in": "header",
+            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "required": false
           }
         ],
         "responses": {
+          "200": {
+            "description": "JSON-RPC response. Returned as `application/json` for a single response or `text/event-stream` when the server streams additional messages."
+          },
           "202": {
-            "description": "Message accepted. Response will stream via SSE."
+            "description": "Message accepted (for JSON-RPC notifications / responses that do not require a reply)."
+          },
+          "400": {
+            "description": "Malformed JSON-RPC payload."
           },
           "404": {
-            "description": "Session not found. No active session for the given `session_id`."
+            "description": "Unknown or expired `Mcp-Session-Id`."
           },
           "413": {
-            "description": "Payload too large. Maximum allowed size is 4MB."
+            "description": "Payload too large. Maximum allowed size is 32 MiB."
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Terminate an MCP Streamable HTTP session",
+        "description": "Terminate the MCP session identified by the `Mcp-Session-Id` header. Subsequent requests bearing the same session id will receive `404 Not Found`.",
+        "operationId": "mcp_terminate_session",
+        "parameters": [
+          {
+            "name": "Mcp-Session-Id",
+            "in": "header",
+            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "required": false
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session terminated."
           },
-          "500": {
-            "description": "Internal server error. An unexpected issue occurred."
+          "404": {
+            "description": "Unknown or already-terminated `Mcp-Session-Id`."
           }
         }
       }
