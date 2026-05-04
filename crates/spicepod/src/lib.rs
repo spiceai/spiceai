@@ -622,6 +622,106 @@ mod version_tests {
         assert!(result.is_err(), "Unknown version 'v3' should be rejected");
     }
 
+    #[test]
+    fn test_search_engines_parse_top_level() {
+        let yaml = concat!(
+            "version: v1\n",
+            "kind: Spicepod\n",
+            "name: search_engines_pod\n",
+            "\n",
+            "search_engines:\n",
+            "  - name: hybrid\n",
+            "    from: elasticsearch\n",
+            "    kind:\n",
+            "      - vector\n",
+            "      - text\n",
+            "    params:\n",
+            "      endpoint: 'http://localhost:9200'\n",
+            "    defaults:\n",
+            "      refresh: wait_for\n",
+            "    capabilities:\n",
+            "      vector:\n",
+            "        dimensions: '1536'\n",
+            "      text:\n",
+            "        analyzer: english\n",
+            "\n",
+            "datasets:\n",
+            "  - name: docs\n",
+            "    from: 'file:data.csv'\n",
+            "    vectors:\n",
+            "      engine: hybrid\n",
+            "    full_text_search:\n",
+            "      engine: hybrid\n",
+            "    columns:\n",
+            "      - name: body\n",
+            "        embeddings:\n",
+            "          - from: openai_embeddings\n",
+            "            engine: hybrid\n",
+            "        full_text_search:\n",
+            "          enabled: true\n",
+            "          engine: hybrid\n",
+        );
+
+        let def: SpicepodDefinition =
+            yaml::from_str(yaml).expect("Should parse search_engines spicepod");
+        assert_eq!(def.search_engines.len(), 1);
+
+        let component::ComponentOrReference::Component(engine) = &def.search_engines[0] else {
+            panic!("Expected inline search engine component");
+        };
+        assert_eq!(engine.name, "hybrid");
+        assert_eq!(engine.from, "elasticsearch");
+        assert!(engine.supports(search_engine::SearchEngineKind::Vector));
+        assert!(engine.supports(search_engine::SearchEngineKind::Text));
+
+        let vector_params = engine
+            .params_for(search_engine::SearchEngineKind::Vector)
+            .expect("vector params should merge");
+        let vector_params = vector_params.as_string_map();
+        assert_eq!(
+            vector_params.get("endpoint").map(String::as_str),
+            Some("http://localhost:9200")
+        );
+        assert_eq!(
+            vector_params.get("refresh").map(String::as_str),
+            Some("wait_for")
+        );
+        assert_eq!(
+            vector_params.get("dimensions").map(String::as_str),
+            Some("1536")
+        );
+
+        let dataset = &def.datasets[0];
+        let component::ComponentOrReference::Component(dataset) = dataset else {
+            panic!("Expected inline dataset component");
+        };
+        assert_eq!(
+            dataset
+                .vectors
+                .as_ref()
+                .and_then(|store| store.engine.as_deref()),
+            Some("hybrid")
+        );
+        assert_eq!(
+            dataset
+                .full_text_search
+                .as_ref()
+                .and_then(|store| store.engine.as_deref()),
+            Some("hybrid")
+        );
+        assert_eq!(
+            dataset.columns[0].embeddings[0].engine.as_deref(),
+            Some("hybrid")
+        );
+        assert_eq!(
+            dataset.columns[0]
+                .full_text_search
+                .as_ref()
+                .and_then(|fts| fts.engine.as_deref()),
+            Some("hybrid")
+        );
+    }
+
     // ========================================================================
     // v1 schema support (backward compat with release/1.11)
     // ========================================================================

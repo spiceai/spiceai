@@ -96,22 +96,28 @@
         "$ref": "#/$defs/ComponentOrReference6"
       }
     },
-    "tools": {
+    "search_engines": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference7"
       }
     },
-    "workers": {
+    "tools": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference8"
       }
     },
-    "functions": {
+    "workers": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference9"
+      }
+    },
+    "functions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ComponentOrReference10"
       }
     },
     "dependencies": {
@@ -145,6 +151,12 @@
         "prefix": "debezium",
         "paramsRef": "#/$defs/DebeziumDataConnectorParams",
         "schemaRef": "#/$defs/DebeziumDataset"
+      },
+      {
+        "name": "ducklake",
+        "prefix": "ducklake",
+        "paramsRef": "#/$defs/DucklakeDataConnectorParams",
+        "schemaRef": "#/$defs/DucklakeDataset"
       },
       {
         "name": "dynamodb",
@@ -241,6 +253,12 @@
         "prefix": "spiceai",
         "paramsRef": "#/$defs/SpiceAiDataConnectorParams",
         "schemaRef": "#/$defs/SpiceAiDataset"
+      },
+      {
+        "name": "spiceai",
+        "prefix": "spiceai",
+        "paramsRef": "#/$defs/SpiceaiDataConnectorParams",
+        "schemaRef": "#/$defs/SpiceaiDataset"
       }
     ],
     "dataAccelerators": [
@@ -1707,8 +1725,21 @@
                 }
               ]
             },
+            "full_text_search": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FtsStore"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "check_availability": {
               "$ref": "#/$defs/CheckAvailability"
+            },
+            "load": {
+              "$ref": "#/$defs/Load"
             },
             "mode": {
               "$ref": "#/$defs/AccessMode"
@@ -1753,6 +1784,18 @@
           },
           "then": {
             "$ref": "#/$defs/DebeziumDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^ducklake:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/DucklakeDataset"
           }
         },
         {
@@ -1946,6 +1989,18 @@
           "then": {
             "$ref": "#/$defs/SpiceAiDataset"
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^spiceai:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/SpiceaiDataset"
+          }
         }
       ]
     },
@@ -1959,6 +2014,20 @@
           "description": "Optional semantic details about the column",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "type": {
+          "description": "Optional column data type. Accepts Postgres-style names (e.g.\n`bigint`, `timestamptz`, `text[]`, `numeric(18,4)`) and Arrow display\nforms (e.g. `Int64`, `Utf8`, `Map<Utf8, Int64>`).\n\nStored as a raw string at the spicepod layer; parsed into an Arrow\n`DataType` by the runtime via `parse_declared_type`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "nullable": {
+          "description": "Optional nullability for the column. When omitted, the runtime\ndefaults to nullable.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -2021,6 +2090,24 @@
           ],
           "format": "uint",
           "minimum": 0
+        },
+        "engine": {
+          "description": "Optional search engine override for this embedding column.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Optional engine parameters for this embedding column.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "aggregation": {
           "description": "Aggregation strategy for multi-vector embeddings. Only meaningful\nwhen the underlying column is list-typed. Defaults to `max`.",
@@ -2107,6 +2194,24 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "engine": {
+          "description": "Optional text search engine override for this column.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Optional engine parameters for this text search column.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
@@ -2289,6 +2394,10 @@
           "additionalProperties": {
             "$ref": "#/$defs/OnConflictBehavior"
           }
+        },
+        "write_mode": {
+          "description": "Controls write behavior for read-write accelerated datasets.\nOnly applies when `access: read_write` and the dataset is accelerated.",
+          "$ref": "#/$defs/WriteMode"
         },
         "metrics": {
           "anyOf": [
@@ -2542,12 +2651,21 @@
       ]
     },
     "RefreshMode": {
-      "type": "string",
-      "enum": [
-        "full",
-        "append",
-        "changes",
-        "caching"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "full",
+            "append",
+            "changes",
+            "caching"
+          ]
+        },
+        {
+          "description": "Refresh exclusively by reloading newer snapshots from the configured\nsnapshot location. The federated source is never queried for refreshes.\nRequires `snapshots` to be enabled and a snapshot-supporting engine.",
+          "type": "string",
+          "const": "snapshot"
+        }
       ]
     },
     "ZeroResultsAction": {
@@ -2599,6 +2717,14 @@
         "upsert",
         "upsert_dedup",
         "upsert_dedup_by_row_id"
+      ]
+    },
+    "WriteMode": {
+      "description": "Controls the write behavior for accelerated read-write datasets.\n\n- `write_through` (default): Writes go to the federated source (e.g. Postgres)\n  synchronously. The user receives confirmation after a full ACID commit to the\n  source. The local accelerator is updated via the normal refresh mechanism\n  (e.g. WAL replication with `refresh_mode: changes`).\n\n- `write_back`: Writes commit to the local accelerator first and return after\n  that accelerator commit completes. The same mutation is then forwarded to\n  the federated source asynchronously, so the source may lag and source\n  persistence failures are logged rather than returned to the caller. This\n  mode requires `replication.enabled: true` as an explicit opt-in to those\n  asynchronous source durability semantics.",
+      "type": "string",
+      "enum": [
+        "write_through",
+        "write_back"
       ]
     },
     "PartitionedBySchema": {
@@ -2791,6 +2917,34 @@
       },
       "additionalProperties": false
     },
+    "FtsStore": {
+      "description": "Dataset-level full-text search store configuration.\n\nSelects which engine backs the full-text search index for this dataset and\nsupplies the connection parameters needed to reach it.\n\nWhen absent, the runtime defaults to the built-in Tantivy in-process engine\n(controlled by the column-level `full_text_search.index_store` field).\n\n# Example\n\n```yaml\ndatasets:\n  - from: postgres:my_table\n    name: docs\n    acceleration:\n      enabled: true\n    full_text_search:\n      engine: elasticsearch\n      params:\n        endpoint: https://my-cluster.es.io:9200\n        index: spice-docs\n        user: ${secrets:ES_USER}\n        pass: ${secrets:ES_PASS}\n    columns:\n      - name: body\n        full_text_search:\n          enabled: true\n          row_id: id\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "engine": {
+          "description": "FTS engine name. Currently only `\"elasticsearch\"` is supported.\nWhen absent (or when the `elasticsearch` feature is disabled), the\nruntime falls back to the Tantivy in-process engine.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Engine-specific connection parameters.\n\nFor `engine: elasticsearch`:\n- `endpoint` (required) — Elasticsearch cluster URL, e.g. `https://localhost:9200`\n- `index` (optional) — ES index name; defaults to the dataset name\n- `user` / `pass` (optional) — HTTP Basic Auth credentials\n- `client_timeout` / `connect_timeout` (optional) — timeout durations, e.g. `30s`",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "CheckAvailability": {
       "description": "Controls whether the federated table periodically has its availability checked.",
       "oneOf": [
@@ -2803,6 +2957,21 @@
           "description": "The dataset is not checked for availability.",
           "type": "string",
           "const": "disabled"
+        }
+      ]
+    },
+    "Load": {
+      "description": "Controls when a dataset is loaded by the runtime.",
+      "oneOf": [
+        {
+          "description": "Load the dataset during runtime startup.",
+          "type": "string",
+          "const": "on_startup"
+        },
+        {
+          "description": "Load the dataset when it is first queried or explicitly refreshed.",
+          "type": "string",
+          "const": "on_demand"
         }
       ]
     },
@@ -3225,6 +3394,136 @@
     "ComponentOrReference7": {
       "anyOf": [
         {
+          "$ref": "#/$defs/SearchEngine"
+        },
+        {
+          "$ref": "#/$defs/ComponentReference"
+        }
+      ]
+    },
+    "SearchEngine": {
+      "description": "A named search backend that datasets can reference from `vectors.engine`,\n`full_text_search.engine`, or column-level search configuration.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Component name referenced by datasets and columns.",
+          "type": "string"
+        },
+        "from": {
+          "description": "Backend/provider name, for example `elasticsearch`, `s3_vectors`, or `duckdb`.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Search capabilities exposed by this engine.",
+          "$ref": "#/$defs/SearchEngineKindSelection"
+        },
+        "params": {
+          "description": "Backend connection parameters shared by all capabilities.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "defaults": {
+          "description": "Default engine parameters applied before dataset or column overrides.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "capabilities": {
+          "description": "Capability-specific defaults applied after `defaults` and before dataset or column overrides.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SearchEngineCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "from",
+        "kind"
+      ]
+    },
+    "SearchEngineKindSelection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SearchEngineKind"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SearchEngineKind"
+          }
+        }
+      ]
+    },
+    "SearchEngineKind": {
+      "type": "string",
+      "enum": [
+        "vector",
+        "text",
+        "graph"
+      ]
+    },
+    "SearchEngineCapabilities": {
+      "type": "object",
+      "properties": {
+        "vector": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "graph": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ComponentOrReference8": {
+      "anyOf": [
+        {
           "$ref": "#/$defs/Tool"
         },
         {
@@ -3336,7 +3635,7 @@
         "type"
       ]
     },
-    "ComponentOrReference8": {
+    "ComponentOrReference9": {
       "anyOf": [
         {
           "$ref": "#/$defs/Worker"
@@ -3450,7 +3749,7 @@
         }
       ]
     },
-    "ComponentOrReference9": {
+    "ComponentOrReference10": {
       "anyOf": [
         {
           "$ref": "#/$defs/Function"
@@ -4231,6 +4530,52 @@
       ],
       "additionalProperties": true
     },
+    "DucklakeDataConnectorParams": {
+      "title": "DucklakeParams",
+      "type": "object",
+      "properties": {
+        "ducklake_connection_string": {
+          "description": "The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake').",
+          "type": "string"
+        },
+        "ducklake_name": {
+          "description": "The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'.",
+          "type": "string"
+        },
+        "ducklake_open": {
+          "description": "Optional path to an existing DuckDB file. If not provided, an in-memory DuckDB is used.",
+          "type": "string"
+        },
+        "ducklake_aws_region": {
+          "description": "The AWS region for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "ducklake_aws_access_key_id": {
+          "description": "The AWS access key ID for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "ducklake_aws_secret_access_key": {
+          "description": "The AWS secret access key for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "ducklake_aws_endpoint": {
+          "description": "Custom S3-compatible endpoint URL (e.g. for MinIO).",
+          "type": "string",
+          "x-secret": true
+        },
+        "ducklake_aws_allow_http": {
+          "description": "Allow HTTP (non-TLS) connections to S3.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ducklake_connection_string"
+      ],
+      "additionalProperties": true
+    },
     "DynamodbDataConnectorParams": {
       "title": "DynamodbParams",
       "type": "object",
@@ -4841,6 +5186,10 @@
           "type": "string",
           "default": "disabled"
         },
+        "max_concurrent_requests": {
+          "description": "Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.params.github_max_concurrent_connections or the connector default.",
+          "type": "string"
+        },
         "include": {
           "description": "Include only files matching the pattern.",
           "type": "string",
@@ -5353,6 +5702,26 @@
           "description": "Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB).",
           "type": "string"
         },
+        "request_header_filters": {
+          "description": "Set to 'enabled' or 'disabled' to control whether request_headers filters can be pushed down as dynamic HTTP request headers.",
+          "type": "string",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        },
+        "request_header_allowlist": {
+          "description": "Comma-separated list of HTTP request header names that request_headers filters may set. Required when request_header_filters is enabled.",
+          "type": "string"
+        },
+        "max_request_headers_length": {
+          "description": "Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB).",
+          "type": "string"
+        },
+        "max_request_partitions": {
+          "description": "Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped.",
+          "type": "string"
+        },
         "health_probe": {
           "description": "Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted.",
           "type": "string"
@@ -5431,6 +5800,26 @@
         },
         "auth_client_auth": {
           "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
+          "type": "string"
+        },
+        "max_concurrent_requests": {
+          "description": "Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled.",
+          "type": "string"
+        },
+        "requests_per_second_limit": {
+          "description": "Maximum number of HTTP requests per second to the same upstream origin. Overrides runtime.params.http_requests_per_second_limit when set. If both are unset, no per-second request rate limit is applied.",
+          "type": "string"
+        },
+        "requests_per_minute_limit": {
+          "description": "Maximum number of HTTP requests per minute to the same upstream origin. Overrides runtime.params.http_requests_per_minute_limit when set. If both are unset, no per-minute request rate limit is applied.",
+          "type": "string"
+        },
+        "rate_control_jitter_min": {
+          "description": "Minimum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms.",
+          "type": "string"
+        },
+        "rate_control_jitter_max": {
+          "description": "Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
           "type": "string"
         },
         "file_format": {
@@ -5645,6 +6034,26 @@
           "description": "Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB).",
           "type": "string"
         },
+        "request_header_filters": {
+          "description": "Set to 'enabled' or 'disabled' to control whether request_headers filters can be pushed down as dynamic HTTP request headers.",
+          "type": "string",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        },
+        "request_header_allowlist": {
+          "description": "Comma-separated list of HTTP request header names that request_headers filters may set. Required when request_header_filters is enabled.",
+          "type": "string"
+        },
+        "max_request_headers_length": {
+          "description": "Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB).",
+          "type": "string"
+        },
+        "max_request_partitions": {
+          "description": "Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped.",
+          "type": "string"
+        },
         "health_probe": {
           "description": "Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted.",
           "type": "string"
@@ -5723,6 +6132,26 @@
         },
         "auth_client_auth": {
           "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
+          "type": "string"
+        },
+        "max_concurrent_requests": {
+          "description": "Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled.",
+          "type": "string"
+        },
+        "requests_per_second_limit": {
+          "description": "Maximum number of HTTP requests per second to the same upstream origin. Overrides runtime.params.http_requests_per_second_limit when set. If both are unset, no per-second request rate limit is applied.",
+          "type": "string"
+        },
+        "requests_per_minute_limit": {
+          "description": "Maximum number of HTTP requests per minute to the same upstream origin. Overrides runtime.params.http_requests_per_minute_limit when set. If both are unset, no per-minute request rate limit is applied.",
+          "type": "string"
+        },
+        "rate_control_jitter_min": {
+          "description": "Minimum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms.",
+          "type": "string"
+        },
+        "rate_control_jitter_max": {
+          "description": "Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
           "type": "string"
         },
         "file_format": {
@@ -6326,7 +6755,45 @@
           "type": "string",
           "x-secret": true
         },
+        "spiceai_region": {
+          "type": "string"
+        },
         "spiceai_endpoint": {
+          "type": "string"
+        },
+        "spiceai_flight_endpoint": {
+          "type": "string"
+        },
+        "spiceai_tls_ca_certificate_file": {
+          "description": "Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "SpiceaiDataConnectorParams": {
+      "title": "SpiceaiParams",
+      "type": "object",
+      "properties": {
+        "spiceai_api_key": {
+          "type": "string",
+          "x-secret": true
+        },
+        "spiceai_token": {
+          "type": "string",
+          "x-secret": true
+        },
+        "spiceai_region": {
+          "type": "string"
+        },
+        "spiceai_endpoint": {
+          "type": "string"
+        },
+        "spiceai_flight_endpoint": {
+          "type": "string"
+        },
+        "spiceai_tls_ca_certificate_file": {
+          "description": "Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates.",
           "type": "string"
         }
       },
@@ -6547,6 +7014,7 @@
           "type": "string"
         },
         "pg_sslrootcert": {
+          "description": "The path to, or inline PEM content for, the SSL root certificate.",
           "type": "string"
         },
         "pg_connection_pool_min": {
@@ -6729,6 +7197,9 @@
         "spiceai_token": {
           "type": "string",
           "x-secret": true
+        },
+        "spiceai_region": {
+          "type": "string"
         },
         "spiceai_endpoint": {
           "type": "string"
@@ -6995,7 +7466,11 @@
           "default": ""
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -7216,7 +7691,11 @@
           "default": "disabled"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -7414,7 +7893,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -7624,7 +8107,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -7830,7 +8317,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -8040,7 +8531,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -8242,7 +8737,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -8481,7 +8980,11 @@
           ]
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -8679,7 +9182,11 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
           "type": "string"
         },
         "system_prompt": {
@@ -9023,8 +9530,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9191,8 +9711,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9359,8 +9892,202 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "DucklakeDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for ducklake connector. Format: ducklake:<path>",
+          "type": "string",
+          "pattern": "^ducklake:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the ducklake data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DucklakeDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9527,8 +10254,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9695,8 +10435,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9863,8 +10616,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10031,8 +10797,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10199,8 +10978,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10367,8 +11159,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10535,8 +11340,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10703,8 +11521,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10871,8 +11702,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11039,8 +11883,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11207,8 +12064,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11375,8 +12245,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11543,8 +12426,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11711,8 +12607,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11879,8 +12788,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12047,8 +12969,202 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "SpiceaiDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for spiceai connector. Format: spiceai:<path>",
+          "type": "string",
+          "pattern": "^spiceai:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the spiceai data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpiceaiDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12224,8 +13340,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12401,8 +13530,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12578,8 +13720,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12755,8 +13910,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12932,8 +14100,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -13109,8 +14290,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -14187,8 +15381,21 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "load": {
+          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
