@@ -374,9 +374,11 @@ pub fn transform_stream(
 fn add_usage_delta(usage: &mut CompletionUsage, delta: Usage) {
     let delta = CompletionUsage::from(delta);
 
-    usage.prompt_tokens += delta.prompt_tokens;
-    usage.completion_tokens += delta.completion_tokens;
-    usage.total_tokens += delta.total_tokens;
+    usage.prompt_tokens = usage.prompt_tokens.saturating_add(delta.prompt_tokens);
+    usage.completion_tokens = usage
+        .completion_tokens
+        .saturating_add(delta.completion_tokens);
+    usage.total_tokens = usage.total_tokens.saturating_add(delta.total_tokens);
     usage.prompt_tokens_details = combine_prompt_token_details(
         usage.prompt_tokens_details.take(),
         delta.prompt_tokens_details,
@@ -427,7 +429,7 @@ fn combine_completion_token_details(
 
 fn combine_opt_u32(current: Option<u32>, delta: Option<u32>) -> Option<u32> {
     match (current, delta) {
-        (Some(current), Some(delta)) => Some(current + delta),
+        (Some(current), Some(delta)) => Some(current.saturating_add(delta)),
         (Some(current), None) => Some(current),
         (None, Some(delta)) => Some(delta),
         (None, None) => None,
@@ -521,6 +523,48 @@ mod tests {
                 .as_ref()
                 .and_then(|details| details.cached_tokens),
             Some(10)
+        );
+    }
+
+    #[test]
+    fn usage_delta_saturates_token_counts() {
+        let mut usage = CompletionUsage {
+            prompt_tokens: u32::MAX - 1,
+            completion_tokens: u32::MAX - 1,
+            total_tokens: u32::MAX - 1,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(u32::MAX - 1),
+                audio_tokens: Some(u32::MAX - 1),
+            }),
+            completion_tokens_details: None,
+        };
+
+        add_usage_delta(
+            &mut usage,
+            Usage {
+                input_tokens: 2,
+                output_tokens: 2,
+                cache_read_input_tokens: Some(2),
+                ..Usage::default()
+            },
+        );
+
+        assert_eq!(usage.prompt_tokens, u32::MAX);
+        assert_eq!(usage.completion_tokens, u32::MAX);
+        assert_eq!(usage.total_tokens, u32::MAX);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.audio_tokens),
+            Some(u32::MAX - 1)
         );
     }
 }
