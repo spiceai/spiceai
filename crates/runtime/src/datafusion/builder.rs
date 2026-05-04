@@ -520,6 +520,7 @@ impl DataFusionBuilder {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
+            data_update_broadcaster: crate::dataupdate::DataUpdateBroadcaster::new(),
             writable_catalogs: RwLock::new(HashSet::new()),
             ddl_enabled_catalogs,
             ddl_extension_store,
