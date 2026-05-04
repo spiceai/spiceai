@@ -190,6 +190,7 @@ struct RequestFilterParams {
     allow_header_filters: bool,
     max_headers_length: usize,
     request_header_allowlist: Vec<String>,
+    request_headers_sensitive: Vec<String>,
 }
 
 struct HttpProviderParams {
@@ -318,6 +319,20 @@ impl Https {
                     .split(',')
                     .map(|header_name| header_name.trim().to_string())
                     .filter(|header_name| !header_name.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let request_headers_sensitive = self
+            .params
+            .get("request_headers_sensitive")
+            .expose()
+            .ok()
+            .map(|v: &str| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s: &&str| !s.is_empty())
+                    .map(str::to_lowercase)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -466,6 +481,7 @@ impl Https {
                 allow_header_filters,
                 max_headers_length,
                 request_header_allowlist,
+                request_headers_sensitive,
             },
             max_request_partitions,
             health_probe,
@@ -771,6 +787,7 @@ impl Https {
             allow_header_filters,
             max_headers_length,
             request_header_allowlist,
+            request_headers_sensitive,
         } = request_filters;
 
         let mut provider = data_components::http::provider::HttpTableProvider::new(
@@ -854,7 +871,11 @@ impl Https {
                 request_header_allowlist.len()
             );
             provider = provider
-                .enable_header_filters(max_headers_length, request_header_allowlist)
+                .enable_header_filters(
+                    max_headers_length,
+                    request_header_allowlist,
+                    request_headers_sensitive,
+                )
                 .map_err(|e| DataConnectorError::InvalidConfiguration {
                     dataconnector: "https".to_string(),
                     message: format!("Invalid request header filter configuration: {e}"),
@@ -1056,6 +1077,8 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("request_header_allowlist")
             .description("Comma-separated list of HTTP request header names that request_headers filters may set. Required when request_header_filters is enabled."),
+        ParameterSpec::runtime("request_headers_sensitive")
+            .description("Comma-separated list of HTTP request header names (must be a subset of request_header_allowlist) whose values are hashed (SHA-256) before being stored in the accelerator cache. Raw values are forwarded to the upstream API unchanged."),
         ParameterSpec::runtime("max_request_headers_length")
             .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
         ParameterSpec::runtime("max_request_partitions")

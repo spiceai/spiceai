@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use reqwest::header::HeaderName;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;

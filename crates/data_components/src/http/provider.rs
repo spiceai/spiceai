@@ -22,6 +22,7 @@ use arrow::{
 };
 use arrow_array::UInt16Array;
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use datafusion::{
     catalog::Session,
     common::{Constraints, project_schema},
@@ -43,6 +44,8 @@ use reqwest::{
     Client,
     header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
+use runtime_request_context::RequestContext;
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::{
@@ -138,6 +141,22 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
+
+const SENSITIVE_HASH_PREFIX: &str = "spice-redacted-sha256:";
+
+pub fn prepare_header_value(raw: &str, sensitive: bool) -> String {
+    if sensitive {
+        let digest = Sha256::digest(raw.as_bytes());
+        format!("{SENSITIVE_HASH_PREFIX}{}", URL_SAFE_NO_PAD.encode(digest))
+    } else {
+        raw.to_string()
+    }
+}
+
+pub fn is_redacted_sentinel(value: &str) -> bool {
+    value.starts_with(SENSITIVE_HASH_PREFIX)
+}
+
 pub type PartitionSpec = (
     Option<String>,
     Option<String>,
@@ -330,6 +349,9 @@ struct RequestFilterOptions {
     max_body_bytes: usize,
     max_headers_length: usize,
     allowed_headers: HashSet<HeaderName>,
+    /// Subset of allowed_headers whose values are hashed (SHA-256, sentinel-prefixed)
+    /// before storage. Empty by default — no behavior change when unset.
+    sensitive_headers: Arc<HashSet<HeaderName>>,
 }
 
 impl Default for RequestFilterOptions {
@@ -340,6 +362,7 @@ impl Default for RequestFilterOptions {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_headers_length: DEFAULT_MAX_HEADERS_LENGTH,
             allowed_headers: HashSet::new(),
+            sensitive_headers: Arc::new(HashSet::new()),
         }
     }
 }
@@ -559,10 +582,17 @@ impl HttpTableProvider {
         self
     }
 
-    pub fn enable_header_filters<I, S>(mut self, max_length: usize, header_names: I) -> Result<Self>
+    pub fn enable_header_filters<I, S, J, T>(
+        mut self,
+        max_length: usize,
+        header_names: I,
+        sensitive_header_names: J,
+    ) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
+        J: IntoIterator<Item = T>,
+        T: AsRef<str>,
     {
         let mut allowed_headers = HashSet::new();
         for header_name in header_names {
@@ -592,11 +622,32 @@ impl HttpTableProvider {
             }
         );
 
+        let mut sensitive_headers_set = HashSet::new();
+        for header_name in sensitive_header_names {
+            let raw = header_name.as_ref().trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let parsed = HeaderName::try_from(raw).map_err(|e| Error::Configuration {
+                message: format!("Invalid request_headers_sensitive entry '{raw}': {e}"),
+            })?;
+            ensure!(
+                allowed_headers.contains(&parsed),
+                ConfigurationSnafu {
+                    message: format!(
+                        "request_headers_sensitive entry '{raw}' is not in request_header_allowlist. Add '{raw}' to request_header_allowlist or remove it from request_headers_sensitive."
+                    )
+                }
+            );
+            sensitive_headers_set.insert(parsed);
+        }
+
         self.request_filter_options
             .enable(RequestFilterKind::Headers);
         self.request_filter_options.max_headers_length =
             max_length.min(DEFAULT_MAX_HEADERS_LENGTH * 4);
         self.request_filter_options.allowed_headers = allowed_headers;
+        self.request_filter_options.sensitive_headers = Arc::new(sensitive_headers_set);
         Ok(self)
     }
 
@@ -3086,7 +3137,26 @@ impl HttpTableProvider {
                     ),
                 }
             })?;
-            headers.insert(header_name, header_value);
+
+            // If the stored value is a redacted sentinel (SHA-256 hash of the original),
+            // recover the raw value from the current request's incoming headers so the
+            // upstream HTTP call receives the real header value.
+            let upstream_header_value =
+                if is_redacted_sentinel(header_value.to_str().unwrap_or_default()) {
+                    // SAFETY: parse_request_headers is always called from within a live
+                    // DataFusion task context that was entered via RequestContext::scope.
+                    let context = unsafe { RequestContext::current_sync() };
+                    let recovered = context
+                        .incoming_headers()
+                        .get(&header_name)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| HeaderValue::from_str(s).ok())
+                        .flatten();
+                    recovered.unwrap_or(header_value)
+                } else {
+                    header_value
+                };
+            headers.insert(header_name, upstream_header_value);
         }
 
         Ok(headers)
@@ -3204,7 +3274,11 @@ mod tests {
 
     fn header_provider() -> HttpTableProvider {
         base_provider()
-            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id", "x-region"])
+            .enable_header_filters(
+                DEFAULT_MAX_HEADERS_LENGTH,
+                vec!["x-sandbox-id", "x-region"],
+                Vec::<String>::new(),
+            )
             .expect("header filters should enable")
     }
 
@@ -3445,7 +3519,11 @@ mod tests {
         let provider = base_provider()
             .with_allowed_paths(vec!["/a".to_string()])
             .expect("allowed paths")
-            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id".to_string()])
+            .enable_header_filters(
+                DEFAULT_MAX_HEADERS_LENGTH,
+                vec!["x-sandbox-id".to_string()],
+                Vec::<String>::new(),
+            )
             .expect("enable header filters");
         // request_path = '/a' OR request_headers IN ('{"x-sandbox-id":"a"}')
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -3714,7 +3792,11 @@ mod tests {
     #[test]
     fn test_request_headers_filter_rejects_authorization_with_auth() {
         let provider = base_provider()
-            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["authorization"])
+            .enable_header_filters(
+                DEFAULT_MAX_HEADERS_LENGTH,
+                vec!["authorization"],
+                Vec::<String>::new(),
+            )
             .expect("authorization should be allowlisted before auth is configured")
             .with_auth(Arc::new(TestAuthenticator));
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -6396,7 +6478,11 @@ mod tests {
             .expect("valid path glob")
             .enable_query_filters(DEFAULT_MAX_QUERY_LENGTH)
             .enable_body_filters(DEFAULT_MAX_BODY_BYTES)
-            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-test"])
+            .enable_header_filters(
+                DEFAULT_MAX_HEADERS_LENGTH,
+                vec!["x-test"],
+                Vec::<String>::new(),
+            )
             .expect("header filters should enable")
             .with_max_request_partitions(max_request_partitions);
         HttpExec::new(

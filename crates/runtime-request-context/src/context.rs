@@ -57,6 +57,9 @@ pub struct RequestContext {
     /// The raw `authorization` header value from the incoming request, if present.
     /// Used to forward credentials when proxying requests (e.g. scheduler → executor).
     authorization_header: Option<String>,
+    /// All headers from the incoming request, captured at the request boundary.
+    /// Used by connectors that need to forward or inspect arbitrary request headers.
+    incoming_headers: HeaderMap,
 }
 
 #[async_trait::async_trait]
@@ -75,6 +78,8 @@ tokio::task_local! {
 /// An internal request context that is used outside the context of a client request.
 static INTERNAL_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
     LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
+// Note: `build()` initialises `incoming_headers` to `HeaderMap::new()` by default, so no
+// explicit override is needed for the internal context.
 
 static CLIENT_CACHE_KEY_REGEX: LazyLock<Regex> =
     LazyLock::new(|| match Regex::new(r"^([\w-]{1,128})$") {
@@ -247,6 +252,12 @@ impl RequestContext {
         self.authorization_header.as_deref()
     }
 
+    /// Returns the full set of headers from the incoming request.
+    #[must_use]
+    pub fn incoming_headers(&self) -> &HeaderMap {
+        &self.incoming_headers
+    }
+
     #[must_use]
     pub fn scoped_client_supplied_cache_key(&self) -> Option<String> {
         self.client_supplied_cache_key.as_deref().map(|cache_key| {
@@ -325,6 +336,7 @@ pub struct RequestContextBuilder {
     extensions: Extensions,
     trace_parent: Option<TraceParent>,
     authorization_header: Option<String>,
+    incoming_headers: HeaderMap,
 }
 
 impl RequestContextBuilder {
@@ -340,6 +352,7 @@ impl RequestContextBuilder {
             extensions: Extensions::default(),
             trace_parent: None,
             authorization_header: None,
+            incoming_headers: HeaderMap::new(),
         }
     }
 
@@ -383,6 +396,8 @@ impl RequestContextBuilder {
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+
+        self.incoming_headers = headers.clone();
 
         match super::extract_trace_parent(headers) {
             Ok(trace_parent) => {
@@ -429,6 +444,12 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_authorization_header(mut self, authorization_header: Option<String>) -> Self {
         self.authorization_header = authorization_header;
+        self
+    }
+
+    #[must_use]
+    pub fn with_incoming_headers(mut self, headers: HeaderMap) -> Self {
+        self.incoming_headers = headers;
         self
     }
 
@@ -528,6 +549,7 @@ impl RequestContextBuilder {
             trace_parent: self.trace_parent,
             nested_query_level: AtomicI16::new(0),
             authorization_header: self.authorization_header,
+            incoming_headers: self.incoming_headers,
         }
     }
 

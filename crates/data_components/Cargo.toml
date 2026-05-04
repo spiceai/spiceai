@@ -31,6 +31,8 @@ azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
     "key_auth",
 ], optional = true }
 base64.workspace = true
+runtime-request-context = { path = "../runtime-request-context" }
+sha2.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
 bigdecimal = { workspace = true, optional = true }

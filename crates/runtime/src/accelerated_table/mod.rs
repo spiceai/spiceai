@@ -15,9 +15,12 @@ limitations under the License.
 */
 
 use crate::config::ClusterRole;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
+
+use reqwest::header::HeaderName;
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
@@ -269,6 +272,10 @@ pub struct AcceleratedTable {
     /// Sender for batched cache writes. Only used in caching refresh mode.
     batch_write_tx: Option<caching::CacheWriteSender>,
     cluster_role: Option<ClusterRole>,
+    /// Subset of request headers whose values are hashed before storage (connector param).
+    sensitive_headers: Arc<HashSet<HeaderName>>,
+    /// Header names to extract from the incoming request for cache keying (accelerator param).
+    caching_allowed_request_headers: Arc<HashSet<HeaderName>>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -351,6 +358,10 @@ pub struct Builder {
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
     accelerator_write_mutex: Arc<Mutex<()>>,
+    /// Subset of request headers whose values are hashed before storage.
+    sensitive_headers: Arc<HashSet<HeaderName>>,
+    /// Header names to extract from the incoming request for cache keying.
+    caching_allowed_request_headers: Arc<HashSet<HeaderName>>,
 }
 
 impl Builder {
@@ -398,6 +409,8 @@ impl Builder {
             is_s3_express_acceleration: false,
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
+            sensitive_headers: Arc::new(HashSet::new()),
+            caching_allowed_request_headers: Arc::new(HashSet::new()),
         }
     }
 
@@ -586,6 +599,21 @@ impl Builder {
     /// Set whether to serve expired data on upstream error in cache mode
     pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
         self.caching_stale_if_error = enabled;
+        self
+    }
+
+    /// Set the sensitive headers (hashed before storage) for cache mode
+    pub fn sensitive_headers(&mut self, headers: Arc<HashSet<HeaderName>>) -> &mut Self {
+        self.sensitive_headers = headers;
+        self
+    }
+
+    /// Set the headers to extract from the incoming request for cache keying
+    pub fn caching_allowed_request_headers(
+        &mut self,
+        headers: Arc<HashSet<HeaderName>>,
+    ) -> &mut Self {
+        self.caching_allowed_request_headers = headers;
         self
     }
 
@@ -1003,6 +1031,8 @@ impl Builder {
             last_updated_at,
             batch_write_tx,
             cluster_role: self.cluster_role,
+            sensitive_headers: self.sensitive_headers,
+            caching_allowed_request_headers: self.caching_allowed_request_headers,
         })
     }
 }
@@ -1382,6 +1412,8 @@ impl TableProvider for AcceleratedTable {
                     Arc::clone(&self.in_flight_revalidations),
                     Arc::clone(&self.synchronized_children),
                     batch_write_tx,
+                    Arc::clone(&self.sensitive_headers),
+                    Arc::clone(&self.caching_allowed_request_headers),
                 ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input.ok_or_else(|| {

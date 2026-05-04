@@ -15,10 +15,13 @@ limitations under the License.
 */
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
+
+use reqwest::header::HeaderName;
 
 use arrow::array::StringArray;
 use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
@@ -40,7 +43,6 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::expr::ExprListDisplay;
 use futures::{StreamExt, TryStreamExt};
-use std::collections::HashSet;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
@@ -470,7 +472,7 @@ impl CacheRefreshHelper {
         let stale_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
         // Extract unique filter sets from stale rows
-        let filter_sets = Self::extract_unique_filter_sets(&stale_batches)?;
+        let filter_sets = Self::extract_unique_filter_sets(&stale_batches, &HashSet::new())?;
 
         let total_stale_rows: usize = stale_batches.iter().map(RecordBatch::num_rows).sum();
         tracing::debug!(
@@ -603,15 +605,23 @@ impl CacheRefreshHelper {
         Ok(refreshed_rows)
     }
 
-    /// Extract filter expressions from a row containing `request_path`, `request_query`, `request_body`
+    /// Extract filter expressions from a row containing `request_path`, `request_query`, `request_body`,
+    /// and optionally `request_headers` when `caching_allowed_request_headers` is non-empty.
+    ///
+    /// Returns `Ok(None)` when the row contains a redacted sentinel in the `request_headers` column,
+    /// meaning the original header value is unavailable and the row should be skipped for refresh.
     fn extract_filters_from_row(
         batch: &RecordBatch,
         row_idx: usize,
-    ) -> DataFusionResult<Vec<Expr>> {
+        caching_allowed_request_headers: &HashSet<HeaderName>,
+    ) -> DataFusionResult<Option<Vec<Expr>>> {
         let schema = batch.schema();
         let mut filters = Vec::new();
 
-        let filter_columns = ["request_path", "request_query", "request_body"];
+        let mut filter_columns = vec!["request_path", "request_query", "request_body"];
+        if !caching_allowed_request_headers.is_empty() {
+            filter_columns.push("request_headers");
+        }
 
         for column_name in filter_columns {
             if let Some((idx, _)) = schema.column_with_name(column_name) {
@@ -627,6 +637,13 @@ impl CacheRefreshHelper {
 
                 if !array.is_null(row_idx) {
                     let value = array.value(row_idx).to_string();
+
+                    if column_name == "request_headers"
+                        && data_components::http::provider::is_redacted_sentinel(&value)
+                    {
+                        return Ok(None);
+                    }
+
                     // Only add filter if value is non-empty (empty string means no filter)
                     if !value.is_empty() {
                         tracing::debug!("Extracted {column_name} filter: {value}");
@@ -640,7 +657,7 @@ impl CacheRefreshHelper {
             "Extracted {} total filters from row (including empty values)",
             filters.len()
         );
-        Ok(filters)
+        Ok(Some(filters))
     }
 
     /// Extract unique filter sets from batches, deduplicating rows with identical
@@ -649,13 +666,24 @@ impl CacheRefreshHelper {
     /// This is needed because HTTP connector JSON array responses are stored as multiple rows
     /// with identical request parameters. Without deduplication, refreshing N rows from the
     /// same JSON array would trigger N identical HTTP requests.
-    fn extract_unique_filter_sets(batches: &[RecordBatch]) -> DataFusionResult<Vec<Vec<Expr>>> {
+    fn extract_unique_filter_sets(
+        batches: &[RecordBatch],
+        caching_allowed_request_headers: &HashSet<HeaderName>,
+    ) -> DataFusionResult<Vec<Vec<Expr>>> {
         let mut seen_filter_keys = std::collections::HashSet::new();
         let mut filter_sets: Vec<Vec<Expr>> = Vec::new();
 
         for batch in batches {
             for row_idx in 0..batch.num_rows() {
-                let row_filters = Self::extract_filters_from_row(batch, row_idx)?;
+                let Some(row_filters) = Self::extract_filters_from_row(
+                    batch,
+                    row_idx,
+                    caching_allowed_request_headers,
+                )?
+                else {
+                    // Row contains a redacted sentinel — skip it
+                    continue;
+                };
                 let cache_key = compute_cache_key_from_filters(&row_filters);
                 if seen_filter_keys.insert(cache_key) {
                     filter_sets.push(row_filters);
@@ -1487,6 +1515,12 @@ pub struct CachingAccelerationScanExec {
     synchronized_children: SynchronizedChildren,
     /// Sender for batched cache writes
     batch_write_tx: CacheWriteSender,
+    /// Headers to hash (redact) when building the cache key.
+    /// Empty by default — no behavior change when unset.
+    sensitive_headers: Arc<HashSet<HeaderName>>,
+    /// Header names to extract from the incoming request and include in the cache key.
+    /// Empty by default — no behavior change when unset.
+    caching_allowed_request_headers: Arc<HashSet<HeaderName>>,
 }
 
 impl CachingAccelerationScanExec {
@@ -1507,6 +1541,8 @@ impl CachingAccelerationScanExec {
         in_flight_revalidations: InFlightRevalidations,
         synchronized_children: SynchronizedChildren,
         batch_write_tx: CacheWriteSender,
+        sensitive_headers: Arc<HashSet<HeaderName>>,
+        caching_allowed_request_headers: Arc<HashSet<HeaderName>>,
     ) -> Self {
         // Default max_age (TTL) to 30 seconds if not specified
         let max_age = max_age.or(Some(Duration::from_secs(30)));
@@ -1534,6 +1570,8 @@ impl CachingAccelerationScanExec {
             in_flight_revalidations,
             synchronized_children,
             batch_write_tx,
+            sensitive_headers,
+            caching_allowed_request_headers,
         }
     }
 }
@@ -1595,6 +1633,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             Arc::clone(&self.in_flight_revalidations),
             Arc::clone(&self.synchronized_children),
             self.batch_write_tx.clone(),
+            Arc::clone(&self.sensitive_headers),
+            Arc::clone(&self.caching_allowed_request_headers),
         )))
     }
 
@@ -1635,6 +1675,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
         let synchronized_children = Arc::clone(&self.synchronized_children);
         let batch_write_tx = self.batch_write_tx.clone();
+        let sensitive_headers = Arc::clone(&self.sensitive_headers);
+        let caching_allowed_request_headers = Arc::clone(&self.caching_allowed_request_headers);
 
         tracing::debug!(
             "CacheAccelerationScanExec::execute about to spawn cache check for dataset={}",
@@ -1654,6 +1696,81 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 num_filters = filters.len(),
                 "About to read batches from accelerator stream; filters: {}", ExprListDisplay::comma_separated(&filters)
             );
+
+            // Build the request_headers filter from the current RequestContext
+            use data_components::http::provider::prepare_header_value;
+            use runtime_request_context::{AsyncMarker, RequestContext};
+
+            let request_context = RequestContext::current(AsyncMarker::new().await);
+            let mut context_headers: serde_json::Map<String, serde_json::Value> =
+                serde_json::Map::new();
+            for header_name in caching_allowed_request_headers.iter() {
+                if let Some(raw_value) = request_context.incoming_headers().get(header_name) {
+                    if let Ok(raw_str) = raw_value.to_str() {
+                        let sensitive = sensitive_headers.contains(header_name);
+                        let stored = prepare_header_value(raw_str, sensitive);
+                        context_headers.insert(
+                            header_name.to_string(),
+                            serde_json::Value::String(stored),
+                        );
+                    }
+                }
+            }
+
+            // Merge any existing SQL request_headers filter into context_headers.
+            // Context values take precedence on collision.
+            let mut filters: Vec<Expr> = filters;
+            if !caching_allowed_request_headers.is_empty() {
+                // Extract and remove any pre-existing request_headers filter
+                let mut existing_headers_json: Option<serde_json::Map<String, serde_json::Value>> =
+                    None;
+                filters.retain(|expr| {
+                    if let Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+                        left,
+                        op: datafusion::logical_expr::Operator::Eq,
+                        right,
+                    }) = expr
+                    {
+                        if matches!(left.as_ref(), Expr::Column(c) if c.name == "request_headers") {
+                            if let Expr::Literal(scalar, _) = right.as_ref() {
+                                if let Some(Some(s)) = scalar.try_as_str() {
+                                    if let Ok(map) = serde_json::from_str::<
+                                        serde_json::Map<String, serde_json::Value>,
+                                    >(s)
+                                    {
+                                        existing_headers_json = Some(map);
+                                    }
+                                }
+                            }
+                            return false;
+                        }
+                    }
+                    true
+                });
+
+                // Merge: existing first, then context overrides
+                if let Some(existing) = existing_headers_json {
+                    for (k, v) in existing {
+                        context_headers.entry(k).or_insert(v);
+                    }
+                }
+
+                // Sort keys for a deterministic cache key
+                let mut sorted_map: serde_json::Map<String, serde_json::Value> =
+                    serde_json::Map::new();
+                let mut keys: Vec<String> = context_headers.keys().cloned().collect();
+                keys.sort();
+                for k in keys {
+                    if let Some(v) = context_headers.remove(&k) {
+                        sorted_map.insert(k, v);
+                    }
+                }
+
+                if !sorted_map.is_empty() {
+                    let json_str = serde_json::to_string(&sorted_map).unwrap_or_default();
+                    filters.push(col("request_headers").eq(lit(json_str)));
+                }
+            }
 
             let cached_batches: Vec<RecordBatch> = match accelerator_stream.try_collect().await {
                 Ok(batches) => batches,
@@ -2084,8 +2201,9 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
-            .expect("Should extract filters");
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &HashSet::new())
+            .expect("Should extract filters")
+            .expect("Should not be None");
         assert_eq!(filters.len(), 3, "Should extract 3 filters");
     }
 
@@ -2119,8 +2237,9 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
-            .expect("Should extract filters");
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &HashSet::new())
+            .expect("Should extract filters")
+            .expect("Should not be None");
         // Only path and body should be extracted (query is null)
         assert_eq!(filters.len(), 2, "Should only extract non-null filters");
     }
@@ -2155,8 +2274,9 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
-            .expect("Should extract filters");
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &HashSet::new())
+            .expect("Should extract filters")
+            .expect("Should not be None");
         // Only query should be extracted (path and body are empty strings)
         assert_eq!(
             filters.len(),
@@ -2192,8 +2312,9 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
-            .expect("Should extract filters");
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0, &HashSet::new())
+            .expect("Should extract filters")
+            .expect("Should not be None");
         assert_eq!(
             filters.len(),
             0,
@@ -2603,7 +2724,7 @@ mod tests {
         assert_eq!(batch.num_rows(), 6, "Should have 6 rows total");
 
         // Extract unique filter sets
-        let filter_sets = CacheRefreshHelper::extract_unique_filter_sets(&[batch])
+        let filter_sets = CacheRefreshHelper::extract_unique_filter_sets(&[batch], &HashSet::new())
             .expect("Should extract filter sets");
 
         // Should only have 2 unique filter sets (5 duplicates + 1 unique)
