@@ -1597,6 +1597,38 @@ impl MetadataCatalog for CayenneCatalog {
 
         Ok(true)
     }
+
+    async fn export_dataset_slice(
+        &self,
+        dataset_name: &str,
+        data_dir_anchor: &std::path::Path,
+    ) -> CatalogResult<crate::metastore::snapshot::DatasetMetastoreSlice> {
+        match &self.metastore {
+            MetastoreImpl::Sqlite(m) => {
+                crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
+            }
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => {
+                crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
+            }
+        }
+    }
+
+    async fn import_dataset_slice(
+        &self,
+        slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
+        data_dir_anchor: &std::path::Path,
+    ) -> CatalogResult<()> {
+        match &self.metastore {
+            MetastoreImpl::Sqlite(m) => {
+                crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
+            }
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => {
+                crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
+            }
+        }
+    }
 }
 
 fn is_retryable_write_conflict(error: &CatalogError) -> bool {
