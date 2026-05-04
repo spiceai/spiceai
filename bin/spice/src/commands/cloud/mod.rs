@@ -759,10 +759,10 @@ fn resolve_string_or_prompt_with_terminal(
     // The chooser path constructs args structs with all fields set to None,
     // bypassing Clap's env-var resolution. Re-resolve here so chooser-based
     // PAT/API logins respect the configured env vars.
-    if let Ok(env_value) = std::env::var(env_var) {
-        if !env_value.is_empty() {
-            return Ok(env_value);
-        }
+    if let Ok(env_value) = std::env::var(env_var)
+        && !env_value.is_empty()
+    {
+        return Ok(env_value);
     }
 
     if !is_terminal {
