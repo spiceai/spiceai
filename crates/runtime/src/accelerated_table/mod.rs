@@ -1414,6 +1414,10 @@ impl TableProvider for AcceleratedTable {
                     batch_write_tx,
                     Arc::clone(&self.sensitive_headers),
                     Arc::clone(&self.caching_allowed_request_headers),
+                    {
+                        use runtime_request_context::{AsyncMarker, RequestContext};
+                        RequestContext::current(AsyncMarker::new().await)
+                    },
                 ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input.ok_or_else(|| {

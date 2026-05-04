@@ -71,7 +71,11 @@ where
     let driver_span = span.clone();
 
     let driver_task = async move {
-        match future.instrument(driver_span.clone()).await {
+        match Arc::clone(&driver_request_context)
+            .scope(future)
+            .instrument(driver_span.clone())
+            .await
+        {
             Ok((metadata, mut stream)) => {
                 let schema = stream.schema();
 

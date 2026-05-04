@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use reqwest::header::HeaderName;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
@@ -1826,6 +1825,11 @@ impl DataFusion {
             // Wire up header-keyed caching if the dataset specifies `caching_allowed_request_headers`.
             // The set of allowed headers comes from the accelerator param; the sensitive set comes
             // from the connector's `request_headers_sensitive` param on the dataset.
+            tracing::debug!(
+                dataset = %dataset.name,
+                caching_allowed_request_headers = ?acceleration_settings.caching_allowed_request_headers,
+                "caching mode: caching_allowed_request_headers from acceleration settings"
+            );
             if !acceleration_settings
                 .caching_allowed_request_headers
                 .is_empty()
@@ -1854,6 +1858,12 @@ impl DataFusion {
                     })
                     .unwrap_or_default();
 
+                tracing::debug!(
+                    dataset = %dataset.name,
+                    ?allowed,
+                    ?sensitive,
+                    "caching mode: wiring allowed and sensitive headers into AcceleratedTable builder"
+                );
                 accelerated_table_builder.sensitive_headers(Arc::new(sensitive));
                 accelerated_table_builder.caching_allowed_request_headers(Arc::new(allowed));
             }

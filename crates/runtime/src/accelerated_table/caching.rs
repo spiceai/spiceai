@@ -1531,6 +1531,10 @@ pub struct CachingAccelerationScanExec {
     /// Header names to extract from the incoming request and include in the cache key.
     /// Empty by default — no behavior change when unset.
     caching_allowed_request_headers: Arc<HashSet<HeaderName>>,
+    /// The RequestContext captured at scan() time (inside the HTTP request scope).
+    /// Stored explicitly because execute() may be called from a spawned task (e.g. inside
+    /// RepartitionExec) where the task-local REQUEST_CONTEXT is no longer set.
+    request_context: Arc<runtime_request_context::RequestContext>,
 }
 
 impl CachingAccelerationScanExec {
@@ -1553,6 +1557,7 @@ impl CachingAccelerationScanExec {
         batch_write_tx: CacheWriteSender,
         sensitive_headers: Arc<HashSet<HeaderName>>,
         caching_allowed_request_headers: Arc<HashSet<HeaderName>>,
+        request_context: Arc<runtime_request_context::RequestContext>,
     ) -> Self {
         // Default max_age (TTL) to 30 seconds if not specified
         let max_age = max_age.or(Some(Duration::from_secs(30)));
@@ -1582,6 +1587,7 @@ impl CachingAccelerationScanExec {
             batch_write_tx,
             sensitive_headers,
             caching_allowed_request_headers,
+            request_context,
         }
     }
 }
@@ -1645,6 +1651,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.batch_write_tx.clone(),
             Arc::clone(&self.sensitive_headers),
             Arc::clone(&self.caching_allowed_request_headers),
+            Arc::clone(&self.request_context),
         )))
     }
 
@@ -1687,6 +1694,10 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let batch_write_tx = self.batch_write_tx.clone();
         let sensitive_headers = Arc::clone(&self.sensitive_headers);
         let caching_allowed_request_headers = Arc::clone(&self.caching_allowed_request_headers);
+        // Use the RequestContext captured at scan() time. We cannot rely on the task-local
+        // REQUEST_CONTEXT here because execute() may be called from a Tokio task spawned by
+        // RepartitionExec (or similar) which does not inherit the task-local scope.
+        let request_context = Arc::clone(&self.request_context);
 
         tracing::debug!(
             "CacheAccelerationScanExec::execute about to spawn cache check for dataset={}",
@@ -1694,7 +1705,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         );
 
         // Use stream::once pattern to handle cache miss like FallbackOnZeroResultsScanExec
-        let cache_miss_or_stale_stream = futures::stream::once(async move {
+        let cache_miss_or_stale_stream = futures::stream::once(Arc::clone(&request_context).scope(async move {
             tracing::debug!(
                 "CacheAccelerationScanExec cache check STARTED for dataset={}",
                 dataset_name
@@ -1709,16 +1720,30 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
             // Build the request_headers filter from the current RequestContext
             use data_components::http::provider::prepare_header_value;
-            use runtime_request_context::{AsyncMarker, RequestContext};
 
-            let request_context = RequestContext::current(AsyncMarker::new().await);
             let mut context_headers: serde_json::Map<String, serde_json::Value> =
                 serde_json::Map::new();
+            tracing::debug!(
+                dataset = %dataset_name,
+                num_allowed = caching_allowed_request_headers.len(),
+                "CachingAccelerationScanExec: building request_headers filter from RequestContext"
+            );
+            tracing::debug!(
+                dataset = %dataset_name,
+                incoming_header_names = ?request_context.incoming_headers().keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+                "CachingAccelerationScanExec: incoming headers present in RequestContext"
+            );
             for header_name in caching_allowed_request_headers.iter() {
                 if let Some(raw_value) = request_context.incoming_headers().get(header_name) {
                     if let Ok(raw_str) = raw_value.to_str() {
                         let sensitive = sensitive_headers.contains(header_name);
                         let stored = prepare_header_value(raw_str, sensitive);
+                        tracing::debug!(
+                            dataset = %dataset_name,
+                            header = %header_name,
+                            sensitive,
+                            "CachingAccelerationScanExec: injecting header into cache key"
+                        );
                         context_headers.insert(
                             header_name.to_string(),
                             serde_json::Value::String(stored),
@@ -1782,6 +1807,28 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 }
             }
 
+            // Extract the expected request_headers JSON string from filters (if present).
+            // The accelerator_stream was launched *before* we built this filter, so it returns
+            // all rows matching the other filters (request_path, etc.) regardless of auth token.
+            // We post-filter in memory here to enforce per-token cache isolation.
+            let expected_request_headers_json: Option<String> = filters.iter().find_map(|expr| {
+                if let Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+                    left,
+                    op: datafusion::logical_expr::Operator::Eq,
+                    right,
+                }) = expr
+                {
+                    if matches!(left.as_ref(), Expr::Column(c) if c.name == "request_headers") {
+                        if let Expr::Literal(scalar, _) = right.as_ref() {
+                            if let Some(Some(s)) = scalar.try_as_str() {
+                                return Some(s.to_string());
+                            }
+                        }
+                    }
+                }
+                None
+            });
+
             let cached_batches: Vec<RecordBatch> = match accelerator_stream.try_collect().await {
                 Ok(batches) => batches,
                 Err(e) => {
@@ -1799,6 +1846,39 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 .into_iter()
                 .filter(|b| b.num_rows() > 0)
                 .collect();
+
+            // Post-filter by request_headers: the accelerator scan ran without this filter
+            // (it wasn't known until RequestContext was read above), so we enforce it here.
+            // A row whose request_headers column doesn't match the expected hash belongs to
+            // a different token — treat it as a cache miss for this request.
+            let cached_batches: Vec<RecordBatch> = if let Some(ref expected_json) = expected_request_headers_json {
+                if let Some(col_idx) = schema_clone.index_of("request_headers").ok() {
+                    cached_batches
+                        .into_iter()
+                        .filter_map(|batch| {
+                            let col = batch.column(col_idx);
+                            let string_array = col
+                                .as_any()
+                                .downcast_ref::<arrow::array::StringArray>()?;
+                            let indices: Vec<u32> = (0..batch.num_rows() as u32)
+                                .filter(|&i| {
+                                    string_array.is_valid(i as usize)
+                                        && string_array.value(i as usize) == expected_json.as_str()
+                                })
+                                .collect();
+                            if indices.is_empty() {
+                                return None;
+                            }
+                            let indices_array = arrow::array::UInt32Array::from(indices);
+                            arrow::compute::take_record_batch(&batch, &indices_array).ok()
+                        })
+                        .collect()
+                } else {
+                    cached_batches
+                }
+            } else {
+                cached_batches
+            };
             let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
             if total_cached_rows > 0 {
@@ -1871,7 +1951,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 )
                 .await
             }
-        })
+        }))
         .flatten();
 
         let adapter = RecordBatchStreamAdapter::new(schema, cache_miss_or_stale_stream);
