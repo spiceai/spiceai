@@ -19,21 +19,23 @@ limitations under the License.
 //!
 //! Today this module supports:
 //!
-//!   * **T0 SQL** via `from: sql` — inline SQL body compiled to a
-//!     `DataFusion` expression.
-//!   * **T2 Remote** via `from: http://…` and `from: https://…` —
-//!     HTTP + JSON endpoint invoked through [`AsyncScalarUDFImpl`].
+//!   * **T0 SQL** via `from: sql` - inline SQL body compiled to a
+//!     `DataFusion` expression or table query.
+//!   * **T2 Remote** via `from: http://...` and `from: https://...` when the
+//!     `http-functions` feature is enabled.
 //!
 //! Unsupported schemes are rejected at build time with
 //! [`UserFunctionError::UnsupportedScheme`].
 
 use std::sync::Arc;
 
+use datafusion::catalog::TableFunctionImpl;
 use datafusion::logical_expr::ScalarUDF;
 use snafu::Snafu;
-use spicepod::component::function::Function;
+use spicepod::component::function::{Function, FunctionKind};
 
 mod arrow_type;
+#[cfg(feature = "http-functions")]
 pub mod remote;
 pub mod sql;
 
@@ -43,6 +45,7 @@ pub mod sql;
 #[derive(Clone, Debug)]
 pub enum BuiltFunction {
     Scalar(Arc<ScalarUDF>),
+    Table(Arc<dyn TableFunctionImpl>),
 }
 
 /// Errors produced while building a user-defined function.
@@ -54,10 +57,20 @@ pub enum BuiltFunction {
 pub enum UserFunctionError {
     #[snafu(display(
         "Failed to register function {name}: the `from` scheme '{scheme}' is unsupported. \
-        Supported schemes: `sql`, `http://`, `https://`. \
+        Supported schemes in this build: {supported_schemes}. \
         See: https://spiceai.org/docs/reference/spicepod/functions"
     ))]
-    UnsupportedScheme { name: String, scheme: String },
+    UnsupportedScheme {
+        name: String,
+        scheme: String,
+        supported_schemes: &'static str,
+    },
+
+    #[cfg(not(feature = "http-functions"))]
+    #[snafu(display(
+        "Failed to register function {name}: HTTP-backed user-defined functions require the `http-functions` feature. This build supports inline SQL functions only (`from: sql`)."
+    ))]
+    HttpFunctionsDisabled { name: String },
 
     #[snafu(display(
         "Failed to register function {name}: one of `body:` or `body_ref:` is required when `from: sql` but neither was provided."
@@ -89,6 +102,7 @@ pub enum UserFunctionError {
         source: sql::SqlBuildError,
     },
 
+    #[cfg(feature = "http-functions")]
     #[snafu(display("Failed to register function {name}: {source}"))]
     Remote {
         name: String,
@@ -97,6 +111,14 @@ pub enum UserFunctionError {
 }
 
 pub type Result<T, E = UserFunctionError> = std::result::Result<T, E>;
+
+fn supported_schemes() -> &'static str {
+    if cfg!(feature = "http-functions") {
+        "`sql`, `http://`, `https://`"
+    } else {
+        "`sql`"
+    }
+}
 
 /// Split `from:` into `(scheme, tail)` — e.g. `sql` → (`"sql"`, `""`),
 /// `http://host/p` →
@@ -122,15 +144,23 @@ pub async fn build_function(decl: &Function) -> Result<BuiltFunction> {
 
     match scheme.as_str() {
         "sql" => build_sql(decl).await,
+        #[cfg(feature = "http-functions")]
         "http" | "https" => build_remote(decl),
+        #[cfg(not(feature = "http-functions"))]
+        "http" | "https" => HttpFunctionsDisabledSnafu {
+            name: decl.name.clone(),
+        }
+        .fail(),
         other => UnsupportedSchemeSnafu {
             name: decl.name.clone(),
             scheme: other.to_string(),
+            supported_schemes: supported_schemes(),
         }
         .fail(),
     }
 }
 
+#[cfg(feature = "http-functions")]
 fn build_remote(decl: &Function) -> Result<BuiltFunction> {
     if decl.body.is_some() || decl.body_ref.is_some() {
         return UnexpectedBodySnafu {
@@ -138,20 +168,47 @@ fn build_remote(decl: &Function) -> Result<BuiltFunction> {
         }
         .fail();
     }
-    let udf = remote::build_scalar_udf(decl).map_err(|source| UserFunctionError::Remote {
-        name: decl.name.clone(),
-        source,
-    })?;
-    Ok(BuiltFunction::Scalar(udf))
+    match decl.kind {
+        FunctionKind::Scalar => {
+            let udf =
+                remote::build_scalar_udf(decl).map_err(|source| UserFunctionError::Remote {
+                    name: decl.name.clone(),
+                    source,
+                })?;
+            Ok(BuiltFunction::Scalar(udf))
+        }
+        FunctionKind::Table => {
+            let udtf =
+                remote::build_table_udtf(decl).map_err(|source| UserFunctionError::Remote {
+                    name: decl.name.clone(),
+                    source,
+                })?;
+            Ok(BuiltFunction::Table(udtf))
+        }
+    }
 }
 
 async fn build_sql(decl: &Function) -> Result<BuiltFunction> {
     let body = resolve_body(decl).await?;
-    let udf = sql::build_scalar_udf(decl, &body).map_err(|source| UserFunctionError::Sql {
-        name: decl.name.clone(),
-        source,
-    })?;
-    Ok(BuiltFunction::Scalar(udf))
+    match decl.kind {
+        FunctionKind::Scalar => {
+            let udf =
+                sql::build_scalar_udf(decl, &body).map_err(|source| UserFunctionError::Sql {
+                    name: decl.name.clone(),
+                    source,
+                })?;
+            Ok(BuiltFunction::Scalar(udf))
+        }
+        FunctionKind::Table => {
+            let udtf = sql::build_table_udtf(decl, &body).await.map_err(|source| {
+                UserFunctionError::Sql {
+                    name: decl.name.clone(),
+                    source,
+                }
+            })?;
+            Ok(BuiltFunction::Table(udtf))
+        }
+    }
 }
 
 /// Resolve the effective body for a SQL-tier function, reading from
@@ -213,6 +270,8 @@ mod tests {
     }
 
     fn decl(from: &str, body: Option<&str>) -> Function {
+        use spicepod::component::function::FunctionReturns;
+
         Function {
             name: "f".into(),
             from: from.into(),
@@ -225,7 +284,7 @@ mod tests {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
-                returns: Some("int64".into()),
+                returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: body.map(str::to_string),
             body_ref: None,
@@ -280,6 +339,7 @@ mod tests {
             BuiltFunction::Scalar(udf) => {
                 assert_eq!(udf.name(), "f");
             }
+            BuiltFunction::Table(_) => panic!("expected scalar function"),
         }
 
         std::fs::remove_file(&tmp).ok();
@@ -294,6 +354,7 @@ mod tests {
         assert!(msg.contains("body_ref"), "{msg}");
     }
 
+    #[cfg(feature = "http-functions")]
     #[tokio::test]
     async fn non_sql_with_body_rejected() {
         let d = decl("http://example.com/f", Some("x + 1"));
@@ -303,9 +364,22 @@ mod tests {
         assert!(err.to_string().contains("must not be set"));
     }
 
+    #[cfg(not(feature = "http-functions"))]
+    #[tokio::test]
+    async fn http_scheme_rejected_without_feature() {
+        let d = decl("http://example.com/f", None);
+        let err = build_function(&d)
+            .await
+            .expect_err("http functions require feature");
+        let msg = err.to_string();
+        assert!(msg.contains("http-functions"), "{msg}");
+        assert!(msg.contains("inline SQL"), "{msg}");
+    }
+
     /// End-to-end: declare a remote UDF pointing at a local axum HTTP server,
     /// register it into `DataFusion`, run `SELECT remote_double(x) FROM t`,
     /// and verify the values round-tripped through JSON.
+    #[cfg(feature = "http-functions")]
     #[tokio::test]
     async fn remote_udf_round_trips_via_http_json() {
         use arrow::array::Int64Array;
@@ -316,7 +390,7 @@ mod tests {
         use datafusion::prelude::SessionContext;
         use serde_json::Value;
         use spicepod::component::function::{
-            FunctionArg, FunctionKind, Signature as YamlSig, Volatility,
+            FunctionArg, FunctionKind, FunctionReturns, Signature as YamlSig, Volatility,
         };
         use std::sync::Arc;
         use tokio::net::TcpListener;
@@ -358,7 +432,7 @@ mod tests {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
-                returns: Some("int64".into()),
+                returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: None,
             body_ref: None,
@@ -373,6 +447,7 @@ mod tests {
         let ctx = SessionContext::new();
         match built {
             BuiltFunction::Scalar(udf) => ctx.register_udf(udf.as_ref().clone()),
+            BuiltFunction::Table(_) => panic!("expected scalar function"),
         }
 
         // MemTable with four rows, query through the SQL layer.
@@ -420,6 +495,7 @@ mod tests {
             BuiltFunction::Scalar(udf) => {
                 ctx.register_udf(udf.as_ref().clone());
             }
+            BuiltFunction::Table(_) => panic!("expected scalar function"),
         }
 
         // Register a tiny table so we can SELECT double_it(col) FROM t.

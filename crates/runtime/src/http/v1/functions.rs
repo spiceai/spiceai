@@ -68,18 +68,31 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     }
 
     let registered_udfs = rt.df.ctx.udfs();
+    let registered_udtfs = rt
+        .df
+        .ctx
+        .state()
+        .table_functions()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
     let functions: Vec<ListFunctionElement> = app
         .functions
         .iter()
         .filter(|decl| {
             decl.enabled
-                && registered_udfs
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(&decl.name))
+                && match decl.kind {
+                    spicepod::component::function::FunctionKind::Scalar => registered_udfs
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&decl.name)),
+                    spicepod::component::function::FunctionKind::Table => registered_udtfs
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&decl.name)),
+                }
         })
         .map(|decl| ListFunctionElement {
             name: decl.name.clone(),
-            kind: "scalar".to_string(),
+            kind: decl.kind.as_str().to_string(),
             volatility: crate::datafusion::udf::effective_user_function_volatility(decl)
                 .to_string(),
             from: decl.from.clone(),
@@ -96,11 +109,15 @@ mod tests {
 
     use app::AppBuilder;
     use datafusion::arrow::datatypes::DataType;
+    use datafusion::catalog::{TableFunctionImpl, TableProvider};
+    use datafusion::common::DataFusionError;
     use datafusion::logical_expr::{ColumnarValue, Volatility as DataFusionVolatility, create_udf};
+    use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
     use http_body_util::BodyExt;
     use spicepod::component::function::{
-        Function, FunctionArg, FunctionKind, Signature, Volatility as FunctionVolatility,
+        Function, FunctionArg, FunctionKind, FunctionReturns, Signature,
+        Volatility as FunctionVolatility,
     };
     use spicepod::component::runtime::{Functions, Runtime as SpicepodRuntime};
     use std::collections::HashMap;
@@ -127,6 +144,7 @@ mod tests {
             vec![
                 test_function("User_Fn", true),
                 remote_function,
+                test_table_function("Rows_Fn", true),
                 test_function("disabled_fn", false),
                 test_function("missing_fn", true),
             ],
@@ -134,6 +152,7 @@ mod tests {
         .await;
         register_stub_udf(&rt, "user_fn");
         register_stub_udf(&rt, "remote_fn");
+        register_stub_udtf(&rt, "rows_fn");
         register_stub_udf(&rt, "disabled_fn");
 
         let (status, functions) = list_json(rt).await;
@@ -155,6 +174,13 @@ mod tests {
                     volatility: "stable".to_string(),
                     from: "https://example.com/udf".to_string(),
                     description: Some("Remote_Fn description".to_string()),
+                },
+                ListFunctionElement {
+                    name: "Rows_Fn".to_string(),
+                    kind: "table".to_string(),
+                    volatility: "stable".to_string(),
+                    from: "sql".to_string(),
+                    description: Some("Rows_Fn description".to_string()),
                 },
             ]
         );
@@ -194,7 +220,7 @@ mod tests {
                     name: "x".to_string(),
                     arrow_type: "int64".to_string(),
                 }],
-                returns: Some("int64".to_string()),
+                returns: Some(FunctionReturns::Scalar("int64".to_string())),
             },
             body: Some("x".to_string()),
             body_ref: None,
@@ -206,6 +232,17 @@ mod tests {
         }
     }
 
+    fn test_table_function(name: &str, enabled: bool) -> Function {
+        let mut function = test_function(name, enabled);
+        function.kind = FunctionKind::Table;
+        function.signature.returns = Some(FunctionReturns::Table(vec![FunctionArg {
+            name: "value".to_string(),
+            arrow_type: "int64".to_string(),
+        }]));
+        function.as_tool = false;
+        function
+    }
+
     fn register_stub_udf(rt: &Runtime, name: &str) {
         let udf = create_udf(
             name,
@@ -215,6 +252,23 @@ mod tests {
             Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(1))))),
         );
         rt.datafusion().ctx.register_udf(udf);
+    }
+
+    #[derive(Debug)]
+    struct StubTableFunction;
+
+    impl TableFunctionImpl for StubTableFunction {
+        fn call(&self, _args: &[Expr]) -> datafusion::common::Result<Arc<dyn TableProvider>> {
+            Err(DataFusionError::Plan(
+                "stub table function is not executable".to_string(),
+            ))
+        }
+    }
+
+    fn register_stub_udtf(rt: &Runtime, name: &str) {
+        rt.datafusion()
+            .ctx
+            .register_udtf(name, Arc::new(StubTableFunction));
     }
 
     async fn list_json(rt: Arc<Runtime>) -> (StatusCode, Vec<ListFunctionElement>) {

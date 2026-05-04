@@ -35,6 +35,8 @@ limitations under the License.
 //! Remote beta functions use Arrow's JSON reader/writer, supporting scalar and
 //! complex Arrow types that have a JSON representation.
 
+use std::collections::HashSet;
+use std::fmt::{Debug, Formatter};
 use std::hash::Hash;
 use std::sync::{
     Arc,
@@ -44,21 +46,29 @@ use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef, new_empty_array};
 use arrow::compute::concat;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_json::{ReaderBuilder, StructMode, writer::JsonArray, writer::WriterBuilder};
+use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::DataFusionError;
+use datafusion::common::Result as DataFusionResult;
+use datafusion::datasource::TableType;
 use datafusion::logical_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
     Volatility as DfVolatility,
 };
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::Expr;
+use datafusion::scalar::ScalarValue;
+use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion_datasource::source::DataSourceExec;
 use futures::{StreamExt, stream};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde_json::{Map, Value};
 use snafu::{ResultExt, Snafu};
-use spicepod::component::function::{Function, Volatility};
+use spicepod::component::function::{Function, FunctionArg, FunctionReturns, Volatility};
 use url::Url;
 
 static NEXT_REMOTE_ID: AtomicU64 = AtomicU64::new(1);
@@ -77,11 +87,29 @@ pub enum RemoteBuildError {
     MissingReturnType,
 
     #[snafu(display(
+        "table return schema is required for a remote table function — set `signature.returns` to a list of output columns, e.g. `returns: [{{ name: value, type: int64 }}]`"
+    ))]
+    MissingTableReturnSchema,
+
+    #[snafu(display(
+        "scalar return type is required for a scalar remote function — set `signature.returns` to a single Arrow type string, not a table column list"
+    ))]
+    ExpectedScalarReturnType,
+
+    #[snafu(display(
+        "table return schema is required for a remote table function — set `signature.returns` to a list of output columns, not a scalar Arrow type string"
+    ))]
+    ExpectedTableReturnSchema,
+
+    #[snafu(display(
         "unsupported or invalid Arrow type '{arrow_type}' for remote UDF signature. \
         Use Arrow display types like `Int64`, `List(Int64)`, `Struct(\"name\": Utf8)`, \
         or Spicepod aliases like `int64`, `list<int64>`, `struct<name:utf8>`, `decimal(38,10)`."
     ))]
     UnsupportedArrowType { arrow_type: String },
+
+    #[snafu(display("duplicate output column '{column}' in remote table function return schema"))]
+    DuplicateOutputColumn { column: String },
 
     #[snafu(display("failed to parse endpoint URL '{from}': {source}"))]
     InvalidEndpoint {
@@ -128,12 +156,11 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
         .map(|a| parse_arrow_type(&a.arrow_type))
         .collect::<Result<Vec<_>>>()?;
 
-    let return_type = decl
-        .signature
-        .returns
-        .as_deref()
-        .ok_or(RemoteBuildError::MissingReturnType)
-        .and_then(parse_arrow_type)?;
+    let return_type = match decl.signature.returns.as_ref() {
+        Some(FunctionReturns::Scalar(arrow_type)) => parse_arrow_type(arrow_type)?,
+        Some(FunctionReturns::Table(_)) => return ExpectedScalarReturnTypeSnafu.fail(),
+        None => return MissingReturnTypeSnafu.fail(),
+    };
 
     let timeout = parse_timeout(decl.params.get("timeout"))?;
     let batch_size = parse_batch_size(decl.params.get("batch_size"))?;
@@ -170,6 +197,165 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
     };
     let async_udf = AsyncScalarUDF::new(Arc::new(impl_));
     Ok(Arc::new(async_udf.into_scalar_udf()))
+}
+
+/// Build a remote table function from a [`Function`] with a `from: http://…`
+/// or `from: https://…` endpoint.
+///
+/// Wire contract:
+///   * Request: `POST <endpoint>` with body `{"args": {"<arg_name>": <arg_value>, ...}}`.
+///   * Response: HTTP 200 with body `{"rows": [{"<column>": <value>, ...}, ...]}`.
+///
+/// # Errors
+///
+/// Returns [`RemoteBuildError`] when the endpoint, signature, params, or HTTP
+/// client cannot be constructed.
+pub fn build_table_udtf(decl: &Function) -> Result<Arc<dyn TableFunctionImpl>> {
+    let endpoint = parse_endpoint(&decl.from)?;
+    let arg_schema = function_arg_schema(&decl.signature.args)?;
+    let output_schema = table_return_schema(decl)?;
+    let timeout = parse_timeout(decl.params.get("timeout"))?;
+    let auth_bearer = parse_auth_bearer(decl.params.get("auth_bearer"))?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(ref token) = auth_bearer {
+        let hv = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| RemoteBuildError::InvalidAuthBearer)?;
+        headers.insert(AUTHORIZATION, hv);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .default_headers(headers)
+        .build()
+        .context(BuildClientSnafu)?;
+
+    Ok(Arc::new(RemoteTableFunc {
+        name: decl.name.clone(),
+        arg_schema,
+        output_schema,
+        endpoint,
+        client,
+    }))
+}
+
+#[derive(Clone)]
+struct RemoteTableFunc {
+    name: String,
+    arg_schema: SchemaRef,
+    output_schema: SchemaRef,
+    endpoint: Url,
+    client: reqwest::Client,
+}
+
+impl Debug for RemoteTableFunc {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteTableFunc")
+            .field("name", &self.name)
+            .field("arg_schema", &self.arg_schema)
+            .field("output_schema", &self.output_schema)
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TableFunctionImpl for RemoteTableFunc {
+    fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        let args = table_arg_values(&self.name, Arc::clone(&self.arg_schema), exprs)?;
+        Ok(Arc::new(RemoteTableProvider {
+            name: self.name.clone(),
+            arg_schema: Arc::clone(&self.arg_schema),
+            schema: Arc::clone(&self.output_schema),
+            endpoint: self.endpoint.clone(),
+            client: self.client.clone(),
+            args,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct RemoteTableProvider {
+    name: String,
+    arg_schema: SchemaRef,
+    schema: SchemaRef,
+    endpoint: Url,
+    client: reqwest::Client,
+    args: Vec<ScalarValue>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for RemoteTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        require_read_write_api_key(&self.name).await?;
+
+        let args = encode_single_args_row(Arc::clone(&self.arg_schema), &self.args, &self.name)?;
+        let mut rows = self.post_table(args).await?;
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+        let batch = decode_table_rows(rows, Arc::clone(&self.schema), &self.name)?;
+        let memory_source = MemorySourceConfig::try_new(
+            &[vec![batch]],
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
+        Ok(Arc::new(DataSourceExec::new(Arc::new(memory_source))))
+    }
+}
+
+impl RemoteTableProvider {
+    async fn post_table(&self, args: Value) -> std::result::Result<Vec<Value>, DataFusionError> {
+        let body = serde_json::json!({ "args": args });
+        let resp = self
+            .client
+            .post(self.endpoint.clone())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "remote table function '{}' request failed: {e}",
+                    self.name
+                ))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet = sanitize_body_for_error(&body);
+            return Err(DataFusionError::Execution(format!(
+                "remote table function '{}' returned HTTP {status}: {snippet}",
+                self.name
+            )));
+        }
+
+        let parsed: RemoteTableResponse = resp.json().await.map_err(|e| {
+            DataFusionError::Execution(format!(
+                "remote table function '{}' response was not valid JSON: {e}",
+                self.name
+            ))
+        })?;
+        Ok(parsed.rows)
+    }
 }
 
 #[derive(Debug)]
@@ -412,6 +598,11 @@ struct RemoteResponse {
     values: Vec<Value>,
 }
 
+#[derive(serde::Deserialize)]
+struct RemoteTableResponse {
+    rows: Vec<Value>,
+}
+
 /// Collapse newlines and truncate a response body for safe inclusion in
 /// an error message. Keeps operators able to diagnose failures without
 /// dumping large or sensitive payloads into the log stream, and without
@@ -557,6 +748,175 @@ fn parse_arrow_type(s: &str) -> Result<DataType> {
     })
 }
 
+fn function_arg_schema(args: &[FunctionArg]) -> Result<SchemaRef> {
+    let fields = args
+        .iter()
+        .map(|arg| {
+            Ok(Field::new(
+                &arg.name,
+                parse_arrow_type(&arg.arrow_type)?,
+                true,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn table_return_schema(decl: &Function) -> Result<SchemaRef> {
+    let columns = match decl.signature.returns.as_ref() {
+        Some(FunctionReturns::Table(columns)) => columns,
+        Some(FunctionReturns::Scalar(_)) => return ExpectedTableReturnSchemaSnafu.fail(),
+        None => return MissingTableReturnSchemaSnafu.fail(),
+    };
+
+    let mut names = HashSet::with_capacity(columns.len());
+    let fields = columns
+        .iter()
+        .map(|column| {
+            if !names.insert(column.name.to_ascii_lowercase()) {
+                return DuplicateOutputColumnSnafu {
+                    column: column.name.clone(),
+                }
+                .fail();
+            }
+            Ok(Field::new(
+                &column.name,
+                parse_arrow_type(&column.arrow_type)?,
+                true,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn table_arg_values(
+    function_name: &str,
+    schema: SchemaRef,
+    exprs: &[Expr],
+) -> DataFusionResult<Vec<ScalarValue>> {
+    let fields = schema.fields();
+    let mut values: Vec<Option<ScalarValue>> = vec![None; fields.len()];
+    let mut positional_index = 0;
+
+    for expr in exprs {
+        let (parameter_name, scalar) = literal_arg(function_name, expr)?;
+        let index = if let Some(name) = parameter_name {
+            fields
+                .iter()
+                .position(|field| field.name().eq_ignore_ascii_case(&name))
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "remote table function '{function_name}' has no argument named '{name}'"
+                    ))
+                })?
+        } else {
+            while positional_index < values.len() && values[positional_index].is_some() {
+                positional_index += 1;
+            }
+            if positional_index >= fields.len() {
+                return Err(DataFusionError::Plan(format!(
+                    "remote table function '{function_name}' expected {} arguments, got more",
+                    fields.len()
+                )));
+            }
+            let index = positional_index;
+            positional_index += 1;
+            index
+        };
+
+        if values[index].is_some() {
+            return Err(DataFusionError::Plan(format!(
+                "remote table function '{function_name}' argument '{}' was provided more than once",
+                fields[index].name()
+            )));
+        }
+        values[index] = Some(cast_scalar_arg(scalar, fields[index].data_type())?);
+    }
+
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            value.ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "remote table function '{function_name}' missing required argument '{}'",
+                    fields[idx].name()
+                ))
+            })
+        })
+        .collect()
+}
+
+fn literal_arg(
+    function_name: &str,
+    expr: &Expr,
+) -> DataFusionResult<(Option<String>, ScalarValue)> {
+    if let Expr::Literal(scalar, metadata) = expr {
+        let parameter_name = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.inner().get("spice.parameter_name"))
+            .cloned();
+        return Ok((parameter_name, scalar.clone()));
+    }
+
+    Err(DataFusionError::NotImplemented(format!(
+        "remote table function '{function_name}' currently supports literal arguments only; got {expr:?}"
+    )))
+}
+
+fn cast_scalar_arg(value: ScalarValue, data_type: &DataType) -> DataFusionResult<ScalarValue> {
+    if matches!(value, ScalarValue::Null) {
+        return ScalarValue::try_from(data_type).map_err(DataFusionError::from);
+    }
+    value.cast_to(data_type).map_err(DataFusionError::from)
+}
+
+fn encode_single_args_row(
+    schema: SchemaRef,
+    values: &[ScalarValue],
+    function_name: &str,
+) -> DataFusionResult<Value> {
+    let columns = values
+        .iter()
+        .map(|value| value.to_array_of_size(1))
+        .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
+    let batch = RecordBatch::try_new(schema, columns)?;
+    let mut rows = record_batch_to_json_rows(&batch, function_name)?;
+    Ok(rows.pop().unwrap_or_else(|| Value::Object(Map::new())))
+}
+
+fn decode_table_rows(
+    rows: Vec<Value>,
+    schema: SchemaRef,
+    function_name: &str,
+) -> DataFusionResult<RecordBatch> {
+    if rows.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    let mut decoder = ReaderBuilder::new(Arc::clone(&schema))
+        .with_struct_mode(StructMode::ObjectOnly)
+        .build_decoder()
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "remote table function '{function_name}' failed to build JSON response decoder: {e}"
+            ))
+        })?;
+    decoder.serialize(&rows).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "remote table function '{function_name}' response rows did not match declared return schema: {e}"
+        ))
+    })?;
+    decoder
+        .flush()
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "remote table function '{function_name}' failed to decode JSON response rows: {e}"
+            ))
+        })?
+        .map_or_else(|| Ok(RecordBatch::new_empty(schema)), Ok)
+}
+
 fn record_batch_to_json_rows(
     batch: &RecordBatch,
     function_name: &str,
@@ -625,7 +985,9 @@ mod tests {
     }
 
     fn sample_decl(from: &str) -> Function {
-        use spicepod::component::function::{FunctionArg, FunctionKind, Signature as YamlSig};
+        use spicepod::component::function::{
+            FunctionArg, FunctionKind, FunctionReturns, Signature as YamlSig,
+        };
         Function {
             name: "remote_fn".into(),
             from: from.into(),
@@ -638,7 +1000,7 @@ mod tests {
                     name: "x".into(),
                     arrow_type: "int64".into(),
                 }],
-                returns: Some("int64".into()),
+                returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: None,
             body_ref: None,
@@ -647,6 +1009,43 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: true,
+        }
+    }
+
+    fn sample_table_decl(from: &str) -> Function {
+        use spicepod::component::function::{
+            FunctionArg, FunctionKind, FunctionReturns, Signature as YamlSig,
+        };
+        Function {
+            name: "remote_rows".into(),
+            from: from.into(),
+            enabled: true,
+            description: None,
+            kind: FunctionKind::Table,
+            volatility: Volatility::Volatile,
+            signature: YamlSig {
+                args: vec![FunctionArg {
+                    name: "x".into(),
+                    arrow_type: "int64".into(),
+                }],
+                returns: Some(FunctionReturns::Table(vec![
+                    FunctionArg {
+                        name: "value".into(),
+                        arrow_type: "int64".into(),
+                    },
+                    FunctionArg {
+                        name: "label".into(),
+                        arrow_type: "utf8".into(),
+                    },
+                ])),
+            },
+            body: None,
+            body_ref: None,
+            metadata: HashMap::default(),
+            params: HashMap::default(),
+            depends_on: vec![],
+            metrics: None,
+            as_tool: false,
         }
     }
 
@@ -712,6 +1111,13 @@ mod tests {
     }
 
     #[test]
+    fn builds_valid_table_decl() {
+        let d = sample_table_decl("http://example.com/udtf");
+        let udtf = build_table_udtf(&d).expect("builds");
+        assert_eq!(format!("{udtf:?}").contains("remote_rows"), true);
+    }
+
+    #[test]
     fn batch_concurrency_validates_bounds() {
         assert_eq!(
             parse_batch_concurrency(None).expect("default batch concurrency parses"),
@@ -764,6 +1170,60 @@ mod tests {
             .expect("list array");
         assert_eq!(list.value_length(0), 2);
         assert!(list.is_null(1));
+    }
+
+    #[tokio::test]
+    async fn remote_table_udtf_round_trips_via_http_json() {
+        use axum::{Router, extract::Json as AxJson, routing::post};
+        use datafusion::prelude::SessionContext;
+        use tokio::net::TcpListener;
+
+        async fn handler(AxJson(body): AxJson<Value>) -> AxJson<Value> {
+            let x = body
+                .get("args")
+                .and_then(|args| args.get("x"))
+                .and_then(Value::as_i64)
+                .expect("args.x should be int64");
+            AxJson(serde_json::json!({
+                "rows": [
+                    {"value": x, "label": "first"},
+                    {"value": x + 1, "label": "second"}
+                ]
+            }))
+        }
+
+        let app = Router::new().route("/rows", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let decl = sample_table_decl(&format!("http://{addr}/rows"));
+        let udtf = build_table_udtf(&decl).expect("builds");
+        let ctx = SessionContext::new();
+        ctx.register_udtf(&decl.name, udtf);
+
+        let df = ctx
+            .sql("SELECT value, label FROM remote_rows(7) ORDER BY value")
+            .await
+            .expect("sql compiles");
+        let results = df.collect().await.expect("runs");
+
+        assert_eq!(results.len(), 1);
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("value int64");
+        let labels = results[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("label utf8");
+        assert_eq!(values.values(), &[7_i64, 8]);
+        assert_eq!(labels.value(0), "first");
+        assert_eq!(labels.value(1), "second");
     }
 
     #[tokio::test]

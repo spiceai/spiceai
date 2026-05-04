@@ -307,6 +307,7 @@ dynamodb = [
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
+http-functions = ["runtime-datafusion-udfs/http-functions"]
 iceberg-write = []
 imap = ["data_components/imap"]
 kafka = ["data_components/kafka"]

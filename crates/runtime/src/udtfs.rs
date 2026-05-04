@@ -13,7 +13,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use runtime_proto::UdtfArgs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -42,21 +42,27 @@ impl Debug for ListUDFTableFunc {
 
 impl TableFunctionImpl for ListUDFTableFunc {
     fn call(&self, _exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let udf_names = self.context.udfs();
+        let mut udf_names = self.context.udfs().into_iter().collect::<Vec<_>>();
+        let mut seen = udf_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        for name in self.context.state().table_functions().keys() {
+            if seen.insert(name.to_ascii_lowercase()) {
+                udf_names.push(name.clone());
+            }
+        }
         let user_infos = user_function_infos();
-        Ok(Arc::new(ListUDFTable::new(
-            udf_names.into_iter().collect(),
-            user_infos,
-        )))
+        Ok(Arc::new(ListUDFTable::new(udf_names, user_infos)))
     }
 }
 
 /// The `TableProvider` produced by the `list_udfs()` UDTF.
 ///
 /// Columns:
-///   * `name` — UDF identifier (Utf8, NOT NULL)
+///   * `name` — function identifier (Utf8, NOT NULL)
 ///   * `source` — `"builtin"` for Spice / `DataFusion` built-ins, `"user"` for functions declared in a spicepod's `functions:` section
-///   * `kind` — `"scalar"` for beta user-defined functions (NULL for built-ins whose kind we cannot cheaply introspect)
+///   * `kind` — `"scalar"` or `"table"` for user-defined functions (NULL for built-ins whose kind we cannot cheaply introspect)
 ///   * `volatility` — `"immutable"` | `"stable"` | `"volatile"` (NULL for built-ins)
 ///   * `from` — source URI for user functions (`sql`, `http://...`, `https://...`), NULL for built-ins
 ///   * `description` — free-form description, NULL when not provided

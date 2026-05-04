@@ -24,13 +24,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A user-defined scalar SQL function registered into the `DataFusion` session context.
+/// A user-defined SQL function registered into the `DataFusion` session context.
 ///
 /// The `from` field selects the execution tier:
-///   * `sql` — inline SQL body (tier T0, in-process, no sandbox).
-///   * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).
+///   * `sql` - inline SQL body (tier T0, in-process, no sandbox).
+///   * `http://...` | `https://...` - remote endpoint invoked over HTTP + JSON (tier T2).
 ///
-/// Supported at runtime: `sql`, `http://…`, `https://…`.
+/// Supported at runtime by default: `sql`. HTTP-backed functions require a
+/// runtime built with the `http-functions` feature.
 ///
 /// Registration is disabled by default. Set `runtime.functions.enabled: true`
 /// in the spicepod to activate declared functions.
@@ -59,7 +60,6 @@ pub struct Function {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// Function kind. Only scalar functions are supported in the beta surface.
     /// Defaults to [`FunctionKind::Scalar`].
     #[serde(default)]
     pub kind: FunctionKind,
@@ -108,23 +108,35 @@ pub struct Function {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
-    /// Whether this function is also exposed as an LLM tool. Defaults to
-    /// `true` — every declared function automatically becomes callable
-    /// both via SQL (`SELECT my_fn(x)`) and via the tool registry (LLM
-    /// tool-calling, `POST /v1/tools/<name>`, `/v1/tools` listing).
+    /// Whether this scalar function is also exposed as an LLM tool. Defaults
+    /// to `true` — scalar functions automatically become callable both via SQL
+    /// (`SELECT my_fn(x)`) and via the tool registry (LLM tool-calling,
+    /// `POST /v1/tools/<name>`, `/v1/tools` listing). Table functions are
+    /// always SQL-only.
     ///
     /// Set to `false` to keep the function SQL-only.
     #[serde(default = "crate::component::default_true")]
     pub as_tool: bool,
 }
 
-/// Function kind. The beta user-defined-function surface supports scalar functions.
+/// Function kind.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum FunctionKind {
     #[default]
     Scalar,
+    Table,
+}
+
+impl FunctionKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FunctionKind::Scalar => "scalar",
+            FunctionKind::Table => "table",
+        }
+    }
 }
 
 /// Function volatility — mirrors [`datafusion_expr::Volatility`].
@@ -150,7 +162,8 @@ pub enum Volatility {
 
 /// Typed function signature.
 ///
-/// `returns` names the output Arrow type.
+/// `returns` names the output Arrow type for scalar functions, or the
+/// output columns for table functions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -159,9 +172,50 @@ pub struct Signature {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<FunctionArg>,
 
-    /// Return Arrow type. Required for scalar functions.
+    /// Return Arrow type for scalar functions, or output columns for table functions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub returns: Option<String>,
+    pub returns: Option<FunctionReturns>,
+}
+
+impl Signature {
+    #[must_use]
+    pub fn scalar_return_type(&self) -> Option<&str> {
+        match self.returns.as_ref()? {
+            FunctionReturns::Scalar(arrow_type) => Some(arrow_type),
+            FunctionReturns::Table(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn table_return_columns(&self) -> Option<&[FunctionArg]> {
+        match self.returns.as_ref()? {
+            FunctionReturns::Scalar(_) => None,
+            FunctionReturns::Table(columns) => Some(columns),
+        }
+    }
+}
+
+/// Function return declaration.
+///
+/// Scalar functions use a single Arrow type string:
+///
+/// ```yaml
+/// returns: int64
+/// ```
+///
+/// Table functions use a list of named output columns:
+///
+/// ```yaml
+/// returns:
+///   - { name: value, type: int64 }
+///   - { name: label, type: utf8 }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(untagged)]
+pub enum FunctionReturns {
+    Scalar(String),
+    Table(Vec<FunctionArg>),
 }
 
 /// A single named argument or output column.
@@ -234,22 +288,32 @@ mod tests {
         assert_eq!(f.signature.args.len(), 4);
         assert_eq!(f.signature.args[0].name, "lat1");
         assert_eq!(f.signature.args[0].arrow_type, "float64");
-        assert_eq!(f.signature.returns.as_deref(), Some("float64"));
+        assert_eq!(f.signature.scalar_return_type(), Some("float64"));
         assert!(f.body.is_some());
     }
 
     #[test]
-    fn rejects_non_scalar_kind() {
+    fn parse_sql_table_function() {
         let src = r"
 name: split_lines
 from: sql
 kind: table
 signature:
     args: [{ name: doc, type: utf8 }]
-    returns: utf8
-body: doc
+    returns:
+      - { name: line, type: utf8 }
+      - { name: line_no, type: int64 }
+body: SELECT doc AS line, 1 AS line_no FROM args
 ";
-        yaml::from_str::<Function>(src).expect_err("table functions are not in beta");
+        let f = yaml::from_str::<Function>(src).expect("table functions parse");
+        assert_eq!(f.kind, FunctionKind::Table);
+        let columns = f
+            .signature
+            .table_return_columns()
+            .expect("table return columns");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "line");
+        assert_eq!(columns[0].arrow_type, "utf8");
     }
 
     #[test]
@@ -307,7 +371,7 @@ body: doc
             volatility: Volatility::Immutable,
             signature: Signature {
                 args: vec![],
-                returns: Some("int64".into()),
+                returns: Some(FunctionReturns::Scalar("int64".into())),
             },
             body: Some("1".into()),
             body_ref: None,
