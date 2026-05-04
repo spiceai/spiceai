@@ -49,9 +49,8 @@ use crate::param::Params;
 ///           enabled: true
 ///           row_id: id
 /// ```
-#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct FtsStore {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -75,4 +74,14 @@ pub struct FtsStore {
 
 const fn default_true() -> bool {
     true
+}
+
+impl Default for FtsStore {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            engine: None,
+            params: None,
+        }
+    }
 }

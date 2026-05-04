@@ -416,7 +416,7 @@ impl SearchIndex for ElasticsearchTextIndex {
             index: self.es_index.clone(),
             search_fields: self.search_fields.clone(),
             query_text: query.to_string(),
-            limit: 100,
+            limit: 10_000,
             schema: Arc::clone(&schema),
             source_schema: Arc::clone(&self.source_schema),
         });
@@ -449,9 +449,11 @@ impl Index for ElasticsearchTextIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        // Elasticsearch is queried live at search time; there is no local index to build.
-        // Pass batches through unchanged so the accelerated table refresh pipeline
-        // sees a consistent row count.
-        Ok(batches)
+        let futs = batches.into_iter().map(|rb| async move {
+            self.write(rb)
+                .await
+                .map_err(|e| DataFusionError::External(e))
+        });
+        try_join_all(futs).await
     }
 }

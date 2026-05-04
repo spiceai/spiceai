@@ -277,7 +277,14 @@ impl TextSearchTableFunc {
                 args.limit,
             )?
             .with_udtf_source(udtf_source)
-            .with_include_score(args.include_score.unwrap_or(true)),
+            .with_include_score(args.include_score.unwrap_or(true))
+            .call_on_scan(Arc::new(|| {
+                async {
+                    let request_context = RequestContext::current(AsyncMarker::new().await);
+                    telemetry::track_text_search(&request_context.to_dimensions());
+                }
+                .boxed()
+            })),
         ))
     }
 }

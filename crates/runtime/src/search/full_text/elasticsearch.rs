@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 //! [`DataConnector`] middleware that wires Elasticsearch BM25 full-text search
-//! for datasets configured with `full_text_search_engine: elasticsearch` in
-//! their dataset params.
+//! for datasets configured with `full_text_search: engine: elasticsearch` in
+//! their Spicepod YAML.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -92,8 +92,7 @@ impl ElasticsearchFullTextConnector {
             .unwrap_or_default();
 
         // Resolve secrets for all params.
-        let resolved =
-            runtime_secrets::get_params_with_secrets(Arc::clone(&secrets), &raw_params).await;
+        let resolved = runtime_secrets::get_params_with_secrets(secrets, &raw_params).await;
 
         let params: std::collections::HashMap<String, String> = resolved
             .into_iter()
@@ -211,9 +210,8 @@ impl DataConnector for ElasticsearchFullTextConnector {
         accelerator_write_mutex: Arc<Mutex<()>>,
         cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
-        // Delegate directly to inner — do NOT use with_indexed_stream.
-        // ElasticsearchTextIndex.write() bulk-indexes to ES; the accelerated
-        // table's CDC loop handles calling compute_index which calls write().
+        // Delegate directly to inner — ES is queried live; no local re-indexing needed.
+        // compute_index() handles bulk-indexing into Elasticsearch on each refresh.
         self.inner_connector.changes_stream(
             federated_table,
             dataset,
