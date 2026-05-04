@@ -1044,6 +1044,8 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
     use governor::Quota;
     use std::num::NonZeroU32;
 
@@ -1057,6 +1059,22 @@ mod tests {
             )
             .build(),
         );
+        let task_history_schema = Arc::new(Schema::new(vec![Field::new(
+            "trace_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let task_history_table = Arc::new(
+            MemTable::try_new(Arc::clone(&task_history_schema), vec![vec![]])
+                .expect("empty task history table should be created"),
+        );
+        datafusion
+            .ctx
+            .register_table(
+                TableReference::partial(SPICE_RUNTIME_SCHEMA, LOCAL_TASK_HISTORY_TABLE),
+                task_history_table,
+            )
+            .expect("local task history table should be registered");
 
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
@@ -1100,6 +1118,37 @@ mod tests {
         let error = ClusterService::get_metrics(&service, Request::new(GetMetricsRequest {}))
             .await
             .expect_err("second metrics request should be rate-limited");
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        let retry_after = error
+            .metadata()
+            .get("retry-after")
+            .expect("retry-after metadata should be present")
+            .to_str()
+            .expect("retry-after metadata should be ASCII")
+            .parse::<u64>()
+            .expect("retry-after metadata should be an integer");
+        assert!(retry_after >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_task_history_rate_limit_returns_retry_after() {
+        let service = make_test_service(1).await;
+        let request = || {
+            Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            })
+        };
+
+        ClusterService::get_task_history(&service, request())
+            .await
+            .expect("first task history request should be under quota");
+
+        let error = ClusterService::get_task_history(&service, request())
+            .await
+            .expect_err("second task history request should be rate-limited");
 
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
         let retry_after = error
