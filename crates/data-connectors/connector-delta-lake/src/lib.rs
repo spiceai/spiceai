@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(
             delta_table_options
                 .get("azure_storage_tenant_id")
-                .map(|value| value.expose_secret()),
+                .map(ExposeSecret::expose_secret),
             Some("tenant-id")
         );
 
