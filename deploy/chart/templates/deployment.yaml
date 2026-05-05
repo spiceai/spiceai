@@ -82,17 +82,41 @@ spec:
               name: metrics
             - containerPort: 50051
               name: flight
-          {{- with .Values.livenessProbe }}
+          {{- if .Values.livenessProbe }}
           livenessProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          {{- else }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            timeoutSeconds: 1
+            periodSeconds: 10
+            failureThreshold: 3
           {{- end }}
-          {{- with .Values.readinessProbe }}
+          {{- if .Values.readinessProbe }}
           readinessProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- else }}
+          readinessProbe:
+            httpGet:
+              path: /v1/ready
+              port: 8090
+            timeoutSeconds: 1
+            periodSeconds: 10
+            failureThreshold: 3
           {{- end }}
-          {{- with .Values.startupProbe }}
+          {{- if .Values.startupProbe }}
           startupProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          {{- else }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            timeoutSeconds: 1
+            periodSeconds: 10
+            failureThreshold: 3
           {{- end }}
           volumeMounts:
             {{- if .Values.volumeMounts }}
