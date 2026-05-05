@@ -449,11 +449,9 @@ impl Index for ElasticsearchTextIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let futs = batches.into_iter().map(|rb| async move {
-            self.write(rb)
-                .await
-                .map_err(|e| DataFusionError::External(e))
-        });
+        let futs = batches
+            .into_iter()
+            .map(|rb| async move { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
     }
 }
