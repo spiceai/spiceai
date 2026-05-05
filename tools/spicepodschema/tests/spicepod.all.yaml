@@ -114,13 +114,15 @@ runtime:
     min_sql_duration: 100ms
     captured_plan: logical # none, logical, physical
     min_plan_duration: 500ms
-    # Optional: persist task history to a connector that supports DDL/DML.
-    # Writes are buffered locally and asynchronously flushed to this target.
+    # Optional: persist task history to a writable connector. Writes are
+    # buffered locally and asynchronously flushed to this target. The target
+    # table is not auto-created — for SQL connectors (postgres, mysql, …)
+    # it must already exist with a schema compatible with `runtime.task_history`.
     persistence:
       from: postgres:public.task_history
       params:
         pg_host: localhost
-        pg_port: '5432'
+        pg_port: 5432
         pg_db: spice
         pg_user: ${secrets:PG_USER}
         pg_pass: ${secrets:PG_PASS}

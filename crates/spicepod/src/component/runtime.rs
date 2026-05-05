@@ -464,7 +464,11 @@ pub struct TaskHistory {
     /// Optional persistent backing store for the `runtime.task_history` table.
     /// When set, writes are buffered to the local in-memory table and
     /// asynchronously flushed to the configured data connector. The connector
-    /// must support DDL/DML (e.g. `postgres`, `mysql`, `sqlite`, `duckdb`).
+    /// must support writes via `read_write_provider` (INSERT, plus DELETE for
+    /// retention) — e.g. `postgres`, `mysql`, `sqlite`, `duckdb`. The target
+    /// table is not auto-created; for SQL connectors it must already exist
+    /// with a schema compatible with the columns described in the
+    /// `runtime.task_history` schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistence: Option<TaskHistoryPersistence>,
 }
@@ -478,10 +482,11 @@ pub struct TaskHistoryPersistence {
     /// `postgres:public.task_history`, `sqlite:/var/lib/spice/task_history.db`).
     pub from: String,
 
-    /// Connector-specific parameters (the same keys you'd put under a
-    /// dataset's `params:` field).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub params: HashMap<String, String>,
+    /// Connector-specific parameters (the same shape as a dataset's
+    /// `params:` field — non-string YAML scalars like ports or booleans
+    /// don't need to be quoted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
 }
 
 fn default_none() -> Arc<str> {

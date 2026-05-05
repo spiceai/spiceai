@@ -21,14 +21,14 @@ use crate::dataconnector::{
     self, parameters::ConnectorParamsBuilder, registered_connector_names, suggest_connector,
 };
 use crate::{
-    Error, Result, Runtime, UnableToCreateBackendSnafu,
-    UnableToInitializeDataConnectorSnafu, UnknownDataConnectorSnafu,
-    datafusion::SPICE_RUNTIME_SCHEMA, task_history,
+    Error, Result, Runtime, UnableToCreateBackendSnafu, UnableToInitializeDataConnectorSnafu,
+    UnknownDataConnectorSnafu, datafusion::SPICE_RUNTIME_SCHEMA, task_history,
 };
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use spicepod::component::runtime::TaskHistoryPersistence;
+use spicepod::param::Params;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -97,7 +97,10 @@ impl Runtime {
         let is_cluster_mode = effective_role.is_some();
 
         let persistence_source = match app.runtime.task_history.persistence.clone() {
-            Some(persistence) => Some(self.build_task_history_persistence_source(persistence).await?),
+            Some(persistence) => Some(
+                self.build_task_history_persistence_source(persistence)
+                    .await?,
+            ),
             None => None,
         };
 
@@ -204,7 +207,11 @@ impl Runtime {
             .build()
             .map_err(|source| Error::InvalidSpicepodDataset { source })?;
         dataset.access = AccessMode::ReadWrite;
-        dataset.params = persistence.params;
+        dataset.params = persistence
+            .params
+            .as_ref()
+            .map(Params::as_string_map)
+            .unwrap_or_default();
 
         let source = dataset.source().to_string();
         let dataset = Arc::new(dataset);
@@ -235,8 +242,8 @@ impl Runtime {
             .ok_or_else(|| Error::UnableToTrackTaskHistory {
                 source: task_history::Error::InvalidConfiguration {
                     source: format!(
-                        "data connector `{source}` does not support DDL/DML and cannot back \
-                         `runtime.task_history.persistence`"
+                        "data connector `{source}` does not expose a writable provider \
+                         (INSERT/DELETE) and cannot back `runtime.task_history.persistence`"
                     )
                     .into(),
                 },
