@@ -49,6 +49,31 @@ serviceAccount:
 #   - --flight
 #   - 0.0.0.0:50051
 
+# Configure Kubernetes probes for the Spice.ai runtime container
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8090
+  timeoutSeconds: 1
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /v1/ready
+    port: 8090
+  timeoutSeconds: 1
+  periodSeconds: 10
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8090
+  timeoutSeconds: 1
+  periodSeconds: 10
+  failureThreshold: 3
+
 # Additional environment variables
 # additionalEnv:
 #   - name: ENV_VAR_NAME

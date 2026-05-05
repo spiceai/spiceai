@@ -23,6 +23,9 @@ helm install spiceai deploy/chart \
 | `serviceAccount.annotations`    | Annotations for the ServiceAccount                                           | `{}`                              |
 | `service.type`                  | Kubernetes Service type (`ClusterIP`, `NodePort`, `LoadBalancer`, or `null`) | `null`                            |
 | `service.additionalAnnotations` | Additional annotations on the Service                                        | `{}`                              |
+| `livenessProbe`                 | Kubernetes liveness probe configuration                                      | see `values.yaml`                 |
+| `readinessProbe`                | Kubernetes readiness probe configuration                                     | see `values.yaml`                 |
+| `startupProbe`                  | Kubernetes startup probe configuration                                       | see `values.yaml`                 |
 | `stateful.enabled`              | Use a StatefulSet with PVC                                                   | `false`                           |
 | `stateful.storageClass`         | StorageClass for StatefulSet PVC                                             | `standard`                        |
 | `stateful.size`                 | PVC size                                                                     | `1Gi`                             |
