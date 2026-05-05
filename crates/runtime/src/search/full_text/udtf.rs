@@ -270,10 +270,14 @@ impl TextSearchTableFunc {
             include_score: args.include_score,
         };
 
+        let normalized_table = owned
+            .normalize_source_table(table_provider)
+            .map_err(DataFusionError::from)?;
+
         Ok(Arc::new(
             SearchQueryProvider::try_from_index(
                 &(Arc::new(owned) as Arc<dyn SearchIndex>),
-                table_provider,
+                normalized_table,
                 args.query.as_str(),
                 args.limit,
             )?

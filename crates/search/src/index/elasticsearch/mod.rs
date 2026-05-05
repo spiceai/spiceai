@@ -377,6 +377,44 @@ pub struct ElasticsearchTextIndex {
     pub batch_write_rows: usize,
 }
 
+impl ElasticsearchTextIndex {
+    /// Wrap a [`TableProvider`] so that its schema matches the normalized source schema
+    /// used by the ES text index: type-cast where needed and mark all fields nullable.
+    /// ES text search results never include dense_vector columns, so the base table
+    /// scan must allow nulls in those fields or Arrow will reject the result.
+    pub fn normalize_source_table(
+        &self,
+        table: Arc<dyn TableProvider>,
+    ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        use datafusion::datasource::ViewTable;
+        use datafusion::prelude::col;
+
+        let raw_schema = table.schema();
+
+        // Project out list/embedding columns — ES text search does not return
+        // them and SearchQueryProvider would include them in its advertised
+        // schema from the base table, causing Arrow type mismatches at scan time.
+        let projections: Vec<_> = raw_schema
+            .fields()
+            .iter()
+            .filter(|f| !matches!(
+                f.data_type(),
+                DataType::FixedSizeList(_, _)
+                    | DataType::LargeList(_)
+                    | DataType::List(_)
+            ))
+            .map(|f| col(f.name()))
+            .collect();
+
+        let plan =
+            LogicalPlanBuilder::scan("base", Arc::new(DefaultTableSource::new(table)), None)?
+                .project(projections)?
+                .build()?;
+
+        Ok(Arc::new(ViewTable::new(plan, None)))
+    }
+}
+
 #[async_trait]
 impl SearchIndex for ElasticsearchTextIndex {
     fn search_column(&self) -> String {

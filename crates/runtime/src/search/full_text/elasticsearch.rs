@@ -49,6 +49,8 @@ pub(crate) struct ElasticsearchFtsParams {
     pub params: std::collections::HashMap<String, String>,
     /// Elasticsearch index name for full-text search documents.
     pub es_index: String,
+    /// Maximum number of rows per bulk request.
+    pub batch_write_rows: usize,
 }
 
 pub struct ElasticsearchFullTextConnector {
@@ -98,9 +100,14 @@ impl ElasticsearchFullTextConnector {
         // Resolve secrets for all params.
         let resolved = runtime_secrets::get_params_with_secrets(secrets, &raw_params).await;
 
+        // Strip the `elasticsearch_` prefix so callers can use consistent prefixed params
+        // (e.g. `elasticsearch_endpoint`, `elasticsearch_index`) matching the vector store convention.
         let params: std::collections::HashMap<String, String> = resolved
             .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .map(|(k, v)| {
+                let key = k.strip_prefix("elasticsearch_").unwrap_or(&k).to_string();
+                (key, v.expose_secret().to_string())
+            })
             .collect();
 
         let es_index = params
@@ -108,9 +115,18 @@ impl ElasticsearchFullTextConnector {
             .cloned()
             .unwrap_or_else(|| dataset.name.to_string().replace('.', "-").to_lowercase());
 
+        let batch_write_rows = params
+            .get("batch_write_rows")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1000);
+
         Ok(Self {
             inner_connector,
-            fts_params: ElasticsearchFtsParams { params, es_index },
+            fts_params: ElasticsearchFtsParams {
+                params,
+                es_index,
+                batch_write_rows,
+            },
         })
     }
 

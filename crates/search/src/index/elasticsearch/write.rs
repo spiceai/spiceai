@@ -642,6 +642,16 @@ fn build_text_documents(
     let encoder_options = EncoderOptions::default();
     let mut column_encoders: Vec<(String, _)> = Vec::with_capacity(schema.fields().len());
     for (i, field) in schema.fields().iter().enumerate() {
+        // Skip vector/embedding columns — they are dense_vector in ES and must not
+        // be written to a text index as plain floats, which would cause mapping conflicts.
+        if matches!(
+            field.data_type(),
+            arrow::datatypes::DataType::FixedSizeList(_, _)
+                | arrow::datatypes::DataType::LargeList(_)
+                | arrow::datatypes::DataType::List(_)
+        ) {
+            continue;
+        }
         let arr = record.column(i);
         let encoder =
             make_encoder(field, arr, &encoder_options).context(IssueWithArrowProcessingSnafu {

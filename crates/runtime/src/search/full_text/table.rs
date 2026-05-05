@@ -138,17 +138,22 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     let client = get_fts_client(&fts_params.params)?;
 
     // Normalize LargeUtf8 → Utf8 in the source schema (ES always returns Utf8).
+    // Also mark all fields as nullable — ES text search results may not include
+    // every field (e.g. dense_vector embedding columns), and Arrow will reject
+    // null values in non-nullable fields.
     let raw_schema = inner_table_provider.schema();
     let normalized_fields: Vec<Arc<arrow_schema::Field>> = raw_schema
         .fields()
         .iter()
+        .filter(|f| !matches!(
+            f.data_type(),
+            arrow::datatypes::DataType::FixedSizeList(_, _)
+                | arrow::datatypes::DataType::LargeList(_)
+                | arrow::datatypes::DataType::List(_)
+        ))
         .map(|f| {
             let normalized = normalize_es_data_type(f.data_type());
-            if &normalized == f.data_type() {
-                Arc::clone(f)
-            } else {
-                Arc::new(Field::new(f.name(), normalized, f.is_nullable()))
-            }
+            Arc::new(Field::new(f.name(), normalized, true))
         })
         .collect();
     let source_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
@@ -201,7 +206,7 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
             search_fields: vec![search_field.clone()],
             primary_key: pk_fields.clone(),
             source_schema: Arc::clone(&source_schema),
-            batch_write_rows: 1000,
+            batch_write_rows: fts_params.batch_write_rows,
         });
         provider = provider.add_index(index as Arc<dyn Index + Send + Sync>);
     }
