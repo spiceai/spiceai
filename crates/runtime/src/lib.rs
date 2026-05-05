@@ -1495,7 +1495,7 @@ impl Runtime {
         let elapsed = start_time.elapsed();
         let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
-        // Shutdown HTTP & Metrics servers last
+        // Shutdown Metrics server last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
