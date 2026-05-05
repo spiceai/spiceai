@@ -135,6 +135,7 @@ pub enum UserFunctionError {
 
 pub type Result<T, E = UserFunctionError> = std::result::Result<T, E>;
 
+#[must_use]
 pub fn supported_schemes() -> &'static str {
     match (
         cfg!(feature = "http-functions"),
