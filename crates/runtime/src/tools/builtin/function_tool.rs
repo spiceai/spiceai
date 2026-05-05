@@ -43,7 +43,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::utils::quote_identifier;
 use futures::TryStreamExt;
 use serde_json::{Map, Value};
-use spicepod::component::function::{Function, FunctionArg};
+use spicepod::component::function::{Function, FunctionArg, FunctionKind};
 use tools::SpiceModelTool;
 
 use crate::datafusion::DataFusion;
@@ -60,6 +60,12 @@ pub fn build(
     decl: &Function,
     df: Weak<DataFusion>,
 ) -> Result<FunctionAsTool, FunctionToolBuildError> {
+    if decl.kind != FunctionKind::Scalar {
+        return Err(FunctionToolBuildError::UnsupportedFunctionKind {
+            function: decl.name.clone(),
+            kind: decl.kind.as_str().to_string(),
+        });
+    }
     for arg in &decl.signature.args {
         map_arrow_to_json(&arg.arrow_type).ok_or_else(|| {
             FunctionToolBuildError::UnsupportedArgType {
@@ -69,7 +75,7 @@ pub fn build(
             }
         })?;
     }
-    let Some(ret) = decl.signature.returns.as_deref() else {
+    let Some(ret) = decl.signature.scalar_return_type() else {
         return Err(FunctionToolBuildError::MissingReturnType {
             function: decl.name.clone(),
         });
@@ -278,6 +284,11 @@ pub enum FunctionToolBuildError {
         "cannot expose function '{function}' as a tool: signature.returns is required for tool-bridged functions"
     ))]
     MissingReturnType { function: String },
+
+    #[snafu(display(
+        "cannot expose function '{function}' as a tool: function kind '{kind}' is not supported for tool exposure. Set `as_tool: false` on the function to suppress."
+    ))]
+    UnsupportedFunctionKind { function: String, kind: String },
 }
 
 /// Map an Arrow-type-string (as used in spicepod `signature.args`) to

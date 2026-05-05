@@ -426,6 +426,15 @@ impl Refresh {
             // 1. On-demand through cache misses (primary)
             // 2. Periodic background refresh of stale data (if refresh_check_interval is set)
             RefreshMode::Caching => {
+                // refresh_on_startup=always schedules a startup refresh regardless of
+                // whether a check_interval is configured. The actual execution time may still
+                // be subject to downstream scheduling such as refresh jitter.
+                if refresh_on_startup == RefreshOnStartup::Always {
+                    tracing::info!(
+                        "Caching mode with refresh_on_startup=always - scheduling startup refresh"
+                    );
+                    return NextRefresh::WaitFor(Duration::ZERO);
+                }
                 // If refresh_check_interval is set, enable periodic refresh for stale data
                 if let Some(check_interval) = self.check_interval {
                     tracing::info!(
@@ -2472,6 +2481,44 @@ mod tests {
                 assert_fn: Box::new(
                     |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
                 ),
+            },
+            TestCase {
+                description: "Caching mode with RefreshOnStartup::Always and no check_interval should refresh immediately",
+                refresh_mode: RefreshMode::Caching,
+                refresh_on_startup: RefreshOnStartup::Always,
+                checkpoint: None,
+                check_interval: None,
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
+            },
+            TestCase {
+                description: "Caching mode with RefreshOnStartup::Always and check_interval should refresh immediately",
+                refresh_mode: RefreshMode::Caching,
+                refresh_on_startup: RefreshOnStartup::Always,
+                checkpoint: None,
+                check_interval: Some(Duration::from_secs(900)),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
+            },
+            TestCase {
+                description: "Caching mode with RefreshOnStartup::Auto and check_interval should wait check_interval",
+                refresh_mode: RefreshMode::Caching,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: None,
+                check_interval: Some(Duration::from_secs(900)),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration == Duration::from_secs(900)),
+                ),
+            },
+            TestCase {
+                description: "Caching mode with RefreshOnStartup::Auto and no check_interval should be disabled",
+                refresh_mode: RefreshMode::Caching,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: None,
+                check_interval: None,
+                assert_fn: Box::new(|result| matches!(result, NextRefresh::Disabled)),
             },
         ];
 

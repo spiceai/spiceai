@@ -132,8 +132,7 @@ pub fn build_scalar_udf(
 
     let return_type_str =
         yaml_sig
-            .returns
-            .as_deref()
+            .scalar_return_type()
             .ok_or_else(|| ToolUdfBuildError::MissingReturnType {
                 tool: tool_name.to_string(),
             })?;
@@ -305,7 +304,7 @@ impl ToolAsScalarUdf {
 mod tests {
     use super::*;
     use crate::tools::SpiceModelTool;
-    use spicepod::component::function::FunctionArg;
+    use spicepod::component::function::{FunctionArg, FunctionReturns};
 
     struct StubTool;
 
@@ -334,6 +333,7 @@ mod tests {
     #[test]
     fn build_fails_without_signature_returns() {
         let sig = YamlSignature {
+            tables: vec![],
             args: vec![FunctionArg {
                 name: "x".into(),
                 arrow_type: "int64".into(),
@@ -347,6 +347,7 @@ mod tests {
     #[test]
     fn build_rejects_duplicate_arg_names() {
         let sig = YamlSignature {
+            tables: vec![],
             args: vec![
                 FunctionArg {
                     name: "x".into(),
@@ -357,7 +358,7 @@ mod tests {
                     arrow_type: "float64".into(),
                 },
             ],
-            returns: Some("int64".into()),
+            returns: Some(FunctionReturns::Scalar("int64".into())),
         };
 
         let err = build_scalar_udf(Arc::new(StubTool), "stub", &sig)

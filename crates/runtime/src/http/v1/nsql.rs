@@ -153,6 +153,10 @@ pub struct Request {
     /// Names of datasets to sample from when constructing model context; this is a sampling hint and does not restrict which tables queries can target. If omitted, all datasets are used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datasets: Option<Vec<String>>,
+
+    /// Stable prompt-cache key forwarded to the configured NSQL model for provider-specific cache handling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 fn default_sample_data_enabled() -> bool {
@@ -192,7 +196,8 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
                 "model": "nql",
                 "stream": false,
                 "sample_data_enabled": true,
-                "datasets": ["sales_data"]
+                "datasets": ["sales_data"],
+                "prompt_cache_key": "sales-dashboard"
             })
         ))
     ),
@@ -321,6 +326,7 @@ pub(crate) async fn handle_nsql_query(
         model,
         sample_data_enabled,
         datasets,
+        prompt_cache_key,
         ..
     } = payload;
     let table_allowlist_opt = match table_allowlist(&model, &rt).await {
@@ -436,6 +442,9 @@ pub(crate) async fn handle_nsql_query(
 
         req.messages.extend(schema_messages.clone());
         req.messages.extend(sample_data_messages.clone());
+        if let Some(prompt_cache_key) = &prompt_cache_key {
+            req.prompt_cache_key = Some(prompt_cache_key.clone());
+        }
 
         // Race the LLM call against the NSQL cancellation token so that a
         // long-running model inference does not pin the request after a
