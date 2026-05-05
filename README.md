@@ -23,7 +23,7 @@
 </div>
 
 <p align="center">
-  <a href="https://spiceai.org/docs">📄 Docs</a> | <a href="#%EF%B8%8F-quickstart-local-machine">⚡️ Quickstart</a> | <a href="https://github.com/spiceai/cookbook">🧑‍🍳 Cookbook</a> | <a href="https://github.com/spiceai/skills">🤖 AI Skills</a> | <a href="https://spiceai.org/blog">📰 Blog</a>
+  <a href="https://spiceai.org/docs">📄 Docs</a> | <a href="#%EF%B8%8F-quickstart-local-machine">⚡️ Quickstart</a> | <a href="https://github.com/spiceai/cookbook">🧑‍🍳 Cookbook</a> | <a href="https://github.com/spiceai/skills">🤖 AI Skills</a> | <a href="https://spice.ai/blog">📰 Blog</a>
 </p>
 
 **Spice** is a portable, accelerated SQL query, search, and LLM-inference engine, written in Rust, for data-grounded AI apps and agents. Run it as a sidecar next to your application — or scale to a multi-node distributed cluster — to get **millisecond data and AI on localhost**, backed by your existing data sources.
@@ -121,8 +121,9 @@ Spin up one Spice runtime per tenant or agent — each with its own sandboxed da
 
 Drop-in skills for Claude Code, Cursor, and any agent that supports the open Agent Skills format. Skills auto-activate to set up datasets, connect data sources, configure acceleration, run federated queries, and wire models — without you re-explaining Spice's configuration model.
 
-```sh
-# Claude Code
+In Claude Code:
+
+```text
 /plugin marketplace add spiceai/skills
 ```
 
@@ -160,15 +161,15 @@ If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ball
 | -------------------------------- | --------------------------------------------------- | -------------------- | --------------------- | ------------------- | ------------------- |
 | **Primary Use-Case**             | Data & AI apps/agents                               | Big data analytics   | Interactive analytics | Real-time analytics | Real-time analytics |
 | **Primary deployment model**     | Sidecar + Cluster                                   | Cluster              | Cluster               | Cluster             | Cluster             |
-| **Federated Query Support**      | ✅                                                   | ✅                    | ✅                     | ―                   | ―                   |
+| **Federated Query Support**      | ✅                                                   | ✅                    | ✅                     | ❌                   | ❌                   |
 | **Distributed Query Execution**  | ✅ (Apache Ballista, multi-active HA)                | ✅                    | ✅                     | ✅                   | Limited             |
 | **Acceleration/Materialization** | ✅ (Cayenne/Vortex, Arrow, SQLite, DuckDB, Postgres) | Intermediate storage | Reflections (Iceberg) | Materialized views  | ✅ (Real-time views) |
-| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue, Databricks)    | ✅                    | ✅                     | ―                   | ―                   |
-| **Iceberg Write (SQL INSERT)**   | ✅                                                   | ✅                    | Limited               | ―                   | ―                   |
+| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue, Databricks)    | ✅                    | ✅                     | ❌                   | ❌                   |
+| **Iceberg Write (SQL INSERT)**   | ✅                                                   | ✅                    | Limited               | ❌                   | ❌                   |
 | **Query Result Caching**         | ✅                                                   | ✅                    | ✅                     | ✅                   | Limited             |
-| **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP per dataset)                         | ―                    | ―                     | ―                   | ―                   |
-| **Native CDC**                   | ✅ (Postgres WAL, DynamoDB Streams, Debezium)        | ―                    | ―                     | ―                   | ✅ (Debezium)        |
-| **Built-in AI / LLM inference**  | ✅                                                   | ―                    | ―                     | ―                   | ―                   |
+| **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP per dataset)                         | ❌                    | ❌                     | ❌                   | ❌                   |
+| **Native CDC**                   | ✅ (Postgres WAL, DynamoDB Streams, Debezium)        | ❌                    | ❌                     | ❌                   | ✅ (Debezium)        |
+| **Built-in AI / LLM inference**  | ✅                                                   | ❌                    | ❌                     | ❌                   | ❌                   |
 
 ### AI Apps and Agents
 
@@ -176,15 +177,15 @@ If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ball
 | ----------------------------- | ----------------------------------------------------------- | ------------------ | ---------- | ---------------- | ----------------------------- |
 | **Primary Use-Case**          | Data & AI apps                                              | Agentic workflows  | RAG apps   | Agent operations | LLM apps                      |
 | **Programming Language**      | Any (HTTP / Flight / ODBC / JDBC)                           | JavaScript, Python | Python     | Python           | Any language (HTTP interface) |
-| **Unified Data + AI Runtime** | ✅                                                           | ―                  | ―          | ―                | ―                             |
-| **Federated Data Query**      | ✅                                                           | ―                  | ―          | ―                | ―                             |
-| **Distributed Query**         | ✅                                                           | ―                  | ―          | ―                | ―                             |
-| **Accelerated Data Access**   | ✅                                                           | ―                  | ―          | ―                | ―                             |
+| **Unified Data + AI Runtime** | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
+| **Federated Data Query**      | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
+| **Distributed Query**         | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
+| **Accelerated Data Access**   | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
 | **Tools/Functions**           | ✅ (MCP server + gateway, Streamable HTTP)                   | ✅                  | ✅          | Limited          | Limited                       |
-| **LLM Memory**                | ✅                                                           | ✅                  | ―          | ✅                | ―                             |
+| **LLM Memory**                | ✅                                                           | ✅                  | ❌          | ✅                | ❌                             |
 | **Hybrid Search**             | ✅ (BM25 + vector + RRF + rerank UDTFs)                      | ✅                  | ✅          | Limited          | Limited                       |
-| **Caching**                   | ✅ (query, results, and provider-aware LLM prompt caching)   | Limited            | ―          | ―                | ―                             |
-| **Embeddings**                | ✅ (Built-in & pluggable; multi-vector ColBERT-style MaxSim) | ✅                  | ✅          | Limited          | ―                             |
+| **Caching**                   | ✅ (query, results, and provider-aware LLM prompt caching)   | Limited            | ❌          | ❌                | ❌                             |
+| **Embeddings**                | ✅ (Built-in & pluggable; multi-vector ColBERT-style MaxSim) | ✅                  | ✅          | Limited          | ❌                             |
 
 ✅ = Fully supported · ❌ = Not supported · Limited = Partial or restricted support
 
@@ -248,7 +249,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `git`                              | Git repositories                      | Release Candidate |                              |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
-| `iceberg`                          | [Apache Iceberg][iceberg] (read+write)| Beta              | Parquet                      |
+| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Beta              | Parquet                      |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
@@ -313,14 +314,14 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Embeddings Providers
 
-| Name          | Description                              | Status            | ML Format(s) | LLM Format(s)\*                 |
+| Name          | Description                              | Status            | ML Format(s) | LLM Format(s)                   |
 | ------------- | ---------------------------------------- | ----------------- | ------------ | ------------------------------- |
 | `openai`      | OpenAI (or compatible) LLM endpoint      | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
 | `file`        | Local filesystem                         | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `huggingface` | Models hosted on HuggingFace             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `model2vec`   | Static embeddings (500x faster)          | Release Candidate | Model2Vec    | -                               |
 | `azure`       | Azure OpenAI                             | Alpha             | -            | OpenAI-compatible HTTP endpoint |
-| `bedrock`     | AWS Bedrock (Titan, Cohere, Nova, Nova 2)| Alpha             | -            | OpenAI-compatible HTTP endpoint |
+| `bedrock`     | AWS Bedrock (Titan, Cohere, Nova, Nova 2) | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 
 ## Supported Vector Engines
 
@@ -346,14 +347,14 @@ Catalog Connectors connect to external catalog providers and make their tables a
 
 ## Supported Secret Stores
 
-| Name              | Description                  | Status |
-| ----------------- | ---------------------------- | ------ |
-| `env`             | Environment variables        | Stable |
-| `kubernetes`      | Kubernetes secrets           | Stable |
-| `keyring`         | OS keychain                  | Stable |
-| `aws_secrets`     | AWS Secrets Manager          | Stable |
-| `hashicorp_vault` | HashiCorp Vault              | RC     |
-| `azure_keyvault`  | Azure Key Vault              | RC     |
+| Name              | Description                  | Status            |
+| ----------------- | ---------------------------- | ----------------- |
+| `env`             | Environment variables        | Stable            |
+| `kubernetes`      | Kubernetes secrets           | Stable            |
+| `keyring`         | OS keychain                  | Stable            |
+| `aws_secrets`     | AWS Secrets Manager          | Stable            |
+| `hashicorp_vault` | HashiCorp Vault              | Release Candidate |
+| `azure_keyvault`  | Azure Key Vault              | Release Candidate |
 
 ## ⚡️ Quickstart (Local Machine)
 
@@ -506,7 +507,7 @@ docker pull spiceai/spiceai
 ```
 
 ```dockerfile
-from spiceai/spiceai:latest
+FROM spiceai/spiceai:latest
 ```
 
 ### Helm (Kubernetes)
@@ -522,19 +523,23 @@ Spice is available in the [AWS Marketplace](https://aws.amazon.com/marketplace/p
 
 ### Distributed cluster (Apache Ballista)
 
-Run Spice as a multi-node cluster with `--role scheduler` and `--scheduler-address` flags. Multi-active schedulers coordinate through your object store — no etcd, ZooKeeper, or Redis. mTLS certificates are managed via the Spice CLI. See the [Ballista architecture deep dive](https://spice.ai/blog/apache-ballista-at-spice-ai) and the [distributed query docs](https://spiceai.org/docs/features/query-federation).
+Run Spice as a multi-node cluster: start scheduler nodes with `--role scheduler` and start executor nodes with `--scheduler-address <scheduler-url>` to join them. Multi-active schedulers coordinate through your object store (configured via `runtime.scheduler.state_location`) — no etcd, ZooKeeper, or Redis. mTLS certificates are managed via the Spice CLI. See the [Ballista architecture deep dive](https://spice.ai/blog/apache-ballista-at-spice-ai) and the [distributed query docs](https://spiceai.org/docs/features/query-federation).
 
 ## 🏎️ Next Steps
 
 ### Add Spice Skills to your AI coding agent
 
-Drop-in skills for Claude Code, Cursor, and more:
+Drop-in skills for Claude Code, Cursor, and more.
+
+In Claude Code (slash command):
+
+```text
+/plugin marketplace add spiceai/skills
+```
+
+In Cursor and other agents (shell):
 
 ```bash
-# Claude Code
-/plugin marketplace add spiceai/skills
-
-# Cursor and other agents
 npx skills add spiceai/skills
 ```
 
@@ -615,7 +620,7 @@ Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILI
 
 ### 🤝 Connect with us
 
-- 📰 Read our [blog](https://spiceai.org/blog) for engineering deep dives
+- 📰 Read our [blog](https://spice.ai/blog) for engineering deep dives
 - 💬 Join the conversation on [Slack](https://spice.ai/slack), [X](https://twitter.com/spice_ai), or [LinkedIn](https://www.linkedin.com/company/74148478)
 - 🐛 [File an issue](https://github.com/spiceai/spiceai/issues/new) — we triage fast
 - 💼 We're hiring! See [spice.ai/careers](https://spice.ai/careers)
