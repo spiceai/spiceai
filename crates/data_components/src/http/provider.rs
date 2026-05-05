@@ -18,6 +18,7 @@ use super::json_nest::{HttpJsonNesting, decompose_json_row};
 use crate::rate_limit::RateLimiter;
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
+    compute::cast,
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
@@ -519,23 +520,18 @@ impl HttpTableProvider {
     /// `parse_http_json_nesting` in the HTTPS data connector) are
     /// responsible for validating this invariant.
     #[must_use]
-    pub fn with_json_nesting(mut self, nesting: HttpJsonNesting) -> Self {
-        let base = Self::base_table_schema();
-        let fields: Vec<Field> = nesting
-            .column_order
-            .iter()
-            .map(|name| {
-                if nesting.metadata_fields.contains(name) {
-                    match base.field_with_name(name) {
-                        Ok(f) => f.clone(),
-                        Err(_) => Field::new(name, DataType::Utf8, true),
-                    }
-                } else {
-                    Field::new(name, DataType::Utf8, true)
-                }
-            })
-            .collect();
-        self.schema = Arc::new(Schema::new(fields));
+    /// Replace the provider schema with a caller-supplied JSON-nesting
+    /// schema. The schema's field order MUST equal `nesting.column_order`,
+    /// and it MUST contain a field named `nesting.json_field_name`. Field
+    /// types are taken from the supplied schema (typically the catch-all
+    /// JSON column is `Utf8`; other static fields use whatever types the
+    /// caller declared, defaulting to `Utf8` when no type was specified).
+    /// HTTP metadata fields (see [`HttpJsonNesting::metadata_fields`]) MUST
+    /// be present in `schema` with the types from
+    /// [`Self::base_table_schema`]; the caller is responsible for
+    /// resolving them.
+    pub fn with_json_nesting(mut self, nesting: HttpJsonNesting, schema: SchemaRef) -> Self {
+        self.schema = schema;
         self.json_nesting = Some(nesting);
         self
     }
@@ -1935,8 +1931,27 @@ impl HttpExec {
 
         let mut body_arrays: std::collections::VecDeque<ArrayRef> = body_builders
             .into_iter()
-            .map(|mut b| Arc::new(b.finish()) as ArrayRef)
-            .collect();
+            .zip(body_field_names.iter())
+            .map(|(mut b, name)| {
+                let arr: ArrayRef = Arc::new(b.finish());
+                let field = fields.iter().find(|f| f.name() == *name).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "json-nested batch: body field `{name}` missing from projected schema"
+                    ))
+                })?;
+                if field.data_type() == &DataType::Utf8 {
+                    Ok(arr)
+                } else {
+                    cast(&arr, field.data_type()).map_err(|e| {
+                        DataFusionError::External(Box::new(ArrowError::CastError(format!(
+                            "failed to cast json_nest column `{}` from Utf8 to {:?}: {e}",
+                            field.name(),
+                            field.data_type()
+                        ))))
+                    })
+                }
+            })
+            .collect::<DataFusionResult<_>>()?;
 
         // Stitch together the final column list in projected-schema
         // order, slotting metadata-built arrays where appropriate.
@@ -3427,6 +3442,36 @@ mod tests {
             "json".to_string(),
             false,
         )
+    }
+
+    /// Test helper: build the legacy all-Utf8 nesting schema that
+    /// `with_json_nesting` produced before it became schema-driven.
+    fn nesting_schema_utf8(nesting: &HttpJsonNesting) -> SchemaRef {
+        let fields: Vec<Field> = nesting
+            .column_order
+            .iter()
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Test helper: build a nesting schema where HTTP metadata
+    /// columns inherit base-schema types and other columns are `Utf8`.
+    fn nesting_schema_with_metadata(nesting: &HttpJsonNesting) -> SchemaRef {
+        let base = HttpTableProvider::base_table_schema();
+        let fields: Vec<Field> = nesting
+            .column_order
+            .iter()
+            .map(|name| {
+                if nesting.metadata_fields.contains(name)
+                    && let Ok(f) = base.field_with_name(name)
+                {
+                    return f.clone();
+                }
+                Field::new(name, DataType::Utf8, true)
+            })
+            .collect();
+        Arc::new(Schema::new(fields))
     }
 
     fn header_provider() -> HttpTableProvider {
@@ -6580,7 +6625,9 @@ mod tests {
             json_field.to_string(),
             std::collections::HashSet::new(),
         );
-        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let provider = Arc::new(
+            base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
+        );
         let schema = provider.schema();
         let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
         (exec, nesting)
@@ -6595,6 +6642,16 @@ mod tests {
             response_status: 200,
             response_headers: Vec::new(),
         }
+    }
+
+    /// Like `nested_exec`, but accepts an explicit Arrow schema so a
+    /// caller can mix typed and Utf8 fields. Used to verify that
+    /// `create_batch_from_rows_nested` casts decomposed JSON values to
+    /// the declared field types.
+    fn nested_exec_with_schema(nesting: HttpJsonNesting, schema: SchemaRef) -> HttpExec {
+        let provider = Arc::new(base_provider().with_json_nesting(nesting, schema));
+        let schema = provider.schema();
+        HttpExec::new(schema, provider, vec![(None, None, None, None)], None)
     }
 
     fn string_col(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
@@ -6616,6 +6673,70 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_casts_typed_columns() {
+        // Mixed schema: id is Int64 (was Utf8 before typed-json_nest
+        // support), name is Utf8 (default), completed is Boolean,
+        // details is the catch-all Utf8 JSON column.
+        let nesting = HttpJsonNesting::new(
+            vec![
+                "id".to_string(),
+                "name".to_string(),
+                "completed".to_string(),
+                "details".to_string(),
+            ],
+            "details".to_string(),
+            std::collections::HashSet::new(),
+        );
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("completed", DataType::Boolean, true),
+            Field::new("details", DataType::Utf8, true),
+        ]));
+        let exec = nested_exec_with_schema(nesting.clone(), schema);
+        let rows = vec![
+            r#"{"id":1,"name":"alpha","completed":true,"extra":"x"}"#.to_string(),
+            r#"{"id":2,"name":"beta","completed":false,"k":42}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
+            .expect("batch should be created with cast columns");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 4);
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(batch.schema().field(2).data_type(), &DataType::Boolean);
+
+        let id = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("id should be Int64");
+        assert_eq!(id.value(0), 1);
+        assert_eq!(id.value(1), 2);
+
+        let completed = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("completed should be Boolean");
+        assert!(completed.value(0));
+        assert!(!completed.value(1));
+
+        // Catch-all stays Utf8 with the residual JSON.
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some(r#"{"extra":"x"}"#));
+        assert_eq!(details[1].as_deref(), Some(r#"{"k":42}"#));
     }
 
     #[test]
@@ -6766,7 +6887,9 @@ mod tests {
             "details".to_string(),
             std::collections::HashSet::new(),
         );
-        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let provider = Arc::new(
+            base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
+        );
         // Project only static columns, not "details".
         let full_schema = provider.schema();
         let projected = Arc::new(
@@ -6806,7 +6929,9 @@ mod tests {
             "details".to_string(),
             std::collections::HashSet::new(),
         );
-        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let provider = Arc::new(
+            base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
+        );
         let full_schema = provider.schema();
         let id_idx = full_schema.index_of("id").expect("id in schema");
         let projected = datafusion::common::project_schema(&full_schema, Some(&vec![id_idx]))
@@ -6838,7 +6963,9 @@ mod tests {
             "details".to_string(),
             std::collections::HashSet::new(),
         );
-        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let provider = Arc::new(
+            base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
+        );
         let full_schema = provider.schema();
         let projected =
             HttpTableProvider::get_projected_schema(&full_schema, Some(&vec![])).expect("schema");
@@ -6885,7 +7012,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let provider = Arc::new(
+            base_provider()
+                .with_json_nesting(nesting.clone(), nesting_schema_with_metadata(&nesting)),
+        );
         let schema = provider.schema();
 
         // Schema should keep base-table types for metadata columns.
