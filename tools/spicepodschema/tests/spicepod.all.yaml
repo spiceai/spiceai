@@ -344,8 +344,11 @@ datasets:
         description: Text content for embeddings
         embeddings:
           - from: openai_embeddings
-            engine: vector_elasticsearch
+            engine: elasticsearch
             params:
+              endpoint: &elasticsearch_endpoint http://localhost:9200
+              user: ${secrets:ES_USER}
+              pass: ${secrets:ES_PASS}
               index: content_vectors
             chunking:
               enabled: true
@@ -357,12 +360,15 @@ datasets:
             vector_size: 1536
         full_text_search:
           enabled: true
-          engine: text_elasticsearch
+          engine: elasticsearch
           row_id:
             - id
           index_store: memory # memory, file
           index_directory: /tmp/fts-index
           params:
+            endpoint: *elasticsearch_endpoint
+            user: ${secrets:ES_USER}
+            pass: ${secrets:ES_PASS}
             index: content_text
     params:
       pg_connection_string: postgresql://user:pass@localhost:5432/db
@@ -388,7 +394,7 @@ datasets:
         vector_size: 1536
     vectors:
       enabled: true
-      engine: vector_duckdb
+      engine: duckdb
       partition_by:
         - name: category
           expression: category
@@ -396,8 +402,11 @@ datasets:
         duckdb_file: ./vectors.duckdb
     full_text_search:
       enabled: true
-      engine: text_elasticsearch
+      engine: elasticsearch
       params:
+        endpoint: *elasticsearch_endpoint
+        user: ${secrets:ES_USER}
+        pass: ${secrets:ES_PASS}
         index: articles_index
     acceleration:
       enabled: true
@@ -1365,59 +1374,6 @@ embeddings:
   # File-based embeddings
   - name: file_embeddings
     from: file:models/embeddings.gguf
-
-# =============================================================================
-# SEARCH ENGINES
-# Shared vector/text/graph search backends
-# =============================================================================
-search_engines:
-  - name: vector_duckdb
-    from: duckdb
-    kind: vector
-    params:
-      duckdb_file: ./vectors/default.duckdb
-
-  - name: vector_elasticsearch
-    from: elasticsearch
-    kind: vector
-    params:
-      endpoint: http://localhost:9200
-      user: ${secrets:ES_USER}
-      pass: ${secrets:ES_PASS}
-    defaults:
-      metric: cosine
-    capabilities:
-      vector:
-        dimensions: 1536
-
-  - name: text_elasticsearch
-    from: elasticsearch
-    kind: text
-    params:
-      endpoint: http://localhost:9200
-      user: ${secrets:ES_USER}
-      pass: ${secrets:ES_PASS}
-    defaults:
-      analyzer: english
-
-  - name: opensearch_hybrid
-    from: opensearch
-    kind:
-      - vector
-      - text
-    params:
-      endpoint: http://localhost:9201
-    capabilities:
-      vector:
-        metric: cosine
-      text:
-        analyzer: standard
-
-  - name: knowledge_graph
-    from: neo4j
-    kind: graph
-    params:
-      uri: bolt://localhost:7687
 
 # =============================================================================
 # TOOLS

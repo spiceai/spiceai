@@ -35,7 +35,6 @@ use crate::component::{
     ComponentOrReference, dataset::Dataset, model::Model, view::View, worker::Worker,
 };
 use crate::extension::Extension;
-use crate::search_engine::SearchEngine;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -121,10 +120,6 @@ pub struct SpicepodDefinition {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub rerankers: Vec<ComponentOrReference<Reranker>>,
-
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(default)]
-    pub search_engines: Vec<ComponentOrReference<SearchEngine>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]

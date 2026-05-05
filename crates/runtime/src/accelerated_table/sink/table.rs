@@ -87,18 +87,7 @@ impl TableSink {
         tracing::debug!(
             "TableSink: executing insertion plan with collect() - this will read source and write to accelerator"
         );
-        let collect_start = std::time::Instant::now();
-        if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
-            tracing::debug!(
-                "TableSink: collect() failed after {:.2}s: {e}",
-                collect_start.elapsed().as_secs_f64()
-            );
-            return Err(retry_from_df_error(e));
-        }
 
-        // Perform post-write index maintenance (e.g., rebuild hash indexes) if the table supports it.
-        // For partitioned tables each partition holds its own IndexedMemTable, so we iterate over
-        // all partition providers and trigger maintenance on each one individually.
         let providers_to_maintain: Vec<Arc<dyn TableProvider>> = if let Some(p) = self
             .table_provider
             .as_any()
@@ -109,6 +98,37 @@ impl TableSink {
             vec![Arc::clone(&self.table_provider)]
         };
 
+        for provider in &providers_to_maintain {
+            if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+                let indexes = indexed.get_all_indexes();
+                tracing::debug!(
+                    index_names = ?indexes.iter().map(|i| i.name()).collect::<Vec<_>>(),
+                    "Running on_write_start for indexes"
+                );
+                for index in indexes {
+                    if let Err(e) = index.on_write_start().await {
+                        tracing::warn!(
+                            "TableSink: on_write_start failed for index '{}': {e}. Continuing with write.",
+                            index.name()
+                        );
+                    }
+                }
+            }
+        }
+
+        let collect_start = std::time::Instant::now();
+        if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
+            tracing::debug!(
+                "TableSink: collect() failed after {:.2}s: {e}",
+                collect_start.elapsed().as_secs_f64()
+            );
+            run_on_write_failed(&providers_to_maintain).await;
+            return Err(retry_from_df_error(e));
+        }
+
+        // Perform post-write index maintenance (e.g., rebuild hash indexes) if the table supports it.
+        // For partitioned tables each partition holds its own IndexedMemTable, so we iterate over
+        // all partition providers and trigger maintenance on each one individually.
         for provider in providers_to_maintain {
             match perform_index_maintenance(provider.as_ref()).await {
                 Ok(true) => {
@@ -151,5 +171,20 @@ impl TableSink {
             collect_start.elapsed().as_secs_f64()
         );
         Ok(())
+    }
+}
+
+async fn run_on_write_failed(providers: &[Arc<dyn TableProvider>]) {
+    for provider in providers {
+        if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+            for index in indexed.get_all_indexes() {
+                if let Err(e) = index.on_write_failed().await {
+                    tracing::warn!(
+                        "TableSink: on_write_failed failed for index '{}': {e}. Index write state may need manual cleanup.",
+                        index.name()
+                    );
+                }
+            }
+        }
     }
 }

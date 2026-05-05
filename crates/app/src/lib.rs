@@ -40,7 +40,6 @@ use spicepod::{
         worker::Worker,
     },
     extension::Extension,
-    search_engine::SearchEngine,
 };
 use util::in_tracing_context;
 
@@ -65,8 +64,6 @@ pub struct App {
     pub embeddings: Vec<Embeddings>,
 
     pub rerankers: Vec<Reranker>,
-
-    pub search_engines: Vec<SearchEngine>,
 
     pub tools: Vec<Tool>,
 
@@ -107,7 +104,6 @@ impl Default for App {
             models: vec![],
             embeddings: vec![],
             rerankers: vec![],
-            search_engines: vec![],
             tools: vec![],
             workers: vec![],
             functions: vec![],
@@ -140,7 +136,6 @@ pub struct AppBuilder {
     models: Vec<Model>,
     embeddings: Vec<Embeddings>,
     rerankers: Vec<Reranker>,
-    search_engines: Vec<SearchEngine>,
     tools: Vec<Tool>,
     workers: Vec<Worker>,
     functions: Vec<Function>,
@@ -162,7 +157,6 @@ impl AppBuilder {
             models: vec![],
             embeddings: vec![],
             rerankers: vec![],
-            search_engines: vec![],
             tools: vec![],
             workers: vec![],
             functions: vec![],
@@ -189,7 +183,6 @@ impl AppBuilder {
         self.models.extend(spicepod.models.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
         self.rerankers.extend(spicepod.rerankers.clone());
-        self.search_engines.extend(spicepod.search_engines.clone());
         self.tools.extend(spicepod.tools.clone());
         self.workers.extend(spicepod.workers.clone());
         self.functions.extend(spicepod.functions.clone());
@@ -270,12 +263,6 @@ impl AppBuilder {
     #[must_use]
     pub fn with_embedding(mut self, embedding: Embeddings) -> AppBuilder {
         self.embeddings.push(embedding);
-        self
-    }
-
-    #[must_use]
-    pub fn with_search_engine(mut self, search_engine: SearchEngine) -> AppBuilder {
-        self.search_engines.push(search_engine);
         self
     }
 
@@ -369,7 +356,6 @@ impl AppBuilder {
             models: self.models,
             embeddings: self.embeddings,
             rerankers: self.rerankers,
-            search_engines: self.search_engines,
             tools: self.tools,
             workers: self.workers,
             functions: self.functions,
@@ -401,7 +387,6 @@ impl AppBuilder {
         let mut models: Vec<Model> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
         let mut rerankers: Vec<Reranker> = vec![];
-        let mut search_engines: Vec<SearchEngine> = vec![];
         let mut tools: Vec<Tool> = vec![];
         let mut workers: Vec<Worker> = vec![];
         let mut functions: Vec<Function> = vec![];
@@ -428,10 +413,6 @@ impl AppBuilder {
 
         for reranker in &spicepod.rerankers {
             rerankers.push(reranker.clone());
-        }
-
-        for search_engine in &spicepod.search_engines {
-            search_engines.push(search_engine.clone());
         }
 
         for tool in &spicepod.tools {
@@ -475,10 +456,6 @@ impl AppBuilder {
 
             for reranker in &dependent_spicepod.rerankers {
                 rerankers.push(reranker.clone());
-            }
-
-            for search_engine in &dependent_spicepod.search_engines {
-                search_engines.push(search_engine.clone());
             }
 
             for tool in &dependent_spicepod.tools {
@@ -532,7 +509,6 @@ impl AppBuilder {
             models,
             embeddings,
             rerankers,
-            search_engines,
             tools,
             workers,
             functions,

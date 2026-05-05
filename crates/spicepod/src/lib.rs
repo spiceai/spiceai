@@ -33,7 +33,6 @@ use component::{
     rerankers::Reranker, runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool,
     view::View, worker::Worker,
 };
-use search_engine::SearchEngine;
 
 use crate::component::Nameable;
 use spec::{SpicepodDefinition, SpicepodVersion};
@@ -47,7 +46,6 @@ pub mod metric;
 pub mod param;
 pub mod partitioning;
 pub mod reader;
-pub mod search_engine;
 pub mod semantic;
 pub mod spec;
 pub mod vector;
@@ -141,8 +139,6 @@ pub struct Spicepod {
     pub embeddings: Vec<Embeddings>,
 
     pub rerankers: Vec<Reranker>,
-
-    pub search_engines: Vec<SearchEngine>,
 
     pub tools: Vec<Tool>,
 
@@ -288,15 +284,6 @@ impl Spicepod {
         .await
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
-        let resolved_search_engines = component::resolve_component_references(
-            fs,
-            &path,
-            &spicepod_definition.search_engines,
-            "search_engines",
-        )
-        .await
-        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
-
         let resolved_tools =
             component::resolve_component_references(fs, &path, &spicepod_definition.tools, "tools")
                 .await
@@ -326,7 +313,6 @@ impl Spicepod {
         detect_duplicate_component_names("model", &resolved_models[..])?;
         detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
         detect_duplicate_component_names("reranker", &resolved_rerankers[..])?;
-        detect_duplicate_component_names("search_engine", &resolved_search_engines[..])?;
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
         detect_duplicate_component_names("worker", &resolved_workers[..])?;
         detect_duplicate_component_names("function", &resolved_functions[..])?;
@@ -340,7 +326,6 @@ impl Spicepod {
             resolved_views,
             resolved_embeddings,
             resolved_rerankers,
-            resolved_search_engines,
             resolved_tools,
             resolved_models,
             resolved_workers,
@@ -431,7 +416,6 @@ fn from_definition(
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
     rerankers: Vec<Reranker>,
-    search_engines: Vec<SearchEngine>,
     tools: Vec<Tool>,
     models: Vec<Model>,
     workers: Vec<Worker>,
@@ -448,7 +432,6 @@ fn from_definition(
         models,
         embeddings,
         rerankers,
-        search_engines,
         tools,
         workers,
         functions,
@@ -635,106 +618,6 @@ mod version_tests {
         ";
         let result: Result<SpicepodDefinition, _> = yaml::from_str(yaml);
         assert!(result.is_err(), "Unknown version 'v3' should be rejected");
-    }
-
-    #[test]
-    fn test_search_engines_parse_top_level() {
-        let yaml = concat!(
-            "version: v1\n",
-            "kind: Spicepod\n",
-            "name: search_engines_pod\n",
-            "\n",
-            "search_engines:\n",
-            "  - name: hybrid\n",
-            "    from: elasticsearch\n",
-            "    kind:\n",
-            "      - vector\n",
-            "      - text\n",
-            "    params:\n",
-            "      endpoint: 'http://localhost:9200'\n",
-            "    defaults:\n",
-            "      refresh: wait_for\n",
-            "    capabilities:\n",
-            "      vector:\n",
-            "        dimensions: '1536'\n",
-            "      text:\n",
-            "        analyzer: english\n",
-            "\n",
-            "datasets:\n",
-            "  - name: docs\n",
-            "    from: 'file:data.csv'\n",
-            "    vectors:\n",
-            "      engine: hybrid\n",
-            "    full_text_search:\n",
-            "      engine: hybrid\n",
-            "    columns:\n",
-            "      - name: body\n",
-            "        embeddings:\n",
-            "          - from: openai_embeddings\n",
-            "            engine: hybrid\n",
-            "        full_text_search:\n",
-            "          enabled: true\n",
-            "          engine: hybrid\n",
-        );
-
-        let def: SpicepodDefinition =
-            yaml::from_str(yaml).expect("Should parse search_engines spicepod");
-        assert_eq!(def.search_engines.len(), 1);
-
-        let component::ComponentOrReference::Component(engine) = &def.search_engines[0] else {
-            panic!("Expected inline search engine component");
-        };
-        assert_eq!(engine.name, "hybrid");
-        assert_eq!(engine.from, "elasticsearch");
-        assert!(engine.supports(search_engine::SearchEngineKind::Vector));
-        assert!(engine.supports(search_engine::SearchEngineKind::Text));
-
-        let vector_params = engine
-            .params_for(search_engine::SearchEngineKind::Vector)
-            .expect("vector params should merge");
-        let vector_params = vector_params.as_string_map();
-        assert_eq!(
-            vector_params.get("endpoint").map(String::as_str),
-            Some("http://localhost:9200")
-        );
-        assert_eq!(
-            vector_params.get("refresh").map(String::as_str),
-            Some("wait_for")
-        );
-        assert_eq!(
-            vector_params.get("dimensions").map(String::as_str),
-            Some("1536")
-        );
-
-        let dataset = &def.datasets[0];
-        let component::ComponentOrReference::Component(dataset) = dataset else {
-            panic!("Expected inline dataset component");
-        };
-        assert_eq!(
-            dataset
-                .vectors
-                .as_ref()
-                .and_then(|store| store.engine.as_deref()),
-            Some("hybrid")
-        );
-        assert_eq!(
-            dataset
-                .full_text_search
-                .as_ref()
-                .and_then(|store| store.engine.as_deref()),
-            Some("hybrid")
-        );
-        assert_eq!(
-            dataset.columns[0].embeddings[0].engine.as_deref(),
-            Some("hybrid")
-        );
-        assert_eq!(
-            dataset.columns[0]
-                .full_text_search
-                .as_ref()
-                .and_then(|fts| fts.engine.as_deref()),
-            Some("hybrid")
-        );
     }
 
     // ========================================================================

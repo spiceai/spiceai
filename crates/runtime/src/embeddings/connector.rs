@@ -549,7 +549,7 @@ fn vector_store_for_embedding(
 
     if let Some(params) = embedding.params.as_ref() {
         let mut merged = effective.params.clone().unwrap_or_default();
-        spicepod::search_engine::merge_params(&mut merged, Some(params));
+        spicepod::param::merge_params(&mut merged, Some(params));
         effective.params = if merged.data.is_empty() {
             None
         } else {

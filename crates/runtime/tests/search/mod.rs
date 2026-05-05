@@ -356,7 +356,8 @@ async fn test_megascience_permutations(
     let mut z = DefaultHasher::new();
     slug.hash(&mut z);
     std::fs::create_dir_all(spice_data_base_path()).expect("failed to create spice data base path");
-    let acceleration = acceleration_opt.to_acceleration(&z.finish().to_string());
+    let unique_id = z.finish().to_string();
+    let acceleration = acceleration_opt.to_acceleration(&unique_id);
 
     let mut app = AppBuilder::new(slug);
     let (views, datasets) = table_option.to_tables();
@@ -512,6 +513,22 @@ fn validate_combination(
         )
     {
         return Err("S3 Vectors on reduced set of combinations".to_string());
+    }
+    if matches!(text_engine, TextEngineOptions::Elasticsearch) {
+        if cfg!(not(feature = "elasticsearch")) {
+            return Err(
+                "Elasticsearch text engine tests require the elasticsearch feature".to_string(),
+            );
+        }
+        if !column_config.is_fts() {
+            return Err("Elasticsearch text engine tests require full-text columns".to_string());
+        }
+        if !matches!(table_option, megascience::TableOptions::Dataset) {
+            return Err("Elasticsearch text engine tests are limited to datasets".to_string());
+        }
+        if std::env::var("ELASTICSEARCH_URL").is_err() {
+            return Err("Elasticsearch text engine tests require ELASTICSEARCH_URL".to_string());
+        }
     }
     Ok(())
 }

@@ -76,6 +76,9 @@ impl ElasticsearchFullTextConnector {
     /// Optional params:
     /// - `user`, `pass`
     /// - `client_timeout`, `connect_timeout`
+    /// - `batch_write_rows`
+    /// - `index_settings`, `number_of_shards`, `number_of_replicas`, `refresh_interval`
+    /// - `bulk_load_refresh_interval`, `force_merge_after_write`, `force_merge_segments`
     pub async fn try_new(
         inner_connector: Arc<dyn DataConnector>,
         dataset: &Dataset,

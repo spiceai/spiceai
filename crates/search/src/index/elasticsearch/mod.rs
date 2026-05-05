@@ -23,7 +23,10 @@ limitations under the License.
 mod write;
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -37,6 +40,7 @@ use elasticsearch::Elasticsearch;
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
+use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
@@ -104,6 +108,160 @@ pub struct ElasticsearchIndex {
 
     /// Maximum number of rows to send per Elasticsearch `_bulk` request.
     pub batch_write_rows: usize,
+
+    /// External index maintenance to run around full/append writes.
+    pub write_maintenance: Arc<ElasticsearchIndexWriteMaintenance>,
+}
+
+/// Optional Elasticsearch maintenance to run around full/append table-sink writes.
+#[derive(Debug, Clone, Default)]
+pub struct ElasticsearchIndexWriteOptions {
+    /// Temporary `index.refresh_interval` to apply before a bounded write.
+    pub refresh_interval_during_write: Option<String>,
+
+    /// Target segment count for `_forcemerge` after a bounded write.
+    pub force_merge_segments: Option<u32>,
+}
+
+/// Stateful helper shared by Elasticsearch-backed indexes that write to the same ES index.
+#[derive(Debug)]
+pub struct ElasticsearchIndexWriteMaintenance {
+    options: ElasticsearchIndexWriteOptions,
+    write_cycle_active: AtomicBool,
+    refresh_interval_overridden: AtomicBool,
+    previous_refresh_interval: Mutex<Option<Option<String>>>,
+}
+
+impl Default for ElasticsearchIndexWriteMaintenance {
+    fn default() -> Self {
+        Self::new(ElasticsearchIndexWriteOptions::default())
+    }
+}
+
+impl ElasticsearchIndexWriteMaintenance {
+    #[must_use]
+    pub fn new(options: ElasticsearchIndexWriteOptions) -> Self {
+        Self {
+            options,
+            write_cycle_active: AtomicBool::new(false),
+            refresh_interval_overridden: AtomicBool::new(false),
+            previous_refresh_interval: Mutex::new(None),
+        }
+    }
+
+    async fn on_write_start(
+        &self,
+        client: &dyn Elasticsearch,
+        es_index: &str,
+    ) -> Result<(), DataFusionError> {
+        let first_start = !self.write_cycle_active.swap(true, Ordering::AcqRel);
+        if !first_start {
+            return Ok(());
+        }
+
+        let Some(refresh_interval) = self.options.refresh_interval_during_write.as_deref() else {
+            return Ok(());
+        };
+
+        if self
+            .refresh_interval_overridden
+            .swap(true, Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+
+        let previous = client
+            .get_index_refresh_interval(es_index)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let body = serde_json::json!({ "index": { "refresh_interval": refresh_interval } });
+
+        if let Err(e) = client.put_index_settings(es_index, &body).await {
+            self.refresh_interval_overridden
+                .store(false, Ordering::Release);
+            return Err(DataFusionError::External(Box::new(e)));
+        }
+
+        *self.previous_refresh_interval.lock().await = Some(previous);
+        tracing::debug!(
+            "Set Elasticsearch index '{es_index}' refresh_interval to '{refresh_interval}' for bulk write."
+        );
+        Ok(())
+    }
+
+    async fn on_write_failed(
+        &self,
+        client: &dyn Elasticsearch,
+        es_index: &str,
+    ) -> Result<(), DataFusionError> {
+        if !self.write_cycle_active.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.restore_refresh_interval(client, es_index).await?;
+        Ok(())
+    }
+
+    async fn on_write_complete(
+        &self,
+        client: &dyn Elasticsearch,
+        es_index: &str,
+    ) -> Result<(), DataFusionError> {
+        if !self.write_cycle_active.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let restored_refresh_interval = self.restore_refresh_interval(client, es_index).await?;
+        if restored_refresh_interval || self.options.force_merge_segments.is_some() {
+            client
+                .refresh_index(es_index)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+
+        if let Some(max_num_segments) = self.options.force_merge_segments {
+            client
+                .force_merge(es_index, max_num_segments)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            tracing::debug!(
+                "Force-merged Elasticsearch index '{es_index}' to max_num_segments={max_num_segments}."
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn restore_refresh_interval(
+        &self,
+        client: &dyn Elasticsearch,
+        es_index: &str,
+    ) -> Result<bool, DataFusionError> {
+        if !self.refresh_interval_overridden.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+
+        let previous = self.previous_refresh_interval.lock().await.clone();
+        let Some(previous) = previous else {
+            self.refresh_interval_overridden
+                .store(false, Ordering::Release);
+            return Ok(false);
+        };
+
+        let refresh_interval = previous
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({ "index": { "refresh_interval": refresh_interval } });
+        client
+            .put_index_settings(es_index, &body)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        *self.previous_refresh_interval.lock().await = None;
+        self.refresh_interval_overridden
+            .store(false, Ordering::Release);
+        tracing::debug!("Restored Elasticsearch index '{es_index}' refresh_interval after write.");
+        Ok(true)
+    }
 }
 
 #[async_trait]
@@ -275,6 +433,24 @@ impl Index for ElasticsearchIndex {
         });
         try_join_all(futs).await
     }
+
+    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+        self.write_maintenance
+            .on_write_start(self.client.as_ref(), &self.es_index)
+            .await
+    }
+
+    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+        self.write_maintenance
+            .on_write_failed(self.client.as_ref(), &self.es_index)
+            .await
+    }
+
+    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+        self.write_maintenance
+            .on_write_complete(self.client.as_ref(), &self.es_index)
+            .await
+    }
 }
 
 impl ElasticsearchIndex {
@@ -375,6 +551,9 @@ pub struct ElasticsearchTextIndex {
 
     /// Maximum number of rows to send per Elasticsearch `_bulk` request.
     pub batch_write_rows: usize,
+
+    /// External index maintenance to run around full/append writes.
+    pub write_maintenance: Arc<ElasticsearchIndexWriteMaintenance>,
 }
 
 impl ElasticsearchTextIndex {
@@ -491,5 +670,23 @@ impl Index for ElasticsearchTextIndex {
             .into_iter()
             .map(|rb| async move { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
+    }
+
+    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+        self.write_maintenance
+            .on_write_start(self.client.as_ref(), &self.es_index)
+            .await
+    }
+
+    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+        self.write_maintenance
+            .on_write_failed(self.client.as_ref(), &self.es_index)
+            .await
+    }
+
+    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+        self.write_maintenance
+            .on_write_complete(self.client.as_ref(), &self.es_index)
+            .await
     }
 }

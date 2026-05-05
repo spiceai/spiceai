@@ -119,7 +119,8 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     use crate::component::column::full_text_search_config;
     use crate::component::dataset::FullTextSearchDatasetConfig;
     use crate::embeddings::index::elasticsearch::{
-        ensure_index_with_text_mapping, get_fts_client, normalize_es_data_type,
+        ElasticsearchIndexWriteMaintenance, ensure_index_with_text_mapping, get_fts_client,
+        normalize_es_data_type, parse_index_settings_from_map, parse_write_options_from_map,
     };
     use arrow_schema::Field;
     use search::index::elasticsearch::ElasticsearchTextIndex;
@@ -187,8 +188,18 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
+    let index_settings = parse_index_settings_from_map(&fts_params.params)?;
+    let write_options = parse_write_options_from_map(&fts_params.params)?;
+    let write_maintenance = Arc::new(ElasticsearchIndexWriteMaintenance::new(write_options));
+
     // Ensure the ES index exists with text mappings for all search fields.
-    ensure_index_with_text_mapping(client.as_ref(), &fts_params.es_index, &search_fields).await?;
+    ensure_index_with_text_mapping(
+        client.as_ref(),
+        &fts_params.es_index,
+        &search_fields,
+        index_settings.as_ref(),
+    )
+    .await?;
 
     let mut provider: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
         .as_any()
@@ -209,6 +220,7 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
             primary_key: pk_fields.clone(),
             source_schema: Arc::clone(&source_schema),
             batch_write_rows: fts_params.batch_write_rows,
+            write_maintenance: Arc::clone(&write_maintenance),
         });
         provider = provider.add_index(index as Arc<dyn Index + Send + Sync>);
     }
