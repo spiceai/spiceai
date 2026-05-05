@@ -205,16 +205,38 @@ impl RefreshTask {
             }
         }
 
-        // rx returned None: the reader dropped its sender (stream ended or
-        // panicked). Join to surface panics; this should be immediate.
-        if let Err(e) = reader_handle.await
-            && !self.runtime_status.is_shutdown()
-        {
-            tracing::warn!("CDC reader task for {dataset_name} did not exit cleanly: {e}");
-        }
-
-        if !self.runtime_status.is_shutdown() {
-            tracing::warn!("Changes stream ended for dataset {dataset_name}");
+        // rx returned None: the reader dropped its sender. Three causes:
+        //   1) source stream returned None (clean end-of-stream),
+        //   2) reader saw `tx.closed()` and exited (consumer was dropped),
+        //   3) reader panicked.
+        // (1) and (2) join Ok; (3) joins Err with `is_panic()` true. We must
+        // surface (3) loudly — silently swallowing it would leave the dataset
+        // appearing healthy/ready while CDC ingestion has stopped. Cancelled
+        // joins are expected during shutdown and do not need to escalate.
+        match reader_handle.await {
+            Ok(()) => {
+                if !self.runtime_status.is_shutdown() {
+                    tracing::warn!("Changes stream ended for dataset {dataset_name}");
+                }
+            }
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!(
+                    "CDC reader task for {dataset_name} was cancelled (likely shutdown)"
+                );
+            }
+            Err(e) if !self.runtime_status.is_shutdown() => {
+                let err_msg = format!("CDC reader task ended unexpectedly: {e}");
+                tracing::error!("{err_msg} (dataset={dataset_name})");
+                self.set_refresh_status(
+                    refresh.read().await.display_sql().as_deref(),
+                    status::ComponentStatus::error_with_message(err_msg),
+                )
+                .await;
+            }
+            Err(_) => {
+                // Shutdown in progress and reader did not exit cleanly —
+                // expected during teardown; nothing to escalate.
+            }
         }
 
         Ok(())
@@ -1051,7 +1073,7 @@ mod tests {
     use datafusion::logical_expr::dml::InsertOp;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::Expr;
-    use futures::stream::{self as fstream, BoxStream, StreamExt};
+    use futures::stream::{self as fstream};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
@@ -1472,23 +1494,31 @@ mod tests {
         // CI; the assertion below still requires real pipelining.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while writes_started.load(AtomicOrdering::SeqCst) == 0 {
-            if std::time::Instant::now() > deadline {
-                panic!("apply task never started writing");
-            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "apply task never started writing",
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // Give the reader a moment to fill the prefetch channel while the
-        // apply is sleeping inside its 80ms insert.
-        tokio::time::sleep(Duration::from_millis(40)).await;
-
-        let pulled_now = pulled.load(AtomicOrdering::SeqCst);
-        let writes_now = writes_started.load(AtomicOrdering::SeqCst);
-        // Reader is ahead of applier: at least 2 more items pulled than
-        // writes started. (Channel buffer is 4, so headroom can be up to 5.)
-        assert!(
-            pulled_now >= writes_now + 2,
-            "expected reader to prefetch ahead of applier; pulled={pulled_now}, writes_started={writes_now}",
-        );
+        // Poll until the reader has prefetched at least 2 items ahead of the
+        // applier, or time out. The invariant we care about — reader ahead of
+        // applier under a slow accelerator — must hold during the 80ms apply
+        // window; we just don't want to depend on hitting any specific
+        // moment in that window. Polling avoids fixed-sleep flakiness under
+        // CI scheduling variance.
+        let prefetch_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let p = pulled.load(AtomicOrdering::SeqCst);
+            let w = writes_started.load(AtomicOrdering::SeqCst);
+            if p >= w + 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() <= prefetch_deadline,
+                "expected reader to prefetch ahead of applier; pulled={p}, writes_started={w}",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         task_handle
             .await
@@ -1516,13 +1546,13 @@ mod tests {
                 mut self: Pin<&mut Self>,
                 _cx: &mut Context<'_>,
             ) -> Poll<Option<Self::Item>> {
-                if !self.yielded {
+                if self.yielded {
+                    // Pending forever — never registers a waker.
+                    Poll::Pending
+                } else {
                     self.yielded = true;
                     let env = make_tracked_envelope(1, Arc::clone(&self.log), false);
                     Poll::Ready(Some(Ok(env)))
-                } else {
-                    // Pending forever — never registers a waker.
-                    Poll::Pending
                 }
             }
         }
@@ -1552,9 +1582,10 @@ mod tests {
             if !log.ids().await.is_empty() {
                 break;
             }
-            if std::time::Instant::now() > deadline {
-                panic!("first envelope never committed");
-            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "first envelope never committed",
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
