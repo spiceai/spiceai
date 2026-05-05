@@ -38,6 +38,8 @@ helm install spiceai deploy/chart \
 | `volumeMounts`                  | Additional volume mounts                                                     | `[]`                              |
 | `spicepod`                      | Spicepod configuration (inlined into a ConfigMap)                            | see `values.yaml`                 |
 
+Probe values use the standard Kubernetes probe configuration shape. They can be omitted entirely to use the defaults, or partially overridden while omitted fields keep the defaults from `values.yaml`.
+
 ### ServiceAccount Annotations for Cloud IAM
 
 Use `serviceAccount.annotations` to bind cloud IAM roles to Spice.ai pods, granting access to cloud resources (S3, DynamoDB, GCS, etc.) without static credentials. This works with any Kubernetes distribution that supports annotation-based identity federation.

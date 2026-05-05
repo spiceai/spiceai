@@ -49,7 +49,8 @@ serviceAccount:
 #   - --flight
 #   - 0.0.0.0:50051
 
-# Configure Kubernetes probes for the Spice.ai runtime container
+# Configure Kubernetes probes for the Spice.ai runtime container.
+# Omitted probe fields keep these defaults, so overrides can be partial.
 livenessProbe:
   httpGet:
     path: /health
