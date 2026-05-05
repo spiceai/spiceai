@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod s3;
+pub mod snapshot_engine;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -1000,6 +1001,14 @@ impl DataAccelerator for CayenneAccelerator {
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
+                    // For pre-recreate snapshots we don't have a constructed
+                    // catalog handy (the metastore directory may even be in
+                    // a transient state). Pass None and accept the default
+                    // engine; the resulting snapshot will use the legacy
+                    // archive-cayenne.db path. This is acceptable because
+                    // pre-recreate snapshots are best-effort backups, not
+                    // refresh_mode: snapshot sources.
+                    None,
                 )
                 .await;
 
@@ -1056,13 +1065,45 @@ impl DataAccelerator for CayenneAccelerator {
 
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
-            let snapshot_adapter =
-                runtime_acceleration::snapshot::AccelerationLayout::cayenne(metadata_dir, path_buf);
+            let snapshot_adapter = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
+                metadata_dir.clone(),
+                path_buf.clone(),
+            );
+            // Build a CayenneSnapshotEngine so the snapshot tar uses the
+            // per-dataset metastore-slice format (no raw cayenne.db file)
+            // and so `download_latest_snapshot` imports the slice into the
+            // local metastore as the final extraction step.
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str)
+                .to_string();
+            let snapshot_engine = match self
+                .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
+                .await
+            {
+                Ok(catalog) => Some(Arc::new(
+                    crate::dataaccelerator::cayenne::snapshot_engine::CayenneSnapshotEngine::new(
+                        catalog,
+                        source.name().to_string(),
+                        path_buf.clone(),
+                    ),
+                )
+                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to build CayenneSnapshotEngine for snapshot bootstrap, \
+                         falling back to default engine: {err}"
+                    );
+                    None
+                }
+            };
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
+                snapshot_engine,
             )
             .await)
         } else {
@@ -1308,6 +1349,75 @@ impl DataAccelerator for CayenneAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn supports_snapshot_reload(&self) -> bool {
+        true
+    }
+
+    /// Build a [`CayenneSnapshotEngine`] for this source so the on-disk
+    /// archive uses the per-dataset metastore-slice format (and the writer
+    /// skips `cayenne.db` / `-wal` / `-shm`). Returning `None` falls back to
+    /// the default `SnapshotManager` engine, which will include the raw
+    /// `cayenne.db` file (and its journal sidecar) — that legacy format
+    /// breaks `refresh_mode: snapshot` because the reader's local metastore
+    /// already exists at extract time.
+    async fn snapshot_engine_for_source(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Option<Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>> {
+        let acceleration = source.acceleration()?;
+        let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+        let metastore_type = acceleration
+            .params
+            .get("cayenne_metastore")
+            .map_or("sqlite", String::as_str)
+            .to_string();
+        let catalog = match self
+            .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to build CayenneSnapshotEngine for snapshot create/extract; \
+                     falling back to default engine: {err}"
+                );
+                return None;
+            }
+        };
+        let dir_path = match self.cayenne_data_dir(source) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to resolve cayenne data dir for snapshot engine; falling back to default engine: {err}"
+                );
+                return None;
+            }
+        };
+        Some(Arc::new(
+            crate::dataaccelerator::cayenne::snapshot_engine::CayenneSnapshotEngine::new(
+                catalog,
+                source.name().to_string(),
+                PathBuf::from(dir_path),
+            ),
+        ))
+    }
+
+    /// Reloads the Cayenne-backed table provider from the snapshot directory
+    /// that was just restored to the accelerator's primary location.
+    ///
+    /// Cayenne uses a per-dataset directory layout; dropping the previous
+    /// provider releases the cached `Vortex` segment/footer caches, and the
+    /// factory then reopens the directory tree from disk.
+    async fn reload_from_snapshot(
+        &self,
+        _source: &dyn AccelerationSource,
+        previous_provider: Arc<dyn TableProvider>,
+        provider_factory: super::ReloadProviderFactory,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        drop(previous_provider);
+        provider_factory().await
     }
 
     async fn drop_table(

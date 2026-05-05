@@ -24,7 +24,7 @@ limitations under the License.
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
 };
@@ -118,11 +118,37 @@ pub async fn archive_directories<W>(dirs: &[(PathBuf, String)], writer: W) -> Re
 where
     W: AsyncWrite + Unpin + Send,
 {
+    archive_directories_with_plan(dirs, writer, &[], &[]).await
+}
+
+/// Like [`archive_directories`], but allows excluding files (`skip_relative_paths`,
+/// matched against each entry's path *relative to its source directory*) and
+/// appending extra in-memory entries (`extras`) at the end of the tar.
+///
+/// `extras[i]` is added to the archive with `archive_path = extras[i].0` and
+/// `bytes = extras[i].1`. The bytes count toward the returned total.
+///
+/// # Errors
+///
+/// Returns an error if writing the tar archive fails (I/O error on `writer`,
+/// missing source directory, or any of the recursive walks/append calls
+/// against `dirs` or `extras` fail).
+pub async fn archive_directories_with_plan<W>(
+    dirs: &[(PathBuf, String)],
+    writer: W,
+    skip_relative_paths: &[PathBuf],
+    extras: &[(String, Vec<u8>)],
+) -> Result<u64>
+where
+    W: AsyncWrite + Unpin + Send,
+{
     use tar::Builder;
     use tokio::io::AsyncWriteExt;
     use tokio::task::spawn_blocking;
 
     let dirs = dirs.to_vec();
+    let skip: HashSet<PathBuf> = skip_relative_paths.iter().cloned().collect();
+    let extras = extras.to_vec();
 
     // Use spawn_blocking since tar operations are synchronous
     let (total_bytes, tar_data) = spawn_blocking(move || {
@@ -159,12 +185,23 @@ where
                 }
 
                 // Add all files from this directory recursively
-                add_directory_to_archive(&mut archive, dir_path, archive_prefix).map_err(|e| {
-                    ArchiveError::CreateArchive {
+                add_directory_to_archive_filtered(&mut archive, dir_path, archive_prefix, &skip)
+                    .map_err(|e| ArchiveError::CreateArchive {
                         path: dir_path.clone(),
                         source: e,
-                    }
-                })?;
+                    })?;
+            }
+
+            // Append in-memory extras after the on-disk content.
+            for (archive_path, bytes) in &extras {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mtime(0);
+                archive
+                    .append_data(&mut header, archive_path.as_str(), bytes.as_slice())
+                    .map_err(|source| ArchiveError::WriteArchive { source })?;
             }
 
             // Finish the archive
@@ -796,11 +833,14 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
     Ok(())
 }
 
-/// Recursively add a directory and its contents to a tar archive.
-fn add_directory_to_archive<W: std::io::Write>(
+/// Walks `dir_path` recursively and appends each file to `archive` under
+/// `archive_prefix`, skipping any file whose path *relative to `dir_path`*
+/// is contained in `skip_relative_paths`.
+fn add_directory_to_archive_filtered<W: std::io::Write>(
     archive: &mut tar::Builder<W>,
     dir_path: &Path,
     archive_prefix: &str,
+    skip_relative_paths: &HashSet<PathBuf>,
 ) -> std::io::Result<()> {
     use std::fs;
 
@@ -809,6 +849,7 @@ fn add_directory_to_archive<W: std::io::Write>(
         dir: &Path,
         base_path: &Path,
         archive_prefix: &str,
+        skip_relative_paths: &HashSet<PathBuf>,
     ) -> std::io::Result<()> {
         if dir.is_dir() {
             for entry in fs::read_dir(dir)? {
@@ -817,6 +858,14 @@ fn add_directory_to_archive<W: std::io::Write>(
                 let relative_path = path.strip_prefix(base_path).map_err(|_| {
                     std::io::Error::other(format!("Failed to strip prefix from {}", path.display()))
                 })?;
+
+                if skip_relative_paths.contains(relative_path) {
+                    tracing::debug!(
+                        "Skipping {} during archive creation (engine plan)",
+                        path.display()
+                    );
+                    continue;
+                }
 
                 let archive_path = if archive_prefix.is_empty() {
                     relative_path.to_path_buf()
@@ -834,7 +883,13 @@ fn add_directory_to_archive<W: std::io::Write>(
                 }
 
                 if metadata.is_dir() {
-                    visit_dirs(archive, &path, base_path, archive_prefix)?;
+                    visit_dirs(
+                        archive,
+                        &path,
+                        base_path,
+                        archive_prefix,
+                        skip_relative_paths,
+                    )?;
                 } else if metadata.is_file() {
                     archive.append_path_with_name(&path, &archive_path)?;
                 }
@@ -843,7 +898,13 @@ fn add_directory_to_archive<W: std::io::Write>(
         Ok(())
     }
 
-    visit_dirs(archive, dir_path, dir_path, archive_prefix)
+    visit_dirs(
+        archive,
+        dir_path,
+        dir_path,
+        archive_prefix,
+        skip_relative_paths,
+    )
 }
 
 #[cfg(test)]

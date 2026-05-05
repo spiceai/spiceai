@@ -20,6 +20,7 @@ limitations under the License.
 //! that can be used to store Cayenne metadata. This allows swapping between `SQLite`,
 //! Turso, or other storage implementations.
 
+pub mod snapshot;
 pub mod sqlite;
 
 #[cfg(feature = "turso")]
@@ -281,6 +282,14 @@ impl<T: Into<MetastoreValue>> From<Option<T>> for MetastoreValue {
 
 /// A row returned from a query.
 pub trait MetastoreRow: Send {
+    /// Get the raw `MetastoreValue` for a column by index. Used by
+    /// generic export/import logic that does not know the column types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column index is out of bounds.
+    fn get_value(&self, index: usize) -> CatalogResult<MetastoreValue>;
+
     /// Get an i64 value from the row by column index.
     ///
     /// # Errors
