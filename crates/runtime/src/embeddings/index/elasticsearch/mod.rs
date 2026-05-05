@@ -318,12 +318,14 @@ pub async fn try_from_table(
     ensure_index_with_mapping(
         client.as_ref(),
         &es_index,
-        &vector_field,
-        dims,
-        &text_fields,
-        &mapping_opts,
-        &metadata_columns,
-        index_settings.as_ref(),
+        VectorIndexMapping {
+            vector_field: &vector_field,
+            dims,
+            text_fields: &text_fields,
+            mapping_opts: &mapping_opts,
+            metadata_columns: &metadata_columns,
+            index_settings: index_settings.as_ref(),
+        },
     )
     .await?;
 
@@ -623,13 +625,17 @@ fn es_metadata_columns(
 async fn ensure_index_with_mapping(
     client: &dyn Elasticsearch,
     es_index: &str,
-    vector_field: &str,
-    dims: i32,
-    text_fields: &[String],
-    mapping_opts: &VectorMappingOptions,
-    metadata_columns: &MetadataColumns,
-    index_settings: Option<&serde_json::Value>,
+    mapping: VectorIndexMapping<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let VectorIndexMapping {
+        vector_field,
+        dims,
+        text_fields,
+        mapping_opts,
+        metadata_columns,
+        index_settings,
+    } = mapping;
+
     if dims <= 0 {
         return Err(format!(
             "Failed to prepare Elasticsearch index '{es_index}': embedding dimension must be positive, got {dims}. Check that the embedding model reports a valid output dimension."
@@ -756,6 +762,15 @@ async fn ensure_index_with_mapping(
         }
         Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
     }
+}
+
+struct VectorIndexMapping<'a> {
+    vector_field: &'a str,
+    dims: i32,
+    text_fields: &'a [String],
+    mapping_opts: &'a VectorMappingOptions,
+    metadata_columns: &'a MetadataColumns,
+    index_settings: Option<&'a serde_json::Value>,
 }
 
 /// Check whether an error from `create_index` indicates the index already exists
