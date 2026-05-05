@@ -256,6 +256,7 @@ mod tests {
         let fts_params = ElasticsearchFtsParams {
             params: HashMap::from([("endpoint".to_string(), "http://localhost:9200".to_string())]),
             es_index: "docs".to_string(),
+            batch_write_rows: 1000,
         };
         let table_ref = datafusion::sql::TableReference::parse_str("docs");
 

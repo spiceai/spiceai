@@ -96,28 +96,22 @@
         "$ref": "#/$defs/ComponentOrReference6"
       }
     },
-    "search_engines": {
+    "tools": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference7"
       }
     },
-    "tools": {
+    "workers": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/ComponentOrReference8"
       }
     },
-    "workers": {
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/ComponentOrReference9"
-      }
-    },
     "functions": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ComponentOrReference10"
+        "$ref": "#/$defs/ComponentOrReference9"
       }
     },
     "dependencies": {
@@ -3394,136 +3388,6 @@
     "ComponentOrReference7": {
       "anyOf": [
         {
-          "$ref": "#/$defs/SearchEngine"
-        },
-        {
-          "$ref": "#/$defs/ComponentReference"
-        }
-      ]
-    },
-    "SearchEngine": {
-      "description": "A named search backend that datasets can reference from `vectors.engine`,\n`full_text_search.engine`, or column-level search configuration.",
-      "type": "object",
-      "properties": {
-        "name": {
-          "description": "Component name referenced by datasets and columns.",
-          "type": "string"
-        },
-        "from": {
-          "description": "Backend/provider name, for example `elasticsearch`, `s3_vectors`, or `duckdb`.",
-          "type": "string"
-        },
-        "kind": {
-          "description": "Search capabilities exposed by this engine.",
-          "$ref": "#/$defs/SearchEngineKindSelection"
-        },
-        "params": {
-          "description": "Backend connection parameters shared by all capabilities.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Params"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "defaults": {
-          "description": "Default engine parameters applied before dataset or column overrides.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Params"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "capabilities": {
-          "description": "Capability-specific defaults applied after `defaults` and before dataset or column overrides.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SearchEngineCapabilities"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "name",
-        "from",
-        "kind"
-      ]
-    },
-    "SearchEngineKindSelection": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/SearchEngineKind"
-        },
-        {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/SearchEngineKind"
-          }
-        }
-      ]
-    },
-    "SearchEngineKind": {
-      "type": "string",
-      "enum": [
-        "vector",
-        "text",
-        "graph"
-      ]
-    },
-    "SearchEngineCapabilities": {
-      "type": "object",
-      "properties": {
-        "vector": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Params"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "text": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Params"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "graph": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Params"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "ComponentOrReference8": {
-      "anyOf": [
-        {
           "$ref": "#/$defs/Tool"
         },
         {
@@ -3598,25 +3462,55 @@
       ]
     },
     "Signature": {
-      "description": "Typed function signature.\n\n`returns` names the output Arrow type.",
+      "description": "Typed function signature.\n\n`returns` names the output Arrow type for scalar functions, or the\noutput columns for table functions.",
       "type": "object",
       "properties": {
+        "tables": {
+          "description": "Table inputs consumed by function backends that accept relational input.\nWhen a function accepts table and scalar arguments, table inputs\nare the leading arguments and scalar arguments follow them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FunctionTableArg"
+          }
+        },
         "args": {
-          "description": "Positional argument list. Empty for niladic functions.",
+          "description": "Positional scalar argument list. Empty for niladic functions.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/FunctionArg"
           }
         },
         "returns": {
-          "description": "Return Arrow type. Required for scalar functions.",
-          "type": [
-            "string",
-            "null"
+          "description": "Return Arrow type for scalar functions, or output columns for table functions.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FunctionReturns"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
       "additionalProperties": false
+    },
+    "FunctionTableArg": {
+      "description": "A declared table input for function backends.\n\nThe `name` is the logical input name exposed to the backend. `columns`\ndeclares the Arrow schema expected by the backend. The actual input data can\ncome from a backend-specific parameter, such as `params.input_table`, or from\na SQL `body`/`body_ref` query that produces the declared columns.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FunctionArg"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
     },
     "FunctionArg": {
       "description": "A single named argument or output column.\n\nThe `type` field is an Arrow logical-type string (e.g. `float64`,\n`utf8`, `list<int32>`, `decimal(38, 10)`, `timestamp(us, utc)`). The\nparser retains it verbatim; tier-specific function factories validate\naccepted type strings when the function is registered.",
@@ -3635,7 +3529,21 @@
         "type"
       ]
     },
-    "ComponentOrReference9": {
+    "FunctionReturns": {
+      "description": "Function return declaration.\n\nScalar functions use a single Arrow type string:\n\n```yaml\nreturns: int64\n```\n\nTable functions use a list of named output columns:\n\n```yaml\nreturns:\n  - { name: value, type: int64 }\n  - { name: label, type: utf8 }\n```",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FunctionArg"
+          }
+        }
+      ]
+    },
+    "ComponentOrReference8": {
       "anyOf": [
         {
           "$ref": "#/$defs/Worker"
@@ -3749,7 +3657,7 @@
         }
       ]
     },
-    "ComponentOrReference10": {
+    "ComponentOrReference9": {
       "anyOf": [
         {
           "$ref": "#/$defs/Function"
@@ -3760,7 +3668,7 @@
       ]
     },
     "Function": {
-      "description": "A user-defined scalar SQL function registered into the `DataFusion` session context.\n\nThe `from` field selects the execution tier:\n  * `sql` — inline SQL body (tier T0, in-process, no sandbox).\n  * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).\n\nSupported at runtime: `sql`, `http://…`, `https://…`.\n\nRegistration is disabled by default. Set `runtime.functions.enabled: true`\nin the spicepod to activate declared functions.",
+      "description": "A user-defined function registered into the `DataFusion` session context.\n\nThe `from` field selects the execution tier:\n  * `sql` - inline SQL body (tier T0, in-process, no sandbox).\n  * `http://...` | `https://...` - remote endpoint invoked over HTTP + JSON (tier T2).\n  * `wasm` - WebAssembly module invoked with Arrow IPC batches.\n\nSupported at runtime by default: `sql`. HTTP-backed functions require a\nruntime built with the `http-functions` feature. WebAssembly functions\nrequire a runtime built with the `wasm-functions` feature.\n\nRegistration is disabled by default. Set `runtime.functions.enabled: true`\nin the spicepod to activate declared functions.",
       "type": "object",
       "properties": {
         "name": {
@@ -3784,7 +3692,7 @@
           ]
         },
         "kind": {
-          "description": "Function kind. Only scalar functions are supported in the beta surface.\nDefaults to [`FunctionKind::Scalar`].",
+          "description": "Defaults to [`FunctionKind::Scalar`].",
           "$ref": "#/$defs/FunctionKind",
           "default": "scalar"
         },
@@ -3840,7 +3748,7 @@
           ]
         },
         "as_tool": {
-          "description": "Whether this function is also exposed as an LLM tool. Defaults to\n`true` — every declared function automatically becomes callable\nboth via SQL (`SELECT my_fn(x)`) and via the tool registry (LLM\ntool-calling, `POST /v1/tools/<name>`, `/v1/tools` listing).\n\nSet to `false` to keep the function SQL-only.",
+          "description": "Whether this scalar function is also exposed as an LLM tool. Defaults\nto `true` — scalar functions automatically become callable both via SQL\n(`SELECT my_fn(x)`) and via the tool registry (LLM tool-calling,\n`POST /v1/tools/<name>`, `/v1/tools` listing). Table functions are\nalways SQL-only.\n\nSet to `false` to keep the function SQL-only.",
           "type": "boolean",
           "default": true
         }
@@ -3853,10 +3761,11 @@
       ]
     },
     "FunctionKind": {
-      "description": "Function kind. The beta user-defined-function surface supports scalar functions.",
+      "description": "Function kind.",
       "type": "string",
       "enum": [
-        "scalar"
+        "scalar",
+        "table"
       ]
     },
     "Volatility": {
@@ -5756,7 +5665,7 @@
           "type": "string"
         },
         "pagination_max_pages": {
-          "description": "Maximum number of pages to fetch for pagination. Default: 100.",
+          "description": "Maximum number of pages to fetch for pagination. Default: 100. Set to 'nolimit' to disable the limit.",
           "type": "string"
         },
         "pagination_data_map_to_array": {
@@ -6088,7 +5997,7 @@
           "type": "string"
         },
         "pagination_max_pages": {
-          "description": "Maximum number of pages to fetch for pagination. Default: 100.",
+          "description": "Maximum number of pages to fetch for pagination. Default: 100. Set to 'nolimit' to disable the limit.",
           "type": "string"
         },
         "pagination_data_map_to_array": {
@@ -7545,6 +7454,12 @@
         "parallel_tool_calls": {
           "type": "string"
         },
+        "prompt_cache_key": {
+          "type": "string"
+        },
+        "prompt_cache_retention": {
+          "type": "string"
+        },
         "user": {
           "type": "string"
         },
@@ -7645,6 +7560,16 @@
         },
         "openai_parallel_tool_calls": {
           "description": "**DEPRECATED**: Use 'parallel_tool_calls' without prefix",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: Use 'prompt_cache_key' without prefix",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
+          "description": "**DEPRECATED**: Use 'prompt_cache_retention' without prefix",
           "type": "string",
           "deprecated": true
         },
@@ -7773,6 +7698,12 @@
         "azure_parallel_tool_calls": {
           "type": "string"
         },
+        "azure_prompt_cache_key": {
+          "type": "string"
+        },
+        "azure_prompt_cache_retention": {
+          "type": "string"
+        },
         "azure_user": {
           "type": "string"
         },
@@ -7876,6 +7807,16 @@
           "type": "string",
           "deprecated": true
         },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
         "openai_user": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -7973,6 +7914,12 @@
           "type": "string"
         },
         "file_parallel_tool_calls": {
+          "type": "string"
+        },
+        "file_prompt_cache_key": {
+          "type": "string"
+        },
+        "file_prompt_cache_retention": {
           "type": "string"
         },
         "file_user": {
@@ -8074,6 +8021,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -8189,6 +8146,12 @@
         "databricks_parallel_tool_calls": {
           "type": "string"
         },
+        "databricks_prompt_cache_key": {
+          "type": "string"
+        },
+        "databricks_prompt_cache_retention": {
+          "type": "string"
+        },
         "databricks_user": {
           "type": "string"
         },
@@ -8288,6 +8251,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -8399,6 +8372,12 @@
         "huggingface_parallel_tool_calls": {
           "type": "string"
         },
+        "huggingface_prompt_cache_key": {
+          "type": "string"
+        },
+        "huggingface_prompt_cache_retention": {
+          "type": "string"
+        },
         "huggingface_user": {
           "type": "string"
         },
@@ -8498,6 +8477,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -8613,6 +8602,12 @@
         "anthropic_parallel_tool_calls": {
           "type": "string"
         },
+        "anthropic_prompt_cache_key": {
+          "type": "string"
+        },
+        "anthropic_prompt_cache_retention": {
+          "type": "string"
+        },
         "anthropic_user": {
           "type": "string"
         },
@@ -8712,6 +8707,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -8819,6 +8824,12 @@
         "xai_parallel_tool_calls": {
           "type": "string"
         },
+        "xai_prompt_cache_key": {
+          "type": "string"
+        },
+        "xai_prompt_cache_retention": {
+          "type": "string"
+        },
         "xai_user": {
           "type": "string"
         },
@@ -8918,6 +8929,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -9062,6 +9083,12 @@
         "bedrock_parallel_tool_calls": {
           "type": "string"
         },
+        "bedrock_prompt_cache_key": {
+          "type": "string"
+        },
+        "bedrock_prompt_cache_retention": {
+          "type": "string"
+        },
         "bedrock_user": {
           "type": "string"
         },
@@ -9165,6 +9192,16 @@
           "type": "string",
           "deprecated": true
         },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
         "openai_user": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -9262,6 +9299,12 @@
           "type": "string"
         },
         "google_parallel_tool_calls": {
+          "type": "string"
+        },
+        "google_prompt_cache_key": {
+          "type": "string"
+        },
+        "google_prompt_cache_retention": {
           "type": "string"
         },
         "google_user": {
@@ -9363,6 +9406,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
