@@ -242,6 +242,42 @@ async fn start_http_server() -> Result<
         .route(
             "/data/items.csv",
             get(|| async { ([("content-type", "text/csv")], ITEMS_CSV) }),
+        )
+        .route(
+            "/api/metrics-paginated",
+            get(
+                |query: axum::extract::Query<HashMap<String, String>>| async move {
+                    // Token-based pagination: returns 2 metrics per page, 3 pages total (5 metrics).
+                    static METRICS: &[(&str, f64)] = &[
+                        ("cpu", 42.0),
+                        ("mem", 78.5),
+                        ("disk", 55.0),
+                        ("net_in", 12.3),
+                        ("net_out", 9.7),
+                    ];
+                    let page: usize = query
+                        .get("cursor")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1);
+                    let items_per_page = 2;
+                    let start = (page - 1) * items_per_page;
+                    let end = std::cmp::min(start + items_per_page, METRICS.len());
+                    let items: Vec<Value> = METRICS[start..end]
+                        .iter()
+                        .map(|(metric, reading)| json!({ "metric": metric, "reading": reading }))
+                        .collect();
+                    let next_cursor = if end < METRICS.len() {
+                        Value::Number(serde_json::Number::from(page + 1))
+                    } else {
+                        Value::Null
+                    };
+                    let body = json!({
+                        "data": items,
+                        "next_cursor": next_cursor,
+                    });
+                    ([("content-type", "application/json")], body.to_string())
+                },
+            ),
         );
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
@@ -1378,6 +1414,98 @@ async fn test_http_oauth2_rejects_partial_configuration() -> Result<(), String> 
                 query_result.is_err(),
                 "partial OAuth2 auth config should prevent the dataset from serving queries"
             );
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Tests `IN (SELECT ...)` subqueries with **pagination** against a real registered table
+///
+///   1. A CSV file (`orgs`) with org IDs
+///   2. An HTTP dataset (`paginated_api`) with header filters and token-based pagination
+///   3. A query that builds JSON headers from the CSV rows and uses
+///      `IN (SELECT ...)` to drive dynamic HTTP requests across multiple pages
+#[tokio::test]
+async fn test_http_dynamic_request_headers_from_subquery_with_pagination() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+            tracing::debug!("HTTP test server started at {addr}");
+
+            // 1. Register both datasets: the S3 CSV lookup table and the paginated HTTP API.
+            let orgs_dataset = Dataset::new("s3://spiceai-public-datasets/orgs.csv", "orgs");
+
+            let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "paginated_api");
+            http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                (
+                    "allowed_request_paths".to_string(),
+                    "/metrics-paginated".to_string(),
+                ),
+                ("request_header_filters".to_string(), "enabled".to_string()),
+                (
+                    "request_header_allowlist".to_string(),
+                    "x-org-id".to_string(),
+                ),
+                ("max_request_partitions".to_string(), "100".to_string()),
+                // Token-based pagination config
+                ("pagination".to_string(), "enabled".to_string()),
+                (
+                    "pagination_next_pointer".to_string(),
+                    "/next_cursor".to_string(),
+                ),
+                ("pagination_token_param".to_string(), "cursor".to_string()),
+                ("pagination_data_pointer".to_string(), "/data".to_string()),
+                ("pagination_max_pages".to_string(), "10".to_string()),
+            ])));
+
+            let app = AppBuilder::new("http_dynamic_headers_subquery_paginated_test")
+                .with_dataset(orgs_dataset)
+                .with_dataset(http_dataset)
+                .build();
+            let mut rt = load_runtime(app).await?;
+
+            // 2. Build header JSON from CSV rows, use IN (SELECT ...) to drive
+            //    dynamic paginated HTTP requests.
+            let query = r#"
+                WITH org_headers AS (
+                    SELECT '{"x-org-id":"' || org_id || '"}' AS hdr
+                    FROM orgs
+                )
+                SELECT
+                    request_headers,
+                    json_get_str(content, 'metric') AS metric,
+                    json_get_float(content, 'reading') AS reading
+                FROM paginated_api
+                WHERE request_path = '/metrics-paginated'
+                  AND request_headers IN (SELECT hdr FROM org_headers)
+                ORDER BY request_headers, metric
+            "#;
+
+            run_query_and_check_results(
+                &mut rt,
+                "http_dynamic_request_headers_from_subquery_paginated",
+                query,
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    // Each org should get 5 metrics (3 pages: 2+2+1).
+                    let total_rows: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert!(total_rows > 0, "expected paginated results but got 0 rows");
+                    let pretty = arrow::util::pretty::pretty_format_batches(&result_batches)
+                        .expect("failed to format batches");
+                    insta::assert_snapshot!(
+                        "http_dynamic_request_headers_from_subquery_paginated_results",
+                        pretty
+                    );
+                })),
+            )
+            .await?;
 
             tx.send(())
                 .map_err(|()| "Failed to send shutdown signal".to_string())?;

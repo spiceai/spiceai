@@ -197,6 +197,23 @@ impl TableProvider for SwappableTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         self.current().insert_into(state, input, insert_op).await
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.current().delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.current().update(state, assignments, filters).await
+    }
 }
 
 #[cfg(test)]
