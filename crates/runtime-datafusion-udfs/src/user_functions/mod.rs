@@ -381,7 +381,22 @@ async fn infer_dependencies(decl: &Function) -> Result<Vec<String>> {
         _ => {}
     }
 
+    let excluded_dependencies = inferred_dependency_exclusions(decl);
+    dependencies.retain(|dependency| !excluded_dependencies.contains(dependency));
+
     Ok(deduplicate_dependencies(dependencies))
+}
+
+fn inferred_dependency_exclusions(decl: &Function) -> HashSet<TableReference> {
+    let mut exclusions = HashSet::new();
+    exclusions.insert(TableReference::bare("args"));
+    exclusions.extend(
+        decl.signature
+            .tables
+            .iter()
+            .map(|table| TableReference::parse_str(&table.name)),
+    );
+    exclusions
 }
 
 fn string_param<'a>(decl: &'a Function, key: &str) -> Option<&'a str> {
@@ -589,6 +604,42 @@ mod tests {
             .expect("dependencies inferred");
 
         assert_eq!(inferred.depends_on, vec!["customers", "orders"]);
+    }
+
+    #[tokio::test]
+    async fn sql_dependency_inference_excludes_function_inputs() {
+        let mut d = decl(
+            "sql",
+            Some(
+                "SELECT input.id, args.x FROM input JOIN real_source ON input.id = real_source.id CROSS JOIN args",
+            ),
+        );
+        d.signature.tables = vec![spicepod::component::function::FunctionTableArg {
+            name: "input".into(),
+            columns: vec![],
+        }];
+
+        let dependencies = infer_dependencies(&d).await.expect("dependencies inferred");
+
+        assert_eq!(dependencies, vec!["real_source"]);
+    }
+
+    #[tokio::test]
+    async fn wasm_sql_dependency_inference_excludes_function_inputs() {
+        let mut d = decl(
+            "wasm",
+            Some(
+                "SELECT input.id, args.x FROM input JOIN wasm_source ON input.id = wasm_source.id CROSS JOIN args",
+            ),
+        );
+        d.signature.tables = vec![spicepod::component::function::FunctionTableArg {
+            name: "input".into(),
+            columns: vec![],
+        }];
+
+        let dependencies = infer_dependencies(&d).await.expect("dependencies inferred");
+
+        assert_eq!(dependencies, vec!["wasm_source"]);
     }
 
     #[tokio::test]

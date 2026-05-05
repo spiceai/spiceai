@@ -771,11 +771,13 @@ fn duckdb_vector_sql_cte(
 ) -> String {
     let distance_expr = hnsw.metric.distance_expr(embedding_column, vector_literal);
     let score_expr = hnsw.metric.cte_score_expr(CTE_DISTANCE_ALIAS);
+    let embedding_not_null = embedding_not_null_predicate(embedding_column);
 
     let cte = format!(
         "WITH {CTE_NAME} AS (\
          SELECT *, {distance_expr} AS {CTE_DISTANCE_ALIAS} \
          FROM {table} \
+         WHERE {embedding_not_null} \
          ORDER BY {CTE_DISTANCE_ALIAS} ASC LIMIT {limit}\
          )",
         table = quote_identifier(table_name),
@@ -809,12 +811,19 @@ fn duckdb_vector_sql_flat(
         .map(|filter| expr::to_sql_with_engine(filter, Some(Engine::DuckDB)))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| DataFusionError::Plan(e.to_string()))?;
-    let where_clause = format!(" WHERE {}", filter_exprs.join(" AND "));
+    let mut predicates = Vec::with_capacity(filter_exprs.len() + 1);
+    predicates.push(embedding_not_null_predicate(embedding_column));
+    predicates.extend(filter_exprs);
+    let where_clause = format!(" WHERE {}", predicates.join(" AND "));
 
     Ok(format!(
         "SELECT {select_exprs} FROM {table}{where_clause} ORDER BY {distance_expr} ASC LIMIT {limit}",
         table = quote_identifier(table_name),
     ))
+}
+
+fn embedding_not_null_predicate(embedding_column: &str) -> String {
+    format!("{} IS NOT NULL", quote_identifier(embedding_column))
 }
 
 /// Build the SELECT expression list, substituting `_score` with the given score expression.
@@ -1165,6 +1174,7 @@ mod tests {
             "WITH __spice_nn AS (\
              SELECT *, array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS __spice_dist \
              FROM docs \
+             WHERE body_embedding IS NOT NULL \
              ORDER BY __spice_dist ASC LIMIT 10\
              ) SELECT id, CAST(1.0 - __spice_dist AS DOUBLE) AS _score \
              FROM __spice_nn \
@@ -1200,6 +1210,7 @@ mod tests {
             "WITH __spice_nn AS (\
              SELECT *, array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS __spice_dist \
              FROM docs \
+             WHERE body_embedding IS NOT NULL \
              ORDER BY __spice_dist ASC LIMIT 10\
              ) SELECT 1 AS __spice_empty_projection_row \
              FROM __spice_nn \
@@ -1294,7 +1305,7 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT id, CAST(1.0 - array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS DOUBLE) AS _score \
-             FROM docs WHERE \"id\" > 10 \
+               FROM docs WHERE body_embedding IS NOT NULL AND \"id\" > 10 \
              ORDER BY array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) ASC LIMIT 10"
         );
     }
@@ -1317,6 +1328,7 @@ mod tests {
             "WITH __spice_nn AS (\
              SELECT *, array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS __spice_dist \
              FROM docs \
+             WHERE body_embedding IS NOT NULL \
              ORDER BY __spice_dist ASC LIMIT 10\
              ) SELECT id, CAST(1.0 - __spice_dist AS DOUBLE) AS _score \
              FROM __spice_nn \
