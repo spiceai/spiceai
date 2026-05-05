@@ -43,6 +43,7 @@ on:
           - 'odbc-athena'
           - 'odbc-databricks'
           - 'oracle'
+          - 'oracle-catalog'
           - 'duckdb'
           - 'duckdb-zero-results'
           - 'duckdb-partitioned'

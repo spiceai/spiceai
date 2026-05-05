@@ -114,6 +114,7 @@ jobs:
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
+                tags: ["default"],
                 use_minio: useMinio,
                 is_tagged_release: isTaggedRelease,
               }, {
@@ -122,6 +123,7 @@ jobs:
                 target_os: "darwin",
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
+                tags: ["default", "metal"],
                 use_minio: false,
                 is_tagged_release: isTaggedRelease,
               }
@@ -135,6 +137,7 @@ jobs:
                 target_os: "linux",
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
+                tags: ["default"],
                 use_minio: false,
                 is_tagged_release: isTaggedRelease,
               });
