@@ -101,10 +101,9 @@ impl RefreshTask {
         // The bounded channel provides natural backpressure: when the apply
         // loop is the bottleneck, the reader parks on `send` and stops
         // pulling, so we never accumulate unbounded memory.
-        let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<Result<cdc::ChangeEnvelope, cdc::StreamError>>(
-                CDC_PREFETCH_BUFFER,
-            );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<
+            Result<cdc::ChangeEnvelope, cdc::StreamError>,
+        >(CDC_PREFETCH_BUFFER);
 
         let reader_dataset = dataset_name.clone();
         let reader_handle = tokio::spawn(async move {
@@ -1074,12 +1073,7 @@ mod tests {
         }
 
         async fn ids(&self) -> Vec<i32> {
-            self.events
-                .lock()
-                .await
-                .iter()
-                .map(|(id, _)| *id)
-                .collect()
+            self.events.lock().await.iter().map(|(id, _)| *id).collect()
         }
     }
 
@@ -1106,13 +1100,8 @@ mod tests {
         }
     }
 
-    fn make_tracked_envelope(
-        id: i32,
-        log: Arc<CommitLog>,
-        is_ready: bool,
-    ) -> ChangeEnvelope {
-        let batch =
-            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![id], vec![Some("row")]);
+    fn make_tracked_envelope(id: i32, log: Arc<CommitLog>, is_ready: bool) -> ChangeEnvelope {
+        let batch = create_test_change_batch(vec!["c"], &[vec!["id"]], vec![id], vec![Some("row")]);
         ChangeEnvelope::new(
             Box::new(TrackingCommitter {
                 id,
@@ -1139,19 +1128,14 @@ mod tests {
 
     impl<S: futures::Stream + Unpin> futures::Stream for DropSignalStream<S> {
         type Item = S::Item;
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             Pin::new(&mut self.inner).poll_next(cx)
         }
     }
 
     /// Builds a `ChangesStream` from a vector of pre-built items. Items are
     /// yielded in order; the stream then ends.
-    fn make_changes_stream(
-        items: Vec<Result<ChangeEnvelope, CdcStreamError>>,
-    ) -> ChangesStream {
+    fn make_changes_stream(items: Vec<Result<ChangeEnvelope, CdcStreamError>>) -> ChangesStream {
         fstream::iter(items).boxed()
     }
 
@@ -1163,7 +1147,9 @@ mod tests {
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
-        let refresh = Arc::new(RwLock::new(crate::accelerated_table::refresh::Refresh::default()));
+        let refresh = Arc::new(RwLock::new(
+            crate::accelerated_table::refresh::Refresh::default(),
+        ));
         task.start_changes_stream(refresh, stream, None, ready_sender, initial_load_completed)
             .await
     }
@@ -1236,8 +1222,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_changes_stream_commits_after_write() {
-        let write_log: Arc<TokioMutex<Vec<&'static str>>> =
-            Arc::new(TokioMutex::new(Vec::new()));
+        let write_log: Arc<TokioMutex<Vec<&'static str>>> = Arc::new(TokioMutex::new(Vec::new()));
         let provider = Arc::new(WriteOrderRecordingProvider {
             inner: make_mem_table() as Arc<dyn TableProvider>,
             write_log: Arc::clone(&write_log),
@@ -1261,12 +1246,8 @@ mod tests {
         }
 
         let mk = |id: i32| -> ChangeEnvelope {
-            let batch = create_test_change_batch(
-                vec!["c"],
-                &[vec!["id"]],
-                vec![id],
-                vec![Some("row")],
-            );
+            let batch =
+                create_test_change_batch(vec!["c"], &[vec!["id"]], vec![id], vec![Some("row")]);
             ChangeEnvelope::new(
                 Box::new(SequencedCommitter {
                     log: Arc::clone(&combined),
@@ -1367,9 +1348,14 @@ mod tests {
             Ok(make_tracked_envelope(2, Arc::clone(&log), true)), // ready=true
             Ok(make_tracked_envelope(3, Arc::clone(&log), false)),
         ]);
-        run_changes_stream(&task, stream, Some(Arc::clone(&notify)), Arc::clone(&initial_load))
-            .await
-            .expect("start_changes_stream should succeed");
+        run_changes_stream(
+            &task,
+            stream,
+            Some(Arc::clone(&notify)),
+            Arc::clone(&initial_load),
+        )
+        .await
+        .expect("start_changes_stream should succeed");
 
         assert!(
             initial_load.load(Ordering::Relaxed),
@@ -1436,10 +1422,7 @@ mod tests {
 
     impl<S: futures::Stream + Unpin> futures::Stream for CountingStream<S> {
         type Item = S::Item;
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(item)) => {
                     self.pulled.fetch_add(1, AtomicOrdering::SeqCst);
