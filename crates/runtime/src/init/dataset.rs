@@ -1494,12 +1494,6 @@ pub struct RegisterDatasetContext {
 #[expect(clippy::result_large_err)]
 fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     if ds.has_full_text_column() && !ds.is_accelerated() {
-        // Elasticsearch-backed FTS stores the index externally — no local
-        // acceleration is needed to build or query the index.
-        #[cfg(feature = "elasticsearch")]
-        if ds.fts_engine() == Some("elasticsearch") {
-            return Ok(());
-        }
         return Err(FullTextSearchRequiresAccelerationSnafu {
             dataset_name: ds.name.to_string(),
         }
@@ -1649,6 +1643,40 @@ mod tests {
                 .read()
                 .await
                 .contains_key(&dataset_ref)
+        );
+    }
+
+    #[tokio::test]
+    async fn elasticsearch_full_text_requires_acceleration() {
+        let mut dataset = spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        dataset.columns = vec![
+            spicepod::semantic::Column::new("body").with_full_text_search(
+                spicepod::semantic::FullTextSearchConfig::enabled().with_row_id("id"),
+            ),
+        ];
+        dataset.full_text_search = Some(spicepod::fts::FtsStore {
+            enabled: true,
+            engine: Some("elasticsearch".to_string()),
+            params: None,
+        });
+
+        let app = app::AppBuilder::new("fts_validation")
+            .with_dataset(dataset.clone())
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let dataset = DatasetBuilder::try_from(dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(runtime)
+            .build()
+            .expect("valid runtime dataset");
+
+        let err = validate_dataset(&Arc::new(dataset))
+            .expect_err("elasticsearch fts should require acceleration");
+        assert!(
+            err.to_string()
+                .contains("acceleration is required for full text search"),
+            "unexpected error: {err}"
         );
     }
 }

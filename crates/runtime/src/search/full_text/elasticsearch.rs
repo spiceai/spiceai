@@ -24,10 +24,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
+use futures::StreamExt;
+use runtime_datafusion_index::IndexedTableProvider;
 use secrecy::ExposeSecret;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::accelerated_table::AcceleratedTable;
+use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
     dataset::{Dataset, acceleration::RefreshMode},
@@ -36,6 +39,7 @@ use crate::component::{
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_elasticsearch_fts_to_table;
+use crate::search::util::find_concrete_table_provider;
 use runtime_secrets::Secrets;
 
 /// Resolved Elasticsearch FTS connection parameters.
@@ -108,6 +112,29 @@ impl ElasticsearchFullTextConnector {
             inner_connector,
             fts_params: ElasticsearchFtsParams { params, es_index },
         })
+    }
+
+    #[expect(clippy::needless_pass_by_value)]
+    fn with_indexed_stream<F>(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        f: F,
+    ) -> Option<ChangesStream>
+    where
+        F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
+    {
+        let table_provider = federated_table.try_table_provider_sync()?;
+        let indexed_table = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)?;
+
+        let indexes = Indexes::new(indexed_table.get_all_indexes());
+        let underlying_table = Arc::new(FederatedTable::Immediate(indexed_table.get_underlying()));
+
+        let stream = f(&self.inner_connector, underlying_table)?;
+        Some(
+            stream
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
+                .boxed(),
+        )
     }
 }
 
@@ -210,15 +237,15 @@ impl DataConnector for ElasticsearchFullTextConnector {
         accelerator_write_mutex: Arc<Mutex<()>>,
         cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
-        // Delegate directly to inner — ES is queried live; no local re-indexing needed.
-        // compute_index() handles bulk-indexing into Elasticsearch on each refresh.
-        self.inner_connector.changes_stream(
-            federated_table,
-            dataset,
-            accelerated_table_provider,
-            accelerator_write_mutex,
-            cpu_runtime,
-        )
+        self.with_indexed_stream(federated_table, |inner, table| {
+            inner.changes_stream(
+                table,
+                dataset,
+                Arc::clone(&accelerated_table_provider),
+                Arc::clone(&accelerator_write_mutex),
+                cpu_runtime.clone(),
+            )
+        })
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -226,6 +253,6 @@ impl DataConnector for ElasticsearchFullTextConnector {
     }
 
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        self.inner_connector.append_stream(federated_table)
+        self.with_indexed_stream(federated_table, |inner, table| inner.append_stream(table))
     }
 }

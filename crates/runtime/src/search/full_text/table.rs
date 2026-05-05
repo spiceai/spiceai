@@ -121,7 +121,7 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     use crate::embeddings::index::elasticsearch::{
         ensure_index_with_text_mapping, get_fts_client, normalize_es_data_type,
     };
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::Field;
     use search::index::elasticsearch::ElasticsearchTextIndex;
 
     let Some(FullTextSearchDatasetConfig {
@@ -166,9 +166,19 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
                     let dt = normalize_es_data_type(f.data_type());
                     Field::new(f.name(), dt, f.is_nullable())
                 })
-                .unwrap_or_else(|_| Field::new(name, DataType::Utf8, true))
+                .map_err(|_| {
+                    let valid_columns = raw_schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                        "Failed to configure Elasticsearch full-text search for dataset {tbl}: row_id column '{name}' does not exist in the dataset schema. Valid columns: {valid_columns}."
+                    ))
+                })
         })
-        .collect();
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
     // Ensure the ES index exists with text mappings for all search fields.
     ensure_index_with_text_mapping(client.as_ref(), &fts_params.es_index, &search_fields).await?;
@@ -197,4 +207,47 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     }
 
     Ok(provider)
+}
+
+#[cfg(all(test, feature = "elasticsearch"))]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::catalog::MemTable;
+    use spicepod::semantic::{Column, FullTextSearchConfig};
+
+    use crate::search::full_text::elasticsearch::ElasticsearchFtsParams;
+
+    #[tokio::test]
+    async fn add_elasticsearch_fts_errors_when_row_id_missing() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let table =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
+                as Arc<dyn TableProvider>;
+        let columns = vec![
+            Column::new("body")
+                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("missing_id")),
+        ];
+        let fts_params = ElasticsearchFtsParams {
+            params: HashMap::from([("endpoint".to_string(), "http://localhost:9200".to_string())]),
+            es_index: "docs".to_string(),
+        };
+        let table_ref = datafusion::sql::TableReference::parse_str("docs");
+
+        let err = add_elasticsearch_fts_to_table(table, &columns, &table_ref, &fts_params)
+            .await
+            .expect_err("missing row_id column should fail before indexing");
+
+        assert!(
+            err.to_string()
+                .contains("row_id column 'missing_id' does not exist in the dataset schema"),
+            "unexpected error: {err}"
+        );
+    }
 }
