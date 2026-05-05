@@ -442,19 +442,28 @@ impl TableProvider for RemoteTableProvider {
         let args = encode_single_args_row(Arc::clone(&self.arg_schema), &self.args, &self.name)?;
         let ctx = context_from_state(state)?;
         let tables = encode_dynamic_tables(&ctx, &self.table_args, &self.name).await?;
-        let request_limit = limit;
+        let request_limit = match self.response_kind {
+            RemoteResponseKind::Rows => limit,
+            RemoteResponseKind::ScalarValues => None,
+        };
         let mut rows = match self.response_kind {
             RemoteResponseKind::Rows => self.post_table(args, tables, request_limit).await?,
             RemoteResponseKind::ScalarValues => {
                 self.post_scalar(args, tables, request_limit).await?
             }
         };
-        if let Some(limit) = limit {
+        if matches!(self.response_kind, RemoteResponseKind::Rows)
+            && let Some(limit) = limit
+        {
             rows.truncate(limit);
         }
         if rows.len() > self.max_rows {
+            let function_kind = match self.response_kind {
+                RemoteResponseKind::Rows => "remote table function",
+                RemoteResponseKind::ScalarValues => "remote function",
+            };
             return Err(DataFusionError::Execution(format!(
-                "remote table function '{}' returned {} row(s), exceeding configured max_rows {}",
+                "{function_kind} '{}' returned {} row(s), exceeding configured max_rows {}",
                 self.name,
                 rows.len(),
                 self.max_rows
@@ -1885,6 +1894,105 @@ mod tests {
         assert_eq!(values.values(), &[7_i64, 8]);
         assert_eq!(labels.value(0), "first");
         assert_eq!(labels.value(1), "second");
+    }
+
+    #[tokio::test]
+    async fn remote_table_udtf_pushes_query_limit_to_request() {
+        use axum::{Router, extract::Json as AxJson, routing::post};
+        use datafusion::prelude::{SessionContext, col, lit};
+        use tokio::net::TcpListener;
+
+        async fn handler(AxJson(body): AxJson<Value>) -> AxJson<Value> {
+            assert_eq!(body.get("limit").and_then(Value::as_u64), Some(1));
+            let x = body
+                .get("args")
+                .and_then(|args| args.get("x"))
+                .and_then(Value::as_i64)
+                .expect("args.x should be int64");
+            AxJson(serde_json::json!({
+                "rows": [
+                    {"value": x, "label": "first"},
+                    {"value": x + 1, "label": "second"}
+                ]
+            }))
+        }
+
+        let app = Router::new().route("/rows", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let decl = sample_table_decl(&format!("http://{addr}/rows"));
+        let udtf = build_table_udtf(&decl).expect("builds");
+        let ctx = SessionContext::new();
+        ctx.register_udtf(&decl.name, udtf);
+        let provider = ctx
+            .table_function(&decl.name)
+            .expect("registered UDTF")
+            .create_table_provider(&[lit(7_i64)])
+            .expect("creates table provider");
+        ctx.register_table("remote_limited_rows", provider)
+            .expect("register UDTF result");
+
+        let results = ctx
+            .table("remote_limited_rows")
+            .await
+            .expect("table exists")
+            .limit(0, Some(1))
+            .expect("limits")
+            .select(vec![col("value")])
+            .expect("projects")
+            .collect()
+            .await
+            .expect("runs");
+
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value int64");
+        assert_eq!(values.values(), &[7_i64]);
+    }
+
+    #[tokio::test]
+    async fn remote_scalar_error_body_is_bounded() {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        async fn handler() -> impl IntoResponse {
+            (StatusCode::INTERNAL_SERVER_ERROR, "x".repeat(16 * 1024))
+        }
+
+        let app = Router::new().route("/scalar", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let remote = RemoteScalarUdf {
+            id: 0,
+            name: "remote_fn".to_string(),
+            signature: Signature::exact(vec![DataType::Int64], DfVolatility::Volatile),
+            return_type: DataType::Int64,
+            arg_names: vec!["x".to_string()],
+            arg_types: vec![DataType::Int64],
+            endpoint: Url::parse(&format!("http://{addr}/scalar")).expect("valid URL"),
+            client: reqwest::Client::new(),
+            batch_size: DEFAULT_BATCH_SIZE,
+            batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        };
+
+        let err = remote
+            .post_batch(vec![serde_json::json!({"x": 1})])
+            .await
+            .expect_err("HTTP 500 should fail");
+        let message = err.to_string();
+        assert!(message.contains("[truncated]"));
+        assert!(message.len() < 512);
     }
 
     #[tokio::test]

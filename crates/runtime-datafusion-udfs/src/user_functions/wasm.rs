@@ -1426,6 +1426,39 @@ mod tests {
         path
     }
 
+    fn looping_runner(fuel: u64) -> WasmRunner {
+        let wasm = wat::parse_str(
+            r#"
+                        (module
+                            (memory (export "memory") 1)
+                            (func (export "spice_alloc") (param i32) (result i32)
+                                i32.const 0)
+                            (func (export "spice_dealloc") (param i32) (param i32))
+                            (func (export "spice_transform")
+                                (param i32) (param i32) (param i32) (param i32)
+                                (result i64)
+                                (loop $again
+                                    br $again)
+                                i64.const 0))
+                        "#,
+        )
+        .expect("valid wat");
+        let mut engine_config = Config::new();
+        engine_config.consume_fuel(true);
+        let engine = Engine::new(&engine_config).expect("engine");
+        let module = Module::from_binary(&engine, &wasm).expect("module");
+        WasmRunner {
+            engine,
+            module: Arc::new(module),
+            entrypoint: DEFAULT_ENTRYPOINT.to_string(),
+            limits: WasmLimits {
+                fuel,
+                max_memory_bytes: DEFAULT_WASM_MAX_MEMORY_BYTES,
+                max_table_elements: DEFAULT_WASM_MAX_TABLE_ELEMENTS,
+            },
+        }
+    }
+
     fn wasm_identity_decl(module: &Path) -> Function {
         let mut params = HashMap::new();
         params.insert(
@@ -1489,6 +1522,16 @@ mod tests {
             outer_ref_columns: vec![],
             spans: Spans::new(),
         })
+    }
+
+    #[test]
+    fn wasm_runner_interrupts_when_fuel_is_exhausted() {
+        let runner = looping_runner(10);
+        let err = runner.invoke(&[], &[]).expect_err("fuel exhaustion");
+        assert!(
+            err.to_string().contains("fuel"),
+            "expected fuel exhaustion error, got: {err}"
+        );
     }
 
     #[tokio::test]
