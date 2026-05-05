@@ -18,6 +18,6 @@ description: "Query: clickbench_q6"
 |               |             AggregateExec: mode=Partial, gby=[SearchPhrase@0 as alias1], aggr=[]                                                                                  |
 |               |               SchemaCastScanExec                                                                                                                                  |
 |               |                 BytesProcessedExec                                                                                                                                |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1529] |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>] |
 |               |                                                                                                                                                                   |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+

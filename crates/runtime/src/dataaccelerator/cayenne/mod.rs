@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod s3;
+pub mod snapshot_engine;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -23,7 +24,7 @@ use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
 
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::common::DFSchema;
@@ -57,6 +58,8 @@ use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
+use runtime_datafusion_index::{Index, IndexedTableProvider};
+use search::index::native_vector::NativeVectorIndex;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -653,6 +656,78 @@ impl CayenneAccelerator {
     }
 }
 
+/// Build a [`NativeVectorIndex`] for each `FixedSizeList<Float32, N>` column in
+/// the schema. These indexes are attached to the accelerated table via
+/// [`IndexedTableProvider`] so the search engine's `get_vector_index()` can
+/// discover them and route `vector_search()` queries through the SIMD distance
+/// UDFs rather than the on-the-fly `embed()` fallback.
+///
+/// This pairs with the existing auto-embedding mechanism: when a dataset
+/// declares `columns: [{name: body, embeddings: [{use: model}]}]`,
+/// `EmbeddingConnector::wrap_table` produces an `EmbeddingTable` that adds
+/// `body_embedding: FixedSizeList<Float32, N>` to the schema handed to
+/// `create_external_table`. This helper picks that column up without any
+/// additional spicepod configuration.
+///
+/// Empty schemas and schemas without vector columns return an empty vec — the
+/// caller should skip the `IndexedTableProvider` wrap in that case.
+fn native_vector_indexes_for_schema(
+    schema: &Schema,
+    table_name: &str,
+    primary_keys: &[String],
+) -> Vec<Arc<dyn Index + Send + Sync>> {
+    let pk_fields: Vec<arrow_schema::Field> = primary_keys
+        .iter()
+        .filter_map(|pk_name| {
+            schema
+                .column_with_name(pk_name)
+                .map(|(_, f)| f.as_ref().clone())
+        })
+        .collect();
+    let table_ref = datafusion::sql::TableReference::bare(table_name.to_string());
+
+    schema
+        .fields()
+        .iter()
+        .filter_map(|f| match f.data_type() {
+            DataType::FixedSizeList(inner, dim)
+                if inner.data_type() == &DataType::Float32 && *dim > 0 =>
+            {
+                let idx = NativeVectorIndex::new(
+                    table_ref.clone(),
+                    f.name().clone(),
+                    pk_fields.clone(),
+                    *dim,
+                );
+                tracing::debug!(
+                    table = table_name,
+                    column = f.name(),
+                    dimension = dim,
+                    "attaching NativeVectorIndex to Cayenne table"
+                );
+                Some(Arc::new(idx) as Arc<dyn Index + Send + Sync>)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Wrap a table provider in [`IndexedTableProvider`] when the schema has at
+/// least one vector column.
+fn wrap_with_native_vector_indexes(
+    provider: Arc<dyn TableProvider>,
+    schema: &Schema,
+    table_name: &str,
+    primary_keys: &[String],
+) -> Arc<dyn TableProvider> {
+    let indexes = native_vector_indexes_for_schema(schema, table_name, primary_keys);
+    if indexes.is_empty() {
+        provider
+    } else {
+        Arc::new(IndexedTableProvider::with_indexes(provider, indexes)) as Arc<dyn TableProvider>
+    }
+}
+
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
@@ -926,6 +1001,14 @@ impl DataAccelerator for CayenneAccelerator {
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
+                    // For pre-recreate snapshots we don't have a constructed
+                    // catalog handy (the metastore directory may even be in
+                    // a transient state). Pass None and accept the default
+                    // engine; the resulting snapshot will use the legacy
+                    // archive-cayenne.db path. This is acceptable because
+                    // pre-recreate snapshots are best-effort backups, not
+                    // refresh_mode: snapshot sources.
+                    None,
                 )
                 .await;
 
@@ -982,13 +1065,45 @@ impl DataAccelerator for CayenneAccelerator {
 
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
-            let snapshot_adapter =
-                runtime_acceleration::snapshot::AccelerationLayout::cayenne(metadata_dir, path_buf);
+            let snapshot_adapter = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
+                metadata_dir.clone(),
+                path_buf.clone(),
+            );
+            // Build a CayenneSnapshotEngine so the snapshot tar uses the
+            // per-dataset metastore-slice format (no raw cayenne.db file)
+            // and so `download_latest_snapshot` imports the slice into the
+            // local metastore as the final extraction step.
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str)
+                .to_string();
+            let snapshot_engine = match self
+                .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
+                .await
+            {
+                Ok(catalog) => Some(Arc::new(
+                    crate::dataaccelerator::cayenne::snapshot_engine::CayenneSnapshotEngine::new(
+                        catalog,
+                        source.name().to_string(),
+                        path_buf.clone(),
+                    ),
+                )
+                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to build CayenneSnapshotEngine for snapshot bootstrap, \
+                         falling back to default engine: {err}"
+                    );
+                    None
+                }
+            };
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
+                snapshot_engine,
             )
             .await)
         } else {
@@ -1116,9 +1231,14 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::clone(&write_provider),
                 write_provider,
                 schema_metadata,
-            ));
+            )) as Arc<dyn TableProvider>;
 
-            Ok(table_provider as Arc<dyn TableProvider>)
+            Ok(wrap_with_native_vector_indexes(
+                table_provider,
+                &arrow_schema,
+                &table_name,
+                &primary_keys,
+            ))
         } else {
             // Get metadata catalog for partition tracking
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
@@ -1171,7 +1291,7 @@ impl DataAccelerator for CayenneAccelerator {
             }
 
             let creator = Arc::new(CayennePartitionCreator::new(
-                table_name,
+                table_name.clone(),
                 PathBuf::from(&dir_path),
                 partition_by.clone(),
                 Arc::clone(&arrow_schema),
@@ -1182,14 +1302,14 @@ impl DataAccelerator for CayenneAccelerator {
                 time_retention_filter_builder,
                 vortex_config,
                 object_store_config,
-                primary_keys,
+                primary_keys.clone(),
                 on_conflict,
                 runtime_env,
             ));
 
             // Wrap the base table provider with partitioning logic
             let partition_provider = Arc::new(
-                PartitionTableProvider::new(creator, partition_by, arrow_schema)
+                PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?,
@@ -1212,9 +1332,14 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::clone(&write_provider),
                 write_provider,
                 schema_metadata,
-            ));
+            )) as Arc<dyn TableProvider>;
 
-            Ok(table_provider as Arc<dyn TableProvider>)
+            Ok(wrap_with_native_vector_indexes(
+                table_provider,
+                &arrow_schema,
+                &table_name,
+                &primary_keys,
+            ))
         }
     }
 
@@ -1224,6 +1349,75 @@ impl DataAccelerator for CayenneAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn supports_snapshot_reload(&self) -> bool {
+        true
+    }
+
+    /// Build a [`CayenneSnapshotEngine`] for this source so the on-disk
+    /// archive uses the per-dataset metastore-slice format (and the writer
+    /// skips `cayenne.db` / `-wal` / `-shm`). Returning `None` falls back to
+    /// the default `SnapshotManager` engine, which will include the raw
+    /// `cayenne.db` file (and its journal sidecar) — that legacy format
+    /// breaks `refresh_mode: snapshot` because the reader's local metastore
+    /// already exists at extract time.
+    async fn snapshot_engine_for_source(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Option<Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>> {
+        let acceleration = source.acceleration()?;
+        let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+        let metastore_type = acceleration
+            .params
+            .get("cayenne_metastore")
+            .map_or("sqlite", String::as_str)
+            .to_string();
+        let catalog = match self
+            .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to build CayenneSnapshotEngine for snapshot create/extract; \
+                     falling back to default engine: {err}"
+                );
+                return None;
+            }
+        };
+        let dir_path = match self.cayenne_data_dir(source) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to resolve cayenne data dir for snapshot engine; falling back to default engine: {err}"
+                );
+                return None;
+            }
+        };
+        Some(Arc::new(
+            crate::dataaccelerator::cayenne::snapshot_engine::CayenneSnapshotEngine::new(
+                catalog,
+                source.name().to_string(),
+                PathBuf::from(dir_path),
+            ),
+        ))
+    }
+
+    /// Reloads the Cayenne-backed table provider from the snapshot directory
+    /// that was just restored to the accelerator's primary location.
+    ///
+    /// Cayenne uses a per-dataset directory layout; dropping the previous
+    /// provider releases the cached `Vortex` segment/footer caches, and the
+    /// factory then reopens the directory tree from disk.
+    async fn reload_from_snapshot(
+        &self,
+        _source: &dyn AccelerationSource,
+        previous_provider: Arc<dyn TableProvider>,
+        provider_factory: super::ReloadProviderFactory,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        drop(previous_provider);
+        provider_factory().await
     }
 
     async fn drop_table(
@@ -1644,6 +1838,7 @@ mod tests {
     use app::AppBuilder;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion_table_providers::UnsupportedTypeAction;
+    use search::index::{SearchIndex, VectorIndex};
     use std::sync::Arc;
 
     fn http_response_headers_field() -> Field {
@@ -1662,6 +1857,112 @@ mod tests {
             ),
             true,
         )
+    }
+
+    #[test]
+    fn native_vector_indexes_skips_non_vector_schemas() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "users", &["id".to_string()]);
+        assert!(indexes.is_empty());
+    }
+
+    #[test]
+    fn native_vector_indexes_attached_for_fsl_f32() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 768),
+                true,
+            ),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "docs", &["id".to_string()]);
+        assert_eq!(indexes.len(), 1);
+        let native = indexes[0]
+            .as_any()
+            .downcast_ref::<NativeVectorIndex>()
+            .expect("NativeVectorIndex");
+        assert_eq!(native.dimension(), 768);
+        assert_eq!(native.search_column(), "embedding");
+    }
+
+    #[test]
+    fn native_vector_indexes_ignores_wrong_element_type() {
+        // Only Float32 is supported by the SIMD kernels — Float64 / Int32 must be skipped.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "embedding_f64",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 384),
+                true,
+            ),
+            Field::new(
+                "nums",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 4),
+                true,
+            ),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "docs", &["id".to_string()]);
+        assert!(indexes.is_empty());
+    }
+
+    #[test]
+    fn native_vector_indexes_attached_for_auto_generated_embedding_column() {
+        // Mirrors the schema EmbeddingTable would advertise for a dataset with
+        // `columns: [{ name: body, embeddings: [{ use: model }] }]`:
+        // original text column + `{col}_embedding: FixedSizeList<Float32, N>`.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, true),
+            Field::new(
+                "body_embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 384),
+                true,
+            ),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "docs", &["id".to_string()]);
+        assert_eq!(indexes.len(), 1);
+        let native = indexes[0]
+            .as_any()
+            .downcast_ref::<NativeVectorIndex>()
+            .expect("NativeVectorIndex for auto-generated embedding column");
+        assert_eq!(native.search_column(), "body_embedding");
+        assert_eq!(native.dimension(), 384);
+    }
+
+    #[test]
+    fn native_vector_indexes_attached_per_vector_column() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "title_embed",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 256),
+                true,
+            ),
+            Field::new(
+                "body_embed",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    1536,
+                ),
+                true,
+            ),
+        ]);
+        let indexes = native_vector_indexes_for_schema(&schema, "docs", &["id".to_string()]);
+        assert_eq!(indexes.len(), 2);
+        let dims: Vec<i32> = indexes
+            .iter()
+            .filter_map(|i| {
+                i.as_any()
+                    .downcast_ref::<NativeVectorIndex>()
+                    .map(VectorIndex::dimension)
+            })
+            .collect();
+        assert!(dims.contains(&256));
+        assert!(dims.contains(&1536));
     }
 
     #[tokio::test]

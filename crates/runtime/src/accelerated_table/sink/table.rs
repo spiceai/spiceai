@@ -22,6 +22,7 @@ use datafusion::{
     physical_plan::collect, prelude::SessionContext,
 };
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_datafusion_index::IndexedTableProvider;
 use runtime_table_partition::provider::PartitionTableProvider;
 use util::RetryError;
 
@@ -121,6 +122,25 @@ impl TableSink {
                         "TableSink: index maintenance failed after write: {e}. Index may be stale until next refresh."
                     );
                     // Don't fail the write - data was successfully written, index rebuild is best-effort
+                }
+            }
+
+            // Call on_write_complete on every Index in an IndexedTableProvider.
+            // Uses IF NOT EXISTS semantics: creates index after overwrite (new table),
+            // no-op after append (index already exists). CDC skips this path entirely.
+            if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+                let indexes = indexed.get_all_indexes();
+                tracing::debug!(
+                    index_names = ?indexes.iter().map(|i| i.name()).collect::<Vec<_>>(),
+                    "Running on_write_complete for indexes"
+                );
+                for index in indexes {
+                    if let Err(e) = index.on_write_complete().await {
+                        tracing::warn!(
+                            "TableSink: on_write_complete failed for index '{}': {e}. Index may be stale until next refresh.",
+                            index.name()
+                        );
+                    }
                 }
             }
         }

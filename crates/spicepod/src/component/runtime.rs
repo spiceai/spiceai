@@ -89,6 +89,9 @@ pub struct Runtime {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
+
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub functions: Functions,
 }
 
 impl Runtime {
@@ -121,6 +124,27 @@ pub enum RuntimeReadyState {
     /// regardless of whether they are currently `Ready`, `Error`, or `Disabled`,
     /// as long as none is `ShuttingDown`.
     OnRegistration,
+}
+
+/// Controls registration and execution surfaces for Spicepod user-defined functions.
+///
+/// Defaults to disabled. Operators must explicitly set
+/// `runtime.functions.enabled: true` before the runtime registers top-level
+/// `functions:` entries or exposes `tools:` entries as SQL functions via
+/// `as_sql: true`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Functions {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Functions {
+    #[must_use]
+    pub fn enabled() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -418,6 +442,9 @@ pub struct TaskHistory {
     #[serde(default = "default_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub captured_output: Arc<str>,
+    #[serde(default = "default_truncated")]
+    #[cfg_attr(feature = "schemars", schemars(with = "TaskHistoryCapturedContext"))]
+    pub captured_context: Arc<str>,
     #[serde(default = "default_retention_period")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub retention_period: Arc<str>,
@@ -439,6 +466,10 @@ fn default_none() -> Arc<str> {
     "none".into()
 }
 
+fn default_truncated() -> Arc<str> {
+    "truncated".into()
+}
+
 fn default_retention_period() -> Arc<str> {
     "8h".into()
 }
@@ -452,6 +483,7 @@ impl Default for TaskHistory {
         Self {
             enabled: true,
             captured_output: default_none(),
+            captured_context: default_truncated(),
             retention_period: default_retention_period(),
             retention_check_interval: default_retention_check_interval(),
             min_sql_duration: None,
@@ -466,6 +498,16 @@ pub enum TaskHistoryCapturedOutput {
     #[default]
     None,
     Truncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[cfg_attr(feature = "schemars", serde(rename_all = "snake_case"))]
+pub enum TaskHistoryCapturedContext {
+    Redacted,
+    #[default]
+    Truncated,
+    Full,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -487,10 +529,25 @@ impl TaskHistory {
         }
 
         Err(format!(
-            r#"Expected "none" or "truncated" for "captured_output", but got: "{}""#,
+            "Expected \"none\" or \"truncated\" for \"captured_output\", but got: \"{}\"",
             self.captured_output
         )
         .into())
+    }
+
+    pub fn get_captured_context(
+        &self,
+    ) -> Result<TaskHistoryCapturedContext, Box<dyn Error + Send + Sync>> {
+        match self.captured_context.as_ref() {
+            "redacted" => Ok(TaskHistoryCapturedContext::Redacted),
+            "truncated" => Ok(TaskHistoryCapturedContext::Truncated),
+            "full" => Ok(TaskHistoryCapturedContext::Full),
+            _ => Err(format!(
+                "Expected \"redacted\", \"truncated\", or \"full\" for \"captured_context\", but got: \"{}\"",
+                self.captured_context
+            )
+            .into()),
+        }
     }
 
     pub fn get_captured_plan(
@@ -779,66 +836,41 @@ pub struct Scheduler {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
-    /// Partition management configuration
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_management: Option<PartitionManagement>,
-}
+    /// How often the scheduler assigns accelerated table partitions to executors.
+    #[serde(default = "default_partition_assignment_interval")]
+    pub partition_assignment_interval: String,
 
-impl Scheduler {
-    /// Returns the configured `max_partitions_per_executor`, falling back to
-    /// the default when no `partition_management` section is present.
-    #[must_use]
-    pub fn max_partitions_per_executor(&self) -> usize {
-        self.partition_management
-            .as_ref()
-            .map_or(default_max_partitions_per_executor(), |pm| {
-                pm.max_partitions_per_executor
-            })
-    }
-}
+    /// Maximum number of partition assignments made per assignment interval.
+    #[serde(default = "default_max_partition_assignments_per_interval")]
+    pub max_partition_assignments_per_interval: usize,
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct PartitionManagement {
-    #[serde(default = "default_partition_management_interval")]
-    pub interval: String,
-
-    #[serde(default = "default_max_assignments_per_cycle")]
-    pub max_assignments_per_cycle: usize,
-
+    /// Maximum partitions assigned to a single executor (soft limit).
     #[serde(default = "default_max_partitions_per_executor")]
     pub max_partitions_per_executor: usize,
 
-    #[serde(default = "default_discovery_timeout")]
-    pub discovery_timeout: String,
+    /// How long to wait for partition discovery before timing out.
+    #[serde(default = "default_partition_discovery_timeout")]
+    pub partition_discovery_timeout: String,
 }
 
-fn default_partition_management_interval() -> String {
+#[must_use]
+pub fn default_partition_assignment_interval() -> String {
     "30s".to_string()
 }
 
-fn default_max_assignments_per_cycle() -> usize {
+#[must_use]
+pub fn default_max_partition_assignments_per_interval() -> usize {
     100
 }
 
-fn default_max_partitions_per_executor() -> usize {
+#[must_use]
+pub fn default_max_partitions_per_executor() -> usize {
     1000
 }
 
-fn default_discovery_timeout() -> String {
+#[must_use]
+pub fn default_partition_discovery_timeout() -> String {
     "60s".to_string()
-}
-
-impl Default for PartitionManagement {
-    fn default() -> Self {
-        Self {
-            interval: default_partition_management_interval(),
-            max_assignments_per_cycle: default_max_assignments_per_cycle(),
-            max_partitions_per_executor: default_max_partitions_per_executor(),
-            discovery_timeout: default_discovery_timeout(),
-        }
-    }
 }
 
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
@@ -898,6 +930,8 @@ pub struct RuntimeDeserializer {
     pub metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub functions: Functions,
 }
 
 #[expect(deprecated)]
@@ -975,6 +1009,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             },
             metrics: deserializer.metrics,
             scheduler: deserializer.scheduler,
+            functions: deserializer.functions,
         })
     }
 }
@@ -1244,6 +1279,7 @@ mod tests {
             let task_history = TaskHistory {
                 enabled: true,
                 captured_output: "none".into(),
+                captured_context: "truncated".into(),
                 retention_period: "8h".into(),
                 retention_check_interval: "15m".into(),
                 min_sql_duration: Some(duration_str.into()),
@@ -1265,6 +1301,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: Some("invalid".into()),
@@ -1305,6 +1342,42 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, None);
+        assert_eq!(runtime.task_history.captured_context, "truncated".into());
+        assert_eq!(
+            runtime
+                .task_history
+                .get_captured_context()
+                .expect("should parse"),
+            TaskHistoryCapturedContext::Truncated
+        );
+
+        let yaml = r"
+            task_history:
+                enabled: true
+                captured_context: redacted
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime
+                .task_history
+                .get_captured_context()
+                .expect("should parse"),
+            TaskHistoryCapturedContext::Redacted
+        );
+
+        let yaml = r"
+            task_history:
+                enabled: true
+                captured_context: full
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime
+                .task_history
+                .get_captured_context()
+                .expect("should parse"),
+            TaskHistoryCapturedContext::Full
+        );
     }
 
     #[test]
@@ -1323,6 +1396,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1338,6 +1412,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1353,6 +1428,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1368,6 +1444,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -1405,6 +1482,7 @@ mod tests {
             let task_history = TaskHistory {
                 enabled: true,
                 captured_output: "none".into(),
+                captured_context: "truncated".into(),
                 retention_period: "8h".into(),
                 retention_check_interval: "15m".into(),
                 min_sql_duration: None,
@@ -1426,6 +1504,7 @@ mod tests {
         let task_history = TaskHistory {
             enabled: true,
             captured_output: "none".into(),
+            captured_context: "truncated".into(),
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: None,
@@ -2051,5 +2130,21 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.ready_state, RuntimeReadyState::OnRegistration);
+    }
+
+    #[test]
+    fn test_runtime_functions_disabled_by_default() {
+        let runtime: Runtime = yaml::from_str("{}").expect("Failed to parse Runtime");
+        assert!(!runtime.functions.enabled);
+    }
+
+    #[test]
+    fn test_runtime_functions_can_be_enabled() {
+        let yaml = r"
+            functions:
+                enabled: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert!(runtime.functions.enabled);
     }
 }

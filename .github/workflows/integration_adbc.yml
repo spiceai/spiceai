@@ -39,8 +39,9 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
+          persist-credentials: false
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
       - name: Check for code changes
@@ -53,8 +54,9 @@ jobs:
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
+          persist-credentials: false
           fetch-depth: 1
 
       - name: Cache Cargo registry
@@ -78,9 +80,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
@@ -88,7 +88,7 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
       - name: Set up ADBC drivers
-        uses: columnar-tech/setup-dbc@b6ee17cd41eaac512c319524eac22b1331b9e675 # v1.0.1
+        uses: columnar-tech/setup-dbc@4d83cce5bf2aa1e46eedbe44f13b57bbef8f2baf # v1.0.2
         with:
           drivers: 'sqlite'
 

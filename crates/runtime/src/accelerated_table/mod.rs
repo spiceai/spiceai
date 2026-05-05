@@ -66,12 +66,12 @@ pub mod refresh_task;
 mod refresh_task_runner;
 mod retention;
 pub(crate) mod sink;
-mod snapshots;
+pub(crate) mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
-pub mod write_through;
+pub mod write;
 
-pub(crate) use write_through::WriteMode;
+pub(crate) use write::WriteMode;
 
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
@@ -180,6 +180,12 @@ pub enum Error {
 
     #[snafu(display("Failed to construct data for the accelerated dataset: {source}"))]
     FailedToBuildRecordBatch { source: ArrowError },
+
+    #[snafu(display("Failed to process upsert batch for dataset {dataset_name}: {reason}"))]
+    InvalidUpsertPrimaryKeys {
+        dataset_name: String,
+        reason: String,
+    },
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
@@ -326,11 +332,15 @@ pub struct Builder {
     disable_federation: bool,
     write_to_accelerator_only: bool,
     write_through: bool,
+    write_back: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
     snapshot_creation_config: Option<SnapshotCreationConfig>,
+    /// Per-dataset state for `RefreshMode::Snapshot`. Required when the
+    /// refresh mode is Snapshot; ignored otherwise.
+    snapshot_refresh_state: Option<snapshots::SnapshotRefreshState>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -375,9 +385,11 @@ impl Builder {
             disable_federation: false,
             write_to_accelerator_only: false,
             write_through: false,
+            write_back: false,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
+            snapshot_refresh_state: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -436,6 +448,20 @@ impl Builder {
         self
     }
 
+    /// Returns a clone of the accelerator `Arc`.
+    #[must_use]
+    pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.accelerator)
+    }
+
+    /// Replace the accelerator provider.
+    ///
+    /// This must be called **before** [`build`](Self::build) so that the
+    /// refresher (created during build) receives the updated provider.
+    pub fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        self.accelerator = accelerator;
+    }
+
     /// Set to only write to the accelerator (not replicate to federated source).
     /// This is used when `on_conflict` is configured - writes go only to the accelerator.
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {
@@ -447,6 +473,13 @@ impl Builder {
     /// and the local Cayenne accelerator using staged append/commit/rollback semantics.
     pub fn write_through(&mut self) -> &mut Self {
         self.write_through = true;
+        self
+    }
+
+    /// Enable write-back mode: writes commit to the local accelerator first,
+    /// then asynchronously persist to the federated source.
+    pub fn write_back(&mut self) -> &mut Self {
+        self.write_back = true;
         self
     }
 
@@ -550,6 +583,16 @@ impl Builder {
         snapshot_config: Option<SnapshotCreationConfig>,
     ) -> &mut Self {
         self.snapshot_creation_config = snapshot_config;
+        self
+    }
+
+    /// Configure per-dataset state for `RefreshMode::Snapshot`. Required when
+    /// the refresh mode is Snapshot.
+    pub fn snapshot_refresh_state(
+        &mut self,
+        state: Option<snapshots::SnapshotRefreshState>,
+    ) -> &mut Self {
+        self.snapshot_refresh_state = state;
         self
     }
 
@@ -724,6 +767,16 @@ impl Builder {
                     Some(start_refresh),
                 )
             }
+            RefreshMode::Snapshot => {
+                // Snapshot mode is interval-driven and supports manual refresh triggers
+                // to force a poll of the snapshot store outside the regular cadence.
+                let (start_refresh, on_start_refresh) =
+                    mpsc::channel::<Option<RefreshOverrides>>(1);
+                (
+                    refresh::AccelerationRefreshMode::Snapshot(on_start_refresh),
+                    Some(start_refresh),
+                )
+            }
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
@@ -766,6 +819,7 @@ impl Builder {
         }
 
         refresher.with_snapshot_creation_config(self.snapshot_creation_config);
+        refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
         refresher.set_bootstrap_status(self.bootstrap_status);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
@@ -956,6 +1010,8 @@ impl Builder {
 
         let write_mode = if self.write_through {
             WriteMode::resolve_write_through(&self.accelerator, &self.federated)?
+        } else if self.write_back {
+            WriteMode::WriteBack
         } else if self.write_to_accelerator_only {
             WriteMode::AcceleratorOnly
         } else {
@@ -1081,6 +1137,11 @@ impl AcceleratedTable {
     #[must_use]
     pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.accelerator)
+    }
+
+    #[must_use]
+    pub(crate) fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.accelerator
     }
 
     /// Add a child accelerator that should receive cached data when this parent stores new cache entries.
@@ -1236,6 +1297,11 @@ impl TableProvider for AcceleratedTable {
                 Ok(results)
             }
             ZeroResultsAction::UseSource => {
+                // In UseSource mode, all filters must still flow into scan() so that
+                // FallbackOnZeroResultsScanExec receives the full predicate set and can use
+                // its internal filter_plan to evaluate those predicates before making a
+                // correct fallback decision. Unsupported-function filters are therefore kept
+                // out of accelerator SQL pushdown, but still participate in the fallback check.
                 Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
             }
         }
@@ -1292,10 +1358,20 @@ impl TableProvider for AcceleratedTable {
             None
         };
         let scan_projection = extended_projection.as_ref().or(projection);
-        let input = self
-            .accelerator
-            .scan(state, scan_projection, filters, limit)
-            .await?;
+        // For UseSource mode, the scan is handled inside the match arm below (with filter
+        // splitting). For all other modes, perform the accelerator scan upfront.
+        let input = if matches!(
+            (is_caching_mode, &self.zero_results_action),
+            (false, ZeroResultsAction::UseSource)
+        ) {
+            None
+        } else {
+            Some(
+                self.accelerator
+                    .scan(state, scan_projection, filters, limit)
+                    .await?,
+            )
+        };
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
             let federated = Arc::clone(&federated);
@@ -1305,6 +1381,11 @@ impl TableProvider for AcceleratedTable {
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
                 // Caching mode: wrap with cache execution plan to handle staleness and background refresh
+                let input = input.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "accelerator scan input missing in caching mode".to_string(),
+                    )
+                })?;
 
                 // Check which filters the accelerator doesn't fully support and need to be re-applied.
                 // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
@@ -1338,13 +1419,37 @@ impl TableProvider for AcceleratedTable {
                     batch_write_tx,
                 ))
             }
-            (false, ZeroResultsAction::ReturnEmpty) => input,
-            (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
-                self.dataset_name.clone(),
-                input,
-                fallback_fn,
-                TableScanParams::new(state, projection, filters, limit),
-            )),
+            (false, ZeroResultsAction::ReturnEmpty) => input.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "accelerator scan input missing in ReturnEmpty mode".to_string(),
+                )
+            })?,
+            (false, ZeroResultsAction::UseSource) => {
+                let filter_refs: Vec<&Expr> = filters.iter().collect();
+                let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
+                let accelerator_filters = filters_for_accelerator_scan(filters, &pushdown_support)?;
+
+                let accelerator_limit = if accelerator_filters.len() == filters.len() {
+                    limit
+                } else {
+                    None
+                };
+                let input = self
+                    .accelerator
+                    .scan(
+                        state,
+                        scan_projection,
+                        &accelerator_filters,
+                        accelerator_limit,
+                    )
+                    .await?;
+                Arc::new(FallbackOnZeroResultsScanExec::new(
+                    self.dataset_name.clone(),
+                    input,
+                    fallback_fn,
+                    TableScanParams::new(state, projection, filters, limit),
+                ))
+            }
         };
 
         // Compute the target schema based on user's original projection.
@@ -1374,6 +1479,19 @@ impl TableProvider for AcceleratedTable {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // In `refresh_mode: snapshot`, the accelerator is a read-only mirror
+        // of the snapshot store. Accepting writes here would either be
+        // silently overwritten by the next snapshot reload (data loss) or
+        // race with the file replacement performed during refresh. Reject
+        // explicitly so callers fail loudly rather than observing surprising
+        // behavior.
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "writes to accelerated table {} are not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -1393,10 +1511,22 @@ impl TableProvider for AcceleratedTable {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.insert_into(state, input, overwrite).await
             }
+            WriteMode::WriteBack => {
+                write::write_back::validate_insert_op(overwrite)?;
+                write::write_back::insert_write_back(
+                    state,
+                    input,
+                    overwrite,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                    Arc::clone(&self.refresher),
+                    self.schema(),
+                )
+            }
             WriteMode::WriteThrough {
                 cayenne_target,
                 federated_provider,
-            } => write_through::insert_write_through(
+            } => write::write_through::insert_write_through(
                 input,
                 overwrite,
                 cayenne_target.as_ref(),
@@ -1404,6 +1534,99 @@ impl TableProvider for AcceleratedTable {
                 &self.refresher,
                 self.schema(),
             ),
+        }
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "deletes on accelerated table {} are not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => self.accelerator.delete_from(state, filters).await,
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.delete_from(state, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::delete_write_back(
+                    state,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::delete_write_through(
+                    state,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "updates on accelerated table {} are not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => {
+                self.accelerator.update(state, assignments, filters).await
+            }
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.update(state, assignments, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::update_write_back(
+                    state,
+                    assignments,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::update_write_through(
+                    state,
+                    assignments,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
         }
     }
 }
@@ -1424,6 +1647,33 @@ fn extend_projection_for_caching(
     let mut extended = proj.clone();
     extended.push(idx);
     Some(extended)
+}
+
+fn filters_for_accelerator_scan(
+    filters: &[Expr],
+    pushdown_support: &[TableProviderFilterPushDown],
+) -> DataFusionResult<Vec<Expr>> {
+    if filters.len() != pushdown_support.len() {
+        return Err(DataFusionError::Internal(format!(
+            "accelerator filter support length mismatch: expected {}, got {}",
+            filters.len(),
+            pushdown_support.len()
+        )));
+    }
+
+    let function_support = deny_spice_specific_functions();
+    let mut accelerator_filters = Vec::with_capacity(filters.len());
+
+    for (filter, support) in filters.iter().zip(pushdown_support.iter()) {
+        let function_supported = function_support.supports(filter);
+        let can_run_in_accelerator =
+            function_supported && !matches!(support, TableProviderFilterPushDown::Unsupported);
+        if can_run_in_accelerator {
+            accelerator_filters.push(filter.clone());
+        }
+    }
+
+    Ok(accelerator_filters)
 }
 
 #[derive(Debug)]
@@ -1587,6 +1837,9 @@ impl Retention {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::prelude::{col, lit};
+    use datafusion_functions_json::udfs::json_get_str_udf;
 
     fn schema_with_fetched_at() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1599,6 +1852,18 @@ mod tests {
                 true,
             ),
         ]))
+    }
+
+    fn expr_strings(filters: &[Expr]) -> Vec<String> {
+        filters.iter().map(ToString::to_string).collect()
+    }
+
+    fn json_get_str_filter() -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            json_get_str_udf(),
+            vec![col("content"), lit("key")],
+        ))
+        .eq(lit("needle"))
     }
 
     #[test]
@@ -1644,6 +1909,45 @@ mod tests {
             extended,
             vec![2, 3],
             "Should add fetched_at to single column"
+        );
+    }
+
+    #[test]
+    fn test_filters_for_accelerator_scan_excludes_local_only_filters() {
+        let exact_filter = col("id").eq(lit(42_i64));
+        let inexact_filter = col("name").eq(lit("espresso"));
+        let unsupported_filter = col("content").eq(lit("local only"));
+        let denied_filter = json_get_str_filter();
+        let filters = vec![
+            exact_filter.clone(),
+            inexact_filter.clone(),
+            unsupported_filter,
+            denied_filter,
+        ];
+        let pushdown_support = vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Unsupported,
+            TableProviderFilterPushDown::Exact,
+        ];
+
+        let accelerator_filters = filters_for_accelerator_scan(&filters, &pushdown_support)
+            .expect("filter split should succeed");
+        let expected_accelerator_filters = expr_strings(&[exact_filter, inexact_filter]);
+
+        assert_eq!(
+            expr_strings(&accelerator_filters),
+            expected_accelerator_filters
+        );
+    }
+
+    #[test]
+    fn test_filters_for_accelerator_scan_validates_support_length() {
+        let err = filters_for_accelerator_scan(&[col("id").eq(lit(42_i64))], &[])
+            .expect_err("mismatched filter support should fail");
+
+        assert!(
+            matches!(err, DataFusionError::Internal(message) if message.contains("accelerator filter support length mismatch"))
         );
     }
 }

@@ -17,9 +17,12 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::{
-    common::{plan_err, tree_node::TreeNodeRecursion},
+    common::{
+        plan_err,
+        tree_node::{TreeNode, TreeNodeRecursion},
+    },
     error::DataFusionError,
-    logical_expr::{DdlStatement, LogicalPlan, Statement},
+    logical_expr::{DdlStatement, Expr, LogicalPlan, Statement},
 };
 
 use crate::datafusion::DataFusion;
@@ -74,10 +77,7 @@ pub fn validate_sql_query_operations(
                 }
 
                 // Fall back to per-table writable check
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
-                    // No catalog specified but default catalog is writable
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
@@ -104,10 +104,7 @@ pub fn validate_sql_query_operations(
                     return Ok(TreeNodeRecursion::Continue);
                 }
 
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
-                    // No catalog specified but default catalog is writable
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
@@ -123,23 +120,25 @@ pub fn validate_sql_query_operations(
                     );
                 }
 
-                if !df.is_path_catalog_writable(&dml.table_name) {
-                    return plan_err!(
-                        "UPDATE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                // Check if attempting to update a catalog table.
+                if let Some(catalog) = dml.table_name.catalog() && catalog != super::SPICE_DEFAULT_CATALOG {
+                    if !df.is_catalog_writable(catalog) {
+                        return plan_err!(
+                            "UPDATE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                            dml.table_name
+                        );
+                    }
+                    return Ok(TreeNodeRecursion::Continue);
+                }
+
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
+                    Ok(TreeNodeRecursion::Continue)
+                } else {
+                    plan_err!(
+                        "UPDATE operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
                         dml.table_name
-                    );
+                    )
                 }
-
-                if !df.is_cayenne_catalog(&dml.table_name) {
-                    let target_catalog = dml.table_name.catalog().unwrap_or(super::SPICE_DEFAULT_CATALOG);
-                    return plan_err!(
-                        "UPDATE operations are only supported on writable Cayenne catalog tables. Table '{}', catalog '{}' is not Cayenne-backed.",
-                        dml.table_name,
-                        target_catalog
-                    );
-                }
-
-                Ok(TreeNodeRecursion::Continue)
             } else { plan_err!("Operation is not allowed: {}", dml.name()) }
         }
         LogicalPlan::Copy(_) => {
@@ -265,11 +264,32 @@ pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusion
                     "Write-capable extension plan '{name}' is not allowed in read-only SQL context."
                 )
             } else {
+                validate_no_code_executing_functions(node)?;
                 Ok(TreeNodeRecursion::Continue)
             }
         }
-        _ => Ok(TreeNodeRecursion::Continue),
+        _ => {
+            validate_no_code_executing_functions(node)?;
+            Ok(TreeNodeRecursion::Continue)
+        }
     })?;
+    Ok(())
+}
+
+fn validate_no_code_executing_functions(plan: &LogicalPlan) -> Result<(), DataFusionError> {
+    for expr in plan.expressions() {
+        expr.apply(|expr| {
+            if let Expr::ScalarFunction(function) = expr {
+                let function_name = function.func.name();
+                if crate::datafusion::udf::is_code_executing_function(function_name) {
+                    return plan_err!(
+                        "Function '{function_name}' requires a read-write API key and is not allowed in read-only SQL context."
+                    );
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
     Ok(())
 }
 
@@ -497,7 +517,7 @@ mod tests {
     async fn test_validate_update_operation_blocked() {
         let df = create_test_datafusion();
 
-        let sql = "UPDATE tbl_writable SET name = 'updated' WHERE id = 1";
+        let sql = "UPDATE tbl_read_only SET name = 'updated' WHERE id = 1";
         let plan = df
             .ctx
             .state()
@@ -505,9 +525,12 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        // UPDATE operations should be blocked
+        // UPDATE on a read-only dataset should be blocked
         let result = validate_sql_query_operations(&plan, &df);
-        assert!(result.is_err(), "UPDATE operations should be blocked");
+        assert!(
+            result.is_err(),
+            "UPDATE operations should be blocked on read-only datasets"
+        );
     }
 
     #[tokio::test]
@@ -928,6 +951,46 @@ mod tests {
         assert!(
             err.to_string().contains("read-only"),
             "error should cite read-only context, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_code_executing_function() {
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+        use datafusion::scalar::ScalarValue;
+
+        let df = create_test_datafusion();
+        let function_name = "code_exec_test_fn";
+        let _cleanup = scopeguard::guard(function_name, |name| {
+            crate::datafusion::udf::remove_code_executing_function(name);
+        });
+
+        let udf = create_udf(
+            function_name,
+            vec![],
+            DataType::Utf8,
+            Volatility::Volatile,
+            Arc::new(|_| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                    "ok".to_string(),
+                ))))
+            }),
+        );
+        df.ctx.register_udf(udf);
+        crate::datafusion::udf::add_code_executing_function(function_name);
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("SELECT code_exec_test_fn()")
+            .await
+            .expect("plan should be created");
+
+        let err = validate_sql_query_read_only(&plan)
+            .expect_err("code-executing functions must be rejected");
+        assert!(
+            err.to_string().contains("read-write API key"),
+            "error should cite read-write API key requirement, got: {err}"
         );
     }
 

@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::catalogconnector::iceberg::{
-    Error as IcebergError, UnableToBuildCatalogClientSnafu, UnableToBuildCatalogSnafu,
+    UnableToBuildCatalogClientSnafu, UnableToBuildCatalogSnafu,
 };
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::{
@@ -38,6 +38,7 @@ use iceberg::{CatalogBuilder, NamespaceIdent};
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use snafu::prelude::*;
+use spice_cloud_client::endpoints::{data_endpoint as spice_cloud_data_endpoint, is_valid_region};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tonic::metadata::MetadataValue;
 
@@ -67,7 +68,7 @@ impl SpiceCloudPlatformCatalog {
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let (org, app, catalog_name) = Self::parse_and_validate_catalog_id(catalog)?;
-        let catalog_client = self.create_rest_catalog_client().await?;
+        let catalog_client = self.create_rest_catalog_client(catalog).await?;
         let read_provider = self
             .create_read_provider(runtime, catalog, &org, &app, &catalog_name)
             .await?;
@@ -116,12 +117,8 @@ impl SpiceCloudPlatformCatalog {
         }
     }
 
-    async fn create_rest_catalog_client(&self) -> Result<RestCatalog, IcebergError> {
-        let endpoint = self
-            .params
-            .get("http_endpoint")
-            .expose()
-            .unwrap_or_else(|_| "https://data.spiceai.io");
+    async fn create_rest_catalog_client(&self, catalog: &Catalog) -> super::Result<RestCatalog> {
+        let endpoint = self.http_endpoint(catalog)?;
         let mut props = HashMap::new();
         if let Some(api_key) = self.api_key() {
             props.insert("token".to_string(), api_key.to_string());
@@ -135,7 +132,7 @@ impl SpiceCloudPlatformCatalog {
             .build()
             .context(UnableToBuildCatalogClientSnafu)?;
 
-        props.insert(REST_CATALOG_PROP_URI.to_string(), endpoint.to_string());
+        props.insert(REST_CATALOG_PROP_URI.to_string(), endpoint);
         let iceberg_rest_catalog = RestCatalogBuilder::default()
             .with_client(client)
             .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
@@ -209,6 +206,10 @@ impl SpiceCloudPlatformCatalog {
             params.insert("spiceai_endpoint".to_string(), flight_endpoint.to_string());
         }
 
+        if let Some(region) = self.region() {
+            params.insert("spiceai_region".to_string(), region.to_string());
+        }
+
         if let Some(api_key) = self.api_key() {
             params.insert("spiceai_api_key".to_string(), api_key.to_string());
         }
@@ -225,6 +226,40 @@ impl SpiceCloudPlatformCatalog {
             self.params.get("flight_endpoint").expose()
         {
             return Some(flight_endpoint);
+        }
+
+        None
+    }
+
+    fn http_endpoint(&self, catalog: &Catalog) -> super::Result<String> {
+        if let ExposedParamLookup::Present(endpoint) = self.params.get("http_endpoint").expose() {
+            return Ok(endpoint.to_string());
+        }
+
+        if let Some(region) = self.region() {
+            if !is_valid_region(region) {
+                return Err(super::Error::InvalidConfigurationNoSource {
+                    connector: "spice.ai".into(),
+                    message: format!(
+                        "Invalid Spice Cloud region: {region}. Specify a valid region, for example us-east-1. To list available regions, run: spice cloud regions"
+                    ),
+                    connector_component: ConnectorComponent::from(catalog),
+                });
+            }
+
+            return Ok(spice_cloud_data_endpoint(region));
+        }
+
+        Err(super::Error::InvalidConfigurationNoSource {
+            connector: "spice.ai".into(),
+            message: "Missing Spice Cloud region. Specify a valid region, for example us-east-1. To list available regions, run: spice cloud regions".to_string(),
+            connector_component: ConnectorComponent::from(catalog),
+        })
+    }
+
+    fn region(&self) -> Option<&str> {
+        if let ExposedParamLookup::Present(region) = self.params.get("region").expose() {
+            return Some(region);
         }
 
         None
@@ -287,6 +322,7 @@ impl SpiceCloudPlatformCatalog {
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("api_key").secret(),
     ParameterSpec::component("token").secret(),
+    ParameterSpec::component("region"),
     ParameterSpec::component("endpoint"),
     ParameterSpec::component("flight_endpoint"),
     ParameterSpec::component("http_endpoint"),
@@ -329,11 +365,24 @@ fn parse_catalog_slug(catalog_slug: &str) -> Result<(String, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::catalog::CatalogBuilder;
     use secrecy::SecretString;
     use std::sync::Arc;
 
     use runtime_secrets::Secrets;
     use tokio::sync::RwLock;
+
+    async fn make_test_catalog() -> Catalog {
+        let app = app::AppBuilder::new("test").build();
+        let runtime = crate::Runtime::builder().build().await;
+
+        CatalogBuilder::try_new("spice.ai:org/app".to_string(), "test_catalog")
+            .expect("catalog builder should be valid")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(runtime))
+            .build()
+            .expect("catalog should build")
+    }
 
     #[test]
     fn test_parse_catalog_slug_org_and_app() {
@@ -448,6 +497,104 @@ mod tests {
         let connector = SpiceCloudPlatformCatalog { params };
 
         assert_eq!(connector.flight_endpoint(), None);
+    }
+
+    #[tokio::test]
+    async fn test_http_endpoint_builds_regional_endpoint() {
+        let params = Parameters::try_new(
+            "test",
+            vec![("spiceai_region".to_string(), "us-east-1".to_string().into())],
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+        let catalog = make_test_catalog().await;
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert_eq!(
+            connector
+                .http_endpoint(&catalog)
+                .expect("region should build endpoint"),
+            "https://us-east-1-prod-aws-data.spiceai.io"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_endpoint_rejects_invalid_region() {
+        let params = Parameters::try_new(
+            "test",
+            vec![(
+                "spiceai_region".to_string(),
+                "bad_region".to_string().into(),
+            )],
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+        let catalog = make_test_catalog().await;
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert!(matches!(
+            connector.http_endpoint(&catalog),
+            Err(super::super::Error::InvalidConfigurationNoSource { message, .. })
+            if message.contains("Invalid Spice Cloud region: bad_region")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_http_endpoint_requires_region() {
+        let params = Parameters::try_new(
+            "test",
+            Vec::<(String, SecretString)>::new(),
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+        let catalog = make_test_catalog().await;
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert!(matches!(
+            connector.http_endpoint(&catalog),
+            Err(super::super::Error::InvalidConfigurationNoSource { message, .. })
+            if message.contains("Missing Spice Cloud region")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_http_endpoint_parameter_bypasses_region_validation() {
+        let params = Parameters::try_new(
+            "test",
+            vec![
+                (
+                    "spiceai_http_endpoint".to_string(),
+                    "https://custom.example.com".to_string().into(),
+                ),
+                (
+                    "spiceai_region".to_string(),
+                    "bad_region".to_string().into(),
+                ),
+            ],
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+        let catalog = make_test_catalog().await;
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert_eq!(
+            connector
+                .http_endpoint(&catalog)
+                .expect("explicit endpoint should be used"),
+            "https://custom.example.com"
+        );
     }
 
     #[tokio::test]

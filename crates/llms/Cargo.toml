@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "llms"
 repository.workspace = true
 rust-version.workspace = true
@@ -43,8 +43,8 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84", optional = true } # branch: spiceai
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84", package = "mistralrs-core", optional = true } # branch: spiceai
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "6e64b990543ef1571ce512ca77b8ae4bae52c4c5", optional = true } # branch: spiceai
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "6e64b990543ef1571ce512ca77b8ae4bae52c4c5", package = "mistralrs-core", optional = true } # branch: spiceai
 rand.workspace = true
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3", features = [

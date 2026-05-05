@@ -18,13 +18,13 @@ use crate::Error::{self, FailedToStartClusterExecutor};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::cluster::partition::{
     executor_request_initial_partitions,
-    scheduler_task::{PartitionManagementConfig, PartitionManagementTask},
+    scheduler_task::{PartitionAssignmentConfig, PartitionAssignmentTask},
 };
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::jobs::JobExecutor;
 use crate::status::ComponentStatus;
 use crate::{
-    CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_MANAGEMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
+    CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
@@ -92,18 +92,20 @@ pub enum DistributedNode {
         /// Registry of connected executors for `FlightSQL`.
         executor_registry: Arc<ExecutorRegistry>,
 
-        /// Shared cluster state document used by both partition managers
-        /// and the scheduler registry.
+        /// Shared cluster state document (cluster.json) for partition metadata and scheduler registry.
         cluster_state: Arc<ClusterStateStore>,
 
-        /// Heartbeat store, owned alongside the cluster state.
+        /// Heartbeat store for this scheduler.
         heartbeats: Arc<SchedulerHeartbeatStore>,
 
-        /// Manager for accelerated table partition metadata.
-        accelerations_partitions: Arc<AccelerationsPartitions>,
+        /// Partition store for accelerated table partition metadata.
+        accelerations_partitions_store: Arc<AccelerationsPartitions>,
 
-        /// Manager for catalog/federated table partition metadata.
-        catalog_partitions: Arc<CatalogPartitions>,
+        /// Partition store for catalog/federated table partition metadata.
+        catalog_partitions_store: Arc<CatalogPartitions>,
+
+        /// Partition service for discovery, assignment, and executor notification.
+        partition_service: Arc<PartitionService>,
     },
     Executor {
         /// Partition assignments for this runtime (executor) for each table.
@@ -403,11 +405,11 @@ fn update_scheduler_pollers(
     *known_schedulers = next_schedulers;
 }
 
-mod cluster_state;
+pub(crate) mod accelerated_partition_provider;
+pub(crate) use runtime_cluster::cluster_state;
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
-pub(crate) mod executor_registry;
 mod heartbeat;
 pub mod metrics_collector;
 pub mod partition;
@@ -416,19 +418,17 @@ pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
 
-pub use cluster_state::{
-    CLUSTER_STATE_SCHEMA_VERSION, ClusterState as SpiceClusterState, ClusterStateStore,
-    MutateError, MutateOk, MutationOutcome, PartitionScope, SchedulerEntry,
-};
+use crate::cluster::partition::service::PartitionService;
+pub use accelerated_partition_provider::AcceleratedPartitionProvider;
+pub use cluster_state::{ClusterStateStore, SchedulerEntry};
 pub use control_stream_client::ControlStreamManager;
-pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider};
 pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
-pub use partition::{
-    AccelerationsPartitions, CatalogPartitions, PartitionManager, PartitionMetadata,
-    TablePartitionMetadata,
-};
+pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
-pub use scheduler_registry::{SchedulerPeers, start_scheduler_registry};
+use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
+pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
+pub use scheduler_registry::SchedulerPeers;
+pub use scheduler_registry::start_scheduler_registry;
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
@@ -834,40 +834,39 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     };
 
     if let Some(config) = app.runtime.scheduler.clone() {
-        if let Some(partition_manager) = rt.partition_manager() {
+        if rt.partition_store().is_some() {
             // Validate all accelerated datasets/views have partition keys
-            // for distributed partition management.
+            // for distributed partition assignment.
             partition::validate_partition_keys(&app).map_err(|e| {
                 crate::Error::FailedToStartClusterScheduler {
                     source: Box::new(e),
                 }
             })?;
 
-            // Initialize partition metadata for all accelerated tables
-            if let Err(err) = partition::initialize_partition_metadata(
-                rt.datafusion(),
-                Arc::clone(&app),
-                &partition_manager,
-            )
-            .await
+            // Seed partition metadata for all accelerated tables. Requires the
+            // PartitionService to have been wired onto `DataFusion` during
+            // builder setup.
+            let df = rt.datafusion();
+            if let Some(partition_service) = df.partition_service.as_ref()
+                && let Err(err) =
+                    partition::initialize_partition_metadata(partition_service, &df, &app).await
             {
                 tracing::warn!(
                     "Failed to initialize partition metadata during scheduler startup: {err}"
                 );
+            } else if df.partition_service.is_none() {
+                tracing::warn!(
+                    "PartitionService not initialized on DataFusion; skipping partition metadata seeding"
+                );
             }
 
-            // Start partition management task
-            let pm_shutdown = CancellationToken::new();
-            let pm_config = match config
-                .partition_management
-                .clone()
-                .map(PartitionManagementConfig::try_from)
-            {
-                Some(Ok(cfg)) => cfg,
-                None => PartitionManagementConfig::default(),
-                Some(Err(err)) => {
+            // Start partition assignment task
+            let pa_shutdown = CancellationToken::new();
+            let pa_config = match PartitionAssignmentConfig::try_from(config.clone()) {
+                Ok(cfg) => cfg,
+                Err(err) => {
                     tracing::warn!(
-                        "Failed to parse partition management config, partition management task will not be started: {err}"
+                        "Failed to parse partition assignment config, partition assignment task will not be started: {err}"
                     );
                     return Ok(None);
                 }
@@ -877,23 +876,20 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             rt.status
                 .update_component_status("partition_metadata", ComponentStatus::Initializing);
 
-            let pm_task = PartitionManagementTask::new(
-                rt.app(),
+            let pa_task = PartitionAssignmentTask::new(
                 rt.datafusion(),
-                Arc::clone(&partition_manager),
-                Arc::clone(&scheduler_executor_registry),
                 Arc::clone(&rt.status),
-                pm_config,
-                pm_shutdown.clone(),
+                pa_config.interval,
+                pa_shutdown.clone(),
             );
 
             futures.push(Box::pin(
                 self_for_task
                     .start_runtime_task(
-                        CLUSTER_PARTITION_MANAGEMENT_TASK,
-                        Some(pm_shutdown),
+                        CLUSTER_PARTITION_ASSIGNMENT_TASK,
+                        Some(pa_shutdown),
                         async move {
-                            pm_task
+                            pa_task
                                 .run()
                                 .await
                                 .boxed()
@@ -1786,7 +1782,11 @@ impl ClusterSecretExpanderImpl {
 
 #[async_trait::async_trait]
 impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
-    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String> {
+    async fn expand_secret(
+        &self,
+        executor_id: &str,
+        key: &str,
+    ) -> Result<secrecy::SecretString, String> {
         let request = runtime_proto::ExpandSecretRequest {
             executor_id: executor_id.to_string(),
             key: key.to_string(),
@@ -1799,7 +1799,9 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
             .await
             .map_err(|status| format!("Failed to expand secret from scheduler: {status}"))?;
 
-        Ok(response.into_inner().value)
+        // Wrap at the earliest point we own the plaintext so downstream code
+        // cannot accidentally stash it in a non-zeroizing buffer.
+        Ok(secrecy::SecretString::from(response.into_inner().value))
     }
 }
 

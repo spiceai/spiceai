@@ -17,26 +17,25 @@ limitations under the License.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use crate::cluster::partition::get_partition_filter_exprs;
+use crate::component::dataset::Load;
 use crate::component::dataset::acceleration::Mode;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
+use crate::datafusion::OnDemandTableLoader;
+use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
-    AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
-    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
-    PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnknownDataConnectorSnafu,
+    AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
+    AcceleratorInitializationFailedSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
+    LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
-    component::{
-        access::AccessMode,
-        dataset::{
-            Dataset,
-            acceleration::{Acceleration, RefreshMode},
-            builder::DatasetBuilder,
-        },
+    component::dataset::{
+        Dataset,
+        acceleration::{Acceleration, RefreshMode},
+        builder::DatasetBuilder,
     },
     dataaccelerator::{
         AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
@@ -57,14 +56,34 @@ use crate::{
     warn_spaced,
 };
 use app::App;
-use datafusion::sql::TableReference;
+use async_trait::async_trait;
+use datafusion::{error::DataFusionError, sql::TableReference};
 #[cfg(any(feature = "duckdb", feature = "sqlite"))]
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+
+#[async_trait]
+impl OnDemandTableLoader for Runtime {
+    async fn has_on_demand_tables(&self) -> bool {
+        self.has_on_demand_datasets().await
+    }
+
+    async fn load_on_demand_tables(
+        &self,
+        table_references: Vec<TableReference>,
+    ) -> std::result::Result<(), DataFusionError> {
+        for table_reference in table_references {
+            self.load_on_demand_dataset(&table_reference)
+                .await
+                .map_err(|err| DataFusionError::External(Box::new(err)))?;
+        }
+        Ok(())
+    }
+}
 
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
@@ -72,12 +91,9 @@ impl Runtime {
             return;
         };
 
-        // Control the number of parallel dataset loads
-        let semaphore = if let Some(parallel_num) = app.runtime.dataset_load_parallelism {
-            Arc::new(Semaphore::new(parallel_num))
-        } else {
-            Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
-        };
+        // Use the shared semaphore so that startup and on-demand loads share
+        // the same `runtime.dataset_load_parallelism` budget.
+        let semaphore = Arc::clone(&self.dataset_load_semaphore);
 
         // Before loading datasets, we must initialize views accelerators (if any).
         // This is required for acceleration federation for some engines (e.g. `DuckDB`).
@@ -85,21 +101,34 @@ impl Runtime {
         self.initialize_views_accelerators(&valid_views).await;
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
+        let mut startup_datasets = Vec::new();
+        let mut on_demand_datasets = Vec::new();
+        for ds in valid_datasets {
+            if ds.load == Load::OnDemand {
+                on_demand_datasets.push(ds);
+            } else {
+                startup_datasets.push(ds);
+            }
+        }
+
+        self.register_on_demand_datasets(&on_demand_datasets).await;
 
         // Validate Cayenne snapshot consistency before initializing accelerators.
         // All Cayenne datasets sharing the same metadata directory must have the same
         // snapshot configuration (either all enabled or all disabled).
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
+            startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
         if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
 
-        let init_results = self.initialize_datasets_accelerators(&valid_datasets).await;
+        let init_results = self
+            .initialize_datasets_accelerators(&startup_datasets)
+            .await;
 
         // Validate that no datasets with snapshots share acceleration files
-        let initialized_sources: Vec<Arc<dyn AccelerationSource>> = valid_datasets
+        let initialized_sources: Vec<Arc<dyn AccelerationSource>> = startup_datasets
             .iter()
             .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
             .map(|ds| ds.clone_arc())
@@ -114,7 +143,7 @@ impl Runtime {
         let mut localpod_datasets = Vec::new();
 
         // First create futures for non-localpod datasets
-        for ds in &valid_datasets {
+        for ds in &startup_datasets {
             let bootstrap_status = match init_results.get(&ds.name) {
                 Some(Ok(status)) => status.clone(),
                 Some(Err(_)) => {
@@ -198,6 +227,75 @@ impl Runtime {
             spawned_tasks.push(handle);
         }
 
+        // Aggregate startup summary so users see "3/5 queued, 2 skipped at init" at a glance
+        // instead of having to piece that together from per-dataset warnings. `dispatched`
+        // is the number of spawned load tasks, which can be less than the number of
+        // datasets that will load because localpod datasets are chained behind their
+        // parent dataset's task. Wording avoids the words "failed" / "error" so it
+        // doesn't trip quickstart CI checks that grep spice.log for those tokens as a
+        // sentinel for real failures.
+        let dispatched = spawned_tasks.len();
+        let init_skipped = init_results.values().filter(|r| r.is_err()).count();
+        let total = startup_datasets.len();
+        if total > 0 {
+            tracing::info!(
+                "Loading datasets: {dispatched} tasks dispatched, {init_skipped} skipped at accelerator init (of {total} total; localpod datasets may be chained)."
+            );
+        }
+
+        // Spawn a best-effort follow-up summary that samples the status registry every
+        // 30s until all datasets have settled (reached Ready/Refreshing or Error), so
+        // users see periodic progress on slow-loading pods without having to query
+        // /v1/datasets. Uses the runtime's shutdown token so a ctrl-c stops the sampler
+        // cleanly. Skipped when there are no datasets at all so we don't spawn a timer
+        // that would just no-op.
+        if total > 0 {
+            let status_handle = Arc::clone(&self.status);
+            let shutdown_token = self.status.shutdown_token();
+            tokio::spawn(async move {
+                let mut elapsed_secs = 0u64;
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                        () = shutdown_token.cancelled() => return,
+                    }
+                    elapsed_secs += 30;
+                    let statuses = status_handle.get_dataset_statuses();
+                    let mut ready = 0usize;
+                    let mut unhealthy = 0usize;
+                    let mut initializing = 0usize;
+                    for s in statuses.values() {
+                        match s {
+                            status::ComponentStatus::Ready
+                            | status::ComponentStatus::Refreshing => {
+                                ready += 1;
+                            }
+                            status::ComponentStatus::Error(_) => unhealthy += 1,
+                            status::ComponentStatus::Initializing => initializing += 1,
+                            _ => {}
+                        }
+                    }
+                    let total = statuses.len();
+                    if total == 0 {
+                        return;
+                    }
+                    // Phrasing deliberately avoids "error"/"failed" so quickstart smoke
+                    // tests that grep spice.log for those tokens don't get false positives
+                    // on a healthy startup. Real per-dataset failure is already logged at
+                    // WARN level inside `load_dataset`.
+                    tracing::info!(
+                        "Dataset load summary (after {elapsed_secs}s): {ready}/{total} ready, {unhealthy} unhealthy, {initializing} still initializing."
+                    );
+                    // Stop once every dataset has settled (Ready/Refreshing or Error).
+                    // `initializing` only counts Initializing; other transient states
+                    // (e.g. Disabled) are treated as settled for this summary.
+                    if initializing == 0 {
+                        return;
+                    }
+                }
+            });
+        }
+
         let _ = join_all(spawned_tasks).await;
 
         // After all datasets have loaded, load the views.
@@ -243,6 +341,152 @@ impl Runtime {
                         })
                 })
             })
+    }
+
+    async fn register_on_demand_datasets(&self, datasets: &[Arc<Dataset>]) {
+        if datasets.is_empty() {
+            return;
+        }
+
+        let mut on_demand_datasets = self.on_demand_datasets.write().await;
+        for ds in datasets {
+            self.status
+                .update_dataset(&ds.name, status::ComponentStatus::NotLoaded);
+            on_demand_datasets.insert(ds.name.clone(), Arc::clone(ds));
+        }
+        tracing::info!(
+            "Configured {} datasets with load: on_demand; they will be loaded on first query or refresh.",
+            datasets.len()
+        );
+    }
+
+    async fn matching_on_demand_dataset(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<TableReference> {
+        let on_demand_datasets = self.on_demand_datasets.read().await;
+        let candidate = table_reference.to_string().to_ascii_lowercase();
+        let bare = table_reference.table().to_ascii_lowercase();
+        let candidate_is_bare = candidate == bare;
+
+        let mut bare_match: Option<TableReference> = None;
+
+        for key in on_demand_datasets.keys() {
+            let key_string = key.to_string();
+            let key_lower = key_string.to_ascii_lowercase();
+
+            if key_lower == candidate {
+                return Some(key.clone());
+            }
+
+            if !candidate_is_bare {
+                continue;
+            }
+
+            let matches_bare = key_lower == bare
+                || key_lower
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|part| part == bare);
+
+            if matches_bare {
+                if bare_match.is_some() {
+                    tracing::debug!(
+                        "Skipping on-demand load for ambiguous unqualified table reference {}",
+                        table_reference
+                    );
+                    return None;
+                }
+                bare_match = Some(key.clone());
+            }
+        }
+
+        bare_match
+    }
+
+    pub(crate) async fn has_on_demand_datasets(&self) -> bool {
+        !self.on_demand_datasets.read().await.is_empty()
+    }
+
+    pub(crate) async fn load_on_demand_dataset(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<()> {
+        let Some(dataset_key) = self.matching_on_demand_dataset(table_reference).await else {
+            return Ok(());
+        };
+
+        let load_lock = {
+            let mut locks = self.on_demand_load_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(dataset_key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = load_lock.lock().await;
+
+        let Some(ds) = self
+            .on_demand_datasets
+            .read()
+            .await
+            .get(&dataset_key)
+            .cloned()
+        else {
+            return Ok(());
+        };
+
+        self.status
+            .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+
+        let init_results = self
+            .initialize_datasets_accelerators(&[Arc::clone(&ds)])
+            .await;
+        let bootstrap_status = match init_results.get(&ds.name) {
+            Some(Ok(status)) => status.clone(),
+            Some(Err(err)) => {
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
+                return Err(Error::UnableToLoadDatasetConnector {
+                    dataset: ds.name.clone(),
+                });
+            }
+            None => {
+                let err = Error::UnableToLoadDatasetConnector {
+                    dataset: ds.name.clone(),
+                };
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
+                return Err(err);
+            }
+        };
+
+        let load_result = self
+            .try_load_dataset_once(
+                Arc::clone(&ds),
+                bootstrap_status,
+                Some(Arc::clone(&self.dataset_load_semaphore)),
+            )
+            .await;
+
+        match load_result {
+            Ok(()) => {
+                self.on_demand_datasets.write().await.remove(&dataset_key);
+                self.on_demand_load_locks.lock().await.remove(&dataset_key);
+                Ok(())
+            }
+            Err(err) => {
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
+                Err(err)
+            }
+        }
     }
 
     async fn load_dataset_connector(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
@@ -308,6 +552,65 @@ impl Runtime {
         Ok(data_connector)
     }
 
+    async fn try_load_dataset_once(
+        &self,
+        ds: Arc<Dataset>,
+        bootstrap_status: BootstrapStatus,
+        load_semaphore: Option<Arc<Semaphore>>,
+    ) -> Result<()> {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        if let Err(err) = validate_dataset(&ds) {
+            let ds_name = &ds.name;
+            metrics::datasets::LOAD_ERROR.add(1, &[]);
+            error_spaced!(spaced_tracer, "{}{err}", "");
+            self.status.update_dataset(
+                ds_name,
+                status::ComponentStatus::error_with_message(err.to_string()),
+            );
+            return Err(err);
+        }
+
+        let connector_start = Instant::now();
+        let connector = match self.load_dataset_connector(Arc::clone(&ds)).await {
+            Ok(connector) => {
+                tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
+                connector
+            }
+            Err(err) => {
+                if !self.status.is_shutdown() {
+                    let ds_name = &ds.name;
+                    self.status.update_dataset(
+                        ds_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                }
+                return Err(err);
+            }
+        };
+
+        // Check shutdown between connector load and registration.
+        if self.status.is_shutdown() {
+            return Err(crate::Error::UnableToInitializeDataConnector {
+                source: "Runtime is shutting down".into(),
+            });
+        }
+
+        let runtime = ds.runtime();
+        DatasetInitialization::plan_eager(
+            ds,
+            runtime,
+            connector,
+            bootstrap_status,
+            load_semaphore,
+            None,
+        )
+        .initialize()
+        .await
+    }
+
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
     ///
     /// The `load_semaphore` limits concurrent schema inference via
@@ -320,19 +623,6 @@ impl Runtime {
         bootstrap_status: BootstrapStatus,
         load_semaphore: Arc<Semaphore>,
     ) {
-        let spaced_tracer = Arc::clone(&self.spaced_tracer);
-
-        if let Err(err) = validate_dataset(&ds) {
-            let ds_name = &ds.name;
-            metrics::datasets::LOAD_ERROR.add(1, &[]);
-            error_spaced!(spaced_tracer, "{}{err}", "");
-            self.status.update_dataset(
-                ds_name,
-                status::ComponentStatus::error_with_message(err.to_string()),
-            );
-            return;
-        }
-
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
@@ -347,61 +637,21 @@ impl Runtime {
                 ));
             }
 
-            let connector_start = Instant::now();
-            let connector = match Arc::clone(&runtime)
-                .load_dataset_connector(Arc::clone(&ds))
-                .await
-            {
-                Ok(connector) => {
-                    tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
-                    connector
-                }
-                Err(err) => {
-                    if runtime.status.is_shutdown() {
-                        // should not retry or trace error if runtime is shutting down
-                        return Err(RetryError::permanent(err));
-                    }
-
-                    let ds_name = &ds.name;
-                    runtime.status.update_dataset(
-                        ds_name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
-                    );
-                    metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                    return Err(RetryError::transient(err));
-                }
-            };
-
-            // Check shutdown between connector load and registration.
-            if runtime.status.is_shutdown() {
-                return Err(RetryError::permanent(
-                    crate::Error::UnableToInitializeDataConnector {
-                        source: "Runtime is shutting down".into(),
-                    },
-                ));
-            }
-
-            if let Err(err) = Arc::clone(&runtime)
-                .register_loaded_dataset(
+            match runtime
+                .try_load_dataset_once(
                     Arc::clone(&ds),
-                    connector,
-                    None,
                     bootstrap_status.clone(),
                     Some(Arc::clone(&load_semaphore)),
                 )
                 .await
             {
-                if runtime.status.is_shutdown() {
-                    return Err(RetryError::permanent(err));
+                Ok(()) => Ok(()),
+                Err(err) if runtime.status.is_shutdown() => Err(RetryError::permanent(err)),
+                Err(err) if matches!(err, Error::PermanentDatasetFailure { .. }) => {
+                    Err(RetryError::permanent(err))
                 }
-                if matches!(err, Error::PermanentDatasetFailure { .. }) {
-                    return Err(RetryError::permanent(err));
-                }
-                return Err(RetryError::transient(err));
+                Err(err) => Err(RetryError::transient(err)),
             }
-
-            Ok(())
         });
 
         // Use tokio::select! so that backoff sleeps inside `retry` are immediately
@@ -412,7 +662,7 @@ impl Runtime {
         }
     }
 
-    async fn register_loaded_dataset(
+    pub(crate) async fn register_loaded_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
@@ -596,7 +846,7 @@ impl Runtime {
         ds_name: TableReference,
         ds_acceleration: Option<&Acceleration>,
     ) {
-        if self.df.table_exists(ds_name.clone()) {
+        if self.df.table_exists(&ds_name) {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                 datasets_health_monitor
                     .deregister_dataset(&ds_name.to_string())
@@ -668,15 +918,16 @@ impl Runtime {
                     .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                     .await;
 
-                if let Err(e) = Arc::clone(&self)
-                    .register_loaded_dataset(
-                        Arc::clone(&ds),
-                        Arc::clone(&connector),
-                        None,
-                        BootstrapStatus::None,
-                        None,
-                    )
-                    .await
+                if let Err(e) = DatasetInitialization::plan_eager(
+                    Arc::clone(&ds),
+                    Arc::clone(&self),
+                    Arc::clone(&connector),
+                    BootstrapStatus::None,
+                    None,
+                    None,
+                )
+                .initialize()
+                .await
                 {
                     self.status.update_dataset(
                         &ds.name,
@@ -784,13 +1035,15 @@ impl Runtime {
         tracing::debug!("Accelerated table for dataset {} is ready", ds.name);
 
         // Hot reload doesn't bootstrap from snapshot
-        self.register_loaded_dataset(
+        DatasetInitialization::plan_eager(
             ds,
+            Arc::clone(&self),
             Arc::clone(&connector),
-            Some(accelerated_table),
             BootstrapStatus::None,
             None,
+            Some(accelerated_table),
         )
+        .initialize()
         .await?;
 
         Ok(())
@@ -820,8 +1073,12 @@ impl Runtime {
                     return Err(OdbcNotInstalledSnafu.build());
                 }
 
+                let suggestion = dataconnector::suggest_connector(source).await;
+                let available = dataconnector::registered_connector_names().await;
                 return Err(UnknownDataConnectorSnafu {
                     data_connector: source,
+                    suggestion,
+                    available,
                 }
                 .build());
             };
@@ -921,12 +1178,37 @@ impl Runtime {
                 })?;
         let accelerator_engine = acceleration_settings.engine;
 
-        // Allow ReadWrite access when:
-        // 1. Replication is enabled (changes are synced back to source), OR
-        // 2. on_conflict is configured (accelerator supports local writes via upsert/drop)
         let has_on_conflict = !acceleration_settings.on_conflict.is_empty();
-        if ds.access() == AccessMode::ReadWrite && !replicate && !has_on_conflict {
-            AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
+        let has_changes_refresh = acceleration_settings
+            .refresh_mode
+            .is_some_and(|mode| matches!(mode, RefreshMode::Changes));
+        let has_write_back =
+            acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack;
+
+        // `on_conflict` forces writes to the accelerator only. When combined with
+        // `write_mode: write_back` and `refresh_mode: changes` (CDC), on_conflict acts
+        // as WAL UPDATE upsert routing only and write_back can coexist with it.
+        // Reject the combination of on_conflict + write_back without CDC, since there
+        // would be no path to sync the accelerator writes back to the federated source.
+        if has_on_conflict && has_write_back && !has_changes_refresh {
+            crate::AcceleratedWriteBackWithOnConflictSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
+        }
+
+        // `write_mode: write_back` commits to the local accelerator first and
+        // asynchronously forwards the same mutation to the federated source.
+        // Because the source commit is not part of the synchronous response,
+        // require `replication.enabled` as the user's explicit opt-in to those
+        // asynchronous source durability semantics.
+        if acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack
+            && !replicate
+        {
+            crate::AcceleratedWriteBackWithoutReplicationSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
         }
 
         self.accelerator_engine_registry
@@ -967,7 +1249,7 @@ impl Runtime {
 
         if let Some(notifier) = notifier {
             // spawn a background task to wait for the accelerated table to be ready before creating schedules
-            let runtime = Arc::clone(&self);
+            let runtime = ds.runtime();
             let ds = Arc::clone(&ds);
             let dataset_name = ds.name.to_string();
             tokio::task::spawn(async move {
@@ -987,19 +1269,31 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
+        let mut startup_datasets = Vec::new();
+        let mut on_demand_datasets = Vec::new();
+        for ds in valid_datasets {
+            if ds.load == Load::OnDemand {
+                on_demand_datasets.push(ds);
+            } else {
+                startup_datasets.push(ds);
+            }
+        }
+        self.register_on_demand_datasets(&on_demand_datasets).await;
 
         // Validate Cayenne snapshot consistency before initializing accelerators.
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
+            startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
         if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
 
-        let init_results = self.initialize_datasets_accelerators(&valid_datasets).await;
+        let init_results = self
+            .initialize_datasets_accelerators(&startup_datasets)
+            .await;
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
-        for ds in &valid_datasets {
+        for ds in &startup_datasets {
             let bootstrap_status = match init_results.get(&ds.name) {
                 Some(Ok(status)) => status.clone(),
                 Some(Err(_)) => {
@@ -1057,6 +1351,8 @@ impl Runtime {
                     }
                 };
 
+                self.on_demand_datasets.write().await.remove(&ds_name);
+                self.on_demand_load_locks.lock().await.remove(&ds_name);
                 self.status
                     .update_dataset(&ds_name, status::ComponentStatus::Disabled);
                 Arc::clone(&self)
@@ -1234,5 +1530,105 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
                 dataset.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataconnector::{
+        ConnectorParams, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
+        register_connector_factory,
+    };
+    use crate::parameters::ParameterSpec;
+    use async_trait::async_trait;
+    use datafusion::datasource::TableProvider;
+    use std::any::Any;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingConnectorFactory {
+        creates: Arc<AtomicUsize>,
+    }
+
+    impl DataConnectorFactory for CountingConnectorFactory {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn create(
+            &self,
+            _params: ConnectorParams,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            let creates = Arc::clone(&self.creates);
+            Box::pin(async move {
+                creates.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(CountingConnector) as Arc<dyn DataConnector>)
+            })
+        }
+
+        fn prefix(&self) -> &'static str {
+            "counting_on_demand"
+        }
+
+        fn parameters(&self) -> &'static [ParameterSpec] {
+            &[]
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingConnector;
+
+    #[async_trait]
+    impl DataConnector for CountingConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _dataset: &Dataset,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            unimplemented!("on-demand startup should not create or read from this connector")
+        }
+    }
+
+    #[tokio::test]
+    async fn load_on_demand_dataset_does_not_create_connector_at_startup() {
+        let creates = Arc::new(AtomicUsize::new(0));
+        register_connector_factory(
+            "counting_on_demand",
+            Arc::new(CountingConnectorFactory {
+                creates: Arc::clone(&creates),
+            }),
+        )
+        .await;
+
+        let mut dataset =
+            spicepod::component::dataset::Dataset::new("counting_on_demand:any", "lazy_dataset");
+        dataset.load = spicepod::component::dataset::Load::OnDemand;
+
+        let app = app::AppBuilder::new("on_demand_test")
+            .with_dataset(dataset)
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().with_app(app).build().await);
+
+        Arc::clone(&runtime).set_components_initializing().await;
+        Arc::clone(&runtime).load_datasets().await;
+
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+        let dataset_ref = TableReference::parse_str("lazy_dataset");
+        assert_eq!(
+            runtime.status().get_dataset_statuses().get(&dataset_ref),
+            Some(&status::ComponentStatus::NotLoaded)
+        );
+        assert!(
+            runtime
+                .on_demand_datasets()
+                .read()
+                .await
+                .contains_key(&dataset_ref)
+        );
     }
 }

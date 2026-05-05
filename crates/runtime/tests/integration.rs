@@ -76,6 +76,8 @@ mod git;
 mod github;
 mod glue;
 mod graphql;
+#[cfg(all(feature = "postgres", feature = "hashicorp_vault"))]
+mod hashicorp_vault;
 mod http;
 mod iceberg;
 mod iceberg_api;
@@ -113,6 +115,8 @@ mod s3_location_pruning;
     feature = "turso"
 ))]
 mod schema_evolution;
+#[cfg(feature = "sharepoint")]
+mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
 #[cfg(feature = "snowflake")]
@@ -224,7 +228,11 @@ where
     if snapshot_plan {
         insta::with_settings!({
             description => format!("Query: {query}"),
-            omit_expression => true
+            omit_expression => true,
+            filters => vec![
+                // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
+                (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+            ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);
         });

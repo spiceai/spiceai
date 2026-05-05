@@ -24,8 +24,8 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
+use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
-use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
@@ -57,6 +57,7 @@ use {
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
+use crate::cluster::partition::service::PartitionService;
 #[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 #[cfg(feature = "duckdb")]
@@ -66,7 +67,7 @@ use datafusion_optimizer_rules::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
-        EmptyHashJoinExecPhysicalOptimization,
+        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
     },
 };
@@ -135,6 +136,7 @@ pub struct DataFusionBuilder {
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
+    partition_service: Option<Arc<PartitionService>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -180,6 +182,7 @@ impl DataFusionBuilder {
             url_tables_enabled: false,
             additional_analyzer_rules: vec![],
             executor_registry: None,
+            partition_service: None,
         }
     }
 
@@ -280,6 +283,13 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Sets the partition service for discovery and assignment of partitions (scheduler mode only).
+    #[must_use]
+    pub fn with_partition_service(mut self, service: Arc<PartitionService>) -> Self {
+        self.partition_service = Some(service);
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
@@ -334,6 +344,7 @@ impl DataFusionBuilder {
         }
 
         state = state
+            .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
                 Arc::new(Box::new(track_bytes_processed)),
@@ -435,13 +446,14 @@ impl DataFusionBuilder {
         let cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>> =
             // How we handle Cayenne DDL depends if its single node vs distributed.
             if let Some(executor_registry) = &self.executor_registry {
-                use crate::cluster::FederatedPartitionProvider;
+                use crate::cluster::{AcceleratedPartitionProvider, FederatedPartitionProvider};
 
 
                 // Rules only for distributed query
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
+                    Arc::new(AcceleratedPartitionProvider::from_registry(Arc::clone(executor_registry)))
+                        as Arc<dyn TablePartitionProvider>,
                     &ctx,
                 )));
 
@@ -508,6 +520,7 @@ impl DataFusionBuilder {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
+            data_update_broadcaster: crate::dataupdate::DataUpdateBroadcaster::new(),
             writable_catalogs: RwLock::new(HashSet::new()),
             ddl_enabled_catalogs,
             ddl_extension_store,
@@ -516,6 +529,7 @@ impl DataFusionBuilder {
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
+            on_demand_table_loader: RwLock::new(None),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
@@ -530,7 +544,7 @@ impl DataFusionBuilder {
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
-            executor_registry: self.executor_registry,
+            partition_service: self.partition_service,
             #[cfg(not(windows))]
             cayenne_ddl_handler,
         }
@@ -647,33 +661,20 @@ pub(crate) fn runtime_env(
 }
 
 pub(crate) fn default_extension_planners(
-    executor_registry: Option<Arc<ExecutorRegistry>>,
-    io_runtime: tokio::runtime::Handle,
+    _executor_registry: Option<Arc<ExecutorRegistry>>,
+    _io_runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
-    let mut planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
+    let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
         // One stateless DDL planner handles all DdlExtensionNodes from any handler.
         Arc::new(datafusion_ddl::DdlExtensionPlanner),
+        // One stateless DML planner handles all DmlExtensionNodes from any handler.
+        Arc::new(datafusion_dml::DmlExtensionPlanner),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ];
-    // Cayenne DML (DELETE, UPDATE, INSERT, MERGE forwarding): either single or distributed.
-    #[cfg(not(windows))]
-    if let Some(registry) = executor_registry {
-        planners.push(Arc::new(
-            super::cayenne_ddl::DistributedCayenneDmlExtensionPlanner::new(
-                registry,
-                Some(io_runtime),
-            ),
-        ));
-    } else {
-        planners.push(Arc::new(cayenne::ddl::CayenneDmlExtensionPlanner::new(
-            super::SPICE_DEFAULT_CATALOG,
-            super::SPICE_DEFAULT_SCHEMA,
-        )));
-    };
     planners
 }
 

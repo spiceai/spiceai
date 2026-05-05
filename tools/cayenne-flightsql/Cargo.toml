@@ -2,7 +2,7 @@
 description = "Standalone Flight SQL server with a single Cayenne catalog"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "cayenne-flightsql"
 repository.workspace = true
 rust-version.workspace = true

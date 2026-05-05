@@ -5,8 +5,8 @@ SELECT
         ELSE 0
     END) / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue
 FROM
-    mysql.public.lineitem,
-    mysql.public.part
+    mysql.tpch_sf1.lineitem,
+    mysql.tpch_sf1.part
 WHERE
     l_partkey = p_partkey
     AND l_shipdate >= DATE '1995-09-01'

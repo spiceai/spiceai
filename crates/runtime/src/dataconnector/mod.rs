@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{self, AcceleratedTable};
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
@@ -57,6 +57,7 @@ use tracing::Level;
 use std::future::Future;
 use std::time::Duration;
 
+pub mod http_rate_control;
 pub mod listing;
 
 /// Creates a default reqwest client with standard Spice settings.
@@ -168,6 +169,8 @@ pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
+#[cfg(feature = "duckdb")]
+pub mod ducklake;
 pub mod gcs;
 pub mod glue;
 pub mod iceberg;
@@ -476,6 +479,45 @@ pub async fn register_all() {
     }
 }
 
+/// Names of every registered data connector. Useful for generating helpful
+/// "did you mean?" suggestions when a user references an unknown connector.
+pub async fn registered_connector_names() -> Vec<String> {
+    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    let mut names: Vec<String> = guard.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Returns the registered connector name whose Levenshtein distance to `name`
+/// is lowest (bounded so short typos only match very close names).
+pub async fn suggest_connector(name: &str) -> Option<String> {
+    closest_name(name, &registered_connector_names().await)
+}
+
+/// Pure helper used by [`suggest_connector`]. Kept separate from the registry
+/// lookup so its scoring + threshold can be unit-tested without spinning up
+/// the async registry.
+pub(crate) fn closest_name(typo: &str, candidates: &[String]) -> Option<String> {
+    let input = typo.to_ascii_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for candidate in candidates {
+        let d = util::levenshtein::distance(&input, &candidate.to_ascii_lowercase());
+        if best.as_ref().is_none_or(|(_, b)| d < *b) {
+            best = Some((candidate.clone(), d));
+        }
+    }
+    let (candidate, distance) = best?;
+    // Bound: allow at most one edit per 3 chars of the longer string. Prevents a
+    // wildly different name ("kafka" vs. "postgres") from being suggested while
+    // still catching connector-name typos like "postgress" → "postgres" (d=1).
+    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
+    if distance <= max_allowed {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 pub async fn unregister_all() {
     let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
     registry.clear();
@@ -516,6 +558,30 @@ pub trait DataConnectorFactory: Send + Sync {
     fn reserved_keywords(&self) -> &'static [&'static str] {
         &[]
     }
+
+    /// Returns a static schema for the given dataset if this connector's
+    /// schema is fully determined by configuration and does not require
+    /// any source-facing I/O or connector construction.
+    ///
+    /// Called during dataset registration **before** the connector itself
+    /// is built (no `create` call is required first). Implementations may
+    /// consult `params` (e.g. a configured file format) and `dataset`
+    /// (e.g. declared content type, JSON column decomposition) but must
+    /// not perform any I/O.
+    ///
+    /// When `Some(schema)` is returned, the runtime is allowed to register
+    /// the dataset using that schema and defer building the connector and
+    /// calling [`DataConnector::read_provider`] until the dataset is
+    /// actually referenced. The connector is still expected to return a
+    /// `TableProvider` whose schema matches on the first `read_provider`
+    /// call; mismatches surface at first scan as a hard error rather than
+    /// being silently retried (the static schema is configuration, not
+    /// source state).
+    ///
+    /// Default: `None`. Most connectors infer schema from the source.
+    fn static_schema(&self, _params: &ConnectorParams, _dataset: &Dataset) -> Option<SchemaRef> {
+        None
+    }
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
@@ -550,6 +616,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         _dataset: &Dataset,
         _accelerated_table_provider: Arc<dyn TableProvider>,
         _accelerator_write_mutex: Arc<Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         None
     }
@@ -587,6 +654,23 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         _dataset: &Dataset,
         _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
+        Ok(())
+    }
+
+    /// A hook called **before** the accelerated table is built, giving the
+    /// connector a chance to wrap or replace the accelerator provider on the
+    /// [`Builder`](crate::accelerated_table::Builder).
+    ///
+    /// Any provider set here will be shared with the [`Refresher`] that is
+    /// created during [`Builder::build`]. Use this hook instead of
+    /// [`on_accelerated_table_registration`](Self::on_accelerated_table_registration)
+    /// when the wrapped provider must be visible to the refresh pipeline
+    /// (e.g. to recreate indexes after a data refresh).
+    async fn on_accelerator_setup(
+        &self,
+        _dataset: &Dataset,
+        _builder: &mut accelerated_table::Builder,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 
@@ -774,6 +858,52 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn closest_name_matches_one_char_typo() {
+        let candidates = names(&["postgres", "mysql", "snowflake", "kafka"]);
+        assert_eq!(
+            closest_name("postgress", &candidates),
+            Some("postgres".to_string())
+        );
+    }
+
+    #[test]
+    fn closest_name_matches_case_insensitive() {
+        let candidates = names(&["postgres", "mysql"]);
+        assert_eq!(
+            closest_name("MYSQL", &candidates),
+            Some("mysql".to_string())
+        );
+    }
+
+    #[test]
+    fn closest_name_distant_returns_none() {
+        let candidates = names(&["postgres", "mysql", "kafka"]);
+        // "xyz" has no close match.
+        assert_eq!(closest_name("xyz", &candidates), None);
+    }
+
+    #[test]
+    fn closest_name_empty_candidates_returns_none() {
+        let candidates: Vec<String> = Vec::new();
+        assert_eq!(closest_name("postgres", &candidates), None);
+    }
+
+    #[test]
+    fn closest_name_short_typo_short_threshold() {
+        // Short names get a max_allowed floor of 1 — a single-char off name matches,
+        // but two chars off does not (protects against wildly different suggestions).
+        let candidates = names(&["pg", "my"]);
+        // "po" vs "pg": distance 1, allowed. vs "my": distance 2, not allowed.
+        assert_eq!(closest_name("po", &candidates), Some("pg".to_string()));
+        // "zz" vs both is distance 2 — no match.
+        assert_eq!(closest_name("zz", &candidates), None);
+    }
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::parameters::ConnectorParamsBuilder;
@@ -801,6 +931,55 @@ mod tests {
         .build(secrets, Handle::current())
         .await
         .expect("failed to build connector params")
+    }
+
+    #[tokio::test]
+    async fn test_static_schema_default_returns_none() {
+        // Any factory that doesn't override `static_schema` should return
+        // None. This is the contract relied on by the deferred-dataset
+        // path: a None return falls back to the eager source-contact
+        // registration flow.
+        struct DefaultFactory;
+        impl DataConnectorFactory for DefaultFactory {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn create(
+                &self,
+                _params: ConnectorParams,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                unimplemented!("static_schema must not require create()")
+            }
+            fn prefix(&self) -> &'static str {
+                "default_factory"
+            }
+            fn parameters(&self) -> &'static [ParameterSpec] {
+                &[]
+            }
+        }
+
+        register_connector_factory("default_factory", Arc::new(DefaultFactory)).await;
+
+        let app = Arc::new(app::AppBuilder::new("test_app").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+        let dataset = DatasetBuilder::try_new("default_factory:tbl".to_string(), "tbl")
+            .expect("Failed to create builder")
+            .with_app(Arc::clone(&app))
+            .with_runtime(Arc::clone(&rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        let params = ConnectorParamsBuilder::new(
+            "default_factory".into(),
+            ConnectorComponent::Dataset(Arc::new(dataset.clone())),
+        )
+        .build(secrets, Handle::current())
+        .await
+        .expect("failed to build connector params");
+
+        let factory = DefaultFactory;
+        assert!(factory.static_schema(&params, &dataset).is_none());
     }
 
     #[tokio::test]

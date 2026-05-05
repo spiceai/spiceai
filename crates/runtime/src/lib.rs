@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+#![recursion_limit = "256"]
 
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
@@ -36,9 +37,10 @@ use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
+use crate::component::dataset::Load;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
-use crate::datafusion::DataFusion;
 use crate::datafusion::error::format_datafusion_error;
+use crate::datafusion::{DataFusion, OnDemandTableLoader};
 use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
@@ -75,7 +77,9 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
-use crate::cluster::{DistributedNode, PartitionManager, SchedulerPeers};
+use crate::cluster::{
+    ClusterStateStore, DistributedNode, PartitionStore, SchedulerHeartbeatStore, SchedulerPeers,
+};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
@@ -202,14 +206,26 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unknown data connector: {data_connector}. Specify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+        "Unknown data connector '{data_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/data-connectors",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownDataConnector { data_connector: String },
+    UnknownDataConnector {
+        data_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
-        "Unknown catalog connector: {catalog_connector}. Specify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+        "Unknown catalog connector '{catalog_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/catalogs",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownCatalogConnector { catalog_connector: String },
+    UnknownCatalogConnector {
+        catalog_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
         "The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
@@ -257,9 +273,14 @@ pub enum Error {
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
-        "An accelerated table was configured as read_write without setting replication.enabled = true"
+        "An accelerated table for {dataset_name} cannot be configured with both 'on_conflict' and 'acceleration.write_mode: write_back' without 'refresh_mode: changes'. Without CDC, 'on_conflict' forces writes to the accelerator only and there is no sync path back to the federated source. Add 'refresh_mode: changes' to enable CDC-based sync, or remove 'on_conflict'."
     ))]
-    AcceleratedReadWriteTableWithoutReplication,
+    AcceleratedWriteBackWithOnConflict { dataset_name: String },
+
+    #[snafu(display(
+        "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back commits to the local accelerator first and persists to the federated source asynchronously, so source persistence failures are logged rather than returned to the caller. Set 'replication.enabled: true' to opt in to asynchronous source durability, or use a different write_mode."
+    ))]
+    AcceleratedWriteBackWithoutReplication { dataset_name: String },
 
     #[snafu(display(
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
@@ -456,7 +477,7 @@ pub enum Error {
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
 const CLUSTER_SCHEDULER_REGISTRY: &str = "cluster_scheduler_registry";
-const CLUSTER_PARTITION_MANAGEMENT_TASK: &str = "cluster_partition_management_task";
+const CLUSTER_PARTITION_ASSIGNMENT_TASK: &str = "cluster_partition_assignment_task";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
@@ -480,6 +501,7 @@ pub struct Runtime {
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     /// Per-model rate controllers for AI UDF concurrency control.
     model_rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
     // LLMs that support the OpenAI Responses API
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
@@ -519,6 +541,16 @@ pub struct Runtime {
 
     config: Arc<Config>,
 
+    /// Datasets configured with `load: on_demand` that have not been loaded yet.
+    on_demand_datasets: Arc<RwLock<HashMap<TableReference, Arc<component::dataset::Dataset>>>>,
+    /// Per-dataset locks to ensure concurrent triggers only load a dataset once.
+    on_demand_load_locks: Arc<Mutex<HashMap<TableReference, Arc<Mutex<()>>>>>,
+
+    /// Shared semaphore that bounds concurrent dataset schema inference
+    /// (`read_provider`) calls so that startup loads and on-demand loads both
+    /// honor `runtime.dataset_load_parallelism`.
+    dataset_load_semaphore: Arc<tokio::sync::Semaphore>,
+
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
     /// telemetry. For executors this is set after the app definition is
     /// fetched from the scheduler; for all other modes it is set before
@@ -547,6 +579,13 @@ impl Runtime {
     #[must_use]
     pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
+    }
+
+    #[must_use]
+    pub fn on_demand_datasets(
+        &self,
+    ) -> Arc<RwLock<HashMap<TableReference, Arc<component::dataset::Dataset>>>> {
+        Arc::clone(&self.on_demand_datasets)
     }
 
     #[must_use]
@@ -594,6 +633,13 @@ impl Runtime {
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         Arc::clone(&self.model_rate_controllers)
+    }
+
+    #[must_use]
+    pub fn http_rate_control_registry(
+        &self,
+    ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+        Arc::clone(&self.http_rate_control_registry)
     }
 
     #[must_use]
@@ -781,32 +827,21 @@ impl Runtime {
         Ok(())
     }
 
-    /// Returns the partition manager for accelerated table partition metadata (scheduler only).
+    /// Returns the partition store for accelerated table partition metadata (scheduler only).
     #[must_use]
-    pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
+    pub fn partition_store(&self) -> Option<Arc<PartitionStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
-                accelerations_partitions,
+                accelerations_partitions_store,
                 ..
-            }) => Some(Arc::clone(accelerations_partitions)),
+            }) => Some(Arc::clone(accelerations_partitions_store)),
             _ => None,
         }
     }
 
-    /// Returns the catalog/federated partition manager (scheduler only).
+    /// Returns the cluster state store (scheduler only).
     #[must_use]
-    pub fn catalog_partition_manager(&self) -> Option<Arc<PartitionManager>> {
-        match self.distributed.as_ref() {
-            Some(DistributedNode::Scheduler {
-                catalog_partitions, ..
-            }) => Some(Arc::clone(catalog_partitions)),
-            _ => None,
-        }
-    }
-
-    /// Returns the shared cluster state store (scheduler only).
-    #[must_use]
-    pub fn cluster_state(&self) -> Option<Arc<crate::cluster::ClusterStateStore>> {
+    pub fn cluster_state(&self) -> Option<Arc<ClusterStateStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { cluster_state, .. }) => {
                 Some(Arc::clone(cluster_state))
@@ -817,7 +852,7 @@ impl Runtime {
 
     /// Returns the scheduler heartbeat store (scheduler only).
     #[must_use]
-    pub fn scheduler_heartbeats(&self) -> Option<Arc<crate::cluster::SchedulerHeartbeatStore>> {
+    pub fn scheduler_heartbeats(&self) -> Option<Arc<SchedulerHeartbeatStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { heartbeats, .. }) => Some(Arc::clone(heartbeats)),
             _ => None,
@@ -1220,8 +1255,12 @@ impl Runtime {
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
         for ds in &valid_datasets {
-            self.status
-                .update_dataset(&ds.name, ComponentStatus::Initializing);
+            let status = if ds.load == Load::OnDemand {
+                ComponentStatus::NotLoaded
+            } else {
+                ComponentStatus::Initializing
+            };
+            self.status.update_dataset(&ds.name, status);
         }
 
         if cfg!(feature = "models") {
@@ -1269,11 +1308,25 @@ impl Runtime {
         }
     }
 
+    /// Install the on-demand table loader on the embedded `DataFusion` so that
+    /// query planning and the refresh endpoint can trigger loads of
+    /// `load: on_demand` datasets. Should be called immediately after the
+    /// `Runtime` is wrapped in an `Arc`, before any servers start accepting
+    /// requests.
+    pub fn install_on_demand_loader(self: &Arc<Self>) {
+        let loader: Arc<dyn OnDemandTableLoader> = Arc::<Runtime>::clone(self);
+        self.df.set_on_demand_table_loader(Arc::downgrade(&loader));
+    }
+
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     pub async fn load_components(self: Arc<Self>) {
+        // Idempotent: ensures the loader is installed even when callers (tests,
+        // embedders) skip the `install_on_demand_loader` step.
+        self.install_on_demand_loader();
+
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
@@ -1521,7 +1574,7 @@ impl Runtime {
                 .collect::<HashSet<_>>();
             for (name, tooling) in tool_lock.iter() {
                 match tooling {
-                    Tooling::Tool(tool) => {
+                    Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
                     Tooling::Catalog(catalog) => {
@@ -1548,7 +1601,8 @@ impl Runtime {
                 };
                 return catalog.get(name).await;
             } else {
-                let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
+                let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name)
+                else {
                     return None;
                 };
                 Arc::clone(tool)

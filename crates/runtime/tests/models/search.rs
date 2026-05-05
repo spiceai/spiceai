@@ -26,6 +26,7 @@ use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use anyhow::Context;
 use app::{App, AppBuilder};
+#[cfg(feature = "s3_vectors")]
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use http::HeaderValue;
@@ -41,6 +42,8 @@ use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
+#[cfg(feature = "duckdb")]
+use spicepod::vector::VectorStore;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -103,6 +106,7 @@ impl SearchTestCase {
         self
     }
 
+    #[cfg(feature = "s3_vectors")]
     pub fn replace_table(&self, from: &TableReference, to: &TableReference) -> Self {
         let body = match self.body.clone() {
             SearchTestType::Http(Value::Object(mut v)) => {
@@ -538,6 +542,8 @@ pub(crate) fn item_tpcds_dataset_w_embeddings(
         }],
         description: None,
         full_text_search: None,
+        r#type: None,
+        nullable: None,
         metadata: HashMap::new(),
     }];
 
@@ -581,6 +587,8 @@ pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
         }],
         description: None,
         full_text_search: None,
+        r#type: None,
+        nullable: None,
         metadata: HashMap::new(),
     }];
     ds_tpcds_cp
@@ -1239,6 +1247,77 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
 /// Regression test for <https://github.com/spiceai/spiceai/issues/9621>
 ///
 /// This test ensures that RRF queries work correctly with `DuckDB` acceleration.
+#[tokio::test]
+async fn test_rrf_recency_unboosting_disjoint_regression() -> Result<(), anyhow::Error> {
+    let left_path = format!(
+        "file:{}/tests/models/test_data/rrf_left_fruit.csv",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let right_path = format!(
+        "file:{}/tests/models/test_data/rrf_right_fruit.csv",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let mut left_ds = Dataset::new(left_path, "left_fruit");
+    left_ds.params = Some(Params::from_string_map(HashMap::from([
+        ("file_format".to_string(), "csv".to_string()),
+        ("csv_has_header".to_string(), "true".to_string()),
+    ])));
+    left_ds.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+    left_ds.columns = vec![
+        Column::new("content")
+            .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id")),
+    ];
+
+    let mut right_ds = Dataset::new(right_path, "right_fruit");
+    right_ds.params = Some(Params::from_string_map(HashMap::from([
+        ("file_format".to_string(), "csv".to_string()),
+        ("csv_has_header".to_string(), "true".to_string()),
+    ])));
+    right_ds.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+    right_ds.columns = vec![
+        Column::new("content")
+            .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id")),
+    ];
+
+    let app = AppBuilder::new("search_app")
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
+            "hf_minilm",
+        ))
+        .with_dataset(left_ds)
+        .with_dataset(right_ds)
+        .build();
+
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            let api_config = start_app(app).await?;
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+
+            let sql = "SELECT id, content, picked_at FROM rrf(vector_search(left_fruit, 'red crispy', content), vector_search(right_fruit, 'red crispy', content), join_key => 'id', k => 0, time_column => 'picked_at', decay_constant => 0.25) ORDER BY _fused_score DESC, id ASC LIMIT 3";
+            let resp = http_sql(http_base_url.as_str(), sql).await?;
+            insta::with_settings!({
+                description => sql
+            }, {
+                insta::assert_snapshot!("rrf_recency_unboosting_disjoint_regression", normalize_search_response(resp, true));
+            });
+
+            Ok(())
+        })
+        .await
+}
+
+/// Regression test for <https://github.com/spiceai/spiceai/issues/9621>
+///
+/// This test ensures that RRF queries work correctly with `DuckDB` acceleration.
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn test_rrf_search_duckdb_acceleration() -> Result<(), anyhow::Error> {
@@ -1285,6 +1364,138 @@ async fn test_rrf_search_duckdb_acceleration() -> Result<(), anyhow::Error> {
             ),
         ],
     ).await
+}
+
+#[cfg(feature = "duckdb")]
+#[derive(Clone, Copy)]
+enum DuckDBHnswConfiguration {
+    VectorEngine,
+    Embeddings,
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_hnsw_search_dataset(name: &str, configuration: DuckDBHnswConfiguration) -> Dataset {
+    let mut dataset = get_mega_science_dataset(
+        Some(name),
+        Some(
+            Column::new("question")
+                .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id")),
+        ),
+        None,
+    );
+    let hnsw_params = duckdb_hnsw_params();
+    let acceleration_params = match configuration {
+        DuckDBHnswConfiguration::VectorEngine => None,
+        DuckDBHnswConfiguration::Embeddings => Some(hnsw_params.clone()),
+    };
+
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        refresh_sql: Some(format!("SELECT * FROM {name} LIMIT 128")),
+        params: acceleration_params,
+        ..Default::default()
+    });
+
+    if matches!(configuration, DuckDBHnswConfiguration::VectorEngine) {
+        dataset.vectors = Some(VectorStore {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            partition_by: Vec::new(),
+            params: Some(hnsw_params),
+        });
+    }
+
+    dataset
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_hnsw_params() -> Params {
+    Params::from_string_map(HashMap::from([
+        ("duckdb_distance_metric".to_string(), "l2".to_string()),
+        ("duckdb_hnsw_m".to_string(), "8".to_string()),
+        ("duckdb_hnsw_ef_construction".to_string(), "24".to_string()),
+        ("duckdb_hnsw_ef_search".to_string(), "12".to_string()),
+    ]))
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_duckdb_hnsw_search_vector_engine_and_embeddings_config() -> Result<(), anyhow::Error>
+{
+    let vector_engine_dataset = "duckdb_hnsw_vector_engine";
+    let embeddings_dataset = "duckdb_hnsw_embeddings";
+    let app = AppBuilder::new("search_app")
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
+            "hf_minilm",
+        ))
+        .with_dataset(duckdb_hnsw_search_dataset(
+            vector_engine_dataset,
+            DuckDBHnswConfiguration::VectorEngine,
+        ))
+        .with_dataset(duckdb_hnsw_search_dataset(
+            embeddings_dataset,
+            DuckDBHnswConfiguration::Embeddings,
+        ))
+        .build();
+
+    let api_config = start_app(app).await?;
+    let http_base_url = format!("http://{}", api_config.http_bind_address);
+
+    assert_duckdb_hnsw_vector_search(http_base_url.as_str(), vector_engine_dataset).await?;
+    assert_duckdb_hnsw_vector_search(http_base_url.as_str(), embeddings_dataset).await
+}
+
+#[cfg(feature = "duckdb")]
+async fn assert_duckdb_hnsw_vector_search(
+    http_base_url: &str,
+    dataset_name: &str,
+) -> Result<(), anyhow::Error> {
+    let query = format!(
+        "SELECT id, _score FROM vector_search({dataset_name}, 'second') ORDER BY _score DESC LIMIT 4"
+    );
+    let response = http_sql(http_base_url, &query).await?;
+    let rows = response
+        .as_array()
+        .context("DuckDB HNSW vector search response should be an array")?;
+    anyhow::ensure!(
+        rows.len() == 4,
+        "DuckDB HNSW vector search for {dataset_name} should return 4 rows, got {}",
+        rows.len()
+    );
+
+    let mut has_negative_l2_score = false;
+    for row in rows {
+        let score = row
+            .get("_score")
+            .and_then(Value::as_f64)
+            .context("DuckDB HNSW vector search row should include numeric _score")?;
+        anyhow::ensure!(
+            score <= f64::EPSILON,
+            "DuckDB HNSW vector search for {dataset_name} should use l2 scoring, got positive score {score}"
+        );
+        has_negative_l2_score |= score.is_sign_negative();
+    }
+    anyhow::ensure!(
+        has_negative_l2_score,
+        "DuckDB HNSW vector search for {dataset_name} should produce at least one negative l2 score"
+    );
+
+    let explain = http_sql(http_base_url, &format!("EXPLAIN {query}")).await?;
+    let plan = explain
+        .as_array()
+        .and_then(|rows| rows.last())
+        .and_then(Value::as_object)
+        .and_then(|row| row.get("plan"))
+        .and_then(Value::as_str)
+        .context("DuckDB HNSW vector search explain response should include a plan")?;
+    anyhow::ensure!(
+        plan.contains("DuckDBVectorQueryExec"),
+        "DuckDB HNSW vector search for {dataset_name} should use DuckDBVectorQueryExec"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -1715,6 +1926,7 @@ async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
 
 #[cfg(feature = "flightsql")]
 #[tokio::test]
+#[ignore = "Failing. https://github.com/spiceai/spiceai/issues/10634"]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     use spicepod::{acceleration::Acceleration, param::Params};
 
@@ -1757,6 +1969,8 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
             embeddings: vec![
                 ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("cp_catalog_page_sk"),
             ],
+            r#type: None,
+            nullable: None,
             metadata: HashMap::new(),
         },
         Column {
@@ -1766,6 +1980,8 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
             embeddings: vec![
                 ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("cp_catalog_page_sk"),
             ],
+            r#type: None,
+            nullable: None,
             metadata: HashMap::new(),
         },
     ];

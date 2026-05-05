@@ -21,7 +21,7 @@ use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArg
 use spice::commands::{
     acceleration, add, catalogs, chat, cloud, cluster, completions, connect, dataset, datasets,
     init, install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace,
-    upgrade, version, workers,
+    upgrade, validate, version, workers,
 };
 use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;
@@ -135,16 +135,25 @@ enum Commands {
 
     /// Generate shell completions
     Completions(completions::CompletionsArgs),
+
+    /// Validate a spicepod.yaml without starting the runtime
+    Validate(validate::ValidateArgs),
 }
 
 fn main() {
+    use std::io::IsTerminal;
+
     let cli = Cli::parse();
 
-    // Initialize logging based on verbosity
-    let filter = match cli.verbose {
-        0 => EnvFilter::new("info"),
-        1 => EnvFilter::new("debug"),
-        _ => EnvFilter::new("trace"),
+    // Verbosity flag wins; otherwise honour RUST_LOG; otherwise default to info.
+    let filter = if cli.verbose > 0 {
+        if cli.verbose == 1 {
+            EnvFilter::new("debug")
+        } else {
+            EnvFilter::new("trace")
+        }
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
     tracing_subscriber::fmt()
@@ -153,11 +162,13 @@ fn main() {
         .without_time()
         .init();
 
-    // Print version header (matching Go CLI behavior), suppressed in JSON mode
-    if !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
+    // Version banner: stderr-only so it doesn't foul pipes, and only for interactive stderr.
+    // Suppressed for commands that produce JSON (scripting) or where it's just noise.
+    if std::io::stderr().is_terminal()
+        && !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
         && !is_json_output(&cli.command)
     {
-        println!("Spice.ai OSS CLI {}", version::cli_version());
+        eprintln!("Spice.ai OSS CLI {}", version::cli_version());
     }
 
     // Run the CLI
@@ -193,14 +204,39 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Deployments(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Inspect(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::ApiKeys(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Metrics(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Logs(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Deploy(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Rollback(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Secrets(cloud::SecretsCommands::Set(x)) => {
                 x.output == OutputFormat::Json
             }
             cloud::CloudCommands::Secrets(cloud::SecretsCommands::Get(x)) => {
                 x.output == OutputFormat::Json
             }
+            cloud::CloudCommands::Secrets(cloud::SecretsCommands::Delete(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Create(cloud::CreateCommands::App(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Create(cloud::CreateCommands::Deployment(x)) => {
+                x.output == OutputFormat::Json
+            }
             cloud::CloudCommands::Get(cloud::GetCommands::App(x)) => x.output == OutputFormat::Json,
-            _ => false,
+            cloud::CloudCommands::Update(cloud::UpdateCommands::App(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Delete(cloud::DeleteCommands::App(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Login(_)
+            | cloud::CloudCommands::Logout
+            | cloud::CloudCommands::Link(_)
+            | cloud::CloudCommands::Unlink => false,
         },
         _ => false,
     }
@@ -339,7 +375,103 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Completions(args) => {
             completions::execute(&args, &mut Cli::command());
         }
+        Commands::Validate(args) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
+            rt.block_on(validate::execute(&args))?;
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("failed to parse CLI args")
+    }
+
+    fn is_json(args: &[&str]) -> bool {
+        is_json_output(&parse(args).command)
+    }
+
+    #[test]
+    fn cloud_metrics_json_output_suppresses_banner() {
+        assert!(is_json(&[
+            "spice", "cloud", "metrics", "--app", "org/app", "--output", "json",
+        ]));
+    }
+
+    #[test]
+    fn cloud_metrics_table_output_keeps_banner() {
+        assert!(!is_json(&["spice", "cloud", "metrics", "--app", "org/app"]));
+        assert!(!is_json(&[
+            "spice", "cloud", "metrics", "--app", "org/app", "--output", "table",
+        ]));
+    }
+
+    #[test]
+    fn cloud_all_json_producing_subcommands_suppress_banner() {
+        // Every cloud subcommand whose execute_* fn writes JSON when --output=json
+        // must cause the banner to be suppressed, otherwise piping to `jq` breaks.
+        let json_producing: &[&[&str]] = &[
+            &["spice", "cloud", "whoami", "--output", "json"],
+            &["spice", "cloud", "apps", "--output", "json"],
+            &["spice", "cloud", "regions", "--output", "json"],
+            &["spice", "cloud", "images", "--output", "json"],
+            &["spice", "cloud", "deployments", "--output", "json"],
+            &["spice", "cloud", "inspect", "--output", "json"],
+            &["spice", "cloud", "api-keys", "--output", "json"],
+            &["spice", "cloud", "metrics", "--output", "json"],
+            &["spice", "cloud", "logs", "--output", "json"],
+            &["spice", "cloud", "deploy", "--output", "json"],
+            &["spice", "cloud", "rollback", "--output", "json"],
+            &["spice", "cloud", "secrets", "list", "--output", "json"],
+            &[
+                "spice", "cloud", "secrets", "set", "name", "value", "--output", "json",
+            ],
+            &[
+                "spice", "cloud", "secrets", "get", "name", "--output", "json",
+            ],
+            &[
+                "spice", "cloud", "secrets", "delete", "name", "--output", "json",
+            ],
+            &[
+                "spice", "cloud", "create", "app", "name", "--output", "json",
+            ],
+            &["spice", "cloud", "create", "deployment", "--output", "json"],
+            &[
+                "spice", "cloud", "get", "app", "org/app", "--output", "json",
+            ],
+            &["spice", "cloud", "update", "app", "--output", "json"],
+            &[
+                "spice", "cloud", "delete", "app", "org/app", "--yes", "--output", "json",
+            ],
+        ];
+        for argv in json_producing {
+            assert!(
+                is_json(argv),
+                "expected --output=json to suppress banner for: {argv:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn non_json_commands_keep_banner() {
+        // Commands without --output=json should not suppress the banner.
+        assert!(!is_json(&["spice", "cloud", "login"]));
+        assert!(!is_json(&["spice", "cloud", "logout"]));
+        assert!(!is_json(&["spice", "cloud", "unlink"]));
+        assert!(!is_json(&["spice", "datasets"]));
+        assert!(!is_json(&["spice", "pods"]));
+    }
+
+    #[test]
+    fn non_cloud_json_output_suppresses_banner() {
+        assert!(is_json(&["spice", "datasets", "--output", "json"]));
+        assert!(is_json(&["spice", "pods", "--output", "json"]));
+        assert!(is_json(&["spice", "status", "--output", "json"]));
+    }
 }

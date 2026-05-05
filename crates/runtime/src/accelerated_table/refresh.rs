@@ -414,14 +414,27 @@ impl Refresh {
                 };
                 last_checkpoint.last_checkpoint_time().await.ok().flatten()
             }
+            // Snapshot mode is interval-based and does not depend on the
+            // dataset checkpoint (snapshot poll cadence is governed solely by
+            // `check_interval`). The first poll happens immediately on startup
+            // so we pick up any snapshot newer than what is on local disk.
             // Append and Changes modes are always refreshed since they stream changes from the source table.
-            RefreshMode::Append | RefreshMode::Changes => {
+            RefreshMode::Snapshot | RefreshMode::Append | RefreshMode::Changes => {
                 return NextRefresh::WaitFor(Duration::ZERO);
             }
             // Caching mode handles refreshes in two ways:
             // 1. On-demand through cache misses (primary)
             // 2. Periodic background refresh of stale data (if refresh_check_interval is set)
             RefreshMode::Caching => {
+                // refresh_on_startup=always schedules a startup refresh regardless of
+                // whether a check_interval is configured. The actual execution time may still
+                // be subject to downstream scheduling such as refresh jitter.
+                if refresh_on_startup == RefreshOnStartup::Always {
+                    tracing::info!(
+                        "Caching mode with refresh_on_startup=always - scheduling startup refresh"
+                    );
+                    return NextRefresh::WaitFor(Duration::ZERO);
+                }
                 // If refresh_check_interval is set, enable periodic refresh for stale data
                 if let Some(check_interval) = self.check_interval {
                     tracing::info!(
@@ -611,6 +624,9 @@ pub enum AccelerationRefreshMode {
     Append(Receiver<Option<RefreshOverrides>>),
     Changes(ChangesStream),
     Caching(Receiver<Option<RefreshOverrides>>),
+    /// Snapshot mode: refreshes are driven by polling the snapshot store for
+    /// snapshots newer than the currently loaded one.
+    Snapshot(Receiver<Option<RefreshOverrides>>),
 }
 
 pub struct Refresher {
@@ -628,6 +644,7 @@ pub struct Refresher {
     refresh_on_startup: RefreshOnStartup,
     synchronize_with: Option<SynchronizedTable>,
     snapshot_config: Option<SnapshotCreationConfig>,
+    snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
     snapshot_interval_task: Option<tokio::task::JoinHandle<()>>,
 
     initial_load_completed: Arc<AtomicBool>,
@@ -692,6 +709,7 @@ impl Refresher {
             semaphore: None,
             on_complete_notification: None,
             snapshot_config: None,
+            snapshot_refresh_state: None,
             snapshot_interval_task: None,
             metrics: None,
             cpu_runtime,
@@ -759,6 +777,16 @@ impl Refresher {
         snapshot_config: Option<SnapshotCreationConfig>,
     ) -> &mut Self {
         self.snapshot_config = snapshot_config;
+        self
+    }
+
+    /// Configure per-dataset state for `RefreshMode::Snapshot`. Required when
+    /// the refresh mode is Snapshot.
+    pub fn with_snapshot_refresh_state(
+        &mut self,
+        state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    ) -> &mut Self {
+        self.snapshot_refresh_state = state;
         self
     }
 
@@ -862,7 +890,8 @@ impl Refresher {
             (
                 AccelerationRefreshMode::Append(receiver)
                 | AccelerationRefreshMode::Full(receiver)
-                | AccelerationRefreshMode::Caching(receiver),
+                | AccelerationRefreshMode::Caching(receiver)
+                | AccelerationRefreshMode::Snapshot(receiver),
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
@@ -937,6 +966,9 @@ impl Refresher {
 
         refresh_task_runner =
             refresh_task_runner.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
+        refresh_task_runner =
+            refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
 
         let mut refresh_task_runner = refresh_task_runner.build();
 
@@ -2449,6 +2481,44 @@ mod tests {
                 assert_fn: Box::new(
                     |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
                 ),
+            },
+            TestCase {
+                description: "Caching mode with RefreshOnStartup::Always and no check_interval should refresh immediately",
+                refresh_mode: RefreshMode::Caching,
+                refresh_on_startup: RefreshOnStartup::Always,
+                checkpoint: None,
+                check_interval: None,
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
+            },
+            TestCase {
+                description: "Caching mode with RefreshOnStartup::Always and check_interval should refresh immediately",
+                refresh_mode: RefreshMode::Caching,
+                refresh_on_startup: RefreshOnStartup::Always,
+                checkpoint: None,
+                check_interval: Some(Duration::from_secs(900)),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
+            },
+            TestCase {
+                description: "Caching mode with RefreshOnStartup::Auto and check_interval should wait check_interval",
+                refresh_mode: RefreshMode::Caching,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: None,
+                check_interval: Some(Duration::from_secs(900)),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration == Duration::from_secs(900)),
+                ),
+            },
+            TestCase {
+                description: "Caching mode with RefreshOnStartup::Auto and no check_interval should be disabled",
+                refresh_mode: RefreshMode::Caching,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: None,
+                check_interval: None,
+                assert_fn: Box::new(|result| matches!(result, NextRefresh::Disabled)),
             },
         ];
 
