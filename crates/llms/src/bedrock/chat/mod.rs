@@ -54,13 +54,14 @@ use aws_sdk_bedrockruntime::types::builders::{
 };
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ContentBlockDelta as ContentBlockDeltaType, ContentBlockDeltaEvent,
-    ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent, ConversationRole,
-    ConverseStreamMetadataEvent, ConverseStreamOutput as ConverseStreamOutputPacket,
-    GuardrailConfiguration, GuardrailStreamConfiguration, InferenceConfiguration,
-    JsonSchemaDefinition, Message, MessageStartEvent, MessageStopEvent, OutputConfig, OutputFormat,
-    OutputFormatStructure, OutputFormatType, SystemContentBlock, ToolResultContentBlock,
-    ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
+    CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta as ContentBlockDeltaType,
+    ContentBlockDeltaEvent, ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent,
+    ConversationRole, ConverseStreamMetadataEvent,
+    ConverseStreamOutput as ConverseStreamOutputPacket, GuardrailConfiguration,
+    GuardrailStreamConfiguration, InferenceConfiguration, JsonSchemaDefinition, Message,
+    MessageStartEvent, MessageStopEvent, OutputConfig, OutputFormat, OutputFormatStructure,
+    OutputFormatType, SystemContentBlock, ToolResultContentBlock, ToolResultStatus,
+    ToolUseBlockDelta, ToolUseBlockStart,
 };
 use aws_smithy_types::Document;
 use futures::stream::StreamExt;
@@ -349,6 +350,27 @@ impl BedrockConverse {
             .collect()
     }
 
+    fn prompt_cache_point() -> Result<CachePointBlock, BuildError> {
+        CachePointBlock::builder()
+            .r#type(CachePointType::Default)
+            .build()
+    }
+
+    fn add_prompt_cache_point(
+        system: &mut Vec<SystemContentBlock>,
+        messages: &mut [Message],
+    ) -> Result<(), BuildError> {
+        let cache_point = Self::prompt_cache_point()?;
+        if let Some(last_message) = messages.last_mut() {
+            last_message
+                .content
+                .push(ContentBlock::CachePoint(cache_point));
+        } else {
+            system.push(SystemContentBlock::CachePoint(cache_point));
+        }
+        Ok(())
+    }
+
     fn output_config(
         response_format: Option<ResponseFormat>,
     ) -> Result<Option<OutputConfig>, OpenAIError> {
@@ -415,6 +437,7 @@ impl BedrockConverse {
             tool_choice,
             tools,
             response_format,
+            prompt_cache_key,
             ..
         } = req;
 
@@ -430,9 +453,13 @@ impl BedrockConverse {
             )
         });
 
-        let system = Self::convert_system_messages(system);
-        let messages =
+        let mut system = Self::convert_system_messages(system);
+        let mut messages =
             Self::convert_non_system_messages(messages).map_err(|e| to_api_error(e.to_string()))?;
+        if prompt_cache_key.is_some() {
+            Self::add_prompt_cache_point(&mut system, &mut messages)
+                .map_err(|e| to_api_error(e.to_string()))?;
+        }
 
         let guardrails: Option<GuardrailStreamConfiguration> = self
             .guardrail
@@ -476,6 +503,7 @@ impl BedrockConverse {
             tools,
             tool_choice,
             response_format,
+            prompt_cache_key,
             ..
         } = req;
 
@@ -491,9 +519,13 @@ impl BedrockConverse {
             )
         });
 
-        let system = Self::convert_system_messages(system);
-        let messages =
+        let mut system = Self::convert_system_messages(system);
+        let mut messages =
             Self::convert_non_system_messages(messages).map_err(|e| to_api_error(e.to_string()))?;
+        if prompt_cache_key.is_some() {
+            Self::add_prompt_cache_point(&mut system, &mut messages)
+                .map_err(|e| to_api_error(e.to_string()))?;
+        }
 
         let guardrails: Option<GuardrailConfiguration> = self
             .guardrail
@@ -825,5 +857,51 @@ impl Chat for BedrockConverse {
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::chat::ChatCompletionRequestUserMessageArgs;
+
+    #[test]
+    fn prompt_cache_point_is_added_to_last_message() {
+        let messages = vec![
+            ChatCompletionRequestUserMessageArgs::default()
+                .content("Reusable context")
+                .build()
+                .expect("user message should build")
+                .into(),
+        ];
+        let mut system = vec![];
+        let mut messages = BedrockConverse::convert_non_system_messages(messages)
+            .expect("bedrock messages should convert");
+
+        BedrockConverse::add_prompt_cache_point(&mut system, &mut messages)
+            .expect("cache point should build");
+
+        assert!(matches!(
+            messages
+                .last()
+                .and_then(|message| message.content.last()),
+            Some(ContentBlock::CachePoint(cache_point))
+                if cache_point.r#type == CachePointType::Default
+        ));
+    }
+
+    #[test]
+    fn prompt_cache_point_is_added_to_system_when_messages_are_empty() {
+        let mut system = vec![];
+        let mut messages = vec![];
+
+        BedrockConverse::add_prompt_cache_point(&mut system, &mut messages)
+            .expect("cache point should build");
+
+        assert!(matches!(
+            system.last(),
+            Some(SystemContentBlock::CachePoint(cache_point))
+                if cache_point.r#type == CachePointType::Default
+        ));
     }
 }

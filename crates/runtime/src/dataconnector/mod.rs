@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{self, AcceleratedTable};
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
@@ -432,6 +432,12 @@ pub async fn register_connector_factory(
     registry.insert(name.to_string(), connector_factory);
 }
 
+/// Look up a registered connector factory by name.
+pub async fn get_connector_factory(name: &str) -> Option<Arc<dyn DataConnectorFactory>> {
+    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    guard.get(name).map(Arc::clone)
+}
+
 /// Create a new `DataConnector` by name.
 ///
 /// # Returns
@@ -559,9 +565,12 @@ pub trait DataConnectorFactory: Send + Sync {
         &[]
     }
 
-    /// Returns a static schema for the given dataset if this connector's
-    /// schema is fully determined by configuration and does not require
-    /// any source-facing I/O or connector construction.
+    /// Returns a static schema for the given dataset if this connector
+    /// **intrinsically** knows the schema from configuration alone
+    /// — i.e. without contacting the source and without relying on a
+    /// user-declared `columns:` block. (User-declared columns are
+    /// handled separately by the runtime's deferral dispatch as a
+    /// fallback when this method returns `None`.)
     ///
     /// Called during dataset registration **before** the connector itself
     /// is built (no `create` call is required first). Implementations may
@@ -578,7 +587,9 @@ pub trait DataConnectorFactory: Send + Sync {
     /// being silently retried (the static schema is configuration, not
     /// source state).
     ///
-    /// Default: `None`. Most connectors infer schema from the source.
+    /// Default: `None`. Most connectors do not have an intrinsic
+    /// configuration-only schema and instead rely on either source
+    /// inference or the user-declared `columns:` fallback.
     fn static_schema(&self, _params: &ConnectorParams, _dataset: &Dataset) -> Option<SchemaRef> {
         None
     }
@@ -654,6 +665,23 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         _dataset: &Dataset,
         _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
+        Ok(())
+    }
+
+    /// A hook called **before** the accelerated table is built, giving the
+    /// connector a chance to wrap or replace the accelerator provider on the
+    /// [`Builder`](crate::accelerated_table::Builder).
+    ///
+    /// Any provider set here will be shared with the [`Refresher`] that is
+    /// created during [`Builder::build`]. Use this hook instead of
+    /// [`on_accelerated_table_registration`](Self::on_accelerated_table_registration)
+    /// when the wrapped provider must be visible to the refresh pipeline
+    /// (e.g. to recreate indexes after a data refresh).
+    async fn on_accelerator_setup(
+        &self,
+        _dataset: &Dataset,
+        _builder: &mut accelerated_table::Builder,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 

@@ -448,6 +448,20 @@ impl Builder {
         self
     }
 
+    /// Returns a clone of the accelerator `Arc`.
+    #[must_use]
+    pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.accelerator)
+    }
+
+    /// Replace the accelerator provider.
+    ///
+    /// This must be called **before** [`build`](Self::build) so that the
+    /// refresher (created during build) receives the updated provider.
+    pub fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        self.accelerator = accelerator;
+    }
+
     /// Set to only write to the accelerator (not replicate to federated source).
     /// This is used when `on_conflict` is configured - writes go only to the accelerator.
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {
@@ -1130,10 +1144,6 @@ impl AcceleratedTable {
         &self.accelerator
     }
 
-    pub(crate) fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
-        self.accelerator = accelerator;
-    }
-
     /// Add a child accelerator that should receive cached data when this parent stores new cache entries.
     /// This is used for localpod caching synchronization.
     pub async fn add_synchronized_child(&self, child_accelerator: Arc<dyn TableProvider>) {
@@ -1532,6 +1542,13 @@ impl TableProvider for AcceleratedTable {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "deletes on accelerated table {} are not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -1570,6 +1587,13 @@ impl TableProvider for AcceleratedTable {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "updates on accelerated table {} are not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {

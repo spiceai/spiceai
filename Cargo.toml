@@ -334,6 +334,8 @@ twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }
 uuid = "1"
+wasmtime = { version = "44.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
+wat = "1.248.0"
 
 flatbuffers = "25.2.10"
 
