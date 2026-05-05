@@ -83,6 +83,11 @@ pub fn from_app(app: App) -> SpicepodDefinition {
             .into_iter()
             .map(ComponentOrReference::Component)
             .collect(),
+        functions: app
+            .functions
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
         version: SpicepodVersion::default(),
         kind: SpicepodKind::default(),
         metadata: HashMap::default(),

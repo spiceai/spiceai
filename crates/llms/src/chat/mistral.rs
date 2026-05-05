@@ -60,6 +60,10 @@ use std::{
 };
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
+/// Preserve the existing local LLM scheduler concurrency. Paged attention uses
+/// the same cap so enabling cache-aware scheduling does not change request parallelism.
+const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
+
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
     counter: AtomicUsize,
@@ -133,17 +137,33 @@ impl MistralLlama {
             .and_then(|p| p.as_path().extension())
             .and_then(|e| e.to_str());
 
+        let paged_attn_config = Self::paged_attention_config(&device);
+        let paged_attn_requested = paged_attn_config.is_some();
         let pipeline = match extension {
-            Some("ggml") => {
-                Self::load_ggml_pipeline(paths, &device, &model_id, chat_template_literal)?
-            }
-            Some("gguf") => {
-                Self::load_gguf_pipeline(paths, &device, &model_id, chat_template_literal)?
-            }
-            _ => Self::load_default_pipeline(paths, &device, &model_id, chat_template_literal)?,
+            Some("ggml") => Self::load_ggml_pipeline(
+                paths,
+                &device,
+                &model_id,
+                chat_template_literal,
+                paged_attn_config,
+            )?,
+            Some("gguf") => Self::load_gguf_pipeline(
+                paths,
+                &device,
+                &model_id,
+                chat_template_literal,
+                paged_attn_config,
+            )?,
+            _ => Self::load_default_pipeline(
+                paths,
+                &device,
+                &model_id,
+                chat_template_literal,
+                paged_attn_config,
+            )?,
         };
 
-        Ok(Self::from_pipeline(pipeline).await)
+        Ok(Self::from_pipeline(pipeline, paged_attn_requested).await)
     }
 
     /// Create paths object, [`ModelPaths`], to create new [`MistralLlama`].
@@ -178,6 +198,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
         NormalLoaderBuilder::new(
@@ -197,7 +218,7 @@ impl MistralLlama {
             true,
             DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
-            None,
+            paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
@@ -207,6 +228,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         // Note: GGUF supports chat templates in the file, but since GGML/llama.cpp does
         // not write them into GGUF with their conversions, often it requires user
@@ -256,7 +278,7 @@ impl MistralLlama {
             true,
             DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
-            None,
+            paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
@@ -266,6 +288,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let tokenizer = paths.get_tokenizer_filename().to_string_lossy().to_string();
         GGMLLoaderBuilder::new(
@@ -286,9 +309,54 @@ impl MistralLlama {
             true,
             DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
-            None,
+            paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+    }
+
+    fn paged_attention_config(device: &Device) -> Option<mistralrs::PagedAttentionConfig> {
+        if matches!(device, Device::Cpu) || !Self::paged_attention_supported() {
+            return None;
+        }
+
+        match mistralrs::PagedAttentionMetaBuilder::default().build() {
+            Ok(config) => Some(config),
+            Err(e) => {
+                tracing::warn!("Failed to initialize local LLM paged attention cache: {e}");
+                None
+            }
+        }
+    }
+
+    fn paged_attention_supported() -> bool {
+        cfg!(all(feature = "cuda", target_family = "unix"))
+    }
+
+    fn default_scheduler_config() -> mistralrs::SchedulerConfig {
+        mistralrs::SchedulerConfig::DefaultScheduler {
+            method: mistralrs::DefaultSchedulerMethod::Fixed(LOCAL_LLM_MAX_SEQS),
+        }
+    }
+
+    async fn scheduler_config(
+        pipeline: &Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
+        paged_attn_requested: bool,
+    ) -> mistralrs::SchedulerConfig {
+        if paged_attn_requested {
+            let cache_config = pipeline.lock().await.get_metadata().cache_config.clone();
+            if let Some(config) = cache_config {
+                return mistralrs::SchedulerConfig::PagedAttentionMeta {
+                    max_num_seqs: LOCAL_LLM_MAX_SEQS.get(),
+                    config,
+                };
+            }
+
+            tracing::debug!(
+                "Paged attention was requested for local LLM caching, but the model did not initialize paged cache metadata. Falling back to the default scheduler."
+            );
+        }
+
+        Self::default_scheduler_config()
     }
 
     /// Get the device to use for the model.
@@ -390,6 +458,8 @@ impl MistralLlama {
             TokenSource::Literal(secret.expose_secret().to_string())
         });
 
+        let paged_attn_config = Self::paged_attention_config(&device);
+        let paged_attn_requested = paged_attn_config.is_some();
         let pipeline = loader?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
@@ -399,28 +469,22 @@ impl MistralLlama {
                 false,
                 DeviceMapSetting::Auto(device_map_params),
                 None,
-                None,
+                paged_attn_config,
             )
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?;
 
-        Ok(Self::from_pipeline(pipeline).await)
+        Ok(Self::from_pipeline(pipeline, paged_attn_requested).await)
     }
 
-    #[expect(clippy::expect_used)]
-    async fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Self {
+    async fn from_pipeline(
+        pipeline: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
+        paged_attn_requested: bool,
+    ) -> Self {
+        let scheduler_config = Self::scheduler_config(&pipeline, paged_attn_requested).await;
         Self {
-            pipeline: MistralRsBuilder::new(
-                p,
-                mistralrs::SchedulerConfig::DefaultScheduler {
-                    method: mistralrs::DefaultSchedulerMethod::Fixed(
-                        NonZeroUsize::new(5).expect("unreachable 5 > 0"),
-                    ),
-                },
-                false,
-                None,
-            )
-            .build()
-            .await,
+            pipeline: MistralRsBuilder::new(pipeline, scheduler_config, false, None)
+                .build()
+                .await,
             counter: AtomicUsize::new(0),
         }
     }

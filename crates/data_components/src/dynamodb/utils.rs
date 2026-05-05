@@ -60,7 +60,11 @@ pub fn scalar_to_attribute_value(
     time_format: &str,
 ) -> datafusion::error::Result<AttributeValue> {
     match scalar {
-        ScalarValue::Utf8(Some(s)) => Ok(AttributeValue::S(s.clone())),
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+            Ok(AttributeValue::S(s.clone()))
+        }
+        ScalarValue::Int8(Some(i)) => Ok(AttributeValue::N(i.to_string())),
+        ScalarValue::Int16(Some(i)) => Ok(AttributeValue::N(i.to_string())),
         ScalarValue::Int64(Some(i)) => Ok(AttributeValue::N(i.to_string())),
         ScalarValue::Int32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
         ScalarValue::UInt8(Some(i)) => Ok(AttributeValue::N(i.to_string())),
@@ -178,7 +182,12 @@ pub fn scalar_to_attribute_value(
             aws_sdk_dynamodb::primitives::Blob::new(b.clone()),
         )),
         ScalarValue::TimestampSecond(Some(s), tz_opt) => {
-            timestamp_to_attribute(*s * 1_000, tz_opt.as_ref(), time_format)
+            let millis = s.checked_mul(1_000).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "TimestampSecond value {s} overflows when converting to milliseconds"
+                ))
+            })?;
+            timestamp_to_attribute(millis, tz_opt.as_ref(), time_format)
         }
         ScalarValue::TimestampMillisecond(Some(ms), tz_opt) => {
             timestamp_to_attribute(*ms, tz_opt.as_ref(), time_format)
@@ -190,6 +199,7 @@ pub fn scalar_to_attribute_value(
             timestamp_to_attribute(*ns / 1_000_000, tz_opt.as_ref(), time_format)
         }
         ScalarValue::Null => Ok(AttributeValue::Null(true)),
+        other if other.is_null() => Ok(AttributeValue::Null(true)),
         _ => Err(DataFusionError::NotImplemented(
             "ScalarValue type not supported".to_string(),
         )),
@@ -318,7 +328,7 @@ mod tests {
 
     fn assert_number(scalar: &ScalarValue, expected: &str) {
         let result = scalar_to_attribute_value(scalar, "%Y-%m-%dT%H:%M:%S%z")
-            .expect("scalar_to_attribute_value should convert decimal scalars to numbers");
+            .expect("scalar_to_attribute_value should convert numeric scalars to numbers");
         match result {
             AttributeValue::N(n) => assert_eq!(n, expected, "for scalar {scalar:?}"),
             other => panic!("Expected AttributeValue::N, got {other:?}"),
@@ -521,5 +531,71 @@ mod tests {
     fn float64_finite_accepted() {
         let scalar = ScalarValue::Float64(Some(2.719));
         assert_number(&scalar, "2.719");
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed NULL handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn typed_null_utf8_produces_dynamodb_null() {
+        let scalar = ScalarValue::Utf8(None);
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z")
+            .expect("typed Utf8 null should produce DynamoDB NULL");
+        assert_eq!(result, AttributeValue::Null(true));
+    }
+
+    #[test]
+    fn typed_null_int32_produces_dynamodb_null() {
+        let scalar = ScalarValue::Int32(None);
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z")
+            .expect("typed Int32 null should produce DynamoDB NULL");
+        assert_eq!(result, AttributeValue::Null(true));
+    }
+
+    #[test]
+    fn untyped_null_produces_dynamodb_null() {
+        let scalar = ScalarValue::Null;
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z")
+            .expect("untyped null should produce DynamoDB NULL");
+        assert_eq!(result, AttributeValue::Null(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // Overflow handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn timestamp_second_overflow_returns_error() {
+        let scalar = ScalarValue::TimestampSecond(Some(i64::MAX), None);
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
+        assert!(
+            result.is_err(),
+            "TimestampSecond near i64::MAX should fail on overflow"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional type coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn int8_accepted() {
+        let scalar = ScalarValue::Int8(Some(42));
+        assert_number(&scalar, "42");
+    }
+
+    #[test]
+    fn int16_accepted() {
+        let scalar = ScalarValue::Int16(Some(-1000));
+        assert_number(&scalar, "-1000");
+    }
+
+    #[test]
+    fn large_utf8_accepted() {
+        let scalar = ScalarValue::LargeUtf8(Some("hello".to_string()));
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z")
+            .expect("LargeUtf8 should be accepted");
+        assert_eq!(result, AttributeValue::S("hello".to_string()));
     }
 }

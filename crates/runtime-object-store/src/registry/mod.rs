@@ -561,6 +561,13 @@ impl SpiceObjectStoreRegistry {
         let password = params.get("pass").map(ToOwned::to_owned).ok_or_else(|| {
             DataFusionError::Configuration("No password provided for SMB".to_string())
         })?;
+        let port = params
+            .get("port")
+            .map(|p| {
+                p.parse::<u16>()
+                    .map_err(|_| DataFusionError::Configuration(format!("Invalid SMB port: {p}")))
+            })
+            .transpose()?;
         let client_timeout = params
             .get("client_timeout")
             .map(|timeout| fundu::parse_duration(timeout))
@@ -574,6 +581,7 @@ impl SpiceObjectStoreRegistry {
 
         Ok(Arc::new(SMBObjectStore::new(
             host.to_string(),
+            port,
             share,
             user,
             password,
