@@ -172,6 +172,11 @@ pub enum Error {
     ))]
     PrimaryKeyTypeNotYetSupported { data_type: String },
 
+    #[snafu(display(
+        "Primary key column '{field_name}' contains a NULL value in a CDC change record. NULL primary keys cannot be used for delete or upsert operations."
+    ))]
+    PrimaryKeyNullValue { field_name: String },
+
     #[snafu(display("Invalid time column format: {source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
