@@ -523,7 +523,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
