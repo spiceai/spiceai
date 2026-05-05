@@ -31,7 +31,7 @@ use datafusion::{
     sql::TableReference,
 };
 use futures::TryStreamExt;
-use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+use runtime_request_context::{CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext};
 use snafu::ResultExt;
 use std::sync::OnceLock;
 use std::{collections::HashSet, hash::Hasher, sync::Arc};
@@ -395,7 +395,13 @@ impl Query {
                     CacheKey::LogicalPlan(p) => Some(*p),
                     _ => None,
                 };
-                Self::trigger_background_query_revalidation(Arc::clone(df), sql, plan, raw_key);
+                Self::trigger_background_query_revalidation(
+                    Arc::clone(df),
+                    sql,
+                    plan,
+                    raw_key,
+                    request_context.cache_namespace(),
+                );
             }
         }
 
@@ -462,16 +468,21 @@ impl Query {
     /// - The `DataFusion` context is dropped (runtime shutdown)
     /// - The query execution is interrupted via the session context
     ///
-    /// Creates a background request context for cache revalidation.
+    /// Build the request context that drives a background SWR revalidation
+    /// query. We must inherit the originating request's cache namespace so
+    /// the refreshed entry lands in the same scope (otherwise a per-user
+    /// triggered refresh would write into the System scope and the user
+    /// would never see the new data on their next request).
     ///
-    /// Uses `NoCache` to prevent the background query from going through the normal
-    /// cache lookup/store path. This avoids false cache misses and duplicate storage.
-    /// The `cache_revalidation_result` function handles storing results under the correct
-    /// original cache key that triggered the stale-while-revalidate.
-    fn create_background_context() -> Arc<RequestContext> {
+    /// `NoCache` is intentional: the revalidation flow stores the result
+    /// directly under the original cache key via `cache_revalidation_result`,
+    /// so going through the normal cache lookup/store path would be
+    /// redundant and would also confuse hit/miss accounting.
+    fn create_background_context(namespace: CacheNamespace) -> Arc<RequestContext> {
         Arc::new(
             RequestContext::builder(Protocol::Internal)
                 .with_cache_control(CacheControl::NoCache)
+                .with_cache_namespace(namespace)
                 .build(),
         )
     }
@@ -571,6 +582,7 @@ impl Query {
         sql: &str,
         plan: Option<&LogicalPlan>,
         cache_key: RawCacheKey,
+        namespace: CacheNamespace,
     ) {
         // Static Moka cache to track ongoing revalidation tasks by cache key.
         // This provides built-in single-in-flight semantics - if multiple requests
@@ -587,7 +599,7 @@ impl Query {
         let cache_key_u64 = cache_key.as_u64();
 
         // Create a background request context with NoCache to bypass cache lookup
-        let background_context = Self::create_background_context();
+        let background_context = Self::create_background_context(namespace);
 
         // Clone sql and plan for the async block
         let sql_owned = sql.to_string();
@@ -803,6 +815,90 @@ mod tests {
 
         let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
+    }
+
+    /// SWR background revalidation must run under the originating user's
+    /// namespace, not `System`. Without this, any sub-cache lookups in the
+    /// background task (planner cache, accelerator cache) would land in the
+    /// wrong scope and either leak across users or never serve the user
+    /// who triggered the refresh.
+    ///
+    /// We verify the contract end-to-end: Alice triggers SWR, the background
+    /// refresh runs, and a second principal (Bob) still sees a MISS for the
+    /// same SQL. If the background context fell back to `System`, Bob would
+    /// either see a cross-user HIT (security regression) or Alice's refresh
+    /// would land in `System` and leave her STALE.
+    #[tokio::test]
+    async fn test_swr_revalidation_inherits_originating_namespace() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("1s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            stale_while_revalidate_ttl: Some("5s".to_string()),
+            ..Default::default()
+        }))
+        .await;
+
+        let alice = create_test_request_context_in_namespace(
+            CacheControl::MaxStale(CacheKeyType::Raw, Some(Duration::from_secs(5))),
+            CacheNamespace::Principal("apikey:alice".into()),
+        );
+        let bob = create_test_request_context_in_namespace(
+            CacheControl::Cache(CacheKeyType::Raw),
+            CacheNamespace::Principal("apikey:bob".into()),
+        );
+
+        // Alice populates her namespace.
+        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let r = q.run().await.expect("ok");
+                assert_eq!(r.cache_status, CacheStatus::CacheMiss);
+                let _ = r.data.try_collect::<Vec<_>>().await.expect("drain");
+            })
+            .await;
+
+        // Wait past TTL but within stale-while-revalidate window.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Alice's stale request triggers background revalidation.
+        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let r = q.run().await.expect("ok");
+                assert_eq!(r.cache_status, CacheStatus::CacheStaleWhileRevalidate);
+                let _ = r.data.try_collect::<Vec<_>>().await.expect("drain");
+            })
+            .await;
+
+        // Allow the background task to finish.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(cp) = df.results_cache_provider() {
+            cp.run_pending_tasks().await;
+        }
+
+        // Alice now sees a fresh HIT — proving SWR wrote back into her
+        // namespace, not into System.
+        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let r = q.run().await.expect("ok");
+                assert_eq!(r.cache_status, CacheStatus::CacheHit);
+            })
+            .await;
+
+        // Bob still sees MISS for the same SQL — SWR did not bleed Alice's
+        // entry into a cross-user scope.
+        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
+        Arc::clone(&bob)
+            .scope(async move {
+                let r = q.run().await.expect("ok");
+                assert_eq!(
+                    r.cache_status,
+                    CacheStatus::CacheMiss,
+                    "SWR refresh must not leak into bob's scope"
+                );
+            })
+            .await;
     }
 
     /// Two distinct principals running the same SQL must each see a cache
