@@ -223,6 +223,14 @@ The `Mcp-Session-Id` header must identify an existing session created via `POST 
                         .description("Unknown or expired `Mcp-Session-Id`.")
                         .build(),
                 )
+                .response(
+                    "403",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list.",
+                        )
+                        .build(),
+                )
                 .build(),
         );
         openai.paths.add_path_operation(
@@ -246,6 +254,14 @@ The `Mcp-Session-Id` header must identify an existing session created via `POST 
                     "404",
                     utoipa::openapi::ResponseBuilder::new()
                         .description("Unknown or already-terminated `Mcp-Session-Id`.")
+                        .build(),
+                )
+                .response(
+                    "403",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list.",
+                        )
                         .build(),
                 )
                 .build(),
