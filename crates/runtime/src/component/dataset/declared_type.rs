@@ -19,7 +19,7 @@ limitations under the License.
 //! Accepts three families of type expressions:
 //!
 //!   1. **Arrow display forms** — `Int64`, `Utf8`, `Float64`, `Bool`,
-//!      `Date32`, `Timestamp(Microsecond, UTC)`, `List<Int64>`,
+//!      `Date32`, `Timestamp(Nanosecond, UTC)`, `List<Int64>`,
 //!      `Decimal128(p, s)`, etc. Routed through Arrow's
 //!      `DataType::from_str` for primitive lookup.
 //!   2. **Postgres / SQL forms** via `DataFusion`'s `sqlparser` —
@@ -96,7 +96,7 @@ pub enum ParseTypeError {
         "Could not parse column type `{input}`. \
          Accepted forms include Postgres types (e.g. `bigint`, `text`, `numeric(18,4)`, \
          `timestamptz`, `text[]`), Arrow display forms (e.g. `Int64`, `Utf8`, \
-         `Timestamp(Microsecond, UTC)`, `List<Int64>`, `Decimal128(18, 4)`), and \
+         `Timestamp(Nanosecond, UTC)`, `List<Int64>`, `Decimal128(18, 4)`), and \
          Map types (`Map<K, V>` / `map<k, v>`)."
     ))]
     Unrecognized { input: String },
@@ -155,6 +155,23 @@ enum TypeToken {
     /// `Decimal128(18, 4)` and `varchar(255)`.
     #[regex(r"[0-9]+", |lex| lex.slice().to_owned())]
     Number(String),
+
+    /// Double- or single-quoted string. Used inside Arrow display
+    /// forms such as `Timestamp(Nanosecond, "UTC")`. Surrounding
+    /// quotes are preserved in the token text so that the leaf
+    /// reconstruction step round-trips the original input.
+    #[regex(r#""[^"]*""#, |lex| lex.slice().to_owned())]
+    #[regex(r#"'[^']*'"#, |lex| lex.slice().to_owned())]
+    QuotedString(String),
+
+    /// Punctuation that may appear inside type arguments (notably
+    /// timezone offsets like `+05:30`).
+    #[token(":")]
+    Colon,
+    #[token("+")]
+    Plus,
+    #[token("-")]
+    Minus,
 
     #[token("(")]
     LParen,
@@ -364,10 +381,76 @@ fn leaf_lookup(s: &str) -> Option<DataType> {
     if let Some(dt) = parse_pg_alias(s) {
         return Some(dt);
     }
+    if let Some(dt) = parse_arrow_timestamp_display(s) {
+        return Some(dt);
+    }
     if let Ok(dt) = DataType::from_str(s) {
         return Some(dt);
     }
     parse_via_sqlparser(s).ok()
+}
+
+/// Parse Arrow's `Display` form for `Timestamp(<unit>[, <tz>])` and
+/// `Time32`/`Time64(<unit>)`. Arrow's own `DataType::from_str` only
+/// accepts the no-arguments and `None`-timezone variants for these,
+/// so users cannot otherwise round-trip `"{:?}", DataType::Timestamp(...)`
+/// through the declared-type parser. Examples this accepts:
+///
+///   * `Timestamp(Nanosecond, UTC)`
+///   * `Timestamp(Microsecond, "UTC")`
+///   * `Timestamp(Millisecond, +05:30)`
+///   * `Time64(Microsecond)`
+///   * `Time32(Second)`
+fn parse_arrow_timestamp_display(s: &str) -> Option<DataType> {
+    let s = s.trim();
+    let (head, args) = split_call(s)?;
+    let head_lower = head.to_ascii_lowercase();
+    match head_lower.as_str() {
+        "timestamp" => {
+            let mut parts = args.splitn(2, ',');
+            let unit = parse_time_unit(parts.next()?.trim())?;
+            let tz = match parts.next() {
+                None => None,
+                Some(rest) => match rest.trim() {
+                    "None" => None,
+                    other => Some(strip_quotes(other).to_string().into()),
+                },
+            };
+            Some(DataType::Timestamp(unit, tz))
+        }
+        "time32" => Some(DataType::Time32(parse_time_unit(args.trim())?)),
+        "time64" => Some(DataType::Time64(parse_time_unit(args.trim())?)),
+        _ => None,
+    }
+}
+
+fn split_call(s: &str) -> Option<(&str, &str)> {
+    let open = s.find('(')?;
+    if !s.ends_with(')') {
+        return None;
+    }
+    Some((&s[..open], &s[open + 1..s.len() - 1]))
+}
+
+fn parse_time_unit(s: &str) -> Option<TimeUnit> {
+    match s.to_ascii_lowercase().as_str() {
+        "second" | "s" => Some(TimeUnit::Second),
+        "millisecond" | "ms" => Some(TimeUnit::Millisecond),
+        "microsecond" | "us" => Some(TimeUnit::Microsecond),
+        "nanosecond" | "ns" => Some(TimeUnit::Nanosecond),
+        _ => None,
+    }
+}
+
+fn strip_quotes(s: &str) -> &str {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
+        || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Postgres aliases that `sqlparser` either lacks or maps to a different
@@ -400,7 +483,7 @@ fn parse_pg_alias(input: &str) -> Option<DataType> {
             Some(DataType::Int16)
         }
         "timestamptz" => Some(DataType::Timestamp(
-            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
             Some("UTC".into()),
         )),
         // Lowercase aliases for common Arrow primitives.
@@ -510,13 +593,13 @@ fn sql_to_arrow_type(sql: &SqlDataType) -> Option<DataType> {
         // Date / time
         SqlDataType::Date | SqlDataType::Date32 => DataType::Date32,
         SqlDataType::Time(_, _) => DataType::Time64(TimeUnit::Microsecond),
-        SqlDataType::Datetime(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
+        SqlDataType::Datetime(_) => DataType::Timestamp(TimeUnit::Nanosecond, None),
         SqlDataType::Timestamp(_, tz) => match tz {
             TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => {
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
             }
             TimezoneInfo::None | TimezoneInfo::WithoutTimeZone => {
-                DataType::Timestamp(TimeUnit::Microsecond, None)
+                DataType::Timestamp(TimeUnit::Nanosecond, None)
             }
         },
         SqlDataType::Interval { .. } => DataType::Interval(IntervalUnit::MonthDayNano),
@@ -614,17 +697,22 @@ mod tests {
 
     #[test]
     fn postgres_timestamps() {
+        // Postgres `timestamptz` / `timestamp with time zone` are
+        // returned by the Postgres connector as `Nanosecond, UTC`,
+        // so the declared-type parser uses the same precision to
+        // avoid spurious schema mismatches in the deferred
+        // registration path.
         assert_eq!(
             parse("timestamptz"),
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
         );
         assert_eq!(
             parse("timestamp with time zone"),
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
         );
         assert_eq!(
             parse("timestamp"),
-            DataType::Timestamp(TimeUnit::Microsecond, None)
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
         assert_eq!(parse("date"), DataType::Date32);
     }
@@ -659,6 +747,39 @@ mod tests {
         assert_eq!(parse("Boolean"), DataType::Boolean);
         assert_eq!(parse("Date32"), DataType::Date32);
         assert_eq!(parse("Binary"), DataType::Binary);
+    }
+
+    #[test]
+    fn arrow_timestamp_display_with_timezone() {
+        assert_eq!(
+            parse("Timestamp(Nanosecond, UTC)"),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            parse("Timestamp(Microsecond, \"UTC\")"),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            parse("Timestamp(Millisecond, +05:30)"),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("+05:30".into()))
+        );
+        assert_eq!(
+            parse("Timestamp(Second, None)"),
+            DataType::Timestamp(TimeUnit::Second, None)
+        );
+    }
+
+    #[test]
+    fn arrow_time_display_units() {
+        assert_eq!(parse("Time32(Second)"), DataType::Time32(TimeUnit::Second));
+        assert_eq!(
+            parse("Time64(Microsecond)"),
+            DataType::Time64(TimeUnit::Microsecond)
+        );
+        assert_eq!(
+            parse("Time64(Nanosecond)"),
+            DataType::Time64(TimeUnit::Nanosecond)
+        );
     }
 
     #[test]
