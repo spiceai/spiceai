@@ -993,25 +993,10 @@ impl Query {
             }
             .instrument(span.clone());
 
-        // Heap-allocate this large async state machine so the surrounding
-        // `run_internal` future stays small. Without this, every caller's
-        // state machine inlines the full inner-block state at each
-        // `Query::run().await` site. Test bodies that chain many `run()`
-        // calls inside one outer async block (e.g.
-        // `cayenne::test_cayenne_dml_comprehensive` with 17 scenarios) end
-        // up with a multi-MB future that is constructed on the stack before
-        // being moved to the heap, which can overflow the default 2 MB
-        // tokio worker stack on Linux.
-        //
-        // Cost: one small heap allocation per query (~hundreds of bytes,
-        // freed when the query ends). This is negligible next to the dozens
-        // of allocations DataFusion already performs during planning and
-        // execution, and same-lifetime allocations do not fragment the
-        // heap on jemalloc / mimalloc / glibc.
-        let query_result_fut: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<QueryResult>> + Send>,
-        > = Box::pin(query_result);
-        let query_result = query_result_fut.await;
+        // Keep this large async block out of callers' state machines. This
+        // preserves the concrete future type, avoiding dynamic dispatch while
+        // still moving the state machine itself to the heap.
+        let query_result = Box::pin(query_result).await;
 
         match query_result {
             Ok(result) => Ok(result),
