@@ -1032,6 +1032,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_active_requires_write_access() {
+        let rt = test_runtime().await;
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Http).build());
+        context
+            .set_auth_principal(Arc::new(ApiKey::ReadOnly {
+                key: "read-only".to_string(),
+            }) as AuthPrincipalRef)
+            .expect("auth principal should be set");
+
+        let response = context
+            .scope(cancel_active(
+                Extension(rt),
+                Path(Uuid::new_v4().to_string()),
+            ))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn cancel_active_rejects_invalid_uuid() {
         let rt = test_runtime().await;
 
