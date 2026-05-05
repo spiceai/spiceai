@@ -134,11 +134,11 @@ where
     };
     // Resolve effective MCP config: programmatic Config override takes precedence over App config.
     #[cfg(feature = "mcp")]
-    let mcp_config: Option<&spicepod::component::runtime::McpConfig> = config
+    let mcp_config: Option<spicepod::component::runtime::McpConfig> = config
         .runtime
         .as_ref()
-        .and_then(|r| r.mcp.as_ref())
-        .or_else(|| app.as_ref().and_then(|a| a.runtime.mcp.as_ref()));
+        .and_then(|r| r.mcp.clone())
+        .or_else(|| app.as_ref().and_then(|a| a.runtime.mcp.clone()));
     let auth_layer = auth_provider.map(AuthLayer::new);
     let routes = routes::routes(
         &rt,
@@ -147,7 +147,7 @@ where
         auth_layer,
         &cors_config,
         #[cfg(feature = "mcp")]
-        mcp_config,
+        mcp_config.as_ref(),
     );
     drop(app);
 
