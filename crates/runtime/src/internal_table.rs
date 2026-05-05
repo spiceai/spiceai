@@ -127,8 +127,75 @@ pub async fn create_internal_accelerated_table(
     secrets: Arc<RwLock<Secrets>>,
     runtime: Arc<Runtime>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider =
-        get_local_table_provider(&name, &schema, primary_key.clone(), Arc::clone(&runtime)).await?;
+    create_internal_accelerated_table_inner(
+        runtime_status,
+        name,
+        schema,
+        primary_key,
+        acceleration,
+        refresh,
+        retention,
+        secrets,
+        runtime,
+        None,
+    )
+    .await
+}
+
+/// Like [`create_internal_accelerated_table`], but persists writes to a
+/// caller-provided federated source via the accelerated table's write-back
+/// mode. The local accelerator continues to serve as the synchronous buffer;
+/// the source provider must support `insert_into` (i.e. expose a
+/// `read_write_provider`).
+#[expect(clippy::too_many_arguments)]
+pub async fn create_internal_accelerated_table_with_persistence(
+    runtime_status: Arc<status::RuntimeStatus>,
+    name: TableReference,
+    schema: Arc<Schema>,
+    primary_key: Option<Vec<String>>,
+    acceleration: Acceleration,
+    refresh: Refresh,
+    retention: Option<Retention>,
+    secrets: Arc<RwLock<Secrets>>,
+    runtime: Arc<Runtime>,
+    persistence_source: Arc<dyn TableProvider>,
+) -> Result<Arc<AcceleratedTable>, Error> {
+    create_internal_accelerated_table_inner(
+        runtime_status,
+        name,
+        schema,
+        primary_key,
+        acceleration,
+        refresh,
+        retention,
+        secrets,
+        runtime,
+        Some(persistence_source),
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn create_internal_accelerated_table_inner(
+    runtime_status: Arc<status::RuntimeStatus>,
+    name: TableReference,
+    schema: Arc<Schema>,
+    primary_key: Option<Vec<String>>,
+    acceleration: Acceleration,
+    refresh: Refresh,
+    retention: Option<Retention>,
+    secrets: Arc<RwLock<Secrets>>,
+    runtime: Arc<Runtime>,
+    persistence_source: Option<Arc<dyn TableProvider>>,
+) -> Result<Arc<AcceleratedTable>, Error> {
+    let local_source = persistence_source.is_none();
+    let source_table_provider = match persistence_source {
+        Some(provider) => provider,
+        None => {
+            get_local_table_provider(&name, &schema, primary_key.clone(), Arc::clone(&runtime))
+                .await?
+        }
+    };
     let federated_table = Arc::new(FederatedTable::new_unchecked(Arc::clone(
         &source_table_provider,
     )));
@@ -156,7 +223,11 @@ pub async fn create_internal_accelerated_table(
         runtime.tokio_io_runtime(),
     );
     builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
-    builder.write_to_accelerator_only();
+    if local_source {
+        builder.write_to_accelerator_only();
+    } else {
+        builder.write_back();
+    }
 
     builder.retention(retention);
 

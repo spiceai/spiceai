@@ -18,7 +18,9 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
-use crate::internal_table::create_internal_accelerated_table;
+use crate::internal_table::{
+    create_internal_accelerated_table, create_internal_accelerated_table_with_persistence,
+};
 use crate::{Runtime, status};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
@@ -26,6 +28,7 @@ use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringArray, StringBui
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_schema::ArrowError;
 use data_components::arrow::struct_builder::StructBuilder;
+use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::constraints::UpsertOptions;
@@ -92,6 +95,7 @@ impl TaskSpan {
         status: Arc<status::RuntimeStatus>,
         retention_period_secs: u64,
         retention_check_interval_secs: u64,
+        persistence_source: Option<Arc<dyn TableProvider>>,
         runtime: Arc<Runtime>,
         is_cluster_mode: bool,
     ) -> Result<Arc<AcceleratedTable>, Error> {
@@ -122,20 +126,41 @@ impl TaskSpan {
             .into(),
         );
 
-        create_internal_accelerated_table(
-            status,
-            tbl_reference,
-            Arc::new(TaskSpan::table_schema(is_cluster_mode)),
-            Some(vec!["span_id".to_string()]),
-            acceleration_settings,
-            Refresh::default(),
-            retention,
-            Arc::new(RwLock::new(Secrets::default())),
-            runtime,
-        )
-        .await
-        .boxed()
-        .context(UnableToRegisterTableSnafu)
+        let schema = Arc::new(TaskSpan::table_schema(is_cluster_mode));
+        let primary_key = Some(vec!["span_id".to_string()]);
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+
+        match persistence_source {
+            Some(source) => create_internal_accelerated_table_with_persistence(
+                status,
+                tbl_reference,
+                schema,
+                primary_key,
+                acceleration_settings,
+                Refresh::default(),
+                retention,
+                secrets,
+                runtime,
+                source,
+            )
+            .await
+            .boxed()
+            .context(UnableToRegisterTableSnafu),
+            None => create_internal_accelerated_table(
+                status,
+                tbl_reference,
+                schema,
+                primary_key,
+                acceleration_settings,
+                Refresh::default(),
+                retention,
+                secrets,
+                runtime,
+            )
+            .await
+            .boxed()
+            .context(UnableToRegisterTableSnafu),
+        }
     }
 
     fn table_schema(is_cluster_mode: bool) -> Schema {

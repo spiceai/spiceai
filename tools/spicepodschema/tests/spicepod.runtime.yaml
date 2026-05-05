@@ -24,3 +24,7 @@ runtime:
   task_history:
     enabled: true
     captured_context: redacted
+    persistence:
+      from: sqlite:task_history
+      params:
+        sqlite_file: /var/lib/spice/task_history.db

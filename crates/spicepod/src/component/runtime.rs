@@ -460,6 +460,28 @@ pub struct TaskHistory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub min_plan_duration: Option<Arc<str>>,
+
+    /// Optional persistent backing store for the `runtime.task_history` table.
+    /// When set, writes are buffered to the local in-memory table and
+    /// asynchronously flushed to the configured data connector. The connector
+    /// must support DDL/DML (e.g. `postgres`, `mysql`, `sqlite`, `duckdb`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<TaskHistoryPersistence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct TaskHistoryPersistence {
+    /// The data connector source for the persistent table, in the same
+    /// `<connector>:<path>` form used by datasets (e.g.
+    /// `postgres:public.task_history`, `sqlite:/var/lib/spice/task_history.db`).
+    pub from: String,
+
+    /// Connector-specific parameters (the same keys you'd put under a
+    /// dataset's `params:` field).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub params: HashMap<String, String>,
 }
 
 fn default_none() -> Arc<str> {
@@ -489,6 +511,7 @@ impl Default for TaskHistory {
             min_sql_duration: None,
             captured_plan: None,
             min_plan_duration: None,
+            persistence: None,
         }
     }
 }
@@ -1285,6 +1308,7 @@ mod tests {
                 min_sql_duration: Some(duration_str.into()),
                 captured_plan: None,
                 min_plan_duration: None,
+                persistence: None,
             };
 
             let result = task_history
@@ -1307,6 +1331,7 @@ mod tests {
             min_sql_duration: Some("invalid".into()),
             captured_plan: None,
             min_plan_duration: None,
+            persistence: None,
         };
         assert!(
             task_history.min_sql_duration_as_millis().is_err(),
@@ -1402,6 +1427,7 @@ mod tests {
             min_sql_duration: None,
             captured_plan: Some("none".into()),
             min_plan_duration: None,
+            persistence: None,
         };
         assert_eq!(
             task_history.get_captured_plan().expect("should parse"),
@@ -1418,6 +1444,7 @@ mod tests {
             min_sql_duration: None,
             captured_plan: Some("explain".into()),
             min_plan_duration: None,
+            persistence: None,
         };
         assert_eq!(
             task_history.get_captured_plan().expect("should parse"),
@@ -1434,6 +1461,7 @@ mod tests {
             min_sql_duration: None,
             captured_plan: Some("explain analyze".into()),
             min_plan_duration: None,
+            persistence: None,
         };
         assert_eq!(
             task_history.get_captured_plan().expect("should parse"),
@@ -1450,6 +1478,7 @@ mod tests {
             min_sql_duration: None,
             captured_plan: Some("invalid".into()),
             min_plan_duration: None,
+            persistence: None,
         };
         assert!(
             task_history.get_captured_plan().is_err(),
@@ -1488,6 +1517,7 @@ mod tests {
                 min_sql_duration: None,
                 captured_plan: Some("explain".into()),
                 min_plan_duration: Some(duration_str.into()),
+                persistence: None,
             };
 
             let result = task_history
@@ -1510,6 +1540,7 @@ mod tests {
             min_sql_duration: None,
             captured_plan: Some("explain".into()),
             min_plan_duration: Some("invalid".into()),
+            persistence: None,
         };
         assert!(
             task_history.min_plan_duration_as_millis().is_err(),

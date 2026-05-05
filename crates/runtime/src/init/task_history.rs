@@ -15,13 +15,20 @@ limitations under the License.
 */
 
 use crate::cluster::DistributedNode;
+use crate::component::access::AccessMode;
+use crate::component::dataset::builder::DatasetBuilder;
+use crate::dataconnector::{
+    self, parameters::ConnectorParamsBuilder, registered_connector_names, suggest_connector,
+};
 use crate::{
-    Error, Result, Runtime, UnableToCreateBackendSnafu, datafusion::SPICE_RUNTIME_SCHEMA,
-    task_history,
+    Error, Result, Runtime, UnableToCreateBackendSnafu,
+    UnableToInitializeDataConnectorSnafu, UnknownDataConnectorSnafu,
+    datafusion::SPICE_RUNTIME_SCHEMA, task_history,
 };
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
+use spicepod::component::runtime::TaskHistoryPersistence;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -89,10 +96,16 @@ impl Runtime {
         let effective_role = self.df.cluster_config.effective_role();
         let is_cluster_mode = effective_role.is_some();
 
+        let persistence_source = match app.runtime.task_history.persistence.clone() {
+            Some(persistence) => Some(self.build_task_history_persistence_source(persistence).await?),
+            None => None,
+        };
+
         let local_table = task_history::TaskSpan::instantiate_table(
             self.status(),
             retention_period_secs,
             retention_check_interval_secs,
+            persistence_source,
             Arc::clone(&self),
             is_cluster_mode,
         )
@@ -158,5 +171,80 @@ impl Runtime {
                 table_to_register,
             )
             .context(UnableToCreateBackendSnafu)
+    }
+
+    /// Resolves the configured `task_history.persistence` block into a
+    /// writable `TableProvider` that the accelerated table will write back to.
+    /// The connector name is the prefix of `from:` (e.g. `postgres` in
+    /// `postgres:public.task_history`), and must support DDL/DML.
+    async fn build_task_history_persistence_source(
+        self: &Arc<Self>,
+        persistence: TaskHistoryPersistence,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let app = self.app();
+        let app_guard = app.read().await;
+        let app_ref =
+            app_guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| Error::UnableToTrackTaskHistory {
+                    source: task_history::Error::InvalidConfiguration {
+                        source: "task_history.persistence requires a loaded spicepod App".into(),
+                    },
+                })?;
+        drop(app_guard);
+
+        let table_name = format!(
+            "{SPICE_RUNTIME_SCHEMA}.{}",
+            task_history::DEFAULT_TASK_HISTORY_TABLE
+        );
+        let mut dataset = DatasetBuilder::try_new(persistence.from.clone(), &table_name)?
+            .with_app(app_ref)
+            .with_runtime(Arc::clone(self))
+            .build()
+            .map_err(|source| Error::InvalidSpicepodDataset { source })?;
+        dataset.access = AccessMode::ReadWrite;
+        dataset.params = persistence.params;
+
+        let source = dataset.source().to_string();
+        let dataset = Arc::new(dataset);
+
+        let connector_name: Arc<str> = Arc::from(source.as_str());
+        let params = ConnectorParamsBuilder::new(connector_name, (&dataset).into())
+            .build(self.secrets(), self.tokio_io_runtime())
+            .await
+            .context(UnableToInitializeDataConnectorSnafu)?;
+
+        let connector = match dataconnector::create_new_connector(&source, params).await {
+            Some(result) => result.context(UnableToInitializeDataConnectorSnafu)?,
+            None => {
+                let suggestion = suggest_connector(&source).await;
+                let available = registered_connector_names().await;
+                return Err(UnknownDataConnectorSnafu {
+                    data_connector: source,
+                    suggestion,
+                    available,
+                }
+                .build());
+            }
+        };
+
+        let provider = connector
+            .read_write_provider(&dataset)
+            .await
+            .ok_or_else(|| Error::UnableToTrackTaskHistory {
+                source: task_history::Error::InvalidConfiguration {
+                    source: format!(
+                        "data connector `{source}` does not support DDL/DML and cannot back \
+                         `runtime.task_history.persistence`"
+                    )
+                    .into(),
+                },
+            })?
+            .map_err(|e| Error::UnableToInitializeDataConnector {
+                source: Box::new(e),
+            })?;
+
+        Ok(provider)
     }
 }
