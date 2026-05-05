@@ -749,7 +749,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                         duckdb_path_str,
                         Some("ready_after_load"),
                     ))
-                    .with_sql_cache(SQLResultsCacheConfig {
+                    .with_results_cache(ResultsCache {
                         enabled: false,
                         ..Default::default()
                     })
@@ -799,7 +799,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                         duckdb_path_str,
                         Some("ready_after_load"),
                     ))
-                    .with_sql_cache(SQLResultsCacheConfig {
+                    .with_results_cache(ResultsCache {
                         enabled: false,
                         ..Default::default()
                     })
