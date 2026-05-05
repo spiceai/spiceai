@@ -80,6 +80,26 @@ impl CacheNamespace {
             CacheNamespace::System => "system",
         }
     }
+
+    /// Inputs to be folded into a cache key hash so two distinct namespaces
+    /// produce distinct cache keys for otherwise-identical payloads.
+    ///
+    /// Returns `(tag, id_bytes)` where `tag` is the namespace discriminant
+    /// (kept stable across releases so cached entries survive upgrades):
+    /// - `0` → [`CacheNamespace::Public`] (no id)
+    /// - `1` → [`CacheNamespace::Principal`] (`id_bytes` is the principal's
+    ///   stable opaque id)
+    /// - `2` → [`CacheNamespace::System`] (no id)
+    ///
+    /// Pair with `cache::key::CacheKey::as_raw_key_in_namespace`.
+    #[must_use]
+    pub fn hash_inputs(&self) -> (u8, &[u8]) {
+        match self {
+            CacheNamespace::Public => (0, &[]),
+            CacheNamespace::Principal(id) => (1, id.as_bytes()),
+            CacheNamespace::System => (2, &[]),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -118,5 +138,22 @@ mod tests {
         let a = CacheNamespace::Principal(Arc::from("u2m:sub:42"));
         let b = CacheNamespace::Principal(Arc::from("u2m:sub:43"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash_inputs_distinct_per_variant() {
+        let pub_ns = CacheNamespace::Public;
+        let sys_ns = CacheNamespace::System;
+        let principal_ns = CacheNamespace::Principal(Arc::from("apikey:abc"));
+        let pub_inputs = pub_ns.hash_inputs();
+        let sys_inputs = sys_ns.hash_inputs();
+        let p_inputs = principal_ns.hash_inputs();
+
+        assert_eq!(pub_inputs, (0, &[][..]));
+        assert_eq!(sys_inputs, (2, &[][..]));
+        assert_eq!(p_inputs.0, 1);
+        assert_eq!(p_inputs.1, b"apikey:abc");
+        // Tags must be distinct so empty-id Public and System never collide.
+        assert_ne!(pub_inputs.0, sys_inputs.0);
     }
 }

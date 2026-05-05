@@ -121,6 +121,8 @@ impl Query {
         pre_parsed_plan: Option<Box<LogicalPlan>>,
     ) -> super::Result<PlanOrCached> {
         let cache_control = request_context.cache_control();
+        let cache_namespace = request_context.cache_namespace();
+        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
         let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
         let scoped_user_cache_key =
             if cache_control.cache_key_type() == Some(CacheKeyType::ClientSupplied) {
@@ -161,7 +163,8 @@ impl Query {
             }
         };
 
-        let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(df));
+        let sql_raw_cache_key =
+            sql_cache_key.as_raw_key_in_namespace(Self::plan_hasher(df), ns_tag, ns_id);
         let plan: Box<LogicalPlan> = if let Some(plan) = pre_parsed_plan {
             // Reuse the pre-parsed plan to avoid re-parsing. Parameters are
             // already bound from `check_read_only_sql`.
@@ -331,7 +334,11 @@ impl Query {
             }
         }
 
-        let raw_key = key.as_raw_key(cache_provider.hasher());
+        let raw_key = {
+            let ns = request_context.cache_namespace();
+            let (ns_tag, ns_id) = ns.hash_inputs();
+            key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
+        };
 
         let cached_result = match cache_provider.get_raw_key(&raw_key).await {
             Ok(Some(result)) => result,
@@ -723,7 +730,7 @@ mod tests {
         datafusion::{DataFusion, query::QueryBuilder},
         status,
     };
-    use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+    use runtime_request_context::{CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext};
 
     // Helper function to create a test RequestContext
     fn create_test_request_context(
@@ -734,6 +741,21 @@ mod tests {
             RequestContext::builder(Protocol::Internal)
                 .with_cache_control(cache_control)
                 .with_client_supplied_cache_key(user_cache_key)
+                .build(),
+        )
+    }
+
+    /// Build a `RequestContext` with an explicit cache namespace. Used to
+    /// drive cross-principal isolation tests in this module without going
+    /// through real auth middleware.
+    fn create_test_request_context_in_namespace(
+        cache_control: CacheControl,
+        namespace: CacheNamespace,
+    ) -> Arc<RequestContext> {
+        Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_cache_control(cache_control)
+                .with_cache_namespace(namespace)
                 .build(),
         )
     }
@@ -781,6 +803,94 @@ mod tests {
 
         let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
+    }
+
+    /// Two distinct principals running the same SQL must each see a cache
+    /// MISS for the other's first request, and a HIT only on their own
+    /// repeat. Cross-principal HITs would be a security regression — the
+    /// whole point of `CacheNamespace`.
+    #[tokio::test]
+    async fn test_results_cache_isolated_per_principal() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+
+        let alice = create_test_request_context_in_namespace(
+            CacheControl::Cache(CacheKeyType::Raw),
+            CacheNamespace::Principal("apikey:alice".into()),
+        );
+        let bob = create_test_request_context_in_namespace(
+            CacheControl::Cache(CacheKeyType::Raw),
+            CacheNamespace::Principal("apikey:bob".into()),
+        );
+
+        // Alice runs SELECT 1, populates the cache under her namespace.
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let _ = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should drain");
+            })
+            .await;
+
+        // Alice repeats: HIT (own namespace).
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheHit);
+            })
+            .await;
+
+        // Bob runs the same SQL: MUST be a MISS, otherwise we leaked
+        // Alice's cached result across principals.
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&bob)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.cache_status,
+                    CacheStatus::CacheMiss,
+                    "bob must not see alice's cached entry"
+                );
+                let _ = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should drain");
+            })
+            .await;
+
+        // Bob repeats: HIT in his own namespace.
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&bob)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheHit);
+            })
+            .await;
+
+        // And an unauthenticated (Public) caller must also miss — it
+        // shares no namespace with either Alice or Bob.
+        let public = create_test_request_context_in_namespace(
+            CacheControl::Cache(CacheKeyType::Raw),
+            CacheNamespace::Public,
+        );
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&public)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+            })
+            .await;
     }
 
     #[tokio::test]
