@@ -1591,6 +1591,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
+        // Register the drop notifier BEFORE aborting. `Notify::notify_waiters`
+        // does not buffer — if we created the `notified()` future after
+        // `abort()` returned, the reader could already have torn down the
+        // stream and called `notify_waiters` with no waiters registered,
+        // which would lose the signal and make this test wait the full
+        // timeout for nothing.
+        let dropped_fut = drop_signal.notified();
+        tokio::pin!(dropped_fut);
+
         // Abort the parent task. This drops `rx`, which closes `tx`, which
         // must wake the reader's `tokio::select!` and cause it to exit —
         // dropping the source stream as it goes. Without the select-on-
@@ -1598,7 +1607,7 @@ mod tests {
         // the source.
         join.abort();
 
-        let dropped = tokio::time::timeout(Duration::from_secs(2), drop_signal.notified())
+        let dropped = tokio::time::timeout(Duration::from_secs(2), &mut dropped_fut)
             .await
             .is_ok();
         assert!(
