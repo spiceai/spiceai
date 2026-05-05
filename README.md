@@ -35,7 +35,7 @@
 ## Why Spice?
 
 - 🚀 **Localhost latency at any scale** — Millisecond queries against a sandboxed working set on each pod, transparently delegated to a distributed cluster for the long tail.
-- 🦀 **Built in Rust** on industry-leading open foundations: [Apache DataFusion](https://datafusion.apache.org), [Apache Ballista](https://ballista.apache.org), [Apache Arrow](https://arrow.apache.org), [Apache Iceberg](https://iceberg.apache.org), [Vortex](https://github.com/vortex-data/vortex), [DuckDB](https://duckdb.org), and [SQLite](https://www.sqlite.org).
+- 🦀 **Built in Rust** on industry-leading open foundations: [Apache DataFusion](https://datafusion.apache.org), [Apache Ballista](https://datafusion.apache.org/ballista/), [Apache Arrow](https://arrow.apache.org), [Apache Iceberg](https://iceberg.apache.org), [Vortex](https://github.com/vortex-data/vortex), [DuckDB](https://duckdb.org), and [SQLite](https://www.sqlite.org).
 - ⚡ **Distributed query without the operational tax** — Apache Ballista with multi-active schedulers coordinated through object storage. **2.9x faster than single-node DataFusion** on TPC-H SF100, **8x less RAM than Spark**.
 - 💎 **Spice Cayenne** data accelerator on Vortex — **1.4x faster than DuckDB with 3x less memory** on TPC-H SF100. **100x faster random access vs. Parquet**.
 - 🔍 **Petabyte-scale hybrid search** — Native Amazon S3 Vectors, Tantivy BM25, pgvector, DuckDB HNSW, Elasticsearch, with reciprocal rank fusion (RRF) and reranker UDTFs — all in a single SQL query.
