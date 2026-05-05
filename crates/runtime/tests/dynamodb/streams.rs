@@ -647,9 +647,9 @@ async fn wait_for_dataset_rows(
     }
 }
 
-/// Inserts phantom rows directly into the DuckDB acceleration table, bypassing DynamoDB.
+/// Inserts phantom rows directly into the `DuckDB` acceleration table, bypassing `DynamoDB`.
 ///
-/// These rows have IDs that do not exist in DynamoDB, so no CDC stream events will ever
+/// These rows have IDs that do not exist in `DynamoDB`, so no CDC stream events will ever
 /// delete them. An `InsertOp::Overwrite` rebootstrap will remove them (the table is
 /// replaced atomically); an `InsertOp::Append` rebootstrap leaves them in place.
 fn add_phantom_rows_to_acceleration(duckdb_path: &str, table_name: &str, count: usize) {
@@ -657,9 +657,10 @@ fn add_phantom_rows_to_acceleration(duckdb_path: &str, table_name: &str, count: 
     let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
     let base_table = resolve_acceleration_base_table(&conn, table_name);
     for i in 0..count {
+        let version = i64::try_from(i).expect("phantom row index fits in i64");
         conn.execute(
             &format!(r#"INSERT INTO "{base_table}" (id, name, version) VALUES (?, ?, ?)"#),
-            duckdb::params![format!("phantom-{i}"), format!("Phantom {i}"), i as i64],
+            duckdb::params![format!("phantom-{i}"), format!("Phantom {i}"), version],
         )
         .expect("Failed to insert phantom row");
     }
@@ -703,10 +704,10 @@ async fn wait_for_exact_row_count(
     }
 }
 
-/// Verifies that rebootstrap removes phantom rows that exist in DuckDB but not in DynamoDB.
+/// Verifies that rebootstrap removes phantom rows that exist in `DuckDB` but not in `DynamoDB`.
 ///
-/// The test injects rows directly into the DuckDB acceleration file with IDs that do not
-/// exist in DynamoDB.  No CDC delete events are ever generated for these IDs, so the only
+/// The test injects rows directly into the `DuckDB` acceleration file with IDs that do not
+/// exist in `DynamoDB`.  No CDC delete events are ever generated for these IDs, so the only
 /// mechanism that can remove them is an atomic table replacement.
 ///
 /// Fails with `InsertOp::Append`: phantom IDs have no PK match in the rebootstrap scan,
