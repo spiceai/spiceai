@@ -69,6 +69,7 @@ pub(crate) static OPENAI_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
             "top_p",
             "tool_choice",
             "parallel_tool_calls",
+            "prompt_cache_key",
             "user",
         ])
     });
@@ -94,7 +95,7 @@ macro_rules! set_default_w_warning {
                 Ok(val) => Some(val),
                 Err(_) => {
                     tracing::warn!(
-                        "Failed to parse `openai_{}` override for model='{}'. Ensure {:?} is of the correct format.",
+                        "Failed to parse `{}` model parameter override for model='{}'. Ensure {:?} is of the correct format.",
                         stringify!($field),
                         $model,
                         $value
@@ -264,6 +265,9 @@ impl ChatWrapper {
                 "tool_choice" => set_default_w_warning!(req, tool_choice, value, self.public_name),
                 "parallel_tool_calls" => {
                     set_default_w_warning!(req, parallel_tool_calls, value, self.public_name);
+                }
+                "prompt_cache_key" => {
+                    set_default_w_warning!(req, prompt_cache_key, value, self.public_name);
                 }
                 "user" => set_default_w_warning!(req, user, value, self.public_name),
                 _ => {
