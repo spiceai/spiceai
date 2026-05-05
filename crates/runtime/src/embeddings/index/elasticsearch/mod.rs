@@ -678,15 +678,15 @@ pub(crate) fn get_fts_client(
         .map(ToString::to_string);
 
     let mut opts = ClientOptions::default();
-    if let Some(s) = params.get("client_timeout") {
-        if let Ok(d) = duration_parse::parse_duration(s) {
-            opts.request_timeout = d;
-        }
+    if let Some(s) = params.get("client_timeout")
+        && let Ok(d) = duration_parse::parse_duration(s)
+    {
+        opts.request_timeout = d;
     }
-    if let Some(s) = params.get("connect_timeout") {
-        if let Ok(d) = duration_parse::parse_duration(s) {
-            opts.connect_timeout = d;
-        }
+    if let Some(s) = params.get("connect_timeout")
+        && let Ok(d) = duration_parse::parse_duration(s)
+    {
+        opts.connect_timeout = d;
     }
 
     let client = Client::new_with_options(endpoint, user.as_deref(), pass.as_deref(), &opts)

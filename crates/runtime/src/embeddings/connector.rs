@@ -516,7 +516,7 @@ fn vector_index_groups(
                 .iter_mut()
                 .find(|candidate| candidate.name == grouped_column.name)
             {
-                candidate.embeddings = grouped_column.embeddings.clone();
+                candidate.embeddings.clone_from(&grouped_column.embeddings);
             } else {
                 columns.push(grouped_column);
             }
@@ -529,7 +529,7 @@ fn vector_index_groups(
                 .iter_mut()
                 .find(|candidate| candidate.name == grouped_column.name)
             {
-                candidate.embeddings = grouped_column.embeddings.clone();
+                candidate.embeddings.clone_from(&grouped_column.embeddings);
             }
             groups.push((effective_vector_store, columns));
         }

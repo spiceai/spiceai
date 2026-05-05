@@ -211,7 +211,7 @@ impl TextSearchTableFunc {
     /// `FullTextDatabaseIndex`-specific internals.
     #[cfg(feature = "elasticsearch")]
     fn call_with_es_indexes(
-        es_indexes: Vec<&ElasticsearchTextIndex>,
+        es_indexes: &[&ElasticsearchTextIndex],
         args: &TextSearchTableFuncArgs,
         table_provider: Arc<dyn datafusion::catalog::TableProvider>,
     ) -> DataFusionResult<Arc<dyn datafusion::catalog::TableProvider>> {
@@ -225,6 +225,7 @@ impl TextSearchTableFunc {
         let es_index: &ElasticsearchTextIndex = if let Some(ref requested) = args.column {
             es_indexes
                 .iter()
+                .copied()
                 .find(|idx| idx.search_fields.contains(requested))
                 .ok_or_else(|| {
                     let all: Vec<String> = es_indexes
@@ -259,7 +260,7 @@ impl TextSearchTableFunc {
         let column = args.column(&es_index.search_fields)?;
         let mut owned = (*es_index).clone();
         owned.search_fields = vec![column.clone()];
-        owned.search_column_name = column.clone();
+        owned.search_column_name.clone_from(&column);
 
         let udtf_source = UdtfSource::TextSearch {
             table: args.tbl.to_string(),
@@ -493,18 +494,12 @@ impl TableFunctionImpl for TextSearchTableFunc {
 
         // Phase 2: try Elasticsearch-backed text indexes if Tantivy found nothing.
         #[cfg(feature = "elasticsearch")]
-        if fts_indexes.is_none() {
-            if let Some((es_indexes, _)) =
+        if fts_indexes.is_none()
+            && let Some((es_indexes, _)) =
                 find_index_in_table_provider::<ElasticsearchTextIndex>(&table_provider)
-            {
-                if !es_indexes.is_empty() {
-                    return Self::call_with_es_indexes(
-                        es_indexes,
-                        &args,
-                        Arc::clone(&table_provider),
-                    );
-                }
-            }
+            && !es_indexes.is_empty()
+        {
+            return Self::call_with_es_indexes(&es_indexes, &args, Arc::clone(&table_provider));
         }
 
         let fts_indexes = fts_indexes
