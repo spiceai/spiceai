@@ -34,6 +34,8 @@ limitations under the License.
 //!   * `timeout` — per-call timeout, default `30s`. Plain integer (seconds) or `Ns` / `Nms` suffix strings.
 //!   * `batch_size` — rows per HTTP request, default `1024`.
 //!   * `batch_concurrency` — maximum in-flight HTTP batches per invocation, default `4`.
+//!   * `max_response_bytes` — maximum response body size decoded from the function server, default `10MiB`.
+//!   * `max_rows` — maximum table-function response rows without a query `LIMIT`, default `100000`.
 //!   * `auth_bearer` — optional `Authorization: Bearer <value>` header value (already secret-resolved by the caller).
 //!
 //! Remote beta functions use Arrow's JSON reader/writer, supporting scalar and
@@ -74,6 +76,7 @@ use datafusion_datasource::source::DataSourceExec;
 use futures::{StreamExt, stream};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use runtime_request_context::{AsyncMarker, RequestContext};
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::function::{
@@ -89,6 +92,13 @@ const DEFAULT_BATCH_SIZE: usize = 1024;
 const MAX_BATCH_SIZE: usize = 100_000;
 const DEFAULT_BATCH_CONCURRENCY: usize = 4;
 const MAX_BATCH_CONCURRENCY: usize = 64;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_MAX_TABLE_RESPONSE_ROWS: usize = 100_000;
+const MAX_TABLE_RESPONSE_ROWS: usize = 1_000_000;
+const MAX_SCALAR_TABLE_RESPONSE_ROWS: usize = 1;
+const MAX_ERROR_BODY_BYTES: usize = 4096;
+const ERROR_SNIPPET_CHARS: usize = 256;
 
 #[derive(Debug, Snafu)]
 pub enum RemoteBuildError {
@@ -186,6 +196,7 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
     let timeout = parse_timeout(decl.params.get("timeout"))?;
     let batch_size = parse_batch_size(decl.params.get("batch_size"))?;
     let batch_concurrency = parse_batch_concurrency(decl.params.get("batch_concurrency"))?;
+    let max_response_bytes = parse_max_response_bytes(decl.params.get("max_response_bytes"))?;
     let auth_bearer = parse_auth_bearer(decl.params.get("auth_bearer"))?;
 
     let mut headers = HeaderMap::new();
@@ -215,6 +226,7 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
         client,
         batch_size,
         batch_concurrency,
+        max_response_bytes,
     };
     let async_udf = AsyncScalarUDF::new(Arc::new(impl_));
     Ok(Arc::new(async_udf.into_scalar_udf()))
@@ -226,6 +238,11 @@ fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let (return_type, output_schema) = scalar_return_schema(decl)?;
     let timeout = parse_timeout(decl.params.get("timeout"))?;
+    let max_response_bytes = parse_max_response_bytes(decl.params.get("max_response_bytes"))?;
+    let max_rows = parse_max_rows(
+        decl.params.get("max_rows"),
+        MAX_SCALAR_TABLE_RESPONSE_ROWS,
+    )?;
     let auth_bearer = parse_auth_bearer(decl.params.get("auth_bearer"))?;
 
     let mut headers = HeaderMap::new();
@@ -250,6 +267,8 @@ fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
         endpoint,
         client,
         response_kind: RemoteResponseKind::ScalarValues,
+        max_response_bytes,
+        max_rows,
     });
     let udf_impl = RemoteScalarTableArgUdf {
         id: NEXT_REMOTE_ID.fetch_add(1, Ordering::Relaxed),
@@ -278,6 +297,8 @@ pub fn build_table_udtf(decl: &Function) -> Result<Arc<dyn TableFunctionImpl>> {
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let output_schema = table_return_schema(decl)?;
     let timeout = parse_timeout(decl.params.get("timeout"))?;
+    let max_response_bytes = parse_max_response_bytes(decl.params.get("max_response_bytes"))?;
+    let max_rows = parse_max_rows(decl.params.get("max_rows"), DEFAULT_MAX_TABLE_RESPONSE_ROWS)?;
     let auth_bearer = parse_auth_bearer(decl.params.get("auth_bearer"))?;
 
     let mut headers = HeaderMap::new();
@@ -302,6 +323,8 @@ pub fn build_table_udtf(decl: &Function) -> Result<Arc<dyn TableFunctionImpl>> {
         endpoint,
         client,
         response_kind: RemoteResponseKind::Rows,
+        max_response_bytes,
+        max_rows,
     }))
 }
 
@@ -314,6 +337,8 @@ struct RemoteTableFunc {
     endpoint: Url,
     client: reqwest::Client,
     response_kind: RemoteResponseKind,
+    max_response_bytes: usize,
+    max_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -350,6 +375,8 @@ impl Debug for RemoteTableFunc {
             .field("output_schema", &self.output_schema)
             .field("endpoint", &self.endpoint)
             .field("response_kind", &self.response_kind)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("max_rows", &self.max_rows)
             .finish_non_exhaustive()
     }
 }
@@ -372,6 +399,8 @@ impl TableFunctionImpl for RemoteTableFunc {
             args,
             table_args,
             response_kind: self.response_kind,
+            max_response_bytes: self.max_response_bytes,
+            max_rows: self.max_rows,
         }))
     }
 }
@@ -386,6 +415,8 @@ struct RemoteTableProvider {
     args: Vec<ScalarValue>,
     table_args: Vec<TableArgValue>,
     response_kind: RemoteResponseKind,
+    max_response_bytes: usize,
+    max_rows: usize,
 }
 
 #[async_trait::async_trait]
@@ -414,12 +445,21 @@ impl TableProvider for RemoteTableProvider {
         let args = encode_single_args_row(Arc::clone(&self.arg_schema), &self.args, &self.name)?;
         let ctx = context_from_state(state)?;
         let tables = encode_dynamic_tables(&ctx, &self.table_args, &self.name).await?;
+        let request_limit = limit;
         let mut rows = match self.response_kind {
-            RemoteResponseKind::Rows => self.post_table(args, tables).await?,
-            RemoteResponseKind::ScalarValues => self.post_scalar(args, tables).await?,
+            RemoteResponseKind::Rows => self.post_table(args, tables, request_limit).await?,
+            RemoteResponseKind::ScalarValues => self.post_scalar(args, tables, request_limit).await?,
         };
         if let Some(limit) = limit {
             rows.truncate(limit);
+        }
+        if rows.len() > self.max_rows {
+            return Err(DataFusionError::Execution(format!(
+                "remote table function '{}' returned {} row(s), exceeding configured max_rows {}",
+                self.name,
+                rows.len(),
+                self.max_rows
+            )));
         }
         let batch = decode_table_rows(&rows, Arc::clone(&self.schema), &self.name)?;
         let memory_source = MemorySourceConfig::try_new(
@@ -436,8 +476,9 @@ impl RemoteTableProvider {
         &self,
         args: Value,
         tables: Map<String, Value>,
+        limit: Option<usize>,
     ) -> std::result::Result<Vec<Value>, DataFusionError> {
-        let body = table_request_body(args, tables);
+        let body = table_request_body(args, tables, limit);
         let resp = self
             .client
             .post(self.endpoint.clone())
@@ -451,22 +492,13 @@ impl RemoteTableProvider {
                 ))
             })?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let snippet = sanitize_body_for_error(&body);
-            return Err(DataFusionError::Execution(format!(
-                "remote table function '{}' returned HTTP {status}: {snippet}",
-                self.name
-            )));
-        }
-
-        let parsed: RemoteTableResponse = resp.json().await.map_err(|e| {
-            DataFusionError::Execution(format!(
-                "remote table function '{}' response was not valid JSON: {e}",
-                self.name
-            ))
-        })?;
+        let parsed: RemoteTableResponse = decode_json_response(
+            resp,
+            &self.name,
+            "remote table function",
+            self.max_response_bytes,
+        )
+        .await?;
         Ok(parsed.rows)
     }
 
@@ -474,8 +506,9 @@ impl RemoteTableProvider {
         &self,
         args: Value,
         tables: Map<String, Value>,
+        limit: Option<usize>,
     ) -> std::result::Result<Vec<Value>, DataFusionError> {
-        let body = table_request_body(args, tables);
+        let body = table_request_body(args, tables, limit);
         let resp = self
             .client
             .post(self.endpoint.clone())
@@ -489,22 +522,13 @@ impl RemoteTableProvider {
                 ))
             })?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let snippet = sanitize_body_for_error(&body);
-            return Err(DataFusionError::Execution(format!(
-                "remote function '{}' returned HTTP {status}: {snippet}",
-                self.name
-            )));
-        }
-
-        let parsed: RemoteResponse = resp.json().await.map_err(|e| {
-            DataFusionError::Execution(format!(
-                "remote function '{}' response was not valid JSON: {e}",
-                self.name
-            ))
-        })?;
+        let parsed: RemoteResponse = decode_json_response(
+            resp,
+            &self.name,
+            "remote function",
+            self.max_response_bytes,
+        )
+        .await?;
         Ok(parsed
             .values
             .into_iter()
@@ -517,11 +541,14 @@ impl RemoteTableProvider {
     }
 }
 
-fn table_request_body(args: Value, tables: Map<String, Value>) -> Value {
-    let mut body = Map::with_capacity(2);
+fn table_request_body(args: Value, tables: Map<String, Value>, limit: Option<usize>) -> Value {
+    let mut body = Map::with_capacity(3);
     body.insert("args".to_string(), args);
     if !tables.is_empty() {
         body.insert("tables".to_string(), Value::Object(tables));
+    }
+    if let Some(limit) = limit {
+        body.insert("limit".to_string(), serde_json::json!(limit));
     }
     Value::Object(body)
 }
@@ -615,6 +642,7 @@ struct RemoteScalarUdf {
     client: reqwest::Client,
     batch_size: usize,
     batch_concurrency: usize,
+    max_response_bytes: usize,
 }
 
 impl PartialEq for RemoteScalarUdf {
@@ -802,22 +830,13 @@ impl RemoteScalarUdf {
                 ))
             })?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let snippet = sanitize_body_for_error(&body);
-            return Err(DataFusionError::Execution(format!(
-                "remote function '{}' returned HTTP {status}: {snippet}",
-                self.name
-            )));
-        }
-
-        let parsed: RemoteResponse = resp.json().await.map_err(|e| {
-            DataFusionError::Execution(format!(
-                "remote function '{}' response was not valid JSON: {e}",
-                self.name
-            ))
-        })?;
+        let parsed: RemoteResponse = decode_json_response(
+            resp,
+            &self.name,
+            "remote function",
+            self.max_response_bytes,
+        )
+        .await?;
         Ok(parsed.values)
     }
 }
@@ -848,19 +867,102 @@ struct RemoteTableResponse {
     rows: Vec<Value>,
 }
 
+async fn decode_json_response<T: DeserializeOwned>(
+    resp: reqwest::Response,
+    function_name: &str,
+    function_kind: &str,
+    max_response_bytes: usize,
+) -> std::result::Result<T, DataFusionError> {
+    let status = resp.status();
+    if !status.is_success() {
+        let snippet = error_response_snippet(resp).await;
+        return Err(DataFusionError::Execution(format!(
+            "{function_kind} '{function_name}' returned HTTP {status}: {snippet}"
+        )));
+    }
+
+    let body = read_response_body_limited(resp, function_name, function_kind, max_response_bytes)
+        .await?;
+    serde_json::from_slice(&body).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "{function_kind} '{function_name}' response was not valid JSON: {e}"
+        ))
+    })
+}
+
+async fn read_response_body_limited(
+    resp: reqwest::Response,
+    function_name: &str,
+    function_kind: &str,
+    max_response_bytes: usize,
+) -> std::result::Result<Vec<u8>, DataFusionError> {
+    if resp
+        .content_length()
+        .and_then(|len| usize::try_from(len).ok())
+        .is_some_and(|len| len > max_response_bytes)
+    {
+        return Err(DataFusionError::Execution(format!(
+            "{function_kind} '{function_name}' response exceeded max_response_bytes {max_response_bytes}"
+        )));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            DataFusionError::Execution(format!(
+                "{function_kind} '{function_name}' failed to read response body: {e}"
+            ))
+        })?;
+        if body.len().saturating_add(chunk.len()) > max_response_bytes {
+            return Err(DataFusionError::Execution(format!(
+                "{function_kind} '{function_name}' response exceeded max_response_bytes {max_response_bytes}"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn error_response_snippet(resp: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    let mut truncated = false;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return format!("failed to read response body: {e}"),
+        };
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&body);
+    sanitize_body_for_error(&body, truncated)
+}
+
 /// Collapse newlines and truncate a response body for safe inclusion in
 /// an error message. Keeps operators able to diagnose failures without
 /// dumping large or sensitive payloads into the log stream, and without
 /// violating the repo's single-line log/error convention.
-fn sanitize_body_for_error(body: &str) -> String {
-    const MAX: usize = 256;
+fn sanitize_body_for_error(body: &str, already_truncated: bool) -> String {
     let one_line: String = body
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect();
-    if one_line.chars().count() > MAX {
-        let truncated: String = one_line.chars().take(MAX).collect();
+    if one_line.chars().count() > ERROR_SNIPPET_CHARS {
+        let truncated: String = one_line.chars().take(ERROR_SNIPPET_CHARS).collect();
         format!("{truncated}… [truncated]")
+    } else if already_truncated {
+        format!("{one_line}… [truncated]")
     } else {
         one_line
     }
@@ -960,6 +1062,50 @@ fn parse_batch_concurrency(v: Option<&Value>) -> Result<usize> {
         return Err(RemoteBuildError::InvalidParam {
             key: "batch_concurrency".into(),
             expected: format!("positive integer ≤ {MAX_BATCH_CONCURRENCY}"),
+            got: n.to_string(),
+        });
+    }
+    Ok(n)
+}
+
+fn parse_max_response_bytes(v: Option<&Value>) -> Result<usize> {
+    parse_usize_param(
+        "max_response_bytes",
+        v,
+        DEFAULT_MAX_RESPONSE_BYTES,
+        1,
+        MAX_RESPONSE_BYTES,
+    )
+}
+
+fn parse_max_rows(v: Option<&Value>, default: usize) -> Result<usize> {
+    parse_usize_param("max_rows", v, default, 1, MAX_TABLE_RESPONSE_ROWS)
+}
+
+fn parse_usize_param(
+    key: &str,
+    v: Option<&Value>,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize> {
+    let Some(v) = v else {
+        return Ok(default);
+    };
+    let n = v.as_u64().ok_or_else(|| RemoteBuildError::InvalidParam {
+        key: key.into(),
+        expected: "positive integer".into(),
+        got: format!("{v}"),
+    })?;
+    let n = usize::try_from(n).map_err(|_| RemoteBuildError::InvalidParam {
+        key: key.into(),
+        expected: "positive integer".into(),
+        got: format!("{v}"),
+    })?;
+    if n < min || n > max {
+        return Err(RemoteBuildError::InvalidParam {
+            key: key.into(),
+            expected: format!("integer between {min} and {max}"),
             got: n.to_string(),
         });
     }
@@ -1656,6 +1802,7 @@ mod tests {
             client: reqwest::Client::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         };
         let input: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
             Some(vec![Some(1), Some(2)]),

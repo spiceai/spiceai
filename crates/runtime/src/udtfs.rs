@@ -52,6 +52,7 @@ impl TableFunctionImpl for ListUDFTableFunc {
                 udf_names.push(name.clone());
             }
         }
+        udf_names.sort_by_key(|name| name.to_ascii_lowercase());
         let user_infos = user_function_infos();
         Ok(Arc::new(ListUDFTable::new(udf_names, user_infos)))
     }
@@ -64,7 +65,7 @@ impl TableFunctionImpl for ListUDFTableFunc {
 ///   * `source` — `"builtin"` for Spice / `DataFusion` built-ins, `"user"` for functions declared in a spicepod's `functions:` section
 ///   * `kind` — `"scalar"` or `"table"` for user-defined functions (NULL for built-ins whose kind we cannot cheaply introspect)
 ///   * `volatility` — `"immutable"` | `"stable"` | `"volatile"` (NULL for built-ins)
-///   * `from` — source URI for user functions (`sql`, `http://...`, `https://...`), NULL for built-ins
+///   * `from` — source URI for user functions (`sql`, `http://...`, `https://...`, `wasm`), NULL for built-ins
 ///   * `description` — free-form description, NULL when not provided
 #[derive(Debug)]
 pub struct ListUDFTable {

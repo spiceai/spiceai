@@ -11,7 +11,7 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
-arrow-ipc.workspace = true
+arrow-ipc = { workspace = true, optional = true }
 arrow-json.workspace = true
 arrow-schema.workspace = true
 async-openai.workspace = true
@@ -51,5 +51,5 @@ wat.workspace = true
 default = []
 http-functions = ["dep:reqwest", "dep:runtime-auth", "dep:url"]
 models = ["dep:llms"]
-wasm-functions = ["dep:wasmtime"]
+wasm-functions = ["dep:arrow-ipc", "dep:wasmtime"]
 wasm-functions-compile = ["wasm-functions", "dep:blake3"]

@@ -64,7 +64,7 @@ use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::function::{Function, FunctionArg, FunctionReturns, Volatility};
 use util::session_state::builder_from_existing;
-use wasmtime::{Engine, Instance, Module, Store, TypedFunc};
+use wasmtime::{Config, Engine, Instance, Module, ResourceLimiter, Store, TypedFunc};
 
 static NEXT_WASM_SCALAR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -76,6 +76,9 @@ const DEFAULT_TARGET: &str = "wasm32-unknown-unknown";
 const INPUT_TABLE_PARAM: &str = "input_table";
 const MODULE_PARAM: &str = "module";
 const SOURCE_PARAM: &str = "source";
+const DEFAULT_WASM_FUEL: u64 = 100_000_000;
+const DEFAULT_WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_WASM_MAX_TABLE_ELEMENTS: usize = 1_000_000;
 
 #[derive(Debug, Snafu)]
 pub enum WasmBuildError {
@@ -131,6 +134,13 @@ pub enum WasmBuildError {
     #[snafu(display("WASM param `{param}` must be a string"))]
     InvalidStringParam { param: String },
 
+    #[snafu(display("WASM param `{param}` must be {expected}, got {got}"))]
+    InvalidIntegerParam {
+        param: String,
+        expected: String,
+        got: String,
+    },
+
     #[snafu(display("unsupported WASM source language '{language}'. Supported languages: rust"))]
     UnsupportedLanguage { language: String },
 
@@ -159,6 +169,13 @@ pub enum WasmBuildError {
     CompileRust { message: String },
 
     #[cfg(feature = "wasm-functions-compile")]
+    #[snafu(display("failed to read compiled WASM artifact directory '{path}': {source}"))]
+    ReadArtifactDir {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[cfg(feature = "wasm-functions-compile")]
     #[snafu(display("failed to copy compiled WASM artifact from '{from}' to '{to}': {source}"))]
     CopyArtifact {
         from: String,
@@ -175,6 +192,12 @@ pub enum WasmBuildError {
         path: String,
         source: std::io::Error,
     },
+
+    #[snafu(display("failed to create WASM engine: {source}"))]
+    CreateEngine { source: wasmtime::Error },
+
+    #[snafu(display("failed to configure WASM execution fuel: {source}"))]
+    SetFuel { source: wasmtime::Error },
 
     #[snafu(display("failed to compile WASM module '{path}': {source}"))]
     CompileModule {
@@ -232,6 +255,7 @@ struct WasmRunner {
     engine: Engine,
     module: Arc<Module>,
     entrypoint: String,
+    limits: WasmLimits,
 }
 
 impl Debug for WasmRunner {
@@ -239,6 +263,41 @@ impl Debug for WasmRunner {
         f.debug_struct("WasmRunner")
             .field("entrypoint", &self.entrypoint)
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WasmLimits {
+    fuel: u64,
+    max_memory_bytes: usize,
+    max_table_elements: usize,
+}
+
+impl ResourceLimiter for WasmLimits {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(desired <= self.max_memory_bytes)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(desired <= self.max_table_elements)
+    }
+
+    fn instances(&self) -> usize {
+        1
+    }
+
+    fn memories(&self) -> usize {
+        1
     }
 }
 
@@ -303,7 +362,10 @@ async fn build_table_func(
         .context(ReadModuleSnafu {
             path: module_path.display().to_string(),
         })?;
-    let engine = Engine::default();
+    let limits = config.limits;
+    let mut engine_config = Config::new();
+    engine_config.consume_fuel(true);
+    let engine = Engine::new(&engine_config).context(CreateEngineSnafu)?;
     let module = Module::from_binary(&engine, &module_bytes).context(CompileModuleSnafu {
         path: module_path.display().to_string(),
     })?;
@@ -318,6 +380,7 @@ async fn build_table_func(
             engine,
             module: Arc::new(module),
             entrypoint: config.entrypoint,
+            limits,
         }),
     }))
 }
@@ -552,7 +615,10 @@ impl TableProvider for WasmTableProvider {
 
 impl WasmRunner {
     fn invoke(&self, input_ipc: &[u8], args_ipc: &[u8]) -> Result<Vec<u8>> {
-        let mut store = Store::new(&self.engine, ());
+        let limits = self.limits;
+        let mut store = Store::new(&self.engine, limits);
+        store.limiter(|limits| limits);
+        store.set_fuel(limits.fuel).context(SetFuelSnafu)?;
         let instance = Instance::new(&mut store, &self.module, &[]).context(InstantiateSnafu)?;
         let memory = instance
             .get_memory(&mut store, "memory")
@@ -637,7 +703,7 @@ impl GuestAllocation {
 }
 
 fn write_guest_bytes(
-    store: &mut Store<()>,
+    store: &mut Store<WasmLimits>,
     memory: &wasmtime::Memory,
     alloc: &TypedFunc<i32, i32>,
     bytes: &[u8],
@@ -657,7 +723,7 @@ fn write_guest_bytes(
 }
 
 fn read_guest_bytes(
-    store: &Store<()>,
+    store: &Store<WasmLimits>,
     memory: &wasmtime::Memory,
     allocation: GuestAllocation,
 ) -> Result<Vec<u8>> {
@@ -674,7 +740,7 @@ fn read_guest_bytes(
 }
 
 fn dealloc_unique(
-    store: &mut Store<()>,
+    store: &mut Store<WasmLimits>,
     dealloc: &TypedFunc<(i32, i32), ()>,
     allocations: &[GuestAllocation],
 ) -> Result<()> {
@@ -700,6 +766,7 @@ struct WasmConfig {
     language: String,
     entrypoint: String,
     input_table: Option<String>,
+    limits: WasmLimits,
     #[cfg(feature = "wasm-functions-compile")]
     cache_dir: Option<PathBuf>,
     #[cfg(feature = "wasm-functions-compile")]
@@ -741,6 +808,19 @@ impl WasmConfig {
             entrypoint: param_string(&decl.params, "entrypoint")?
                 .unwrap_or_else(|| DEFAULT_ENTRYPOINT.to_string()),
             input_table: param_string(&decl.params, INPUT_TABLE_PARAM)?,
+            limits: WasmLimits {
+                fuel: param_u64(&decl.params, "fuel", DEFAULT_WASM_FUEL)?,
+                max_memory_bytes: param_usize(
+                    &decl.params,
+                    "max_memory_bytes",
+                    DEFAULT_WASM_MAX_MEMORY_BYTES,
+                )?,
+                max_table_elements: param_usize(
+                    &decl.params,
+                    "max_table_elements",
+                    DEFAULT_WASM_MAX_TABLE_ELEMENTS,
+                )?,
+            },
             #[cfg(feature = "wasm-functions-compile")]
             cache_dir: param_path(&decl.params, "cache_dir")?,
             #[cfg(feature = "wasm-functions-compile")]
@@ -767,6 +847,39 @@ fn param_string(params: &HashMap<String, Value>, key: &str) -> Result<Option<Str
 
 fn param_path(params: &HashMap<String, Value>, key: &str) -> Result<Option<PathBuf>> {
     Ok(param_string(params, key)?.map(PathBuf::from))
+}
+
+fn param_u64(params: &HashMap<String, Value>, key: &str, default: u64) -> Result<u64> {
+    let Some(value) = params.get(key) else {
+        return Ok(default);
+    };
+    let value = value.as_u64().ok_or_else(|| WasmBuildError::InvalidIntegerParam {
+        param: key.to_string(),
+        expected: "a positive integer".to_string(),
+        got: format!("{value}"),
+    })?;
+    if value == 0 {
+        return Err(WasmBuildError::InvalidIntegerParam {
+            param: key.to_string(),
+            expected: "a positive integer".to_string(),
+            got: value.to_string(),
+        });
+    }
+    Ok(value)
+}
+
+fn param_usize(params: &HashMap<String, Value>, key: &str, default: usize) -> Result<usize> {
+    let default = u64::try_from(default).map_err(|_| WasmBuildError::InvalidIntegerParam {
+        param: key.to_string(),
+        expected: "a positive integer that fits in u64".to_string(),
+        got: default.to_string(),
+    })?;
+    let value = param_u64(params, key, default)?;
+    usize::try_from(value).map_err(|_| WasmBuildError::InvalidIntegerParam {
+        param: key.to_string(),
+        expected: "a positive integer that fits in usize".to_string(),
+        got: value.to_string(),
+    })
 }
 
 fn configured_input_source(

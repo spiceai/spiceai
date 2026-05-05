@@ -135,7 +135,7 @@ pub enum UserFunctionError {
 
 pub type Result<T, E = UserFunctionError> = std::result::Result<T, E>;
 
-fn supported_schemes() -> &'static str {
+pub fn supported_schemes() -> &'static str {
     match (
         cfg!(feature = "http-functions"),
         cfg!(feature = "wasm-functions"),

@@ -15,7 +15,7 @@ The Spice open source project provides multiple distribution variants to support
 | macOS    | aarch64 (Apple Silicon) | Native (build host)                    | —                   |
 | Windows  | x86_64 (MSVC)           | —                                      | MSVC toolchain      |
 
-> **Note:** Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) is not supported on Windows natively — use WSL instead.
+> **Note:** Open source Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) is not supported on Windows natively in open source builds — use WSL instead. Native Windows runtime support is available with managed enterprise deployments.
 
 ## Distribution Availability
 
@@ -78,7 +78,7 @@ The data distribution excludes AI/ML model support, resulting in a smaller binar
 
 - All data connectors
 - All data accelerators
-- Acceleration snapshots
+- Acceleration snapshots in Cloud Platform and Enterprise distributions; local open source builds can enable this with the `snapshots` feature
 - Default memory allocator (snmalloc)
 
 **Excluded Features:**

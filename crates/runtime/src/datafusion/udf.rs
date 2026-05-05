@@ -165,13 +165,9 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
 fn warn_beta_once() {
     static BETA_WARNING: std::sync::Once = std::sync::Once::new();
     BETA_WARNING.call_once(|| {
-        let supported_sources = if cfg!(feature = "http-functions") {
-            "`sql`, `http://`, and `https://`"
-        } else {
-            "`sql`; `http://` and `https://` require the `http-functions` feature"
-        };
+        let supported_sources = runtime_datafusion_udfs::user_functions::supported_schemes();
         tracing::warn!(
-            "User-defined SQL functions (spicepod `functions:` section) are in BETA. Supported sources are {supported_sources}; APIs and on-disk \
+            "User-defined functions (spicepod `functions:` section) are in BETA. Supported sources in this build are {supported_sources}; APIs and on-disk \
              format may change before general availability. See: \
              https://spiceai.org/docs/reference/spicepod/functions"
         );
