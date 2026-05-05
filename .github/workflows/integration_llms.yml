@@ -155,7 +155,7 @@ jobs:
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
               echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."
               exit 1
-            fi
+            fi`
             if [ -z "$SPICE_ANTHROPIC_API_KEY" ]; then
               echo "Error: 'SPICE_ANTHROPIC_API_KEY' is not defined."
               exit 1

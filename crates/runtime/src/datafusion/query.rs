@@ -689,7 +689,12 @@ impl Query {
                             }
                             PlanOrCached::Cached(query_result) => {
                                 Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                                return Ok(query_result);
+                                return Ok(attach_cancellation_to_query_result(
+                                    query_result,
+                                    query_cancel_token.clone(),
+                                    query_id_str.clone(),
+                                    active_query_guard,
+                                ));
                             }
                         }
                     }
@@ -1269,6 +1274,22 @@ fn attach_query_active_guard_to_stream(
         schema,
         Box::pin(updated_stream.instrument(span)),
     ))
+}
+
+fn attach_cancellation_to_query_result<G>(
+    query_result: QueryResult,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    query_id: String,
+    guard: G,
+) -> QueryResult
+where
+    G: Send + 'static,
+{
+    let QueryResult { data, cache_status } = query_result;
+    QueryResult::new(
+        attach_cancellation_to_stream(data, cancellation_token, query_id, guard),
+        cache_status,
+    )
 }
 
 /// Wraps a record batch stream so that cancellation via the supplied
@@ -1987,6 +2008,8 @@ mod tests {
     use spicepod::component::caching::SQLResultsCacheConfig;
     use std::any::Any;
     use std::fmt::{Debug, Formatter};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio_util::sync::CancellationToken;
 
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
@@ -2124,6 +2147,69 @@ mod tests {
         }
 
         assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+    }
+
+    #[tokio::test]
+    async fn cached_query_result_keeps_registry_entry_until_stream_drop_and_observes_cancel() {
+        let config = SQLResultsCacheConfig::default();
+        let cache_provider = Arc::new(
+            QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("cache provider new"),
+        );
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(Caching::new().with_results_cache(cache_provider)))
+            .build(),
+        );
+
+        {
+            let mut query = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+                .build()
+                .run()
+                .await
+                .expect("initial query should run");
+            assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+            while let Some(batch_result) = query.data.next().await {
+                batch_result.expect("initial query stream should succeed");
+            }
+        }
+
+        let query_id = uuid::Uuid::new_v4();
+        let cancel_token = CancellationToken::new();
+        let mut cached_query = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .query_id(query_id)
+            .cancellation_token(cancel_token.clone())
+            .build()
+            .run()
+            .await
+            .expect("cached query should run");
+
+        assert_eq!(cached_query.cache_status, CacheStatus::CacheHit);
+        let registry = df.query_cancel_registry();
+        assert!(
+            registry.list().iter().any(|info| info.query_id == query_id),
+            "cached query should remain registered while its stream is alive"
+        );
+
+        assert!(registry.cancel(query_id));
+        assert!(cancel_token.is_cancelled());
+        let cancellation = cached_query
+            .data
+            .next()
+            .await
+            .expect("cached stream should emit cancellation");
+        assert_query_cancelled(
+            cancellation.expect_err("cached stream item should be a cancellation error"),
+            &query_id.to_string(),
+        );
+        assert!(cached_query.data.next().await.is_none());
+        assert!(
+            registry.list().iter().all(|info| info.query_id != query_id),
+            "cached query should be deregistered after the stream terminates"
+        );
     }
 
     #[tokio::test]
@@ -2612,6 +2698,118 @@ mod tests {
         Box::pin(RecordBatchStreamAdapter::new(Arc::clone(schema), {
             futures::stream::iter(batches.into_iter().map(Ok))
         }))
+    }
+
+    fn pending_stream(schema: &Arc<Schema>) -> SendableRecordBatchStream {
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(schema),
+            futures::stream::pending::<DataFusionResult<RecordBatch>>(),
+        ))
+    }
+
+    struct DropFlag {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl DropFlag {
+        fn new(dropped: Arc<AtomicBool>) -> Self {
+            Self { dropped }
+        }
+    }
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn assert_query_cancelled(error: DataFusionError, expected_query_id: &str) {
+        assert!(is_cancellation_error(&error));
+        let DataFusionError::External(source) = error else {
+            panic!("expected external cancellation error");
+        };
+        let cancellation = source
+            .downcast_ref::<Error>()
+            .expect("external error should be query cancellation");
+        let Error::QueryCancelled { query_id } = cancellation else {
+            panic!("expected query cancellation error");
+        };
+        assert_eq!(query_id, expected_query_id);
+    }
+
+    #[tokio::test]
+    async fn attach_cancellation_to_stream_emits_single_cancel_then_terminates() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42])) as ArrayRef],
+        )
+        .expect("batch");
+        let cancel_token = CancellationToken::new();
+        let guard_dropped = Arc::new(AtomicBool::new(false));
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let mut stream = attach_cancellation_to_stream(
+            stream_from_batches(&schema, vec![batch]),
+            cancel_token.clone(),
+            query_id.clone(),
+            DropFlag::new(Arc::clone(&guard_dropped)),
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("stream should emit the first batch")
+            .expect("first batch should succeed");
+        assert_eq!(first.num_rows(), 1);
+        assert!(!guard_dropped.load(Ordering::SeqCst));
+
+        cancel_token.cancel();
+        let cancellation = stream
+            .next()
+            .await
+            .expect("stream should emit one cancellation error");
+        assert_query_cancelled(
+            cancellation.expect_err("second item should be cancellation"),
+            &query_id,
+        );
+        assert!(stream.next().await.is_none());
+        assert!(guard_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn attach_cancellation_to_stream_wakes_pending_next_on_cancel() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let cancel_token = CancellationToken::new();
+        let guard_dropped = Arc::new(AtomicBool::new(false));
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let mut stream = attach_cancellation_to_stream(
+            pending_stream(&schema),
+            cancel_token.clone(),
+            query_id.clone(),
+            DropFlag::new(Arc::clone(&guard_dropped)),
+        );
+
+        let pending_next = tokio::spawn(async move { stream.next().await });
+        tokio::task::yield_now().await;
+        cancel_token.cancel();
+
+        let cancellation = pending_next
+            .await
+            .expect("pending stream task should complete")
+            .expect("pending stream should emit cancellation");
+        assert_query_cancelled(
+            cancellation.expect_err("pending item should be cancellation"),
+            &query_id,
+        );
+        assert!(guard_dropped.load(Ordering::SeqCst));
     }
 
     /// Collect all batches from a `SendableRecordBatchStream`.
