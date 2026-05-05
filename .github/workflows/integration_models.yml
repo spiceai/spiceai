@@ -139,6 +139,10 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      - name: Clean spiceio install directory
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        run: rm -rf "${{ runner.temp }}/spiceio-bin"
+
       - name: Set up spiceio for build archive
         if: env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio-build
@@ -573,6 +577,10 @@ jobs:
       - name: Stop sccache spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Clean spiceio install directory
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        run: rm -rf "${{ runner.temp }}/spiceio-bin"
 
       - name: Set up spiceio for build archive
         if: env.HAS_SPICEIO_SECRET == 'true'
