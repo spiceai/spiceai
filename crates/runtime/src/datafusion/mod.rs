@@ -3010,6 +3010,21 @@ impl DataFusion {
             builder.refresh_semaphore(Arc::clone(semaphore));
         }
 
+        // Wrap the DuckDB accelerator with HNSW vector indexes (if applicable).
+        // This mirrors the dataset path in `EmbeddingConnector::on_accelerator_setup`.
+        #[cfg(feature = "duckdb")]
+        {
+            crate::embeddings::connector::try_wrap_view_accelerator_with_hnsw(
+                view,
+                table,
+                &mut builder,
+            )
+            .await
+            .map_err(|e| Error::UnableToCreateView {
+                reason: format!("Failed to create HNSW vector indexes for view: {e}"),
+            })?;
+        }
+
         let accelerated_table =
             builder
                 .build()
