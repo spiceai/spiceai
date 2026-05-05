@@ -71,8 +71,8 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
-  AI_INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/ai-integration-test-archive/integration.tar.zst
-  AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/ai-integration-test-archive-extended/integration-extended.tar.zst
+  AI_INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive/integration.tar.zst
+  AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive-extended/integration-extended.tar.zst
 
 jobs:
   build:
@@ -132,16 +132,28 @@ jobs:
           cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration.tar.zst
 
       - name: Upload test archive to spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
           set -euo pipefail
           : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to upload the AI integration test archive}"
-          if ! aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3api head-bucket --bucket build; then
-            aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 mb s3://build || true
-            aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3api head-bucket --bucket build
+          bucket_status=$(curl --silent --show-error --output /tmp/spiceio-create-build-bucket --write-out "%{http_code}" --request PUT "${SPICEIO_ENDPOINT%/}/build")
+          if [[ "$bucket_status" != "200" && "$bucket_status" != "204" && "$bucket_status" != "409" ]]; then
+            cat /tmp/spiceio-create-build-bucket
+            exit 1
           fi
-          aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 cp ./integration.tar.zst "$AI_INTEGRATION_TEST_ARCHIVE_S3_URI"
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --upload-file ./integration.tar.zst "$archive_url"
+
+      - name: Upload test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ai-integration-test-archive
+          path: ./integration.tar.zst
+          retention-days: 3
+          compression-level: 1
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -184,13 +196,22 @@ jobs:
           region: us-west-1
 
       - name: Download test archive from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
           set -euo pipefail
           : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
           mkdir -p ./integration_test
-          aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 cp "$AI_INTEGRATION_TEST_ARCHIVE_S3_URI" ./integration_test/integration.tar.zst
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
+
+      - name: Download test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ai-integration-test-archive
+          path: ./integration_test
 
       - name: Set up API Keys
         run: |
@@ -364,13 +385,22 @@ jobs:
           region: us-west-1
 
       - name: Download test archive from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
           set -euo pipefail
           : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
           mkdir -p ./integration_test
-          aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 cp "$AI_INTEGRATION_TEST_ARCHIVE_S3_URI" ./integration_test/integration.tar.zst
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
+
+      - name: Download test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ai-integration-test-archive
+          path: ./integration_test
 
       - name: Run integration test
         env:
@@ -434,13 +464,22 @@ jobs:
           region: us-west-1
 
       - name: Download test archive from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
           set -euo pipefail
           : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
           mkdir -p ./integration_test
-          aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 cp "$AI_INTEGRATION_TEST_ARCHIVE_S3_URI" ./integration_test/integration.tar.zst
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
+
+      - name: Download test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ai-integration-test-archive
+          path: ./integration_test
 
       - name: Run Beta functionality embedding tests
         env:
@@ -514,16 +553,28 @@ jobs:
           cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration-extended.tar.zst
 
       - name: Upload test archive to spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
           set -euo pipefail
           : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to upload the extended AI integration test archive}"
-          if ! aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3api head-bucket --bucket build; then
-            aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 mb s3://build || true
-            aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3api head-bucket --bucket build
+          bucket_status=$(curl --silent --show-error --output /tmp/spiceio-create-build-bucket --write-out "%{http_code}" --request PUT "${SPICEIO_ENDPOINT%/}/build")
+          if [[ "$bucket_status" != "200" && "$bucket_status" != "204" && "$bucket_status" != "409" ]]; then
+            cat /tmp/spiceio-create-build-bucket
+            exit 1
           fi
-          aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 cp ./integration-extended.tar.zst "$AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI"
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --upload-file ./integration-extended.tar.zst "$archive_url"
+
+      - name: Upload test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ai-integration-test-archive-extended
+          path: ./integration-extended.tar.zst
+          retention-days: 3
+          compression-level: 1
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''

@@ -96,7 +96,7 @@ jobs:
     runs-on: spiceai-macos
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
-      TEST_BINARY_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/llms_integration_test
+      TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -127,12 +127,23 @@ jobs:
           region: us-west-1
 
       - name: Upload test binary to spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
           set -euo pipefail
           : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to upload the LLM integration test binary}"
-          aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 cp ./llms_integration_test "$TEST_BINARY_S3_URI"
+          test_binary_url="${SPICEIO_ENDPOINT%/}/build/${TEST_BINARY_OBJECT_KEY}"
+          curl --fail --silent --show-error --upload-file ./llms_integration_test "$test_binary_url"
+
+      - name: Upload test binary
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: llms-integration-test-binary
+          path: ./llms_integration_test
+          retention-days: 3
+          compression-level: 1
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -143,7 +154,7 @@ jobs:
     needs: [build, setup-matrix]
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
-      TEST_BINARY_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/llms_integration_test
+      TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     strategy:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -166,13 +177,22 @@ jobs:
           region: us-west-1
 
       - name: Download test binary from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
           set -euo pipefail
           : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the LLM integration test binary}"
           mkdir -p ./integration_test
-          aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 cp "$TEST_BINARY_S3_URI" ./integration_test/llms_integration_test
+          test_binary_url="${SPICEIO_ENDPOINT%/}/build/${TEST_BINARY_OBJECT_KEY}"
+          curl --fail --silent --show-error --output ./integration_test/llms_integration_test "$test_binary_url"
+
+      - name: Download test binary
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: llms-integration-test-binary
+          path: ./integration_test
 
       - name: Mark test binary as executable
         run: chmod +x ./integration_test/llms_integration_test
