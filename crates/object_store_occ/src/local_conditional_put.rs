@@ -451,6 +451,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_conditional_update_compares_etag_without_version() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new(dir.path()).expect("create store");
+
+        let path = Path::from("test/etag-only.json");
+        let create_result = store
+            .put_opts(
+                &path,
+                b"v1".as_slice().into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create should succeed");
+
+        let version = UpdateVersion {
+            e_tag: create_result.e_tag,
+            version: Some("local-store-has-no-version".to_string()),
+        };
+
+        store
+            .put_opts(
+                &path,
+                b"v2".as_slice().into(),
+                PutOptions::from(PutMode::Update(version)),
+            )
+            .await
+            .expect("etag-matched update should ignore version");
+
+        let bytes = store
+            .get(&path)
+            .await
+            .expect("get should succeed")
+            .bytes()
+            .await
+            .expect("read bytes");
+        assert_eq!(bytes.as_ref(), b"v2");
+    }
+
+    #[tokio::test]
     async fn test_concurrent_conditional_updates_one_wins() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let store =
@@ -512,8 +551,21 @@ mod tests {
             "exactly one writer should succeed; r1={r1:?}, r2={r2:?}"
         );
         assert!(
-            successes.iter().any(|s| !s),
-            "exactly one writer should fail with Precondition"
+            matches!(r1, Err(ObjectStoreError::Precondition { .. }))
+                || matches!(r2, Err(ObjectStoreError::Precondition { .. })),
+            "exactly one writer should fail with Precondition; r1={r1:?}, r2={r2:?}"
+        );
+
+        let final_bytes = store
+            .get(&path)
+            .await
+            .expect("get final value")
+            .bytes()
+            .await
+            .expect("read final bytes");
+        assert!(
+            matches!(final_bytes.as_ref(), b"writer-1" | b"writer-2"),
+            "final value should be from the winning writer, got {final_bytes:?}"
         );
     }
 }

@@ -90,6 +90,9 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_control: Option<RateControl>,
+
     #[serde(default, skip_serializing_if = "is_default")]
     pub functions: Functions,
 }
@@ -853,6 +856,22 @@ pub struct Scheduler {
     pub partition_discovery_timeout: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct RateControl {
+    /// Root URI for globally persisted HTTP governor rate-control state.
+    pub state_location: String,
+
+    /// Optional object store params for the rate-control state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
+    /// How often each runtime refreshes per-origin governor state from object storage.
+    #[serde(default = "default_rate_control_refresh_interval")]
+    pub refresh_interval: String,
+}
+
 #[must_use]
 pub fn default_partition_assignment_interval() -> String {
     "30s".to_string()
@@ -871,6 +890,11 @@ pub fn default_max_partitions_per_executor() -> usize {
 #[must_use]
 pub fn default_partition_discovery_timeout() -> String {
     "60s".to_string()
+}
+
+#[must_use]
+pub fn default_rate_control_refresh_interval() -> String {
+    "30s".to_string()
 }
 
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
@@ -930,6 +954,8 @@ pub struct RuntimeDeserializer {
     pub metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_control: Option<RateControl>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub functions: Functions,
 }
@@ -1009,6 +1035,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             },
             metrics: deserializer.metrics,
             scheduler: deserializer.scheduler,
+            rate_control: deserializer.rate_control,
             functions: deserializer.functions,
         })
     }

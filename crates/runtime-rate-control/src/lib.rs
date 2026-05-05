@@ -14,7 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    num::{NonZeroU32, NonZeroU64},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,15 +27,49 @@ use governor::{
     Quota, RateLimiter,
     clock::DefaultClock,
     middleware::NoOpMiddleware,
-    state::{InMemoryState, NotKeyed},
+    nanos::Nanos,
+    state::{NotKeyed, StateStore},
 };
+use object_store::ObjectStore;
+use object_store_occ::{ObjectState, WriteResult};
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+
+const DEFAULT_PERSISTENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION: u32 = 1;
+const MAX_PERSISTENCE_CONFLICTS: usize = 8;
+
+type GovernorRateLimiter = RateLimiter<NotKeyed, SharedGovernorState, DefaultClock, NoOpMiddleware>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to acquire semaphore permit. {source}"))]
     SemaphoreAcquireError { source: tokio::sync::AcquireError },
+
+    #[snafu(display(
+        "Failed to refresh persisted rate-control state for origin {origin}. {source}"
+    ))]
+    PersistenceRefresh {
+        origin: String,
+        source: object_store_occ::Error,
+    },
+
+    #[snafu(display("Failed to persist rate-control state for origin {origin}. {source}"))]
+    PersistenceWrite {
+        origin: String,
+        source: object_store_occ::Error,
+    },
+
+    #[snafu(display(
+        "Unsupported persisted rate-control state schema version {version} for origin {origin}"
+    ))]
+    UnsupportedPersistedStateVersion { origin: String, version: u32 },
+
+    #[snafu(display(
+        "Failed to persist rate-control state for origin {origin} after {attempts} concurrent updates. Try again."
+    ))]
+    PersistenceConflictLimit { origin: String, attempts: usize },
 
     #[snafu(display(
         "The rate limiter has insufficient capacity for a request with weight '{weight}'. Reduce the request size, or increase the rate limit, and try again."
@@ -39,6 +78,315 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Clone)]
+struct QuotaDefinition {
+    name: Option<String>,
+    quota: Quota,
+}
+
+impl QuotaDefinition {
+    fn new(name: Option<String>, quota: Quota) -> Self {
+        Self { name, quota }
+    }
+
+    fn persistence_key(&self, fallback_name: &str) -> String {
+        let name = self.name.as_deref().unwrap_or(fallback_name);
+        format!(
+            "{name}:burst={}:replenish_ns={}",
+            self.quota.burst_size().get(),
+            self.quota.replenish_interval().as_nanos()
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+struct PersistedRateControlState {
+    schema_version: u32,
+    updated_at_unix_ms: u64,
+    limiters: HashMap<String, PersistedLimiterState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedLimiterState {
+    theoretical_arrival_time_unix_nanos: u64,
+}
+
+#[derive(Clone)]
+struct SharedGovernorState {
+    inner: Arc<SharedGovernorStateInner>,
+}
+
+struct SharedGovernorStateInner {
+    theoretical_arrival_time_nanos: AtomicU64,
+    start_unix_nanos: u64,
+}
+
+impl std::fmt::Debug for SharedGovernorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let nanos = self
+            .inner
+            .theoretical_arrival_time_nanos
+            .load(Ordering::Relaxed);
+        f.debug_struct("SharedGovernorState")
+            .field("theoretical_arrival_time", &Duration::from_nanos(nanos))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for SharedGovernorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedGovernorState {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(SharedGovernorStateInner {
+                theoretical_arrival_time_nanos: AtomicU64::new(0),
+                start_unix_nanos: unix_nanos_now(),
+            }),
+        }
+    }
+
+    fn merge_absolute_nanos(&self, absolute_nanos: u64) {
+        let relative_nanos = absolute_nanos.saturating_sub(self.inner.start_unix_nanos);
+        self.inner
+            .theoretical_arrival_time_nanos
+            .fetch_max(relative_nanos, Ordering::AcqRel);
+    }
+
+    fn snapshot_absolute_nanos(&self) -> Option<u64> {
+        let relative_nanos = self
+            .inner
+            .theoretical_arrival_time_nanos
+            .load(Ordering::Acquire);
+        if relative_nanos == 0 {
+            None
+        } else {
+            Some(self.inner.start_unix_nanos.saturating_add(relative_nanos))
+        }
+    }
+}
+
+impl StateStore for SharedGovernorState {
+    type Key = NotKeyed;
+
+    fn measure_and_replace<T, F, E>(&self, _key: &Self::Key, f: F) -> std::result::Result<T, E>
+    where
+        F: Fn(Option<Nanos>) -> std::result::Result<(T, Nanos), E>,
+    {
+        let mut previous = self
+            .inner
+            .theoretical_arrival_time_nanos
+            .load(Ordering::Acquire);
+        let mut decision = f(NonZeroU64::new(previous).map(|nanos| Nanos::new(nanos.get())));
+
+        while let Ok((result, next_state)) = decision {
+            let next_state_nanos = u64::from(next_state);
+            match self
+                .inner
+                .theoretical_arrival_time_nanos
+                .compare_exchange_weak(
+                    previous,
+                    next_state_nanos,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                Ok(_) => return Ok(result),
+                Err(next_previous) => previous = next_previous,
+            }
+            decision = f(NonZeroU64::new(previous).map(|nanos| Nanos::new(nanos.get())));
+        }
+
+        decision.map(|(result, _)| result)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PersistedLimiterBinding {
+    key: String,
+    state: SharedGovernorState,
+}
+
+#[derive(Clone)]
+struct RateControllerPersistenceConfig {
+    store: Arc<dyn ObjectStore>,
+    prefix: String,
+    object_key: String,
+    origin: String,
+    refresh_interval: Duration,
+}
+
+impl std::fmt::Debug for RateControllerPersistenceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RateControllerPersistenceConfig")
+            .field("prefix", &self.prefix)
+            .field("object_key", &self.object_key)
+            .field("origin", &self.origin)
+            .field("refresh_interval", &self.refresh_interval)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct RateControllerPersistence {
+    object_state: Arc<ObjectState<PersistedRateControlState>>,
+    object_key: String,
+    origin: String,
+    refresh_interval: Duration,
+    limiters: Vec<PersistedLimiterBinding>,
+    last_refresh: Mutex<Option<tokio::time::Instant>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PersistResult {
+    Persisted,
+    Conflict,
+}
+
+impl RateControllerPersistence {
+    fn new(
+        config: RateControllerPersistenceConfig,
+        limiters: Vec<PersistedLimiterBinding>,
+    ) -> Arc<Self> {
+        let prefix = normalize_object_state_prefix(&config.prefix);
+        let object_state = Arc::new(ObjectState::new(config.store).with_prefix(prefix));
+        let persistence = Arc::new(Self {
+            object_state,
+            object_key: config.object_key,
+            origin: config.origin,
+            refresh_interval: normalize_refresh_interval(config.refresh_interval),
+            limiters,
+            last_refresh: Mutex::new(None),
+        });
+        persistence.spawn_refresh_task();
+        persistence
+    }
+
+    async fn refresh_if_due(&self) -> Result<()> {
+        {
+            let last_refresh = self.last_refresh.lock().await;
+            if last_refresh
+                .is_some_and(|last_refresh| last_refresh.elapsed() < self.refresh_interval)
+            {
+                return Ok(());
+            }
+        }
+
+        self.refresh().await?;
+        let mut last_refresh = self.last_refresh.lock().await;
+        *last_refresh = Some(tokio::time::Instant::now());
+        Ok(())
+    }
+
+    async fn refresh(&self) -> Result<()> {
+        let remote = self
+            .object_state
+            .get(&self.object_key)
+            .await
+            .map_err(|source| Error::PersistenceRefresh {
+                origin: self.origin.clone(),
+                source,
+            })?;
+
+        if let Some(remote) = remote {
+            self.apply_remote(&remote)?;
+        }
+
+        Ok(())
+    }
+
+    async fn persist_snapshot(&self) -> Result<PersistResult> {
+        if self.limiters.is_empty() {
+            return Ok(PersistResult::Persisted);
+        }
+
+        let snapshot = self.snapshot();
+        match self
+            .object_state
+            .insert_or_update(&self.object_key, &snapshot)
+            .await
+            .map_err(|source| Error::PersistenceWrite {
+                origin: self.origin.clone(),
+                source,
+            })? {
+            WriteResult::Inserted | WriteResult::Updated => Ok(PersistResult::Persisted),
+            WriteResult::Conflict { current } => {
+                self.apply_remote(&current)?;
+                Ok(PersistResult::Conflict)
+            }
+        }
+    }
+
+    fn snapshot(&self) -> PersistedRateControlState {
+        let mut snapshot = self
+            .object_state
+            .get_cached(&self.object_key)
+            .unwrap_or_default();
+        snapshot.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION;
+        snapshot.updated_at_unix_ms = unix_millis_now();
+
+        for binding in &self.limiters {
+            if let Some(theoretical_arrival_time_unix_nanos) =
+                binding.state.snapshot_absolute_nanos()
+            {
+                snapshot.limiters.insert(
+                    binding.key.clone(),
+                    PersistedLimiterState {
+                        theoretical_arrival_time_unix_nanos,
+                    },
+                );
+            }
+        }
+
+        snapshot
+    }
+
+    fn apply_remote(&self, remote: &PersistedRateControlState) -> Result<()> {
+        if remote.schema_version != PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION {
+            return Err(Error::UnsupportedPersistedStateVersion {
+                origin: self.origin.clone(),
+                version: remote.schema_version,
+            });
+        }
+
+        for binding in &self.limiters {
+            if let Some(remote_state) = remote.limiters.get(&binding.key) {
+                binding
+                    .state
+                    .merge_absolute_nanos(remote_state.theoretical_arrival_time_unix_nanos);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    fn spawn_refresh_task(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let refresh_interval = self.refresh_interval;
+
+        let refresh_task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(refresh_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(persistence) = weak.upgrade() else {
+                    break;
+                };
+                if let Err(error) = persistence.refresh().await {
+                    tracing::warn!("Failed to refresh persisted rate-control state: {error}");
+                }
+            }
+        });
+        drop(refresh_task);
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct JitterConfig {
@@ -62,9 +410,10 @@ impl JitterConfig {
 pub struct RateControllerBuilder {
     jitter: Option<JitterConfig>,
     max_concurrent_requests: Option<usize>,
-    quotas: Vec<Quota>,
-    weighted_quota: Option<Quota>,
+    quotas: Vec<QuotaDefinition>,
+    weighted_quota: Option<QuotaDefinition>,
     metrics: Option<Arc<RateControllerMetrics>>,
+    persistence: Option<RateControllerPersistenceConfig>,
 }
 
 impl RateControllerBuilder {
@@ -75,7 +424,7 @@ impl RateControllerBuilder {
 
     #[must_use]
     pub fn with_weighted_quota(mut self, quota: Quota) -> Self {
-        self.weighted_quota = Some(quota);
+        self.weighted_quota = Some(QuotaDefinition::new(Some("weighted".to_string()), quota));
         self
     }
 
@@ -99,28 +448,87 @@ impl RateControllerBuilder {
 
     #[must_use]
     pub fn add_quota(mut self, quota: Quota) -> Self {
-        self.quotas.push(quota);
+        self.quotas.push(QuotaDefinition::new(None, quota));
+        self
+    }
+
+    #[must_use]
+    pub fn add_quota_with_name(mut self, name: impl Into<String>, quota: Quota) -> Self {
+        self.quotas
+            .push(QuotaDefinition::new(Some(name.into()), quota));
         self
     }
 
     #[must_use]
     pub fn with_quotas(mut self, quotas: Vec<Quota>) -> Self {
-        self.quotas = quotas;
+        self.quotas = quotas
+            .into_iter()
+            .map(|quota| QuotaDefinition::new(None, quota))
+            .collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_object_store_persistence(
+        mut self,
+        store: Arc<dyn ObjectStore>,
+        prefix: impl Into<String>,
+        object_key: impl Into<String>,
+        origin: impl Into<String>,
+        refresh_interval: Duration,
+    ) -> Self {
+        self.persistence = Some(RateControllerPersistenceConfig {
+            store,
+            prefix: prefix.into(),
+            object_key: object_key.into(),
+            origin: origin.into(),
+            refresh_interval,
+        });
         self
     }
 
     #[must_use]
     pub fn build(self) -> Arc<RateController> {
         let jitter = self.jitter;
+        let mut persisted_limiters = Vec::new();
         let rate_limiters = self
             .quotas
             .into_iter()
-            .map(|quota| Arc::new(RateLimiter::direct(quota)))
+            .enumerate()
+            .map(|(index, quota_definition)| {
+                let state = SharedGovernorState::new();
+                let fallback_name = format!("quota-{index}");
+                persisted_limiters.push(PersistedLimiterBinding {
+                    key: quota_definition.persistence_key(&fallback_name),
+                    state: state.clone(),
+                });
+                Arc::new(RateLimiter::new(
+                    quota_definition.quota,
+                    state,
+                    DefaultClock::default(),
+                ))
+            })
             .collect::<Vec<_>>();
 
-        let weighted_rate_limiter = self
-            .weighted_quota
-            .map(|quota| Arc::new(RateLimiter::direct(quota)));
+        let weighted_rate_limiter = self.weighted_quota.map(|quota_definition| {
+            let state = SharedGovernorState::new();
+            persisted_limiters.push(PersistedLimiterBinding {
+                key: quota_definition.persistence_key("weighted"),
+                state: state.clone(),
+            });
+            Arc::new(RateLimiter::new(
+                quota_definition.quota,
+                state,
+                DefaultClock::default(),
+            ))
+        });
+
+        let persistence = if persisted_limiters.is_empty() {
+            None
+        } else {
+            self.persistence
+                .map(|config| RateControllerPersistence::new(config, persisted_limiters))
+        };
 
         let semaphore = self
             .max_concurrent_requests
@@ -132,6 +540,7 @@ impl RateControllerBuilder {
             weighted_rate_limiter,
             semaphore,
             self.metrics.unwrap_or_default(),
+            persistence,
         )
     }
 }
@@ -189,11 +598,11 @@ impl RateControllerMetrics {
 #[derive(Debug)]
 pub struct RateController {
     jitter_config: JitterConfig,
-    rate_limiters: Vec<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
-    weighted_rate_limiter:
-        Option<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
+    rate_limiters: Vec<Arc<GovernorRateLimiter>>,
+    weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
     semaphore: Option<Arc<Semaphore>>,
     metrics: Arc<RateControllerMetrics>,
+    persistence: Option<Arc<RateControllerPersistence>>,
 }
 
 #[derive(Debug)]
@@ -222,8 +631,9 @@ impl Permit {
     /// - If the weighted quota does not have sufficient capacity for the provided weight, this will return an `InsufficientCapacity` error.
     pub async fn until_ready(&self) -> Result<()> {
         let wait_start = tokio::time::Instant::now();
-        let result = Arc::clone(&self.rate_controller)
-            .until_weighted_ready(self.weight)
+        let result = self
+            .rate_controller
+            .wait_for_rate_limiters(self.weight)
             .await;
 
         let wait_duration = wait_start.elapsed();
@@ -293,12 +703,11 @@ impl RateController {
 
     fn new(
         jitter: Option<JitterConfig>,
-        rate_limiters: Vec<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
-        weighted_rate_limiter: Option<
-            Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>,
-        >,
+        rate_limiters: Vec<Arc<GovernorRateLimiter>>,
+        weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
         semaphore: Option<Arc<Semaphore>>,
         metrics: Arc<RateControllerMetrics>,
+        persistence: Option<Arc<RateControllerPersistence>>,
     ) -> Arc<Self> {
         let jitter_config = jitter.unwrap_or(JitterConfig {
             min: Duration::ZERO,
@@ -311,7 +720,37 @@ impl RateController {
             weighted_rate_limiter,
             semaphore,
             metrics,
+            persistence,
         })
+    }
+
+    async fn wait_for_rate_limiters(self: &Arc<Self>, weight: Option<u32>) -> Result<()> {
+        let mut conflicts = 0;
+
+        loop {
+            if let Some(persistence) = &self.persistence {
+                persistence.refresh_if_due().await?;
+            }
+
+            Arc::clone(self).until_weighted_ready(weight).await?;
+
+            let Some(persistence) = &self.persistence else {
+                return Ok(());
+            };
+
+            match persistence.persist_snapshot().await? {
+                PersistResult::Persisted => return Ok(()),
+                PersistResult::Conflict => {
+                    conflicts += 1;
+                    if conflicts >= MAX_PERSISTENCE_CONFLICTS {
+                        return Err(Error::PersistenceConflictLimit {
+                            origin: persistence.origin().to_string(),
+                            attempts: conflicts,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// Acquires a permit from the rate controller with a specified weight.
@@ -364,7 +803,7 @@ impl RateController {
         };
 
         // check all of the rate limiters async
-        if let Err(error) = Arc::clone(self).until_weighted_ready(weight).await {
+        if let Err(error) = self.wait_for_rate_limiters(weight).await {
             self.metrics.record_acquire_error(wait_start.elapsed());
             return Err(error);
         }
@@ -387,11 +826,53 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn duration_nanos_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn normalize_refresh_interval(refresh_interval: Duration) -> Duration {
+    if refresh_interval.is_zero() {
+        DEFAULT_PERSISTENCE_REFRESH_INTERVAL
+    } else {
+        refresh_interval
+    }
+}
+
+fn normalize_object_state_prefix(prefix: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
+fn unix_nanos_now() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration_nanos_u64(duration),
+        Err(error) => {
+            tracing::warn!("Failed to read system time for rate-control state: {error}");
+            0
+        }
+    }
+}
+
+fn unix_millis_now() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration_millis_u64(duration),
+        Err(error) => {
+            tracing::warn!("Failed to read system time for rate-control state: {error}");
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{num::NonZeroU32, time::Instant};
 
     use super::*;
+    use object_store::memory::InMemory;
 
     #[tokio::test]
     async fn test_rate_limiter_acquire() {
@@ -450,6 +931,58 @@ mod tests {
             },
             () = tokio::time::sleep(Duration::from_secs(1)) => {
                 panic!("Expected to acquire a permit after dropping one, but timed out.");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_governor_state_is_shared_between_controllers() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let quota = Quota::with_period(Duration::from_millis(100))
+            .expect("quota period should be non-zero")
+            .allow_burst(NonZeroU32::new(1).expect("burst should be non-zero"));
+
+        let first_controller = RateControllerBuilder::new()
+            .add_quota_with_name("requests", quota)
+            .with_object_store_persistence(
+                Arc::clone(&store),
+                "",
+                "https%3A%2F%2Fapi.example.com%3A443",
+                "https://api.example.com:443",
+                Duration::from_secs(30),
+            )
+            .build();
+        let second_controller = RateControllerBuilder::new()
+            .add_quota_with_name("requests", quota)
+            .with_object_store_persistence(
+                store,
+                "",
+                "https%3A%2F%2Fapi.example.com%3A443",
+                "https://api.example.com:443",
+                Duration::from_secs(30),
+            )
+            .build();
+
+        let first_permit = first_controller
+            .acquire()
+            .await
+            .expect("first controller should acquire immediately");
+        drop(first_permit);
+
+        tokio::select! {
+            second = second_controller.acquire() => {
+                panic!("second controller should wait on persisted state, got: {second:?}");
+            }
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        tokio::select! {
+            second = second_controller.acquire() => {
+                let permit = second.expect("second controller should acquire after shared quota replenishes");
+                drop(permit);
+            }
+            () = tokio::time::sleep(Duration::from_millis(250)) => {
+                panic!("second controller did not acquire after shared quota replenished");
             }
         }
     }

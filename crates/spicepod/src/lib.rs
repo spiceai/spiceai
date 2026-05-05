@@ -974,6 +974,39 @@ mod version_tests {
         assert_eq!(scheduler.partition_discovery_timeout, "60s");
     }
 
+    #[test]
+    fn test_rate_control_state_defaults() {
+        let yaml = r"
+            state_location: s3://bucket/rate-control
+        ";
+        let rate_control: component::runtime::RateControl =
+            yaml::from_str(yaml).expect("Should parse RateControl");
+        assert_eq!(rate_control.state_location, "s3://bucket/rate-control");
+        assert_eq!(rate_control.refresh_interval, "30s");
+        assert!(rate_control.params.is_none());
+    }
+
+    #[test]
+    fn test_runtime_rate_control_deserializes() {
+        let yaml = r"
+            rate_control:
+              state_location: file:///tmp/spice-rate-control
+              refresh_interval: 15s
+              params:
+                allow_http: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let rate_control = runtime
+            .rate_control
+            .expect("rate_control section should exist");
+        assert_eq!(
+            rate_control.state_location,
+            "file:///tmp/spice-rate-control"
+        );
+        assert_eq!(rate_control.refresh_interval, "15s");
+        assert!(rate_control.params.is_some());
+    }
+
     /// `read_write_create` access mode deserializes.
     #[test]
     fn test_access_mode_read_write_create() {

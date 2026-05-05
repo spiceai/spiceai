@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -325,11 +325,16 @@ where
     /// Returns an error if listing keys fails.
     pub async fn refresh(&self) -> Result<()> {
         let keys = self.list_keys().await?;
+        let live_keys: HashSet<String> = keys.iter().cloned().collect();
 
-        for key in keys {
-            // Ignore errors during refresh - just skip failed entries
-            let _ = self.get(&key).await;
+        for key in &keys {
+            // Ignore errors during refresh - just skip failed entries.
+            if self.get(key).await.is_err() {
+                self.remove_from_cache(key);
+            }
         }
+
+        self.cache.write().retain(|key, _| live_keys.contains(key));
 
         Ok(())
     }
@@ -486,6 +491,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_conflict_returns_current_value_and_refreshes_cache() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first_writer: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+        let second_writer: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+
+        let initial = TestData {
+            name: "initial".to_string(),
+            value: 1,
+        };
+        first_writer
+            .insert("key1", &initial)
+            .await
+            .expect("insert failed");
+
+        assert_eq!(
+            second_writer.get("key1").await.expect("get failed"),
+            Some(initial)
+        );
+
+        let first_update = TestData {
+            name: "first writer".to_string(),
+            value: 2,
+        };
+        assert_eq!(
+            first_writer
+                .update("key1", &first_update)
+                .await
+                .expect("first update failed"),
+            UpdateResult::Ok
+        );
+
+        let stale_update = TestData {
+            name: "second writer".to_string(),
+            value: 3,
+        };
+        let result = second_writer
+            .update("key1", &stale_update)
+            .await
+            .expect("stale update failed");
+
+        match result {
+            UpdateResult::Conflict { current } => assert_eq!(current, first_update),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        assert_eq!(second_writer.get_cached("key1"), Some(first_update.clone()));
+
+        assert_eq!(
+            second_writer
+                .update("key1", &stale_update)
+                .await
+                .expect("retry update failed"),
+            UpdateResult::Ok
+        );
+        assert_eq!(
+            first_writer.get("key1").await.expect("final get failed"),
+            Some(stale_update)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_or_update_conflict_with_stale_cache() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first_writer: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+        let second_writer: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+
+        let initial = TestData {
+            name: "initial".to_string(),
+            value: 1,
+        };
+        first_writer
+            .insert("key1", &initial)
+            .await
+            .expect("insert failed");
+        second_writer
+            .get("key1")
+            .await
+            .expect("populate second writer cache");
+
+        let current = TestData {
+            name: "remote current".to_string(),
+            value: 2,
+        };
+        first_writer
+            .update("key1", &current)
+            .await
+            .expect("first writer update failed");
+
+        let stale_value = TestData {
+            name: "stale write".to_string(),
+            value: 3,
+        };
+        let result = second_writer
+            .insert_or_update("key1", &stale_value)
+            .await
+            .expect("insert_or_update failed");
+
+        match result {
+            WriteResult::Conflict { current: conflict } => assert_eq!(conflict, current),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        assert_eq!(second_writer.get_cached("key1"), Some(current));
+    }
+
+    #[tokio::test]
     async fn test_get_cached() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let state: ObjectState<TestData> =
@@ -547,6 +662,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_keys_scopes_prefix_and_json_suffix() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+
+        let data = TestData {
+            name: "test".to_string(),
+            value: 42,
+        };
+        let payload = serde_json::to_vec(&data).expect("serialize failed");
+
+        store
+            .put(&Path::from("test/key1.json"), payload.clone().into())
+            .await
+            .expect("put key1 failed");
+        store
+            .put(&Path::from("test/nested/key2.json"), payload.clone().into())
+            .await
+            .expect("put nested key2 failed");
+        store
+            .put(&Path::from("test/raw.txt"), payload.clone().into())
+            .await
+            .expect("put raw file failed");
+        store
+            .put(&Path::from("other/key3.json"), payload.into())
+            .await
+            .expect("put other prefix failed");
+
+        let mut keys = state.list_keys().await.expect("list_keys failed");
+        keys.sort();
+
+        assert_eq!(keys, vec!["key1", "nested/key2"]);
+    }
+
+    #[tokio::test]
     async fn test_refresh() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let state: ObjectState<TestData> =
@@ -569,5 +719,89 @@ mod tests {
         state.refresh().await.expect("refresh failed");
 
         assert_eq!(state.get_cached("external"), Some(data));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_removes_deleted_cached_entries() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+
+        let data = TestData {
+            name: "test".to_string(),
+            value: 42,
+        };
+
+        state.insert("key1", &data).await.expect("insert failed");
+        assert_eq!(state.get_cached("key1"), Some(data));
+
+        store
+            .delete(&Path::from("test/key1.json"))
+            .await
+            .expect("delete failed");
+
+        state.refresh().await.expect("refresh failed");
+
+        assert!(state.get_cached("key1").is_none());
+        assert!(
+            state
+                .list_keys()
+                .await
+                .expect("list_keys failed")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_removes_cached_entry() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+
+        let data = TestData {
+            name: "test".to_string(),
+            value: 42,
+        };
+
+        state.insert("key1", &data).await.expect("insert failed");
+        assert!(state.get_cached("key1").is_some());
+
+        store
+            .delete(&Path::from("test/key1.json"))
+            .await
+            .expect("delete failed");
+
+        assert_eq!(state.get("key1").await.expect("get failed"), None);
+        assert!(state.get_cached("key1").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_populates_valid_entries_and_skips_invalid_json() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+
+        let valid = TestData {
+            name: "valid".to_string(),
+            value: 7,
+        };
+        let payload = serde_json::to_vec(&valid).expect("serialize failed");
+
+        store
+            .put(&Path::from("test/valid.json"), payload.into())
+            .await
+            .expect("put valid failed");
+        store
+            .put(
+                &Path::from("test/invalid.json"),
+                b"not valid json".as_slice().into(),
+            )
+            .await
+            .expect("put invalid failed");
+
+        state.refresh().await.expect("refresh failed");
+
+        assert_eq!(state.get_cached("valid"), Some(valid));
+        assert!(state.get_cached("invalid").is_none());
     }
 }

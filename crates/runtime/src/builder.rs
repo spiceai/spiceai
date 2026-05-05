@@ -38,6 +38,7 @@ use crate::{
     status, tracers,
 };
 use app::App;
+use spicepod::component::runtime::RateControl as SpicepodRateControl;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::TelemetryConfig;
@@ -245,6 +246,13 @@ impl RuntimeBuilder {
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
 
+        let http_rate_control_registry = build_http_rate_control_registry(
+            spicepod_rt.rate_control.as_ref(),
+            Arc::clone(&secrets),
+            io_runtime.clone(),
+        )
+        .await;
+
         let distributed: Option<DistributedNode> = match self
             .resolved_cluster_config
             .as_ref()
@@ -406,9 +414,7 @@ impl RuntimeBuilder {
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
             model_rate_controllers: Arc::new(RwLock::new(HashMap::new())),
-            http_rate_control_registry: Arc::new(
-                dataconnector::http_rate_control::HttpRateControlRegistry::default(),
-            ),
+            http_rate_control_registry,
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
@@ -484,6 +490,70 @@ impl RuntimeBuilder {
 impl Default for RuntimeBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+async fn build_http_rate_control_registry(
+    rate_control: Option<&SpicepodRateControl>,
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+    let Some(rate_control) = rate_control else {
+        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+    };
+
+    let Some(refresh_interval) = parse_rate_control_refresh_interval(rate_control) else {
+        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+    };
+
+    match crate::object_store_state::build_object_store(
+        secrets,
+        io_runtime,
+        &rate_control.state_location,
+        rate_control.params.as_ref(),
+        "rate-control state",
+    )
+    .await
+    {
+        Ok((store, base_prefix)) => {
+            tracing::info!(
+                "Initialized persisted HTTP governor rate-control state with location: {}",
+                rate_control.state_location
+            );
+            Arc::new(
+                dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
+                    store,
+                    base_prefix,
+                    refresh_interval,
+                ),
+            )
+        }
+        Err(error) => {
+            tracing::error!(
+                "Failed to initialize persisted HTTP governor rate-control state: {error}"
+            );
+            Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
+        }
+    }
+}
+
+fn parse_rate_control_refresh_interval(rate_control: &SpicepodRateControl) -> Option<Duration> {
+    match fundu::parse_duration(&rate_control.refresh_interval) {
+        Ok(refresh_interval) if refresh_interval.is_zero() => {
+            tracing::error!(
+                "Invalid runtime.rate_control.refresh_interval '{}': value must be greater than 0",
+                rate_control.refresh_interval
+            );
+            None
+        }
+        Ok(refresh_interval) => Some(refresh_interval),
+        Err(error) => {
+            tracing::error!(
+                "Invalid runtime.rate_control.refresh_interval '{}': {error}",
+                rate_control.refresh_interval
+            );
+            None
+        }
     }
 }
 

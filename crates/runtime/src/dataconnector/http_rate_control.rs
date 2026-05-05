@@ -28,6 +28,7 @@ use crate::dataconnector::{ConnectorComponent, DataConnectorError, DataConnector
 use crate::parameters::{ParameterSpec, Parameters};
 use data_components::rate_limit::{HttpRateLimiter, HttpRateLimiterMetrics};
 use governor::Quota;
+use object_store::ObjectStore;
 use opentelemetry::KeyValue;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerMetrics};
 use tokio::sync::RwLock;
@@ -53,6 +54,23 @@ pub struct HttpRateControlRegistry {
     rate_controllers: RwLock<HashMap<String, SharedRateControllerEntry>>,
     metrics_by_origin: StdRwLock<HashMap<String, Arc<HttpRateControlMetrics>>>,
     metric_owners: StdRwLock<HashMap<String, String>>,
+    persisted_governor_state: Option<HttpRateControlPersistedState>,
+}
+
+#[derive(Clone)]
+struct HttpRateControlPersistedState {
+    store: Arc<dyn ObjectStore>,
+    base_prefix: String,
+    refresh_interval: Duration,
+}
+
+impl std::fmt::Debug for HttpRateControlPersistedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRateControlPersistedState")
+            .field("base_prefix", &self.base_prefix)
+            .field("refresh_interval", &self.refresh_interval)
+            .finish_non_exhaustive()
+    }
 }
 
 #[must_use]
@@ -501,6 +519,22 @@ pub fn resolve_config<S: BuildHasher>(
 }
 
 impl HttpRateControlRegistry {
+    #[must_use]
+    pub fn with_persisted_governor_state(
+        store: Arc<dyn ObjectStore>,
+        base_prefix: impl Into<String>,
+        refresh_interval: Duration,
+    ) -> Self {
+        Self {
+            persisted_governor_state: Some(HttpRateControlPersistedState {
+                store,
+                base_prefix: base_prefix.into(),
+                refresh_interval,
+            }),
+            ..Self::default()
+        }
+    }
+
     pub async fn shared_rate_limiter(&self, base_url: &Url) -> Arc<HttpRateLimiter> {
         let key = rate_control_key(base_url);
         let rate_limiters = self.rate_limiters.read().await;
@@ -595,7 +629,8 @@ impl HttpRateControlRegistry {
             });
         }
 
-        let shared = build_shared_rate_controller(config);
+        let shared =
+            build_shared_rate_controller(&key, config, self.persisted_governor_state.as_ref());
         rate_controllers.insert(
             key.clone(),
             SharedRateControllerEntry {
@@ -662,7 +697,8 @@ impl HttpRateControlRegistry {
             );
         }
 
-        let shared = build_shared_rate_controller(config);
+        let shared =
+            build_shared_rate_controller(&key, config, self.persisted_governor_state.as_ref());
         rate_controllers.insert(
             key,
             SharedRateControllerEntry {
@@ -702,7 +738,11 @@ pub async fn shared_rate_controller(
         .await
 }
 
-fn build_shared_rate_controller(config: &HttpRateControlConfig) -> SharedRateController {
+fn build_shared_rate_controller(
+    origin_key: &str,
+    config: &HttpRateControlConfig,
+    persisted_state: Option<&HttpRateControlPersistedState>,
+) -> SharedRateController {
     if !config.is_enabled() {
         return SharedRateController {
             config: config.clone(),
@@ -712,14 +752,29 @@ fn build_shared_rate_controller(config: &HttpRateControlConfig) -> SharedRateCon
 
     let mut builder = RateController::builder()
         .with_jitter(JitterConfig::new(config.jitter_min, config.jitter_max));
+    if let Some(persisted_state) = persisted_state {
+        builder = builder.with_object_store_persistence(
+            Arc::clone(&persisted_state.store),
+            persisted_state.base_prefix.clone(),
+            rate_control_state_object_key(origin_key),
+            origin_key.to_string(),
+            persisted_state.refresh_interval,
+        );
+    }
     if let Some(max_concurrent_requests) = config.max_concurrent_requests {
         builder = builder.with_max_concurrent_requests(max_concurrent_requests);
     }
     if let Some(requests_per_second) = config.requests_per_second {
-        builder = builder.add_quota(Quota::per_second(requests_per_second));
+        builder = builder.add_quota_with_name(
+            "requests_per_second",
+            Quota::per_second(requests_per_second),
+        );
     }
     if let Some(requests_per_minute) = config.requests_per_minute {
-        builder = builder.add_quota(Quota::per_minute(requests_per_minute));
+        builder = builder.add_quota_with_name(
+            "requests_per_minute",
+            Quota::per_minute(requests_per_minute),
+        );
     }
 
     SharedRateController {
@@ -970,6 +1025,25 @@ pub fn rate_control_key(base_url: &Url) -> String {
     }
 }
 
+fn rate_control_state_object_key(origin_key: &str) -> String {
+    let mut encoded = String::with_capacity(origin_key.len());
+    for byte in origin_key.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            push_percent_encoded_byte(&mut encoded, byte);
+        }
+    }
+    encoded
+}
+
+fn push_percent_encoded_byte(output: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    output.push('%');
+    output.push(char::from(HEX[usize::from(byte >> 4)]));
+    output.push(char::from(HEX[usize::from(byte & 0x0F)]));
+}
+
 fn conflicting_config_error<T>(
     dataset: &Dataset,
     dataconnector: &'static str,
@@ -1020,6 +1094,14 @@ mod tests {
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn rate_control_state_object_key_percent_encodes_origin() {
+        assert_eq!(
+            rate_control_state_object_key("https://api.example.com:443"),
+            "https%3A%2F%2Fapi.example.com%3A443"
+        );
     }
 
     #[tokio::test]
