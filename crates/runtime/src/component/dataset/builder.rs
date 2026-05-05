@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    CheckAvailability, Dataset, Error, Load, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
+    CheckAvailability, Dataset, Error, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
     acceleration, replication, validate_identifier,
 };
 use crate::Runtime;
@@ -63,7 +63,6 @@ pub struct DatasetBuilder {
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
     pub check_availability: CheckAvailability,
-    pub load: Load,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -152,7 +151,6 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             runtime: None,
             vectors: dataset.vectors,
             check_availability: CheckAvailability::from(dataset.check_availability),
-            load: Load::from(dataset.load),
         })
     }
 }
@@ -184,7 +182,6 @@ impl DatasetBuilder {
             runtime: None,
             vectors: None,
             check_availability: CheckAvailability::default(),
-            load: Load::default(),
         })
     }
 
@@ -282,7 +279,6 @@ impl DatasetBuilder {
             runtime,
             vectors: self.vectors,
             check_availability: self.check_availability,
-            load: self.load,
         };
 
         Ok(dataset)
