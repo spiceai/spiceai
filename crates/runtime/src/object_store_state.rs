@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
-use datafusion::execution::object_store::ObjectStoreRegistry;
 use object_store::ObjectStore;
 use runtime_object_store::build_azure_object_store;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
@@ -77,6 +76,14 @@ pub(crate) enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display(
+        "Failed to parse {usage} file location {location}: URL is not a local file path"
+    ))]
+    InvalidFileLocation {
+        usage: &'static str,
+        location: String,
+    },
+
     #[snafu(display("Failed to initialize local filesystem for {usage} at {location}: {source}"))]
     LocalFileSystemInit {
         usage: &'static str,
@@ -100,17 +107,12 @@ pub(crate) async fn build_object_store(
     })?;
 
     if url.scheme() == "file" {
-        let local_path = match url.host_str() {
-            Some(host) => {
-                let path_suffix = url.path().trim_start_matches('/');
-                if path_suffix.is_empty() {
-                    std::path::PathBuf::from(host)
-                } else {
-                    std::path::PathBuf::from(format!("{host}/{path_suffix}"))
-                }
-            }
-            None => std::path::PathBuf::from(url.path()),
-        };
+        let local_path = url
+            .to_file_path()
+            .map_err(|()| Error::InvalidFileLocation {
+                usage,
+                location: state_location.to_string(),
+            })?;
 
         tokio::fs::create_dir_all(&local_path)
             .await
@@ -167,8 +169,8 @@ pub(crate) async fn build_object_store(
             location: url.to_string(),
         })?
     } else {
-        SpiceObjectStoreRegistry::new(io_runtime)
-            .get_store(&url)
+        let registry = SpiceObjectStoreRegistry::new(io_runtime);
+        datafusion::execution::object_store::ObjectStoreRegistry::get_store(&registry, &url)
             .context(ObjectStoreInitSnafu {
                 usage,
                 location: url.to_string(),
@@ -304,6 +306,26 @@ mod tests {
             WriteResult::Conflict { current } => assert_eq!(current, remote_update),
             other => panic!("expected Conflict, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn build_object_store_file_location_handles_localhost_and_percent_encoding() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp_dir.path().join("nested state");
+        let state_location = format!("file://localhost{}", state_dir.display()).replace(' ', "%20");
+
+        let (_, prefix) = build_object_store(
+            secrets(),
+            Handle::current(),
+            &state_location,
+            None,
+            "test state",
+        )
+        .await
+        .expect("file state store should build");
+
+        assert_eq!(prefix, "");
+        assert!(state_dir.is_dir());
     }
 
     #[tokio::test]

@@ -736,19 +736,18 @@ impl RateController {
     }
 
     async fn wait_for_rate_limiters(self: &Arc<Self>, weight: Option<u32>) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            persistence.refresh_if_due().await?;
+        }
+
+        Arc::clone(self).until_weighted_ready(weight).await?;
+
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+
         let mut conflicts = 0;
-
         loop {
-            if let Some(persistence) = &self.persistence {
-                persistence.refresh_if_due().await?;
-            }
-
-            Arc::clone(self).until_weighted_ready(weight).await?;
-
-            let Some(persistence) = &self.persistence else {
-                return Ok(());
-            };
-
             match persistence.persist_snapshot().await? {
                 PersistResult::Persisted => return Ok(()),
                 PersistResult::Conflict => {
@@ -884,6 +883,7 @@ mod tests {
 
     use super::*;
     use object_store::memory::InMemory;
+    use object_store_occ::UpdateResult;
 
     #[tokio::test]
     async fn test_rate_limiter_acquire() {
@@ -1060,6 +1060,89 @@ mod tests {
 
         assert!(persisted.limiters.contains_key("current-limiter"));
         assert!(!persisted.limiters.contains_key("stale-limiter"));
+    }
+
+    #[tokio::test]
+    async fn persistence_conflicts_do_not_recharge_rate_limiters() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let object_key = "https%3A%2F%2Fapi.example.com%3A443";
+        let quota = Quota::with_period(Duration::from_millis(200))
+            .expect("quota period should be non-zero")
+            .allow_burst(NonZeroU32::new(1).expect("burst should be non-zero"));
+
+        let rate_controller = RateControllerBuilder::new()
+            .add_quota_with_name("requests", quota)
+            .with_object_store_persistence(
+                Arc::clone(&store),
+                "",
+                object_key,
+                "https://api.example.com:443",
+                Duration::from_secs(30),
+            )
+            .build();
+        let persistence = rate_controller
+            .persistence
+            .as_ref()
+            .expect("controller should have persistence");
+
+        let initial_state = PersistedRateControlState {
+            schema_version: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
+            updated_at_unix_ms: unix_millis_now(),
+            limiters: HashMap::new(),
+        };
+        assert_eq!(
+            persistence
+                .object_state
+                .insert_or_update(object_key, &initial_state)
+                .await
+                .expect("seed persisted state"),
+            WriteResult::Inserted
+        );
+        *persistence.last_refresh.lock().await = Some(tokio::time::Instant::now());
+
+        let external_writer: ObjectState<PersistedRateControlState> = ObjectState::new(store);
+        assert_eq!(
+            external_writer
+                .get(object_key)
+                .await
+                .expect("external writer should read initial state"),
+            Some(initial_state)
+        );
+        let external_state = PersistedRateControlState {
+            schema_version: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
+            updated_at_unix_ms: unix_millis_now(),
+            limiters: HashMap::new(),
+        };
+        assert_eq!(
+            external_writer
+                .update(object_key, &external_state)
+                .await
+                .expect("external writer should update persisted state"),
+            UpdateResult::Ok
+        );
+
+        let first_permit = rate_controller
+            .acquire()
+            .await
+            .expect("first acquire should persist after resolving one conflict");
+        drop(first_permit);
+
+        tokio::select! {
+            second = rate_controller.acquire() => {
+                panic!("second acquire should wait after one request, got: {second:?}");
+            }
+            () = tokio::time::sleep(Duration::from_millis(150)) => {}
+        }
+
+        tokio::select! {
+            second = rate_controller.acquire() => {
+                let permit = second.expect("second acquire should wait for one quota interval, not two");
+                drop(permit);
+            }
+            () = tokio::time::sleep(Duration::from_millis(200)) => {
+                panic!("second acquire waited longer than one quota interval after persistence conflict");
+            }
+        }
     }
 
     #[tokio::test]

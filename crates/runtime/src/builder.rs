@@ -531,13 +531,11 @@ async fn build_http_rate_control_registry(
                     "Initialized persisted HTTP governor rate-control state with location: {}",
                     rate_control.state_location
                 );
-                Arc::new(
-                dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
+                Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
                     store,
                     base_prefix,
                     refresh_interval,
-                ),
-            )
+                ))
             }
             Err(error) => {
                 tracing::error!(
