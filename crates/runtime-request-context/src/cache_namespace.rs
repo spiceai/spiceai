@@ -100,6 +100,28 @@ impl CacheNamespace {
             CacheNamespace::System => (2, &[]),
         }
     }
+
+    /// Stable string identifier suitable for storage inside the caching
+    /// accelerator's `__spice_cache_namespace` column. Comparing rows by
+    /// this value is what enforces cross-principal isolation in the
+    /// accelerator.
+    ///
+    /// Format:
+    /// - [`CacheNamespace::Public`] → `"public"`
+    /// - [`CacheNamespace::System`] → `"system"`
+    /// - [`CacheNamespace::Principal`] → the principal's opaque id
+    ///   verbatim (e.g. `"apikey:0123456789abcdef"`)
+    ///
+    /// The values are stable across releases; persisted cache rows must
+    /// continue to compare equal after upgrades.
+    #[must_use]
+    pub fn storage_id(&self) -> &str {
+        match self {
+            CacheNamespace::Public => "public",
+            CacheNamespace::Principal(id) => id.as_ref(),
+            CacheNamespace::System => "system",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -155,5 +177,21 @@ mod tests {
         assert_eq!(p_inputs.1, b"apikey:abc");
         // Tags must be distinct so empty-id Public and System never collide.
         assert_ne!(pub_inputs.0, sys_inputs.0);
+    }
+
+    #[test]
+    fn storage_id_is_stable_per_variant() {
+        assert_eq!(CacheNamespace::Public.storage_id(), "public");
+        assert_eq!(CacheNamespace::System.storage_id(), "system");
+        assert_eq!(
+            CacheNamespace::Principal(Arc::from("apikey:abc")).storage_id(),
+            "apikey:abc",
+        );
+        // public and system are distinct so an unauthenticated user and a
+        // background system task cannot collide on cached rows.
+        assert_ne!(
+            CacheNamespace::Public.storage_id(),
+            CacheNamespace::System.storage_id(),
+        );
     }
 }
