@@ -46,6 +46,7 @@ on:
           - 'duckdb-zero-results'
           - 'duckdb-partitioned'
           - 'snowflake'
+          - 'snowflake-catalog'
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
