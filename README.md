@@ -38,7 +38,7 @@
 - 🦀 **Built in Rust** on industry-leading open foundations: [Apache DataFusion](https://datafusion.apache.org), [Apache Ballista](https://datafusion.apache.org/ballista/), [Apache Arrow](https://arrow.apache.org), [Apache Iceberg](https://iceberg.apache.org), [Vortex](https://github.com/vortex-data/vortex), [DuckDB](https://duckdb.org), and [SQLite](https://www.sqlite.org).
 - ⚡ **Distributed query without the operational tax** — Apache Ballista with multi-active schedulers coordinated through object storage. **2.9x faster than single-node DataFusion** on TPC-H SF100, **8x less RAM than Spark**.
 - 💎 **Spice Cayenne** data accelerator on Vortex — **1.4x faster than DuckDB with 3x less memory** on TPC-H SF100. **100x faster random access vs. Parquet**.
-- 🔍 **Petabyte-scale hybrid search** — Native Amazon S3 Vectors, Tantivy BM25, pgvector, DuckDB HNSW, Elasticsearch, with reciprocal rank fusion (RRF) and reranker UDTFs — all in a single SQL query.
+- 🔍 **Petabyte-scale hybrid search** — Native Amazon S3 Vectors, Tantivy BM25, DuckDB HNSW, and Elasticsearch kNN, with reciprocal rank fusion (RRF) and reranker UDTFs — all in a single SQL query.
 - 🤖 **AI-native runtime** — OpenAI-compatible APIs, MCP server + gateway, LLM memory, NSQL text-to-SQL, multi-vector ColBERT-style embeddings, provider-aware prompt caching.
 - 🔗 **30+ data connectors** with advanced query push-down — federate Postgres, MySQL, Snowflake, Databricks, Iceberg, Delta Lake, S3, Spark, MSSQL, DynamoDB, MongoDB, GitHub, SharePoint, Kafka, and more.
 - ⏱️ **Real-time CDC** — Native PostgreSQL WAL streaming and DynamoDB Streams (no Debezium or Kafka required), plus Debezium when you need it.
@@ -95,7 +95,7 @@ Connect to any Iceberg catalog (REST, AWS Glue, Hadoop), query tables with full 
 
 ### Petabyte-scale hybrid search
 
-Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus pgvector, DuckDB HNSW, SQLite-vec, and Elasticsearch. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
+Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus DuckDB HNSW and Elasticsearch kNN as `.vectors.engine` backends. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
 
 ```sql
 SELECT * FROM rerank(
@@ -325,13 +325,13 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Vector Engines
 
+Configured as `.vectors.engine` on a column-level embedding.
+
 | Name            | Description                                                          | Status |
 | --------------- | -------------------------------------------------------------------- | ------ |
 | `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
-| `pgvector`      | PostgreSQL with pgvector extension                                   | Alpha  |
-| `duckdb_vector` | DuckDB with HNSW vector index                                        | Alpha  |
-| `sqlite_vec`    | SQLite with sqlite-vec extension                                     | Alpha  |
-| `elasticsearch` | Elasticsearch as a vector engine                                     | Alpha  |
+| `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
+| `elasticsearch` | Elasticsearch with kNN                                               | Alpha  |
 
 ## Supported Catalogs
 
@@ -347,14 +347,14 @@ Catalog Connectors connect to external catalog providers and make their tables a
 
 ## Supported Secret Stores
 
-| Name              | Description                  | Status            |
-| ----------------- | ---------------------------- | ----------------- |
-| `env`             | Environment variables        | Stable            |
-| `kubernetes`      | Kubernetes secrets           | Stable            |
-| `keyring`         | OS keychain                  | Stable            |
-| `aws_secrets`     | AWS Secrets Manager          | Stable            |
-| `hashicorp_vault` | HashiCorp Vault              | Release Candidate |
-| `azure_keyvault`  | Azure Key Vault              | Release Candidate |
+| Name                  | Description           | Status            |
+| --------------------- | --------------------- | ----------------- |
+| `env`                 | Environment variables | Stable            |
+| `kubernetes`          | Kubernetes secrets    | Stable            |
+| `keyring`             | OS keychain           | Stable            |
+| `aws_secrets_manager` | AWS Secrets Manager   | Stable            |
+| `hashicorp_vault`     | HashiCorp Vault       | Release Candidate |
+| `azure_keyvault`      | Azure Key Vault       | Release Candidate |
 
 ## ⚡️ Quickstart (Local Machine)
 
@@ -627,4 +627,4 @@ Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILI
 - 🛠️ Contribute code or docs (see [CONTRIBUTING.md](CONTRIBUTING.md))
 - ✉️ Send feedback to [hey@spice.ai](mailto:hey@spice.ai)
 
-⭐️ **Star this repo** to follow along — it helps us a ton, and you'll know when v2.0 ships. 🙏
+⭐️ **Star this repo** to follow along — it helps us a ton, and you'll see new releases as they ship. 🙏
