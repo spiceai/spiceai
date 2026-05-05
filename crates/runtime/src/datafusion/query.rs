@@ -1314,11 +1314,18 @@ where
     G: Send + 'static,
 {
     struct State<G> {
-        stream: SendableRecordBatchStream,
+        stream: Option<SendableRecordBatchStream>,
         token: tokio_util::sync::CancellationToken,
         query_id: String,
-        _guard: G,
+        guard: Option<G>,
         emitted_cancel: bool,
+    }
+
+    impl<G> State<G> {
+        fn release_query_resources(&mut self) {
+            self.stream.take();
+            self.guard.take();
+        }
     }
 
     fn cancellation_error(query_id: &str) -> DataFusionError {
@@ -1330,10 +1337,10 @@ where
     let schema = stream.schema();
 
     let state = State {
-        stream,
+        stream: Some(stream),
         token: cancellation_token,
         query_id,
-        _guard: guard,
+        guard: Some(guard),
         emitted_cancel: false,
     };
 
@@ -1343,15 +1350,20 @@ where
         }
         if state.token.is_cancelled() {
             state.emitted_cancel = true;
+            state.release_query_resources();
             return Some((Err(cancellation_error(&state.query_id)), state));
         }
+        let token = state.token.clone();
+        let mut stream = state.stream.take()?;
         tokio::select! {
             biased;
-            () = state.token.cancelled() => {
+            () = token.cancelled() => {
                 state.emitted_cancel = true;
+                state.release_query_resources();
                 Some((Err(cancellation_error(&state.query_id)), state))
             }
-            next = state.stream.next() => {
+            next = stream.next() => {
+                state.stream = Some(stream);
                 next.map(|item| (item, state))
             }
         }
@@ -2776,8 +2788,8 @@ mod tests {
             cancellation.expect_err("second item should be cancellation"),
             &query_id,
         );
-        assert!(stream.next().await.is_none());
         assert!(guard_dropped.load(Ordering::SeqCst));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
