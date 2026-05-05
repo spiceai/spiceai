@@ -55,12 +55,13 @@
 
 ## What you get
 
-Spice provides four industry-standard APIs in a lightweight, portable runtime (single binary or container):
+Spice provides five industry-standard APIs in a lightweight, portable runtime (single binary or container):
 
 1. **SQL Query & Search**: HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC APIs; `vector_search`, `text_search`, `rrf`, and `rerank` UDTFs.
-2. **OpenAI-Compatible APIs**: Hosted LLM gateway (OpenAI, Anthropic, xAI, Bedrock) and local model serving (CUDA/Metal accelerated). Includes the OpenAI Responses API, web search, and tool calls.
-3. **Iceberg Catalog REST APIs**: A unified Iceberg REST Catalog API for query and write.
-4. **MCP HTTP+SSE APIs**: Model Context Protocol server *and* gateway with Streamable HTTP transport.
+2. **Text-to-SQL (NSQL)**: Natural-language SQL generation grounded in your federated schema with built-in sampling tools — usable from the HTTP API, the SQL REPL, or directly inside agent tool calls.
+3. **OpenAI-Compatible APIs**: Hosted LLM gateway (OpenAI, Anthropic, xAI, Bedrock) and local model serving (CUDA/Metal accelerated). Includes the OpenAI Responses API, web search, and tool calls.
+4. **Iceberg Catalog REST APIs**: A unified Iceberg REST Catalog API for query and write.
+5. **MCP HTTP+SSE APIs**: Model Context Protocol server *and* gateway with Streamable HTTP transport.
 
 ## 🎥 Watch & Learn
 
