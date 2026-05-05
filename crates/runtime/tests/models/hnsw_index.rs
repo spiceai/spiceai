@@ -443,7 +443,7 @@ async fn test_hnsw_index_survives_multiple_refreshes() -> Result<(), anyhow::Err
         .await
 }
 
-/// Helper: creates an accelerated view with DuckDB + HNSW vector indexes over a source dataset.
+/// Helper: creates an accelerated view with `DuckDB` + HNSW vector indexes over a source dataset.
 fn hnsw_view(view_name: &str, source_ds: &str, db_path: &str) -> View {
     let accel_params: HashMap<String, String> =
         HashMap::from([("duckdb_file".to_string(), db_path.to_string())]);

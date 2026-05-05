@@ -561,8 +561,8 @@ pub(crate) fn duckdb_embedding_columns_from_view(
     embedding_columns
 }
 
-/// Wraps the accelerator in `builder` with DuckDB HNSW vector indexes if the view
-/// has both a DuckDB vector engine configured and at least one embedding column.
+/// Wraps the accelerator in `builder` with `DuckDB` HNSW vector indexes if the view
+/// has both a `DuckDB` vector engine configured and at least one embedding column.
 /// Returns `true` if the accelerator was wrapped, `false` otherwise.
 #[cfg(feature = "duckdb")]
 pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
