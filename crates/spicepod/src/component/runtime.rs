@@ -2223,7 +2223,6 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert!(runtime.functions.enabled);
-
     }
 
     #[test]
