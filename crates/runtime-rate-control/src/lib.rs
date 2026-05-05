@@ -238,6 +238,7 @@ struct RateControllerPersistence {
     refresh_interval: Duration,
     limiters: Vec<PersistedLimiterBinding>,
     last_refresh: Mutex<Option<tokio::time::Instant>>,
+    refresh_gate: Mutex<()>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -260,12 +261,23 @@ impl RateControllerPersistence {
             refresh_interval: normalize_refresh_interval(config.refresh_interval),
             limiters,
             last_refresh: Mutex::new(None),
+            refresh_gate: Mutex::new(()),
         });
         persistence.spawn_refresh_task();
         persistence
     }
 
     async fn refresh_if_due(&self) -> Result<()> {
+        {
+            let last_refresh = self.last_refresh.lock().await;
+            if last_refresh
+                .is_some_and(|last_refresh| last_refresh.elapsed() < self.refresh_interval)
+            {
+                return Ok(());
+            }
+        }
+
+        let _refresh_guard = self.refresh_gate.lock().await;
         {
             let last_refresh = self.last_refresh.lock().await;
             if last_refresh
@@ -378,7 +390,7 @@ impl RateControllerPersistence {
                 let Some(persistence) = weak.upgrade() else {
                     break;
                 };
-                if let Err(error) = persistence.refresh().await {
+                if let Err(error) = persistence.refresh_if_due().await {
                     tracing::warn!("Failed to refresh persisted rate-control state: {error}");
                 }
             }

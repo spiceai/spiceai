@@ -133,7 +133,11 @@ pub(crate) async fn build_object_store(
         return Ok((store, String::new()));
     }
 
-    let base_prefix = url.path().trim_matches('/').to_string();
+    let base_prefix = if matches!(url.scheme(), "abfs" | "abfss") {
+        String::new()
+    } else {
+        url.path().trim_matches('/').to_string()
+    };
 
     let store: Arc<dyn ObjectStore> = if url.scheme() == "s3" {
         let params = params.map(Params::as_string_map);
@@ -424,7 +428,7 @@ mod tests {
 
         assert!(result.is_ok(), "abfs state store should build: {result:?}");
         let (_, prefix) = result.expect("abfs state store should build");
-        assert_eq!(prefix, "runtime/rate-control");
+        assert_eq!(prefix, "");
     }
 
     #[tokio::test]
@@ -445,6 +449,6 @@ mod tests {
 
         assert!(result.is_ok(), "abfss state store should build: {result:?}");
         let (_, prefix) = result.expect("abfss state store should build");
-        assert_eq!(prefix, "runtime/rate-control");
+        assert_eq!(prefix, "");
     }
 }
