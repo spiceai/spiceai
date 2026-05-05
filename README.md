@@ -143,11 +143,12 @@ Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start e
 
 ## How is Spice different?
 
-1. **AI-Native Runtime** — Spice combines data query and AI inference in a single engine, so retrieval, ranking, and generation happen in one query plan, in one process.
-2. **Application-Focused Topology** — Designed to run as a 1:1 or 1:N sidecar at the app/agent level, not a shared centralized cluster. It's common to spin up multiple Spice instances — one per tenant, per agent, or per pod.
-3. **Dual-Engine Acceleration** — Per-dataset choice of OLAP (Cayenne/Vortex, Arrow, DuckDB) and OLTP (SQLite, PostgreSQL) engines, so you can match workload to engine instead of forcing everything into one shape.
-4. **Disaggregated Storage** — Compute is separated from disaggregated storage; working sets live with the app while authoritative data stays in source systems.
-5. **Edge to Cloud** — Single binary that runs on a laptop, as a Kubernetes sidecar, as a microservice, or as a multi-node Ballista cluster across edge, on-prem, and public clouds. Chain instances for tier-optimized deployments.
+1. **Cluster-sidecar architecture** — Each application gets its own Spice sidecar serving SQL, search, and LLM inference on `localhost`, transparently delegating the long tail to a central Spice cluster (Ballista distributed query, Cayenne acceleration, hybrid search indexing) over Arrow Flight. You get three latency tiers in one engine: **results cache (microseconds) → local working set (single-digit milliseconds) → cluster delegation (distributed)**. No other open-source runtime gives you all three behind one connection. [Read the architecture →](https://spice.ai/blog/cluster-sidecar-architecture)
+2. **Structural data sandboxing** — Datasets a sidecar doesn't declare in its `spicepod.yaml` are *physically absent from the catalog*, not filtered at query time. The application never holds credentials to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. A compromised pod gets a loopback scoped to that tenant's working set, not database credentials.
+3. **Ingest once, serve everywhere** — The cluster ingests each source dataset once and produces one authoritative materialization that every sidecar pulls. Source systems see one stable connection pool, not one per pod. Pull-based refresh + acceleration snapshots in S3 mean cold starts in seconds and graceful degradation when the cluster is unreachable.
+4. **AI-Native Runtime** — Data query and AI inference live in one engine, so retrieval, ranking, and generation happen in one query plan, in one process — `vector_search`, `text_search`, `rrf`, `rerank`, NSQL, and tool calls are all SQL primitives.
+5. **Dual-engine acceleration** — Per-dataset choice of OLAP (Cayenne/Vortex, Arrow, DuckDB) and OLTP (SQLite, PostgreSQL) engines, so you can match workload to engine instead of forcing everything into one shape.
+6. **Edge to cloud, single binary** — Runs on a laptop, as a Kubernetes sidecar, as a microservice, or as a multi-node Ballista cluster across edge, on-prem, and public clouds. Self-hosted OSS, Spice Cloud (managed cluster), and Spice.ai Enterprise (on-prem full stack) all use identical `spicepod.yaml` manifests — no app changes to migrate.
 
 If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ballista**, Spice gives you a flexible, production-ready engine you can just use — instead of stitching them together yourself.
 
