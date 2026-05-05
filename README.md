@@ -55,7 +55,7 @@
 
 ## What you get
 
-Spice provides five industry-standard APIs in a lightweight, portable runtime (single binary or container):
+Spice provides five APIs and interfaces in a lightweight, portable runtime (single binary or container):
 
 1. **SQL Query & Search**: HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC APIs; `vector_search`, `text_search`, `rrf`, and `rerank` UDTFs.
 2. **Text-to-SQL (NSQL)**: Natural-language SQL generation grounded in your federated schema with built-in sampling tools — usable from the HTTP API, the SQL REPL, or directly inside agent tool calls.
@@ -314,14 +314,14 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Embeddings Providers
 
-| Name          | Description                              | Status            | ML Format(s) | LLM Format(s)                   |
-| ------------- | ---------------------------------------- | ----------------- | ------------ | ------------------------------- |
-| `openai`      | OpenAI (or compatible) LLM endpoint      | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
-| `file`        | Local filesystem                         | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
-| `huggingface` | Models hosted on HuggingFace             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
-| `model2vec`   | Static embeddings (500x faster)          | Release Candidate | Model2Vec    | -                               |
-| `azure`       | Azure OpenAI                             | Alpha             | -            | OpenAI-compatible HTTP endpoint |
-| `bedrock`     | AWS Bedrock (Titan, Cohere, Nova, Nova 2) | Alpha             | -            | OpenAI-compatible HTTP endpoint |
+| Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)                          |
+| ------------- | -------------------------------------------- | ----------------- | ------------ | -------------------------------------- |
+| `openai`      | OpenAI (or compatible) embeddings endpoint   | Release Candidate | -            | OpenAI-compatible embeddings endpoint  |
+| `file`        | Local filesystem                             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                 |
+| `huggingface` | Models hosted on HuggingFace                 | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                 |
+| `model2vec`   | Static embeddings (500x faster)              | Release Candidate | Model2Vec    | -                                      |
+| `azure`       | Azure OpenAI                                 | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
+| `bedrock`     | AWS Bedrock (Titan, Cohere, Nova, Nova 2)    | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
 
 ## Supported Vector Engines
 
