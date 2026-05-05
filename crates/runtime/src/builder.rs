@@ -440,8 +440,6 @@ impl RuntimeBuilder {
             distributed,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
-            on_demand_datasets: Arc::new(RwLock::new(HashMap::new())),
-            on_demand_load_locks: Arc::new(Mutex::new(HashMap::new())),
             dataset_load_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),

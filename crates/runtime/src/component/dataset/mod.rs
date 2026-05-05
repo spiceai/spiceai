@@ -37,6 +37,7 @@ use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Dur
 
 pub mod acceleration;
 pub mod builder;
+pub mod declared_schema;
 pub mod declared_type;
 pub mod metadata;
 pub mod replication;
@@ -249,34 +250,6 @@ impl Display for CheckAvailability {
     }
 }
 
-/// Controls when a dataset is loaded by the runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Load {
-    /// Load the dataset during runtime startup.
-    #[default]
-    OnStartup,
-    /// Load the dataset when it is first queried or explicitly refreshed.
-    OnDemand,
-}
-
-impl From<spicepod_dataset::Load> for Load {
-    fn from(load: spicepod_dataset::Load) -> Self {
-        match load {
-            spicepod_dataset::Load::OnStartup => Load::OnStartup,
-            spicepod_dataset::Load::OnDemand => Load::OnDemand,
-        }
-    }
-}
-
-impl Display for Load {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Load::OnStartup => write!(f, "on_startup"),
-            Load::OnDemand => write!(f, "on_demand"),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Dataset {
     pub from: String,
@@ -300,7 +273,6 @@ pub struct Dataset {
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
     pub check_availability: CheckAvailability,
-    pub load: Load,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -326,7 +298,6 @@ impl std::fmt::Debug for Dataset {
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
             .field("check_availability", &self.check_availability)
-            .field("load", &self.load)
             .finish_non_exhaustive()
     }
 }
@@ -352,7 +323,6 @@ impl PartialEq for Dataset {
             && self.metrics == other.metrics
             && self.vectors == other.vectors
             && self.check_availability == other.check_availability
-            && self.load == other.load
     }
 }
 

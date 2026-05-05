@@ -23,6 +23,9 @@ helm install spiceai deploy/chart \
 | `serviceAccount.annotations`    | Annotations for the ServiceAccount                                           | `{}`                              |
 | `service.type`                  | Kubernetes Service type (`ClusterIP`, `NodePort`, `LoadBalancer`, or `null`) | `null`                            |
 | `service.additionalAnnotations` | Additional annotations on the Service                                        | `{}`                              |
+| `livenessProbe`                 | Kubernetes liveness probe configuration                                      | see `values.yaml`                 |
+| `readinessProbe`                | Kubernetes readiness probe configuration                                     | see `values.yaml`                 |
+| `startupProbe`                  | Kubernetes startup probe configuration                                       | see `values.yaml`                 |
 | `stateful.enabled`              | Use a StatefulSet with PVC                                                   | `false`                           |
 | `stateful.storageClass`         | StorageClass for StatefulSet PVC                                             | `standard`                        |
 | `stateful.size`                 | PVC size                                                                     | `1Gi`                             |
@@ -34,6 +37,8 @@ helm install spiceai deploy/chart \
 | `volumes`                       | Additional volumes                                                           | `[]`                              |
 | `volumeMounts`                  | Additional volume mounts                                                     | `[]`                              |
 | `spicepod`                      | Spicepod configuration (inlined into a ConfigMap)                            | see `values.yaml`                 |
+
+Probe values use the standard Kubernetes probe configuration shape. They can be omitted entirely to use the built-in defaults, or partially overridden while omitted fields keep the defaults from `values.yaml`. If `exec`, `tcpSocket`, or `grpc` is configured, the chart omits the default `httpGet` handler from the rendered probe.
 
 ### ServiceAccount Annotations for Cloud IAM
 
