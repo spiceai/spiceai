@@ -129,7 +129,15 @@ pub struct ElasticsearchIndexWriteMaintenance {
     options: ElasticsearchIndexWriteOptions,
     write_cycle_active: AtomicBool,
     refresh_interval_overridden: AtomicBool,
-    previous_refresh_interval: Mutex<Option<Option<String>>>,
+    previous_refresh_interval: Mutex<PreviousRefreshInterval>,
+}
+
+#[derive(Debug, Clone, Default)]
+enum PreviousRefreshInterval {
+    #[default]
+    NotCaptured,
+    Unset,
+    Value(String),
 }
 
 impl Default for ElasticsearchIndexWriteMaintenance {
@@ -145,7 +153,7 @@ impl ElasticsearchIndexWriteMaintenance {
             options,
             write_cycle_active: AtomicBool::new(false),
             refresh_interval_overridden: AtomicBool::new(false),
-            previous_refresh_interval: Mutex::new(None),
+            previous_refresh_interval: Mutex::new(PreviousRefreshInterval::default()),
         }
     }
 
@@ -182,7 +190,10 @@ impl ElasticsearchIndexWriteMaintenance {
             return Err(DataFusionError::External(Box::new(e)));
         }
 
-        *self.previous_refresh_interval.lock().await = Some(previous);
+        *self.previous_refresh_interval.lock().await = match previous {
+            Some(refresh_interval) => PreviousRefreshInterval::Value(refresh_interval),
+            None => PreviousRefreshInterval::Unset,
+        };
         tracing::debug!(
             "Set Elasticsearch index '{es_index}' refresh_interval to '{refresh_interval}' for bulk write."
         );
@@ -241,22 +252,24 @@ impl ElasticsearchIndexWriteMaintenance {
         }
 
         let previous = self.previous_refresh_interval.lock().await.clone();
-        let Some(previous) = previous else {
-            self.refresh_interval_overridden
-                .store(false, Ordering::Release);
-            return Ok(false);
+        let refresh_interval = match previous {
+            PreviousRefreshInterval::NotCaptured => {
+                self.refresh_interval_overridden
+                    .store(false, Ordering::Release);
+                return Ok(false);
+            }
+            PreviousRefreshInterval::Unset => serde_json::Value::Null,
+            PreviousRefreshInterval::Value(refresh_interval) => {
+                serde_json::Value::String(refresh_interval)
+            }
         };
-
-        let refresh_interval = previous
-            .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null);
         let body = serde_json::json!({ "index": { "refresh_interval": refresh_interval } });
         client
             .put_index_settings(es_index, &body)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        *self.previous_refresh_interval.lock().await = None;
+        *self.previous_refresh_interval.lock().await = PreviousRefreshInterval::NotCaptured;
         self.refresh_interval_overridden
             .store(false, Ordering::Release);
         tracing::debug!("Restored Elasticsearch index '{es_index}' refresh_interval after write.");
