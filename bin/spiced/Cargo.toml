@@ -113,6 +113,7 @@ default = [
     "models",
     "odbc",
     "vortex",
+    "http-functions",
 ]
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
