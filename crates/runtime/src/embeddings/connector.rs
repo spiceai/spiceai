@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{self, AcceleratedTable};
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
@@ -269,13 +269,13 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.metrics_provider()
     }
 
-    async fn on_accelerated_table_registration(
+    async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        builder: &mut accelerated_table::Builder,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
-            .on_accelerated_table_registration(dataset, accelerated_table)
+            .on_accelerator_setup(dataset, builder)
             .await?;
 
         #[cfg(feature = "duckdb")]
@@ -285,7 +285,13 @@ impl DataConnector for EmbeddingConnector {
                 return Ok(());
             }
 
-            let accelerator = accelerated_table.get_accelerator();
+            tracing::debug!(
+                dataset = %dataset.name,
+                columns = ?embedding_columns.iter().map(|(col, _)| col.as_str()).collect::<Vec<_>>(),
+                "Wrapping accelerator with DuckDB HNSW vector indexes"
+            );
+
+            let accelerator = builder.get_accelerator();
             let indexed_accelerator =
                 crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
                     &dataset.name,
@@ -296,10 +302,20 @@ impl DataConnector for EmbeddingConnector {
                     Arc::clone(&self.secrets),
                 )
                 .await?;
-            accelerated_table.set_accelerator(indexed_accelerator);
+            builder.set_accelerator(indexed_accelerator);
         }
 
         Ok(())
+    }
+
+    async fn on_accelerated_table_registration(
+        &self,
+        dataset: &Dataset,
+        accelerated_table: &mut AcceleratedTable,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner_connector
+            .on_accelerated_table_registration(dataset, accelerated_table)
+            .await
     }
 
     fn supports_changes_stream(&self) -> bool {

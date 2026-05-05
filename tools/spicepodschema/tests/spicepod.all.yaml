@@ -674,6 +674,7 @@ datasets:
       delta_lake_azure_storage_account_key: key
       delta_lake_azure_storage_client_id: client-id
       delta_lake_azure_storage_client_secret: secret
+      delta_lake_azure_storage_tenant_id: tenant-id
       delta_lake_azure_storage_sas_key: sas
       delta_lake_azure_storage_endpoint: endpoint
       # GCP params
