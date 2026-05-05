@@ -48,6 +48,14 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+  INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-test-archive/integration.tar.zst
+  INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-retention-oom-test-archive/retention_oom.tar.zst
+  INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-aws-sdk-test-archive/integration_aws_sdk.tar.zst
+  INTEGRATION_SNAPSHOT_REFRESH_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-snapshot-refresh-test-archive/integration_snapshot_refresh.tar.zst
+  INTEGRATION_AWS_SDK_CREDENTIAL_BRIDGE_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-aws-sdk-credential-bridge-test-archive/integration_aws_sdk_credential_bridge.tar.zst
+  INTEGRATION_PARTITION_TABLE_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-partition-table-test-archive/partition_table_test.tar.zst
+  INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-data-components-test-archive/data_components_hadoop.tar.zst
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
@@ -145,75 +153,91 @@ jobs:
           cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
           cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file data_components_hadoop.tar.zst
 
-      # Upload the test archive as an artifact
+      - name: Set up MinIO client
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Upload test archives to local MinIO
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to upload integration test archives}"
+          mc mb --ignore-existing spice-minio/build
+          mc cp ./integration.tar.zst "spice-minio/${INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./retention_oom.tar.zst "spice-minio/${INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./integration_aws_sdk.tar.zst "spice-minio/${INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./integration_snapshot_refresh.tar.zst "spice-minio/${INTEGRATION_SNAPSHOT_REFRESH_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./integration_aws_sdk_credential_bridge.tar.zst "spice-minio/${INTEGRATION_AWS_SDK_CREDENTIAL_BRIDGE_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./partition_table_test.tar.zst "spice-minio/${INTEGRATION_PARTITION_TABLE_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./data_components_hadoop.tar.zst "spice-minio/${INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI#s3://}"
+
       - name: Upload test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-test-archive
           path: ./integration.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
 
       - name: Upload retention OOM test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-retention-oom-test-archive
           path: ./retention_oom.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
 
       - name: Upload AWS SDK test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
 
       - name: Upload snapshot refresh test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-snapshot-refresh-test-archive
           path: ./integration_snapshot_refresh.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
 
       - name: Upload AWS SDK credential bridge test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
 
       - name: Upload partition table test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
 
       - name: Upload data components test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-data-components-test-archive
           path: ./data_components_hadoop.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
 
   test:
@@ -247,16 +271,43 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-oracle-odpi
 
-      # Download the test archive artifact
+      - name: Set up MinIO client
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download test archive from local MinIO
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
+          mkdir -p ./integration_test
+          mc cp "spice-minio/${INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}" ./integration_test/integration.tar.zst
+
       - name: Download test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-test-archive
           path: ./integration_test
 
+      - name: Download retention OOM test archive from local MinIO
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download retention OOM test archive}"
+          mkdir -p ./retention_oom_test
+          mc cp "spice-minio/${INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI#s3://}" ./retention_oom_test/retention_oom.tar.zst
+
       - name: Download retention OOM test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-retention-oom-test-archive
@@ -439,7 +490,26 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download AWS SDK test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
+          mkdir -p ./integration_aws_sdk_test
+          mc cp "spice-minio/${INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI#s3://}" ./integration_aws_sdk_test/integration_aws_sdk.tar.zst
+
       - name: Download AWS SDK test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-aws-sdk-test-archive
@@ -480,7 +550,26 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download AWS SDK credential bridge test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK credential bridge test archive}"
+          mkdir -p ./integration_aws_sdk_credential_bridge_test
+          mc cp "spice-minio/${INTEGRATION_AWS_SDK_CREDENTIAL_BRIDGE_TEST_ARCHIVE_S3_URI#s3://}" ./integration_aws_sdk_credential_bridge_test/integration_aws_sdk_credential_bridge.tar.zst
+
       - name: Download AWS SDK credential bridge test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
@@ -524,7 +613,26 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download snapshot refresh test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
+          mkdir -p ./integration_snapshot_refresh_test
+          mc cp "spice-minio/${INTEGRATION_SNAPSHOT_REFRESH_TEST_ARCHIVE_S3_URI#s3://}" ./integration_snapshot_refresh_test/integration_snapshot_refresh.tar.zst
+
       - name: Download snapshot refresh test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-snapshot-refresh-test-archive
@@ -564,7 +672,26 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download data components test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download data components test archive}"
+          mkdir -p ./data_components_test
+          mc cp "spice-minio/${INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI#s3://}" ./data_components_test/data_components_hadoop.tar.zst
+
       - name: Download data components test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-data-components-test-archive
@@ -594,7 +721,26 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download partition table test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download partition table test archive}"
+          mkdir -p ./partition_table_test
+          mc cp "spice-minio/${INTEGRATION_PARTITION_TABLE_TEST_ARCHIVE_S3_URI#s3://}" ./partition_table_test/partition_table_test.tar.zst
+
       - name: Download partition table test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-partition-table-test-archive
