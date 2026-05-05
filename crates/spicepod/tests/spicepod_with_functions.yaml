@@ -68,6 +68,22 @@ functions:
     body: 'x * 2654435761'
     as_tool: false
 
+  - name: duplicate_rows
+    from: sql
+    kind: table
+    description: Emit an input row and its successor.
+    volatility: immutable
+    signature:
+      args: [{ name: x, type: int64 }]
+      returns:
+        - { name: value, type: int64 }
+        - { name: doubled, type: int64 }
+    body: |
+      SELECT x AS value, x * 2 AS doubled FROM args
+      UNION ALL
+      SELECT x + 1 AS value, (x + 1) * 2 AS doubled FROM args
+    as_tool: false
+
 tools:
   # A tool that's also callable as a SQL UDF.
   - name: geocode

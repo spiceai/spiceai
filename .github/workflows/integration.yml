@@ -148,6 +148,7 @@ jobs:
           cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
           cargo nextest archive -p runtime --test retention_oom --features ${FEATURES} --archive-file retention_oom.tar.zst
           cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
+          cargo nextest archive -p runtime --test integration_snapshot_refresh --features duckdb,sqlite,turso,snapshots --archive-file integration_snapshot_refresh.tar.zst
           cargo nextest archive -p aws-sdk-credential-bridge --test credential_provider --archive-file integration_aws_sdk_credential_bridge.tar.zst
           cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
           cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file data_components_hadoop.tar.zst
@@ -179,6 +180,16 @@ jobs:
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
+          retention-days: 3
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
+
+      - name: Upload snapshot refresh test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-snapshot-refresh-test-archive
+          path: ./integration_snapshot_refresh.tar.zst
           retention-days: 3
           # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
@@ -506,6 +517,45 @@ jobs:
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_aws_sdk_credential_bridge_test/integration_aws_sdk_credential_bridge.tar.zst
+
+  test-snapshot-refresh:
+    name: Snapshot Refresh Mode Integration Tests
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    permissions: read-all
+    runs-on: spicehq-dev-runners
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Download snapshot refresh test archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-snapshot-refresh-test-archive
+          path: ./integration_snapshot_refresh_test
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Login to ACR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Run snapshot refresh integration tests
+        env:
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_snapshot_refresh_test/integration_snapshot_refresh.tar.zst
 
   test-data-components:
     name: Data Components Integration Tests

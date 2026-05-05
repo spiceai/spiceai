@@ -1063,7 +1063,7 @@ async fn scan_and_overwrite_accelerator(
     let table_sink = TableSink::new(accelerated_table_provider);
     let _guard = accelerator_write_mutex.lock().await;
     if let Err(e) = table_sink
-        .insert_into(instrumented_stream, InsertOp::Append)
+        .insert_into(instrumented_stream, InsertOp::Overwrite)
         .await
     {
         tracing::error!(

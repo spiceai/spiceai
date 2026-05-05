@@ -61,7 +61,8 @@ use runtime_datafusion_udfs::{
     user::{USER_UDF_NAME, UserUdf},
 };
 use serde_json::Value;
-use spicepod::component::function::{Function, Volatility};
+use spicepod::component::function::{Function, FunctionKind, Volatility};
+use util::in_tracing_context_async;
 
 /// Register core scalar UDFs that have no runtime dependencies.
 ///
@@ -163,7 +164,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         );
     }
 
-    register_user_functions(runtime, ctx).await;
+    in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
 
 /// Emits the user-defined functions BETA warning at most once per
@@ -173,9 +174,9 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
 fn warn_beta_once() {
     static BETA_WARNING: std::sync::Once = std::sync::Once::new();
     BETA_WARNING.call_once(|| {
+        let supported_sources = runtime_datafusion_udfs::user_functions::supported_schemes();
         tracing::warn!(
-            "User-defined scalar functions (spicepod `functions:` section) are in BETA. \
-             Supported sources are `sql`, `http://`, and `https://`; APIs and on-disk \
+            "User-defined functions (spicepod `functions:` section) are in BETA. Supported sources in this build are {supported_sources}; APIs and on-disk \
              format may change before general availability. See: \
              https://spiceai.org/docs/reference/spicepod/functions"
         );
@@ -219,6 +220,10 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                     tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
                     continue;
                 }
+                if let Some(existing_name) = registered_table_udf_name(ctx, &decl.name) {
+                    tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user function because a table function with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
                 ctx.register_udf(udf.as_ref().clone());
                 registered_function_names.push(decl.name.clone());
                 if function_executes_code(&decl) {
@@ -231,6 +236,30 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                     "Registered user function"
                 );
                 functions_to_expose_as_tools.push(decl);
+            }
+            runtime_datafusion_udfs::user_functions::BuiltFunction::Table(udtf) => {
+                if let Some(existing_name) = registered_scalar_udf_name(ctx, &decl.name) {
+                    tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user table function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                if let Some(existing_name) = registered_table_udf_name(ctx, &decl.name) {
+                    tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user table function because a table function with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                ctx.register_udtf(&decl.name, udtf);
+                registered_function_names.push(decl.name.clone());
+                if function_executes_code(&decl) {
+                    add_code_executing_function(&decl.name);
+                }
+                upsert_user_function_info(info_from_decl(&decl));
+                tracing::info!(
+                    name = %decl.name,
+                    from = %decl.from,
+                    "Registered user table function"
+                );
+                if decl.as_tool {
+                    tracing::warn!(name = %decl.name, "User table functions cannot be exposed as tools; skipping tool exposure");
+                }
             }
         }
     }
@@ -288,6 +317,10 @@ pub fn register_async_user_udf(ctx: &SessionContext, udf: &ScalarUDF, name: &str
         tracing::warn!(name = %name, existing_name = %existing_name, "Skipping async user UDF registration because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
         return false;
     }
+    if let Some(existing_name) = registered_table_udf_name(ctx, name) {
+        tracing::warn!(name = %name, existing_name = %existing_name, "Skipping async user UDF registration because a table function with this name is already registered; rename the function to avoid changing query semantics");
+        return false;
+    }
     ctx.register_udf(udf.clone());
     add_user_function_to_deny_list(name);
     add_code_executing_function(name);
@@ -300,6 +333,16 @@ pub fn registered_scalar_udf_name(ctx: &SessionContext, name: &str) -> Option<St
     ctx.udfs()
         .into_iter()
         .find(|registered_name| registered_name.eq_ignore_ascii_case(name))
+}
+
+/// Return the exact registered table-function name that collides with `name`, if any.
+#[must_use]
+pub fn registered_table_udf_name(ctx: &SessionContext, name: &str) -> Option<String> {
+    ctx.state()
+        .table_functions()
+        .keys()
+        .find(|registered_name| registered_name.eq_ignore_ascii_case(name))
+        .cloned()
 }
 
 fn function_executes_code(decl: &Function) -> bool {
@@ -356,7 +399,7 @@ pub(crate) fn effective_user_function_volatility(decl: &Function) -> &'static st
 fn info_from_decl(decl: &Function) -> UserFunctionInfo {
     UserFunctionInfo {
         name: decl.name.clone(),
-        kind: "scalar".to_string(),
+        kind: decl.kind.as_str().to_string(),
         volatility: effective_user_function_volatility(decl).to_string(),
         from: decl.from.clone(),
         description: decl.description.clone(),
@@ -388,11 +431,18 @@ pub async fn apply_function_diff(
                 None => true,
             };
         if needs_drop {
-            ctx.deregister_udf(&current.name);
+            match current.kind {
+                FunctionKind::Scalar => {
+                    ctx.deregister_udf(&current.name);
+                }
+                FunctionKind::Table => {
+                    ctx.deregister_udtf(&current.name);
+                }
+            }
             functions_to_drop.push(current.name.clone());
             remove_code_executing_function(&current.name);
             remove_user_function_info(&current.name);
-            if current.as_tool {
+            if current.kind == FunctionKind::Scalar && current.as_tool {
                 tools_to_drop.push(current.name.clone());
             }
             tracing::info!(name = %current.name, "Deregistered user function");
@@ -452,6 +502,10 @@ pub async fn apply_function_diff(
                     tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
                     continue;
                 }
+                if let Some(existing_name) = registered_table_udf_name(ctx, &next.name) {
+                    tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user function because a table function with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
                 ctx.register_udf(udf.as_ref().clone());
                 registered_function_names.push(next.name.clone());
                 if function_executes_code(&next) {
@@ -460,6 +514,27 @@ pub async fn apply_function_diff(
                 upsert_user_function_info(info_from_decl(&next));
                 tracing::info!(name = %next.name, from = %next.from, "Registered user function");
                 functions_to_expose_as_tools.push(next);
+            }
+            runtime_datafusion_udfs::user_functions::BuiltFunction::Table(udtf) => {
+                warn_beta_once();
+                if let Some(existing_name) = registered_scalar_udf_name(ctx, &next.name) {
+                    tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user table function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                if let Some(existing_name) = registered_table_udf_name(ctx, &next.name) {
+                    tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user table function because a table function with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                ctx.register_udtf(&next.name, udtf);
+                registered_function_names.push(next.name.clone());
+                if function_executes_code(&next) {
+                    add_code_executing_function(&next.name);
+                }
+                upsert_user_function_info(info_from_decl(&next));
+                tracing::info!(name = %next.name, from = %next.from, "Registered user table function");
+                if next.as_tool {
+                    tracing::warn!(name = %next.name, "User table functions cannot be exposed as tools; skipping tool exposure");
+                }
             }
         }
     }
@@ -748,7 +823,9 @@ mod tests {
     }
 
     fn test_user_function(name: &str, enabled: bool) -> Function {
-        use spicepod::component::function::{FunctionArg, FunctionKind, Signature, Volatility};
+        use spicepod::component::function::{
+            FunctionArg, FunctionKind, FunctionReturns, Signature, Volatility,
+        };
 
         Function {
             name: name.to_string(),
@@ -758,11 +835,12 @@ mod tests {
             kind: FunctionKind::Scalar,
             volatility: Volatility::Immutable,
             signature: Signature {
+                tables: vec![],
                 args: vec![FunctionArg {
                     name: "x".to_string(),
                     arrow_type: "int64".to_string(),
                 }],
-                returns: Some("int64".to_string()),
+                returns: Some(FunctionReturns::Scalar("int64".to_string())),
             },
             body: Some("x".to_string()),
             body_ref: None,

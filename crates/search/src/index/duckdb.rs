@@ -103,6 +103,15 @@ impl DuckDBDistanceMetric {
             Self::InnerProduct => format!("array_inner_product({column}, {vector_literal})"),
         }
     }
+
+    /// Compute score from a pre-computed distance alias (used in the outer CTE query).
+    #[must_use]
+    fn cte_score_expr(self, distance_alias: &str) -> String {
+        match self {
+            Self::Cosine => format!("1.0 - {distance_alias}"),
+            Self::L2 | Self::InnerProduct => format!("-{distance_alias}"),
+        }
+    }
 }
 
 impl TryFrom<&str> for DuckDBDistanceMetric {
@@ -242,13 +251,19 @@ impl DuckDBVectorIndex {
         conn.execute("SET hnsw_enable_experimental_persistence = true", [])
             .map_err(to_execution_error)?;
         let index_name = DuckDBHnswOptions::index_name_for(table_name, &embedding_column);
-        conn.execute(
-            &self
-                .hnsw
-                .create_index_sql(table_name, &embedding_column, &index_name),
-            [],
-        )
-        .map_err(to_execution_error)?;
+        let create_sql = self
+            .hnsw
+            .create_index_sql(table_name, &embedding_column, &index_name);
+        conn.execute(&create_sql, []).map_err(to_execution_error)?;
+
+        tracing::debug!(
+            table = %table_name,
+            index = %index_name,
+            column = %embedding_column,
+            sql = %create_sql,
+            "HNSW index created successfully"
+        );
+
         Ok(())
     }
 
@@ -371,6 +386,10 @@ impl Index for DuckDBVectorIndex {
     /// init time; DuckDB VSS maintains it automatically on subsequent inserts.
     async fn on_write_complete(&self) -> DataFusionResult<()> {
         let Some(ctx) = &self.query_context else {
+            tracing::debug!(
+                column = %self.embedded_column,
+                "on_write_complete skipped: no query context for HNSW index"
+            );
             return Ok(());
         };
         let index = self.clone();
@@ -686,6 +705,26 @@ fn internal_table_timestamp(table_name: &str, definition_name: &str) -> Option<u
     }
 }
 
+/// CTE name used for the inner nearest-neighbor subquery.
+const CTE_NAME: &str = "__spice_nn";
+/// Alias for the pre-computed distance value inside the CTE.
+const CTE_DISTANCE_ALIAS: &str = "__spice_dist";
+
+/// Build vector search SQL for DuckDB.
+///
+/// When **no filters** are present, uses a CTE that preserves the clean
+/// `TopN → Projection → SeqScan` plan shape required by the HNSW optimizer:
+/// ```sql
+/// WITH __spice_nn AS (
+///     SELECT *, distance_func(col, vec) AS __spice_dist
+///     FROM table
+///     ORDER BY __spice_dist ASC LIMIT k
+/// )
+/// SELECT col1, col2, CAST(score_from_dist AS DOUBLE) AS _score
+/// FROM __spice_nn ORDER BY __spice_dist ASC
+/// ```
+///
+/// When **filters** are present, falls back to a flat query so filters are applied before the distance calculation.
 fn duckdb_vector_sql(
     table_name: &str,
     embedding_column: &str,
@@ -695,10 +734,101 @@ fn duckdb_vector_sql(
     hnsw: &DuckDBHnswOptions,
     vector_literal: &str,
 ) -> DataFusionResult<String> {
+    let limit = limit.unwrap_or(DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT);
+
+    if filters.is_empty() {
+        // CTE path — activates HNSW index scan
+        Ok(duckdb_vector_sql_cte(
+            table_name,
+            embedding_column,
+            projected_columns,
+            limit,
+            hnsw,
+            vector_literal,
+        ))
+    } else {
+        // Flat query path — score calculation
+        duckdb_vector_sql_flat(
+            table_name,
+            embedding_column,
+            projected_columns,
+            filters,
+            limit,
+            hnsw,
+            vector_literal,
+        )
+    }
+}
+
+/// CTE path: no filters, clean plan shape for HNSW optimizer.
+fn duckdb_vector_sql_cte(
+    table_name: &str,
+    embedding_column: &str,
+    projected_columns: &[String],
+    limit: usize,
+    hnsw: &DuckDBHnswOptions,
+    vector_literal: &str,
+) -> String {
+    let distance_expr = hnsw.metric.distance_expr(embedding_column, vector_literal);
+    let score_expr = hnsw.metric.cte_score_expr(CTE_DISTANCE_ALIAS);
+    let embedding_not_null = embedding_not_null_predicate(embedding_column);
+
+    let cte = format!(
+        "WITH {CTE_NAME} AS (\
+         SELECT *, {distance_expr} AS {CTE_DISTANCE_ALIAS} \
+         FROM {table} \
+         WHERE {embedding_not_null} \
+         ORDER BY {CTE_DISTANCE_ALIAS} ASC LIMIT {limit}\
+         )",
+        table = quote_identifier(table_name),
+    );
+
+    let select_exprs = build_select_exprs(projected_columns, &score_expr);
+
+    format!(
+        "{cte} SELECT {select_exprs} FROM {CTE_NAME} \
+         ORDER BY {CTE_DISTANCE_ALIAS} ASC",
+    )
+}
+
+/// Flat query path: filters applied via WHERE, no HNSW index (brute-force scan).
+fn duckdb_vector_sql_flat(
+    table_name: &str,
+    embedding_column: &str,
+    projected_columns: &[String],
+    filters: &[Expr],
+    limit: usize,
+    hnsw: &DuckDBHnswOptions,
+    vector_literal: &str,
+) -> DataFusionResult<String> {
     let score_expr = hnsw.metric.score_expr(embedding_column, vector_literal);
     let distance_expr = hnsw.metric.distance_expr(embedding_column, vector_literal);
 
-    let select_exprs = if projected_columns.is_empty() {
+    let select_exprs = build_select_exprs(projected_columns, &score_expr);
+
+    let filter_exprs: Vec<String> = filters
+        .iter()
+        .map(|filter| expr::to_sql_with_engine(filter, Some(Engine::DuckDB)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+    let mut predicates = Vec::with_capacity(filter_exprs.len() + 1);
+    predicates.push(embedding_not_null_predicate(embedding_column));
+    predicates.extend(filter_exprs);
+    let where_clause = format!(" WHERE {}", predicates.join(" AND "));
+
+    Ok(format!(
+        "SELECT {select_exprs} FROM {table}{where_clause} ORDER BY {distance_expr} ASC LIMIT {limit}",
+        table = quote_identifier(table_name),
+    ))
+}
+
+fn embedding_not_null_predicate(embedding_column: &str) -> String {
+    format!("{} IS NOT NULL", quote_identifier(embedding_column))
+}
+
+/// Build the SELECT expression list, substituting `_score` with the given score expression.
+fn build_select_exprs(projected_columns: &[String], score_expr: &str) -> String {
+    if projected_columns.is_empty() {
         format!("1 AS {}", quote_identifier(EMPTY_PROJECTION_ROW_COLUMN))
     } else {
         projected_columns
@@ -715,29 +845,7 @@ fn duckdb_vector_sql(
             })
             .collect::<Vec<_>>()
             .join(", ")
-    };
-
-    let mut filter_exprs = vec![format!(
-        "{} IS NOT NULL",
-        quote_identifier(embedding_column)
-    )];
-    if !filters.is_empty() {
-        filter_exprs.extend(
-            filters
-                .iter()
-                .map(|filter| expr::to_sql_with_engine(filter, Some(Engine::DuckDB)))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DataFusionError::Plan(e.to_string()))?,
-        );
     }
-    let where_expr = format!(" WHERE {}", filter_exprs.join(" AND "));
-
-    let limit = limit.unwrap_or(DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT);
-
-    Ok(format!(
-        "SELECT {select_exprs} FROM {}{where_expr} ORDER BY {distance_expr} ASC LIMIT {limit}",
-        quote_identifier(table_name)
-    ))
 }
 
 fn duckdb_filter_pushdown(schema: &SchemaRef, filter: &Expr) -> TableProviderFilterPushDown {
@@ -1063,7 +1171,14 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT id, CAST(1.0 - array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS DOUBLE) AS _score FROM docs WHERE body_embedding IS NOT NULL ORDER BY array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) ASC LIMIT 10"
+            "WITH __spice_nn AS (\
+             SELECT *, array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS __spice_dist \
+             FROM docs \
+             WHERE body_embedding IS NOT NULL \
+             ORDER BY __spice_dist ASC LIMIT 10\
+             ) SELECT id, CAST(1.0 - __spice_dist AS DOUBLE) AS _score \
+             FROM __spice_nn \
+             ORDER BY __spice_dist ASC"
         );
     }
 
@@ -1092,7 +1207,14 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT 1 AS __spice_empty_projection_row FROM docs WHERE body_embedding IS NOT NULL ORDER BY array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) ASC LIMIT 10"
+            "WITH __spice_nn AS (\
+             SELECT *, array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS __spice_dist \
+             FROM docs \
+             WHERE body_embedding IS NOT NULL \
+             ORDER BY __spice_dist ASC LIMIT 10\
+             ) SELECT 1 AS __spice_empty_projection_row \
+             FROM __spice_nn \
+             ORDER BY __spice_dist ASC"
         );
     }
 
@@ -1162,6 +1284,55 @@ mod tests {
         )
         .expect("SQL should build");
 
-        assert!(sql.ends_with(" LIMIT 1000"));
+        assert!(sql.contains("LIMIT 1000"));
+    }
+
+    #[test]
+    fn duckdb_vector_sql_uses_flat_query_with_filters() {
+        let filter = col("id").gt(lit(10_i64));
+        let sql = duckdb_vector_sql(
+            "docs",
+            "body_embedding",
+            &["id".to_string(), SEARCH_SCORE_COLUMN_NAME.to_string()],
+            &[filter],
+            Some(10),
+            &DuckDBHnswOptions::default(),
+            "[1.0, 0.0]::FLOAT[2]",
+        )
+        .expect("SQL should build");
+
+        // Flat query: no CTE, direct SELECT with WHERE and inline score
+        assert_eq!(
+            sql,
+            "SELECT id, CAST(1.0 - array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS DOUBLE) AS _score \
+               FROM docs WHERE body_embedding IS NOT NULL AND \"id\" > 10 \
+             ORDER BY array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) ASC LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn duckdb_vector_sql_uses_cte_without_filters() {
+        let sql = duckdb_vector_sql(
+            "docs",
+            "body_embedding",
+            &["id".to_string(), SEARCH_SCORE_COLUMN_NAME.to_string()],
+            &[],
+            Some(10),
+            &DuckDBHnswOptions::default(),
+            "[1.0, 0.0]::FLOAT[2]",
+        )
+        .expect("SQL should build");
+
+        assert_eq!(
+            sql,
+            "WITH __spice_nn AS (\
+             SELECT *, array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS __spice_dist \
+             FROM docs \
+             WHERE body_embedding IS NOT NULL \
+             ORDER BY __spice_dist ASC LIMIT 10\
+             ) SELECT id, CAST(1.0 - __spice_dist AS DOUBLE) AS _score \
+             FROM __spice_nn \
+             ORDER BY __spice_dist ASC"
+        );
     }
 }

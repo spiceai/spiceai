@@ -617,6 +617,25 @@ mod test {
     }
 
     #[test]
+    fn test_get_openai_request_overrides_with_prompt_cache_key() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "hf_prompt_cache_key".to_string(),
+            Value::String("schema-context".to_string()),
+        );
+
+        let overrides = get_openai_request_overrides(&model, "hf");
+
+        assert_eq!(overrides.len(), 1);
+        assert!(
+            overrides
+                .iter()
+                .any(|(key, value)| key == "prompt_cache_key"
+                    && value == &Value::String("schema-context".to_string()))
+        );
+    }
+
+    #[test]
     // Param with <model-prefix> takes precedence over the deprecated openai_ prefix.
     fn test_get_openai_request_overrides_with_model_prefix_and_deprecated() {
         let mut model = Model::new("hf:test_model", "test_model");

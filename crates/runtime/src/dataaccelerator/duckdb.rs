@@ -56,7 +56,10 @@ use datafusion_table_providers::{
         DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory,
         write::{DuckDBTableWriter, WriteCompletionHandler},
     },
-    sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+    sql::db_connection_pool::{
+        self as db_connection_pool,
+        duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+    },
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
@@ -393,6 +396,7 @@ impl DataAccelerator for DuckDBAccelerator {
                         )),
                         AccelerationEngine::DuckDB,
                         Arc::new(arrow_schema::Schema::empty()),
+                        None,
                     )
                     .await;
 
@@ -411,6 +415,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 source,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::DuckDB,
+                None,
             )
             .await;
 
@@ -582,6 +587,58 @@ impl DataAccelerator for DuckDBAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn supports_snapshot_reload(&self) -> bool {
+        true
+    }
+
+    /// Reloads the `DuckDB`-backed table provider from the snapshot file
+    /// that was just written to the primary path.
+    ///
+    /// Drops the previous provider, evicts the cached connection pool from
+    /// the upstream `DuckDBTableProviderFactory` registry, and then re-runs
+    /// the registry factory to build a fresh provider over the on-disk file.
+    /// The pool eviction is required because the registry caches pool
+    /// instances by file path; without it, the freshly built provider would
+    /// reuse the prior pool's open connections — which keep observing the
+    /// previous file inode — and queries would continue to return stale data
+    /// even after the file has been atomically replaced on disk.
+    async fn reload_from_snapshot(
+        &self,
+        source: &dyn AccelerationSource,
+        previous_provider: Arc<dyn TableProvider>,
+        provider_factory: super::ReloadProviderFactory,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        // Drop the caller's clone first so the only remaining strong refs to
+        // the prior pool are the registry entry (which we are about to evict)
+        // and any in-flight queries (which will drain naturally).
+        drop(previous_provider);
+
+        // Evict the cached pool. For file mode this matches the path the
+        // factory keyed on at construction time; for memory mode this falls
+        // back to the in-memory key. Snapshot reload is only meaningful for
+        // file mode in practice (memory accelerators cannot be snapshotted),
+        // but the memory branch is kept for completeness.
+        let acceleration =
+            source
+                .acceleration()
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    "acceleration not configured for snapshot reload".into()
+                })?;
+        match acceleration.mode {
+            Mode::File | Mode::FileCreate | Mode::FileUpdate => {
+                let path = self.duckdb_file_path(source).boxed()?;
+                self.duckdb_factory.invalidate_file_instance(path).await;
+            }
+            Mode::Memory => {
+                self.duckdb_factory
+                    .invalidate_instance(&db_connection_pool::DbInstanceKey::memory())
+                    .await;
+            }
+        }
+
+        provider_factory().await
     }
 
     async fn drop_table(
