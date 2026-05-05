@@ -52,13 +52,13 @@ pub enum Error {
     ))]
     PersistenceRefresh {
         origin: String,
-        source: object_store_occ::Error,
+        source: Box<object_store_occ::Error>,
     },
 
     #[snafu(display("Failed to persist rate-control state for origin {origin}. {source}"))]
     PersistenceWrite {
         origin: String,
-        source: object_store_occ::Error,
+        source: Box<object_store_occ::Error>,
     },
 
     #[snafu(display(
@@ -288,7 +288,7 @@ impl RateControllerPersistence {
             .await
             .map_err(|source| Error::PersistenceRefresh {
                 origin: self.origin.clone(),
-                source,
+                source: Box::new(source),
             })?;
 
         if let Some(remote) = remote {
@@ -310,7 +310,7 @@ impl RateControllerPersistence {
             .await
             .map_err(|source| Error::PersistenceWrite {
                 origin: self.origin.clone(),
-                source,
+                source: Box::new(source),
             })? {
             WriteResult::Inserted | WriteResult::Updated => Ok(PersistResult::Persisted),
             WriteResult::Conflict { current } => {
