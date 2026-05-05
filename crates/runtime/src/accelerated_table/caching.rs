@@ -57,6 +57,56 @@ pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
 
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "fetched_at";
 
+/// Reserved column name added to caching-mode accelerator storage to scope
+/// cached rows by [`runtime_request_context::CacheNamespace`]. The column is
+/// hidden from the user-facing schema and may not be referenced in user
+/// projections, filters, or dataset definitions.
+///
+/// Stored value is the namespace's stable string id (e.g. `"public"`,
+/// `"system"`, or `"apikey:<sha256[..16]>"`). Comparing rows by this column
+/// is what enforces cross-principal isolation inside the caching
+/// accelerator.
+pub const CACHE_NAMESPACE_COLUMN: &str = "__spice_cache_namespace";
+
+/// Returns true if `name` collides with a column reserved by the caching
+/// accelerator. Used by dataset configuration validation so a user-defined
+/// column never silently overwrites internal cache state.
+#[must_use]
+pub fn is_reserved_caching_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case(CACHE_NAMESPACE_COLUMN)
+}
+
+/// Extends a federated/source schema with [`CACHE_NAMESPACE_COLUMN`] so the
+/// caching accelerator can store the per-namespace tag alongside cached
+/// rows. This is only applied to storage; the user-facing
+/// [`crate::accelerated_table::AcceleratedTable`] schema continues to
+/// expose the original column set.
+///
+/// Returns an error if the source schema already defines a column whose
+/// name collides with [`CACHE_NAMESPACE_COLUMN`] — that name is reserved
+/// for the runtime and a collision would silently corrupt cached rows.
+pub fn extend_schema_with_cache_namespace(
+    dataset_name: &str,
+    schema: &arrow::datatypes::Schema,
+) -> DataFusionResult<arrow::datatypes::Schema> {
+    use arrow::datatypes::Field;
+    if schema.column_with_name(CACHE_NAMESPACE_COLUMN).is_some() {
+        return Err(DataFusionError::Plan(format!(
+            "dataset `{dataset_name}` declares a column named `{CACHE_NAMESPACE_COLUMN}`, which is reserved by the caching accelerator for per-user cache scoping. Rename the source column to avoid this name.",
+        )));
+    }
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
+    fields.push(Field::new(
+        CACHE_NAMESPACE_COLUMN,
+        arrow::datatypes::DataType::Utf8,
+        false,
+    ));
+    Ok(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
 /// Maximum number of concurrent refresh requests
 const MAX_CONCURRENT_REFRESHES: usize = 10;
 
@@ -1749,6 +1799,51 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
         let adapter = RecordBatchStreamAdapter::new(schema, cache_miss_or_stale_stream);
         Ok(Box::pin(adapter))
+    }
+}
+
+#[cfg(test)]
+mod cache_namespace_column_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn reserved_column_name_is_case_insensitive() {
+        assert!(is_reserved_caching_column(CACHE_NAMESPACE_COLUMN));
+        assert!(is_reserved_caching_column("__SPICE_CACHE_NAMESPACE"));
+        assert!(!is_reserved_caching_column("fetched_at"));
+        assert!(!is_reserved_caching_column("request_path"));
+    }
+
+    #[test]
+    fn extend_schema_appends_namespace_column() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, true),
+        ]);
+        let extended = extend_schema_with_cache_namespace("ds", &schema).expect("ok");
+        assert_eq!(extended.fields().len(), 3);
+        assert_eq!(extended.field(2).name(), CACHE_NAMESPACE_COLUMN);
+        assert_eq!(extended.field(2).data_type(), &DataType::Utf8);
+        assert!(
+            !extended.field(2).is_nullable(),
+            "namespace column is required so missing-on-read indicates a corrupt table"
+        );
+    }
+
+    #[test]
+    fn extend_schema_rejects_collision_with_clear_error() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new(CACHE_NAMESPACE_COLUMN, DataType::Utf8, true),
+        ]);
+        let err = extend_schema_with_cache_namespace("http_cache", &schema)
+            .expect_err("collision must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("http_cache") && msg.contains(CACHE_NAMESPACE_COLUMN),
+            "error must name the dataset and the reserved column: {msg}"
+        );
     }
 }
 
