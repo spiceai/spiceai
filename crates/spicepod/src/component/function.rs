@@ -122,6 +122,13 @@ pub struct Function {
 }
 
 /// Function kind.
+///
+/// A future `HigherOrder` variant will land when `DataFusion`'s
+/// `HigherOrderUDF` trait is absorbed (see apache/datafusion#21679). It lowers
+/// to a separate trait, not a decoration on `ScalarUDF`, so it must be a
+/// distinct kind here as well. Adding it later is backward-compatible: serde
+/// rejects unknown values today, so no spicepod can accidentally take the
+/// name.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]

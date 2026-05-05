@@ -52,7 +52,12 @@ pub mod wasm;
 /// What a factory produces once a [`Function`] declaration has been
 /// compiled and validated.
 ///
+/// Today only [`BuiltFunction::Scalar`] is produced; aggregate, window,
+/// table, and higher-order variants will land alongside their tier-specific
+/// factories. Marked `#[non_exhaustive]` so adding variants is not a breaking
+/// change for downstream callers — they must already use a wildcard arm.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum BuiltFunction {
     Scalar(Arc<ScalarUDF>),
     Table(Arc<dyn TableFunctionImpl>),
