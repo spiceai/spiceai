@@ -404,7 +404,7 @@ async fn test_megascience_permutations(
     } else {
         es_endpoint = String::new();
         _es_container = None;
-    };
+    }
 
     // Build the FTS store, injecting the live endpoint and a unique per-combination index name.
     let mut fts_store = text_engine.to_fts_store(&es_endpoint);
@@ -435,7 +435,7 @@ async fn test_megascience_permutations(
         },
         columns,
         Some(vector_store),
-        fts_store,
+        fts_store.as_ref(),
         &acceleration,
     );
 
