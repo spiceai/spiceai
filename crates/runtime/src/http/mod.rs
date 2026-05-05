@@ -132,9 +132,13 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
+    // Resolve effective MCP config: programmatic Config override takes precedence over App config.
     #[cfg(feature = "mcp")]
-    let mcp_config: Option<&spicepod::component::runtime::McpConfig> =
-        app.as_ref().and_then(|a| a.runtime.mcp.as_ref());
+    let mcp_config: Option<&spicepod::component::runtime::McpConfig> = config
+        .runtime
+        .as_ref()
+        .and_then(|r| r.mcp.as_ref())
+        .or_else(|| app.as_ref().and_then(|a| a.runtime.mcp.as_ref()));
     let auth_layer = auth_provider.map(AuthLayer::new);
     let routes = routes::routes(
         &rt,

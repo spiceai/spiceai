@@ -182,6 +182,15 @@ selected via the `Accept` header. Session continuity is carried via the `Mcp-Ses
                         .build(),
                 )
                 .response(
+                    "403",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list. \
+Configure `runtime.mcp.allowed_hosts` or set it to `[\"*\"]` to allow all hosts.",
+                        )
+                        .build(),
+                )
+                .response(
                     "413",
                     utoipa::openapi::ResponseBuilder::new()
                         .description("Payload too large. Maximum allowed size is 32 MiB.")

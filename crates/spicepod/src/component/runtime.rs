@@ -2206,4 +2206,67 @@ mod tests {
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.ready_state, RuntimeReadyState::OnRegistration);
     }
+
+    #[test]
+    fn test_deserialize_mcp_config_bare_hostnames() {
+        // Bare hostnames (default-like usage).
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - localhost
+                - 127.0.0.1
+                - '::1'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(hosts, vec!["localhost", "127.0.0.1", "::1"]);
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_host_port_pairs() {
+        // host:port pair format.
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - 'example.com:8090'
+                - 'localhost:9000'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(hosts, vec!["example.com:8090", "localhost:9000"]);
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_full_origin_urls() {
+        // Full origin URL format.
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - 'https://example.com'
+                - 'http://app.internal:8080'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(
+            hosts,
+            vec!["https://example.com", "http://app.internal:8080"]
+        );
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_wildcard() {
+        // Wildcard disables host checking.
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - '*'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(hosts, vec!["*"]);
+    }
 }
