@@ -616,7 +616,7 @@ Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILI
 ### 🤝 Connect with us
 
 - 📰 Read our [blog](https://spiceai.org/blog) for engineering deep dives
-- 💬 Join the conversation on [Slack](https://spice.ai/slack), [Discord](https://discord.gg/kZnTfneP5u), [X](https://twitter.com/spice_ai), or [LinkedIn](https://www.linkedin.com/company/74148478)
+- 💬 Join the conversation on [Slack](https://spice.ai/slack), [X](https://twitter.com/spice_ai), or [LinkedIn](https://www.linkedin.com/company/74148478)
 - 🐛 [File an issue](https://github.com/spiceai/spiceai/issues/new) — we triage fast
 - 💼 We're hiring! See [spice.ai/careers](https://spice.ai/careers)
 - 🛠️ Contribute code or docs (see [CONTRIBUTING.md](CONTRIBUTING.md))
