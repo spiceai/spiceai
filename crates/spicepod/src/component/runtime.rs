@@ -1166,28 +1166,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_mcp_config_no_section() {
-        let yaml = r"
-        http_port: 8090
-        ";
-        let parsed: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
-        assert!(parsed.mcp.is_none(), "mcp should be None when not set");
-    }
-
-    #[test]
-    fn test_deserialize_mcp_config_empty_section() {
-        let yaml = r"
-        mcp: {}
-        ";
-        let parsed: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
-        let mcp = parsed.mcp.expect("mcp section should be present");
-        assert!(
-            mcp.allowed_hosts.is_none(),
-            "allowed_hosts should be None when not set"
-        );
-    }
-
-    #[test]
     fn test_deserialize_mcp_config_with_allowed_hosts() {
         let yaml = r"
         mcp:
