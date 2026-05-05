@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
+use super::{CacheControl, CacheKeyType, CacheNamespace, Protocol, UserAgent, baggage};
 use crate::TraceParent;
 use app::App;
 use futures::{Stream, StreamExt};
@@ -49,6 +49,13 @@ pub struct RequestContext {
     protocol: AtomicU8,
     cache_control: CacheControl,
     client_supplied_cache_key: Option<String>,
+    /// Optional explicit override for the cache namespace. When `None`, the
+    /// namespace is derived from `protocol` + `auth_principal` on demand by
+    /// [`Self::cache_namespace`]. Set explicitly by callers that need to
+    /// inherit a namespace from another context (e.g. SWR background
+    /// revalidation must run under the originating user's namespace, not
+    /// `System`).
+    cache_namespace_override: Option<CacheNamespace>,
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
@@ -195,6 +202,12 @@ impl RequestContext {
     pub fn to_dimensions(&self) -> Vec<KeyValue> {
         let mut dimensions = vec![KeyValue::new("protocol", self.protocol().as_str())];
         dimensions.extend(self.dimensions.iter().cloned());
+        // Low-cardinality scope dimension: `public` / `principal` / `system`.
+        // Never includes the principal id.
+        dimensions.push(KeyValue::new(
+            "cache_namespace_kind",
+            self.cache_namespace().kind(),
+        ));
         dimensions
     }
 
@@ -229,6 +242,33 @@ impl RequestContext {
     #[must_use]
     pub fn cache_control(&self) -> CacheControl {
         self.cache_control
+    }
+
+    /// The cache namespace this request is executing under.
+    ///
+    /// Computed once per call from `protocol` + `auth_principal`, unless an
+    /// explicit override was set on the builder (used by SWR background
+    /// revalidation and similar flows that must inherit the originating
+    /// request's namespace).
+    ///
+    /// Mapping:
+    /// - `Protocol::Internal` → [`CacheNamespace::System`].
+    /// - Authenticated principal whose `stable_id()` is `Some(id)` →
+    ///   [`CacheNamespace::Principal(id)`].
+    /// - Anything else (no principal, anonymous principal) →
+    ///   [`CacheNamespace::Public`].
+    #[must_use]
+    pub fn cache_namespace(&self) -> CacheNamespace {
+        if let Some(ns) = &self.cache_namespace_override {
+            return ns.clone();
+        }
+        if matches!(self.protocol(), Protocol::Internal) {
+            return CacheNamespace::System;
+        }
+        match self.auth_principal.get().and_then(|p| p.stable_id()) {
+            Some(id) => CacheNamespace::Principal(Arc::from(id.as_ref())),
+            None => CacheNamespace::Public,
+        }
     }
 
     #[must_use]
@@ -319,6 +359,7 @@ pub struct RequestContextBuilder {
     protocol: Protocol,
     cache_control: CacheControl,
     client_supplied_cache_key: Option<String>,
+    cache_namespace_override: Option<CacheNamespace>,
     app: Option<Arc<App>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
@@ -334,6 +375,7 @@ impl RequestContextBuilder {
             protocol,
             cache_control: CacheControl::Cache(CacheKeyType::Default),
             client_supplied_cache_key: None,
+            cache_namespace_override: None,
             app: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
@@ -411,6 +453,19 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_client_supplied_cache_key(mut self, cache_key: Option<String>) -> Self {
         self.client_supplied_cache_key = cache_key;
+        self
+    }
+
+    /// Override the cache namespace for this request, bypassing the
+    /// `protocol` + `auth_principal` derivation in
+    /// [`RequestContext::cache_namespace`]. Use this only for flows that
+    /// must inherit a namespace from another request — most importantly
+    /// SWR background revalidation, which runs under `Protocol::Internal`
+    /// (would otherwise be `System`) but must store its result under the
+    /// originating user's namespace so the user actually sees the refresh.
+    #[must_use]
+    pub fn with_cache_namespace(mut self, cache_namespace: CacheNamespace) -> Self {
+        self.cache_namespace_override = Some(cache_namespace);
         self
     }
 
@@ -522,6 +577,7 @@ impl RequestContextBuilder {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
             client_supplied_cache_key: user_cache_key,
+            cache_namespace_override: self.cache_namespace_override,
             dimensions,
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
