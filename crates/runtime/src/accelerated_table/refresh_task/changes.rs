@@ -227,8 +227,8 @@ impl RefreshTask {
                 let err_msg = format!("CDC reader task ended unexpectedly: {e}");
                 tracing::error!("{err_msg} (dataset={dataset_name})");
                 self.set_refresh_status(
-                    refresh.read().await.display_sql().as_deref(),
-                    status::ComponentStatus::error_with_message(err_msg),
+                    refresh.read().await.sql.clone().as_deref(),
+                    status::ComponentStatus::Error,
                 )
                 .await;
             }
