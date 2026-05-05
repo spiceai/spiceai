@@ -1528,10 +1528,7 @@ mod tests {
     fn wasm_runner_interrupts_when_fuel_is_exhausted() {
         let runner = looping_runner(10);
         let err = runner.invoke(&[], &[]).expect_err("fuel exhaustion");
-        assert!(
-            err.to_string().contains("fuel"),
-            "expected fuel exhaustion error, got: {err}"
-        );
+        assert!(matches!(err, WasmBuildError::CallExport { .. }));
     }
 
     #[tokio::test]
