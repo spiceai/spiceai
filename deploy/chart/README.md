@@ -38,7 +38,7 @@ helm install spiceai deploy/chart \
 | `volumeMounts`                  | Additional volume mounts                                                     | `[]`                              |
 | `spicepod`                      | Spicepod configuration (inlined into a ConfigMap)                            | see `values.yaml`                 |
 
-Probe values use the standard Kubernetes probe configuration shape. They can be omitted entirely to use the built-in defaults, or partially overridden while omitted fields keep the defaults from `values.yaml`.
+Probe values use the standard Kubernetes probe configuration shape. They can be omitted entirely to use the built-in defaults, or partially overridden while omitted fields keep the defaults from `values.yaml`. If `exec`, `tcpSocket`, or `grpc` is configured, the chart omits the default `httpGet` handler from the rendered probe.
 
 ### ServiceAccount Annotations for Cloud IAM
 

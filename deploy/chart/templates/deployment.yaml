@@ -82,42 +82,12 @@ spec:
               name: metrics
             - containerPort: 50051
               name: flight
-          {{- if .Values.livenessProbe }}
           livenessProbe:
-            {{- toYaml .Values.livenessProbe | nindent 12 }}
-          {{- else }}
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8090
-            timeoutSeconds: 1
-            periodSeconds: 10
-            failureThreshold: 3
-          {{- end }}
-          {{- if .Values.readinessProbe }}
+            {{- include "spiceai.probe" (dict "probe" .Values.livenessProbe "path" "/health" "port" 8090) | nindent 12 }}
           readinessProbe:
-            {{- toYaml .Values.readinessProbe | nindent 12 }}
-          {{- else }}
-          readinessProbe:
-            httpGet:
-              path: /v1/ready
-              port: 8090
-            timeoutSeconds: 1
-            periodSeconds: 10
-            failureThreshold: 3
-          {{- end }}
-          {{- if .Values.startupProbe }}
+            {{- include "spiceai.probe" (dict "probe" .Values.readinessProbe "path" "/v1/ready" "port" 8090) | nindent 12 }}
           startupProbe:
-            {{- toYaml .Values.startupProbe | nindent 12 }}
-          {{- else }}
-          startupProbe:
-            httpGet:
-              path: /health
-              port: 8090
-            timeoutSeconds: 1
-            periodSeconds: 10
-            failureThreshold: 3
-          {{- end }}
+            {{- include "spiceai.probe" (dict "probe" .Values.startupProbe "path" "/health" "port" 8090) | nindent 12 }}
           volumeMounts:
             {{- if .Values.volumeMounts }}
             {{- .Values.volumeMounts | toYaml | nindent 12 }}

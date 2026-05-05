@@ -52,6 +52,7 @@ serviceAccount:
 # Configure Kubernetes probes for the Spice.ai runtime container.
 # Omitted probe fields keep these defaults, so overrides can be partial.
 # If a probe value is omitted entirely, the template renders these defaults.
+# If exec, tcpSocket, or grpc is configured, the template omits the default httpGet handler.
 livenessProbe:
   httpGet:
     path: /health
