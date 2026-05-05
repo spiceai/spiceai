@@ -999,6 +999,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_governor_state_is_applied_after_controller_recreation() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let quota = Quota::with_period(Duration::from_millis(200))
+            .expect("quota period should be non-zero")
+            .allow_burst(NonZeroU32::new(1).expect("burst should be non-zero"));
+        let object_key = "https%3A%2F%2Fapi.example.com%3A443";
+
+        let first_controller = RateControllerBuilder::new()
+            .add_quota_with_name("requests", quota)
+            .with_object_store_persistence(
+                Arc::clone(&store),
+                "",
+                object_key,
+                "https://api.example.com:443",
+                Duration::from_secs(30),
+            )
+            .build();
+        let first_permit = first_controller
+            .acquire()
+            .await
+            .expect("first controller should acquire immediately");
+        drop(first_permit);
+
+        let recreated_controller = RateControllerBuilder::new()
+            .add_quota_with_name("requests", quota)
+            .with_object_store_persistence(
+                store,
+                "",
+                object_key,
+                "https://api.example.com:443",
+                Duration::from_secs(30),
+            )
+            .build();
+
+        tokio::select! {
+            recreated = recreated_controller.acquire() => {
+                panic!("recreated controller should wait on persisted state, got: {recreated:?}");
+            }
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+
+        tokio::select! {
+            recreated = recreated_controller.acquire() => {
+                let permit = recreated.expect("recreated controller should acquire after shared quota replenishes");
+                drop(permit);
+            }
+            () = tokio::time::sleep(Duration::from_millis(250)) => {
+                panic!("recreated controller did not honor persisted Unix-epoch governor state");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn persisted_snapshot_prunes_stale_limiter_keys() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let object_key = "https%3A%2F%2Fapi.example.com%3A443";
