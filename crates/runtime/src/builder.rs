@@ -498,45 +498,60 @@ async fn build_http_rate_control_registry(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let Some(rate_control) = rate_control else {
-        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
-    };
-
-    let Some(refresh_interval) = parse_rate_control_refresh_interval(rate_control) else {
-        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
-    };
-
-    match crate::object_store_state::build_object_store(
-        secrets,
-        io_runtime,
-        &rate_control.state_location,
-        rate_control.params.as_ref(),
-        "rate-control state",
-    )
-    .await
+    #[cfg(not(feature = "rate-control"))]
     {
-        Ok((store, base_prefix)) => {
-            tracing::info!(
-                "Initialized persisted HTTP governor rate-control state with location: {}",
-                rate_control.state_location
+        let _ = (&secrets, &io_runtime);
+        if rate_control.is_some() {
+            tracing::warn!(
+                "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
             );
-            Arc::new(
+        }
+        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+    }
+
+    #[cfg(feature = "rate-control")]
+    {
+        let Some(rate_control) = rate_control else {
+            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+        };
+
+        let Some(refresh_interval) = parse_rate_control_refresh_interval(rate_control) else {
+            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+        };
+
+        match crate::object_store_state::build_object_store(
+            secrets,
+            io_runtime,
+            &rate_control.state_location,
+            rate_control.params.as_ref(),
+            "rate-control state",
+        )
+        .await
+        {
+            Ok((store, base_prefix)) => {
+                tracing::info!(
+                    "Initialized persisted HTTP governor rate-control state with location: {}",
+                    rate_control.state_location
+                );
+                Arc::new(
                 dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
                     store,
                     base_prefix,
                     refresh_interval,
                 ),
             )
-        }
-        Err(error) => {
-            tracing::error!(
-                "Failed to initialize persisted HTTP governor rate-control state: {error}"
-            );
-            Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to initialize persisted HTTP governor rate-control state: {error}"
+                );
+                Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
+            }
         }
     }
 }
 
+#[cfg(feature = "rate-control")]
 fn parse_rate_control_refresh_interval(rate_control: &SpicepodRateControl) -> Option<Duration> {
     match fundu::parse_duration(&rate_control.refresh_interval) {
         Ok(refresh_interval) if refresh_interval.is_zero() => {

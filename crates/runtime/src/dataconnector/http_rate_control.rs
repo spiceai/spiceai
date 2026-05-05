@@ -519,6 +519,7 @@ pub fn resolve_config<S: BuildHasher>(
 }
 
 impl HttpRateControlRegistry {
+    #[cfg(feature = "rate-control")]
     #[must_use]
     pub fn with_persisted_governor_state(
         store: Arc<dyn ObjectStore>,
