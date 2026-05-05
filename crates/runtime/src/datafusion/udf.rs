@@ -58,6 +58,7 @@ use runtime_datafusion_udfs::{
 };
 use serde_json::Value;
 use spicepod::component::function::{Function, FunctionKind, Volatility};
+use util::in_tracing_context_async;
 
 /// Register core scalar UDFs that have no runtime dependencies.
 ///
@@ -155,7 +156,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         );
     }
 
-    register_user_functions(runtime, ctx).await;
+    in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
 
 /// Emits the user-defined functions BETA warning at most once per
