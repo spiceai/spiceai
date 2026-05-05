@@ -108,6 +108,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("azure_storage_client_secret")
         .description("The service principal client secret for accessing the storage account.")
         .secret(),
+    ParameterSpec::component("azure_storage_tenant_id")
+        .description("The service principal tenant id for accessing the storage account.")
+        .secret(),
     ParameterSpec::component("azure_storage_sas_key")
         .description("The shared access signature key for accessing the storage account.")
         .secret(),
@@ -294,4 +297,49 @@ pub const CONNECTOR_NAME: &str = "delta_lake";
 #[must_use]
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     DeltaLakeFactory::new_arc()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime::secrets::Secrets;
+    use secrecy::SecretString;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn tenant_id_parameter_is_accepted_and_registered() {
+        let parameters = Parameters::try_new(
+            "connector delta_lake",
+            vec![(
+                "delta_lake_azure_storage_tenant_id".to_string(),
+                SecretString::new("tenant-id".to_string().into()),
+            )],
+            "delta_lake",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("tenant id should be accepted for delta_lake");
+
+        assert_eq!(
+            parameters.get("azure_storage_tenant_id").expose().ok(),
+            Some("tenant-id")
+        );
+
+        let delta_table_options = parameters.to_secret_map();
+        assert_eq!(
+            delta_table_options
+                .get("azure_storage_tenant_id")
+                .map(ExposeSecret::expose_secret),
+            Some("tenant-id")
+        );
+
+        let registry_params = parameters.storage_registry_params();
+        let tenant_id = registry_params
+            .iter()
+            .find(|(key, _)| key == "tenant_id")
+            .map(|(_, value)| value.expose_secret());
+
+        assert_eq!(tenant_id, Some("tenant-id"));
+    }
 }

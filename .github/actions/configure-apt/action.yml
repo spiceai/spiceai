@@ -25,6 +25,21 @@ runs:
         Acquire::ForceIPv4 "true";
         EOF
 
+        # GitHub-hosted Ubuntu runner images can include the git-core PPA.
+        # It is not needed for CI and can make apt update fail when Launchpad
+        # times out.
+        if [ -d /etc/apt/sources.list.d ]; then
+          while IFS= read -r -d '' SOURCE_FILE; do
+            if sudo grep -Eq 'ppa\.launchpadcontent\.net/git-core/ppa|git-core/ppa' "${SOURCE_FILE}"; then
+              echo "Removing git-core PPA apt source: ${SOURCE_FILE}"
+              sudo rm -f "${SOURCE_FILE}"
+            fi
+          done < <(
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+              \( -name '*.list' -o -name '*.sources' \) -print0
+          )
+        fi
+
         # Ordered list of Ubuntu archive mirrors close to Pittsburgh, PA
         # (Teraswitch datacenter), with reliable fallbacks. The deb822
         # sources format supports multiple URIs per source, and apt will

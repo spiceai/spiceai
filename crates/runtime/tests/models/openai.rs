@@ -83,6 +83,8 @@ mod nsql {
                     }],
                     description: None,
                     full_text_search: None,
+                    r#type: None,
+                    nullable: None,
                     metadata: HashMap::new(),
             }];
 
@@ -189,6 +191,8 @@ mod search {
                         }],
                         description: None,
                         full_text_search: None,
+                        r#type: None,
+                        nullable: None,
                         metadata: HashMap::new(),
                     }),
                 ))
@@ -248,6 +252,8 @@ mod search {
             }],
             description: None,
             full_text_search: None,
+            r#type: None,
+            nullable: None,
             metadata: HashMap::new(),
         }];
 
@@ -268,6 +274,8 @@ mod search {
             }],
             description: None,
             full_text_search: None,
+            r#type: None,
+            nullable: None,
             metadata: HashMap::new(),
         }];
 
@@ -623,6 +631,8 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
                 }],
                 description: None,
                 full_text_search: None,
+                r#type: None,
+                nullable: None,
                 metadata: HashMap::new(),
             }];
 
