@@ -239,10 +239,7 @@ fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
     let (return_type, output_schema) = scalar_return_schema(decl)?;
     let timeout = parse_timeout(decl.params.get("timeout"))?;
     let max_response_bytes = parse_max_response_bytes(decl.params.get("max_response_bytes"))?;
-    let max_rows = parse_max_rows(
-        decl.params.get("max_rows"),
-        MAX_SCALAR_TABLE_RESPONSE_ROWS,
-    )?;
+    let max_rows = parse_max_rows(decl.params.get("max_rows"), MAX_SCALAR_TABLE_RESPONSE_ROWS)?;
     let auth_bearer = parse_auth_bearer(decl.params.get("auth_bearer"))?;
 
     let mut headers = HeaderMap::new();
@@ -448,7 +445,9 @@ impl TableProvider for RemoteTableProvider {
         let request_limit = limit;
         let mut rows = match self.response_kind {
             RemoteResponseKind::Rows => self.post_table(args, tables, request_limit).await?,
-            RemoteResponseKind::ScalarValues => self.post_scalar(args, tables, request_limit).await?,
+            RemoteResponseKind::ScalarValues => {
+                self.post_scalar(args, tables, request_limit).await?
+            }
         };
         if let Some(limit) = limit {
             rows.truncate(limit);
@@ -522,13 +521,9 @@ impl RemoteTableProvider {
                 ))
             })?;
 
-        let parsed: RemoteResponse = decode_json_response(
-            resp,
-            &self.name,
-            "remote function",
-            self.max_response_bytes,
-        )
-        .await?;
+        let parsed: RemoteResponse =
+            decode_json_response(resp, &self.name, "remote function", self.max_response_bytes)
+                .await?;
         Ok(parsed
             .values
             .into_iter()
@@ -830,13 +825,9 @@ impl RemoteScalarUdf {
                 ))
             })?;
 
-        let parsed: RemoteResponse = decode_json_response(
-            resp,
-            &self.name,
-            "remote function",
-            self.max_response_bytes,
-        )
-        .await?;
+        let parsed: RemoteResponse =
+            decode_json_response(resp, &self.name, "remote function", self.max_response_bytes)
+                .await?;
         Ok(parsed.values)
     }
 }
@@ -881,8 +872,8 @@ async fn decode_json_response<T: DeserializeOwned>(
         )));
     }
 
-    let body = read_response_body_limited(resp, function_name, function_kind, max_response_bytes)
-        .await?;
+    let body =
+        read_response_body_limited(resp, function_name, function_kind, max_response_bytes).await?;
     serde_json::from_slice(&body).map_err(|e| {
         DataFusionError::Execution(format!(
             "{function_kind} '{function_name}' response was not valid JSON: {e}"

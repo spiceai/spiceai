@@ -853,11 +853,13 @@ fn param_u64(params: &HashMap<String, Value>, key: &str, default: u64) -> Result
     let Some(value) = params.get(key) else {
         return Ok(default);
     };
-    let value = value.as_u64().ok_or_else(|| WasmBuildError::InvalidIntegerParam {
-        param: key.to_string(),
-        expected: "a positive integer".to_string(),
-        got: format!("{value}"),
-    })?;
+    let value = value
+        .as_u64()
+        .ok_or_else(|| WasmBuildError::InvalidIntegerParam {
+            param: key.to_string(),
+            expected: "a positive integer".to_string(),
+            got: format!("{value}"),
+        })?;
     if value == 0 {
         return Err(WasmBuildError::InvalidIntegerParam {
             param: key.to_string(),
@@ -1287,6 +1289,8 @@ fn hash_path(path: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
 #[cfg(feature = "wasm-functions-compile")]
 fn compile_rust_file(config: &CompileConfig, output: &Path) -> Result<()> {
     let result = Command::new("rustc")
+        .arg("--edition")
+        .arg("2024")
         .arg("--crate-type")
         .arg("cdylib")
         .arg("--target")
@@ -1340,7 +1344,7 @@ fn compile_cargo_project(config: &CompileConfig) -> Result<PathBuf> {
     }
 
     let mut wasm_files = std::fs::read_dir(&release_dir)
-        .context(HashSourceSnafu {
+        .context(ReadArtifactDirSnafu {
             path: release_dir.display().to_string(),
         })?
         .filter_map(std::result::Result::ok)
