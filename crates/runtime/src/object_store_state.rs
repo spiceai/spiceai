@@ -71,6 +71,12 @@ pub(crate) enum Error {
         source: aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilderError,
     },
 
+    #[snafu(display("Failed to validate S3 parameters for {usage}: {source}"))]
+    S3ParameterValidation {
+        usage: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to initialize local filesystem for {usage} at {location}: {source}"))]
     LocalFileSystemInit {
         usage: &'static str,
@@ -106,11 +112,13 @@ pub(crate) async fn build_object_store(
             None => std::path::PathBuf::from(url.path()),
         };
 
-        std::fs::create_dir_all(&local_path).map_err(|source| Error::LocalFileSystemInit {
-            usage,
-            location: local_path.display().to_string(),
-            source: Box::new(source),
-        })?;
+        tokio::fs::create_dir_all(&local_path)
+            .await
+            .map_err(|source| Error::LocalFileSystemInit {
+                usage,
+                location: local_path.display().to_string(),
+                source: Box::new(source),
+            })?;
 
         let store: Arc<dyn ObjectStore> = Arc::new(
             object_store_occ::LocalConditionalPut::new(&local_path).map_err(|source| {
@@ -129,7 +137,7 @@ pub(crate) async fn build_object_store(
 
     let store: Arc<dyn ObjectStore> = if url.scheme() == "s3" {
         let params = params.map(Params::as_string_map);
-        let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref(), usage).await;
+        let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref(), usage).await?;
 
         S3ObjectStoreBuilder::from_url(&url, io_runtime)
             .context(S3ObjectStoreInitSnafu {
@@ -170,7 +178,7 @@ async fn build_s3_parameters(
     secrets: Arc<RwLock<Secrets>>,
     params: Option<&HashMap<String, String>>,
     usage: &'static str,
-) -> Parameters {
+) -> Result<Parameters> {
     let default_params = || Parameters::new(vec![], "s3", &S3_PARAMETERS);
     match params {
         Some(params) => {
@@ -183,9 +191,9 @@ async fn build_s3_parameters(
                 &S3_PARAMETERS,
             )
             .await
-            .unwrap_or_else(|_| default_params())
+            .map_err(|source| Error::S3ParameterValidation { usage, source })
         }
-        None => default_params(),
+        None => Ok(default_params()),
     }
 }
 
@@ -345,7 +353,9 @@ mod tests {
             "${ secrets:S3_SECRET }".to_string(),
         );
 
-        let s3_params = build_s3_parameters(secrets, Some(&params), "test state").await;
+        let s3_params = build_s3_parameters(secrets, Some(&params), "test state")
+            .await
+            .expect("S3 parameters should validate");
         let secret_map = s3_params.to_secret_map();
 
         assert_eq!(
@@ -356,6 +366,18 @@ mod tests {
             secret_map.get("secret").map(ExposeSecret::expose_secret),
             Some("executor-1:S3_SECRET")
         );
+    }
+
+    #[tokio::test]
+    async fn build_s3_parameters_rejects_invalid_values() {
+        let mut params = HashMap::new();
+        params.insert("s3_auth".to_string(), "not-valid".to_string());
+
+        let err = build_s3_parameters(secrets(), Some(&params), "test state")
+            .await
+            .expect_err("invalid S3 parameters should fail");
+
+        assert!(matches!(err, Error::S3ParameterValidation { .. }));
     }
 
     #[tokio::test]

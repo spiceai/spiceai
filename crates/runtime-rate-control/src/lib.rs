@@ -321,12 +321,11 @@ impl RateControllerPersistence {
     }
 
     fn snapshot(&self) -> PersistedRateControlState {
-        let mut snapshot = self
-            .object_state
-            .get_cached(&self.object_key)
-            .unwrap_or_default();
-        snapshot.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION;
-        snapshot.updated_at_unix_ms = unix_millis_now();
+        let mut snapshot = PersistedRateControlState {
+            schema_version: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
+            updated_at_unix_ms: unix_millis_now(),
+            limiters: HashMap::with_capacity(self.limiters.len()),
+        };
 
         for binding in &self.limiters {
             if let Some(theoretical_arrival_time_unix_nanos) =
@@ -985,6 +984,70 @@ mod tests {
                 panic!("second controller did not acquire after shared quota replenished");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn persisted_snapshot_prunes_stale_limiter_keys() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let object_key = "https%3A%2F%2Fapi.example.com%3A443";
+        let limiter_state = SharedGovernorState::new();
+        limiter_state.merge_absolute_nanos(unix_nanos_now().saturating_add(1_000_000));
+
+        let persistence = RateControllerPersistence::new(
+            RateControllerPersistenceConfig {
+                store,
+                prefix: String::new(),
+                object_key: object_key.to_string(),
+                origin: "https://api.example.com:443".to_string(),
+                refresh_interval: Duration::from_secs(30),
+            },
+            vec![PersistedLimiterBinding {
+                key: "current-limiter".to_string(),
+                state: limiter_state,
+            }],
+        );
+
+        let remote = PersistedRateControlState {
+            schema_version: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
+            updated_at_unix_ms: unix_millis_now(),
+            limiters: HashMap::from([
+                (
+                    "current-limiter".to_string(),
+                    PersistedLimiterState {
+                        theoretical_arrival_time_unix_nanos: unix_nanos_now(),
+                    },
+                ),
+                (
+                    "stale-limiter".to_string(),
+                    PersistedLimiterState {
+                        theoretical_arrival_time_unix_nanos: unix_nanos_now(),
+                    },
+                ),
+            ]),
+        };
+        persistence
+            .object_state
+            .insert_or_update(object_key, &remote)
+            .await
+            .expect("seed persisted state");
+
+        assert_eq!(
+            persistence
+                .persist_snapshot()
+                .await
+                .expect("persist snapshot"),
+            PersistResult::Persisted
+        );
+
+        let persisted = persistence
+            .object_state
+            .get(object_key)
+            .await
+            .expect("read persisted state")
+            .expect("persisted state should exist");
+
+        assert!(persisted.limiters.contains_key("current-limiter"));
+        assert!(!persisted.limiters.contains_key("stale-limiter"));
     }
 
     #[tokio::test]
