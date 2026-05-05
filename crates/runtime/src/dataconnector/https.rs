@@ -58,6 +58,23 @@ use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 
+fn parse_pagination_max_pages(value: &str) -> Option<usize> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("nolimit") {
+        return None;
+    }
+
+    if let Ok(max_pages) = trimmed.parse::<usize>() {
+        Some(max_pages)
+    } else {
+        tracing::warn!(
+            "Invalid pagination_max_pages value '{}': expected a positive integer or 'nolimit'. The parameter will be ignored.",
+            value
+        );
+        Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES)
+    }
+}
+
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
@@ -170,58 +187,7 @@ impl Https {
     /// Returns true if the connector is configured with parameters that indicate
     /// a dynamic HTTP API endpoint (as opposed to a static file download).
     fn has_dynamic_api_params(&self) -> bool {
-        let has_allowed_paths = self
-            .params
-            .get("allowed_request_paths")
-            .expose()
-            .ok()
-            .is_some_and(|v| !v.is_empty());
-
-        let has_query_filters = self
-            .params
-            .get("request_query_filters")
-            .expose()
-            .ok()
-            .is_some_and(util::parse_enabled);
-
-        let has_body_filters = self
-            .params
-            .get("request_body_filters")
-            .expose()
-            .ok()
-            .is_some_and(util::parse_enabled);
-
-        let has_header_filters = self
-            .params
-            .get("request_header_filters")
-            .expose()
-            .ok()
-            .is_some_and(util::parse_enabled);
-
-        let has_pagination = self
-            .params
-            .get("pagination")
-            .expose()
-            .ok()
-            .is_some_and(|v| v == "enabled" || v == "true" || v == "auto")
-            || [
-                "pagination_next_pointer",
-                "pagination_token_param",
-                "pagination_data_pointer",
-                "pagination_link_header",
-                "pagination_max_pages",
-                "pagination_data_map_to_array",
-                "pagination_query_params",
-                "pagination_page_size",
-            ]
-            .iter()
-            .any(|key| self.params.get(key).expose().ok().is_some());
-
-        has_allowed_paths
-            || has_query_filters
-            || has_body_filters
-            || has_header_filters
-            || has_pagination
+        params_indicate_dynamic_api(&self.params)
     }
 
     fn ensure_rate_control_supported_for_structured_dataset(
@@ -456,8 +422,10 @@ impl Https {
                 .get("pagination_max_pages")
                 .expose()
                 .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES);
+                .map_or(
+                    Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES),
+                    parse_pagination_max_pages,
+                );
 
             let data_map_to_array = self
                 .params
@@ -872,7 +840,14 @@ impl Https {
         })?;
 
         if let Some(nesting) = parse_http_json_nesting(dataset)? {
-            provider = provider.with_json_nesting(nesting);
+            let schema = build_json_nest_schema(dataset, &nesting).map_err(|e| {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: e.to_string(),
+                }
+            })?;
+            provider = provider.with_json_nesting(nesting, schema);
         }
 
         if let Some((auth_config, refresh_token)) = self.resolve_refresh_token_auth(dataset)? {
@@ -942,6 +917,9 @@ impl Https {
         }
 
         if let Some(pagination_config) = pagination {
+            let max_pages = pagination_config
+                .max_pages
+                .map_or_else(|| "nolimit".to_string(), |max_pages| max_pages.to_string());
             tracing::trace!(
                 "Enabling pagination for {}: next_pointer={:?}, link_header={}, token_param={:?}, data_pointer={:?}, max_pages={}, data_map_to_array={}, query_params={:?}, page_size={:?}",
                 dataset.name,
@@ -949,7 +927,7 @@ impl Https {
                 pagination_config.use_link_header,
                 pagination_config.token_param,
                 pagination_config.data_pointer,
-                pagination_config.max_pages,
+                max_pages,
                 pagination_config.data_map_to_array,
                 pagination_config.query_params,
                 pagination_config.page_size,
@@ -988,6 +966,127 @@ impl Https {
         Self::spawn_endpoint_validation(Arc::clone(&provider), dataset.name.to_string());
 
         Ok(provider)
+    }
+}
+
+/// Returns true if the supplied connector parameters indicate a
+/// dynamic HTTP API endpoint (as opposed to a static file download).
+/// Mirrors `Https::has_dynamic_api_params`, which is the canonical
+/// runtime check; kept as a free function so the `HttpsFactory`
+/// can run the same gate before constructing a connector.
+fn params_indicate_dynamic_api(params: &Parameters) -> bool {
+    let has_allowed_paths = params
+        .get("allowed_request_paths")
+        .expose()
+        .ok()
+        .is_some_and(|v| !v.is_empty());
+
+    let has_query_filters = params
+        .get("request_query_filters")
+        .expose()
+        .ok()
+        .is_some_and(util::parse_enabled);
+
+    let has_body_filters = params
+        .get("request_body_filters")
+        .expose()
+        .ok()
+        .is_some_and(util::parse_enabled);
+
+    let has_header_filters = params
+        .get("request_header_filters")
+        .expose()
+        .ok()
+        .is_some_and(util::parse_enabled);
+
+    let has_pagination = params
+        .get("pagination")
+        .expose()
+        .ok()
+        .is_some_and(|v| v == "enabled" || v == "true" || v == "auto")
+        || [
+            "pagination_next_pointer",
+            "pagination_token_param",
+            "pagination_data_pointer",
+            "pagination_link_header",
+            "pagination_max_pages",
+            "pagination_data_map_to_array",
+            "pagination_query_params",
+            "pagination_page_size",
+        ]
+        .iter()
+        .any(|key| params.get(key).expose().ok().is_some());
+
+    has_allowed_paths
+        || has_query_filters
+        || has_body_filters
+        || has_header_filters
+        || has_pagination
+}
+
+/// Build the schema for a JSON-nested HTTP table from the user's
+/// declared `columns:` block. The schema's field order matches
+/// `nesting.column_order` (already validated to equal the declared
+/// column order). Each field's Arrow type is the user's declared
+/// `type:` if present, defaulting to `Utf8` when omitted (matching
+/// the historical behavior). Nullability is the declared `nullable:`,
+/// defaulting to `true`.
+fn build_json_nest_schema(
+    dataset: &Dataset,
+    nesting: &HttpJsonNesting,
+) -> Result<arrow_schema::SchemaRef, crate::component::dataset::declared_type::ParseTypeError> {
+    use crate::component::dataset::declared_type::parse_declared_type;
+
+    let base = data_components::http::provider::HttpTableProvider::base_table_schema();
+    let mut fields = Vec::with_capacity(nesting.column_order.len());
+    for name in &nesting.column_order {
+        // HTTP metadata columns inherit their type from the base schema
+        // so the metadata-population path can write the right Arrow type
+        // (e.g. `response_status` is `UInt16`, not `Utf8`).
+        if nesting.metadata_fields.contains(name)
+            && let Ok(f) = base.field_with_name(name)
+        {
+            fields.push(f.clone());
+            continue;
+        }
+        let column = dataset
+            .columns
+            .iter()
+            .find(|c| &c.name == name)
+            .unwrap_or_else(|| {
+                unreachable!("nesting.column_order is derived from dataset.columns")
+            });
+        let dt = match column.r#type.as_deref() {
+            Some(t) => parse_declared_type(t)?,
+            None => arrow_schema::DataType::Utf8,
+        };
+        let nullable = column.nullable.unwrap_or(true);
+        fields.push(arrow_schema::Field::new(name, dt, nullable));
+    }
+    Ok(std::sync::Arc::new(arrow_schema::Schema::new(fields)))
+}
+
+/// Compute the static schema (no source I/O) for an HTTPS dataset in
+/// dynamic API mode. Returns `None` for file-mode datasets so the
+/// runtime falls back to either declared columns or eager source
+/// inference.
+fn static_schema_for_https_dataset(
+    params: &Parameters,
+    dataset: &Dataset,
+) -> Option<arrow_schema::SchemaRef> {
+    if !params_indicate_dynamic_api(params) {
+        return None;
+    }
+
+    match parse_http_json_nesting(dataset) {
+        Ok(Some(nesting)) => build_json_nest_schema(dataset, &nesting).ok(),
+        Ok(None) => Some(std::sync::Arc::new(
+            data_components::http::provider::HttpTableProvider::base_table_schema(),
+        )),
+        // Defer the user-facing error to the eager path, where it is
+        // already produced as a structured `InvalidConfigurationNoSource`
+        // error.
+        Err(_) => None,
     }
 }
 
@@ -1039,11 +1138,49 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
 
     let column_order: Vec<String> = dataset.columns.iter().map(|col| col.name.clone()).collect();
 
+    // Reject the catch-all column itself being named after a reserved
+    // HTTP metadata field — it would be ambiguous whether the column
+    // should hold the JSON catch-all or the metadata value.
+    if HTTP_METADATA_FIELDS.contains(&json_column.name.as_str()) {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "Column '{}' is marked as the JSON catch-all (json_object: \"*\") but its name is reserved for HTTP metadata. Rename the column.",
+                json_column.name
+            ),
+        });
+    }
+
+    let metadata_fields: std::collections::HashSet<String> = column_order
+        .iter()
+        .filter(|name| HTTP_METADATA_FIELDS.contains(&name.as_str()))
+        .cloned()
+        .collect();
+
     Ok(Some(HttpJsonNesting::new(
         column_order,
         json_column.name.clone(),
+        metadata_fields,
     )))
 }
+
+/// Names of columns in [`HttpTableProvider::base_table_schema`].
+/// When schema decomposition is enabled, declared columns whose names
+/// match one of these are sourced from HTTP request/response metadata
+/// instead of being decomposed from the JSON body.
+///
+/// [`HttpTableProvider::base_table_schema`]: data_components::http::provider::HttpTableProvider::base_table_schema
+const HTTP_METADATA_FIELDS: &[&str] = &[
+    "request_path",
+    "request_query",
+    "request_body",
+    "request_headers",
+    "content",
+    "response_status",
+    "response_headers",
+    "fetched_at",
+];
 
 #[async_trait]
 impl DataConnector for Https {
@@ -1186,7 +1323,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_data_pointer")
             .description("JSON pointer (RFC 6901) to the data array in each page's response (e.g., '/data', '/results', '/items'). When set, only the array at this path is returned as data rows."),
         ParameterSpec::runtime("pagination_max_pages")
-            .description("Maximum number of pages to fetch for pagination. Default: 100."),
+            .description("Maximum number of pages to fetch for pagination. Default: 100. Set to 'nolimit' to disable the limit."),
         ParameterSpec::runtime("pagination_data_map_to_array")
             .description("When 'enabled', if the data at pagination_data_pointer (or the top-level response) is a JSON object/map, extract its values as rows instead of treating it as a single row. Default: 'disabled'.")
             .one_of(&["enabled", "disabled"]),
@@ -1274,6 +1411,28 @@ impl DataConnectorFactory for HttpsFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         &PARAMETERS
+    }
+
+    /// HTTPS opts in to deferred registration when the dataset is
+    /// configured as a dynamic API endpoint, where the schema is
+    /// fully determined by configuration:
+    ///
+    /// * Without a `json_object` marker, the schema is the fixed
+    ///   `HttpTableProvider::base_table_schema()` (request/response
+    ///   columns).
+    /// * With a `json_object` marker, the schema is derived from the
+    ///   declared columns, honoring user-specified Arrow types and
+    ///   defaulting to `Utf8` when no type is given.
+    ///
+    /// File-mode endpoints (Parquet/CSV/JSON files) return `None`;
+    /// the runtime falls back to the user-declared `columns:` schema
+    /// or, if absent, the eager source-inference path.
+    fn static_schema(
+        &self,
+        params: &ConnectorParams,
+        dataset: &Dataset,
+    ) -> Option<arrow_schema::SchemaRef> {
+        static_schema_for_https_dataset(&params.parameters, dataset)
     }
 }
 
@@ -1925,6 +2084,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_http_provider_params_parses_finite_pagination_max_pages() {
+        let connector =
+            test_connector_with(&[("pagination", "enabled"), ("pagination_max_pages", "250")])
+                .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("pagination params should be valid");
+
+        assert_eq!(
+            params
+                .pagination
+                .expect("pagination should be configured")
+                .max_pages,
+            Some(250)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_http_provider_params_parses_nolimit_pagination_max_pages() {
+        let connector = test_connector_with(&[
+            ("pagination", "enabled"),
+            ("pagination_max_pages", "nolimit"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("pagination params should be valid");
+
+        assert_eq!(
+            params
+                .pagination
+                .expect("pagination should be configured")
+                .max_pages,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_refresh_token_auth_rejects_refresh_token_without_url() {
         let connector = test_connector_with(&[("http_auth_refresh_token", "rt-only")]).await;
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
@@ -2124,5 +2325,180 @@ mod tests {
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_classifies_metadata_columns() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("request_path"),
+            Column::new("response_status"),
+            Column::new("id"),
+            column_with_marker("data", Value::String("*".to_string())),
+        ];
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+        assert_eq!(nesting.json_field_name, "data");
+        assert_eq!(
+            nesting.column_order,
+            vec!["request_path", "response_status", "id", "data"]
+        );
+        assert!(nesting.metadata_fields.contains("request_path"));
+        assert!(nesting.metadata_fields.contains("response_status"));
+        assert!(
+            !nesting.metadata_fields.contains("id"),
+            "non-reserved column must not be classified as metadata"
+        );
+        // Reserved-name columns must not also be treated as static body
+        // fields, otherwise the body would shadow the HTTP metadata.
+        assert!(!nesting.static_fields.contains("request_path"));
+        assert!(!nesting.static_fields.contains("response_status"));
+        assert!(nesting.static_fields.contains("id"));
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_rejects_catchall_named_after_metadata() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            column_with_marker("response_status", Value::String("*".to_string())),
+        ];
+        let error = parse_http_json_nesting(&dataset)
+            .expect_err("reserved-name catch-all should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("reserved for HTTP metadata"),
+                    "expected reserved-name error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    async fn test_params(extra: &[(&str, &str)]) -> Parameters {
+        let mut params: Vec<(String, SecretString)> = Vec::new();
+        for (k, v) in extra {
+            params.push(((*k).to_string(), (*v).to_string().into()));
+        }
+        Parameters::try_new(
+            "connector https",
+            params,
+            "http",
+            Arc::new(RwLock::new(Secrets::default())),
+            &PARAMETERS,
+        )
+        .await
+        .expect("test connector parameters should be valid")
+    }
+
+    #[tokio::test]
+    async fn static_schema_returns_none_in_file_mode() {
+        let params = test_params(&[]).await;
+        let dataset = test_dataset(
+            "https://example.com/data.parquet",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+        assert!(static_schema_for_https_dataset(&params, &dataset).is_none());
+    }
+
+    #[tokio::test]
+    async fn static_schema_returns_none_in_file_mode_even_with_declared_columns() {
+        let params = test_params(&[]).await;
+        let mut dataset = test_dataset(
+            "https://example.com/data.parquet",
+            RefreshMode::Append,
+            None,
+        )
+        .await;
+        dataset.columns = vec![
+            Column::new("id").with_type("bigint"),
+            Column::new("name").with_type("text"),
+        ];
+        // File mode: declared columns are handled by the runtime
+        // dispatch fallback, not by HTTPS' static_schema.
+        assert!(static_schema_for_https_dataset(&params, &dataset).is_none());
+    }
+
+    #[tokio::test]
+    async fn static_schema_in_dynamic_api_mode_without_marker_returns_base_schema() {
+        let params = test_params(&[("allowed_request_paths", "/items/*")]).await;
+        let dataset = test_dataset("https://api.example.com", RefreshMode::Append, None).await;
+        let schema =
+            static_schema_for_https_dataset(&params, &dataset).expect("dynamic mode -> Some");
+        let expected = data_components::http::provider::HttpTableProvider::base_table_schema();
+        assert_eq!(schema.fields().len(), expected.fields().len());
+        for (a, b) in schema.fields().iter().zip(expected.fields().iter()) {
+            assert_eq!(a.name(), b.name());
+            assert_eq!(a.data_type(), b.data_type());
+            assert_eq!(a.is_nullable(), b.is_nullable());
+        }
+    }
+
+    #[tokio::test]
+    async fn static_schema_in_dynamic_api_mode_with_json_nest_defaults_to_utf8() {
+        let params = test_params(&[("allowed_request_paths", "/items/*")]).await;
+        let mut dataset = test_dataset("https://api.example.com", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("name"),
+            column_with_marker("data", Value::String("*".to_string())),
+        ];
+        let schema = static_schema_for_https_dataset(&params, &dataset)
+            .expect("json_nest dynamic mode -> Some");
+        assert_eq!(schema.fields().len(), 3);
+        for f in schema.fields() {
+            assert_eq!(
+                f.data_type(),
+                &arrow_schema::DataType::Utf8,
+                "untyped json_nest column should default to Utf8 (field {})",
+                f.name()
+            );
+            assert!(f.is_nullable());
+        }
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["id", "name", "data"]
+        );
+    }
+
+    #[tokio::test]
+    async fn static_schema_in_dynamic_api_mode_with_json_nest_honors_typed_columns() {
+        let params = test_params(&[("allowed_request_paths", "/items/*")]).await;
+        let mut dataset = test_dataset("https://api.example.com", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id").with_type("bigint").with_nullable(false),
+            Column::new("name"),
+            column_with_marker("data", Value::String("*".to_string())),
+        ];
+        let schema = static_schema_for_https_dataset(&params, &dataset)
+            .expect("json_nest dynamic mode -> Some");
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &arrow_schema::DataType::Int64);
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(schema.field(1).data_type(), &arrow_schema::DataType::Utf8);
+        assert_eq!(schema.field(2).name(), "data");
+        assert_eq!(schema.field(2).data_type(), &arrow_schema::DataType::Utf8);
+    }
+
+    #[tokio::test]
+    async fn static_schema_returns_none_when_json_nest_marker_is_invalid() {
+        let params = test_params(&[("allowed_request_paths", "/items/*")]).await;
+        let mut dataset = test_dataset("https://api.example.com", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            column_with_marker("data", Value::String("not-a-wildcard".to_string())),
+        ];
+        // Defer the user-facing error to the eager path.
+        assert!(static_schema_for_https_dataset(&params, &dataset).is_none());
     }
 }

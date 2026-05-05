@@ -468,7 +468,7 @@ mod tests {
         let pod = Spicepod::load_exact(&PathBuf::from("./tests/spicepod_with_functions.yaml"))
             .await
             .expect("Should load spicepod with functions");
-        assert_eq!(pod.functions.len(), 5);
+        assert_eq!(pod.functions.len(), 6);
         let names: Vec<&str> = pod.functions.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
@@ -477,7 +477,8 @@ mod tests {
                 "haversine_km",
                 "shout",
                 "classify_intent",
-                "internal_hash"
+                "internal_hash",
+                "duplicate_rows"
             ]
         );
 
@@ -486,7 +487,7 @@ mod tests {
         assert_eq!(double_it.signature.args.len(), 1);
         assert_eq!(double_it.signature.args[0].name, "x");
         assert_eq!(double_it.signature.args[0].arrow_type, "int64");
-        assert_eq!(double_it.signature.returns.as_deref(), Some("int64"));
+        assert_eq!(double_it.signature.scalar_return_type(), Some("int64"));
         assert_eq!(double_it.body.as_deref(), Some("x * 2"));
         // Defaults to being exposed as a tool.
         assert!(double_it.as_tool);
@@ -499,6 +500,20 @@ mod tests {
         let internal = &pod.functions[4];
         assert_eq!(internal.name, "internal_hash");
         assert!(!internal.as_tool, "internal_hash should be SQL-only");
+
+        let duplicate_rows = &pod.functions[5];
+        assert_eq!(duplicate_rows.name, "duplicate_rows");
+        assert_eq!(
+            duplicate_rows.kind,
+            component::function::FunctionKind::Table
+        );
+        let columns = duplicate_rows
+            .signature
+            .table_return_columns()
+            .expect("table return columns");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "value");
+        assert_eq!(columns[1].arrow_type, "int64");
 
         // Tool with as_sql: true is visible on the resolved Spicepod.
         assert_eq!(pod.tools.len(), 1);
