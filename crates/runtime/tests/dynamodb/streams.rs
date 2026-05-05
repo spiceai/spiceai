@@ -51,6 +51,7 @@ const PORT3: u16 = 8003;
 const PORT4: u16 = 8004;
 const PORT5: u16 = 8005;
 const PORT6: u16 = 8006;
+const PORT7: u16 = 8007;
 
 #[instrument]
 pub async fn start_dynamodb_docker_container(
@@ -527,14 +528,54 @@ fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str,
     .expect("Failed to update checkpoint");
 }
 
+/// Resolves the underlying base table name for an accelerated `DuckDB` table.
+///
+/// After `InsertOp::Overwrite`, the accelerator exposes data through a view over an internal
+/// `__data_<table_name>_<timestamp>` table. Raw `DuckDB` DML must target the latest internal
+/// table; if no internal table exists, the definition name is used directly.
+fn resolve_acceleration_base_table(conn: &duckdb::Connection, table_name: &str) -> String {
+    let prefix = format!("__data_{table_name}_");
+    let Ok(mut stmt) =
+        conn.prepare("SELECT table_name FROM duckdb_tables() WHERE starts_with(table_name, ?)")
+    else {
+        return table_name.to_string();
+    };
+
+    let Ok(rows) = stmt.query_map([&prefix], |row| row.get::<usize, String>(0)) else {
+        return table_name.to_string();
+    };
+
+    let mut latest: Option<(String, u64)> = None;
+    for row in rows.flatten() {
+        let Some(inner) = row.strip_prefix("__data_") else {
+            continue;
+        };
+        let Some((name_part, ts_part)) = inner.rsplit_once('_') else {
+            continue;
+        };
+        if name_part != table_name {
+            continue;
+        }
+        let Ok(ts) = ts_part.parse::<u64>() else {
+            continue;
+        };
+        if latest.as_ref().is_none_or(|(_, prev_ts)| ts > *prev_ts) {
+            latest = Some((row, ts));
+        }
+    }
+
+    latest.map_or_else(|| table_name.to_string(), |(name, _)| name)
+}
+
 /// Deletes rows from the accelerated table to verify rebootstrap restores them.
 fn delete_rows_from_acceleration(duckdb_path: &str, table_name: &str, ids_to_delete: &[&str]) {
     use duckdb::Connection;
 
     let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
+    let base_table = resolve_acceleration_base_table(&conn, table_name);
 
     for id in ids_to_delete {
-        conn.execute(&format!("DELETE FROM {table_name} WHERE id = ?"), [id])
+        conn.execute(&format!(r#"DELETE FROM "{base_table}" WHERE id = ?"#), [id])
             .expect("Failed to delete row");
     }
 }
@@ -605,6 +646,195 @@ async fn wait_for_dataset_rows(
         }
         sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Inserts phantom rows directly into the `DuckDB` acceleration table, bypassing `DynamoDB`.
+///
+/// These rows have IDs that do not exist in `DynamoDB`, so no CDC stream events will ever
+/// delete them. An `InsertOp::Overwrite` rebootstrap will remove them (the table is
+/// replaced atomically); an `InsertOp::Append` rebootstrap leaves them in place.
+fn add_phantom_rows_to_acceleration(duckdb_path: &str, table_name: &str, count: usize) {
+    use duckdb::Connection;
+    let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
+    let base_table = resolve_acceleration_base_table(&conn, table_name);
+    for i in 0..count {
+        let version = i64::try_from(i).expect("phantom row index fits in i64");
+        conn.execute(
+            &format!(r#"INSERT INTO "{base_table}" (id, name, version) VALUES (?, ?, ?)"#),
+            duckdb::params![format!("phantom-{i}"), format!("Phantom {i}"), version],
+        )
+        .expect("Failed to insert phantom row");
+    }
+}
+
+/// Like `wait_for_dataset_rows` but requires an exact row count, not just a minimum.
+/// Necessary for detecting stale phantom rows that survive an `InsertOp::Append` rebootstrap.
+async fn wait_for_exact_row_count(
+    rt: &Runtime,
+    table_name: &str,
+    expected_rows: usize,
+    timeout_secs: u64,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > Duration::from_secs(timeout_secs) {
+            return false;
+        }
+        let query_result = rt
+            .datafusion()
+            .query_builder(&format!("SELECT COUNT(*) as cnt FROM {table_name}"))
+            .build()
+            .run()
+            .await;
+
+        if let Ok(result) = query_result
+            && let Ok(batches) = result.data.try_collect::<Vec<_>>().await
+            && !batches.is_empty()
+            && batches[0].num_rows() > 0
+            && let Some(col) = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+        {
+            let actual = usize::try_from(col.value(0)).unwrap_or(0);
+            if actual == expected_rows {
+                return true;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Verifies that rebootstrap removes phantom rows that exist in `DuckDB` but not in `DynamoDB`.
+///
+/// The test injects rows directly into the `DuckDB` acceleration file with IDs that do not
+/// exist in `DynamoDB`.  No CDC delete events are ever generated for these IDs, so the only
+/// mechanism that can remove them is an atomic table replacement.
+///
+/// Fails with `InsertOp::Append`: phantom IDs have no PK match in the rebootstrap scan,
+/// so they are left in place → count stays at 8 → timeout.
+/// Passes with `InsertOp::Overwrite`: the internal table is replaced atomically with the
+/// 5-row scan result → phantoms gone → count = 5.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=debug,dynamodb_streams=debug,info",
+    ));
+
+    let table_name = "rebootstrap_stale_rows";
+    let access_key = "foo";
+    let secret_key = "bar";
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_dynamodb_docker_container(PORT7).await?;
+            let client = get_client(PORT7, access_key, secret_key);
+
+            create_table(&client, table_name).await;
+            insert_rows(&client, table_name, 0..5).await;
+            sleep(Duration::from_secs(2)).await;
+
+            let temp_dir = tempfile::tempdir()?;
+            let duckdb_path = temp_dir.path().join("test.duckdb");
+            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
+
+            // Phase 1: Bootstrap normally — acceleration and DynamoDB both have 5 rows.
+            {
+                let app = AppBuilder::new("dynamodb_rebootstrap_stale_phase1")
+                    .with_dataset(make_dynamodb_dataset_with_file_accel(
+                        table_name,
+                        PORT7,
+                        access_key,
+                        secret_key,
+                        duckdb_path_str,
+                        Some("ready_after_load"),
+                    ))
+                    .with_results_cache(ResultsCache {
+                        enabled: false,
+                        ..Default::default()
+                    })
+                    .build();
+
+                configure_test_datafusion();
+                let rt = Runtime::builder().with_app(app).build().await;
+                let cloned_rt = Arc::new(rt.clone());
+
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                        return Err(anyhow::Error::msg("Phase 1: Timed out waiting for datasets to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                runtime_ready_check(&rt).await;
+                sleep(Duration::from_secs(3)).await;
+
+                let initial_count = get_acceleration_row_count(duckdb_path_str, table_name);
+                assert_eq!(initial_count, 5, "Phase 1: Should have 5 rows after initial load");
+            }
+
+            // Phase 2: While Spice is down, inject 3 phantom rows directly into DuckDB.
+            // These IDs do not exist in DynamoDB, so no CDC stream events can remove them.
+            // Only an atomic table replacement (InsertOp::Overwrite) can purge them.
+            add_phantom_rows_to_acceleration(duckdb_path_str, table_name, 3);
+
+            let pre_rebootstrap_count = get_acceleration_row_count(duckdb_path_str, table_name);
+            assert_eq!(
+                pre_rebootstrap_count, 8,
+                "Phase 2: Acceleration should have 8 rows (5 original + 3 phantoms)"
+            );
+
+            // Corrupt checkpoint (20 h ago) to trigger rebootstrap on next startup.
+            corrupt_checkpoint_for_shard_not_found(duckdb_path_str, table_name, 20);
+
+            // Phase 3: Restart Spice — rebootstrap must replace the table, not append to it.
+            // DynamoDB still has 5 rows; after Overwrite rebootstrap, the 3 phantoms are gone.
+            {
+                let app = AppBuilder::new("dynamodb_rebootstrap_stale_phase3")
+                    .with_dataset(make_dynamodb_dataset_with_file_accel(
+                        table_name,
+                        PORT7,
+                        access_key,
+                        secret_key,
+                        duckdb_path_str,
+                        Some("ready_after_load"),
+                    ))
+                    .with_results_cache(ResultsCache {
+                        enabled: false,
+                        ..Default::default()
+                    })
+                    .build();
+
+                configure_test_datafusion();
+                let rt = Runtime::builder().with_app(app).build().await;
+                let cloned_rt = Arc::new(rt.clone());
+
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                        return Err(anyhow::Error::msg("Phase 3: Timed out waiting for datasets to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                // DynamoDB has 5 rows (id-0..id-4). Phantoms must not survive.
+                let has_exact_rows = wait_for_exact_row_count(&rt, table_name, 5, 30).await;
+                assert!(
+                    has_exact_rows,
+                    "Rebootstrap must remove phantom rows that exist only in DuckDB. \
+                     Stale phantom rows survived — InsertOp::Append was used instead of Overwrite"
+                );
+
+                runtime_ready_check(&rt).await;
+            }
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
