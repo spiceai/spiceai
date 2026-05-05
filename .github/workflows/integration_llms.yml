@@ -94,6 +94,9 @@ jobs:
   build:
     name: Build Test Binary
     runs-on: spiceai-macos
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      TEST_BINARY_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/llms_integration_test
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -112,18 +115,35 @@ jobs:
           TEST_BINARY_PATH=$(cargo test -p llms --test integration --features metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./llms_integration_test
 
-      - name: Upload test binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
-          name: llms-integration-test-binary
-          path: ./llms_integration_test
-          retention-days: 3
-          # Test binary is already a compact native binary; use minimal artifact zip compression.
-          compression-level: 1
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+
+      - name: Upload test binary to spiceio
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to upload the LLM integration test binary}"
+          aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 cp ./llms_integration_test "$TEST_BINARY_S3_URI"
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   test:
     runs-on: ${{ matrix.target.runner }}
     needs: [build, setup-matrix]
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      TEST_BINARY_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/llms_integration_test
     strategy:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -133,11 +153,26 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
-      - name: Download test binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
-          name: llms-integration-test-binary
-          path: ./integration_test
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+
+      - name: Download test binary from spiceio
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the LLM integration test binary}"
+          mkdir -p ./integration_test
+          aws --endpoint-url "$SPICEIO_ENDPOINT" --no-sign-request s3 cp "$TEST_BINARY_S3_URI" ./integration_test/llms_integration_test
 
       - name: Mark test binary as executable
         run: chmod +x ./integration_test/llms_integration_test
@@ -176,3 +211,7 @@ jobs:
           fi
           # `--test-threads` to reduce possible rate limiting/ connection issues for hosted models.
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture -- llms::tests --test-threads=2
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true

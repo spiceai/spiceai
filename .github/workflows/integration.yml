@@ -48,6 +48,13 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/integration-test-archive/integration.tar.zst
+  INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/integration-retention-oom-test-archive/retention_oom.tar.zst
+  INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/integration-aws-sdk-test-archive/integration_aws_sdk.tar.zst
+  INTEGRATION_SNAPSHOT_REFRESH_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/integration-snapshot-refresh-test-archive/integration_snapshot_refresh.tar.zst
+  INTEGRATION_AWS_SDK_CREDENTIAL_BRIDGE_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/integration-aws-sdk-credential-bridge-test-archive/integration_aws_sdk_credential_bridge.tar.zst
+  INTEGRATION_PARTITION_TABLE_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/integration-partition-table-test-archive/partition_table_test.tar.zst
+  INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/${{ github.run_attempt }}/integration-data-components-test-archive/data_components_hadoop.tar.zst
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
@@ -145,76 +152,27 @@ jobs:
           cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
           cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file data_components_hadoop.tar.zst
 
-      # Upload the test archive as an artifact
-      - name: Upload test archive
+      - name: Upload test archives to local MinIO
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: integration-test-archive
-          path: ./integration.tar.zst
-          retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
-          compression-level: 1
-
-      - name: Upload retention OOM test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: integration-retention-oom-test-archive
-          path: ./retention_oom.tar.zst
-          retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
-          compression-level: 1
-
-      - name: Upload AWS SDK test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: integration-aws-sdk-test-archive
-          path: ./integration_aws_sdk.tar.zst
-          retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
-          compression-level: 1
-
-      - name: Upload snapshot refresh test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: integration-snapshot-refresh-test-archive
-          path: ./integration_snapshot_refresh.tar.zst
-          retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
-          compression-level: 1
-
-      - name: Upload AWS SDK credential bridge test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: integration-aws-sdk-credential-bridge-test-archive
-          path: ./integration_aws_sdk_credential_bridge.tar.zst
-          retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
-          compression-level: 1
-
-      - name: Upload partition table test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: integration-partition-table-test-archive
-          path: ./partition_table_test.tar.zst
-          retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
-          compression-level: 1
-
-      - name: Upload data components test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: integration-data-components-test-archive
-          path: ./data_components_hadoop.tar.zst
-          retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
-          compression-level: 1
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to upload integration test archives}"
+          if ! aws --endpoint-url "$MINIO_ENDPOINT" s3api head-bucket --bucket build; then
+            aws --endpoint-url "$MINIO_ENDPOINT" s3 mb s3://build || true
+            aws --endpoint-url "$MINIO_ENDPOINT" s3api head-bucket --bucket build
+          fi
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp ./integration.tar.zst "$INTEGRATION_TEST_ARCHIVE_S3_URI"
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp ./retention_oom.tar.zst "$INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI"
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp ./integration_aws_sdk.tar.zst "$INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI"
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp ./integration_snapshot_refresh.tar.zst "$INTEGRATION_SNAPSHOT_REFRESH_TEST_ARCHIVE_S3_URI"
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp ./integration_aws_sdk_credential_bridge.tar.zst "$INTEGRATION_AWS_SDK_CREDENTIAL_BRIDGE_TEST_ARCHIVE_S3_URI"
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp ./partition_table_test.tar.zst "$INTEGRATION_PARTITION_TABLE_TEST_ARCHIVE_S3_URI"
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp ./data_components_hadoop.tar.zst "$INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI"
 
   test:
     name: Integration Tests (part ${{ matrix.label }})
@@ -247,20 +205,31 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-oracle-odpi
 
-      # Download the test archive artifact
-      - name: Download test archive
+      - name: Download test archive from local MinIO
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: integration-test-archive
-          path: ./integration_test
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
+          mkdir -p ./integration_test
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp "$INTEGRATION_TEST_ARCHIVE_S3_URI" ./integration_test/integration.tar.zst
 
-      - name: Download retention OOM test archive
+      - name: Download retention OOM test archive from local MinIO
         if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: integration-retention-oom-test-archive
-          path: ./retention_oom_test
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download retention OOM test archive}"
+          mkdir -p ./retention_oom_test
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp "$INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI" ./retention_oom_test/retention_oom.tar.zst
 
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -439,11 +408,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Download AWS SDK test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: integration-aws-sdk-test-archive
-          path: ./integration_aws_sdk_test
+      - name: Download AWS SDK test archive from local MinIO
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
+          mkdir -p ./integration_aws_sdk_test
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp "$INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI" ./integration_aws_sdk_test/integration_aws_sdk.tar.zst
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -480,11 +455,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Download AWS SDK credential bridge test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: integration-aws-sdk-credential-bridge-test-archive
-          path: ./integration_aws_sdk_credential_bridge_test
+      - name: Download AWS SDK credential bridge test archive from local MinIO
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK credential bridge test archive}"
+          mkdir -p ./integration_aws_sdk_credential_bridge_test
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp "$INTEGRATION_AWS_SDK_CREDENTIAL_BRIDGE_TEST_ARCHIVE_S3_URI" ./integration_aws_sdk_credential_bridge_test/integration_aws_sdk_credential_bridge.tar.zst
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -524,11 +505,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Download snapshot refresh test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: integration-snapshot-refresh-test-archive
-          path: ./integration_snapshot_refresh_test
+      - name: Download snapshot refresh test archive from local MinIO
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
+          mkdir -p ./integration_snapshot_refresh_test
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp "$INTEGRATION_SNAPSHOT_REFRESH_TEST_ARCHIVE_S3_URI" ./integration_snapshot_refresh_test/integration_snapshot_refresh.tar.zst
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -564,11 +551,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Download data components test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: integration-data-components-test-archive
-          path: ./data_components_test
+      - name: Download data components test archive from local MinIO
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download data components test archive}"
+          mkdir -p ./data_components_test
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp "$INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI" ./data_components_test/data_components_hadoop.tar.zst
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -594,11 +587,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Download partition table test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: integration-partition-table-test-archive
-          path: ./partition_table_test
+      - name: Download partition table test archive from local MinIO
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download partition table test archive}"
+          mkdir -p ./partition_table_test
+          aws --endpoint-url "$MINIO_ENDPOINT" s3 cp "$INTEGRATION_PARTITION_TABLE_TEST_ARCHIVE_S3_URI" ./partition_table_test/partition_table_test.tar.zst
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
