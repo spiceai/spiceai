@@ -1202,7 +1202,7 @@ mod tests {
 
     // -- Correctness: commit-after-write ordering -----------------------------
 
-    /// Wraps a TableProvider and records each `insert_into` call.
+    /// Wraps a `TableProvider` and records each `insert_into` call.
     /// Together with `CommitLog`, this lets us assert that for every
     /// envelope `id`, the write event happens strictly before the commit.
     #[derive(Debug)]
@@ -1242,6 +1242,20 @@ mod tests {
         }
     }
 
+    /// Records "commit" into a shared log when its `commit()` runs, so we
+    /// can assert the interleaved write/commit sequence in
+    /// `test_start_changes_stream_commits_after_write`.
+    struct SequencedCommitter {
+        log: Arc<TokioMutex<Vec<&'static str>>>,
+    }
+    #[async_trait]
+    impl CommitChange for SequencedCommitter {
+        async fn commit(&self) -> Result<(), CommitError> {
+            self.log.lock().await.push("commit");
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn test_start_changes_stream_commits_after_write() {
         let write_log: Arc<TokioMutex<Vec<&'static str>>> = Arc::new(TokioMutex::new(Vec::new()));
@@ -1251,21 +1265,9 @@ mod tests {
         });
         let task = make_refresh_task(provider as Arc<dyn TableProvider>);
 
-        // Use a single CommitLog and append "commit" markers to the same
-        // shared write log on commit, so we can read off the interleaved
-        // sequence of write/commit events.
+        // Use a single shared log; both `insert_into` and `commit()` push
+        // markers, so we can read off the interleaved write/commit sequence.
         let combined: Arc<TokioMutex<Vec<&'static str>>> = Arc::clone(&write_log);
-
-        struct SequencedCommitter {
-            log: Arc<TokioMutex<Vec<&'static str>>>,
-        }
-        #[async_trait]
-        impl CommitChange for SequencedCommitter {
-            async fn commit(&self) -> Result<(), CommitError> {
-                self.log.lock().await.push("commit");
-                Ok(())
-            }
-        }
 
         let mk = |id: i32| -> ChangeEnvelope {
             let batch =
@@ -1391,7 +1393,7 @@ mod tests {
 
     // -- Pipelining: verify reader prefetches under a slow apply --------------
 
-    /// TableProvider that delays each `insert_into` to simulate a slow
+    /// `TableProvider` that delays each `insert_into` to simulate a slow
     /// accelerator. Used to expose pipeline overlap: while the apply task
     /// is sleeping inside `insert_into`, the reader task should be free to
     /// drain ahead and fill the prefetch channel.
