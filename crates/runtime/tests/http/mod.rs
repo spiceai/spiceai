@@ -19,6 +19,8 @@ mod json_nested_fields;
 #[cfg(feature = "duckdb")]
 mod view_hot_reload;
 
+mod deferred;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
@@ -44,7 +46,7 @@ use runtime::{
 use serde_json::{Value, json};
 use spicepod::{
     acceleration::{Acceleration, RefreshMode},
-    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
+    component::{caching::SQLResultsCacheConfig, dataset::Dataset, view::View},
     param::Params as DatasetParams,
 };
 use tokio::net::TcpListener;
@@ -221,8 +223,63 @@ async fn start_http_server() -> Result<
             get(|| async { ([("content-type", "application/json")], SHOWS_JSON) }),
         )
         .route(
+            "/api/headers",
+            get(|headers: AxumHeaderMap| async move {
+                // Echo all x-* custom headers for deterministic testing
+                // (filters out standard headers like host, accept, user-agent)
+                // Use BTreeMap for stable key ordering across runs
+                let mut echoed = std::collections::BTreeMap::new();
+                for (name, value) in &headers {
+                    if name.as_str().starts_with("x-")
+                        && let Ok(val_str) = value.to_str()
+                    {
+                        echoed.insert(name.to_string(), val_str.to_string());
+                    }
+                }
+                let body =
+                    serde_json::to_string(&echoed).expect("BTreeMap should serialize to JSON");
+                ([("content-type", "application/json")], body)
+            }),
+        )
+        .route(
             "/data/items.csv",
             get(|| async { ([("content-type", "text/csv")], ITEMS_CSV) }),
+        )
+        .route(
+            "/api/metrics-paginated",
+            get(
+                |query: axum::extract::Query<HashMap<String, String>>| async move {
+                    // Token-based pagination: returns 2 metrics per page, 3 pages total (5 metrics).
+                    static METRICS: &[(&str, f64)] = &[
+                        ("cpu", 42.0),
+                        ("mem", 78.5),
+                        ("disk", 55.0),
+                        ("net_in", 12.3),
+                        ("net_out", 9.7),
+                    ];
+                    let page: usize = query
+                        .get("cursor")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1);
+                    let items_per_page = 2;
+                    let start = (page - 1) * items_per_page;
+                    let end = std::cmp::min(start + items_per_page, METRICS.len());
+                    let items: Vec<Value> = METRICS[start..end]
+                        .iter()
+                        .map(|(metric, reading)| json!({ "metric": metric, "reading": reading }))
+                        .collect();
+                    let next_cursor = if end < METRICS.len() {
+                        Value::Number(serde_json::Number::from(page + 1))
+                    } else {
+                        Value::Null
+                    };
+                    let body = json!({
+                        "data": items,
+                        "next_cursor": next_cursor,
+                    });
+                    ([("content-type", "application/json")], body.to_string())
+                },
+            ),
         );
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
@@ -508,6 +565,309 @@ async fn test_http_json_api_dynamic() -> Result<(), String> {
                 )
                 .await?;
             }
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that dynamic `request_headers` filters are correctly applied to HTTP requests.
+///
+/// Verifies:
+/// - Dynamic headers from `request_headers IN (...)` are sent on the HTTP request
+/// - Static headers from `http_headers` param are preserved
+/// - Dynamic headers override static headers with the same name
+/// - `request_headers` virtual column is populated in query results
+#[tokio::test]
+async fn test_http_dynamic_request_headers() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+            tracing::debug!("HTTP test server started at {addr}");
+
+            let mut dataset = Dataset::new(format!("http://{addr}/api"), "header_test");
+            dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                ("allowed_request_paths".to_string(), "/headers".to_string()),
+                (
+                    "http_headers".to_string(),
+                    "x-static-header: static-value; x-org-id: default-org".to_string(),
+                ),
+                ("request_header_filters".to_string(), "enabled".to_string()),
+                (
+                    "request_header_allowlist".to_string(),
+                    "x-org-id, x-custom".to_string(),
+                ),
+                ("max_request_partitions".to_string(), "100".to_string()),
+            ])));
+
+            let app = AppBuilder::new("http_dynamic_headers_test")
+                .with_dataset(dataset)
+                .build();
+            let mut rt = load_runtime(app).await?;
+
+            let query = r#"
+                SELECT request_headers, content
+                FROM header_test
+                WHERE request_path = '/headers'
+                  AND request_headers IN (
+                    '{"x-org-id":"test-1"}',
+                    '{"x-org-id":"test-2","x-custom":"val"}'
+                  )
+                ORDER BY request_headers
+            "#;
+
+            run_query_and_check_results(
+                &mut rt,
+                "http_dynamic_request_headers",
+                query,
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let pretty = arrow::util::pretty::pretty_format_batches(&result_batches)
+                        .expect("failed to format batches");
+                    insta::assert_snapshot!("http_dynamic_request_headers_results", pretty);
+                })),
+            )
+            .await?;
+
+            // Test with 100 header values to verify parallel partition execution
+            let in_values: Vec<String> = (1..=100)
+                .map(|i| format!(r#"'{{"x-org-id":"org-{i:03}"}}'"#))
+                .collect();
+            let query_100 = format!(
+                r"SELECT count(*) as cnt
+                FROM header_test
+                WHERE request_path = '/headers'
+                  AND request_headers IN ({})
+                ",
+                in_values.join(", ")
+            );
+
+            run_query_and_check_results(
+                &mut rt,
+                "http_dynamic_request_headers_100",
+                &query_100,
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let rows = write_to_json_value(&result_batches)
+                        .expect("batches should serialize to JSON");
+                    assert_eq!(
+                        rows[0]["cnt"], 100,
+                        "expected 100 rows from 100 header partitions"
+                    );
+                })),
+            )
+            .await?;
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that `IN (SELECT ...)` subqueries against a real registered table
+/// trigger the `HttpParamsPushdown` optimizer rule (deferred params path).
+///
+///   1. A CSV file (`orgs`) with org IDs
+///   2. An HTTP dataset (`data_api`) with header filters
+///   3. A query that builds JSON headers from the CSV rows and uses
+///      `IN (SELECT ...)` to drive dynamic HTTP requests
+///
+/// `DataFusion` plans the subquery as a `HashJoinExec` (semi-join) over
+/// `HttpExec`, which the optimizer rewrites into `HttpWithDeferredParamsExec`.
+#[tokio::test]
+async fn test_http_dynamic_request_headers_from_subquery() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+            tracing::debug!("HTTP test server started at {addr}");
+
+            // 1. Register both datasets: the S3 CSV lookup table and the HTTP API.
+            let orgs_dataset = Dataset::new("s3://spiceai-public-datasets/orgs.csv", "orgs");
+
+            let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "data_api");
+            http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                ("allowed_request_paths".to_string(), "/headers".to_string()),
+                (
+                    "http_headers".to_string(),
+                    "x-static-header: static-value".to_string(),
+                ),
+                ("request_header_filters".to_string(), "enabled".to_string()),
+                (
+                    "request_header_allowlist".to_string(),
+                    "x-org-id".to_string(),
+                ),
+                ("max_request_partitions".to_string(), "100".to_string()),
+            ])));
+
+            let app = AppBuilder::new("http_dynamic_headers_subquery_test")
+                .with_dataset(orgs_dataset)
+                .with_dataset(http_dataset)
+                .build();
+            let mut rt = load_runtime(app).await?;
+
+            // 2. Build header JSON from CSV rows, use IN (SELECT ...) to drive dynamic HTTP requests
+            let query = r#"
+                WITH org_headers AS (
+                    SELECT '{"x-org-id":"' || org_id || '"}' AS hdr
+                    FROM orgs
+                )
+                SELECT request_headers, content
+                FROM data_api
+                WHERE request_path = '/headers'
+                  AND request_headers IN (SELECT hdr FROM org_headers)
+                ORDER BY request_headers
+            "#;
+
+            run_query_and_check_results(
+                &mut rt,
+                "http_dynamic_request_headers_from_subquery",
+                query,
+                true,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let pretty = arrow::util::pretty::pretty_format_batches(&result_batches)
+                        .expect("failed to format batches");
+                    insta::assert_snapshot!(
+                        "http_dynamic_request_headers_from_subquery_results",
+                        pretty
+                    );
+                })),
+            )
+            .await?;
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that an **accelerated view** whose SQL uses `IN (SELECT ...)`
+/// against a real registered table triggers the `HttpParamsPushdown`
+/// optimizer rule during the refresh/acceleration path.
+///
+/// ```yaml
+/// views:
+///   - name: org_headers_view
+///     sql: |
+///       WITH org_headers AS (
+///         SELECT '{"x-org-id":"' || org_id || '"}' AS hdr FROM orgs
+///       )
+///       SELECT request_headers, content FROM data_api
+///       WHERE request_path = '/headers'
+///         AND request_headers IN (SELECT hdr FROM org_headers)
+///     acceleration:
+///       enabled: true
+///       refresh_mode: full
+/// ```
+#[tokio::test]
+async fn test_http_dynamic_request_headers_accelerated_view() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+            tracing::debug!("HTTP test server started at {addr}");
+
+            // 1. Register datasets: S3 CSV lookup table and HTTP API.
+            let orgs_dataset = Dataset::new("s3://spiceai-public-datasets/orgs.csv", "orgs");
+
+            let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "data_api");
+            http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                ("allowed_request_paths".to_string(), "/headers".to_string()),
+                (
+                    "http_headers".to_string(),
+                    "x-static-header: static-value".to_string(),
+                ),
+                ("request_header_filters".to_string(), "enabled".to_string()),
+                (
+                    "request_header_allowlist".to_string(),
+                    "x-org-id".to_string(),
+                ),
+                ("max_request_partitions".to_string(), "100".to_string()),
+            ])));
+
+            // 2. Create an accelerated view with IN (SELECT ...) subquery SQL.
+            let mut view = View::new("org_headers_view".to_string());
+            view.sql = Some(
+                r#"
+                WITH org_headers AS (
+                    SELECT '{"x-org-id":"' || org_id || '"}' AS hdr
+                    FROM orgs
+                )
+                SELECT request_headers, content
+                FROM data_api
+                WHERE request_path = '/headers'
+                  AND request_headers IN (SELECT hdr FROM org_headers)
+                "#
+                .to_string(),
+            );
+            view.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Full),
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("http_dynamic_headers_accel_view_test")
+                .with_dataset(orgs_dataset)
+                .with_dataset(http_dataset)
+                .with_view(view)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let cloned_rt = Arc::clone(&rt);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            // 4. Query the accelerated view — data was materialized during refresh.
+            let query =
+                "SELECT request_headers, content FROM org_headers_view ORDER BY request_headers";
+
+            let result_batches: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("collecting results failed: {e}"))?;
+
+            let pretty = arrow::util::pretty::pretty_format_batches(&result_batches)
+                .map_err(|e| format!("format failed: {e}"))?;
+
+            insta::with_settings!({
+                description => "Accelerated view with IN (SELECT ...) subquery over HTTP dataset",
+                omit_expression => true,
+            }, {
+                insta::assert_snapshot!(
+                    "http_dynamic_request_headers_accelerated_view_results",
+                    pretty,
+                );
+            });
+
+            rt.shutdown().await;
 
             tx.send(())
                 .map_err(|()| "Failed to send shutdown signal".to_string())?;
@@ -1056,6 +1416,98 @@ async fn test_http_oauth2_rejects_partial_configuration() -> Result<(), String> 
                 query_result.is_err(),
                 "partial OAuth2 auth config should prevent the dataset from serving queries"
             );
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Tests `IN (SELECT ...)` subqueries with **pagination** against a real registered table
+///
+///   1. A CSV file (`orgs`) with org IDs
+///   2. An HTTP dataset (`paginated_api`) with header filters and token-based pagination
+///   3. A query that builds JSON headers from the CSV rows and uses
+///      `IN (SELECT ...)` to drive dynamic HTTP requests across multiple pages
+#[tokio::test]
+async fn test_http_dynamic_request_headers_from_subquery_with_pagination() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+            tracing::debug!("HTTP test server started at {addr}");
+
+            // 1. Register both datasets: the S3 CSV lookup table and the paginated HTTP API.
+            let orgs_dataset = Dataset::new("s3://spiceai-public-datasets/orgs.csv", "orgs");
+
+            let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "paginated_api");
+            http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                (
+                    "allowed_request_paths".to_string(),
+                    "/metrics-paginated".to_string(),
+                ),
+                ("request_header_filters".to_string(), "enabled".to_string()),
+                (
+                    "request_header_allowlist".to_string(),
+                    "x-org-id".to_string(),
+                ),
+                ("max_request_partitions".to_string(), "100".to_string()),
+                // Token-based pagination config
+                ("pagination".to_string(), "enabled".to_string()),
+                (
+                    "pagination_next_pointer".to_string(),
+                    "/next_cursor".to_string(),
+                ),
+                ("pagination_token_param".to_string(), "cursor".to_string()),
+                ("pagination_data_pointer".to_string(), "/data".to_string()),
+                ("pagination_max_pages".to_string(), "10".to_string()),
+            ])));
+
+            let app = AppBuilder::new("http_dynamic_headers_subquery_paginated_test")
+                .with_dataset(orgs_dataset)
+                .with_dataset(http_dataset)
+                .build();
+            let mut rt = load_runtime(app).await?;
+
+            // 2. Build header JSON from CSV rows, use IN (SELECT ...) to drive
+            //    dynamic paginated HTTP requests.
+            let query = r#"
+                WITH org_headers AS (
+                    SELECT '{"x-org-id":"' || org_id || '"}' AS hdr
+                    FROM orgs
+                )
+                SELECT
+                    request_headers,
+                    json_get_str(content, 'metric') AS metric,
+                    json_get_float(content, 'reading') AS reading
+                FROM paginated_api
+                WHERE request_path = '/metrics-paginated'
+                  AND request_headers IN (SELECT hdr FROM org_headers)
+                ORDER BY request_headers, metric
+            "#;
+
+            run_query_and_check_results(
+                &mut rt,
+                "http_dynamic_request_headers_from_subquery_paginated",
+                query,
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    // Each org should get 5 metrics (3 pages: 2+2+1).
+                    let total_rows: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert!(total_rows > 0, "expected paginated results but got 0 rows");
+                    let pretty = arrow::util::pretty::pretty_format_batches(&result_batches)
+                        .expect("failed to format batches");
+                    insta::assert_snapshot!(
+                        "http_dynamic_request_headers_from_subquery_paginated_results",
+                        pretty
+                    );
+                })),
+            )
+            .await?;
 
             tx.send(())
                 .map_err(|()| "Failed to send shutdown signal".to_string())?;

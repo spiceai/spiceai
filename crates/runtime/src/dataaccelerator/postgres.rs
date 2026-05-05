@@ -70,7 +70,7 @@ impl PostgresAccelerator {
     pub fn new() -> Self {
         Self {
             postgres_factory: PostgresTableProviderFactory::new()
-                .with_function_support(deny_spice_specific_functions().clone()),
+                .with_function_support(deny_spice_specific_functions().as_ref().clone()),
         }
     }
 }
