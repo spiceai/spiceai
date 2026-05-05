@@ -397,12 +397,12 @@ impl ElasticsearchTextIndex {
         let projections: Vec<_> = raw_schema
             .fields()
             .iter()
-            .filter(|f| !matches!(
-                f.data_type(),
-                DataType::FixedSizeList(_, _)
-                    | DataType::LargeList(_)
-                    | DataType::List(_)
-            ))
+            .filter(|f| {
+                !matches!(
+                    f.data_type(),
+                    DataType::FixedSizeList(_, _) | DataType::LargeList(_) | DataType::List(_)
+                )
+            })
             .map(|f| col(f.name()))
             .collect();
 

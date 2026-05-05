@@ -145,12 +145,14 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     let normalized_fields: Vec<Arc<arrow_schema::Field>> = raw_schema
         .fields()
         .iter()
-        .filter(|f| !matches!(
-            f.data_type(),
-            arrow::datatypes::DataType::FixedSizeList(_, _)
-                | arrow::datatypes::DataType::LargeList(_)
-                | arrow::datatypes::DataType::List(_)
-        ))
+        .filter(|f| {
+            !matches!(
+                f.data_type(),
+                arrow::datatypes::DataType::FixedSizeList(_, _)
+                    | arrow::datatypes::DataType::LargeList(_)
+                    | arrow::datatypes::DataType::List(_)
+            )
+        })
         .map(|f| {
             let normalized = normalize_es_data_type(f.data_type());
             Arc::new(Field::new(f.name(), normalized, true))
