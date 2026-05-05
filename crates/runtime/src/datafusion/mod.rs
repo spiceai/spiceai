@@ -2010,11 +2010,35 @@ impl DataFusion {
             &dataset.name.to_string(),
         )?;
 
+        // For caching mode, the underlying accelerator storage is augmented
+        // with a hidden `__spice_cache_namespace` column so cached rows can be
+        // scoped per-principal. The user-facing schema (and therefore query
+        // planning, projection indices, and federation) continues to see only
+        // the original columns. This is a breaking change: existing caching
+        // accelerator storage from earlier Spice versions does not have the
+        // column and must be deleted (e.g. remove the duckdb_file or drop the
+        // SQLite/Postgres/Cayenne backing table) before upgrading.
+        let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
+            Arc::new(
+                crate::accelerated_table::caching::extend_schema_with_cache_namespace(
+                    &dataset.name.to_string(),
+                    &refresh_schema,
+                )
+                .map_err(|source| Error::UnableToCreateDataAccelerator {
+                    source: crate::dataaccelerator::Error::InvalidConfiguration {
+                        msg: source.to_string(),
+                    },
+                })?,
+            )
+        } else {
+            Arc::clone(&refresh_schema)
+        };
+
         let accelerated_table_provider = self
             .accelerator_engine_registry
             .create_accelerator_table(
                 dataset.name.clone(),
-                Arc::clone(&refresh_schema),
+                Arc::clone(&storage_schema),
                 constraints.as_ref(),
                 &acceleration_settings,
                 Arc::clone(&secrets),
@@ -2158,6 +2182,11 @@ impl DataFusion {
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        if matches!(refresh_mode, RefreshMode::Caching) {
+            // Hide the storage-only namespace column from query planning. Users
+            // see the same columns they would have seen pre-isolation.
+            accelerated_table_builder.user_facing_schema(Arc::clone(&refresh_schema));
+        }
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {

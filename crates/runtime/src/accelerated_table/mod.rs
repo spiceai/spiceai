@@ -269,6 +269,11 @@ pub struct AcceleratedTable {
     /// Sender for batched cache writes. Only used in caching refresh mode.
     batch_write_tx: Option<caching::CacheWriteSender>,
     cluster_role: Option<ClusterRole>,
+    /// Schema exposed to user-facing query planning when it differs from the
+    /// underlying accelerator's storage schema. Currently set only in caching
+    /// mode, where the storage schema is augmented with a hidden
+    /// [`caching::CACHE_NAMESPACE_COLUMN`] for per-principal isolation.
+    user_facing_schema: Option<SchemaRef>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -353,6 +358,7 @@ pub struct Builder {
     is_s3_express_acceleration: bool,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
+    user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
 }
 
@@ -402,7 +408,16 @@ impl Builder {
             is_s3_express_acceleration: false,
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
+            user_facing_schema: None,
         }
+    }
+
+    /// Override the schema reported by the resulting [`AcceleratedTable`] to
+    /// query planners. Used by caching mode to hide the internal namespace
+    /// storage column from users.
+    pub fn user_facing_schema(&mut self, schema: SchemaRef) -> &mut Self {
+        self.user_facing_schema = Some(schema);
+        self
     }
 
     pub fn cluster_role(&mut self, role: Option<ClusterRole>) -> &mut Self {
@@ -1042,6 +1057,7 @@ impl Builder {
             last_updated_at,
             batch_write_tx,
             cluster_role: self.cluster_role,
+            user_facing_schema: self.user_facing_schema,
         })
     }
 }
@@ -1266,6 +1282,9 @@ impl TableProvider for AcceleratedTable {
     }
 
     fn schema(&self) -> SchemaRef {
+        if let Some(s) = self.user_facing_schema.as_ref() {
+            return Arc::clone(s);
+        }
         self.accelerator.schema()
     }
 
