@@ -1061,11 +1061,49 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
 
     let column_order: Vec<String> = dataset.columns.iter().map(|col| col.name.clone()).collect();
 
+    // Reject the catch-all column itself being named after a reserved
+    // HTTP metadata field — it would be ambiguous whether the column
+    // should hold the JSON catch-all or the metadata value.
+    if HTTP_METADATA_FIELDS.contains(&json_column.name.as_str()) {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "Column '{}' is marked as the JSON catch-all (json_object: \"*\") but its name is reserved for HTTP metadata. Rename the column.",
+                json_column.name
+            ),
+        });
+    }
+
+    let metadata_fields: std::collections::HashSet<String> = column_order
+        .iter()
+        .filter(|name| HTTP_METADATA_FIELDS.contains(&name.as_str()))
+        .cloned()
+        .collect();
+
     Ok(Some(HttpJsonNesting::new(
         column_order,
         json_column.name.clone(),
+        metadata_fields,
     )))
 }
+
+/// Names of columns in [`HttpTableProvider::base_table_schema`].
+/// When schema decomposition is enabled, declared columns whose names
+/// match one of these are sourced from HTTP request/response metadata
+/// instead of being decomposed from the JSON body.
+///
+/// [`HttpTableProvider::base_table_schema`]: data_components::http::provider::HttpTableProvider::base_table_schema
+const HTTP_METADATA_FIELDS: &[&str] = &[
+    "request_path",
+    "request_query",
+    "request_body",
+    "request_headers",
+    "content",
+    "response_status",
+    "response_headers",
+    "fetched_at",
+];
 
 #[async_trait]
 impl DataConnector for Https {
@@ -2184,6 +2222,56 @@ mod tests {
                 assert!(
                     message.contains("invalid 'json_object' value"),
                     "expected invalid-value error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_classifies_metadata_columns() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("request_path"),
+            Column::new("response_status"),
+            Column::new("id"),
+            column_with_marker("data", Value::String("*".to_string())),
+        ];
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+        assert_eq!(nesting.json_field_name, "data");
+        assert_eq!(
+            nesting.column_order,
+            vec!["request_path", "response_status", "id", "data"]
+        );
+        assert!(nesting.metadata_fields.contains("request_path"));
+        assert!(nesting.metadata_fields.contains("response_status"));
+        assert!(
+            !nesting.metadata_fields.contains("id"),
+            "non-reserved column must not be classified as metadata"
+        );
+        // Reserved-name columns must not also be treated as static body
+        // fields, otherwise the body would shadow the HTTP metadata.
+        assert!(!nesting.static_fields.contains("request_path"));
+        assert!(!nesting.static_fields.contains("response_status"));
+        assert!(nesting.static_fields.contains("id"));
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_rejects_catchall_named_after_metadata() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            column_with_marker("response_status", Value::String("*".to_string())),
+        ];
+        let error = parse_http_json_nesting(&dataset)
+            .expect_err("reserved-name catch-all should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("reserved for HTTP metadata"),
+                    "expected reserved-name error, got: {message}"
                 );
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),

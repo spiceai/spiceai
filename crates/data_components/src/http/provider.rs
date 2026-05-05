@@ -504,15 +504,36 @@ impl HttpTableProvider {
     }
 
     /// Configure JSON schema decomposition. Replaces the provider's
-    /// schema with one built from the user-declared columns (all
-    /// `Utf8`, nullable). Each scanned JSON response row is decomposed
-    /// at query time via [`decompose_json_row`].
+    /// schema with one built from the user-declared columns. Body-derived
+    /// columns are typed as `Utf8` (nullable); columns declared with
+    /// names matching [`Self::base_table_schema`] fields are passed
+    /// through with their original type so queries can reference HTTP
+    /// metadata (e.g. filter on `request_path` for direct fetches).
+    /// Each scanned JSON response row is decomposed at query time via
+    /// [`decompose_json_row`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `nesting.metadata_fields` contains a name that is not
+    /// a column in [`Self::base_table_schema`]. Callers (notably
+    /// `parse_http_json_nesting` in the HTTPS data connector) are
+    /// responsible for validating this invariant.
     #[must_use]
     pub fn with_json_nesting(mut self, nesting: HttpJsonNesting) -> Self {
+        let base = Self::base_table_schema();
         let fields: Vec<Field> = nesting
             .column_order
             .iter()
-            .map(|name| Field::new(name, DataType::Utf8, true))
+            .map(|name| {
+                if nesting.metadata_fields.contains(name) {
+                    match base.field_with_name(name) {
+                        Ok(f) => f.clone(),
+                        Err(_) => Field::new(name, DataType::Utf8, true),
+                    }
+                } else {
+                    Field::new(name, DataType::Utf8, true)
+                }
+            })
             .collect();
         self.schema = Arc::new(Schema::new(fields));
         self.json_nesting = Some(nesting);
@@ -1693,7 +1714,15 @@ impl HttpExec {
         }
 
         if let Some(nesting) = &self.provider.json_nesting {
-            return self.create_batch_from_rows_nested(content_rows, nesting);
+            return self.create_batch_from_rows_nested(
+                path,
+                query,
+                body,
+                request_headers,
+                content_rows,
+                fetch_result,
+                nesting,
+            );
         }
 
         // Store the actual values from the partition for the primary key
@@ -1710,80 +1739,24 @@ impl HttpExec {
         );
 
         // Use response Date header if available, otherwise use current time
-        let timestamp_nanos = if let Some(date) = fetch_result.response_date {
-            i64::try_from(
-                date.duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| DataFusionError::Execution(format!("Invalid response date: {e}")))?
-                    .as_nanos(),
-            )
-            .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))?
-        } else {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to get current time: {e}"))
-                })?;
-            i64::try_from(now.as_nanos())
-                .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))?
-        };
+        let timestamp_nanos = Self::compute_fetched_at_nanos(fetch_result)?;
 
         let columns = self
             .projected_schema
             .fields()
             .iter()
-            .map(|field| match field.name().as_str() {
-                "request_path" => {
-                    Ok(Arc::new(StringArray::from(vec![path_for_batch; num_rows])) as ArrayRef)
-                }
-                "request_query" => {
-                    Ok(Arc::new(StringArray::from(vec![query_for_batch; num_rows])) as ArrayRef)
-                }
-                "request_body" => {
-                    Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
-                }
-                "request_headers" => {
-                    Ok(Arc::new(StringArray::from(vec![headers_for_batch; num_rows])) as ArrayRef)
-                }
-                "content" => Ok(Arc::new(StringArray::from_iter_values(
-                    content_rows.iter().map(String::as_str),
-                )) as ArrayRef),
-                "response_status" => Ok(Arc::new(UInt16Array::from(vec![
-                    fetch_result
-                        .response_status;
-                    num_rows
-                ])) as ArrayRef),
-                "response_headers" => {
-                    let mut builder = MapBuilder::new(
-                        Some(MapFieldNames {
-                            entry: "entries".to_string(),
-                            key: "keys".to_string(),
-                            value: "values".to_string(),
-                        }),
-                        StringBuilder::new(),
-                        StringBuilder::new(),
-                    );
-                    for _ in 0..num_rows {
-                        for (k, v) in &fetch_result.response_headers {
-                            builder.keys().append_value(k);
-                            builder.values().append_value(v);
-                        }
-                        builder
-                            .append(true)
-                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                    }
-                    Ok(Arc::new(builder.finish()) as ArrayRef)
-                }
-                "fetched_at" => {
-                    use arrow::array::TimestampNanosecondArray;
-                    Ok(Arc::new(TimestampNanosecondArray::from(vec![
-                        timestamp_nanos;
-                        num_rows
-                    ])) as ArrayRef)
-                }
-                _ => Err(DataFusionError::Execution(format!(
-                    "Unsupported field name: {}",
-                    field.name()
-                ))),
+            .map(|field| {
+                Self::build_metadata_array(
+                    field.name().as_str(),
+                    path_for_batch,
+                    query_for_batch,
+                    body_for_batch,
+                    headers_for_batch,
+                    content_rows,
+                    fetch_result,
+                    timestamp_nanos,
+                    num_rows,
+                )
             })
             .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
 
@@ -1792,26 +1765,146 @@ impl HttpExec {
         Ok(batch)
     }
 
+    /// Build a single Arrow array for one of the HTTP connector's
+    /// built-in metadata columns. Used by both the default scan path
+    /// and the JSON-decomposition path so that metadata columns behave
+    /// identically in both modes.
+    #[expect(clippy::too_many_arguments)]
+    fn build_metadata_array(
+        name: &str,
+        path_for_batch: &str,
+        query_for_batch: &str,
+        body_for_batch: &str,
+        headers_for_batch: &str,
+        content_rows: &[String],
+        fetch_result: &HttpFetchResult,
+        timestamp_nanos: i64,
+        num_rows: usize,
+    ) -> DataFusionResult<ArrayRef> {
+        match name {
+            "request_path" => {
+                Ok(Arc::new(StringArray::from(vec![path_for_batch; num_rows])) as ArrayRef)
+            }
+            "request_query" => {
+                Ok(Arc::new(StringArray::from(vec![query_for_batch; num_rows])) as ArrayRef)
+            }
+            "request_body" => {
+                Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
+            }
+            "request_headers" => {
+                Ok(Arc::new(StringArray::from(vec![headers_for_batch; num_rows])) as ArrayRef)
+            }
+            "content" => Ok(Arc::new(StringArray::from_iter_values(
+                content_rows.iter().map(String::as_str),
+            )) as ArrayRef),
+            "response_status" => Ok(Arc::new(UInt16Array::from(vec![
+                fetch_result.response_status;
+                num_rows
+            ])) as ArrayRef),
+            "response_headers" => {
+                let mut builder = MapBuilder::new(
+                    Some(MapFieldNames {
+                        entry: "entries".to_string(),
+                        key: "keys".to_string(),
+                        value: "values".to_string(),
+                    }),
+                    StringBuilder::new(),
+                    StringBuilder::new(),
+                );
+                for _ in 0..num_rows {
+                    for (k, v) in &fetch_result.response_headers {
+                        builder.keys().append_value(k);
+                        builder.values().append_value(v);
+                    }
+                    builder
+                        .append(true)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
+            "fetched_at" => {
+                use arrow::array::TimestampNanosecondArray;
+                Ok(Arc::new(TimestampNanosecondArray::from(vec![
+                    timestamp_nanos;
+                    num_rows
+                ])) as ArrayRef)
+            }
+            other => Err(DataFusionError::Execution(format!(
+                "Unsupported field name: {other}"
+            ))),
+        }
+    }
+
+    /// Compute the per-batch `fetched_at` timestamp in nanoseconds since
+    /// the Unix epoch, preferring the response `Date` header and falling
+    /// back to the current system time.
+    fn compute_fetched_at_nanos(fetch_result: &HttpFetchResult) -> DataFusionResult<i64> {
+        if let Some(date) = fetch_result.response_date {
+            i64::try_from(
+                date.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| DataFusionError::Execution(format!("Invalid response date: {e}")))?
+                    .as_nanos(),
+            )
+            .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to get current time: {e}"))
+                })?;
+            i64::try_from(now.as_nanos())
+                .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))
+        }
+    }
+
     /// Create a `RecordBatch` for the user-declared columns by
     /// decomposing each JSON response row according to the nesting
-    /// configuration. All output columns are `Utf8`.
+    /// configuration. Body-derived columns are produced as `Utf8` from
+    /// the decomposed JSON; columns whose names match HTTP metadata
+    /// fields (see [`HttpJsonNesting::metadata_fields`]) are populated
+    /// from the request/response metadata via [`Self::build_metadata_array`]
+    /// with their original types.
     ///
     /// Fast path: when the catch-all column is not in the projected
     /// schema we skip building the catch-all `BTreeMap` and re-
     /// serializing it, which is the dominant cost for wide JSON rows.
     /// Non-object rows still fall through to `decompose_json_row` so
     /// static columns become NULL and no data is dropped.
+    #[expect(clippy::too_many_arguments)]
     fn create_batch_from_rows_nested(
         &self,
+        path: Option<&str>,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
         content_rows: &[String],
+        fetch_result: &HttpFetchResult,
         nesting: &HttpJsonNesting,
     ) -> DataFusionResult<RecordBatch> {
         let fields = self.projected_schema.fields();
-        let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
-        let catchall_projected = field_names.contains(&nesting.json_field_name.as_str());
+        let num_rows = content_rows.len();
 
-        let mut builders: Vec<StringBuilder> = std::iter::repeat_with(StringBuilder::new)
-            .take(fields.len())
+        // Per-batch values for metadata columns. Computed lazily-ish:
+        // cheap enough to always derive, and only used when at least
+        // one metadata column is projected.
+        let path_for_batch = path.unwrap_or("");
+        let query_for_batch = query.unwrap_or("");
+        let body_for_batch = body.unwrap_or("");
+        let headers_for_batch = request_headers.unwrap_or("");
+        let timestamp_nanos = Self::compute_fetched_at_nanos(fetch_result)?;
+
+        // Identify which projected fields are body-derived vs metadata.
+        let body_field_names: Vec<&str> = fields
+            .iter()
+            .filter(|f| !nesting.metadata_fields.contains(f.name()))
+            .map(|f| f.name().as_str())
+            .collect();
+        let catchall_projected = body_field_names.contains(&nesting.json_field_name.as_str());
+
+        // Build body-derived columns via string builders, in projected
+        // (not full-schema) order, restricted to non-metadata fields.
+        let mut body_builders: Vec<StringBuilder> = std::iter::repeat_with(StringBuilder::new)
+            .take(body_field_names.len())
             .collect();
 
         for row in content_rows {
@@ -1819,7 +1912,7 @@ impl HttpExec {
                 && let Ok(serde_json::Value::Object(obj)) =
                     serde_json::from_str::<serde_json::Value>(row)
             {
-                for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+                for (builder, name) in body_builders.iter_mut().zip(body_field_names.iter()) {
                     match obj.get(*name) {
                         None | Some(serde_json::Value::Null) => builder.append_null(),
                         Some(serde_json::Value::String(s)) => builder.append_value(s),
@@ -1832,7 +1925,7 @@ impl HttpExec {
             let decomposed = decompose_json_row(row, nesting).map_err(|source| {
                 DataFusionError::External(Box::new(Error::JsonNesting { source }))
             })?;
-            for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+            for (builder, name) in body_builders.iter_mut().zip(body_field_names.iter()) {
                 match decomposed.get(*name).and_then(|v| v.as_deref()) {
                     Some(v) => builder.append_value(v),
                     None => builder.append_null(),
@@ -1840,10 +1933,37 @@ impl HttpExec {
             }
         }
 
-        let columns: Vec<ArrayRef> = builders
+        let mut body_arrays: std::collections::VecDeque<ArrayRef> = body_builders
             .into_iter()
             .map(|mut b| Arc::new(b.finish()) as ArrayRef)
             .collect();
+
+        // Stitch together the final column list in projected-schema
+        // order, slotting metadata-built arrays where appropriate.
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+        for field in fields {
+            if nesting.metadata_fields.contains(field.name()) {
+                columns.push(Self::build_metadata_array(
+                    field.name().as_str(),
+                    path_for_batch,
+                    query_for_batch,
+                    body_for_batch,
+                    headers_for_batch,
+                    content_rows,
+                    fetch_result,
+                    timestamp_nanos,
+                    num_rows,
+                )?);
+            } else {
+                let array = body_arrays.pop_front().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "json-nested batch: body array count does not match non-metadata projected fields"
+                            .to_string(),
+                    )
+                })?;
+                columns.push(array);
+            }
+        }
 
         RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
             .map_err(DataFusionError::from)
@@ -6458,11 +6578,23 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             column_order.iter().map(|s| (*s).to_string()).collect(),
             json_field.to_string(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
         let schema = provider.schema();
         let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
         (exec, nesting)
+    }
+
+    fn empty_fetch_result() -> HttpFetchResult {
+        HttpFetchResult {
+            content: String::new(),
+            max_age: std::time::Duration::from_secs(0),
+            detected_format: "application/json".to_string(),
+            response_date: None,
+            response_status: 200,
+            response_headers: Vec::new(),
+        }
     }
 
     fn string_col(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
@@ -6494,7 +6626,15 @@ mod tests {
             r#"{"id":"2","name":"beta","k":42}"#.to_string(),
         ];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 3);
@@ -6516,7 +6656,15 @@ mod tests {
         let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
         let rows = vec![r#"{"id":"1"}"#.to_string()];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(string_col(&batch, "id"), vec![Some("1".to_string())]);
         assert_eq!(string_col(&batch, "name"), vec![None]);
@@ -6531,7 +6679,15 @@ mod tests {
             r#"{"name":"beta"}"#.to_string(),
         ];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
 
@@ -6554,7 +6710,15 @@ mod tests {
             "42".to_string(),
         ];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 3);
         for v in string_col(&batch, "id") {
@@ -6574,7 +6738,15 @@ mod tests {
         let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
         let rows = vec![r#"{"id":"1","name":"alpha"}"#.to_string()];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(string_col(&batch, "id")[0].as_deref(), Some("1"));
@@ -6592,6 +6764,7 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             vec!["id".to_string(), "name".to_string(), "details".to_string()],
             "details".to_string(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
         // Project only static columns, not "details".
@@ -6607,7 +6780,15 @@ mod tests {
         let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
         let rows = vec![r#"{"id":"42","name":"fast","extra":"ignored"}"#.to_string()];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("fast-path batch should be created");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 2);
@@ -6623,6 +6804,7 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
         let full_schema = provider.schema();
@@ -6632,7 +6814,15 @@ mod tests {
         let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
         let rows = vec!["[1,2,3]".to_string(), r#"{"id":"x"}"#.to_string()];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 1);
@@ -6646,6 +6836,7 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
         let full_schema = provider.schema();
@@ -6662,10 +6853,127 @@ mod tests {
             r#"{"id":"2"}"#.to_string(),
         ];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_passes_through_metadata_columns() {
+        // Mix decomposed body columns with HTTP metadata columns. The
+        // metadata columns should keep their base-schema types and be
+        // populated from the per-batch HTTP request/response values,
+        // not from the JSON body.
+        let nesting = HttpJsonNesting::new(
+            vec![
+                "request_path".to_string(),
+                "response_status".to_string(),
+                "id".to_string(),
+                "details".to_string(),
+            ],
+            "details".to_string(),
+            ["request_path".to_string(), "response_status".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let schema = provider.schema();
+
+        // Schema should keep base-table types for metadata columns.
+        assert_eq!(
+            schema
+                .field_with_name("request_path")
+                .expect("request_path field")
+                .data_type(),
+            &arrow::datatypes::DataType::Utf8
+        );
+        assert_eq!(
+            schema
+                .field_with_name("response_status")
+                .expect("response_status field")
+                .data_type(),
+            &arrow::datatypes::DataType::UInt16
+        );
+
+        let exec = HttpExec::new(
+            Arc::clone(&schema),
+            provider,
+            vec![(Some("/shows/1".to_string()), None, None, None)],
+            None,
+        );
+        let fetch_result = HttpFetchResult {
+            content: String::new(),
+            max_age: Duration::from_secs(0),
+            detected_format: "json".to_string(),
+            response_date: None,
+            response_status: 201,
+            response_headers: Vec::new(),
+        };
+        // Body has a key colliding with a metadata name; it must be
+        // ignored in favor of the actual HTTP value.
+        let rows = vec![
+            r#"{"id":"1","request_path":"/from-body","extra":"x"}"#.to_string(),
+            r#"{"id":"2"}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(
+                Some("/shows/1"),
+                None,
+                None,
+                None,
+                &rows,
+                &fetch_result,
+                &nesting,
+            )
+            .expect("batch should be created");
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 4);
+
+        // request_path: from HTTP metadata, repeated per row.
+        assert_eq!(
+            string_col(&batch, "request_path"),
+            vec![Some("/shows/1".to_string()), Some("/shows/1".to_string())]
+        );
+
+        // response_status: typed UInt16 from fetch_result.
+        let status = batch
+            .column(
+                batch
+                    .schema()
+                    .index_of("response_status")
+                    .expect("response_status column index"),
+            )
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("response_status should be UInt16");
+        assert_eq!(status.value(0), 201);
+        assert_eq!(status.value(1), 201);
+
+        // id: decomposed from body.
+        assert_eq!(
+            string_col(&batch, "id"),
+            vec![Some("1".to_string()), Some("2".to_string())]
+        );
+
+        // catch-all: must NOT contain `request_path` (it was a metadata
+        // collision), but must contain `extra` for row 0.
+        let details = string_col(&batch, "details");
+        let parsed: serde_json::Value =
+            serde_json::from_str(details[0].as_deref().expect("row 0 details"))
+                .expect("row 0 details parses as JSON");
+        assert!(parsed.get("request_path").is_none());
+        assert_eq!(parsed["extra"], "x");
+        assert!(details[1].is_none());
     }
 
     #[test]
