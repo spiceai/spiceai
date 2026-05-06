@@ -131,13 +131,12 @@ pub struct SearchResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HitsEnvelope {
     #[serde(default)]
-    pub total: HitsTotal,
+    pub total: Option<HitsTotal>,
     pub hits: Vec<Hit>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HitsTotal {
-    #[serde(default)]
     pub value: u64,
 }
 
@@ -587,15 +586,15 @@ impl Elasticsearch for Client {
     }
 
     async fn open_point_in_time(&self, index: &str, keep_alive: &str) -> Result<String> {
-        self.open_point_in_time(index, keep_alive).await
+        Client::open_point_in_time(self, index, keep_alive).await
     }
 
     async fn search_point_in_time(&self, body: &serde_json::Value) -> Result<SearchResponse> {
-        self.search_point_in_time(body).await
+        Client::search_point_in_time(self, body).await
     }
 
     async fn close_point_in_time(&self, pit_id: &str) -> Result<()> {
-        self.close_point_in_time(pit_id).await
+        Client::close_point_in_time(self, pit_id).await
     }
 
     async fn index_exists(&self, index: &str) -> Result<bool> {

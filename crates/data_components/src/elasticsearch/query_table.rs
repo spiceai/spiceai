@@ -273,6 +273,19 @@ impl ElasticsearchScanState {
     async fn fetch_next_point_in_time_batch(
         &mut self,
     ) -> Result<Option<RecordBatch>, DataFusionError> {
+        match self.fetch_next_point_in_time_batch_inner().await {
+            Ok(batch) => Ok(batch),
+            Err(err) => {
+                self.close_point_in_time_best_effort().await;
+                self.done = true;
+                Err(err)
+            }
+        }
+    }
+
+    async fn fetch_next_point_in_time_batch_inner(
+        &mut self,
+    ) -> Result<Option<RecordBatch>, DataFusionError> {
         let page_size = self.remaining.map_or(ELASTICSEARCH_PAGE_SIZE, |remaining| {
             remaining.min(ELASTICSEARCH_PAGE_SIZE)
         });
@@ -360,6 +373,10 @@ impl ElasticsearchScanState {
             .close_point_in_time(&pit_id)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    async fn close_point_in_time_best_effort(&mut self) {
+        let _ = self.close_point_in_time().await;
     }
 
     fn hits_to_projected_batch(
@@ -661,9 +678,9 @@ mod tests {
         SearchResponse {
             pit_id: pit_id.map(ToString::to_string),
             hits: HitsEnvelope {
-                total: HitsTotal {
+                total: Some(HitsTotal {
                     value: u64::try_from(hits.len()).expect("hit count should fit in u64"),
-                },
+                }),
                 hits,
             },
         }
@@ -820,6 +837,15 @@ mod tests {
         client: Arc<dyn Elasticsearch>,
         limit: Option<usize>,
     ) -> Vec<RecordBatch> {
+        try_collect_query_table(client, limit)
+            .await
+            .expect("scan should collect successfully")
+    }
+
+    async fn try_collect_query_table(
+        client: Arc<dyn Elasticsearch>,
+        limit: Option<usize>,
+    ) -> datafusion::error::Result<Vec<RecordBatch>> {
         let table = ElasticsearchQueryTable::new(client, "test-index".to_string(), title_schema());
         let ctx = SessionContext::new();
         let plan = table
@@ -827,9 +853,7 @@ mod tests {
             .await
             .expect("scan should create an execution plan");
 
-        collect(plan, ctx.task_ctx())
-            .await
-            .expect("scan should collect successfully")
+        collect(plan, ctx.task_ctx()).await
     }
 
     #[tokio::test]
@@ -886,6 +910,21 @@ mod tests {
             .expect("single search requests mutex should not be poisoned");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].size, Some(5));
+    }
+
+    #[tokio::test]
+    async fn query_table_scan_closes_point_in_time_on_error() {
+        let mock = Arc::new(MockElasticsearch::with_point_in_time_responses(Vec::new()));
+        let client: Arc<dyn Elasticsearch> = mock.clone();
+
+        let result = try_collect_query_table(client, None).await;
+        assert!(result.is_err(), "scan should fail when PIT search fails");
+
+        let closed = mock
+            .closed_point_in_times
+            .lock()
+            .expect("closed point-in-time mutex should not be poisoned");
+        assert_eq!(closed.as_slice(), ["pit-1"]);
     }
 
     // ── Timestamp ──────────────────────────────────────────────────────────────
