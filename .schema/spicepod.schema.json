@@ -6985,9 +6985,13 @@
           ]
         },
         "responses_api": {
-          "description": "Whether to enable use of this model via the Responses API. `disabled` by default.",
+          "description": "Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.",
           "type": "string",
-          "default": "disabled"
+          "default": "disabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
         },
         "openai_responses_tools": {
           "description": "The OpenAI Responses tools to use when calling the model from the Responses API",
@@ -7211,9 +7215,13 @@
           "default": ""
         },
         "responses_api": {
-          "description": "Whether to enable use of this model via the Responses API. `disabled` by default.",
+          "description": "Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.",
           "type": "string",
-          "default": "disabled"
+          "default": "disabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
         },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to use all available tools.",
