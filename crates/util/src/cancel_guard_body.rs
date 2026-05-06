@@ -73,7 +73,8 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
-        match this.inner.poll_frame(cx) {
+        let mut inner = this.inner;
+        match inner.as_mut().poll_frame(cx) {
             Poll::Ready(None) => {
                 // Normal end-of-stream: disarm the guard so cancellation does
                 // not fire when this wrapper is dropped.
@@ -81,6 +82,14 @@ where
                     guard.disarm();
                 }
                 Poll::Ready(None)
+            }
+            Poll::Ready(Some(frame)) => {
+                if inner.as_ref().get_ref().is_end_stream()
+                    && let Some(guard) = this.guard.take()
+                {
+                    guard.disarm();
+                }
+                Poll::Ready(Some(frame))
             }
             other => other,
         }
@@ -151,6 +160,36 @@ mod tests {
         }
     }
 
+    struct EndStreamAfterFinalFrameBody {
+        frame: Option<Frame<&'static [u8]>>,
+        end_stream: bool,
+    }
+
+    impl Body for EndStreamAfterFinalFrameBody {
+        type Data = &'static [u8];
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if let Some(frame) = self.frame.take() {
+                self.end_stream = true;
+                Poll::Ready(Some(Ok(frame)))
+            } else {
+                Poll::Ready(None)
+            }
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.end_stream
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::default()
+        }
+    }
+
     fn test_context() -> Context<'static> {
         Context::from_waker(noop_waker_ref())
     }
@@ -188,6 +227,28 @@ mod tests {
 
         let eos = guarded.as_mut().poll_frame(&mut cx);
         assert!(matches!(eos, Poll::Ready(None)));
+
+        drop(guarded);
+
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn does_not_cancel_when_dropped_after_final_frame_without_polling_eos() {
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+
+        let body = EndStreamAfterFinalFrameBody {
+            frame: Some(Frame::data(&b"chunk-1"[..])),
+            end_stream: false,
+        };
+        let mut guarded = Box::pin(CancelGuardBody::new(body, guard));
+        let mut cx = test_context();
+
+        let frame = guarded.as_mut().poll_frame(&mut cx);
+        assert!(matches!(frame, Poll::Ready(Some(Ok(_)))));
+        assert!(guarded.is_end_stream());
+        assert!(!token.is_cancelled());
 
         drop(guarded);
 
