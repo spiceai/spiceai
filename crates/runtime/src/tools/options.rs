@@ -183,9 +183,9 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let auto_tools =
-            SpiceToolsOptions::Specific(vec!["auto".to_string(), "my_other_tool".to_string()])
-                .tools_by_name();
+        let auto_opt =
+            SpiceToolsOptions::Specific(vec!["auto".to_string(), "my_other_tool".to_string()]);
+        let auto_tools = auto_opt.tools_by_name();
 
         assert!(!auto_tools.contains(&"random_sample"));
         assert!(!auto_tools.contains(&"sample_distinct_columns"));
