@@ -84,9 +84,9 @@ pub async fn start_mysql_docker_container(
 async fn wait_for_mysql_host_port(port: u16) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
     let mut last_error = None;
+    let pool = get_mysql_conn(port)?;
 
     while start_time.elapsed() <= MYSQL_HOST_PORT_READY_TIMEOUT {
-        let pool = get_mysql_conn(port)?;
         match pool.get_conn().await {
             Ok(mut conn) => match conn.query_drop("SELECT 1").await {
                 Ok(()) => {
@@ -106,10 +106,18 @@ async fn wait_for_mysql_host_port(port: u16) -> Result<(), anyhow::Error> {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
+    let last_error = last_error.unwrap_or_else(|| "none".to_string());
+    pool.disconnect().await.map_err(|error| {
+        anyhow::anyhow!(
+            "MySQL container started but host port {port} was not ready within {}s. Last error: {last_error}; failed to disconnect readiness pool: {error}",
+            MYSQL_HOST_PORT_READY_TIMEOUT.as_secs()
+        )
+    })?;
+
     Err(anyhow::anyhow!(
         "MySQL container started but host port {port} was not ready within {}s. Last error: {}",
         MYSQL_HOST_PORT_READY_TIMEOUT.as_secs(),
-        last_error.unwrap_or_else(|| "none".to_string())
+        last_error
     ))
 }
 

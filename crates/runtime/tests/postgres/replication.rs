@@ -38,7 +38,7 @@ use data_components::postgres_replication::{
 };
 use futures::StreamExt;
 use secrecy::SecretString;
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, error::SqlState};
 
 use crate::init_tracing;
 use crate::postgres::common;
@@ -289,10 +289,11 @@ async fn drop_replication_slot_when_inactive(
 
     while start_time.elapsed() <= timeout {
         match source
-            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .query("SELECT pg_drop_replication_slot($1)", &[&slot])
             .await
         {
             Ok(_) => return Ok(()),
+            Err(error) if error.code() == Some(&SqlState::UNDEFINED_OBJECT) => return Ok(()),
             Err(error) => last_error = Some(error.to_string()),
         }
 

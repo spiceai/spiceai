@@ -162,10 +162,38 @@ async fn wait_for_query_contents(
         sleep(Duration::from_millis(100)).await;
     }
 
+    let last_result = compact_message(&last_result, 500);
+    let last_error = last_error
+        .as_deref()
+        .map(|error| compact_message(error, 500))
+        .unwrap_or_else(|| "none".to_string());
+
     Err(anyhow::anyhow!(
         "Timed out waiting for query contents. Required: {required:?}; forbidden: {forbidden:?}; last result: {last_result}; last error: {}",
-        last_error.unwrap_or_else(|| "none".to_string())
+        last_error
     ))
+}
+
+fn compact_message(message: &str, max_chars: usize) -> String {
+    let mut compact = String::with_capacity(message.len().min(max_chars));
+    let mut chars = message.chars();
+
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return compact;
+        };
+
+        match ch {
+            '\n' | '\r' => compact.push(' '),
+            _ => compact.push(ch),
+        }
+    }
+
+    if chars.next().is_some() {
+        compact.push_str("...");
+    }
+
+    compact
 }
 
 async fn setup_runtime(table_name: &str, port: u16) -> Result<Runtime, anyhow::Error> {
