@@ -20,6 +20,7 @@ use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::datafusion::{DataFusion, query::QueryMethod};
@@ -38,6 +39,7 @@ pub struct QueryBuilder<'a> {
     parameters: Option<ParamValues>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
     query_id: Uuid,
+    cancellation_token: Option<CancellationToken>,
     read_only: bool,
 }
 
@@ -49,6 +51,7 @@ impl<'a> QueryBuilder<'a> {
             parameters: None,
             query_id: Uuid::new_v4(),
             table_allowlist: None,
+            cancellation_token: None,
             read_only: false,
         }
     }
@@ -69,6 +72,7 @@ impl<'a> QueryBuilder<'a> {
             query_id: Uuid::new_v4(),
             table_allowlist: None,
             read_only: false,
+            cancellation_token: None,
         }
     }
 
@@ -87,6 +91,18 @@ impl<'a> QueryBuilder<'a> {
     #[must_use]
     pub fn parameters(mut self, parameters: Option<ParamValues>) -> Self {
         self.parameters = parameters;
+        self
+    }
+
+    /// Supplies a cancellation token that this query will observe. When the
+    /// token is cancelled, any in-flight stream produced by this query yields
+    /// a cancellation error and terminates.
+    ///
+    /// If this is unset, the query attempts to observe the current
+    /// [`runtime_request_context::RequestContext`]'s cancellation token.
+    #[must_use]
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 
@@ -145,6 +161,8 @@ impl<'a> QueryBuilder<'a> {
             df: Arc::clone(&self.df),
             sql: query_method,
             tracker,
+            query_id: self.query_id,
+            cancellation_token: self.cancellation_token,
             read_only: self.read_only,
         }
     }

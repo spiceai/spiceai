@@ -619,7 +619,6 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let rt = Arc::new(rt);
-    rt.install_on_demand_loader();
 
     if needs_metrics {
         rt.init_cache_metrics();

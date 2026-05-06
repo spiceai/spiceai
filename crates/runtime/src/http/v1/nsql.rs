@@ -314,6 +314,13 @@ pub(crate) async fn handle_nsql_query(
     let df = get_current_datafusion(&context);
     let headers = HeaderMap::new();
 
+    // NSQL-scoped cancellation token (child of the request token). Used for
+    // both the LLM race and as the per-query cancellation token passed to
+    // `QueryBuilder`. This way `POST /v1/sql/{id}/cancel` against the
+    // NSQL-issued query reliably cancels NSQL end-to-end (the inner query
+    // registers this same token in the cancel registry).
+    let nsql_token = context.child_cancellation_token();
+
     let Request {
         query,
         model,
@@ -413,6 +420,18 @@ pub(crate) async fn handle_nsql_query(
     let mut num_retries = 0;
 
     loop {
+        // Cooperative cancellation: bail out between LLM/query iterations if
+        // the NSQL token was cancelled (request token cancel propagates to
+        // this child, and admin cancel via the inner query id cancels this
+        // token directly).
+        if nsql_token.is_cancelled() {
+            return (
+                StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
+                headers,
+                "NSQL request cancelled".to_string(),
+            );
+        }
+
         let Ok(mut req) = sql_gen.create_request_for_query(&model, &query, &sql_gen_ctx) else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -427,11 +446,26 @@ pub(crate) async fn handle_nsql_query(
             req.prompt_cache_key = Some(prompt_cache_key.clone());
         }
 
-        let resp = match nql_model.chat_request(req).instrument(span.clone()).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Error running NQL model: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+        // Race the LLM call against the NSQL cancellation token so that a
+        // long-running model inference does not pin the request after a
+        // cancel/disconnect. Dropping the chat_request future tears down the
+        // underlying client/network resources.
+        let chat_fut = nql_model.chat_request(req).instrument(span.clone());
+        let resp = tokio::select! {
+            biased;
+            () = nsql_token.cancelled() => {
+                return (
+                    StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
+                    headers,
+                    "NSQL request cancelled".to_string(),
+                );
+            }
+            res = chat_fut => match res {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Error running NQL model: {e}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+                }
             }
         };
 
@@ -453,8 +487,9 @@ pub(crate) async fn handle_nsql_query(
                 // PREPARE/EXECUTE/DEALLOCATE) regardless of per-catalog writability,
                 // which mitigates model-mediated SQL injection on `/v1/nsql`.
                 let query_result = {
-                    let mut builder =
-                        QueryBuilder::new(&cleaned_query, Arc::clone(&df)).read_only(true);
+                    let mut builder = QueryBuilder::new(&cleaned_query, Arc::clone(&df))
+                        .read_only(true)
+                        .cancellation_token(nsql_token.clone());
                     if let Some(ref allowlist) = table_allowlist_opt {
                         builder = builder.allow_tables(allowlist.clone());
                     }

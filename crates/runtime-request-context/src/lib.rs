@@ -18,6 +18,8 @@ pub mod baggage;
 pub use baggage::*;
 pub mod cache_control;
 pub use cache_control::*;
+pub mod cache_namespace;
+pub use cache_namespace::*;
 pub mod context;
 pub use context::*;
 pub mod protocol;

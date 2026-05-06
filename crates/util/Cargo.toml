@@ -17,14 +17,18 @@ chrono.workspace = true
 ctrlc = "3.5"
 datafusion = { workspace = true, optional = true }
 futures.workspace = true
+http-body = { version = "1.0.1", optional = true }
 humantime.workspace = true
 parking_lot.workspace = true
+pin-project = { workspace = true, optional = true }
 rand.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
+tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber.workspace = true
 
 [features]
 datafusion = ["dep:datafusion"]
 default = ["datafusion"]
+http = ["dep:http-body", "dep:pin-project", "dep:tokio-util"]

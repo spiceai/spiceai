@@ -37,10 +37,9 @@ use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
-use crate::component::dataset::Load;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::datafusion::DataFusion;
 use crate::datafusion::error::format_datafusion_error;
-use crate::datafusion::{DataFusion, OnDemandTableLoader};
 use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
@@ -545,11 +544,6 @@ pub struct Runtime {
     /// is configured — all authorization checks are skipped (current behavior).
     policy_engine: Option<Arc<runtime_policy::PolicyEngine>>,
 
-    /// Datasets configured with `load: on_demand` that have not been loaded yet.
-    on_demand_datasets: Arc<RwLock<HashMap<TableReference, Arc<component::dataset::Dataset>>>>,
-    /// Per-dataset locks to ensure concurrent triggers only load a dataset once.
-    on_demand_load_locks: Arc<Mutex<HashMap<TableReference, Arc<Mutex<()>>>>>,
-
     /// Shared semaphore that bounds concurrent dataset schema inference
     /// (`read_provider`) calls so that startup loads and on-demand loads both
     /// honor `runtime.dataset_load_parallelism`.
@@ -583,13 +577,6 @@ impl Runtime {
     #[must_use]
     pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
-    }
-
-    #[must_use]
-    pub fn on_demand_datasets(
-        &self,
-    ) -> Arc<RwLock<HashMap<TableReference, Arc<component::dataset::Dataset>>>> {
-        Arc::clone(&self.on_demand_datasets)
     }
 
     #[must_use]
@@ -1264,12 +1251,8 @@ impl Runtime {
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
         for ds in &valid_datasets {
-            let status = if ds.load == Load::OnDemand {
-                ComponentStatus::NotLoaded
-            } else {
-                ComponentStatus::Initializing
-            };
-            self.status.update_dataset(&ds.name, status);
+            self.status
+                .update_dataset(&ds.name, ComponentStatus::Initializing);
         }
 
         if cfg!(feature = "models") {
@@ -1317,25 +1300,11 @@ impl Runtime {
         }
     }
 
-    /// Install the on-demand table loader on the embedded `DataFusion` so that
-    /// query planning and the refresh endpoint can trigger loads of
-    /// `load: on_demand` datasets. Should be called immediately after the
-    /// `Runtime` is wrapped in an `Arc`, before any servers start accepting
-    /// requests.
-    pub fn install_on_demand_loader(self: &Arc<Self>) {
-        let loader: Arc<dyn OnDemandTableLoader> = Arc::<Runtime>::clone(self);
-        self.df.set_on_demand_table_loader(Arc::downgrade(&loader));
-    }
-
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     pub async fn load_components(self: Arc<Self>) {
-        // Idempotent: ensures the loader is installed even when callers (tests,
-        // embedders) skip the `install_on_demand_loader` step.
-        self.install_on_demand_loader();
-
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
@@ -1489,16 +1458,20 @@ impl Runtime {
 
         let start_time = Instant::now();
 
-        // shutdown all running components except the HTTP and Metrics servers
+        // Shutdown running components in phases so request-serving tasks drain
+        // before query execution resources are cleaned up.
         let mut runtime_tasks = self.tasks.write().await;
 
-        // HTTP and METRICS servers must be shutdown last
+        // Query-serving tasks, including HTTP and Flight, must drain before
+        // DataFusion cleanup so in-flight queries still have access to their
+        // execution resources during graceful shutdown. Metrics can stay up
+        // until the end for health and observability during shutdown.
         let mut first_shutdown_group = Vec::new();
         let mut last_shutdown_group = Vec::new();
 
         for (name, handle) in runtime_tasks.drain() {
             match name.as_str() {
-                HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
+                METRICS_SERVER => last_shutdown_group.push((name, handle)),
                 _ => first_shutdown_group.push((name, handle)),
             }
         }
@@ -1527,11 +1500,11 @@ impl Runtime {
         document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
-        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        // group includes only Metrics endpoints.
         let elapsed = start_time.elapsed();
         let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
-        // Shutdown HTTP & Metrics servers last
+        // Shutdown Metrics server last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
