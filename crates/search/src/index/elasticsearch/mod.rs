@@ -679,27 +679,63 @@ impl Index for ElasticsearchTextIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        // The FTS IndexedTableProvider lives on the federated/source side and is never
+        // seen by TableSink. The on_write_start/on_write_complete lifecycle hooks are
+        // therefore not called externally — we drive them here instead.
+        //
+        // NOTE: compute_index is called once *per batch* by IndexerExec (one stream
+        // element at a time) and by index_change_envelope (one CDC envelope at a time).
+        // on_write_start/on_write_complete are deliberately idempotent via AtomicBool so
+        // that the first batch in a write cycle opens the window and the last one closes
+        // it. This means bulk_load_refresh_interval, _refresh, and _forcemerge fire once
+        // per write cycle, not once per batch.
+        //
+        // TODO: the per-batch granularity means write_cycle_active resets after each
+        // batch, so on_write_complete actually fires after every batch rather than once
+        // at the true end of the full write. Fixing this requires the FTS
+        // IndexedTableProvider to be visible to TableSink (the same path used by the
+        // vector index), which is a larger architectural change.
+        self.write_maintenance
+            .on_write_start(self.client.as_ref(), &self.es_index)
+            .await?;
+
         let futs = batches
             .into_iter()
             .map(|rb| async move { self.write(rb).await.map_err(DataFusionError::External) });
-        try_join_all(futs).await
-    }
+        let result = try_join_all(futs).await;
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
-        self.write_maintenance
-            .on_write_start(self.client.as_ref(), &self.es_index)
-            .await
-    }
-
-    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
-        self.write_maintenance
-            .on_write_failed(self.client.as_ref(), &self.es_index)
-            .await
-    }
-
-    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
-        self.write_maintenance
-            .on_write_complete(self.client.as_ref(), &self.es_index)
-            .await
+        match result {
+            Ok(batches) => {
+                // Restores refresh_interval, calls _refresh and _forcemerge.
+                // Warn-only: a maintenance failure must not abort the stream mid-write,
+                // as subsequent batches still need to be indexed.
+                if let Err(e) = self
+                    .write_maintenance
+                    .on_write_complete(self.client.as_ref(), &self.es_index)
+                    .await
+                {
+                    tracing::warn!(
+                        index = %self.es_index,
+                        "Elasticsearch FTS on_write_complete failed: {e}. Index may not be fully optimized."
+                    );
+                }
+                Ok(batches)
+            }
+            Err(write_err) => {
+                // Best-effort: restore refresh_interval. Log but don't mask the original
+                // write error if maintenance cleanup itself fails.
+                if let Err(e) = self
+                    .write_maintenance
+                    .on_write_failed(self.client.as_ref(), &self.es_index)
+                    .await
+                {
+                    tracing::warn!(
+                        index = %self.es_index,
+                        "Elasticsearch FTS on_write_failed failed: {e}. Index refresh_interval may need manual cleanup."
+                    );
+                }
+                Err(write_err)
+            }
+        }
     }
 }
