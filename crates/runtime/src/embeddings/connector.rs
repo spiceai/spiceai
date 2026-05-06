@@ -21,6 +21,8 @@ use crate::component::dataset::Dataset;
 #[cfg(feature = "duckdb")]
 use crate::component::dataset::acceleration::Engine;
 use crate::component::metrics::MetricsProvider;
+#[cfg(feature = "duckdb")]
+use crate::component::view::View;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
@@ -511,6 +513,92 @@ fn duckdb_embedding_columns(dataset: &Dataset) -> Vec<(String, ColumnLevelEmbedd
     }
 
     embedding_columns
+}
+
+#[cfg(feature = "duckdb")]
+pub(crate) fn duckdb_vector_store_for_view(view: &View) -> Option<VectorStore> {
+    if let Some(vector_engine) = &view.vectors
+        && vector_engine.enabled
+        && vector_engine.engine.as_deref() == Some("duckdb")
+    {
+        return Some(vector_engine.clone());
+    }
+
+    if !view.has_embeddings()
+        || !view
+            .acceleration
+            .as_ref()
+            .is_some_and(|acceleration| acceleration.engine.to_unpartitioned() == Engine::DuckDB)
+    {
+        return None;
+    }
+
+    let acceleration = view.acceleration.as_ref()?;
+    crate::embeddings::index::duckdb::vector_store_from_embedding_params(&acceleration.params)
+}
+
+#[cfg(feature = "duckdb")]
+pub(crate) fn duckdb_embedding_columns_from_view(
+    view: &View,
+) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
+    let mut embedding_columns = Vec::new();
+
+    for column in &view.columns {
+        let Some(embedding) = column.embeddings.last() else {
+            continue;
+        };
+
+        if let Some((_, existing)) = embedding_columns
+            .iter_mut()
+            .find(|(column_name, _): &&mut (String, _)| column_name == &column.name)
+        {
+            *existing = embedding.clone();
+        } else {
+            embedding_columns.push((column.name.clone(), embedding.clone()));
+        }
+    }
+
+    embedding_columns
+}
+
+/// Wraps the accelerator in `builder` with `DuckDB` HNSW vector indexes if the view
+/// has both a `DuckDB` vector engine configured and at least one embedding column.
+/// Returns `true` if the accelerator was wrapped, `false` otherwise.
+#[cfg(feature = "duckdb")]
+pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
+    view: &View,
+    table: &datafusion::sql::TableReference,
+    builder: &mut crate::accelerated_table::Builder,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(vector_engine) = duckdb_vector_store_for_view(view) else {
+        return Ok(false);
+    };
+
+    let embedding_columns = duckdb_embedding_columns_from_view(view);
+    if embedding_columns.is_empty() {
+        return Ok(false);
+    }
+
+    tracing::debug!(
+        view = %table,
+        columns = ?embedding_columns.iter().map(|(col, _)| col.as_str()).collect::<Vec<_>>(),
+        "Wrapping view accelerator with DuckDB HNSW vector indexes"
+    );
+
+    let accelerator = builder.get_accelerator();
+    let indexed_accelerator =
+        crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
+            table,
+            embedding_columns,
+            &vector_engine,
+            accelerator,
+            view.runtime.embeds(),
+            view.runtime.secrets(),
+        )
+        .await?;
+    builder.set_accelerator(indexed_accelerator);
+
+    Ok(true)
 }
 
 fn underlying_federated_table_for_indexed_table(

@@ -364,6 +364,7 @@ pub struct HttpRateControlMetricsProvider {
     connector_name: &'static str,
     metrics: Arc<HttpRateControlMetrics>,
     metric_source: Option<HttpRateControlMetricSource>,
+    origin: Option<String>,
 }
 
 impl HttpRateControlMetricsProvider {
@@ -373,10 +374,14 @@ impl HttpRateControlMetricsProvider {
         metrics: Arc<HttpRateControlMetrics>,
         metric_source: Option<HttpRateControlMetricSource>,
     ) -> Self {
+        let origin = metric_source
+            .as_ref()
+            .map(|source| rate_control_key(&source.base_url));
         Self {
             connector_name,
             metrics,
             metric_source,
+            origin,
         }
     }
 }
@@ -401,6 +406,18 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
     ) -> Option<ObserveMetricCallback> {
         let metrics = Arc::clone(&self.metrics);
         let metric_source = self.metric_source.clone();
+
+        // Use `origin` (upstream URL) instead of `name` (dataset name) as the
+        // metric label. Multiple datasets sharing the same origin share one
+        // rate controller, and only one dataset emits metrics via `claim_owner`.
+        let mut attributes = attributes;
+        if let Some(origin) = &self.origin {
+            if let Some(pos) = attributes.iter().position(|kv| kv.key.as_str() == "name") {
+                attributes[pos] = KeyValue::new("origin", origin.clone());
+            } else {
+                attributes.push(KeyValue::new("origin", origin.clone()));
+            }
+        }
 
         macro_rules! observe_metric {
             ($value:expr) => {{
@@ -587,7 +604,7 @@ impl HttpRateControlRegistry {
                     upstream_origin = %key,
                     metrics_owner = existing_owner.as_str(),
                     skipped_dataset = owner,
-                    "HTTP rate-control metrics are shared per upstream origin and already emitted by another dataset. Skipping duplicate metric registration for this dataset."
+                    "HTTP rate-control metrics are shared per upstream origin. Metrics are emitted with origin={key} by dataset '{existing_owner}'. Skipping duplicate metric registration for dataset '{owner}'.",
                 );
             }
             existing_owner == owner

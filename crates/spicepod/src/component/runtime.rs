@@ -67,6 +67,9 @@ pub struct Runtime {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight: Option<Flight>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
+
     /// Configures how long the runtime waits for connections to be gracefully drained
     /// and components to shut down cleanly during runtime termination
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -396,6 +399,20 @@ impl Default for TelemetryConfig {
             otel_exporter: None,
         }
     }
+}
+
+/// Configuration for the MCP (Model Context Protocol) HTTP endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct McpConfig {
+    /// Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.
+    /// Used to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),
+    /// host-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).
+    /// Set to `["*"]` to disable host checking entirely.
+    /// Defaults to rmcp defaults (`["localhost", "127.0.0.1", "::1"]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -927,6 +944,8 @@ pub struct RuntimeDeserializer {
     pub cors: CorsConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight: Option<Flight>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
     /// Configures where the runtime will store temporary files needed for operations like
     /// spilling to disk for queries & accelerations that are larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1025,6 +1044,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             auth: deserializer.auth,
             cors: deserializer.cors,
             flight: deserializer.flight,
+            mcp: deserializer.mcp,
             shutdown_timeout: deserializer.shutdown_timeout,
             ready_state: deserializer.ready_state,
             output_level: deserializer.output_level,
@@ -1169,6 +1189,41 @@ mod tests {
         assert!(
             readwrite_debug.contains("ReadWrite"),
             "Debug output should indicate the variant type"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_with_allowed_hosts() {
+        let yaml = r"
+        mcp:
+          allowed_hosts:
+            - localhost
+            - example.com:8090
+            - https://example.com
+        ";
+        let parsed: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = parsed.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(
+            hosts,
+            vec![
+                "localhost".to_string(),
+                "example.com:8090".to_string(),
+                "https://example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_unknown_field_rejected() {
+        let yaml = r"
+        mcp:
+          unknown_field: value
+        ";
+        let result: Result<Runtime, _> = yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown fields in mcp section should be rejected due to deny_unknown_fields"
         );
     }
 
@@ -2173,5 +2228,68 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert!(runtime.functions.enabled);
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_bare_hostnames() {
+        // Bare hostnames (default-like usage).
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - localhost
+                - 127.0.0.1
+                - '::1'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(hosts, vec!["localhost", "127.0.0.1", "::1"]);
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_host_port_pairs() {
+        // host:port pair format.
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - 'example.com:8090'
+                - 'localhost:9000'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(hosts, vec!["example.com:8090", "localhost:9000"]);
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_full_origin_urls() {
+        // Full origin URL format.
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - 'https://example.com'
+                - 'http://app.internal:8080'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(
+            hosts,
+            vec!["https://example.com", "http://app.internal:8080"]
+        );
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_wildcard() {
+        // Wildcard disables host checking.
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - '*'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(hosts, vec!["*"]);
     }
 }
