@@ -133,6 +133,67 @@ async fn run_query(rt: &Runtime, query: &str) -> Result<String, anyhow::Error> {
     Ok(formatted.to_string())
 }
 
+async fn wait_for_query_contents(
+    rt: &Runtime,
+    query: &str,
+    required: &[&str],
+    forbidden: &[&str],
+) -> Result<String, anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let timeout = Duration::from_secs(30);
+    let mut last_result = String::new();
+    let mut last_error = None;
+
+    while start_time.elapsed() <= timeout {
+        match run_query(rt, query).await {
+            Ok(result) => {
+                let has_required = required.iter().all(|value| result.contains(value));
+                let has_no_forbidden = forbidden.iter().all(|value| !result.contains(value));
+
+                if has_required && has_no_forbidden {
+                    return Ok(result);
+                }
+
+                last_result = result;
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let last_result = compact_message(&last_result, 500);
+    let last_error = last_error
+        .as_deref()
+        .map_or_else(|| "none".to_string(), |error| compact_message(error, 500));
+
+    Err(anyhow::anyhow!(
+        "Timed out waiting for query contents. Required: {required:?}; forbidden: {forbidden:?}; last result: {last_result}; last error: {last_error}"
+    ))
+}
+
+fn compact_message(message: &str, max_chars: usize) -> String {
+    let mut compact = String::with_capacity(message.len().min(max_chars));
+    let mut chars = message.chars();
+
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return compact;
+        };
+
+        match ch {
+            '\n' | '\r' => compact.push(' '),
+            _ => compact.push(ch),
+        }
+    }
+
+    if chars.next().is_some() {
+        compact.push_str("...");
+    }
+
+    compact
+}
+
 async fn setup_runtime(table_name: &str, port: u16) -> Result<Runtime, anyhow::Error> {
     let mut dataset = make_dynamodb_dataset(table_name, port, "foo", "bar", false);
     dataset.access = AccessMode::ReadWrite;
@@ -200,8 +261,13 @@ async fn dynamodb_dml_insert() -> anyhow::Result<()> {
             .await?;
 
             // Verify the inserted rows are visible via DynamoDB scan
-            sleep(Duration::from_millis(500)).await;
-            let result = run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY id")).await?;
+            let result = wait_for_query_contents(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                &["Item 1", "Item 2", "seed"],
+                &[],
+            )
+            .await?;
             assert!(result.contains("Item 1"), "Should contain inserted Item 1");
             assert!(result.contains("Item 2"), "Should contain inserted Item 2");
             assert!(result.contains("seed"), "Should still contain seed row");
@@ -257,8 +323,13 @@ async fn dynamodb_dml_delete() -> anyhow::Result<()> {
             .await?;
 
             // Verify deletion
-            sleep(Duration::from_millis(500)).await;
-            let result = run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY id")).await?;
+            let result = wait_for_query_contents(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                &["Item 3", "Item 4"],
+                &["Item 1", "Item 2"],
+            )
+            .await?;
             assert!(!result.contains("Item 1"), "Item 1 should be deleted");
             assert!(!result.contains("Item 2"), "Item 2 should be deleted");
             assert!(result.contains("Item 3"), "Item 3 should remain");
@@ -310,9 +381,13 @@ async fn dynamodb_dml_insert_then_delete() -> anyhow::Result<()> {
             )
             .await?;
 
-            sleep(Duration::from_millis(500)).await;
-            let result =
-                run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY id")).await?;
+            let result = wait_for_query_contents(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                &["Alpha", "Beta", "Charlie", "Seed"],
+                &[],
+            )
+            .await?;
             assert!(result.contains("Alpha"));
             assert!(result.contains("Beta"));
             assert!(result.contains("Charlie"));
@@ -325,9 +400,13 @@ async fn dynamodb_dml_insert_then_delete() -> anyhow::Result<()> {
             )
             .await?;
 
-            sleep(Duration::from_millis(500)).await;
-            let result =
-                run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY id")).await?;
+            let result = wait_for_query_contents(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                &["Charlie", "Seed"],
+                &["Alpha", "Beta"],
+            )
+            .await?;
             assert!(!result.contains("Alpha"), "Alpha should be deleted");
             assert!(!result.contains("Beta"), "Beta should be deleted");
             assert!(result.contains("Charlie"), "Charlie should remain");
@@ -387,8 +466,13 @@ async fn dynamodb_dml_insert_multiple_types() -> anyhow::Result<()> {
             .await?;
 
             // Verify roundtrip
-            sleep(Duration::from_millis(500)).await;
-            let result = run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY id")).await?;
+            let result = wait_for_query_contents(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                &["new", "42", "3.14", "true", "Test Row", "seed"],
+                &[],
+            )
+            .await?;
 
             assert!(result.contains("new"), "Should contain new row");
             assert!(result.contains("42"), "Should contain int_val 42");
@@ -457,9 +541,13 @@ async fn dynamodb_dml_delete_composite_key_tuple_in() -> anyhow::Result<()> {
             )
             .await?;
 
-            sleep(Duration::from_millis(500)).await;
-            let result =
-                run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY pk, sk")).await?;
+            let result = wait_for_query_contents(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY pk, sk"),
+                &["alpha-two", "beta-one", "beta-two"],
+                &["alpha-one"],
+            )
+            .await?;
             assert!(
                 !result.contains("alpha-one"),
                 "alpha-one should be deleted by single-tuple IN"
@@ -475,9 +563,13 @@ async fn dynamodb_dml_delete_composite_key_tuple_in() -> anyhow::Result<()> {
             )
             .await?;
 
-            sleep(Duration::from_millis(500)).await;
-            let result =
-                run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY pk, sk")).await?;
+            let result = wait_for_query_contents(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY pk, sk"),
+                &["beta-two"],
+                &["alpha-two", "beta-one"],
+            )
+            .await?;
             assert!(
                 !result.contains("alpha-two"),
                 "alpha-two should be deleted by multi-tuple IN"
