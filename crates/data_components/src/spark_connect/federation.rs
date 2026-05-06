@@ -31,7 +31,7 @@ use futures::Stream;
 
 use crate::spark_connect::map_error_to_datafusion_err;
 
-use super::SparkConnectTableProvider;
+use super::{SparkConnectTableProvider, acquire_rate_controller_permit};
 
 impl SparkConnectTableProvider {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
@@ -84,7 +84,11 @@ impl SQLExecutor for SparkConnectTableProvider {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            spark_query_to_stream(self.dataframe.clone().sparkSession(), query.to_string()),
+            spark_query_to_stream(
+                self.dataframe.clone().sparkSession(),
+                query.to_string(),
+                self.rate_controller.clone(),
+            ),
         )))
     }
 
@@ -95,17 +99,23 @@ impl SQLExecutor for SparkConnectTableProvider {
     }
 
     async fn get_table_schema(&self, table_name: &str) -> DataFusionResult<SchemaRef> {
-        Ok(self
+        let dataframe = self
             .dataframe
             .clone()
             .sparkSession()
             .table(table_name)
             .map_err(map_error_to_datafusion_err)?
-            .limit(0)
+            .limit(0);
+        let rate_controller_permit = acquire_rate_controller_permit(self.rate_controller.as_ref())
+            .await
+            .map_err(DataFusionError::External)?;
+        let schema = dataframe
             .collect()
             .await
             .map_err(map_error_to_datafusion_err)?
-            .schema())
+            .schema();
+        drop(rate_controller_permit);
+        Ok(schema)
     }
 }
 
@@ -113,10 +123,14 @@ impl SQLExecutor for SparkConnectTableProvider {
 fn spark_query_to_stream(
     session: Arc<spark_connect_rs::SparkSession>,
     query: String,
+    rate_controller: Option<Arc<runtime_rate_control::RateController>>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     let session = Arc::clone(&session);
 
     stream! {
+        let rate_controller_permit = acquire_rate_controller_permit(rate_controller.as_ref())
+            .await
+            .map_err(DataFusionError::External)?;
         let data = session
             .sql(&query)
             .await
@@ -124,6 +138,7 @@ fn spark_query_to_stream(
             .collect()
             .await
             .map_err(map_error_to_datafusion_err)?;
+        drop(rate_controller_permit);
         yield (Ok(data))
     }
 }

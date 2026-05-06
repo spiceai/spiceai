@@ -33,6 +33,7 @@ use datafusion_table_providers::sql::{
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use reqwest::{Client, ClientBuilder};
+use runtime_rate_control::RateController;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use snafu::{Snafu, prelude::*};
@@ -262,6 +263,9 @@ pub enum Error {
     ))]
     HttpRequestFailed { source: reqwest::Error },
 
+    #[snafu(display("Failed to acquire Databricks SQL Warehouse rate-control permit: {source}"))]
+    RateControl { source: runtime_rate_control::Error },
+
     #[snafu(display(
         "Failed to parse response from Databricks SQL Warehouse: {}",
         format_reqwest_error_chain(source)
@@ -432,6 +436,29 @@ impl DatabricksSqlWarehouse {
         shared_semaphore: Option<Arc<Semaphore>>,
         permissions: Arc<dyn DatasetPermissions>,
     ) -> Result<Self, Error> {
+        Self::with_config_semaphore_permissions_and_rate_controller(
+            endpoint,
+            sql_warehouse_id,
+            token_provider,
+            config,
+            shared_semaphore,
+            permissions,
+            None,
+        )
+    }
+
+    /// Creates a new Databricks SQL Warehouse instance with explicit configuration,
+    /// a shared concurrency semaphore, a dataset permissions checker, and an
+    /// optional shared HTTP rate controller.
+    pub fn with_config_semaphore_permissions_and_rate_controller(
+        endpoint: &str,
+        sql_warehouse_id: &str,
+        token_provider: Arc<dyn TokenProvider>,
+        config: SqlWarehouseConfig,
+        shared_semaphore: Option<Arc<Semaphore>>,
+        permissions: Arc<dyn DatasetPermissions>,
+        rate_controller: Option<Arc<RateController>>,
+    ) -> Result<Self, Error> {
         ensure!(
             config.max_concurrent_requests > 0,
             InvalidConcurrencyLimitSnafu {
@@ -466,6 +493,7 @@ impl DatabricksSqlWarehouse {
             &config,
             Arc::clone(&metrics),
             request_semaphore,
+            rate_controller,
         )?);
         let pool = Arc::new(SqlWarehouseConnectionPool {
             api,
@@ -607,6 +635,7 @@ struct SqlWarehouseApi {
     sql_warehouse_id: String,
     token_provider: Arc<dyn TokenProvider>,
     metrics: Arc<DatabricksMetrics>,
+    rate_controller: Option<Arc<RateController>>,
 }
 
 impl SqlWarehouseApi {
@@ -617,6 +646,7 @@ impl SqlWarehouseApi {
         config: &SqlWarehouseConfig,
         metrics: Arc<DatabricksMetrics>,
         request_semaphore: Arc<Semaphore>,
+        rate_controller: Option<Arc<RateController>>,
     ) -> Result<Self, Error> {
         let client = configure_client_builder_with_timeouts(
             ClientBuilder::new(),
@@ -638,6 +668,7 @@ impl SqlWarehouseApi {
             sql_warehouse_id: sql_warehouse_id.to_string(),
             token_provider,
             metrics,
+            rate_controller,
         })
     }
 
@@ -649,6 +680,20 @@ impl SqlWarehouseApi {
             retry_counter: Some(&self.metrics.retries_total),
             inflight_counter: Some(&self.metrics.inflight_operations),
         }
+    }
+
+    async fn acquire_rate_controller_permit(
+        &self,
+    ) -> Result<Option<runtime_rate_control::Permit>, Error> {
+        let Some(rate_controller) = &self.rate_controller else {
+            return Ok(None);
+        };
+
+        rate_controller
+            .acquire()
+            .await
+            .context(RateControlSnafu)
+            .map(Some)
     }
 
     async fn get_schema(
@@ -908,6 +953,7 @@ impl SqlWarehouseApi {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
         async {
+            let rate_controller_permit = self.acquire_rate_controller_permit().await?;
             let response = send_request_with_retry_and_concurrency_limit(
                 "Databricks SQL Warehouse",
                 "execute SQL statement",
@@ -926,6 +972,7 @@ impl SqlWarehouseApi {
             self.metrics
                 .statements_executed_total
                 .fetch_add(1, Ordering::Relaxed);
+            drop(rate_controller_permit);
             Ok(value)
         }
         .instrument(tracing::info_span!(
@@ -948,6 +995,7 @@ impl SqlWarehouseApi {
             "{}/api/2.0/sql/warehouses/{}",
             self.base_url, self.sql_warehouse_id
         );
+        let rate_controller_permit = self.acquire_rate_controller_permit().await?;
         let response = send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "get warehouse details",
@@ -963,6 +1011,7 @@ impl SqlWarehouseApi {
             .json()
             .await
             .context(JsonParsingFailedSnafu)?;
+        drop(rate_controller_permit);
 
         let warehouse_type = value
             .get("warehouse_type")
@@ -992,6 +1041,7 @@ impl SqlWarehouseApi {
             .fetch_add(1, Ordering::Relaxed);
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
+        let rate_controller_permit = self.acquire_rate_controller_permit().await?;
         let response = send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "poll SQL statement status",
@@ -1000,12 +1050,14 @@ impl SqlWarehouseApi {
         )
         .await
         .context(HttpRequestFailedSnafu)?;
-        response
+        let value = response
             .error_for_status()
             .context(HttpRequestFailedSnafu)?
             .json()
             .await
-            .context(JsonParsingFailedSnafu)
+            .context(JsonParsingFailedSnafu)?;
+        drop(rate_controller_permit);
+        Ok(value)
     }
 
     // Fetch the arrow data at the external links, repeating for each chunk
@@ -1058,6 +1110,11 @@ impl SqlWarehouseApi {
                             return Some((Err(e), None));
                         }
                         api.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+                        let rate_controller_permit =
+                            match api.acquire_rate_controller_permit().await {
+                                Ok(permit) => permit,
+                                Err(e) => return Some((Err(e), None)),
+                            };
                         let resp = match send_request_with_retry_and_concurrency_limit(
                             "Databricks SQL Warehouse",
                             "fetch next external chunk link",
@@ -1067,7 +1124,10 @@ impl SqlWarehouseApi {
                         .await
                         .context(HttpRequestFailedSnafu)
                         {
-                            Ok(resp) => resp,
+                            Ok(resp) => {
+                                drop(rate_controller_permit);
+                                resp
+                            }
                             Err(e) => {
                                 return Some((Err(e), None));
                             }
@@ -1159,6 +1219,7 @@ impl SqlWarehouseApi {
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {
         self.check_permanently_disabled()?;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        let rate_controller_permit = self.acquire_rate_controller_permit().await?;
         let result = send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "fetch statement result chunk",
@@ -1175,6 +1236,7 @@ impl SqlWarehouseApi {
         .bytes()
         .await
         .context(HttpRequestFailedSnafu);
+        drop(rate_controller_permit);
         if result.is_ok() {
             self.metrics
                 .chunks_fetched_total
@@ -2131,6 +2193,7 @@ mod tests {
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
             Arc::new(Semaphore::new(8)),
+            None,
         )
         .expect("should create api");
         let table = TableReference::full("my_catalog", "my_schema", "my_table");
@@ -2162,6 +2225,7 @@ mod tests {
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
             Arc::new(Semaphore::new(8)),
+            None,
         )
         .expect("should create api");
         let table = TableReference::bare("just_table");
@@ -2184,6 +2248,7 @@ mod tests {
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
             Arc::new(Semaphore::new(8)),
+            None,
         )
         .expect("should create api");
         let table = TableReference::partial("my_schema", "my_table");
@@ -2206,6 +2271,7 @@ mod tests {
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
             Arc::new(Semaphore::new(8)),
+            None,
         )
         .expect("should create api");
         let table = TableReference::full("cat'alog", "sch'ema", "tab'le");
@@ -2391,6 +2457,7 @@ mod tests {
             sql_warehouse_id: "test-warehouse".to_string(),
             token_provider: Arc::new(StaticTokenProvider("test-token".to_string())),
             metrics: Arc::new(DatabricksMetrics::default()),
+            rate_controller: None,
         }
     }
 
@@ -2679,6 +2746,7 @@ mod tests {
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
             Arc::new(Semaphore::new(8)),
+            None,
         )
         .expect("should create api");
         let table = TableReference::full("my_catalog", "my_schema", "my_table");
@@ -2835,6 +2903,77 @@ mod tests {
         assert_eq!(first_response["status"]["state"], "SUCCEEDED");
         assert_eq!(second_response["status"]["state"], "SUCCEEDED");
         assert_eq!(max_active_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_execute_sql_statement_uses_rate_controller() {
+        let (port, _max_active_requests, mut started_rx, gate) =
+            start_blocking_mock_http_server(MockHttpResponse {
+                status_line: "200 OK",
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: json!({
+                    "status": { "state": "SUCCEEDED" },
+                    "statement_id": "stmt-1",
+                    "result": { "data_array": [] }
+                })
+                .to_string(),
+            })
+            .await;
+
+        let mut api =
+            create_test_api_with_request_limit(port, SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS);
+        api.rate_controller = Some(
+            RateController::builder()
+                .with_max_concurrent_requests(1)
+                .build(),
+        );
+        let api = Arc::new(api);
+
+        let first_payload = json!({"statement": "SELECT 1"});
+        let first_api = Arc::clone(&api);
+        let first = tokio::spawn(async move {
+            first_api
+                .execute_sql_statement("token", &first_payload)
+                .await
+        });
+
+        started_rx
+            .recv()
+            .await
+            .expect("the first request should reach the server");
+
+        let second_payload = json!({"statement": "SELECT 2"});
+        let second_api = Arc::clone(&api);
+        let second = tokio::spawn(async move {
+            second_api
+                .execute_sql_statement("token", &second_payload)
+                .await
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            started_rx.try_recv().is_err(),
+            "the second request should wait for the shared rate-controller permit"
+        );
+
+        gate.add_permits(1);
+        started_rx
+            .recv()
+            .await
+            .expect("the second request should start after the first releases the permit");
+        gate.add_permits(1);
+
+        first
+            .await
+            .expect("the first task should join")
+            .expect("the first request should succeed");
+        second
+            .await
+            .expect("the second task should join")
+            .expect("the second request should succeed");
     }
 
     #[test]
@@ -4585,6 +4724,7 @@ mod tests {
             sql_warehouse_id: "warehouse-a".to_string(),
             token_provider: Arc::new(StaticTokenProvider("token-a".to_string())),
             metrics: Arc::new(DatabricksMetrics::default()),
+            rate_controller: None,
         });
         let api_b = Arc::new(SqlWarehouseApi {
             client,
@@ -4597,6 +4737,7 @@ mod tests {
             sql_warehouse_id: "warehouse-b".to_string(),
             token_provider: Arc::new(StaticTokenProvider("token-b".to_string())),
             metrics: Arc::new(DatabricksMetrics::default()),
+            rate_controller: None,
         });
 
         // The first request (from api_a) should consume the single permit.

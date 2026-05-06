@@ -17,6 +17,7 @@ limitations under the License.
 use std::{fmt::Write, sync::Arc};
 
 use datafusion::sql::TableReference;
+use runtime_rate_control::RateController;
 use serde::Deserialize;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
@@ -76,6 +77,9 @@ pub enum Error {
 
     #[snafu(display("Failed to create HTTP client for Unity Catalog: {source}"))]
     UnableToCreateHttpClient { source: reqwest::Error },
+
+    #[snafu(display("Failed to acquire Unity Catalog rate-control permit: {source}"))]
+    RateControl { source: runtime_rate_control::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -90,6 +94,7 @@ pub struct UnityCatalog {
     client: reqwest::Client,
     user_agent: Option<String>,
     request_semaphore: Option<Arc<Semaphore>>,
+    rate_controller: Option<Arc<RateController>>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +109,16 @@ impl UnityCatalog {
         endpoint: Endpoint,
         token_provider: Option<Arc<dyn TokenProvider>>,
         request_semaphore: Option<Arc<Semaphore>>,
+    ) -> Result<Self> {
+        Self::new_with_rate_controller(endpoint, token_provider, request_semaphore, None)
+    }
+
+    #[expect(clippy::needless_pass_by_value)]
+    pub fn new_with_rate_controller(
+        endpoint: Endpoint,
+        token_provider: Option<Arc<dyn TokenProvider>>,
+        request_semaphore: Option<Arc<Semaphore>>,
+        rate_controller: Option<Arc<RateController>>,
     ) -> Result<Self> {
         let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {
@@ -136,6 +151,7 @@ impl UnityCatalog {
             client,
             user_agent,
             request_semaphore,
+            rate_controller,
         })
     }
 
@@ -373,7 +389,8 @@ impl UnityCatalog {
     }
 
     async fn send_get_with_retry(&self, operation: &str, path: &str) -> Result<reqwest::Response> {
-        send_request_with_retry_and_concurrency_limit(
+        let rate_controller_permit = self.acquire_rate_controller_permit().await?;
+        let response = send_request_with_retry_and_concurrency_limit(
             "Unity Catalog",
             operation,
             || self.get_req(path),
@@ -383,7 +400,21 @@ impl UnityCatalog {
             },
         )
         .await
-        .context(ConnectionSnafu)
+        .context(ConnectionSnafu)?;
+        drop(rate_controller_permit);
+        Ok(response)
+    }
+
+    async fn acquire_rate_controller_permit(&self) -> Result<Option<runtime_rate_control::Permit>> {
+        let Some(rate_controller) = &self.rate_controller else {
+            return Ok(None);
+        };
+
+        rate_controller
+            .acquire()
+            .await
+            .context(RateControlSnafu)
+            .map(Some)
     }
 
     /// Percent-encodes each dot-separated segment of a UC name individually.

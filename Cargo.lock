@@ -3933,6 +3933,7 @@ dependencies = [
  "opentelemetry",
  "paste",
  "runtime",
+ "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
  "snafu",

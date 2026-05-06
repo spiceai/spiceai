@@ -531,11 +531,25 @@ pub fn resolve_config<S: BuildHasher>(
     dataset: &Dataset,
     dataconnector: &'static str,
 ) -> DataConnectorResult<HttpRateControlConfig> {
+    resolve_config_for_component(
+        params,
+        runtime_params,
+        &ConnectorComponent::from(dataset),
+        dataconnector,
+    )
+}
+
+pub fn resolve_config_for_component<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<HttpRateControlConfig> {
     let config = HttpRateControlConfig {
         max_concurrent_requests: parse_optional_nonzero_usize_param(
             params,
             runtime_params,
-            dataset,
+            connector_component,
             dataconnector,
             "max_concurrent_requests",
             RUNTIME_MAX_CONCURRENT_REQUESTS,
@@ -543,7 +557,7 @@ pub fn resolve_config<S: BuildHasher>(
         requests_per_second: parse_optional_nonzero_u32_param(
             params,
             runtime_params,
-            dataset,
+            connector_component,
             dataconnector,
             "requests_per_second_limit",
             RUNTIME_REQUESTS_PER_SECOND_LIMIT,
@@ -551,7 +565,7 @@ pub fn resolve_config<S: BuildHasher>(
         requests_per_minute: parse_optional_nonzero_u32_param(
             params,
             runtime_params,
-            dataset,
+            connector_component,
             dataconnector,
             "requests_per_minute_limit",
             RUNTIME_REQUESTS_PER_MINUTE_LIMIT,
@@ -560,7 +574,13 @@ pub fn resolve_config<S: BuildHasher>(
         jitter_max: Duration::ZERO,
     };
 
-    with_jitter(params, runtime_params, dataset, dataconnector, config)
+    with_jitter(
+        params,
+        runtime_params,
+        connector_component,
+        dataconnector,
+        config,
+    )
 }
 
 impl HttpRateControlRegistry {
@@ -736,12 +756,30 @@ impl HttpRateControlRegistry {
         dataset: &Dataset,
         dataconnector: &'static str,
     ) -> DataConnectorResult<SharedRateControllerReservation> {
+        self.reserve_shared_rate_controller_for_component(
+            base_url,
+            config,
+            dataset.app.name.as_str(),
+            &ConnectorComponent::from(dataset),
+            dataconnector,
+        )
+        .await
+    }
+
+    pub async fn reserve_shared_rate_controller_for_component(
+        self: Arc<Self>,
+        base_url: &Url,
+        config: &HttpRateControlConfig,
+        spicepod_name: &str,
+        connector_component: &ConnectorComponent,
+        dataconnector: &'static str,
+    ) -> DataConnectorResult<SharedRateControllerReservation> {
         let key = rate_control_key(base_url);
         let mut rate_controllers = self.rate_controllers.write().await;
 
         if let Some(existing) = rate_controllers.get_mut(&key) {
             if existing.shared.config != *config {
-                return conflicting_config_error(dataset, dataconnector, &key);
+                return conflicting_config_error(connector_component, dataconnector, &key);
             }
             existing.pending_registrations = existing.pending_registrations.saturating_add(1);
             let shared = existing.shared.clone();
@@ -755,7 +793,7 @@ impl HttpRateControlRegistry {
 
         let shared = build_shared_rate_controller(
             &key,
-            dataset.app.name.as_str(),
+            spicepod_name,
             config,
             self.persisted_governor_state.as_ref(),
         );
@@ -806,13 +844,31 @@ impl HttpRateControlRegistry {
         dataset: &Dataset,
         dataconnector: &'static str,
     ) -> DataConnectorResult<SharedRateController> {
+        self.shared_rate_controller_for_component(
+            base_url,
+            config,
+            dataset.app.name.as_str(),
+            &ConnectorComponent::from(dataset),
+            dataconnector,
+        )
+        .await
+    }
+
+    pub async fn shared_rate_controller_for_component(
+        &self,
+        base_url: &Url,
+        config: &HttpRateControlConfig,
+        spicepod_name: &str,
+        connector_component: &ConnectorComponent,
+        dataconnector: &'static str,
+    ) -> DataConnectorResult<SharedRateController> {
         let key = rate_control_key(base_url);
         let rate_controllers = self.rate_controllers.read().await;
         if let Some(existing) = rate_controllers.get(&key) {
             return resolve_existing_controller(
                 &existing.shared,
                 config,
-                dataset,
+                connector_component,
                 dataconnector,
                 &key,
             );
@@ -824,7 +880,7 @@ impl HttpRateControlRegistry {
             return resolve_existing_controller(
                 &existing.shared,
                 config,
-                dataset,
+                connector_component,
                 dataconnector,
                 &key,
             );
@@ -832,7 +888,7 @@ impl HttpRateControlRegistry {
 
         let shared = build_shared_rate_controller(
             &key,
-            dataset.app.name.as_str(),
+            spicepod_name,
             config,
             self.persisted_governor_state.as_ref(),
         );
@@ -930,7 +986,7 @@ fn build_shared_rate_controller(
 fn resolve_existing_controller(
     existing: &SharedRateController,
     config: &HttpRateControlConfig,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     key: &str,
 ) -> DataConnectorResult<SharedRateController> {
@@ -938,13 +994,13 @@ fn resolve_existing_controller(
         return Ok(existing.clone());
     }
 
-    conflicting_config_error(dataset, dataconnector, key)
+    conflicting_config_error(connector_component, dataconnector, key)
 }
 
 fn parse_optional_nonzero_u32_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     parameter_name: &str,
     runtime_parameter_name: &'static str,
@@ -975,14 +1031,14 @@ fn parse_optional_nonzero_u32_param<S: BuildHasher>(
             .map_err(|source| DataConnectorError::InvalidConfiguration {
                 dataconnector: dataconnector.to_string(),
                 message: format!("The '{display_name}' parameter must be a positive integer."),
-                connector_component: ConnectorComponent::from(dataset),
+                connector_component: connector_component.clone(),
                 source: source.into(),
             })?;
 
     NonZeroU32::new(value).map(Some).ok_or_else(|| {
         DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.to_string(),
-            connector_component: ConnectorComponent::from(dataset),
+            connector_component: connector_component.clone(),
             message: format!("The '{display_name}' parameter must be greater than 0."),
         }
     })
@@ -991,7 +1047,7 @@ fn parse_optional_nonzero_u32_param<S: BuildHasher>(
 fn parse_optional_nonzero_usize_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     parameter_name: &str,
     runtime_parameter_name: &'static str,
@@ -1022,14 +1078,14 @@ fn parse_optional_nonzero_usize_param<S: BuildHasher>(
             .map_err(|source| DataConnectorError::InvalidConfiguration {
                 dataconnector: dataconnector.to_string(),
                 message: format!("The '{display_name}' parameter must be a positive integer."),
-                connector_component: ConnectorComponent::from(dataset),
+                connector_component: connector_component.clone(),
                 source: source.into(),
             })?;
 
     if value == 0 {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.to_string(),
-            connector_component: ConnectorComponent::from(dataset),
+            connector_component: connector_component.clone(),
             message: format!("The '{display_name}' parameter must be greater than 0."),
         });
     }
@@ -1040,7 +1096,7 @@ fn parse_optional_nonzero_usize_param<S: BuildHasher>(
 fn parse_optional_duration_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     parameter_name: &str,
     runtime_parameter_name: &'static str,
@@ -1071,7 +1127,7 @@ fn parse_optional_duration_param<S: BuildHasher>(
             message: format!(
                 "The '{display_name}' parameter must be a valid duration such as '10ms', '1s', or '0ms'."
             ),
-            connector_component: ConnectorComponent::from(dataset),
+            connector_component: connector_component.clone(),
             source: source.into(),
         }
     })
@@ -1080,14 +1136,14 @@ fn parse_optional_duration_param<S: BuildHasher>(
 fn with_jitter<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     mut config: HttpRateControlConfig,
 ) -> DataConnectorResult<HttpRateControlConfig> {
     let jitter_min = parse_optional_duration_param(
         params,
         runtime_params,
-        dataset,
+        connector_component,
         dataconnector,
         "rate_control_jitter_min",
         RUNTIME_RATE_CONTROL_JITTER_MIN,
@@ -1095,7 +1151,7 @@ fn with_jitter<S: BuildHasher>(
     let jitter_max = parse_optional_duration_param(
         params,
         runtime_params,
-        dataset,
+        connector_component,
         dataconnector,
         "rate_control_jitter_max",
         RUNTIME_RATE_CONTROL_JITTER_MAX,
@@ -1118,7 +1174,7 @@ fn with_jitter<S: BuildHasher>(
     if resolved_min > resolved_max {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.to_string(),
-            connector_component: ConnectorComponent::from(dataset),
+            connector_component: connector_component.clone(),
             message: format!(
                 "The '{}' parameter must be less than or equal to '{}'.",
                 runtime_or_dataset_param_name(
@@ -1213,15 +1269,15 @@ fn stable_state_key_hash(value: &str) -> u64 {
 }
 
 fn conflicting_config_error<T>(
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     key: &str,
 ) -> DataConnectorResult<T> {
     Err(DataConnectorError::InvalidConfigurationNoSource {
         dataconnector: dataconnector.to_string(),
-        connector_component: ConnectorComponent::from(dataset),
+        connector_component: connector_component.clone(),
         message: format!(
-            "Multiple HTTP-based datasets target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, and rate_control_jitter_max values for datasets sharing an origin."
+            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, and rate_control_jitter_max values for components sharing an origin."
         ),
     })
 }

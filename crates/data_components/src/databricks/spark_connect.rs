@@ -20,6 +20,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{Read, spark_connect::SparkConnect};
+use runtime_rate_control::RateController;
 use token_provider::TokenProvider;
 
 #[derive(Clone)]
@@ -34,13 +35,29 @@ impl DatabricksSparkConnect {
         token: String,
         databricks_use_ssl: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_rate_controller(endpoint, cluster_id, token, databricks_use_ssl, None).await
+    }
+
+    pub async fn new_with_rate_controller(
+        endpoint: String,
+        cluster_id: String,
+        token: String,
+        databricks_use_ssl: bool,
+        rate_controller: Option<Arc<RateController>>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let session_id = Uuid::new_v4();
         let user_agent = super::user_agent();
         let connection = format!(
             "sc://{endpoint}:443/;use_ssl={databricks_use_ssl};user_id=spice.ai;session_id={session_id};token={token};x-databricks-cluster-id={cluster_id};user_agent={user_agent};"
         );
         Ok(Self {
-            spark_connect: Arc::new(SparkConnect::from_connection(connection.as_str()).await?),
+            spark_connect: Arc::new(
+                SparkConnect::from_connection_with_rate_controller(
+                    connection.as_str(),
+                    rate_controller,
+                )
+                .await?,
+            ),
         })
     }
 
@@ -50,11 +67,29 @@ impl DatabricksSparkConnect {
         databricks_use_ssl: bool,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let result = Self::new(
+        Self::from_token_provider_with_rate_controller(
+            endpoint,
+            cluster_id,
+            databricks_use_ssl,
+            token_provider,
+            None,
+        )
+        .await
+    }
+
+    pub async fn from_token_provider_with_rate_controller(
+        endpoint: String,
+        cluster_id: String,
+        databricks_use_ssl: bool,
+        token_provider: Arc<dyn TokenProvider>,
+        rate_controller: Option<Arc<RateController>>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let result = Self::new_with_rate_controller(
             endpoint,
             cluster_id,
             token_provider.get_token(),
             databricks_use_ssl,
+            rate_controller,
         )
         .await?;
 
