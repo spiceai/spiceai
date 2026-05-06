@@ -104,7 +104,6 @@ pub struct Endpoint(pub String);
 pub struct CatalogId(pub String);
 
 impl UnityCatalog {
-    #[expect(clippy::needless_pass_by_value)]
     pub fn new(
         endpoint: Endpoint,
         token_provider: Option<Arc<dyn TokenProvider>>,
@@ -113,14 +112,14 @@ impl UnityCatalog {
         Self::new_with_rate_controller(endpoint, token_provider, request_semaphore, None)
     }
 
-    #[expect(clippy::needless_pass_by_value)]
     pub fn new_with_rate_controller(
         endpoint: Endpoint,
         token_provider: Option<Arc<dyn TokenProvider>>,
         request_semaphore: Option<Arc<Semaphore>>,
         rate_controller: Option<Arc<RateController>>,
     ) -> Result<Self> {
-        let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
+        let Endpoint(endpoint) = endpoint;
+        let mut endpoint_str = endpoint.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {
             endpoint_str = format!("https://{endpoint_str}");
         }
@@ -133,7 +132,7 @@ impl UnityCatalog {
         #[cfg(feature = "databricks")]
         // Include user_agent, if connects to Databricks instance
         {
-            user_agent = if endpoint.0.contains("databricks") {
+            user_agent = if endpoint.contains("databricks") {
                 Some(crate::databricks::user_agent().to_string())
             } else {
                 None
