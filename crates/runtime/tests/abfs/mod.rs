@@ -29,13 +29,16 @@ use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tracing::instrument;
 
 use crate::{
     configure_test_datafusion,
-    docker::{ContainerRunnerBuilder, RunningContainer},
+    docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port},
 };
+
+const AZURITE_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const AZURITE_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[instrument]
 pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static>, anyhow::Error> {
@@ -48,17 +51,17 @@ pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static
                 "CMD-SHELL".to_string(),
                 "netstat -tulpn | grep 10000".to_string(),
             ]),
-            interval: Some(250_000_000), // 250ms
-            timeout: Some(100_000_000),  // 100ms
-            retries: Some(5),
-            start_period: Some(500_000_000), // 100ms
+            interval: Some(1_000_000_000), // 1s
+            timeout: Some(5_000_000_000),  // 5s
+            retries: Some(60),
+            start_period: Some(10_000_000_000), // 10s
             start_interval: None,
         })
         .build()?
-        .run(None)
+        .run(Some(AZURITE_CONTAINER_START_TIMEOUT))
         .await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    wait_for_tcp_port("127.0.0.1", 10000, AZURITE_HOST_PORT_READY_TIMEOUT).await?;
     Ok(running_container)
 }
 

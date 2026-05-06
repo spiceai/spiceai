@@ -14,18 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
+use mysql_async::prelude::Queryable;
 use spicepod::{
     acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
 use tracing::instrument;
 
-use crate::{
-    container_registry,
-    docker::{ContainerRunnerBuilder, RunningContainer},
-};
+use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
@@ -45,7 +43,10 @@ pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) 
 }
 
 const MYSQL_ROOT_PASSWORD: &str = "integration-test-pw";
+const MYSQL_IMAGE: &str = "docker.io/library/mysql:latest";
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-mysql";
+const MYSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[instrument]
 pub async fn start_mysql_docker_container(
@@ -54,27 +55,70 @@ pub async fn start_mysql_docker_container(
     let container_name = format!("{MYSQL_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(format!("{}mysql:latest", container_registry()))
+        .image(MYSQL_IMAGE.to_string())
         .add_port_binding(3306, port)
         .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
         .add_env_var("MYSQL_DATABASE", "mysqldb")
         .healthcheck(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".to_string(),
-                format!("mysqladmin ping --password={MYSQL_ROOT_PASSWORD}"),
+                format!(
+                    "mysqladmin ping -h127.0.0.1 -uroot --password={MYSQL_ROOT_PASSWORD} --silent"
+                ),
             ]),
-            interval: Some(250_000_000), // 250ms
-            timeout: Some(100_000_000),  // 100ms
-            retries: Some(5),
-            start_period: Some(500_000_000), // 100ms
+            interval: Some(1_000_000_000), // 1s
+            timeout: Some(5_000_000_000),  // 5s
+            retries: Some(120),
+            start_period: Some(30_000_000_000), // 30s
             start_interval: None,
         })
         .build()?
-        .run(None)
+        .run(Some(MYSQL_CONTAINER_START_TIMEOUT))
         .await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    wait_for_mysql_host_port(port).await?;
+
     Ok(running_container)
+}
+
+async fn wait_for_mysql_host_port(port: u16) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let mut last_error = None;
+    let pool = get_mysql_conn(port)?;
+
+    while start_time.elapsed() <= MYSQL_HOST_PORT_READY_TIMEOUT {
+        match pool.get_conn().await {
+            Ok(mut conn) => match conn.query_drop("SELECT 1").await {
+                Ok(()) => {
+                    drop(conn);
+                    pool.disconnect().await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
+            },
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    let last_error = last_error.unwrap_or_else(|| "none".to_string());
+    pool.disconnect().await.map_err(|error| {
+        anyhow::anyhow!(
+            "MySQL container started but host port {port} was not ready within {}s. Last error: {last_error}; failed to disconnect readiness pool: {error}",
+            MYSQL_HOST_PORT_READY_TIMEOUT.as_secs()
+        )
+    })?;
+
+    Err(anyhow::anyhow!(
+        "MySQL container started but host port {port} was not ready within {}s. Last error: {}",
+        MYSQL_HOST_PORT_READY_TIMEOUT.as_secs(),
+        last_error
+    ))
 }
 
 #[instrument]
