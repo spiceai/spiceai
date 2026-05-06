@@ -21,7 +21,7 @@ export SPICE_GOOGLE_API_KEY="your-google-api-key"           # Required for Gemin
 The tests use the following models:
 
 - **OpenAI**: `gpt-4o-mini`
-- **xAI**: `grok-4-1-fast-non-reasoning`
+- **xAI**: `grok-4.20-non-reasoning`
 - **Anthropic**: `claude-haiku-4-5`
 - **Local**: `llama3` (Phi-3.5-mini-instruct from HuggingFace)
 

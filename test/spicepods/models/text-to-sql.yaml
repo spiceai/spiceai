@@ -17,7 +17,7 @@ models:
     name: claude-haiku-3-5
     params:
       anthropic_api_key: ${secrets:SPICE_ANTHROPIC_API_KEY}
-  - from: xai:grok-4-1-fast-non-reasoning
-    name: grok41
+  - from: xai:grok-4.20-non-reasoning
+    name: grok420
     params:
       xai_api_key: ${secrets:SPICE_XAI_API_KEY}
