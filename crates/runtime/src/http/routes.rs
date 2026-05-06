@@ -192,6 +192,15 @@ Configure `runtime.mcp.allowed_hosts` or set it to `[\"*\"]` to allow all hosts.
                         .build(),
                 )
                 .response(
+                    "401",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. \
+Configure an API key provider in your Spicepod and retry with credentials.",
+                        )
+                        .build(),
+                )
+                .response(
                     "413",
                     utoipa::openapi::ResponseBuilder::new()
                         .description("Payload too large. Maximum allowed size is 32 MiB.")
@@ -221,6 +230,15 @@ The `Mcp-Session-Id` header must identify an existing session created via `POST 
                     "404",
                     utoipa::openapi::ResponseBuilder::new()
                         .description("Unknown or expired `Mcp-Session-Id`.")
+                        .build(),
+                )
+                .response(
+                    "401",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. \
+Configure an API key provider in your Spicepod and retry with credentials.",
+                        )
                         .build(),
                 )
                 .response(
@@ -254,6 +272,15 @@ The `Mcp-Session-Id` header must identify an existing session created via `POST 
                     "404",
                     utoipa::openapi::ResponseBuilder::new()
                         .description("Unknown or already-terminated `Mcp-Session-Id`.")
+                        .build(),
+                )
+                .response(
+                    "401",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. \
+Configure an API key provider in your Spicepod and retry with credentials.",
+                        )
                         .build(),
                 )
                 .response(
