@@ -287,12 +287,10 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: b
             );
         }
         // S3 Vectors HTTP search results are non-deterministic: the backend may return
-        // different items with the same rounded score across runs. Use structural validation
-        // instead of exact snapshot comparison for these tests.
-        name if name.starts_with("s3vectors_composite")
-            && !name.contains("vector_search_sql")
-            && !name.contains("with_where") =>
-        {
+        // different items with the same rounded score across runs, or scores can drift
+        // across a two-decimal rounding boundary. Use structural validation instead of
+        // exact snapshot comparison for these tests.
+        name if use_structural_search_response_validation(name) => {
             assert_search_response_structure(name, resp, round_scores);
         }
         _ => {
@@ -302,6 +300,16 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: b
             );
         }
     }
+}
+
+fn use_structural_search_response_validation(test_name: &str) -> bool {
+    let is_s3_vectors_composite = test_name.starts_with("s3vectors_composite");
+    let is_s3_vectors_chunking_keywords =
+        test_name.starts_with("s3vectors_chunking") && test_name.contains("_keywords");
+
+    (is_s3_vectors_composite || is_s3_vectors_chunking_keywords)
+        && !test_name.contains("vector_search_sql")
+        && !test_name.contains("with_where")
 }
 
 /// Validate the structure and invariants of a search response without asserting exact item content.

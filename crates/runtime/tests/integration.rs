@@ -159,7 +159,6 @@ fn configure_test_datafusion() {
         _ => panic!("Must obtain write lock to defaults"),
     }
 }
-
 fn configure_test_datafusion_request_context() {
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),
@@ -337,9 +336,4 @@ where
     }
 
     Ok(())
-}
-
-fn container_registry() -> String {
-    std::env::var("CONTAINER_REGISTRY")
-        .unwrap_or_else(|_| "public.ecr.aws/docker/library/".to_string())
 }

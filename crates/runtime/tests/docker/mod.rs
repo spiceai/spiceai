@@ -377,3 +377,27 @@ pub async fn is_docker_available() -> bool {
     // Try to ping the Docker daemon to verify it's actually running
     docker.ping().await.is_ok()
 }
+
+pub async fn wait_for_tcp_port(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start_time.elapsed() <= timeout {
+        match tokio::net::TcpStream::connect((host, port)).await {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Timed out waiting for TCP port {host}:{port} within {}s. Last error: {}",
+        timeout.as_secs(),
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
+}
