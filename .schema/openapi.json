@@ -4,8 +4,7 @@
     "title": "runtime",
     "description": "The spiced runtime",
     "license": {
-      "name": "Apache-2.0",
-      "identifier": "Apache-2.0"
+      "name": ""
     },
     "version": "2.0.0-unstable"
   },
@@ -343,7 +342,7 @@
           "Datasets"
         ],
         "summary": "Refresh Dataset",
-        "description": "Trigger an on-demand refresh for an accelerated dataset.\n\nThis endpoint triggers an on-demand refresh for an accelerated dataset.\nThe refresh only applies to `full` and `append` refresh modes (not `changes` mode).",
+        "description": "Trigger an on-demand refresh for an accelerated dataset.\n\nThe refresh only applies to `full` and `append` refresh modes (not\n`changes` mode). Datasets without acceleration return 400 — the\nprevious `load: on_demand` flow has been removed; deferred datasets\n(declared schema + `ready_state: on_registration`) are materialised\nautomatically on first query and do not need a manual trigger.",
         "operationId": "post_dataset_refresh",
         "parameters": [
           {
@@ -387,7 +386,7 @@
             }
           },
           "400": {
-            "description": "Acceleration not enabled for the dataset",
+            "description": "Dataset is not accelerated; nothing to refresh",
             "content": {
               "application/json": {
                 "schema": {
@@ -1114,7 +1113,8 @@
                 "sample_data_enabled": true,
                 "datasets": [
                   "sales_data"
-                ]
+                ],
+                "prompt_cache_key": "sales-dashboard"
               }
             }
           },
@@ -1956,6 +1956,93 @@
                 ]
               }
             }
+          },
+          "401": {
+            "description": "Tool routes require runtime auth to be configured",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tools/search": {
+      "get": {
+        "tags": [
+          "Tools"
+        ],
+        "summary": "List Searchable Tool Registry Tools",
+        "description": "Returns the small set of tool definitions an external LLM client should inject to use Spice's searchable tool registry. Invoke returned tools with `POST /v1/tools/{name}`.",
+        "operationId": "list_searchable_tool_registry_tools",
+        "parameters": [
+          {
+            "name": "embedding_model",
+            "in": "query",
+            "description": "Embedding model name to use for searchable tool discovery. Required only when multiple embedding models are configured.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Searchable tool registry tools to inject into an external LLM prompt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ListToolElement"
+                  }
+                },
+                "example": [
+                  {
+                    "name": "tool_search",
+                    "description": "Search the Spice tool registry for tools relevant to the current task.",
+                    "parameters": {
+                      "type": "object"
+                    }
+                  },
+                  {
+                    "name": "tool_invoke",
+                    "description": "Invoke one Spice tool returned by tool_search.",
+                    "parameters": {
+                      "type": "object"
+                    }
+                  },
+                  {
+                    "name": "list_datasets",
+                    "description": "List all SQL tables available.",
+                    "parameters": null
+                  }
+                ]
+              }
+            }
+          },
+          "400": {
+            "description": "Searchable tool registry is not configured",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Tool routes require runtime auth to be configured",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."
+                }
+              }
+            }
           }
         }
       }
@@ -1974,6 +2061,15 @@
             "in": "path",
             "description": "Name of the tool",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "embedding_model",
+            "in": "query",
+            "description": "Embedding model to use when invoking the searchable tool registry's tool_search meta-tool",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2024,14 +2120,33 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid searchable tool registry configuration",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Tool routes require runtime auth to be configured",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."
+                }
+              }
+            }
+          },
           "404": {
             "description": "Tool not found",
             "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                },
-                "example": "Tool no_sql not found"
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Tool 'no_sql' not found"
+                }
               }
             }
           },
@@ -9696,7 +9811,7 @@
         "type": "string",
         "description": "The retention policy for the prompt cache.",
         "enum": [
-          "in-memory",
+          "in_memory",
           "24h"
         ]
       },
@@ -9878,7 +9993,8 @@
           "full",
           "append",
           "changes",
-          "caching"
+          "caching",
+          "snapshot"
         ]
       },
       "RefreshOverrides": {
@@ -9945,6 +10061,13 @@
           "model": {
             "type": "string",
             "description": "The name of the model to use for SQL generation. Default: \"nql\""
+          },
+          "prompt_cache_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable prompt-cache key forwarded to the configured NSQL model for provider-specific cache handling."
           },
           "query": {
             "type": "string",
@@ -10660,6 +10783,13 @@
             "description": "The component is in the process of shutting down",
             "enum": [
               "ShuttingDown"
+            ]
+          },
+          {
+            "type": "string",
+            "description": "The component is configured but not loaded yet",
+            "enum": [
+              "NotLoaded"
             ]
           }
         ],
