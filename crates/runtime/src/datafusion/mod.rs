@@ -39,7 +39,7 @@ use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
-use crate::datafusion::query::Query;
+use crate::datafusion::query::{Query, registry::QueryCancelRegistry};
 use crate::dataupdate::{
     DataUpdate, DataUpdateBroadcaster, StreamingDataUpdate, StreamingDataUpdateExecutionPlan,
     UpdateType,
@@ -660,6 +660,7 @@ pub struct DataFusion {
     /// steady-state hot path: when zero, queries pay only a single
     /// `Acquire`-ordered atomic load and skip the lookup entirely.
     pending_initializations_count: std::sync::atomic::AtomicUsize,
+    query_cancel_registry: Arc<QueryCancelRegistry>,
 
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -810,6 +811,11 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    #[must_use]
+    pub fn query_cancel_registry(&self) -> Arc<QueryCancelRegistry> {
+        Arc::clone(&self.query_cancel_registry)
     }
 
     pub async fn get_table(
@@ -3304,11 +3310,19 @@ impl DataFusion {
     }
 
     /// Performs `DataFusion` cleanup during shutdown.
-    /// Currently performs cleanup of accelerated tables only.
+    /// Currently cancels active queries and cleans up accelerated tables.
     pub async fn shutdown(&self) {
         // Don't block self.accelerated_tables as it needs to be modified during table removal
         // and will be cleaned up authomatically by removing accelerated tables.
         tracing::debug!("Datafusion shutdown started");
+
+        let cancelled_queries = self.query_cancel_registry.cancel_all();
+        if cancelled_queries > 0 {
+            tracing::debug!(
+                cancelled_queries,
+                "Cancelled active queries during DataFusion shutdown"
+            );
+        }
 
         let accelerated_tables = self.accelerated_tables.read().await.clone();
 
