@@ -42,8 +42,6 @@ use std::collections::HashMap;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
-pub(super) const DEFAULT_DESCRIPTION: &str = "Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).";
-
 /// A tool to retrieve the schema of one or more available SQL tables.
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct TableSchemaToolParams {
@@ -86,7 +84,11 @@ impl TableSchemaTool {
     pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
             name: name.unwrap_or("table_schema").to_string(),
-            description: Some(description.unwrap_or(DEFAULT_DESCRIPTION).to_string()),
+            description: Some(
+                description
+                    .unwrap_or("Retrieve the schema of all available SQL tables")
+                    .to_string(),
+            ),
             rt,
             table_allowlist: None,
         }

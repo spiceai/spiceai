@@ -35,9 +35,9 @@ use super::{
     get_readiness::GetReadinessTool,
     list_datasets::ListDatasetsTool,
     sample::{SampleTableMethod, tool::SampleDataTool},
-    search::{DEFAULT_DESCRIPTION as DEFAULT_SEARCH_DESCRIPTION, SearchTool},
-    sql::{DEFAULT_READ_ONLY_DESCRIPTION as DEFAULT_SQL_DESCRIPTION, SqlTool},
-    table_schema::{DEFAULT_DESCRIPTION as DEFAULT_TABLE_SCHEMA_DESCRIPTION, TableSchemaTool},
+    search::SearchTool,
+    sql::SqlTool,
+    table_schema::TableSchemaTool,
 };
 
 #[derive(Debug, Snafu)]
@@ -106,9 +106,9 @@ impl BuiltinToolCatalog {
         let description = match (id, description) {
             (_, Some(desc)) => desc, // Use provided description if available
             ("get_readiness", None) => "Get the readiness status of the Spice.ai runtime",
-            ("search", None) => DEFAULT_SEARCH_DESCRIPTION,
-            ("table_schema", None) => DEFAULT_TABLE_SCHEMA_DESCRIPTION,
-            ("sql", None) => DEFAULT_SQL_DESCRIPTION,
+            ("search", None) => "Search across available, searchable datasets in Spice.ai runtime",
+            ("table_schema", None) => "Get the schema of the Spice.ai dataset",
+            ("sql", None) => "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
             ("sample_distinct_columns", None) => {
                 "Sample distinct column values from a Spice.ai dataset"
             }
