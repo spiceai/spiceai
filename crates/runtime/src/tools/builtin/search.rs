@@ -47,7 +47,7 @@ impl SearchTool {
         Self {
             name: name.unwrap_or("search").to_string(),
             description: description
-                .unwrap_or("Search across available, searchable datasets")
+                .unwrap_or("Run a hybrid (vector + keyword) similarity search over datasets configured with embeddings. Use this for natural-language or semantic lookups (e.g. 'find documents about X') instead of exact SQL filtering. Provide `text` for the query; optionally restrict with `datasets` (only datasets whose `can_search_documents=true` in `list_datasets` are valid), `where_cond` (a SQL predicate without the `WHERE` keyword), `additional_columns`, and `limit`. Returns matched rows grouped per dataset with similarity scores.")
                 .to_string(),
             rt,
             table_allowlist: None,

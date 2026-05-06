@@ -32,7 +32,7 @@ impl GetCurrentDateTimeTool {
         Self {
             name: name.unwrap_or("get_current_datetime").to_string(),
             description: description
-                .unwrap_or("Get the current UTC date and time in ISO 8601 format.")
+                .unwrap_or("Return the current UTC date and time as an ISO 8601 timestamp. Call this whenever the model needs the actual current time to compute relative durations, evaluate freshness, or stamp generated content; do not guess or rely on training-data dates. Takes no arguments. Returns a string like '2026-05-06T13:45:00Z'.")
                 .to_string(),
         }
     }

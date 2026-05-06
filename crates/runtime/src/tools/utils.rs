@@ -57,10 +57,15 @@ pub async fn create_tool_use_messages(
     let arg =
         serde_json::to_string(params).map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
-    let resp = tool
-        .call(arg.as_str())
-        .await
-        .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+    let resp = match tool.call(arg.as_str()).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let tool_name = tool.name();
+            let error = e.to_string();
+            tracing::warn!("Tool '{tool_name}' failed while creating tool-use messages: {error}");
+            tool_call_error_response(tool_name.as_ref(), error)
+        }
+    };
 
     Ok(vec![
         ChatCompletionRequestAssistantMessageArgs::default()
@@ -81,6 +86,12 @@ pub async fn create_tool_use_messages(
             .build()?
             .into(),
     ])
+}
+
+pub fn tool_call_error_response(tool_name: &str, error: impl std::fmt::Display) -> Value {
+    Value::String(format!(
+        "Failed to call the tool {tool_name}. An error occurred: {error}"
+    ))
 }
 
 /// Construct a [`serde_json::Value`] from a [`JsonSchema`] type.
@@ -375,4 +386,52 @@ fn warn_missing_tools(all_tools: &HashMap<String, Tooling>, missing_tools: &[Str
         "The following tools were not found in the registry: {}. Available tools are: {available_tools}. For details, visit https://spiceai.org/docs/features/large-language-models/tools",
         missing_tools.join(", ")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::chat::ChatCompletionRequestToolMessageContent;
+    use async_trait::async_trait;
+    use std::borrow::Cow;
+
+    struct FailingTool;
+
+    #[async_trait]
+    impl SpiceModelTool for FailingTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("failing_tool")
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(&self, _: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Err("boom".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn create_tool_use_messages_returns_tool_error_message() {
+        let messages = create_tool_use_messages(&FailingTool, "tool-call", &serde_json::json!({}))
+            .await
+            .expect("tool-use messages should be created even when the tool fails");
+
+        assert_eq!(messages.len(), 2);
+        let ChatCompletionRequestMessage::Tool(tool_message) = &messages[1] else {
+            panic!("second message should be a tool response");
+        };
+
+        let ChatCompletionRequestToolMessageContent::Text(content) = &tool_message.content else {
+            panic!("tool response should be text");
+        };
+
+        assert!(content.contains("Failed to call the tool failing_tool"));
+        assert!(content.contains("boom"));
+    }
 }
