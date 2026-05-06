@@ -96,9 +96,6 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_rate_control: Option<SourceRateControl>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rate_control: Option<RateControl>,
-
     #[serde(default, skip_serializing_if = "is_default")]
     pub functions: Functions,
 }
@@ -879,22 +876,6 @@ pub struct Scheduler {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct RateControl {
-    /// Root URI for globally persisted HTTP governor rate-control state.
-    pub state_location: String,
-
-    /// Optional object store params for the rate-control state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Params>,
-
-    /// How often each runtime refreshes and persists per-origin governor state in object storage.
-    #[serde(default = "default_rate_control_refresh_interval")]
-    pub refresh_interval: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SourceRateControl {
     /// Root URI for globally persisted source rate-control state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1010,8 +991,6 @@ pub struct RuntimeDeserializer {
     pub scheduler: Option<Scheduler>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_rate_control: Option<SourceRateControl>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rate_control: Option<RateControl>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub functions: Functions,
 }
@@ -1093,7 +1072,6 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             metrics: deserializer.metrics,
             scheduler: deserializer.scheduler,
             source_rate_control: deserializer.source_rate_control,
-            rate_control: deserializer.rate_control,
             functions: deserializer.functions,
         })
     }

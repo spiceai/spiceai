@@ -248,7 +248,6 @@ impl RuntimeBuilder {
 
         let http_rate_control_registry = build_http_rate_control_registry(
             spicepod_rt.source_rate_control.as_ref(),
-            spicepod_rt.rate_control.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
         )
@@ -494,7 +493,6 @@ impl Default for RuntimeBuilder {
 
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
-    rate_control: Option<&spicepod::component::runtime::RateControl>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
@@ -504,7 +502,6 @@ async fn build_http_rate_control_registry(
         if source_rate_control
             .and_then(|config| config.state_location.as_ref())
             .is_some()
-            || rate_control.is_some()
         {
             tracing::warn!(
                 "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
@@ -523,16 +520,6 @@ async fn build_http_rate_control_registry(
                         config.params.as_ref(),
                         config.refresh_interval.as_str(),
                         "runtime.source_rate_control",
-                    )
-                })
-            })
-            .or_else(|| {
-                rate_control.map(|config| {
-                    (
-                        config.state_location.as_str(),
-                        config.params.as_ref(),
-                        config.refresh_interval.as_str(),
-                        "runtime.rate_control",
                     )
                 })
             })

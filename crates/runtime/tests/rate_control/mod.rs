@@ -22,7 +22,7 @@ use runtime::{
     component::dataset::{Dataset, builder::DatasetBuilder},
     dataconnector::http_rate_control::HttpRateControlConfig,
 };
-use spicepod::component::runtime::{RateControl, Runtime as SpicepodRuntime};
+use spicepod::component::runtime::{Runtime as SpicepodRuntime, SourceRateControl};
 use url::Url;
 
 const APP_NAME: &str = "rate_control_file_state_global";
@@ -31,10 +31,11 @@ const ORIGIN_URL: &str = "https://rate-control-file-state.example.com/data";
 fn app_with_file_rate_control(state_location: &str, refresh_interval: &str) -> App {
     AppBuilder::new(APP_NAME)
         .with_runtime(SpicepodRuntime {
-            rate_control: Some(RateControl {
-                state_location: state_location.to_string(),
+            source_rate_control: Some(SourceRateControl {
+                state_location: Some(state_location.to_string()),
                 params: None,
                 refresh_interval: refresh_interval.to_string(),
+                github_concurrent_connections_limit: None,
             }),
             ..Default::default()
         })
