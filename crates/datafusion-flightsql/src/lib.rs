@@ -256,7 +256,10 @@ impl FlightSqlService {
             df
         };
 
-        let schema = std::sync::Arc::clone(df.schema().inner());
+        let raw_schema = std::sync::Arc::clone(df.schema().inner());
+        // Expand view types (Utf8View → LargeUtf8, BinaryView → LargeBinary) so
+        // that the advertised schema matches the cast batches we send below.
+        let schema = Arc::new(arrow_tools::schema::expand_views_schema(&raw_schema));
         let data_stream = df.execute_stream().await.map_err(handle_datafusion_error)?;
 
         // Pre-compute schema flight data once, matching the runtime's approach.
@@ -286,6 +289,10 @@ impl FlightSqlService {
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
                     Ok(batch) => {
+                        // Cast view types to their non-view equivalents to match
+                        // the expanded schema we advertised in GetFlightInfo.
+                        let batch = cast_view_columns(batch, &schema)
+                            .map_err(|e| Status::internal(e.to_string()))?;
                         let (dicts, batch_data) = encoder
                             .encode(
                                 &batch,
@@ -308,4 +315,42 @@ impl FlightSqlService {
 
         Ok(stream.boxed())
     }
+}
+
+/// Cast any columns whose type differs from the target schema (e.g.
+/// `Utf8View` → `LargeUtf8`).
+fn cast_view_columns(
+    batch: arrow::array::RecordBatch,
+    target_schema: &Arc<Schema>,
+) -> Result<arrow::array::RecordBatch, arrow::error::ArrowError> {
+    use arrow::compute::cast;
+
+    if batch.num_columns() != target_schema.fields().len() {
+        return Ok(batch);
+    }
+
+    if batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(target_schema.fields().iter())
+        .all(|(s, t)| s.data_type() == t.data_type())
+    {
+        return Ok(batch);
+    }
+
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(target_schema.fields().iter())
+        .map(|(col, target_field)| {
+            if col.data_type() == target_field.data_type() {
+                Ok(Arc::clone(col))
+            } else {
+                cast(col, target_field.data_type())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    arrow::array::RecordBatch::try_new(Arc::clone(target_schema), columns)
 }
