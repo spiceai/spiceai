@@ -317,7 +317,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to DockerHub
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}

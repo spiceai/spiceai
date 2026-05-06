@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use app::AppBuilder;
+use arrow::array::{Int64Array, UInt64Array};
 use futures::TryStreamExt;
 use runtime::Runtime;
 
@@ -169,16 +170,44 @@ pub(super) async fn wait_for_query_rows(
 }
 
 async fn query_row_count(rt: &Runtime, query: &str) -> Result<usize, anyhow::Error> {
+    let count_query =
+        format!("SELECT COUNT(*) AS row_count FROM ({query}) AS kafka_readiness_query");
     let query_result = rt
         .datafusion()
-        .query_builder(query)
+        .query_builder(&count_query)
         .build()
         .run()
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let data = query_result.data.try_collect::<Vec<_>>().await?;
-    Ok(data.iter().map(arrow::array::RecordBatch::num_rows).sum())
+    let batch = data
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Kafka row count query returned no batches"))?;
+    let column = batch.column(0);
+
+    if let Some(array) = column.as_any().downcast_ref::<UInt64Array>() {
+        if array.is_empty() {
+            return Err(anyhow::anyhow!("Kafka row count query returned no rows"));
+        }
+
+        return usize::try_from(array.value(0))
+            .map_err(|_| anyhow::anyhow!("Kafka row count overflowed usize"));
+    }
+
+    if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+        if array.is_empty() {
+            return Err(anyhow::anyhow!("Kafka row count query returned no rows"));
+        }
+
+        return usize::try_from(array.value(0))
+            .map_err(|_| anyhow::anyhow!("Kafka row count was negative or overflowed usize"));
+    }
+
+    Err(anyhow::anyhow!(
+        "Kafka row count query returned unexpected column type {:?}",
+        column.data_type()
+    ))
 }
 
 async fn run_and_snapshot_query(
