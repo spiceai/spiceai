@@ -219,7 +219,8 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            tokio::time::sleep(Duration::from_secs(1)).await; // Allow retention to complete
+            refresh_table(Arc::clone(&cloned_rt), "nation").await?;
+            refresh_table(Arc::clone(&cloned_rt), "taxi_trips").await?;
 
             for (sql, snapshot_name) in [
                 (

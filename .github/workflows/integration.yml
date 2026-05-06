@@ -325,12 +325,14 @@ jobs:
           username: spiceai-repo-pull
           password: ${{ secrets.AZCR_PASSWORD }}
 
-      - name: Pull the Postgres/MySQL images
+      - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           echo ${{ env.CONTAINER_REGISTRY }}
           docker pull ${{ env.CONTAINER_REGISTRY }}postgres:latest
           docker pull ${{ env.CONTAINER_REGISTRY }}mysql:latest
+          docker pull ${{ env.CONTAINER_REGISTRY }}mongo:latest
+          docker pull ${{ env.CONTAINER_REGISTRY }}gvenzl/oracle-free:latest
 
       - name: Set up Spice.ai API Key
         if: needs.check_changes.outputs.relevant_changes == 'true'

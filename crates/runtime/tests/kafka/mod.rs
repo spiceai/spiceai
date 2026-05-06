@@ -25,13 +25,13 @@ pub mod bootstrap;
 mod full_text;
 
 use bootstrap::{make_kafka_dataset, send_messages_to_kafka, start_kafka_docker_container};
-use tokio::time::sleep;
 
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
 use crate::{init_tracing, utils::test_request_context};
 
 const KAFKA_PORT: u16 = 19093;
+const KAFKA_MESSAGE_PROCESSING_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
@@ -59,9 +59,9 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
             send_messages_to_kafka(&producer, "schema_infer_test", &orders_schema_infer).await?;
 
             // Load test data that contains complex json to test 'flatten_json' param
-            let orders_schema_infer: Vec<serde_json::Value> =
+            let orders_nested: Vec<serde_json::Value> =
                 serde_json::from_str(include_str!("./test_data/orders_nested.json"))?;
-            send_messages_to_kafka(&producer, "flattent_json_test", &orders_schema_infer).await?;
+            send_messages_to_kafka(&producer, "flattent_json_test", &orders_nested).await?;
 
             let ds = make_kafka_dataset("orders", "kafka_orders", KAFKA_PORT, None);
             let options = [("schema_infer_max_records".to_string(), "3".to_string())].into();
@@ -100,8 +100,13 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
 
             runtime_ready_check(&rt).await;
 
-            // Ensure all messages are processed
-            sleep(Duration::from_secs(2)).await;
+            for (table, expected_rows) in [
+                ("kafka_orders", orders_simple.len()),
+                ("kafka_schema_infer_test", orders_schema_infer.len()),
+                ("kafka_flattent_json_test", orders_nested.len()),
+            ] {
+                wait_for_query_rows(&rt, &format!("select * from {table}"), expected_rows).await?;
+            }
 
             for table in [
                 "kafka_orders",
@@ -132,6 +137,48 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
             Ok(())
         })
         .await
+}
+
+pub(super) async fn wait_for_query_rows(
+    rt: &Runtime,
+    query: &str,
+    expected_rows: usize,
+) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start_time.elapsed() <= KAFKA_MESSAGE_PROCESSING_TIMEOUT {
+        match query_row_count(rt, query).await {
+            Ok(actual_rows) if actual_rows >= expected_rows => return Ok(()),
+            Ok(actual_rows) => {
+                last_error = Some(format!(
+                    "query returned {actual_rows} rows; expected at least {expected_rows}"
+                ));
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Timed out waiting for Kafka query to return at least {expected_rows} rows within {}s. Last error: {}",
+        KAFKA_MESSAGE_PROCESSING_TIMEOUT.as_secs(),
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
+}
+
+async fn query_row_count(rt: &Runtime, query: &str) -> Result<usize, anyhow::Error> {
+    let query_result = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let data = query_result.data.try_collect::<Vec<_>>().await?;
+    Ok(data.iter().map(|batch| batch.num_rows()).sum())
 }
 
 async fn run_and_snapshot_query(

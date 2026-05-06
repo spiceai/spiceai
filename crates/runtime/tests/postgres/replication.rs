@@ -273,11 +273,25 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     // Clean up slots so subsequent runs don't trip on orphans.
     drop(stream_a);
     drop(stream_b);
-    tokio::time::sleep(Duration::from_secs(1)).await;
     for slot in &["spice_itest_slot_r1", "spice_itest_slot_r2"] {
-        let _ = source
-            .execute("SELECT pg_drop_replication_slot($1)", &[slot])
-            .await;
+        drop_replication_slot_when_inactive(&source, slot).await;
     }
     Ok(())
+}
+
+async fn drop_replication_slot_when_inactive(source: &tokio_postgres::Client, slot: &str) {
+    let start_time = std::time::Instant::now();
+    let timeout = Duration::from_secs(10);
+
+    while start_time.elapsed() <= timeout {
+        if source
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .await
+            .is_ok()
+        {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
