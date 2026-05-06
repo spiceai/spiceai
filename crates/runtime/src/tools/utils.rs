@@ -129,6 +129,7 @@ pub async fn get_tools_with_allowlist(
     let mut seen_tool_names = HashSet::new();
 
     if opts.includes_all_available_tools() {
+        let builtin_tool_names = opts.tools_by_name();
         extend_unique_tools(
             &mut tools,
             &mut seen_tool_names,
@@ -136,6 +137,7 @@ pub async fn get_tools_with_allowlist(
                 Arc::clone(&rt),
                 &all_tools,
                 &configured_tool_names,
+                &builtin_tool_names,
                 table_allowlist,
             )
             .await,
@@ -146,21 +148,36 @@ pub async fn get_tools_with_allowlist(
     if let SpiceToolsOptions::Specific(requested_tools) = opts {
         for tt in requested_tools {
             match tt.parse::<SpiceToolsOptions>() {
-                Ok(
-                    SpiceToolsOptions::Auto
-                    | SpiceToolsOptions::All
-                    | SpiceToolsOptions::SearchRegistry,
-                ) => extend_unique_tools(
-                    &mut tools,
-                    &mut seen_tool_names,
-                    all_available_tools(
-                        Arc::clone(&rt),
-                        &all_tools,
-                        &configured_tool_names,
-                        table_allowlist.clone(),
-                    )
-                    .await,
-                ),
+                Ok(SpiceToolsOptions::Auto) => {
+                    let builtin_tool_names = SpiceToolsOptions::Auto.tools_by_name();
+                    extend_unique_tools(
+                        &mut tools,
+                        &mut seen_tool_names,
+                        all_available_tools(
+                            Arc::clone(&rt),
+                            &all_tools,
+                            &configured_tool_names,
+                            &builtin_tool_names,
+                            table_allowlist.clone(),
+                        )
+                        .await,
+                    );
+                }
+                Ok(SpiceToolsOptions::All | SpiceToolsOptions::SearchRegistry) => {
+                    let builtin_tool_names = SpiceToolsOptions::All.tools_by_name();
+                    extend_unique_tools(
+                        &mut tools,
+                        &mut seen_tool_names,
+                        all_available_tools(
+                            Arc::clone(&rt),
+                            &all_tools,
+                            &configured_tool_names,
+                            &builtin_tool_names,
+                            table_allowlist.clone(),
+                        )
+                        .await,
+                    );
+                }
                 Ok(SpiceToolsOptions::Nsql) => {
                     for tool_name in SpiceToolsOptions::Nsql.tools_by_name() {
                         match get_tool_by_name(
@@ -216,16 +233,17 @@ async fn all_available_tools(
     rt: Arc<Runtime>,
     all_tools: &HashMap<String, Tooling>,
     configured_tool_names: &HashSet<String>,
+    builtin_tool_names: &[&str],
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
 ) -> Vec<Arc<dyn SpiceModelTool>> {
     let mut tools = vec![];
     let mut seen_tool_names = HashSet::new();
 
-    for tool_name in SpiceToolsOptions::All.tools_by_name() {
+    for tool_name in builtin_tool_names {
         if let Some(resolved_tools) = get_tool_by_name(
             Arc::clone(&rt),
             all_tools,
-            tool_name,
+            *tool_name,
             table_allowlist.clone(),
         )
         .await

@@ -32,6 +32,7 @@ use crate::{
 
 use super::{
     SpiceModelTool,
+    get_current_datetime::GetCurrentDateTimeTool,
     get_readiness::GetReadinessTool,
     list_datasets::ListDatasetsTool,
     sample::{SampleTableMethod, tool::SampleDataTool},
@@ -82,6 +83,7 @@ impl BuiltinToolCatalog {
     pub(crate) fn is_builtin_tool(name: &str) -> bool {
         [
             "get_readiness",
+            "get_current_datetime",
             "search",
             "table_schema",
             "sql",
@@ -106,6 +108,9 @@ impl BuiltinToolCatalog {
         let description = match (id, description) {
             (_, Some(desc)) => desc, // Use provided description if available
             ("get_readiness", None) => "Get the readiness status of the Spice.ai runtime",
+            ("get_current_datetime", None) => {
+                "Get the current UTC date and time in ISO 8601 format"
+            }
             ("search", None) => "Search across available, searchable datasets in Spice.ai runtime",
             ("table_schema", None) => "Get the schema of the Spice.ai dataset",
             ("sql", None) => "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
@@ -144,6 +149,10 @@ impl BuiltinToolCatalog {
         match id {
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(
                 Arc::clone(&self.rt),
+                Some(name),
+                Some(description),
+            ))),
+            "get_current_datetime" => Ok(Arc::new(GetCurrentDateTimeTool::new(
                 Some(name),
                 Some(description),
             ))),
