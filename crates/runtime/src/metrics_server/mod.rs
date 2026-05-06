@@ -870,6 +870,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_http_request_health_bypasses_rate_limit() {
+        // Health probes (used by readiness checks) must never be subject to the /metrics
+        // bucket — otherwise an exhausted limiter would also fail liveness.
+        let registry = prometheus::Registry::new();
+        let rate_limiter = RateLimiter::direct(Quota::per_minute(
+            NonZeroU32::new(1).expect("test quota must be non-zero"),
+        ));
+        let metrics_request = Request::builder()
+            .uri("/metrics")
+            .body(())
+            .expect("test request should build");
+        let health_request = Request::builder()
+            .uri("/health")
+            .body(())
+            .expect("test request should build");
+
+        // Burn the only token in the bucket.
+        let first =
+            handle_http_request(&registry, None, Some(&rate_limiter), &metrics_request).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second =
+            handle_http_request(&registry, None, Some(&rate_limiter), &metrics_request).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // /health should still succeed repeatedly even with the bucket empty.
+        for _ in 0..3 {
+            let resp =
+                handle_http_request(&registry, None, Some(&rate_limiter), &health_request).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
     async fn test_handle_http_request_non_metrics_paths_return_not_found() {
         let registry = prometheus::Registry::new();
         let rate_limiter = RateLimiter::direct(Quota::per_minute(
