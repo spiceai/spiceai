@@ -243,7 +243,7 @@ async fn all_available_tools(
         if let Some(resolved_tools) = get_tool_by_name(
             Arc::clone(&rt),
             all_tools,
-            *tool_name,
+            tool_name,
             table_allowlist.clone(),
         )
         .await
