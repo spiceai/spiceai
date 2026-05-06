@@ -17,9 +17,10 @@ limitations under the License.
 //! Pretty printing utilities for Arrow `RecordBatch`es with data type display.
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::util::pretty::pretty_format_batches;
+use std::sync::Arc;
 
 /// Formats Arrow `RecordBatch`es with data types displayed below column names.
 ///
@@ -32,10 +33,48 @@ pub fn format_batches_with_types(batches: &[RecordBatch]) -> Result<String, Arro
     }
 
     let schema = batches[0].schema();
-    let formatted = pretty_format_batches(batches)?;
+    let type_strings: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| format_data_type(f.data_type()))
+        .collect();
+
+    // Pad column names so Arrow allocates enough width to fit the type strings.
+    let padded_batches = with_padded_names_for_types(batches, &type_strings)?;
+    let formatted = pretty_format_batches(&padded_batches)?;
     let output = formatted.to_string();
 
     Ok(insert_type_row(&output, &schema))
+}
+
+/// Returns copies of `batches` whose schema has each column name padded with
+/// trailing spaces so that `pretty_format_batches` will allocate a column width
+/// at least as wide as the corresponding type string.  The original schema
+/// (with unpadded names) is used for the displayed header row.
+fn with_padded_names_for_types(
+    batches: &[RecordBatch],
+    type_strings: &[String],
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let schema = batches[0].schema();
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .zip(type_strings.iter())
+        .map(|(field, type_str)| {
+            let name = field.name();
+            let padded_name = if name.len() < type_str.len() {
+                format!("{name:<width$}", width = type_str.len())
+            } else {
+                name.clone()
+            };
+            Field::new(padded_name, field.data_type().clone(), field.is_nullable())
+        })
+        .collect();
+    let padded_schema = Arc::new(Schema::new(fields));
+    batches
+        .iter()
+        .map(|batch| RecordBatch::try_new(Arc::clone(&padded_schema), batch.columns().to_vec()))
+        .collect()
 }
 
 /// Insert a type row after the header row in the formatted table,
@@ -311,5 +350,35 @@ mod tests {
         let separator = "+----+------+--+";
         let widths = parse_column_widths(separator);
         assert_eq!(widths, vec![4, 6, 2]);
+    }
+
+    #[test]
+    fn test_type_wider_than_column_name() {
+        // "id" (2 chars) with type "varchar" (7 chars): the type must not overflow its cell.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![Some("1")])),
+                Arc::new(arrow::array::StringArray::from(vec![Some("Alice")])),
+            ],
+        )
+        .expect("creating test batch");
+
+        let formatted = format_batches_with_types(&[batch]).expect("formatting should succeed");
+
+        // Every line must have the same length (borders are straight columns).
+        let lines: Vec<&str> = formatted.lines().collect();
+        let first_len = lines[0].len();
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(
+                line.len(),
+                first_len,
+                "line {i} has different width than line 0:\n{formatted}"
+            );
+        }
     }
 }
