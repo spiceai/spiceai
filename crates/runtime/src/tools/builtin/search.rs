@@ -35,6 +35,8 @@ use crate::{
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+pub(super) const DEFAULT_DESCRIPTION: &str = "Run a hybrid (vector + keyword) similarity search over datasets configured with embeddings. Use this for natural-language or semantic lookups (e.g. 'find documents about X') instead of exact SQL filtering. Provide `text` for the query; optionally restrict with `datasets` (only datasets whose `can_search_documents=true` in `list_datasets` are valid), `where_cond` (a SQL predicate without the `WHERE` keyword), `additional_columns`, and `limit`. Returns matched rows grouped per dataset with similarity scores.";
+
 pub struct SearchTool {
     name: String,
     description: String,
@@ -46,9 +48,7 @@ impl SearchTool {
     pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
             name: name.unwrap_or("search").to_string(),
-            description: description
-                .unwrap_or("Search across available, searchable datasets")
-                .to_string(),
+            description: description.unwrap_or(DEFAULT_DESCRIPTION).to_string(),
             rt,
             table_allowlist: None,
         }

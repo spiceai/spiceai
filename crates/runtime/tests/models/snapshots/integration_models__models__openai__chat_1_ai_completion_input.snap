@@ -119,7 +119,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
-        "description": "Search across available, searchable datasets in Spice.ai runtime",
+        "description": "Run a hybrid (vector + keyword) similarity search over datasets configured with embeddings. Use this for natural-language or semantic lookups (e.g. 'find documents about X') instead of exact SQL filtering. Provide `text` for the query; optionally restrict with `datasets` (only datasets whose `can_search_documents=true` in `list_datasets` are valid), `where_cond` (a SQL predicate without the `WHERE` keyword), `additional_columns`, and `limit`. Returns matched rows grouped per dataset with similarity scores.",
         "name": "search",
         "parameters": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -177,13 +177,13 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
-        "description": "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
+        "description": "Execute a read-only SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. DDL and write statements (INSERT/UPDATE/DELETE/COPY/CREATE/DROP) and session-mutating statements (PREPARE/EXECUTE/DEALLOCATE) are rejected; use `list_datasets` and `table_schema` first to discover tables and columns.",
         "name": "sql",
         "parameters": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
           "properties": {
             "query": {
-              "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query",
+              "description": "The SQL query to run, written in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.",
               "type": "string"
             }
           },
@@ -198,7 +198,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
-        "description": "Get the schema of the Spice.ai dataset",
+        "description": "Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).",
         "name": "table_schema",
         "parameters": {
           "$defs": {

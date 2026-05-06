@@ -36,7 +36,7 @@ use crate::{
         get_pg_params, get_postgres_connection_pool, get_random_port,
         start_postgres_docker_container,
     },
-    utils::{register_test_connectors, runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context, wait_until_true},
 };
 
 fn make_spiceai_dataset(path: &str, name: &str, engine: &str, retention_sql: &str) -> Dataset {
@@ -174,6 +174,32 @@ async fn refresh_table(rt: Arc<Runtime>, table_name: &str) -> Result<(), anyhow:
     Ok(())
 }
 
+async fn wait_for_query_row_count(
+    rt: Arc<Runtime>,
+    sql: &str,
+    expected_row_count: usize,
+) -> Result<(), anyhow::Error> {
+    let observed_expected_count = wait_until_true(std::time::Duration::from_secs(30), || {
+        let rt = Arc::clone(&rt);
+        async move {
+            let Ok(results) = execute_rt_sql(rt, sql).await else {
+                return false;
+            };
+
+            results.iter().map(RecordBatch::num_rows).sum::<usize>() == expected_row_count
+        }
+    })
+    .await;
+
+    if observed_expected_count {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "Timed out waiting for query to return {expected_row_count} rows: {sql}"
+        ))
+    }
+}
+
 #[tokio::test]
 async fn test_retention_sql() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -222,6 +248,19 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
 
             refresh_table(Arc::clone(&cloned_rt), "nation").await?;
             refresh_table(Arc::clone(&cloned_rt), "taxi_trips").await?;
+
+            wait_for_query_row_count(
+                Arc::clone(&cloned_rt),
+                "SELECT n_nationkey, n_name, n_regionkey FROM nation",
+                3,
+            )
+            .await?;
+            wait_for_query_row_count(
+                Arc::clone(&cloned_rt),
+                "SELECT VendorID, Airport_fee, tpep_pickup_datetime, passenger_count, trip_distance FROM taxi_trips",
+                4,
+            )
+            .await?;
 
             for (sql, snapshot_name) in [
                 (
