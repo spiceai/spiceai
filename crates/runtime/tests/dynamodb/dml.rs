@@ -165,12 +165,10 @@ async fn wait_for_query_contents(
     let last_result = compact_message(&last_result, 500);
     let last_error = last_error
         .as_deref()
-        .map(|error| compact_message(error, 500))
-        .unwrap_or_else(|| "none".to_string());
+        .map_or_else(|| "none".to_string(), |error| compact_message(error, 500));
 
     Err(anyhow::anyhow!(
-        "Timed out waiting for query contents. Required: {required:?}; forbidden: {forbidden:?}; last result: {last_result}; last error: {}",
-        last_error
+        "Timed out waiting for query contents. Required: {required:?}; forbidden: {forbidden:?}; last result: {last_result}; last error: {last_error}"
     ))
 }
 
