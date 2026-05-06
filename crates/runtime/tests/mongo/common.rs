@@ -22,12 +22,10 @@ use spicepod::{
 };
 use tracing::instrument;
 
-use crate::{
-    container_registry,
-    docker::{ContainerRunnerBuilder, RunningContainer},
-};
+use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 const MONGODB_ROOT_PASSWORD: &str = "integration-test-pw";
+const MONGODB_IMAGE: &str = "docker.io/library/mongo:latest";
 const MONGODB_DOCKER_CONTAINER: &str = "runtime-integration-test-mongo";
 const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
 const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -60,7 +58,7 @@ pub async fn start_mongodb_docker_container(
     let container_name = format!("{MONGODB_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(format!("{}mongo:latest", container_registry()))
+        .image(MONGODB_IMAGE.to_string())
         .add_port_binding(27017, port)
         .add_env_var("MONGO_INITDB_ROOT_USERNAME", "root")
         .add_env_var("MONGO_INITDB_ROOT_PASSWORD", MONGODB_ROOT_PASSWORD)

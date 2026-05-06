@@ -325,13 +325,20 @@ jobs:
           username: spiceai-repo-pull
           password: ${{ secrets.AZCR_PASSWORD }}
 
+      - name: Login to DockerHub
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           echo ${{ env.CONTAINER_REGISTRY }}
           docker pull ${{ env.CONTAINER_REGISTRY }}postgres:latest
           docker pull ${{ env.CONTAINER_REGISTRY }}mysql:latest
-          docker pull ${{ env.CONTAINER_REGISTRY }}mongo:latest
+          docker pull docker.io/library/mongo:latest
           docker pull ${{ env.CONTAINER_REGISTRY }}gvenzl/oracle-free:latest
 
       - name: Set up Spice.ai API Key
