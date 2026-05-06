@@ -123,12 +123,15 @@ pub struct KnnQuery {
 /// Top-level search response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchResponse {
+    #[serde(default)]
+    pub pit_id: Option<String>,
     pub hits: HitsEnvelope,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HitsEnvelope {
-    pub total: HitsTotal,
+    #[serde(default)]
+    pub total: Option<HitsTotal>,
     pub hits: Vec<Hit>,
 }
 
@@ -143,8 +146,15 @@ pub struct Hit {
     pub id: String,
     #[serde(default, rename = "_score")]
     pub score: Option<f64>,
+    #[serde(default)]
+    pub sort: Option<Vec<serde_json::Value>>,
     #[serde(default, rename = "_source")]
     pub source: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenPointInTimeResponse {
+    id: String,
 }
 
 // ── Client ─────────────────────────────────────────────────────────────────
@@ -321,6 +331,46 @@ impl Client {
             .context(HttpRequestSnafu)?;
         let resp = check_status(resp).await?;
         resp.json().await.context(JsonParseSnafu)
+    }
+
+    /// Open an Elasticsearch point-in-time reader for `index`.
+    pub async fn open_point_in_time(&self, index: &str, keep_alive: &str) -> Result<String> {
+        let url = format!("{}/{index}/_pit", self.base_url);
+        let resp = self
+            .auth(self.http.post(&url))
+            .query(&[("keep_alive", keep_alive)])
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        let body: OpenPointInTimeResponse = resp.json().await.context(JsonParseSnafu)?;
+        Ok(body.id)
+    }
+
+    /// Execute a raw JSON search using a point-in-time reader.
+    pub async fn search_point_in_time(&self, body: &serde_json::Value) -> Result<SearchResponse> {
+        let url = format!("{}/_search", self.base_url);
+        let resp = self
+            .auth(self.http.post(&url))
+            .json(body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
+    /// Close an Elasticsearch point-in-time reader.
+    pub async fn close_point_in_time(&self, pit_id: &str) -> Result<()> {
+        let url = format!("{}/_pit", self.base_url);
+        let resp = self
+            .auth(self.http.delete(&url))
+            .json(&serde_json::json!({ "id": pit_id }))
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        check_status(resp).await?;
+        Ok(())
     }
 
     // ── Index Management ───────────────────────────────────────────────
@@ -573,6 +623,9 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
     async fn get_mapping(&self, index: &str) -> Result<MappingResponse>;
     async fn search(&self, index: &str, body: &SearchRequest) -> Result<SearchResponse>;
     async fn search_raw(&self, index: &str, body: &serde_json::Value) -> Result<SearchResponse>;
+    async fn open_point_in_time(&self, index: &str, keep_alive: &str) -> Result<String>;
+    async fn search_point_in_time(&self, body: &serde_json::Value) -> Result<SearchResponse>;
+    async fn close_point_in_time(&self, pit_id: &str) -> Result<()>;
     async fn index_exists(&self, index: &str) -> Result<bool>;
     async fn create_index(
         &self,
@@ -614,6 +667,18 @@ impl Elasticsearch for Client {
 
     async fn search_raw(&self, index: &str, body: &serde_json::Value) -> Result<SearchResponse> {
         self.search_raw(index, body).await
+    }
+
+    async fn open_point_in_time(&self, index: &str, keep_alive: &str) -> Result<String> {
+        Client::open_point_in_time(self, index, keep_alive).await
+    }
+
+    async fn search_point_in_time(&self, body: &serde_json::Value) -> Result<SearchResponse> {
+        Client::search_point_in_time(self, body).await
+    }
+
+    async fn close_point_in_time(&self, pit_id: &str) -> Result<()> {
+        Client::close_point_in_time(self, pit_id).await
     }
 
     async fn index_exists(&self, index: &str) -> Result<bool> {
