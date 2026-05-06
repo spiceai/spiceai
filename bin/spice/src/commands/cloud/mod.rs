@@ -23,7 +23,9 @@ use crate::context::RuntimeContext;
 use crate::error::{InvalidArgumentSnafu, Result};
 use crate::output::{OutputFormat, TableOutput, write_json};
 use clap::{Args, Subcommand};
+use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
+use std::{fmt, io::IsTerminal};
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
@@ -131,11 +133,102 @@ pub struct RegionsArgs {
     pub output: OutputFormat,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct LoginArgs {
-    /// Skip opening the browser and print the auth URL instead
+    #[command(subcommand)]
+    pub method: Option<LoginMethod>,
+}
+
+impl fmt::Debug for LoginArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoginArgs")
+            .field("method", &self.method)
+            .finish()
+    }
+}
+
+#[derive(Subcommand)]
+pub enum LoginMethod {
+    /// Log in with your Spice Cloud subscription in a browser
+    Subscription(SubscriptionLoginArgs),
+
+    /// Log in with a Spice Cloud personal access token
+    #[command(name = "pat")]
+    Pat(PatLoginArgs),
+
+    /// Log in with OAuth client credentials for automation
+    Api(ApiLoginArgs),
+}
+
+impl fmt::Debug for LoginMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Subscription(args) => f.debug_tuple("Subscription").field(args).finish(),
+            Self::Pat(args) => f.debug_tuple("Pat").field(args).finish(),
+            Self::Api(args) => f.debug_tuple("Api").field(args).finish(),
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct SubscriptionLoginArgs {
+    /// Don't open a browser; print the URL and a one-time code to enter on
+    /// another device. Useful over SSH or in headless shells.
     #[arg(long)]
-    pub no_browser: bool,
+    pub device: bool,
+}
+
+#[derive(Args)]
+pub struct PatLoginArgs {
+    /// Personal access token. Omit to enter it securely.
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_PAT",
+        value_name = "TOKEN",
+        help_heading = "PAT Login Options"
+    )]
+    pub token: Option<String>,
+}
+
+impl fmt::Debug for PatLoginArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PatLoginArgs")
+            .field("token", &self.token.as_deref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+#[derive(Args)]
+pub struct ApiLoginArgs {
+    /// OAuth client ID. Omit to enter it interactively.
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_CLIENT_ID",
+        value_name = "CLIENT_ID",
+        help_heading = "API Login Options"
+    )]
+    pub client_id: Option<String>,
+
+    /// OAuth client secret. Omit to enter it securely.
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_CLIENT_SECRET",
+        value_name = "CLIENT_SECRET",
+        help_heading = "API Login Options"
+    )]
+    pub client_secret: Option<String>,
+}
+
+impl fmt::Debug for ApiLoginArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiLoginArgs")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_deref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Args, Debug)]
@@ -530,7 +623,217 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
 // ============================================================================
 
 async fn execute_login(args: &LoginArgs) -> Result<()> {
+    match &args.method {
+        Some(LoginMethod::Subscription(args)) => execute_login_device_flow(!args.device).await,
+        Some(LoginMethod::Pat(args)) => execute_login_pat(args).await,
+        Some(LoginMethod::Api(args)) => execute_login_api(args).await,
+        None => execute_login_with_chooser().await,
+    }
+}
+
+async fn execute_login_with_chooser() -> Result<()> {
+    ensure_login_chooser_tty(std::io::stdin().is_terminal())?;
+
+    let items = [
+        "Subscription Login (browser)",
+        "Subscription Login (device code, no browser)",
+        "Personal Access Token (PAT)",
+        "API Login (OAuth client)",
+    ];
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("How would you like to log in to Spice Cloud?")
+        .items(items)
+        .default(0)
+        .interact()
+        .map_err(|err| crate::error::Error::InvalidArgument {
+            message: format!("Failed to read login selection: {err}"),
+        })?;
+
+    match selection {
+        0 => execute_login_device_flow(true).await,
+        1 => execute_login_device_flow(false).await,
+        2 => execute_login_pat(&PatLoginArgs { token: None }).await,
+        3 => {
+            execute_login_api(&ApiLoginArgs {
+                client_id: None,
+                client_secret: None,
+            })
+            .await
+        }
+        _ => InvalidArgumentSnafu {
+            message: "Invalid login selection".to_string(),
+        }
+        .fail(),
+    }
+}
+
+fn ensure_login_chooser_tty(is_terminal: bool) -> Result<()> {
+    if !is_terminal {
+        return InvalidArgumentSnafu {
+            message: "Choose a login type explicitly when running non-interactively: 'spice cloud login subscription', 'spice cloud login subscription --device', 'spice cloud login pat', or 'spice cloud login api'",
+        }
+        .fail();
+    }
+
+    Ok(())
+}
+
+async fn execute_login_pat(args: &PatLoginArgs) -> Result<()> {
+    let token = resolve_string_or_prompt(
+        args.token.as_deref(),
+        "PAT",
+        "--token",
+        "SPICE_CLOUD_PAT",
+        "Spice Cloud personal access token",
+        true,
+    )?;
+
+    save_token_and_print_login_result(&token).await
+}
+
+async fn execute_login_api(args: &ApiLoginArgs) -> Result<()> {
+    let client_id = resolve_string_or_prompt(
+        args.client_id.as_deref(),
+        "OAuth client ID",
+        "--client-id",
+        "SPICE_CLOUD_CLIENT_ID",
+        "OAuth client ID",
+        false,
+    )?;
+    let client_secret = resolve_string_or_prompt(
+        args.client_secret.as_deref(),
+        "OAuth client secret",
+        "--client-secret",
+        "SPICE_CLOUD_CLIENT_SECRET",
+        "OAuth client secret",
+        true,
+    )?;
+
+    let client = CloudClient::new_unauthenticated()?;
+    let token = client
+        .exchange_client_credentials(&client_id, &client_secret)
+        .await?;
+
+    save_token_and_print_login_result(&token).await
+}
+
+fn resolve_string_or_prompt(
+    value: Option<&str>,
+    label: &str,
+    flag: &str,
+    env_var: &str,
+    prompt: &str,
+    secret: bool,
+) -> Result<String> {
+    resolve_string_or_prompt_with_terminal(
+        value,
+        label,
+        flag,
+        env_var,
+        prompt,
+        secret,
+        std::io::stdin().is_terminal(),
+    )
+}
+
+fn resolve_string_or_prompt_with_terminal(
+    value: Option<&str>,
+    label: &str,
+    flag: &str,
+    env_var: &str,
+    prompt: &str,
+    secret: bool,
+    is_terminal: bool,
+) -> Result<String> {
+    if let Some(value) = value {
+        if value.is_empty() {
+            return InvalidArgumentSnafu {
+                message: format!("{label} cannot be empty."),
+            }
+            .fail();
+        }
+
+        return Ok(value.to_string());
+    }
+
+    // The chooser path constructs args structs with all fields set to None,
+    // bypassing Clap's env-var resolution. Re-resolve here so chooser-based
+    // PAT/API logins respect the configured env vars.
+    if let Ok(env_value) = std::env::var(env_var)
+        && !env_value.is_empty()
+    {
+        return Ok(env_value);
+    }
+
+    if !is_terminal {
+        return InvalidArgumentSnafu {
+            message: format!("{label} is required. Provide {flag} or set {env_var}."),
+        }
+        .fail();
+    }
+
+    let value = if secret {
+        Password::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .interact()
+            .map_err(|err| crate::error::Error::InvalidArgument {
+                message: format!("Failed to read {label}: {err}"),
+            })?
+    } else {
+        Input::<String>::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .interact_text()
+            .map_err(|err| crate::error::Error::InvalidArgument {
+                message: format!("Failed to read {label}: {err}"),
+            })?
+    };
+
+    if value.is_empty() {
+        return InvalidArgumentSnafu {
+            message: format!("{label} cannot be empty."),
+        }
+        .fail();
+    }
+
+    Ok(value)
+}
+
+async fn save_token_and_print_login_result(token: &str) -> Result<()> {
     use crate::commands::login::merge_auth_config;
+
+    let authed_client = CloudClient::with_token(token)?;
+    let auth_context_result = authed_client.get_auth_context().await;
+
+    merge_auth_config("SPICEAI", &[("TOKEN", token)])?;
+
+    match auth_context_result {
+        Ok(context) => {
+            if let Some(api_key) = context.app_api_key {
+                merge_auth_config("SPICEAI", &[("API_KEY", &api_key)])?;
+            }
+
+            println!();
+            println!(
+                "\x1b[32m✓ Successfully logged in to Spice Cloud as {} ({})\x1b[0m",
+                context.username, context.email
+            );
+        }
+        Err(err) => {
+            println!();
+            println!(
+                "\x1b[33m! Login token saved, but Spice Cloud could not verify the authenticated user context: {err}\x1b[0m"
+            );
+            println!(
+                "\x1b[33m! Subsequent cloud commands may fail if the token is invalid or unauthorized.\x1b[0m"
+            );
+        }
+    }
+
+    print_post_login_help();
+    Ok(())
+}
+
+async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
     use rand::RngExt;
 
     // Generate auth code
@@ -546,16 +849,24 @@ async fn execute_login(args: &LoginArgs) -> Result<()> {
     let client = CloudClient::new_unauthenticated()?;
     let auth_url = client.get_auth_url(&auth_code);
 
-    println!("Opening Spice Cloud authorization page in your default browser...");
+    if open_browser {
+        println!("Opening Spice Cloud authorization page in your default browser...");
+    } else {
+        println!("Complete Spice Cloud device login in a browser.");
+    }
     println!(
         "\nYour auth code:\n\n  {}-{}\n",
         &auth_code[..4],
         &auth_code[4..]
     );
-    println!("If the browser does not open, visit the following URL manually:");
+    if open_browser {
+        println!("If the browser does not open, visit the following URL manually:");
+    } else {
+        println!("Open this URL in a browser:");
+    }
     println!("\n  {auth_url}\n");
 
-    if !args.no_browser {
+    if open_browser {
         let _ = open::that(&auth_url);
     }
 
@@ -584,38 +895,21 @@ async fn execute_login(args: &LoginArgs) -> Result<()> {
             }
 
             if let Some(token) = response.access_token {
-                // Save the token
-                merge_auth_config("SPICEAI", &[("TOKEN", &token)])?;
-
-                // Get user info
-                let authed_client = CloudClient::new()?;
-                if let Ok(context) = authed_client.get_auth_context().await {
-                    if let Some(api_key) = context.app_api_key {
-                        merge_auth_config("SPICEAI", &[("API_KEY", &api_key)])?;
-                    }
-                    println!();
-                    println!(
-                        "\x1b[32m✓ Successfully logged in to Spice Cloud as {} ({})\x1b[0m",
-                        context.username, context.email
-                    );
-                } else {
-                    println!("\n\x1b[32m✓ Successfully logged in to Spice Cloud\x1b[0m");
-                }
-
-                println!();
-                println!(
-                    "You can now use 'spice cloud' commands to manage your apps and deployments."
-                );
-                println!();
-                println!("Quick start:");
-                println!("  spice cloud apps              - List your apps");
-                println!("  spice cloud create app <name> - Create a new app");
-                println!("  spice cloud deploy --app <org/app> - Deploy your app");
-
-                return Ok(());
+                return save_token_and_print_login_result(&token).await;
             }
         }
     }
+}
+
+fn print_post_login_help() {
+    println!();
+    println!("You can now use 'spice cloud' commands to manage your apps and deployments.");
+    println!();
+    println!("Quick start:");
+    println!("  spice cloud apps              - List your apps");
+    println!("  spice cloud create app <name> - Create a new app");
+    println!("  spice cloud deploy --app <org/app> - Deploy your app");
+    println!();
 }
 
 fn execute_logout() -> Result<()> {
@@ -1339,4 +1633,100 @@ fn require_app(flag_value: Option<&str>) -> Result<String> {
         message: "App name is required. Use --app <org/app> or run 'spice cloud link' to link an app",
     }
     .fail()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_chooser_requires_tty() {
+        let err = ensure_login_chooser_tty(false).expect_err("non-TTY chooser should fail");
+
+        assert!(
+            err.to_string()
+                .contains("Choose a login type explicitly when running non-interactively"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_uses_non_empty_value() {
+        let value = resolve_string_or_prompt_with_terminal(
+            Some("client-id"),
+            "OAuth client ID",
+            "--client-id",
+            "SPICE_CLOUD_CLIENT_ID",
+            "OAuth client ID",
+            false,
+            false,
+        )
+        .expect("provided value should be accepted");
+
+        assert_eq!(value, "client-id");
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_rejects_empty_value() {
+        let err = resolve_string_or_prompt_with_terminal(
+            Some(""),
+            "OAuth client ID",
+            "--client-id",
+            "SPICE_CLOUD_CLIENT_ID",
+            "OAuth client ID",
+            false,
+            false,
+        )
+        .expect_err("empty value should fail");
+
+        assert!(
+            err.to_string().contains("OAuth client ID cannot be empty."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_requires_value_when_non_interactive() {
+        let err = resolve_string_or_prompt_with_terminal(
+            None,
+            "OAuth client ID",
+            "--client-id",
+            "SPICE_CLOUD_CLIENT_ID",
+            "OAuth client ID",
+            false,
+            false,
+        )
+        .expect_err("missing value should fail without a TTY");
+
+        assert!(
+            err.to_string().contains(
+                "OAuth client ID is required. Provide --client-id or set SPICE_CLOUD_CLIENT_ID."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_falls_back_to_env_var() {
+        // Use a unique env var name so the test does not depend on host state.
+        let env_var = "SPICE_CLOUD_TEST_RESOLVE_FALLBACK";
+        // SAFETY: Setting environment variable for test purposes only.
+        unsafe { std::env::set_var(env_var, "from-env") };
+
+        let value = resolve_string_or_prompt_with_terminal(
+            None,
+            "test value",
+            "--test",
+            env_var,
+            "test value",
+            false,
+            false,
+        )
+        .expect("env var should be used when value is None");
+
+        // SAFETY: Removing environment variable for test purposes only.
+        unsafe { std::env::remove_var(env_var) };
+
+        assert_eq!(value, "from-env");
+    }
 }
