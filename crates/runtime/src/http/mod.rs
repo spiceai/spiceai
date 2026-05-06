@@ -132,13 +132,17 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
-    // Resolve effective MCP config: programmatic Config override takes precedence over App config.
+    // Resolve effective MCP config using the same whole-object precedence as builder.rs:
+    // if Config.runtime is set, its mcp field wins (even if None — the caller has explicitly
+    // replaced the runtime config and clearing mcp is intentional). Only fall back to
+    // app.runtime.mcp when no programmatic Config.runtime override is present at all.
     #[cfg(feature = "mcp")]
-    let mcp_config: Option<spicepod::component::runtime::McpConfig> = config
-        .runtime
-        .as_ref()
-        .and_then(|r| r.mcp.clone())
-        .or_else(|| app.as_ref().and_then(|a| a.runtime.mcp.clone()));
+    let mcp_config: Option<spicepod::component::runtime::McpConfig> =
+        if let Some(override_runtime) = config.runtime.as_ref() {
+            override_runtime.mcp.clone()
+        } else {
+            app.as_ref().and_then(|a| a.runtime.mcp.clone())
+        };
     let auth_layer = auth_provider.map(AuthLayer::new);
     let routes = routes::routes(
         &rt,
