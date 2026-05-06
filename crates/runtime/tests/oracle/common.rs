@@ -28,8 +28,10 @@ const ORACLE_IMAGE: &str = "gvenzl/oracle-free:latest";
 
 fn oracle_image() -> String {
     std::env::var("CONTAINER_REGISTRY")
-        .map(|registry| format!("{registry}{ORACLE_IMAGE}"))
-        .unwrap_or_else(|_| ORACLE_IMAGE.to_string())
+        .ok()
+        .filter(|registry| !registry.is_empty())
+        .map(|registry| format!("{}/{ORACLE_IMAGE}", registry.trim_end_matches('/')))
+        .unwrap_or_else(|| ORACLE_IMAGE.to_string())
 }
 
 pub fn make_oracle_dataset(path: &str, name: &str, port: u16) -> Dataset {

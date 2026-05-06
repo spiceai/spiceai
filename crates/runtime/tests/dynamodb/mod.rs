@@ -740,23 +740,25 @@ async fn wait_for_table_deleted(
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(60);
+    let mut last_error = None;
 
     while start_time.elapsed() <= timeout {
-        if client
-            .describe_table()
-            .table_name(table_name)
-            .send()
-            .await
-            .is_err()
-        {
-            return Ok(());
+        match client.describe_table().table_name(table_name).send().await {
+            Ok(_) => {}
+            Err(aws_sdk_dynamodb::error::SdkError::ServiceError(error))
+                if error.err().is_resource_not_found_exception() =>
+            {
+                return Ok(());
+            }
+            Err(error) => last_error = Some(error.to_string()),
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     Err(anyhow::anyhow!(
-        "Timed out waiting for DynamoDB table {table_name} to be deleted"
+        "Timed out waiting for DynamoDB table {table_name} to be deleted. Last error: {}",
+        last_error.unwrap_or_else(|| "none".to_string())
     ))
 }
 

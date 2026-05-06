@@ -142,22 +142,29 @@ async fn wait_for_query_contents(
     let start_time = std::time::Instant::now();
     let timeout = Duration::from_secs(30);
     let mut last_result = String::new();
+    let mut last_error = None;
 
     while start_time.elapsed() <= timeout {
-        let result = run_query(rt, query).await?;
-        let has_required = required.iter().all(|value| result.contains(value));
-        let has_no_forbidden = forbidden.iter().all(|value| !result.contains(value));
+        match run_query(rt, query).await {
+            Ok(result) => {
+                let has_required = required.iter().all(|value| result.contains(value));
+                let has_no_forbidden = forbidden.iter().all(|value| !result.contains(value));
 
-        if has_required && has_no_forbidden {
-            return Ok(result);
+                if has_required && has_no_forbidden {
+                    return Ok(result);
+                }
+
+                last_result = result;
+            }
+            Err(error) => last_error = Some(error.to_string()),
         }
 
-        last_result = result;
         sleep(Duration::from_millis(100)).await;
     }
 
     Err(anyhow::anyhow!(
-        "Timed out waiting for query contents. Required: {required:?}; forbidden: {forbidden:?}; last result: {last_result}"
+        "Timed out waiting for query contents. Required: {required:?}; forbidden: {forbidden:?}; last result: {last_result}; last error: {}",
+        last_error.unwrap_or_else(|| "none".to_string())
     ))
 }
 
