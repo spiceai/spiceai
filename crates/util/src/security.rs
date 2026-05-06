@@ -200,6 +200,21 @@ pub fn quote_table_reference(tbl: &TableReference) -> String {
     }
 }
 
+/// Unconditionally wraps a column name in double quotes, escaping any embedded
+/// double quotes per the SQL standard (by doubling them).
+///
+/// Unlike [`datafusion::common::utils::quote_identifier`], which quotes based on
+/// character-composition and valid-identifier checks (first character, allowed
+/// character set), this function **always** quotes. DataFusion's
+/// `quote_identifier` does not account for SQL reserved keywords (`INTERVAL`,
+/// `DATE`, `ORDER`, `GROUP`, `SELECT`, `TABLE`, `USER`, `TYPE`, `KEY`, `VALUE`,
+/// etc.). A column named `interval` passes its validity check unquoted, causing
+/// `sqlparser` to misparse it as the `INTERVAL` keyword.
+#[must_use = "quoted identifier must be used in SQL queries to prevent injection"]
+pub fn quote_column_identifier(column: &str) -> String {
+    format!("\"{}\"", column.replace('"', "\"\""))
+}
+
 /// Calculates the maximum nesting depth of a JSON value.
 ///
 /// This function is critical for preventing stack overflow attacks from maliciously

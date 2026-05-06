@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow_schema::DataType;
-use datafusion::{common::utils::quote_identifier, sql::TableReference};
+use datafusion::sql::TableReference;
 use itertools::Itertools;
 use std::{
     fmt::{Display, Formatter},
@@ -23,7 +23,7 @@ use std::{
 };
 use tracing::Span;
 use tracing_futures::Instrument;
-use util::security::quote_table_reference;
+use util::security::{quote_column_identifier, quote_table_reference};
 
 use crate::datafusion::DataFusion;
 use arrow::compute::concat;
@@ -73,7 +73,7 @@ impl DistinctColumnsParams {
         // Ensure that we still get `n` rows when `len(distinct(col)) < n`, whilst
         // stilling getting all possible distinct values.
         let tbl_quoted = quote_table_reference(tbl);
-        let col = quote_identifier(column);
+        let col = quote_column_identifier(column);
         Self::_sample_col(
             Arc::clone(&df),
             &format!(
@@ -98,6 +98,7 @@ impl DistinctColumnsParams {
         n: usize,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         let tbl_quoted = quote_table_reference(tbl);
+        let col = quote_column_identifier(col);
         Self::_sample_col(
             Arc::clone(&df),
             &format!("SELECT {col} FROM {tbl_quoted} LIMIT {n}"),
