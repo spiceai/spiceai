@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
 use spicepod::{
@@ -25,7 +25,10 @@ use tracing::instrument;
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 const MONGODB_ROOT_PASSWORD: &str = "integration-test-pw";
+const MONGODB_IMAGE: &str = "docker.io/library/mongo:latest";
 const MONGODB_DOCKER_CONTAINER: &str = "runtime-integration-test-mongo";
+const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
@@ -55,7 +58,7 @@ pub async fn start_mongodb_docker_container(
     let container_name = format!("{MONGODB_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image("mongo:latest".to_string())
+        .image(MONGODB_IMAGE.to_string())
         .add_port_binding(27017, port)
         .add_env_var("MONGO_INITDB_ROOT_USERNAME", "root")
         .add_env_var("MONGO_INITDB_ROOT_PASSWORD", MONGODB_ROOT_PASSWORD)
@@ -75,11 +78,38 @@ pub async fn start_mongodb_docker_container(
             start_interval: None,
         })
         .build()?
-        .run(None)
+        .run(Some(MONGODB_CONTAINER_START_TIMEOUT))
         .await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    wait_for_mongodb_host_port(port).await?;
     Ok(running_container)
+}
+
+async fn wait_for_mongodb_host_port(port: u16) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start_time.elapsed() <= MONGODB_HOST_PORT_READY_TIMEOUT {
+        match get_mongodb_client(port).await {
+            Ok(client) => match client
+                .database("admin")
+                .run_command(mongodb::bson::doc! { "ping": 1 })
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = Some(error.to_string()),
+            },
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "MongoDB container started but host port {port} was not ready within {}s. Last error: {}",
+        MONGODB_HOST_PORT_READY_TIMEOUT.as_secs(),
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
 }
 
 #[instrument]

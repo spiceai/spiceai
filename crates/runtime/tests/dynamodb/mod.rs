@@ -34,7 +34,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_credential_bridge::default_aws_config;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
-    ScalarAttributeType,
+    ScalarAttributeType, TableStatus,
 };
 use serde_json::json;
 use spicepod::semantic::Column;
@@ -734,14 +734,68 @@ pub async fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::E
     Ok(client)
 }
 
+async fn wait_for_table_deleted(
+    client: &aws_sdk_dynamodb::Client,
+    table_name: &str,
+) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(60);
+    let mut last_error = None;
+
+    while start_time.elapsed() <= timeout {
+        match client.describe_table().table_name(table_name).send().await {
+            Ok(_) => {}
+            Err(aws_sdk_dynamodb::error::SdkError::ServiceError(error))
+                if error.err().is_resource_not_found_exception() =>
+            {
+                return Ok(());
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Timed out waiting for DynamoDB table {table_name} to be deleted. Last error: {}",
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
+}
+
+async fn wait_for_table_active(
+    client: &aws_sdk_dynamodb::Client,
+    table_name: &str,
+) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(60);
+    let mut last_status = None;
+
+    while start_time.elapsed() <= timeout {
+        if let Ok(output) = client.describe_table().table_name(table_name).send().await
+            && let Some(status) = output.table().and_then(|table| table.table_status())
+        {
+            if status == &TableStatus::Active {
+                return Ok(());
+            }
+            last_status = Some(format!("{status:?}"));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Timed out waiting for DynamoDB table {table_name} to become active. Last status: {}",
+        last_status.unwrap_or_else(|| "unknown".to_string())
+    ))
+}
+
 async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
     let client = get_dynamodb_client().await?;
 
     tracing::info!("Initializing test table: {}", table_name);
 
     let _ = client.delete_table().table_name(table_name).send().await;
-
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    wait_for_table_deleted(&client, table_name).await?;
 
     client
         .create_table()
@@ -776,7 +830,7 @@ async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
 
     // Wait for table to be active
     tracing::info!("Waiting for table to become active...");
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    wait_for_table_active(&client, table_name).await?;
 
     // Insert test items with comprehensive type coverage
 

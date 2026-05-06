@@ -1449,16 +1449,20 @@ impl Runtime {
 
         let start_time = Instant::now();
 
-        // shutdown all running components except the HTTP and Metrics servers
+        // Shutdown running components in phases so request-serving tasks drain
+        // before query execution resources are cleaned up.
         let mut runtime_tasks = self.tasks.write().await;
 
-        // HTTP and METRICS servers must be shutdown last
+        // Query-serving tasks, including HTTP and Flight, must drain before
+        // DataFusion cleanup so in-flight queries still have access to their
+        // execution resources during graceful shutdown. Metrics can stay up
+        // until the end for health and observability during shutdown.
         let mut first_shutdown_group = Vec::new();
         let mut last_shutdown_group = Vec::new();
 
         for (name, handle) in runtime_tasks.drain() {
             match name.as_str() {
-                HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
+                METRICS_SERVER => last_shutdown_group.push((name, handle)),
                 _ => first_shutdown_group.push((name, handle)),
             }
         }
@@ -1487,11 +1491,11 @@ impl Runtime {
         document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
-        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        // group includes only Metrics endpoints.
         let elapsed = start_time.elapsed();
         let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
-        // Shutdown HTTP & Metrics servers last
+        // Shutdown Metrics server last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {

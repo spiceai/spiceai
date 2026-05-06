@@ -22,8 +22,10 @@ limitations under the License.
 //! - `GET /v1/queries/{query_id}/status` - Get query status only
 //! - `GET /v1/queries/{query_id}/results` - Get full results (with pagination)
 //! - `GET /v1/queries/{query_id}/results/chunks/{chunk_index}` - Get a specific result chunk
-//! - `POST /v1/queries/{query_id}/cancel` - Cancel a running query
+//! - `POST /v1/queries/{query_id}/cancel` - Cancel a running async query
 //! - `GET /v1/queries` - List all queries
+//! - `GET /v1/sql/active` - List active synchronous queries
+//! - `POST /v1/sql/{query_id}/cancel` - Cancel an active synchronous query
 
 use std::sync::Arc;
 
@@ -246,10 +248,32 @@ pub struct QuerySummary {
     pub query_id: String,
     /// Current status.
     pub status: JobStatus,
-    /// SQL preview (first 100 chars).
+    /// SQL preview (up to 100 chars, including an ellipsis when truncated).
     pub sql_preview: String,
     /// When created (ISO 8601).
     pub created_at: String,
+}
+
+/// Summary of an active (in-flight) synchronous query.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ActiveQuerySummary {
+    /// Query ID (UUID as string).
+    pub query_id: String,
+    /// Protocol this query was submitted through (http, flight, flightsql, internal).
+    pub protocol: String,
+    /// SQL preview (up to 100 chars, including an ellipsis when truncated).
+    pub sql_preview: String,
+    /// When the query began execution, in milliseconds since epoch.
+    pub started_at_ms: u64,
+}
+
+/// Response for listing active sync queries.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ListActiveQueriesResponse {
+    pub queries: Vec<ActiveQuerySummary>,
+    pub total_count: usize,
 }
 
 /// Response object for the query status route
@@ -261,6 +285,16 @@ pub struct StatusResponse {
     /// Optional error details if the query failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorResponse>,
+}
+
+/// Response for cancelling an active synchronous query.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct CancelActiveQueryResponse {
+    /// Query ID (UUID as string).
+    pub query_id: String,
+    /// Cancellation status.
+    pub status: String,
 }
 
 /// Submit a new SQL query for async execution.
@@ -600,7 +634,7 @@ pub(crate) async fn get_chunk(
     }
 }
 
-/// Cancel a running query.
+/// Cancel a running async query.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/queries/{query_id}/cancel",
@@ -636,6 +670,108 @@ pub(crate) async fn cancel(
         }
         Err(e) => error_to_response(&e),
     }
+}
+
+/// Cancel an active synchronous query known to this runtime.
+///
+/// This covers queries running behind `/v1/sql`, `FlightSQL`, NSQL, `/v1/search`,
+/// and tool-driven SQL.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/v1/sql/{query_id}/cancel",
+    operation_id = "cancel_active_sql_query",
+    tag = "SQL",
+    params(
+        ("query_id" = String, Path, description = "Query ID")
+    ),
+    responses(
+        (status = 200, description = "Active SQL query cancelled", body = CancelActiveQueryResponse),
+        (status = 400, description = "Invalid query ID"),
+        (status = 403, description = "API key does not allow write access"),
+        (status = 404, description = "Active SQL query not found")
+    )
+))]
+pub(crate) async fn cancel_active(
+    Extension(rt): Extension<Arc<Runtime>>,
+    Path(query_id): Path<String>,
+) -> Response {
+    if let Some(response) = super::require_write_access().await {
+        return response;
+    }
+
+    let parsed_uuid = match uuid::Uuid::parse_str(&query_id) {
+        Ok(uuid) => uuid,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid query_id (expected UUID): {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if rt.df.query_cancel_registry().cancel(parsed_uuid) {
+        return (
+            StatusCode::OK,
+            Json(CancelActiveQueryResponse {
+                query_id,
+                status: "cancelled".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": format!("Active SQL query '{query_id}' not found"),
+        })),
+    )
+        .into_response()
+}
+
+/// List currently-active synchronous queries known to this runtime.
+///
+/// This reports queries running behind `/v1/sql`, `FlightSQL`, NSQL, `/v1/search`,
+/// and tool-driven SQL. Async jobs queries are reported via `GET /v1/queries`.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/sql/active",
+    operation_id = "list_active_queries",
+    tag = "SQL",
+    responses(
+        (status = 200, description = "List of active sync queries", body = ListActiveQueriesResponse),
+        (status = 403, description = "API key does not allow write access"),
+    )
+))]
+pub(crate) async fn list_active(Extension(rt): Extension<Arc<Runtime>>) -> Response {
+    if let Some(response) = super::require_write_access().await {
+        return response;
+    }
+
+    let registry = rt.df.query_cancel_registry();
+    let queries: Vec<ActiveQuerySummary> = registry
+        .list()
+        .into_iter()
+        .map(|info| ActiveQuerySummary {
+            query_id: info.query_id.to_string(),
+            protocol: info.protocol.as_str().to_string(),
+            sql_preview: info.sql_preview.to_string(),
+            started_at_ms: info.started_at_ms,
+        })
+        .collect();
+
+    let total_count = queries.len();
+    (
+        StatusCode::OK,
+        Json(ListActiveQueriesResponse {
+            queries,
+            total_count,
+        }),
+    )
+        .into_response()
 }
 
 /// List all queries.
@@ -855,5 +991,161 @@ fn ms_to_iso8601(ms: u64) -> String {
             "Invalid Unix timestamp; returning sentinel ISO 8601 string"
         );
         format!("INVALID_TIMESTAMP({ms})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use app::spicepod::component::runtime::ApiKey;
+    use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+    use runtime_request_context::{Protocol, RequestContextBuilder};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    async fn test_runtime() -> Arc<Runtime> {
+        Arc::new(Runtime::builder().build().await)
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body should be readable");
+        serde_json::from_slice(&body).expect("response body should be valid JSON")
+    }
+
+    #[tokio::test]
+    async fn list_active_requires_write_access() {
+        let rt = test_runtime().await;
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Http).build());
+        context
+            .set_auth_principal(Arc::new(ApiKey::ReadOnly {
+                key: "read-only".to_string(),
+            }) as AuthPrincipalRef)
+            .expect("auth principal should be set");
+
+        let response = context.scope(list_active(Extension(rt))).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cancel_active_requires_write_access() {
+        let rt = test_runtime().await;
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Http).build());
+        context
+            .set_auth_principal(Arc::new(ApiKey::ReadOnly {
+                key: "read-only".to_string(),
+            }) as AuthPrincipalRef)
+            .expect("auth principal should be set");
+
+        let response = context
+            .scope(cancel_active(
+                Extension(rt),
+                Path(Uuid::new_v4().to_string()),
+            ))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cancel_active_rejects_invalid_uuid() {
+        let rt = test_runtime().await;
+
+        let response = cancel_active(Extension(rt), Path("not-a-uuid".to_string())).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cancel_active_returns_not_found_for_missing_query() {
+        let rt = test_runtime().await;
+
+        let response = cancel_active(Extension(rt), Path(Uuid::new_v4().to_string())).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancel_active_cancels_registered_query() {
+        let rt = test_runtime().await;
+        let query_id = Uuid::new_v4();
+        let token = CancellationToken::new();
+        let registry = rt.df.query_cancel_registry();
+        let _guard = registry.register(query_id, "SELECT 1", Protocol::Http, token.clone());
+
+        let response = cancel_active(Extension(rt), Path(query_id.to_string())).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(token.is_cancelled());
+        let body = response_json(response).await;
+        assert_eq!(body["query_id"], query_id.to_string());
+        assert_eq!(body["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn list_active_returns_stable_truncated_summaries() {
+        let rt = test_runtime().await;
+        let registry = rt.df.query_cancel_registry();
+        let long_query_id = Uuid::from_u128(2);
+        let short_query_id = Uuid::from_u128(1);
+        let long_sql = format!("SELECT '{}'", "x".repeat(160));
+
+        let _long_guard = registry.register(
+            long_query_id,
+            &long_sql,
+            Protocol::Http,
+            CancellationToken::new(),
+        );
+        let _short_guard = registry.register(
+            short_query_id,
+            "SELECT 1",
+            Protocol::Flight,
+            CancellationToken::new(),
+        );
+
+        let response = list_active(Extension(rt)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["total_count"], 2);
+        let queries = body["queries"]
+            .as_array()
+            .expect("queries should be an array");
+        assert!(queries.windows(2).all(|window| {
+            let left = &window[0];
+            let right = &window[1];
+            let left_key = (
+                left["started_at_ms"]
+                    .as_u64()
+                    .expect("started_at_ms should be a u64"),
+                left["query_id"]
+                    .as_str()
+                    .expect("query_id should be a string"),
+            );
+            let right_key = (
+                right["started_at_ms"]
+                    .as_u64()
+                    .expect("started_at_ms should be a u64"),
+                right["query_id"]
+                    .as_str()
+                    .expect("query_id should be a string"),
+            );
+            left_key <= right_key
+        }));
+
+        let long_query = queries
+            .iter()
+            .find(|query| query["query_id"] == long_query_id.to_string())
+            .expect("long query should be listed");
+        let preview = long_query["sql_preview"]
+            .as_str()
+            .expect("sql_preview should be a string");
+        assert_eq!(preview.chars().count(), 100);
+        assert!(preview.ends_with("..."));
+        assert!(long_sql.starts_with(preview.trim_end_matches("...")));
     }
 }
