@@ -20,18 +20,22 @@ use bollard::secret::HealthConfig;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tracing::instrument;
 
-use crate::docker::{ContainerRunnerBuilder, RunningContainer};
+use crate::{
+    container_registry,
+    docker::{ContainerRunnerBuilder, RunningContainer},
+};
 
 pub const ORACLE_USERNAME: &str = "system";
 pub const ORACLE_ROOT_PASSWORD: &str = "S3cret_Pass123";
 const ORACLE_IMAGE: &str = "gvenzl/oracle-free:latest";
 
 fn oracle_image() -> String {
-    std::env::var("CONTAINER_REGISTRY")
-        .ok()
-        .filter(|registry| !registry.is_empty())
-        .map(|registry| format!("{}/{ORACLE_IMAGE}", registry.trim_end_matches('/')))
-        .unwrap_or_else(|| ORACLE_IMAGE.to_string())
+    let registry = container_registry();
+    if registry.is_empty() {
+        ORACLE_IMAGE.to_string()
+    } else {
+        format!("{}/{ORACLE_IMAGE}", registry.trim_end_matches('/'))
+    }
 }
 
 pub fn make_oracle_dataset(path: &str, name: &str, port: u16) -> Dataset {
