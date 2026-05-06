@@ -18,7 +18,9 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
-use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
+};
 use arrow::datatypes::DataType;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
@@ -67,6 +69,12 @@ macro_rules! extract_primary_key {
                 schema: Arc::clone(&$data_schema),
             },
         )?;
+        if key_col.is_null(0) {
+            return crate::accelerated_table::PrimaryKeyNullValueSnafu {
+                field_name: $key.to_string(),
+            }
+            .fail();
+        }
         Ok((key_col.value(0).to_string(), lit(key_col.value(0))))
     }};
 }
@@ -970,5 +978,49 @@ mod tests {
         assert_eq!(result[1].1.len(), 2);
         assert_eq!(result[2].0, ChangeOperationType::Upsert);
         assert_eq!(result[2].1.len(), 2);
+    }
+
+    #[test]
+    fn test_get_primary_key_value_null_int32_returns_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![None]));
+        let batch =
+            RecordBatch::try_new(schema, vec![id_array]).expect("Failed to create RecordBatch");
+
+        let result = get_primary_key_value(&batch, "id");
+        let err =
+            result.expect_err("NULL primary key should return an error, not silently produce 0");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("NULL"),
+            "Error should mention NULL: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_get_primary_key_value_null_utf8_returns_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let name_array: ArrayRef = Arc::new(StringArray::from(vec![Option::<&str>::None]));
+        let batch =
+            RecordBatch::try_new(schema, vec![name_array]).expect("Failed to create RecordBatch");
+
+        let result = get_primary_key_value(&batch, "name");
+        assert!(
+            result.is_err(),
+            "NULL primary key should return an error, not silently produce empty string"
+        );
+    }
+
+    #[test]
+    fn test_get_primary_key_value_non_null_succeeds() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![42]));
+        let batch =
+            RecordBatch::try_new(schema, vec![id_array]).expect("Failed to create RecordBatch");
+
+        let result = get_primary_key_value(&batch, "id");
+        assert!(result.is_ok(), "Non-null PK should succeed");
+        let (str_val, _expr) = result.expect("already asserted Ok");
+        assert_eq!(str_val, "42");
     }
 }
