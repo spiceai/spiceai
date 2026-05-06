@@ -105,10 +105,12 @@ pub(crate) fn add_full_text_search_to_table(
     Ok(tbl.add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>))
 }
 
-/// Adds an [`ElasticsearchTextIndex`] to a [`TableProvider`] for each FTS-enabled column.
+/// Adds a single [`ElasticsearchTextIndex`] to a [`TableProvider`] covering all FTS-enabled columns.
 ///
-/// Unlike the Tantivy path, this function builds a live Elasticsearch client and
-/// creates one index per search field. Elasticsearch is queried live at search time.
+/// A single index instance is created with all `search_fields` so that one `_bulk` write
+/// per batch indexes every FTS column as fields of the same ES document — the correct
+/// Elasticsearch model. At query time `call_with_es_indexes` in the UDTF dispatcher
+/// selects the requested column from `search_fields` on that shared instance.
 #[cfg(feature = "elasticsearch")]
 pub(crate) async fn add_elasticsearch_fts_to_table(
     inner_table_provider: Arc<dyn TableProvider>,
@@ -210,20 +212,28 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
         IndexedTableProvider::new(Arc::clone(&inner_table_provider))
     };
 
-    // Create one ElasticsearchTextIndex per search field.
-    for search_field in &search_fields {
-        let index = Arc::new(ElasticsearchTextIndex {
-            client: Arc::clone(&client),
-            es_index: fts_params.es_index.clone(),
-            search_column_name: search_field.clone(),
-            search_fields: vec![search_field.clone()],
-            primary_key: pk_fields.clone(),
-            source_schema: Arc::clone(&source_schema),
-            batch_write_rows: fts_params.batch_write_rows,
-            write_maintenance: Arc::clone(&write_maintenance),
-        });
-        provider = provider.add_index(index as Arc<dyn Index + Send + Sync>);
-    }
+    // Create a single ElasticsearchTextIndex covering all FTS columns so that one _bulk
+    // write per batch indexes every column as fields of the same ES document.
+    // search_column_name is set to the first field as a fallback for single-column
+    // text_search() calls that omit the column argument; call_with_es_indexes resolves
+    // the actual column from search_fields at query time.
+    let first_field = search_fields
+        .first()
+        .cloned()
+        .ok_or_else(|| Box::<dyn std::error::Error + Send + Sync>::from(
+            format!("Attempted to add Elasticsearch FTS to '{tbl}', but search_fields is empty after configuration")
+        ))?;
+    let index = Arc::new(ElasticsearchTextIndex {
+        client: Arc::clone(&client),
+        es_index: fts_params.es_index.clone(),
+        search_column_name: first_field,
+        search_fields,
+        primary_key: pk_fields.clone(),
+        source_schema: Arc::clone(&source_schema),
+        batch_write_rows: fts_params.batch_write_rows,
+        write_maintenance: Arc::clone(&write_maintenance),
+    });
+    provider = provider.add_index(index as Arc<dyn Index + Send + Sync>);
 
     Ok(provider)
 }

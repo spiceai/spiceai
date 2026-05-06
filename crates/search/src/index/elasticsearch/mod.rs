@@ -671,7 +671,11 @@ impl Index for ElasticsearchTextIndex {
 
     fn required_columns(&self) -> Vec<String> {
         let mut cols: Vec<_> = self.primary_key.iter().map(|f| f.name().clone()).collect();
-        cols.push(self.search_column_name.clone());
+        for field in &self.search_fields {
+            if !cols.contains(field) {
+                cols.push(field.clone());
+            }
+        }
         cols
     }
 
