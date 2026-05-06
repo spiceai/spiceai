@@ -36,7 +36,6 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const DEFAULT_PERSISTENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION: u32 = 1;
 
 type GovernorRateLimiter = RateLimiter<NotKeyed, SharedGovernorState, DefaultClock, NoOpMiddleware>;
@@ -210,7 +209,6 @@ struct RateControllerPersistenceConfig {
     prefix: String,
     object_key: String,
     origin: String,
-    refresh_interval: Duration,
 }
 
 impl std::fmt::Debug for RateControllerPersistenceConfig {
@@ -219,7 +217,6 @@ impl std::fmt::Debug for RateControllerPersistenceConfig {
             .field("prefix", &self.prefix)
             .field("object_key", &self.object_key)
             .field("origin", &self.origin)
-            .field("refresh_interval", &self.refresh_interval)
             .finish_non_exhaustive()
     }
 }
@@ -229,7 +226,6 @@ struct RateControllerPersistence {
     object_state: Arc<ObjectState<PersistedRateControlState>>,
     object_key: String,
     origin: String,
-    refresh_interval: Duration,
     limiters: Vec<PersistedLimiterBinding>,
 }
 
@@ -246,15 +242,12 @@ impl RateControllerPersistence {
     ) -> Arc<Self> {
         let prefix = normalize_object_state_prefix(&config.prefix);
         let object_state = Arc::new(ObjectState::new(config.store).with_prefix(prefix));
-        let persistence = Arc::new(Self {
+        Arc::new(Self {
             object_state,
             object_key: config.object_key,
             origin: config.origin,
-            refresh_interval: normalize_refresh_interval(config.refresh_interval),
             limiters,
-        });
-        persistence.spawn_persistence_task();
-        persistence
+        })
     }
 
     async fn refresh(&self) -> Result<()> {
@@ -341,48 +334,6 @@ impl RateControllerPersistence {
         }
 
         Ok(())
-    }
-
-    fn spawn_persistence_task(self: &Arc<Self>) {
-        let weak = Arc::downgrade(self);
-        let refresh_interval = self.refresh_interval;
-
-        let persistence_task = tokio::spawn(async move {
-            if let Some(persistence) = weak.upgrade()
-                && let Err(error) = persistence.refresh().await
-            {
-                tracing::warn!(
-                    origin = persistence.origin.as_str(),
-                    "Failed to refresh persisted rate-control state: {error}"
-                );
-            }
-
-            let first_tick = tokio::time::Instant::now() + refresh_interval;
-            let mut tick = tokio::time::interval_at(first_tick, refresh_interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                let Some(persistence) = weak.upgrade() else {
-                    break;
-                };
-                match persistence.refresh_and_persist_snapshot().await {
-                    Ok(PersistResult::Persisted) => {}
-                    Ok(PersistResult::Conflict) => {
-                        tracing::debug!(
-                            origin = persistence.origin.as_str(),
-                            "Persisted rate-control state changed concurrently; merged remote state and will persist on the next interval"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            origin = persistence.origin.as_str(),
-                            "Failed to persist rate-control state: {error}"
-                        );
-                    }
-                }
-            }
-        });
-        drop(persistence_task);
     }
 }
 
@@ -473,14 +424,12 @@ impl RateControllerBuilder {
         prefix: impl Into<String>,
         object_key: impl Into<String>,
         origin: impl Into<String>,
-        refresh_interval: Duration,
     ) -> Self {
         self.persistence = Some(RateControllerPersistenceConfig {
             store,
             prefix: prefix.into(),
             object_key: object_key.into(),
             origin: origin.into(),
-            refresh_interval,
         });
         self
     }
@@ -686,6 +635,46 @@ impl RateController {
             .map(|semaphore| semaphore.available_permits())
     }
 
+    /// Refreshes this controller's persisted governor state, if persistence is configured.
+    ///
+    /// This performs object-store I/O and is intended for background tasks, not request paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisted state cannot be read or applied.
+    pub async fn refresh_persisted_state(&self) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+
+        persistence.refresh().await
+    }
+
+    /// Refreshes this controller's persisted governor state and persists a fresh snapshot, if persistence is configured.
+    ///
+    /// This performs object-store I/O and is intended for background tasks, not request paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisted state cannot be read, applied, or written.
+    pub async fn refresh_and_persist_state_snapshot(&self) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+
+        match persistence.refresh_and_persist_snapshot().await? {
+            PersistResult::Persisted => {}
+            PersistResult::Conflict => {
+                tracing::debug!(
+                    origin = persistence.origin.as_str(),
+                    "Persisted rate-control state changed concurrently; merged remote state and will persist on the next interval"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn until_ready(self: Arc<Self>) -> Result<()> {
         futures::future::join_all(
             self.rate_limiters
@@ -819,14 +808,6 @@ fn duration_nanos_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn normalize_refresh_interval(refresh_interval: Duration) -> Duration {
-    if refresh_interval.is_zero() {
-        DEFAULT_PERSISTENCE_REFRESH_INTERVAL
-    } else {
-        refresh_interval
-    }
-}
-
 fn normalize_object_state_prefix(prefix: &str) -> String {
     let prefix = prefix.trim_matches('/');
     if prefix.is_empty() {
@@ -949,25 +930,6 @@ mod tests {
         }
     }
 
-    async fn wait_for_local_limiter_snapshot(
-        persistence: &RateControllerPersistence,
-        timeout: Duration,
-    ) -> PersistedRateControlState {
-        let start = Instant::now();
-        loop {
-            let snapshot = persistence.snapshot();
-            if !snapshot.limiters.is_empty() {
-                return snapshot;
-            }
-
-            assert!(
-                start.elapsed() < timeout,
-                "persisted state was not applied locally within {timeout:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
     #[tokio::test]
     async fn acquiring_permit_does_not_write_persisted_state_on_query_path() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -980,13 +942,7 @@ mod tests {
 
         let rate_controller = RateControllerBuilder::new()
             .add_quota_with_name("requests", quota)
-            .with_object_store_persistence(
-                store,
-                "",
-                object_key,
-                "https://api.example.com:443",
-                Duration::from_secs(60 * 60),
-            )
+            .with_object_store_persistence(store, "", object_key, "https://api.example.com:443")
             .build();
 
         let permit = rate_controller
@@ -1006,7 +962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_governor_state_is_written_by_background_task() {
+    async fn persisted_governor_state_can_be_written_by_background_caller() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let object_key = "test_spicepod/api.example.com_443";
         let object_state: ObjectState<PersistedRateControlState> =
@@ -1019,13 +975,7 @@ mod tests {
 
         let rate_controller = RateControllerBuilder::new()
             .add_quota_with_name("requests", quota)
-            .with_object_store_persistence(
-                store,
-                "",
-                object_key,
-                "https://api.example.com:443",
-                Duration::from_millis(20),
-            )
+            .with_object_store_persistence(store, "", object_key, "https://api.example.com:443")
             .build();
 
         let permit = rate_controller
@@ -1033,6 +983,11 @@ mod tests {
             .await
             .expect("controller should acquire immediately");
         drop(permit);
+
+        rate_controller
+            .refresh_and_persist_state_snapshot()
+            .await
+            .expect("background persistence caller should write a snapshot");
 
         let persisted =
             wait_for_persisted_limiter_state(&object_state, object_key, Duration::from_secs(1))
@@ -1073,19 +1028,12 @@ mod tests {
 
         let recreated_controller = RateControllerBuilder::new()
             .add_quota_with_name("requests", quota)
-            .with_object_store_persistence(
-                store,
-                "",
-                object_key,
-                "https://api.example.com:443",
-                Duration::from_secs(30),
-            )
+            .with_object_store_persistence(store, "", object_key, "https://api.example.com:443")
             .build();
-        let persistence = recreated_controller
-            .persistence
-            .as_ref()
-            .expect("controller should have persistence");
-        wait_for_local_limiter_snapshot(persistence, Duration::from_secs(1)).await;
+        recreated_controller
+            .refresh_persisted_state()
+            .await
+            .expect("background persistence caller should refresh persisted state");
 
         tokio::select! {
             recreated = recreated_controller.acquire() => {
@@ -1118,7 +1066,6 @@ mod tests {
                 prefix: String::new(),
                 object_key: object_key.to_string(),
                 origin: "https://api.example.com:443".to_string(),
-                refresh_interval: Duration::from_secs(30),
             },
             vec![PersistedLimiterBinding {
                 key: "current-limiter".to_string(),
@@ -1186,7 +1133,6 @@ mod tests {
                 "",
                 object_key,
                 "https://api.example.com:443",
-                Duration::from_secs(30),
             )
             .build();
         let persistence = rate_controller

@@ -17,7 +17,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ use governor::Quota;
 use object_store::ObjectStore;
 use opentelemetry::KeyValue;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerMetrics};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use url::Url;
 
 const DEFAULT_RATE_CONTROL_JITTER_MIN: Duration = Duration::from_millis(5);
@@ -48,13 +48,41 @@ const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
 static GLOBAL_HTTP_RATE_CONTROL_REGISTRY: LazyLock<Arc<HttpRateControlRegistry>> =
     LazyLock::new(|| Arc::new(HttpRateControlRegistry::default()));
 
-#[derive(Debug, Default)]
 pub struct HttpRateControlRegistry {
     rate_limiters: RwLock<HashMap<String, Arc<HttpRateLimiter>>>,
     rate_controllers: RwLock<HashMap<String, SharedRateControllerEntry>>,
     metrics_by_origin: StdRwLock<HashMap<String, Arc<HttpRateControlMetrics>>>,
     metric_owners: StdRwLock<HashMap<String, String>>,
     persisted_governor_state: Option<HttpRateControlPersistedState>,
+    persistence_task_started: AtomicBool,
+    persistence_task_notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for HttpRateControlRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpRateControlRegistry")
+            .field("persisted_governor_state", &self.persisted_governor_state)
+            .field(
+                "persistence_task_started",
+                &self.persistence_task_started.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for HttpRateControlRegistry {
+    fn default() -> Self {
+        Self {
+            rate_limiters: RwLock::new(HashMap::new()),
+            rate_controllers: RwLock::new(HashMap::new()),
+            metrics_by_origin: StdRwLock::new(HashMap::new()),
+            metric_owners: StdRwLock::new(HashMap::new()),
+            persisted_governor_state: None,
+            persistence_task_started: AtomicBool::new(false),
+            persistence_task_notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -553,6 +581,84 @@ impl HttpRateControlRegistry {
         }
     }
 
+    pub fn start_persistence_task(self: &Arc<Self>) {
+        let Some(persisted_state) = &self.persisted_governor_state else {
+            return;
+        };
+
+        if self.persistence_task_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let weak_registry = Arc::downgrade(self);
+        let refresh_interval = persisted_state.refresh_interval;
+        let notify = Arc::clone(&self.persistence_task_notify);
+        let persistence_task = tokio::spawn(async move {
+            if let Some(registry) = weak_registry.upgrade() {
+                registry.refresh_persisted_governor_states().await;
+            }
+
+            let first_tick = tokio::time::Instant::now() + refresh_interval;
+            let mut tick = tokio::time::interval_at(first_tick, refresh_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    () = notify.notified() => {
+                        let Some(registry) = weak_registry.upgrade() else {
+                            break;
+                        };
+                        registry.refresh_persisted_governor_states().await;
+                    }
+                    _ = tick.tick() => {
+                        let Some(registry) = weak_registry.upgrade() else {
+                            break;
+                        };
+                        registry.refresh_and_persist_governor_states().await;
+                    }
+                }
+            }
+        });
+        drop(persistence_task);
+    }
+
+    async fn persisted_rate_controllers(&self) -> Vec<(String, Arc<RateController>)> {
+        self.rate_controllers
+            .read()
+            .await
+            .iter()
+            .filter_map(|(origin, entry)| {
+                entry
+                    .shared
+                    .controller
+                    .as_ref()
+                    .map(|controller| (origin.clone(), Arc::clone(controller)))
+            })
+            .collect()
+    }
+
+    async fn refresh_persisted_governor_states(&self) {
+        for (origin, controller) in self.persisted_rate_controllers().await {
+            if let Err(error) = controller.refresh_persisted_state().await {
+                tracing::warn!(
+                    origin = origin.as_str(),
+                    "Failed to refresh persisted rate-control state: {error}"
+                );
+            }
+        }
+    }
+
+    async fn refresh_and_persist_governor_states(&self) {
+        for (origin, controller) in self.persisted_rate_controllers().await {
+            if let Err(error) = controller.refresh_and_persist_state_snapshot().await {
+                tracing::warn!(
+                    origin = origin.as_str(),
+                    "Failed to persist rate-control state: {error}"
+                );
+            }
+        }
+    }
+
     pub async fn shared_rate_limiter(&self, base_url: &Url) -> Arc<HttpRateLimiter> {
         let key = rate_control_key(base_url);
         let rate_limiters = self.rate_limiters.read().await;
@@ -653,6 +759,8 @@ impl HttpRateControlRegistry {
             config,
             self.persisted_governor_state.as_ref(),
         );
+        let should_refresh_persisted_state =
+            self.persisted_governor_state.is_some() && shared.controller.is_some();
         rate_controllers.insert(
             key.clone(),
             SharedRateControllerEntry {
@@ -663,6 +771,9 @@ impl HttpRateControlRegistry {
         );
 
         drop(rate_controllers);
+        if should_refresh_persisted_state {
+            self.persistence_task_notify.notify_one();
+        }
         Ok(SharedRateControllerReservation {
             registry: self,
             key,
@@ -725,6 +836,8 @@ impl HttpRateControlRegistry {
             config,
             self.persisted_governor_state.as_ref(),
         );
+        let should_refresh_persisted_state =
+            self.persisted_governor_state.is_some() && shared.controller.is_some();
         rate_controllers.insert(
             key,
             SharedRateControllerEntry {
@@ -733,6 +846,11 @@ impl HttpRateControlRegistry {
                 active_registrations: 1,
             },
         );
+
+        drop(rate_controllers);
+        if should_refresh_persisted_state {
+            self.persistence_task_notify.notify_one();
+        }
 
         Ok(shared)
     }
@@ -785,7 +903,6 @@ fn build_shared_rate_controller(
             persisted_state.base_prefix.clone(),
             rate_control_state_object_key(spicepod_name, origin_key),
             origin_key.to_string(),
-            persisted_state.refresh_interval,
         );
     }
     if let Some(max_concurrent_requests) = config.max_concurrent_requests {
@@ -1147,6 +1264,41 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rate-control")]
+    fn persisted_test_config() -> HttpRateControlConfig {
+        HttpRateControlConfig {
+            max_concurrent_requests: None,
+            requests_per_second: Some(
+                NonZeroU32::new(10).expect("test rate limit should be non-zero"),
+            ),
+            requests_per_minute: None,
+            jitter_min: Duration::ZERO,
+            jitter_max: Duration::ZERO,
+        }
+    }
+
+    #[cfg(feature = "rate-control")]
+    async fn wait_for_object(store: &Arc<dyn ObjectStore>, object_key: &str) {
+        let path = object_store::path::Path::from(format!("{object_key}.json"));
+        let start = tokio::time::Instant::now();
+
+        loop {
+            match store.head(&path).await {
+                Ok(_) => return,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => {
+                    panic!("failed to check persisted state object {object_key}: {error}")
+                }
+            }
+
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "persisted state object {object_key} was not written"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[test]
     fn rate_control_state_object_key_uses_spicepod_and_origin_without_scheme() {
         let object_key = rate_control_state_object_key(
@@ -1160,6 +1312,67 @@ mod tests {
         assert_eq!(hash.len(), 16);
         assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
         assert!(!object_key.contains("https"));
+    }
+
+    #[cfg(feature = "rate-control")]
+    #[tokio::test]
+    async fn registry_persistence_task_persists_all_registered_origins() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let registry = Arc::new(HttpRateControlRegistry::with_persisted_governor_state(
+            Arc::clone(&store),
+            "",
+            Duration::from_millis(20),
+        ));
+        registry.start_persistence_task();
+        registry.start_persistence_task();
+
+        let dataset = test_dataset().await;
+        let config = persisted_test_config();
+        let first_url = Url::parse("https://first.example.com/data").expect("first URL parses");
+        let second_url = Url::parse("https://second.example.com/data").expect("second URL parses");
+
+        let first = registry
+            .shared_rate_controller(&first_url, &config, &dataset, "https")
+            .await
+            .expect("first controller should build");
+        let second = registry
+            .shared_rate_controller(&second_url, &config, &dataset, "https")
+            .await
+            .expect("second controller should build");
+
+        let first_permit = first
+            .controller
+            .as_ref()
+            .expect("first controller should exist")
+            .acquire()
+            .await
+            .expect("first permit should acquire");
+        drop(first_permit);
+        let second_permit = second
+            .controller
+            .as_ref()
+            .expect("second controller should exist")
+            .acquire()
+            .await
+            .expect("second permit should acquire");
+        drop(second_permit);
+
+        wait_for_object(
+            &store,
+            &rate_control_state_object_key(
+                dataset.app.name.as_str(),
+                &rate_control_key(&first_url),
+            ),
+        )
+        .await;
+        wait_for_object(
+            &store,
+            &rate_control_state_object_key(
+                dataset.app.name.as_str(),
+                &rate_control_key(&second_url),
+            ),
+        )
+        .await;
     }
 
     #[tokio::test]
