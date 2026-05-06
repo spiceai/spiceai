@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
 use datafusion_table_providers::{
@@ -24,13 +24,13 @@ use rand::RngExt;
 use secrecy::SecretString;
 use tracing::instrument;
 
-use crate::{
-    container_registry,
-    docker::{ContainerRunnerBuilder, RunningContainer},
-};
+use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port};
 
 pub const PG_PASSWORD: &str = "runtime-integration-test-pw";
+const PG_IMAGE: &str = "docker.io/library/postgres:latest";
 const PG_DOCKER_CONTAINER: &str = "runtime-integration-test-postgres";
+const PG_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const PG_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn get_pg_params(port: usize) -> HashMap<String, SecretString> {
     let mut params = HashMap::new();
@@ -80,7 +80,7 @@ pub async fn start_postgres_docker_container(
     let port = port.try_into().unwrap_or(15432);
 
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(format!("{}postgres:latest", container_registry()))
+        .image(PG_IMAGE.to_string())
         .add_port_binding(5432, port)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .healthcheck(HealthConfig {
@@ -88,17 +88,17 @@ pub async fn start_postgres_docker_container(
                 "CMD-SHELL".to_string(),
                 "pg_isready -U postgres".to_string(),
             ]),
-            interval: Some(250_000_000), // 250ms
-            timeout: Some(100_000_000),  // 100ms
-            retries: Some(5),
-            start_period: Some(500_000_000), // 100ms
+            interval: Some(1_000_000_000), // 1s
+            timeout: Some(5_000_000_000),  // 5s
+            retries: Some(60),
+            start_period: Some(10_000_000_000), // 10s
             start_interval: None,
         })
         .build()?
-        .run(None)
+        .run(Some(PG_CONTAINER_START_TIMEOUT))
         .await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    wait_for_tcp_port("127.0.0.1", port, PG_HOST_PORT_READY_TIMEOUT).await?;
     Ok(running_container)
 }
 
@@ -116,7 +116,7 @@ pub async fn start_postgres_docker_container_with_logical_wal(
         .map_err(|e| anyhow::anyhow!("port {port} does not fit in u16: {e}"))?;
 
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(format!("{}postgres:latest", container_registry()))
+        .image(PG_IMAGE.to_string())
         .add_port_binding(5432, port)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .command([
@@ -133,17 +133,17 @@ pub async fn start_postgres_docker_container_with_logical_wal(
                 "CMD-SHELL".to_string(),
                 "pg_isready -U postgres".to_string(),
             ]),
-            interval: Some(250_000_000),
-            timeout: Some(100_000_000),
-            retries: Some(5),
-            start_period: Some(500_000_000),
+            interval: Some(1_000_000_000),
+            timeout: Some(5_000_000_000),
+            retries: Some(60),
+            start_period: Some(10_000_000_000),
             start_interval: None,
         })
         .build()?
-        .run(None)
+        .run(Some(PG_CONTAINER_START_TIMEOUT))
         .await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    wait_for_tcp_port("127.0.0.1", port, PG_HOST_PORT_READY_TIMEOUT).await?;
     Ok(running_container)
 }
 

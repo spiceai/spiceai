@@ -320,6 +320,11 @@ pub(crate) fn routes(
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+        .route("/v1/sql/active", get(v1::queries::list_active))
+        .route(
+            "/v1/sql/{query_id}/cancel",
+            post(v1::queries::cancel_active),
+        )
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/functions", get(v1::functions::list))
@@ -542,7 +547,24 @@ async fn track_metrics(
     let response = Arc::clone(&request_context)
         .scope(async move {
             request_context.load_extensions().await;
-            next.run(req).await
+            // Install a drop guard on the request's cancellation token so
+            // that if the response body is dropped before the body completes
+            // (for example, the client disconnects while a streaming SQL or
+            // SSE response is being produced), the cancellation token fires
+            // and any cooperating in-flight query terminates promptly.
+            //
+            // The guard is attached to the response body via
+            // `CancelGuardBody`, which disarms the guard once the body
+            // signals end-of-stream. This means the guard's lifetime tracks
+            // the streaming response, not just the response future.
+            let cancel_guard = request_context.cancellation_token().clone().drop_guard();
+            let response = next.run(req).await;
+            let (parts, body) = response.into_parts();
+            let body = axum::body::Body::new(util::cancel_guard_body::CancelGuardBody::new(
+                body,
+                cancel_guard,
+            ));
+            axum::response::Response::from_parts(parts, body)
         })
         .await;
 
