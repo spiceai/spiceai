@@ -24,7 +24,7 @@ use spicepod::{
     component::dataset::{Dataset, TimeFormat},
     param::Params,
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 
@@ -209,12 +209,13 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
                 .await;
 
             let cloned_rt = Arc::new(rt.clone());
+            let load_rt = Arc::clone(&cloned_rt);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = cloned_rt.load_components() => {}
+                () = load_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;

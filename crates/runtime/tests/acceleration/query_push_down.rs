@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![cfg(feature = "postgres-accel")]
+
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
