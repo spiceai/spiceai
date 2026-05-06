@@ -43,6 +43,7 @@ mod on_conflict_options;
 mod partition_by_arrow;
 #[cfg(not(target_os = "windows"))]
 mod partition_by_cayenne;
+#[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
 #[cfg(feature = "duckdb")]
