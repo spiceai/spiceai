@@ -571,13 +571,13 @@ fn parse_rate_control_refresh_interval(
     config_path: &str,
 ) -> Option<Duration> {
     match fundu::parse_duration(refresh_interval) {
-        Ok(refresh_interval) if refresh_interval.is_zero() => {
+        Ok(parsed_refresh_interval) if parsed_refresh_interval.is_zero() => {
             tracing::error!(
                 "Invalid {config_path}.refresh_interval '{refresh_interval}': value must be greater than 0"
             );
             None
         }
-        Ok(refresh_interval) => Some(refresh_interval),
+        Ok(parsed_refresh_interval) => Some(parsed_refresh_interval),
         Err(error) => {
             tracing::error!("Invalid {config_path}.refresh_interval '{refresh_interval}': {error}");
             None
