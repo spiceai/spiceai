@@ -178,7 +178,7 @@ async fn query_row_count(rt: &Runtime, query: &str) -> Result<usize, anyhow::Err
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let data = query_result.data.try_collect::<Vec<_>>().await?;
-    Ok(data.iter().map(|batch| batch.num_rows()).sum())
+    Ok(data.iter().map(arrow::array::RecordBatch::num_rows).sum())
 }
 
 async fn run_and_snapshot_query(

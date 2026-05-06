@@ -82,7 +82,10 @@ async fn wait_for_query_rows(rt: &Runtime, sql: &str, expected_rows: usize) -> R
             .try_collect::<Vec<_>>()
             .await
             .map_err(|e| RetryError::transient(anyhow::anyhow!(e)))?;
-        let actual_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        let actual_rows: usize = batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
         if actual_rows >= expected_rows {
             return Ok(());
         }
