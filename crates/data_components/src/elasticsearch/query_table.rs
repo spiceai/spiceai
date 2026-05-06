@@ -866,7 +866,7 @@ mod tests {
             search_response(first_page, Some("pit-2")),
             search_response(second_page, Some("pit-3")),
         ]));
-        let client: Arc<dyn Elasticsearch> = mock.clone();
+        let client: Arc<dyn Elasticsearch> = Arc::<MockElasticsearch>::clone(&mock);
 
         let batches = collect_query_table(client, None).await;
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -897,7 +897,7 @@ mod tests {
             (0..5).map(make_sorted_hit).collect(),
             None,
         )));
-        let client: Arc<dyn Elasticsearch> = mock.clone();
+        let client: Arc<dyn Elasticsearch> = Arc::<MockElasticsearch>::clone(&mock);
 
         let batches = collect_query_table(client, Some(5)).await;
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -915,7 +915,7 @@ mod tests {
     #[tokio::test]
     async fn query_table_scan_closes_point_in_time_on_error() {
         let mock = Arc::new(MockElasticsearch::with_point_in_time_responses(Vec::new()));
-        let client: Arc<dyn Elasticsearch> = mock.clone();
+        let client: Arc<dyn Elasticsearch> = Arc::<MockElasticsearch>::clone(&mock);
 
         let result = try_collect_query_table(client, None).await;
         assert!(result.is_err(), "scan should fail when PIT search fails");
