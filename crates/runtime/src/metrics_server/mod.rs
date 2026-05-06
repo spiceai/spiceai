@@ -221,80 +221,93 @@ async fn handle_http_request<B>(
     rate_limiter: Option<&DirectRateLimiter>,
     req: &Request<B>,
 ) -> Response<Full<Bytes>> {
-    let mut response = Response::new(if req.uri().path() == "/health" {
-        "OK".into()
-    } else {
-        if req.uri().path() == "/metrics"
-            && let Some(Err(wait_time)) = rate_limiter.map(DirectRateLimiter::check)
-        {
-            let retry_after =
-                retry_after_seconds(wait_time.wait_time_from(DefaultClock::default().now()));
-            let mut resp = Response::new(Full::from(format!(
-                "Too many requests. Retry after {retry_after} seconds.\n"
-            )));
-            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            let headers = resp.headers_mut();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-            if let Ok(val) = HeaderValue::from_str(&retry_after.to_string()) {
-                headers.insert(RETRY_AFTER, val);
-            }
-            return resp;
+    let path = req.uri().path();
+    if path == "/health" {
+        let mut response = Response::new(Full::from("OK"));
+        response
+            .headers_mut()
+            .append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        return response;
+    }
+
+    if path != "/metrics" {
+        let mut resp = Response::new(Full::from("Not Found\n"));
+        *resp.status_mut() = StatusCode::NOT_FOUND;
+        resp.headers_mut()
+            .append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        return resp;
+    }
+
+    if let Some(Err(wait_time)) = rate_limiter.map(DirectRateLimiter::check) {
+        let retry_after =
+            retry_after_seconds(wait_time.wait_time_from(DefaultClock::default().now()));
+        let mut resp = Response::new(Full::from(format!(
+            "Too many requests. Retry after {retry_after} seconds.\n"
+        )));
+        *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        let headers = resp.headers_mut();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        if let Ok(val) = HeaderValue::from_str(&retry_after.to_string()) {
+            headers.insert(RETRY_AFTER, val);
         }
+        return resp;
+    }
 
-        // Check for ?scope=cluster query parameter
-        let query_params = req
-            .uri()
-            .query()
-            .map(parse_query_string)
-            .unwrap_or_default();
+    // Check for ?scope=cluster query parameter
+    let query_params = req
+        .uri()
+        .query()
+        .map(parse_query_string)
+        .unwrap_or_default();
 
-        let is_cluster_scope = query_params
-            .get(SCOPE_PARAM)
-            .is_some_and(|v| v == SCOPE_CLUSTER);
+    let is_cluster_scope = query_params
+        .get(SCOPE_PARAM)
+        .is_some_and(|v| v == SCOPE_CLUSTER);
 
-        if is_cluster_scope {
-            // Cluster-wide metrics requested
-            match cluster_collector {
-                Some(collector) => match collector.collect().await {
-                    Ok(otlp_metrics) => {
-                        let prometheus_text = otlp_to_prometheus_text(&otlp_metrics);
-                        prometheus_text.into()
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to collect cluster metrics: {e}");
-                        format!("# Error collecting cluster metrics: {e}\n").into()
-                    }
-                },
-                None => "# Cluster metrics not available (not running in cluster mode)\n".into(),
-            }
-        } else {
-            // Local metrics only (original behavior)
-            let encoder = TextEncoder::new();
-            let mut metric_families = prometheus_registry.gather();
-
-            let mut histogram_summaries = Vec::new();
-            for family in &metric_families {
-                if family.get_field_type() == MetricType::HISTOGRAM {
-                    for metric in family.get_metric() {
-                        let histogram = metric.get_histogram();
-                        let summary =
-                            histogram_to_summary(family.name(), metric.get_label(), histogram);
-                        histogram_summaries.push(summary);
-                    }
+    let body: Bytes = if is_cluster_scope {
+        // Cluster-wide metrics requested
+        match cluster_collector {
+            Some(collector) => match collector.collect().await {
+                Ok(otlp_metrics) => {
+                    let prometheus_text = otlp_to_prometheus_text(&otlp_metrics);
+                    prometheus_text.into()
                 }
-            }
-            metric_families.extend(histogram_summaries);
-
-            let mut result = Vec::new();
-            match encoder.encode(&metric_families, &mut result) {
-                Ok(()) => result.into(),
                 Err(e) => {
-                    tracing::error!("Error encoding Prometheus metrics: {e}");
-                    "Error encoding Prometheus metrics".into()
+                    tracing::warn!("Failed to collect cluster metrics: {e}");
+                    format!("# Error collecting cluster metrics: {e}\n").into()
+                }
+            },
+            None => "# Cluster metrics not available (not running in cluster mode)\n".into(),
+        }
+    } else {
+        // Local metrics only (original behavior)
+        let encoder = TextEncoder::new();
+        let mut metric_families = prometheus_registry.gather();
+
+        let mut histogram_summaries = Vec::new();
+        for family in &metric_families {
+            if family.get_field_type() == MetricType::HISTOGRAM {
+                for metric in family.get_metric() {
+                    let histogram = metric.get_histogram();
+                    let summary =
+                        histogram_to_summary(family.name(), metric.get_label(), histogram);
+                    histogram_summaries.push(summary);
                 }
             }
         }
-    });
+        metric_families.extend(histogram_summaries);
+
+        let mut result = Vec::new();
+        match encoder.encode(&metric_families, &mut result) {
+            Ok(()) => result.into(),
+            Err(e) => {
+                tracing::error!("Error encoding Prometheus metrics: {e}");
+                "Error encoding Prometheus metrics".into()
+            }
+        }
+    };
+
+    let mut response = Response::new(Full::from(body));
     response
         .headers_mut()
         .append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
@@ -857,23 +870,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_http_request_rate_limit_ignores_non_metrics_paths() {
+    async fn test_handle_http_request_non_metrics_paths_return_not_found() {
         let registry = prometheus::Registry::new();
         let rate_limiter = RateLimiter::direct(Quota::per_minute(
             NonZeroU32::new(1).expect("test quota must be non-zero"),
         ));
-        let root_request = Request::builder()
-            .uri("/")
-            .body(())
-            .expect("test request should build");
+
+        // Paths other than /health and /metrics must return 404 and must NOT consume the
+        // rate-limit bucket — otherwise the limiter could be bypassed by scraping `/`,
+        // `/metrics/`, or any other path.
+        for bypass_path in ["/", "/metrics/", "/foo"] {
+            let request = Request::builder()
+                .uri(bypass_path)
+                .body(())
+                .expect("test request should build");
+            let response =
+                handle_http_request(&registry, None, Some(&rate_limiter), &request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "path {bypass_path} should return 404"
+            );
+        }
+
         let metrics_request = Request::builder()
             .uri("/metrics")
             .body(())
             .expect("test request should build");
-
-        let root_response =
-            handle_http_request(&registry, None, Some(&rate_limiter), &root_request).await;
-        assert_eq!(root_response.status(), StatusCode::OK);
 
         let first_metrics =
             handle_http_request(&registry, None, Some(&rate_limiter), &metrics_request).await;

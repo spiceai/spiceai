@@ -665,10 +665,13 @@ pub struct RateLimits {
     /// Whether write rate limiting is enabled. When `false`, the rate limiter
     /// layer is still present but the check function always succeeds.
     flight_write_enabled: AtomicBool,
-    /// Separate rate limit for the metrics HTTP endpoint.
-    /// This is independent of the data-path write limit so that clients can still
-    /// retrieve observability data even when their data requests are rate-limited.
-    pub cluster_metrics_limit: Quota,
+    /// Rate limit applied to every request served by the `/metrics` HTTP endpoint
+    /// (both local scrapes and `?scope=cluster` fan-out). It is independent of the
+    /// data-path write limit so that clients can still retrieve observability data
+    /// even when their data requests are rate-limited. Because this throttles all
+    /// `/metrics` callers, lowering it to protect the expensive cluster fan-out
+    /// will also throttle ordinary local Prometheus scrapes.
+    pub metrics_endpoint_limit: Quota,
 }
 
 impl RateLimits {
@@ -690,8 +693,8 @@ impl RateLimits {
     }
 
     #[must_use]
-    pub fn with_cluster_metrics_limit(mut self, rate_limit: Quota) -> Self {
-        self.cluster_metrics_limit = rate_limit;
+    pub fn with_metrics_endpoint_limit(mut self, rate_limit: Quota) -> Self {
+        self.metrics_endpoint_limit = rate_limit;
         self
     }
 
@@ -713,11 +716,11 @@ impl Default for RateLimits {
                 NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
             ),
             flight_write_enabled: AtomicBool::new(true),
-            // Allow 100 metrics HTTP requests every 60 seconds by default.
+            // Allow 100 /metrics HTTP requests every 60 seconds by default.
             // This is a separate limiter from the data-path write limit so that
             // clients can still retrieve observability data even when data
             // requests are rate-limited.
-            cluster_metrics_limit: Quota::per_minute(
+            metrics_endpoint_limit: Quota::per_minute(
                 NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
             ),
         }

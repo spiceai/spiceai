@@ -1173,7 +1173,7 @@ impl Runtime {
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
         let metrics_rate_limiter =
-            Arc::new(RateLimiter::direct(self.rate_limits.cluster_metrics_limit));
+            Arc::new(RateLimiter::direct(self.rate_limits.metrics_endpoint_limit));
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
