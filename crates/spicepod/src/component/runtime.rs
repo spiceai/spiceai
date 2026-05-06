@@ -884,7 +884,7 @@ pub struct RateControl {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
-    /// How often each runtime refreshes per-origin governor state from object storage.
+    /// How often each runtime refreshes and persists per-origin governor state in object storage.
     #[serde(default = "default_rate_control_refresh_interval")]
     pub refresh_interval: String,
 }

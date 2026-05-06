@@ -15972,6 +15972,7 @@ dependencies = [
  "rand 0.10.1",
  "serde",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
 ]

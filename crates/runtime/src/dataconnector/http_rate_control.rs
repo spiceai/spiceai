@@ -647,8 +647,12 @@ impl HttpRateControlRegistry {
             });
         }
 
-        let shared =
-            build_shared_rate_controller(&key, config, self.persisted_governor_state.as_ref());
+        let shared = build_shared_rate_controller(
+            &key,
+            dataset.app.name.as_str(),
+            config,
+            self.persisted_governor_state.as_ref(),
+        );
         rate_controllers.insert(
             key.clone(),
             SharedRateControllerEntry {
@@ -715,8 +719,12 @@ impl HttpRateControlRegistry {
             );
         }
 
-        let shared =
-            build_shared_rate_controller(&key, config, self.persisted_governor_state.as_ref());
+        let shared = build_shared_rate_controller(
+            &key,
+            dataset.app.name.as_str(),
+            config,
+            self.persisted_governor_state.as_ref(),
+        );
         rate_controllers.insert(
             key,
             SharedRateControllerEntry {
@@ -758,6 +766,7 @@ pub async fn shared_rate_controller(
 
 fn build_shared_rate_controller(
     origin_key: &str,
+    spicepod_name: &str,
     config: &HttpRateControlConfig,
     persisted_state: Option<&HttpRateControlPersistedState>,
 ) -> SharedRateController {
@@ -774,7 +783,7 @@ fn build_shared_rate_controller(
         builder = builder.with_object_store_persistence(
             Arc::clone(&persisted_state.store),
             persisted_state.base_prefix.clone(),
-            rate_control_state_object_key(origin_key),
+            rate_control_state_object_key(spicepod_name, origin_key),
             origin_key.to_string(),
             persisted_state.refresh_interval,
         );
@@ -1043,23 +1052,47 @@ pub fn rate_control_key(base_url: &Url) -> String {
     }
 }
 
-fn rate_control_state_object_key(origin_key: &str) -> String {
-    let mut encoded = String::with_capacity(origin_key.len());
-    for byte in origin_key.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            push_percent_encoded_byte(&mut encoded, byte);
-        }
-    }
-    encoded
+fn rate_control_state_object_key(spicepod_name: &str, origin_key: &str) -> String {
+    let origin_without_scheme = origin_key
+        .split_once("://")
+        .map_or(origin_key, |(_, origin)| origin);
+    format!(
+        "{}/{}-{:016x}",
+        friendly_state_key_component(spicepod_name),
+        friendly_state_key_component(origin_without_scheme),
+        stable_state_key_hash(origin_key)
+    )
 }
 
-fn push_percent_encoded_byte(output: &mut String, byte: u8) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    output.push('%');
-    output.push(char::from(HEX[usize::from(byte >> 4)]));
-    output.push(char::from(HEX[usize::from(byte & 0x0F)]));
+fn friendly_state_key_component(value: &str) -> String {
+    let mut component = String::with_capacity(value.len());
+    let mut previous_was_separator = false;
+
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_') {
+            component.push(character);
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            component.push('_');
+            previous_was_separator = true;
+        }
+    }
+
+    let component = component.trim_matches('_');
+    if component.is_empty() {
+        "default".to_string()
+    } else {
+        component.to_string()
+    }
+}
+
+fn stable_state_key_hash(value: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 14_695_981_039_346_656_037;
+    const FNV_PRIME: u64 = 1_099_511_628_211;
+
+    value.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
 }
 
 fn conflicting_config_error<T>(
@@ -1115,11 +1148,18 @@ mod tests {
     }
 
     #[test]
-    fn rate_control_state_object_key_percent_encodes_origin() {
-        assert_eq!(
-            rate_control_state_object_key("https://api.example.com:443"),
-            "https%3A%2F%2Fapi.example.com%3A443"
+    fn rate_control_state_object_key_uses_spicepod_and_origin_without_scheme() {
+        let object_key = rate_control_state_object_key(
+            "rate control registry test",
+            "https://api.example.com:443",
         );
+
+        let hash = object_key
+            .strip_prefix("rate_control_registry_test/api.example.com_443-")
+            .expect("object key should start with spicepod name and origin without scheme");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!object_key.contains("https"));
     }
 
     #[tokio::test]
