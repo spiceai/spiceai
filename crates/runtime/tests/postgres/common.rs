@@ -24,12 +24,10 @@ use rand::RngExt;
 use secrecy::SecretString;
 use tracing::instrument;
 
-use crate::{
-    container_registry,
-    docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port},
-};
+use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port};
 
 pub const PG_PASSWORD: &str = "runtime-integration-test-pw";
+const PG_IMAGE: &str = "docker.io/library/postgres:latest";
 const PG_DOCKER_CONTAINER: &str = "runtime-integration-test-postgres";
 const PG_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
 const PG_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -82,7 +80,7 @@ pub async fn start_postgres_docker_container(
     let port = port.try_into().unwrap_or(15432);
 
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(format!("{}postgres:latest", container_registry()))
+        .image(PG_IMAGE.to_string())
         .add_port_binding(5432, port)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .healthcheck(HealthConfig {
@@ -118,7 +116,7 @@ pub async fn start_postgres_docker_container_with_logical_wal(
         .map_err(|e| anyhow::anyhow!("port {port} does not fit in u16: {e}"))?;
 
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(format!("{}postgres:latest", container_registry()))
+        .image(PG_IMAGE.to_string())
         .add_port_binding(5432, port)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .command([

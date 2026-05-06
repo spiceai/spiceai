@@ -23,10 +23,7 @@ use spicepod::{
 };
 use tracing::instrument;
 
-use crate::{
-    container_registry,
-    docker::{ContainerRunnerBuilder, RunningContainer},
-};
+use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
@@ -46,6 +43,7 @@ pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) 
 }
 
 const MYSQL_ROOT_PASSWORD: &str = "integration-test-pw";
+const MYSQL_IMAGE: &str = "docker.io/library/mysql:latest";
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-mysql";
 const MYSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
 const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -57,7 +55,7 @@ pub async fn start_mysql_docker_container(
     let container_name = format!("{MYSQL_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(format!("{}mysql:latest", container_registry()))
+        .image(MYSQL_IMAGE.to_string())
         .add_port_binding(3306, port)
         .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
         .add_env_var("MYSQL_DATABASE", "mysqldb")

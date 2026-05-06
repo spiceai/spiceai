@@ -20,23 +20,11 @@ use bollard::secret::HealthConfig;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tracing::instrument;
 
-use crate::{
-    container_registry,
-    docker::{ContainerRunnerBuilder, RunningContainer},
-};
+use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 pub const ORACLE_USERNAME: &str = "system";
 pub const ORACLE_ROOT_PASSWORD: &str = "S3cret_Pass123";
-const ORACLE_IMAGE: &str = "gvenzl/oracle-free:latest";
-
-fn oracle_image() -> String {
-    let registry = container_registry();
-    if registry.is_empty() {
-        ORACLE_IMAGE.to_string()
-    } else {
-        format!("{}/{ORACLE_IMAGE}", registry.trim_end_matches('/'))
-    }
-}
+const ORACLE_IMAGE: &str = "docker.io/gvenzl/oracle-free:latest";
 
 pub fn make_oracle_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("oracle:{path}"), name.to_string());
@@ -84,7 +72,7 @@ pub async fn start_oracle_docker_container(
     port: u16,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(oracle_image())
+        .image(ORACLE_IMAGE.to_string())
         .add_port_binding(1521, port)
         .add_env_var("ORACLE_PASSWORD", ORACLE_ROOT_PASSWORD)
         .healthcheck(HealthConfig {
