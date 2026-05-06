@@ -39,6 +39,13 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
   "tools": [
     {
       "function": {
+        "description": "Get the current UTC date and time in ISO 8601 format",
+        "name": "get_current_datetime"
+      },
+      "type": "function"
+    },
+    {
+      "function": {
         "description": "Get the readiness status of the Spice.ai runtime",
         "name": "get_readiness"
       },
@@ -48,72 +55,6 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
       "function": {
         "description": "List available datasets",
         "name": "list_datasets"
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Get a random sample of rows from a Spice.ai dataset",
-        "name": "random_sample",
-        "parameters": {
-          "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "properties": {
-            "dataset": {
-              "description": "The SQL dataset to sample data from.",
-              "type": "string"
-            },
-            "limit": {
-              "description": "The number of rows, each with distinct values per column, to sample.",
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "required": [
-            "dataset",
-            "limit"
-          ],
-          "title": "RandomSampleParams",
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Sample distinct column values from a Spice.ai dataset",
-        "name": "sample_distinct_columns",
-        "parameters": {
-          "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "properties": {
-            "cols": {
-              "description": "The columns to sample distinct values from. If None, all columns are sampled.",
-              "items": {
-                "type": "string"
-              },
-              "type": [
-                "array",
-                "null"
-              ]
-            },
-            "dataset": {
-              "description": "The SQL dataset to sample data from.",
-              "type": "string"
-            },
-            "limit": {
-              "description": "The number of rows, each with distinct values per column, to sample.",
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "required": [
-            "dataset",
-            "limit"
-          ],
-          "title": "DistinctColumnsParams",
-          "type": "object"
-        }
       },
       "type": "function"
     },
@@ -230,39 +171,6 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
             "tables"
           ],
           "title": "TableSchemaToolParams",
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Get top N samples from a Spice.ai dataset based on a specified ordering",
-        "name": "top_n_sample",
-        "parameters": {
-          "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "properties": {
-            "dataset": {
-              "description": "The SQL dataset to sample data from.",
-              "type": "string"
-            },
-            "limit": {
-              "description": "The number of rows, each with distinct values per column, to sample.",
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "order_by": {
-              "description": "How to order the samples before retrieving the top N.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "dataset",
-            "limit",
-            "order_by"
-          ],
-          "title": "TopSamplesParams",
           "type": "object"
         }
       },

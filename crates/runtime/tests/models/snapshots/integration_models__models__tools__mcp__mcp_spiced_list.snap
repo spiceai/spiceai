@@ -4,6 +4,11 @@ expression: tools_list
 ---
 [
   {
+    "description": "Get the current UTC date and time in ISO 8601 format",
+    "name": "get_current_datetime",
+    "parameters": null
+  },
+  {
     "description": "Get the readiness status of the Spice.ai runtime",
     "name": "get_readiness",
     "parameters": null
@@ -42,6 +47,17 @@ expression: tools_list
         "last"
       ],
       "title": "LoadMemoryParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Get the current UTC date and time in ISO 8601 format",
+    "name": "mcp_from_spiced/get_current_datetime",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {},
+      "required": [],
+      "title": "empty",
       "type": "object"
     }
   },
