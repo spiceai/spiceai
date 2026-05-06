@@ -241,16 +241,15 @@ impl ExecutionPlan for SqlServerExecPlan {
         let mut nulls_match_native = true;
         for sort_expr in order {
             // Only support simple column references
-            let col = match sort_expr.expr.as_any().downcast_ref::<Column>() {
-                Some(c) => c,
-                None => return Ok(SortOrderPushdownResult::Unsupported),
+            let Some(col) = sort_expr.expr.as_any().downcast_ref::<Column>() else {
+                return Ok(SortOrderPushdownResult::Unsupported);
             };
 
             // If the field is not nullable, null ordering is irrelevant — always Exact.
             let is_nullable = self
                 .projected_schema
                 .field_with_name(col.name())
-                .map(|f| f.is_nullable())
+                .map(arrow::datatypes::Field::is_nullable)
                 .unwrap_or(true);
             if !is_nullable {
                 continue;

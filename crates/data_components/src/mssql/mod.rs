@@ -113,16 +113,14 @@ impl SqlServerTableProvider {
         let table_name = table.table();
         let table_schema = table.schema().unwrap_or("dbo");
 
-        let columns_meta_query: String = format!(
-            "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS \
-            WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'"
-        );
+        let columns_meta_query = "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS \
+            WHERE TABLE_NAME = @P1 AND TABLE_SCHEMA = @P2";
         tracing::debug!("Executing schema query for dataset {table_name}: {columns_meta_query}");
 
         let mut conn = conn.get().await.boxed().context(ConnectionPoolSnafu)?;
 
         let mut query_res = conn
-            .simple_query(columns_meta_query)
+            .query(columns_meta_query, &[&table_name, &table_schema])
             .await
             .context(QuerySnafu)?
             .into_row_stream();
