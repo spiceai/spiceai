@@ -6285,7 +6285,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=97ecd0059bd49297b956b6dd51c7047547cc97e0#97ecd0059bd49297b956b6dd51c7047547cc97e0"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=f4f864d22cc92ee65e33b76afbd128a2ffc50d48#f4f864d22cc92ee65e33b76afbd128a2ffc50d48"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -15935,6 +15935,7 @@ dependencies = [
  "headers-accept",
  "hf-hub",
  "http 1.4.0",
+ "http-body 1.0.1",
  "http-body-util",
  "humantime",
  "hyper 1.9.0",
@@ -16132,6 +16133,7 @@ dependencies = [
  "reqwest 0.12.24",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tonic",
  "tower 0.5.3",
@@ -16375,6 +16377,7 @@ dependencies = [
  "sha2 0.10.9",
  "spicepod",
  "tokio",
+ "tokio-util",
  "tracing",
  "winver",
 ]
@@ -21163,11 +21166,14 @@ dependencies = [
  "ctrlc",
  "datafusion",
  "futures",
+ "http-body 1.0.1",
  "humantime",
  "parking_lot 0.12.5",
+ "pin-project",
  "rand 0.10.1",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

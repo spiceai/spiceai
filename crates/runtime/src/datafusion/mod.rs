@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -39,7 +39,7 @@ use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
-use crate::datafusion::query::Query;
+use crate::datafusion::query::{Query, registry::QueryCancelRegistry};
 use crate::dataupdate::{
     DataUpdate, DataUpdateBroadcaster, StreamingDataUpdate, StreamingDataUpdateExecutionPlan,
     UpdateType,
@@ -63,7 +63,6 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_tools::schema::verify_schema;
-use async_trait::async_trait;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -138,6 +137,7 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
+pub mod table;
 pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
@@ -629,15 +629,6 @@ struct DeferredTableRegistration {
     connector: Arc<dyn DataConnector>,
 }
 
-#[async_trait]
-pub trait OnDemandTableLoader: Send + Sync {
-    async fn has_on_demand_tables(&self) -> bool;
-    async fn load_on_demand_tables(
-        &self,
-        table_references: Vec<TableReference>,
-    ) -> std::result::Result<(), DataFusionError>;
-}
-
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -656,7 +647,21 @@ pub struct DataFusion {
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
-    on_demand_table_loader: RwLock<Option<Weak<dyn OnDemandTableLoader>>>,
+
+    /// Registry of dataset placeholders awaiting first-reference
+    /// initialization. Populated by `register_deferred_dataset` and
+    /// drained by `resolve_pending_initializations`.
+    pending_initializations: TokioRwLock<
+        HashMap<
+            TableReference,
+            Arc<crate::datafusion::table::dataset_table_provider::DatasetTableProvider>,
+        >,
+    >,
+    /// Mirrors `pending_initializations` size and is read on the
+    /// steady-state hot path: when zero, queries pay only a single
+    /// `Acquire`-ordered atomic load and skip the lookup entirely.
+    pending_initializations_count: std::sync::atomic::AtomicUsize,
+    query_cancel_registry: Arc<QueryCancelRegistry>,
 
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -823,17 +828,9 @@ impl DataFusion {
         self.policy_engine.as_ref()
     }
 
-    pub fn set_on_demand_table_loader(&self, loader: Weak<dyn OnDemandTableLoader>) {
-        if let Ok(mut on_demand_table_loader) = self.on_demand_table_loader.write() {
-            *on_demand_table_loader = Some(loader);
-        }
-    }
-
-    fn on_demand_table_loader(&self) -> Option<Arc<dyn OnDemandTableLoader>> {
-        self.on_demand_table_loader
-            .read()
-            .ok()
-            .and_then(|loader| loader.as_ref().and_then(Weak::upgrade))
+    #[must_use]
+    pub fn query_cancel_registry(&self) -> Arc<QueryCancelRegistry> {
+        Arc::clone(&self.query_cancel_registry)
     }
 
     pub async fn get_table(
@@ -1331,31 +1328,24 @@ impl DataFusion {
         Ok(table_provider)
     }
 
-    async fn load_on_demand_tables_for_statement(
+    /// Resolver hook used by `create_logical_plan` to ensure any
+    /// `DatasetTableProvider` placeholders referenced by `statement`
+    /// are initialized (and swapped to their real providers in the
+    /// catalog) before logical planning runs federation analysis.
+    ///
+    /// Hot-path fast exit: a single `Acquire`-ordered atomic load on
+    /// `pending_initializations_count` skips the
+    /// `resolve_table_references` call when no datasets are pending.
+    async fn resolve_pending_initializations_for_statement(
         &self,
         session: &SessionState,
         statement: &Statement,
     ) -> Result<(), DataFusionError> {
-        let Some(loader) = self.on_demand_table_loader() else {
-            return Ok(());
-        };
-        if !loader.has_on_demand_tables().await {
+        if !self.has_pending_initializations() {
             return Ok(());
         }
         let table_refs = session.resolve_table_references(statement)?;
-        loader.load_on_demand_tables(table_refs).await
-    }
-
-    pub async fn load_on_demand_dataset(
-        &self,
-        table_reference: TableReference,
-    ) -> Result<(), DataFusionError> {
-        let Some(loader) = self.on_demand_table_loader() else {
-            return Err(DataFusionError::Execution(format!(
-                "Cannot load on-demand dataset {table_reference}: on-demand loader is not initialized yet"
-            )));
-        };
-        loader.load_on_demand_tables(vec![table_reference]).await
+        self.resolve_pending_initializations(&table_refs).await
     }
 
     pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
@@ -1382,6 +1372,160 @@ impl DataFusion {
         }
 
         Ok(())
+    }
+
+    /// Register a deferred dataset.
+    ///
+    /// Inserts a `DatasetTableProvider` placeholder in the catalog with
+    /// the supplied schema and tracks the dataset in the pending
+    /// initialization registry. The lazy `DatasetInitialization` is
+    /// consumed at most once on first reference via the resolver hook
+    /// in `create_logical_plan`.
+    pub async fn register_deferred_dataset(
+        &self,
+        dataset: Arc<Dataset>,
+        init: crate::init::dataset_initialization::DatasetInitialization,
+        schema: arrow_schema::SchemaRef,
+    ) -> Result<()> {
+        use crate::datafusion::table::dataset_table_provider::DatasetTableProvider;
+        schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+
+        let placeholder = Arc::new(DatasetTableProvider::new(
+            dataset.name.clone(),
+            schema,
+            init,
+        ));
+
+        self.ctx
+            .register_table(
+                dataset.name.clone(),
+                Arc::clone(&placeholder) as Arc<dyn TableProvider>,
+            )
+            .map_err(find_datafusion_root)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+        self.pending_initializations
+            .write()
+            .await
+            .insert(dataset.name.clone(), placeholder);
+        self.pending_initializations_count
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        self.runtime_status
+            .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+
+        Ok(())
+    }
+
+    /// Steady-state hot-path probe: returns `true` iff at least one
+    /// dataset placeholder is awaiting initialization.
+    ///
+    /// Single `Acquire`-ordered atomic load. Pods with no deferred
+    /// datasets, and post-warm-up pods, pay nothing here.
+    #[must_use]
+    pub fn has_pending_initializations(&self) -> bool {
+        self.pending_initializations_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
+    /// Resolve any pending placeholders that match `table_refs`.
+    ///
+    /// For each match, calls `ensure_ready` on the placeholder; on
+    /// success, removes it from the pending registry and decrements
+    /// the counter, then swaps the real provider into the catalog via
+    /// `replace_table`.
+    pub async fn resolve_pending_initializations(
+        &self,
+        table_refs: &[TableReference],
+    ) -> std::result::Result<(), DataFusionError> {
+        if !self.has_pending_initializations() {
+            return Ok(());
+        }
+
+        // Snapshot just the matching placeholders under the read lock,
+        // then run `ensure_ready` (which awaits source I/O) without
+        // holding it.
+        let to_resolve: Vec<_> = {
+            let pending = self.pending_initializations.read().await;
+            table_refs
+                .iter()
+                .filter_map(|r| pending.get(r).map(|p| (r.clone(), Arc::clone(p))))
+                .collect()
+        };
+
+        for (table_ref, placeholder) in to_resolve {
+            let ready = placeholder.ensure_ready().await.map_err(|e| {
+                DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
+            })?;
+
+            // Swap the placeholder out of the catalog with the real
+            // provider so federation analysis on the eventual logical
+            // plan downcasts to the underlying
+            // `FederatedTableProviderAdaptor`.
+            if let Some(real_provider) = ready.table_provider.clone() {
+                self.replace_table(&table_ref, real_provider).map_err(|e| {
+                    DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
+                })?;
+            }
+
+            // Drop from the pending registry. Decrement only if the
+            // entry was still present (concurrent resolvers may have
+            // already removed it).
+            let mut pending = self.pending_initializations.write().await;
+            if pending.remove(&table_ref).is_some() {
+                self.pending_initializations_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Replace the table provider registered under `name` with
+    /// `provider`. Used by the deferred dataset initialization swap.
+    pub fn replace_table(
+        &self,
+        name: &TableReference,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<()> {
+        // DataFusion has no atomic replace; deregister + register is
+        // the documented pattern.
+        let _ = self.ctx.deregister_table(name.clone());
+        self.ctx
+            .register_table(name.clone(), provider)
+            .map_err(find_datafusion_root)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+        Ok(())
+    }
+
+    /// Deregister a placeholder so the eager bring-up path
+    /// can register the real (accelerated) table provider in its
+    /// place. Removes the entry from the pending registry and
+    /// decrements the counter so the resolver fast-path stops
+    /// matching this dataset.
+    pub async fn drop_pending_initialization(&self, name: &TableReference) -> Result<()> {
+        let _ = self.ctx.deregister_table(name.clone());
+        let mut pending = self.pending_initializations.write().await;
+        if pending.remove(name).is_some() {
+            self.pending_initializations_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Clear placeholder bookkeeping after a swap-in-place. Unlike
+    /// `drop_pending_initialization`, this does **not** call
+    /// `deregister_table`. The caller has already replaced the
+    /// placeholder with a real provider (e.g. via `register_table`
+    /// inside `register_loaded_dataset`), so deregistering would
+    /// remove the freshly-registered real provider.
+    pub async fn complete_pending_initialization(&self, name: &TableReference) {
+        let mut pending = self.pending_initializations.write().await;
+        if pending.remove(name).is_some() {
+            self.pending_initializations_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub async fn load_deferred_catalog(&self, name: &str, access: &AccessMode) -> Result<()> {
@@ -1887,11 +2031,35 @@ impl DataFusion {
             &dataset.name.to_string(),
         )?;
 
+        // For caching mode, the underlying accelerator storage is augmented
+        // with a hidden `__spice_cache_namespace` column so cached rows can be
+        // scoped per-principal. The user-facing schema (and therefore query
+        // planning, projection indices, and federation) continues to see only
+        // the original columns. This is a breaking change: existing caching
+        // accelerator storage from earlier Spice versions does not have the
+        // column and must be deleted (e.g. remove the duckdb_file or drop the
+        // SQLite/Postgres/Cayenne backing table) before upgrading.
+        let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
+            Arc::new(
+                crate::accelerated_table::caching::extend_schema_with_cache_namespace(
+                    &dataset.name.to_string(),
+                    &refresh_schema,
+                )
+                .map_err(|source| Error::UnableToCreateDataAccelerator {
+                    source: crate::dataaccelerator::Error::InvalidConfiguration {
+                        msg: source.to_string(),
+                    },
+                })?,
+            )
+        } else {
+            Arc::clone(&refresh_schema)
+        };
+
         let accelerated_table_provider = self
             .accelerator_engine_registry
             .create_accelerator_table(
                 dataset.name.clone(),
-                Arc::clone(&refresh_schema),
+                Arc::clone(&storage_schema),
                 constraints.as_ref(),
                 &acceleration_settings,
                 Arc::clone(&secrets),
@@ -2035,6 +2203,11 @@ impl DataFusion {
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        if matches!(refresh_mode, RefreshMode::Caching) {
+            // Hide the storage-only namespace column from query planning. Users
+            // see the same columns they would have seen pre-isolation.
+            accelerated_table_builder.user_facing_schema(Arc::clone(&refresh_schema));
+        }
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {
@@ -3025,6 +3198,21 @@ impl DataFusion {
             builder.refresh_semaphore(Arc::clone(semaphore));
         }
 
+        // Wrap the DuckDB accelerator with HNSW vector indexes (if applicable).
+        // This mirrors the dataset path in `EmbeddingConnector::on_accelerator_setup`.
+        #[cfg(feature = "duckdb")]
+        {
+            crate::embeddings::connector::try_wrap_view_accelerator_with_hnsw(
+                view,
+                table,
+                &mut builder,
+            )
+            .await
+            .map_err(|e| Error::UnableToCreateView {
+                reason: format!("Failed to create HNSW vector indexes for view: {e}"),
+            })?;
+        }
+
         let accelerated_table =
             builder
                 .build()
@@ -3137,11 +3325,19 @@ impl DataFusion {
     }
 
     /// Performs `DataFusion` cleanup during shutdown.
-    /// Currently performs cleanup of accelerated tables only.
+    /// Currently cancels active queries and cleans up accelerated tables.
     pub async fn shutdown(&self) {
         // Don't block self.accelerated_tables as it needs to be modified during table removal
         // and will be cleaned up authomatically by removing accelerated tables.
         tracing::debug!("Datafusion shutdown started");
+
+        let cancelled_queries = self.query_cancel_registry.cancel_all();
+        if cancelled_queries > 0 {
+            tracing::debug!(
+                cancelled_queries,
+                "Cancelled active queries during DataFusion shutdown"
+            );
+        }
 
         let accelerated_tables = self.accelerated_tables.read().await.clone();
 
@@ -3198,7 +3394,7 @@ impl DataFusion {
     ) -> Result<LogicalPlan, DataFusionError> {
         let dialect = session.config().options().sql_parser.dialect;
         let statement = session.sql_to_statement(sql, &dialect)?;
-        self.load_on_demand_tables_for_statement(session, &statement)
+        self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
 
         let ctx = planner::PlannerContext {
@@ -3227,7 +3423,7 @@ impl DataFusion {
     ) -> Result<LogicalPlan, DataFusionError> {
         let dialect = session.config().options().sql_parser.dialect;
         let statement = session.sql_to_statement(sql, &dialect)?;
-        self.load_on_demand_tables_for_statement(session, &statement)
+        self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
         session.statement_to_plan(statement).await
     }
@@ -4001,7 +4197,6 @@ mod tests {
                 runtime: Arc::new(runtime),
                 vectors: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
-                load: crate::component::dataset::Load::OnStartup,
             }
         }
 

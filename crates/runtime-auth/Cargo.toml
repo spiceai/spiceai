@@ -24,3 +24,4 @@ tokio = { workspace = true }
 tonic.workspace = true
 tower.workspace = true
 tracing.workspace = true
+sha2.workspace = true
