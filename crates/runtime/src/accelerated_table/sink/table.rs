@@ -41,6 +41,18 @@ impl TableSink {
         Self { table_provider }
     }
 
+    async fn providers_for_write_hooks(&self) -> Vec<Arc<dyn TableProvider>> {
+        if let Some(p) = self
+            .table_provider
+            .as_any()
+            .downcast_ref::<PartitionTableProvider>()
+        {
+            p.partition_table_providers().await
+        } else {
+            vec![Arc::clone(&self.table_provider)]
+        }
+    }
+
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
@@ -88,17 +100,9 @@ impl TableSink {
             "TableSink: executing insertion plan with collect() - this will read source and write to accelerator"
         );
 
-        let providers_to_maintain: Vec<Arc<dyn TableProvider>> = if let Some(p) = self
-            .table_provider
-            .as_any()
-            .downcast_ref::<PartitionTableProvider>()
-        {
-            p.partition_table_providers().await
-        } else {
-            vec![Arc::clone(&self.table_provider)]
-        };
+        let providers_before_write = self.providers_for_write_hooks().await;
 
-        for provider in &providers_to_maintain {
+        for provider in &providers_before_write {
             if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
                 let indexes = indexed.get_all_indexes();
                 tracing::debug!(
@@ -122,14 +126,14 @@ impl TableSink {
                 "TableSink: collect() failed after {:.2}s: {e}",
                 collect_start.elapsed().as_secs_f64()
             );
-            run_on_write_failed(&providers_to_maintain).await;
+            run_on_write_failed(&providers_before_write).await;
             return Err(retry_from_df_error(e));
         }
 
         // Perform post-write index maintenance (e.g., rebuild hash indexes) if the table supports it.
         // For partitioned tables each partition holds its own IndexedMemTable, so we iterate over
-        // all partition providers and trigger maintenance on each one individually.
-        for provider in providers_to_maintain {
+        // all partition providers after the insert has created any new partitions.
+        for provider in self.providers_for_write_hooks().await {
             match perform_index_maintenance(provider.as_ref()).await {
                 Ok(true) => {
                     tracing::debug!("TableSink: index maintenance completed successfully");
