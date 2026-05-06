@@ -94,6 +94,9 @@ pub struct Runtime {
     pub scheduler: Option<Scheduler>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate_control: Option<SourceRateControl>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_control: Option<RateControl>,
 
     #[serde(default, skip_serializing_if = "is_default")]
@@ -889,6 +892,38 @@ pub struct RateControl {
     pub refresh_interval: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct SourceRateControl {
+    /// Root URI for globally persisted source rate-control state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_location: Option<String>,
+
+    /// Optional object store params for source rate-control state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
+    /// How often each runtime refreshes and persists per-source rate-control state in object storage.
+    #[serde(default = "default_rate_control_refresh_interval")]
+    pub refresh_interval: String,
+
+    /// Maximum number of concurrent GitHub HTTP requests for this authentication context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_concurrent_connections_limit: Option<usize>,
+}
+
+impl Default for SourceRateControl {
+    fn default() -> Self {
+        Self {
+            state_location: None,
+            params: None,
+            refresh_interval: default_rate_control_refresh_interval(),
+            github_concurrent_connections_limit: None,
+        }
+    }
+}
+
 #[must_use]
 pub fn default_partition_assignment_interval() -> String {
     "30s".to_string()
@@ -974,6 +1009,8 @@ pub struct RuntimeDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate_control: Option<SourceRateControl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_control: Option<RateControl>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub functions: Functions,
@@ -1055,6 +1092,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             },
             metrics: deserializer.metrics,
             scheduler: deserializer.scheduler,
+            source_rate_control: deserializer.source_rate_control,
             rate_control: deserializer.rate_control,
             functions: deserializer.functions,
         })

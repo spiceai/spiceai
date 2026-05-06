@@ -154,7 +154,8 @@ runtime:
     http_requests_per_minute_limit: '300'
     http_rate_control_jitter_min: 2ms
     http_rate_control_jitter_max: 8ms
-    github_max_concurrent_connections: '5'
+  source_rate_control:
+    github_concurrent_connections_limit: 5
 
 # =============================================================================
 # MANAGEMENT CONFIGURATION

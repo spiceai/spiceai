@@ -2079,7 +2079,7 @@ pub fn error_checker(
     if rate_limited == Some(true) {
         // A secondary rate limit was exceeded
         return Err(graphql::Error::RateLimited {
-            message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.params.github_max_concurrent_connections in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
+            message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.source_rate_control.github_concurrent_connections_limit in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
         });
     }
 
@@ -2092,7 +2092,7 @@ pub fn error_checker(
             .unwrap_or(1);
         if ratelimit_remaining == 0 {
             return Err(graphql::Error::RateLimited {
-                message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.params.github_max_concurrent_connections in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
+                message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.source_rate_control.github_concurrent_connections_limit in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
             });
         }
     }

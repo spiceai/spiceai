@@ -38,9 +38,9 @@ use crate::{
     status, tracers,
 };
 use app::App;
-use spicepod::component::runtime::RateControl as SpicepodRateControl;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
+use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use telemetry::timing::TimeMeasurement;
@@ -247,6 +247,7 @@ impl RuntimeBuilder {
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
 
         let http_rate_control_registry = build_http_rate_control_registry(
+            spicepod_rt.source_rate_control.as_ref(),
             spicepod_rt.rate_control.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
@@ -492,14 +493,19 @@ impl Default for RuntimeBuilder {
 }
 
 async fn build_http_rate_control_registry(
-    rate_control: Option<&SpicepodRateControl>,
+    source_rate_control: Option<&SpicepodSourceRateControl>,
+    rate_control: Option<&spicepod::component::runtime::RateControl>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
     #[cfg(not(feature = "rate-control"))]
     {
         let _ = (&secrets, &io_runtime);
-        if rate_control.is_some() {
+        if source_rate_control
+            .and_then(|config| config.state_location.as_ref())
+            .is_some()
+            || rate_control.is_some()
+        {
             tracing::warn!(
                 "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
             );
@@ -509,19 +515,42 @@ async fn build_http_rate_control_registry(
 
     #[cfg(feature = "rate-control")]
     {
-        let Some(rate_control) = rate_control else {
+        let Some((state_location, params, refresh_interval, config_path)) = source_rate_control
+            .and_then(|config| {
+                config.state_location.as_deref().map(|state_location| {
+                    (
+                        state_location,
+                        config.params.as_ref(),
+                        config.refresh_interval.as_str(),
+                        "runtime.source_rate_control",
+                    )
+                })
+            })
+            .or_else(|| {
+                rate_control.map(|config| {
+                    (
+                        config.state_location.as_str(),
+                        config.params.as_ref(),
+                        config.refresh_interval.as_str(),
+                        "runtime.rate_control",
+                    )
+                })
+            })
+        else {
             return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
         };
 
-        let Some(refresh_interval) = parse_rate_control_refresh_interval(rate_control) else {
+        let Some(refresh_interval) =
+            parse_rate_control_refresh_interval(refresh_interval, config_path)
+        else {
             return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
         };
 
         match crate::object_store_state::build_object_store(
             secrets,
             io_runtime,
-            &rate_control.state_location,
-            rate_control.params.as_ref(),
+            state_location,
+            params,
             "rate-control state",
         )
         .await
@@ -529,7 +558,7 @@ async fn build_http_rate_control_registry(
             Ok((store, base_prefix)) => {
                 tracing::info!(
                     "Initialized persisted HTTP governor rate-control state with location: {}",
-                    rate_control.state_location
+                    state_location
                 );
                 let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
                     store,
@@ -550,21 +579,20 @@ async fn build_http_rate_control_registry(
 }
 
 #[cfg(feature = "rate-control")]
-fn parse_rate_control_refresh_interval(rate_control: &SpicepodRateControl) -> Option<Duration> {
-    match fundu::parse_duration(&rate_control.refresh_interval) {
+fn parse_rate_control_refresh_interval(
+    refresh_interval: &str,
+    config_path: &str,
+) -> Option<Duration> {
+    match fundu::parse_duration(refresh_interval) {
         Ok(refresh_interval) if refresh_interval.is_zero() => {
             tracing::error!(
-                "Invalid runtime.rate_control.refresh_interval '{}': value must be greater than 0",
-                rate_control.refresh_interval
+                "Invalid {config_path}.refresh_interval '{refresh_interval}': value must be greater than 0"
             );
             None
         }
         Ok(refresh_interval) => Some(refresh_interval),
         Err(error) => {
-            tracing::error!(
-                "Invalid runtime.rate_control.refresh_interval '{}': {error}",
-                rate_control.refresh_interval
-            );
+            tracing::error!("Invalid {config_path}.refresh_interval '{refresh_interval}': {error}");
             None
         }
     }
