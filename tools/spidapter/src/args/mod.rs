@@ -192,11 +192,11 @@ pub struct CayenneFlightsqlArgs {
     #[arg(long, env = "CAYENNE_DATA_DIR")]
     pub cayenne_data_dir: Option<String>,
 
-    /// Directory for Cayenne SQLite metadata files.
+    /// Directory for Cayenne `SQLite` metadata files.
     #[arg(long, env = "CAYENNE_METADATA_DIR")]
     pub cayenne_metadata_dir: Option<String>,
 
-    /// DataFusion catalog name.
+    /// `DataFusion` catalog name.
     #[arg(long, env = "FLIGHTSQL_CATALOG", default_value = "cayenne")]
     pub catalog: String,
 

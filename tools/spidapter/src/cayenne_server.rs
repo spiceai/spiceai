@@ -39,7 +39,7 @@ struct CayenneRunState {
     child: Child,
     /// grpc endpoint as an `http://` URL suitable for tonic (DDL execution).
     grpc_http_url: String,
-    /// Catalog name registered in the DataFusion session.
+    /// Catalog name registered in the `DataFusion` session.
     catalog: String,
     /// Default schema name.
     schema: String,
