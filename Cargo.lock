@@ -15762,6 +15762,7 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "pin-project",
+ "sha2",
  "tonic",
  "tower 0.5.3",
  "tracing",

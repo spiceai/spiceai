@@ -326,10 +326,11 @@ impl Query {
                 pre_parsed_plan,
                 ..
             } => {
-                // Use the existing get_plan_or_cached which handles all cache control,
-                // stale-while-revalidate, and query tracking. `read_only` is
-                // threaded through so cached results cannot bypass
-                // `validate_sql_query_read_only` below.
+                // Use the existing get_plan_or_cached which handles all cache
+                // control, stale-while-revalidate, and query tracking. The
+                // cache itself is namespaced per principal and refuses to
+                // store write-capable plans, so a read-only caller cannot
+                // observe a cached entry produced by a write-capable plan.
                 match Query::get_plan_or_cached(
                     &self.df,
                     &session,
@@ -337,7 +338,6 @@ impl Query {
                     sql,
                     parameters.clone(),
                     tracker,
-                    self.read_only,
                     pre_parsed_plan.clone(),
                 )
                 .await?
@@ -622,7 +622,6 @@ impl Query {
                             sql,
                             parameters.clone(),
                             tracker,
-                            ctx.read_only,
                             pre_parsed_plan.clone(),
                         )
                         .await?

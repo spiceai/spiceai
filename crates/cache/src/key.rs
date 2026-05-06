@@ -86,23 +86,25 @@ impl<'a> From<(&'a str, &'a EmbeddingInput)> for CacheKey<'a> {
 }
 
 impl CacheKey<'_> {
-    #[must_use]
-    pub fn as_raw_key<T: Hasher>(&self, mut hasher: T) -> RawCacheKey {
+    /// Hash this key's payload into `hasher`. Used by both [`Self::as_raw_key`]
+    /// and [`Self::as_raw_key_in_namespace`] so the payload byte stream stays
+    /// identical regardless of whether a namespace prefix was mixed in.
+    fn hash_payload<T: Hasher>(&self, hasher: &mut T) {
         match self {
-            Self::LogicalPlan(logical_plan) => logical_plan.hash(&mut hasher),
-            Self::Search(search_key) => search_key.hash(&mut hasher),
-            Self::EmbeddingRequest(embedding_request) => embedding_request.hash(&mut hasher),
+            Self::LogicalPlan(logical_plan) => logical_plan.hash(hasher),
+            Self::Search(search_key) => search_key.hash(hasher),
+            Self::EmbeddingRequest(embedding_request) => embedding_request.hash(hasher),
             Self::EmbeddingInput(model_name, embedding_input) => {
-                model_name.hash(&mut hasher);
-                embedding_input.hash(&mut hasher);
+                model_name.hash(hasher);
+                embedding_input.hash(hasher);
             }
             Self::Query(sql, param_values) => {
-                sql.hash(&mut hasher);
+                sql.hash(hasher);
                 if let Some(params) = param_values {
                     match params {
                         ParamValues::List(vec) => {
                             for item in vec {
-                                item.value().hash(&mut hasher);
+                                item.value().hash(hasher);
                             }
                         }
                         ParamValues::Map(hash_map) => {
@@ -111,15 +113,52 @@ impl CacheKey<'_> {
                             pairs.sort_by(|a, b| a.0.cmp(b.0)); // Sort by keys
 
                             for (key, value) in pairs {
-                                key.hash(&mut hasher);
-                                value.value().hash(&mut hasher);
+                                key.hash(hasher);
+                                value.value().hash(hasher);
                             }
                         }
                     }
                 }
             }
-            Self::ClientSupplied(user_key) => user_key.hash(&mut hasher),
+            Self::ClientSupplied(user_key) => user_key.hash(hasher),
         }
+    }
+
+    /// Compute the raw cache key with no namespace mixed in. Use this for
+    /// surfaces whose result is a pure function of the inputs and is safe
+    /// to share across all callers — most importantly the embeddings cache,
+    /// where `(model, input) -> embedding` is permission-independent.
+    #[must_use]
+    pub fn as_raw_key<T: Hasher>(&self, mut hasher: T) -> RawCacheKey {
+        self.hash_payload(&mut hasher);
+        RawCacheKey(hasher.finish())
+    }
+
+    /// Compute the raw cache key with a namespace prefix folded into the
+    /// hash. Two requests whose `(namespace_tag, namespace_id)` differ
+    /// hash to distinct keys for otherwise-identical payloads, which is
+    /// what makes cache hits safe under per-user authentication.
+    ///
+    /// `namespace_tag` is the discriminant of the namespace kind
+    /// (`0` = public/shared, `1` = principal, `2` = system) and
+    /// `namespace_id` is the principal's stable opaque id (empty for
+    /// public/system).
+    ///
+    /// The byte stream hashed is:
+    /// `[namespace_tag][namespace_id.len() as u64 LE][namespace_id...][payload...]`
+    /// so that `(tag=1, id="abc")` and `(tag=1, id="a")` followed by a
+    /// payload starting with `"bc"` cannot collide.
+    #[must_use]
+    pub fn as_raw_key_in_namespace<T: Hasher>(
+        &self,
+        mut hasher: T,
+        namespace_tag: u8,
+        namespace_id: &[u8],
+    ) -> RawCacheKey {
+        hasher.write_u8(namespace_tag);
+        hasher.write_u64(namespace_id.len() as u64);
+        hasher.write(namespace_id);
+        self.hash_payload(&mut hasher);
         RawCacheKey(hasher.finish())
     }
 }
