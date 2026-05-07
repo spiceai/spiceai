@@ -371,8 +371,7 @@ impl LeasedBucket {
             let my_existing = window
                 .leases
                 .get(&self.config.instance_id)
-                .map(|l| l.granted)
-                .unwrap_or(0);
+                .map_or(0, |l| l.granted);
 
             // Fair-share demand: divide remaining cluster budget evenly across
             // active replicas (including self). Clamped to

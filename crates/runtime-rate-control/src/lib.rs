@@ -677,7 +677,7 @@ fn normalize_object_state_prefix(prefix: &str) -> String {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn unix_millis_now() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration_millis_u64(duration),
