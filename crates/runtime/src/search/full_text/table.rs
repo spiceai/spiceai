@@ -294,7 +294,7 @@ mod tests {
         };
         let table_ref = datafusion::sql::TableReference::parse_str("docs");
 
-        let err = add_elasticsearch_fts_to_table(table, &columns, &table_ref, &fts_params, false)
+        let err = add_elasticsearch_fts_to_table(table, &columns, &table_ref, &fts_params)
             .await
             .expect_err("missing row_id column should fail before indexing");
 
