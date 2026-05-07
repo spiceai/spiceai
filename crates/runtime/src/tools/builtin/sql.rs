@@ -32,7 +32,7 @@ use tracing_futures::Instrument;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct SqlToolParams {
-    /// The SQL query to run, written in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.
+    /// The SQL query to run, written in the Spice.ai SQL Dialect (`DataFusion` SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.
     query: String,
 }
 
