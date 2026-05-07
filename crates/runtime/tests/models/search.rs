@@ -382,12 +382,47 @@ fn assert_search_response_structure(test_name: &str, resp: Value, round_scores: 
         // For additional_columns tests, verify extra fields are returned.
         if test_name.contains("additional_columns") {
             let data = result.get("data").and_then(|d| d.as_object());
+            let primary_key = result.get("primary_key").and_then(|p| p.as_object());
             assert!(
-                data.is_some_and(|d| !d.is_empty()),
-                "{test_name}: result[{i}] data should contain requested additional columns"
+                data.is_some_and(|d| !d.is_empty()) || primary_key.is_some_and(|p| p.len() > 1),
+                "{test_name}: result[{i}] data or primary_key should contain requested additional columns"
             );
         }
     }
+}
+
+#[test]
+fn structural_search_response_accepts_additional_columns_in_data() {
+    assert_search_response_structure(
+        "s3vectors_chunking_additional_columns",
+        json!({
+            "duration_ms": 1,
+            "results": [
+                {"_score": 0.4, "data": {"question": "q1"}, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1}},
+                {"_score": 0.3, "data": {"question": "q2"}, "dataset": "qs", "matches": {"answer": ["a2"]}, "primary_key": {"id": 2}},
+                {"_score": 0.2, "data": {"question": "q3"}, "dataset": "qs", "matches": {"answer": ["a3"]}, "primary_key": {"id": 3}},
+                {"_score": 0.1, "data": {"question": "q4"}, "dataset": "qs", "matches": {"answer": ["a4"]}, "primary_key": {"id": 4}}
+            ]
+        }),
+        true,
+    );
+}
+
+#[test]
+fn structural_search_response_accepts_additional_columns_in_primary_key() {
+    assert_search_response_structure(
+        "s3vectors_composite_additional_columns",
+        json!({
+            "duration_ms": 1,
+            "results": [
+                {"_score": 0.4, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1, "question": "q1"}},
+                {"_score": 0.3, "dataset": "qs", "matches": {"answer": ["a2"]}, "primary_key": {"id": 2, "question": "q2"}},
+                {"_score": 0.2, "dataset": "qs", "matches": {"answer": ["a3"]}, "primary_key": {"id": 3, "question": "q3"}},
+                {"_score": 0.1, "dataset": "qs", "matches": {"answer": ["a4"]}, "primary_key": {"id": 4, "question": "q4"}}
+            ]
+        }),
+        true,
+    );
 }
 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
