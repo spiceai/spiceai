@@ -344,6 +344,12 @@ datasets:
         description: Text content for embeddings
         embeddings:
           - from: openai_embeddings
+            engine: elasticsearch
+            params:
+              endpoint: &elasticsearch_endpoint http://localhost:9200
+              user: ${secrets:ES_USER}
+              pass: ${secrets:ES_PASS}
+              index: content_vectors
             chunking:
               enabled: true
               target_chunk_size: 512
@@ -354,10 +360,16 @@ datasets:
             vector_size: 1536
         full_text_search:
           enabled: true
+          engine: elasticsearch
           row_id:
             - id
           index_store: memory # memory, file
           index_directory: /tmp/fts-index
+          params:
+            endpoint: *elasticsearch_endpoint
+            user: ${secrets:ES_USER}
+            pass: ${secrets:ES_PASS}
+            index: content_text
     params:
       pg_connection_string: postgresql://user:pass@localhost:5432/db
       pg_host: localhost
@@ -388,6 +400,14 @@ datasets:
           expression: category
       params:
         duckdb_file: ./vectors.duckdb
+    full_text_search:
+      enabled: true
+      engine: elasticsearch
+      params:
+        endpoint: *elasticsearch_endpoint
+        user: ${secrets:ES_USER}
+        pass: ${secrets:ES_PASS}
+        index: articles_index
     acceleration:
       enabled: true
       engine: duckdb

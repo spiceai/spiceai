@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{panic, sync::Arc};
 
-use crate::{flight::query_to_batches, queries::Query};
+use crate::{flight::query_to_batches, queries::Query, utils::sanitize_record_batches};
 use spiceai::Client as SpiceClient;
 
 pub const CAYENNE_PATH_FILTER_PATTERN: &str =
@@ -27,6 +27,30 @@ const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
 
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
+}
+
+/// Build the list of regex filters for normalizing explain plan output.
+fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static str)> {
+    let temp_dir_str = temp_dir.to_str().unwrap_or_default();
+    let temp_dir_clean = temp_dir_str.trim_end_matches('/').trim_start_matches('/');
+    let temp_dir_pattern = regex::escape(temp_dir_clean);
+    let path_filter_pattern = make_tmpdir_regex_pattern(temp_dir_pattern.as_str());
+
+    vec![
+        (path_filter_pattern, "/data"),
+        (CAYENNE_PATH_FILTER_PATTERN.to_string(), CAYENNE_PATH_FILTER_REPLACEMENT),
+        (VORTEX_RANGE_FILTER_PATTERN.to_string(), VORTEX_RANGE_FILTER_REPLACEMENT),
+        (r"required_guarantees=\[[^\]]*\]".to_string(), "required_guarantees=[N]"),
+        (r"partition_sizes=\[[^\]]*\]".to_string(), "partition_sizes=[<redacted>]"),
+        (
+            r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#.to_string(),
+            "<GROUPING_PAIR>",
+        ),
+        (
+            r#"grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\),\s*grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\)"#.to_string(),
+            "<GROUPING_PAIR>",
+        ),
+    ]
 }
 
 pub async fn record_explain_plan(
@@ -43,36 +67,23 @@ pub async fn record_explain_plan(
         .await
         .map_err(|e| anyhow::anyhow!("query `{query_name}` to plan: {e}"))?;
 
-    let explain_plan_raw = arrow::util::pretty::pretty_format_batches(&plan_results)?;
+    // Apply filters to raw RecordBatch values before formatting so that
+    // pretty_format_batches computes column widths from normalized values,
+    // eliminating non-deterministic padding diffs.
+    let filters = build_explain_filters(&std::env::temp_dir());
+    let sanitized = sanitize_record_batches(&plan_results, &filters)?;
+
+    let explain_plan_raw = arrow::util::pretty::pretty_format_batches(&sanitized)?;
 
     // Sort PartitionedUnionExec children for deterministic snapshot comparison
     let explain_plan = sort_partitioned_union_children(&explain_plan_raw.to_string());
 
     let mut assertion_err: Option<String> = None;
 
-    let temp_dir = std::env::temp_dir();
-    let temp_dir_str = temp_dir.to_str().unwrap_or_default();
-    let temp_dir_clean = temp_dir_str.trim_end_matches('/').trim_start_matches('/');
-    let temp_dir_pattern = regex::escape(temp_dir_clean);
-
-    // Create two patterns:
-    // 1. Exact match starting with the temp_dir: {temp_dir}/some_dir/data
-    // 2. Match with "private" prefix: private{temp_dir}/some_dir/data
-    let path_filter_pattern = make_tmpdir_regex_pattern(temp_dir_pattern.as_str());
-
     insta::with_settings!({
         description => format!("Query: {query_name}"),
         omit_expression => true,
         snapshot_path => "snapshots/explain",
-        filters => vec![
-            (path_filter_pattern.as_str(), "/data"),
-            (CAYENNE_PATH_FILTER_PATTERN, CAYENNE_PATH_FILTER_REPLACEMENT),
-            (VORTEX_RANGE_FILTER_PATTERN, VORTEX_RANGE_FILTER_REPLACEMENT),
-            (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
-            (r"partition_sizes=\[[^\]]*\]", "partition_sizes=[<redacted>]"),
-            (r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#, "<GROUPING_PAIR>"),
-            (r#"grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\),\s*grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\)"#, "<GROUPING_PAIR>")
-        ],
     }, {
         let snapshot_name = if (scale_factor - 1.0).abs() < f64::EPSILON {
             format!("{name}_{query_name}_explain")

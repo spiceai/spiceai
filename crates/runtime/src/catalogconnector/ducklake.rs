@@ -293,6 +293,7 @@ impl CatalogConnector for DuckLakeCatalog {
             catalog_name,
             writable,
             ddl_enabled,
+            catalog.include.clone(),
         ));
 
         // Initial refresh to populate schemas and tables

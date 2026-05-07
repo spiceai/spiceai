@@ -40,6 +40,7 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 pub mod acceleration;
 pub mod component;
 pub mod extension;
+pub mod fts;
 mod keywords;
 pub mod metric;
 pub mod param;

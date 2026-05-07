@@ -30,6 +30,7 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use globset::GlobSet;
 use snafu::prelude::*;
 
 use crate::RefreshableCatalogProvider;
@@ -76,6 +77,8 @@ pub struct DuckLakeCatalogProvider {
     writable: bool,
     /// Whether DDL operations are allowed
     ddl_enabled: bool,
+    /// Optional glob filter for table inclusion (`schema.table` format)
+    include: Option<Arc<GlobSet>>,
 }
 
 impl std::fmt::Debug for DuckLakeCatalogProvider {
@@ -96,12 +99,14 @@ impl DuckLakeCatalogProvider {
     /// * `catalog_name` - The catalog name as attached in `DuckDB`
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
+    /// * `include` - Optional glob filter for table inclusion (`schema.table` format)
     #[must_use]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
         catalog_name: String,
         writable: bool,
         ddl_enabled: bool,
+        include: Option<GlobSet>,
     ) -> Self {
         // Create a table factory that uses the same pool (with ducklake already attached)
         let duckdb_factory = Arc::new(DuckDBTableFactory::new(Arc::clone(&pool)));
@@ -112,6 +117,7 @@ impl DuckLakeCatalogProvider {
             schemas: RwLock::new(HashMap::new()),
             writable,
             ddl_enabled,
+            include: include.map(Arc::new),
         }
     }
 
@@ -180,6 +186,7 @@ impl DuckLakeCatalogProvider {
                 schema_name.clone(),
                 self.writable,
                 self.ddl_enabled,
+                self.include.clone(),
             );
             schema_provider.refresh().await?;
             schemas.insert(schema_name, Arc::new(schema_provider));
@@ -271,6 +278,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                 schema_name,
                 ducklake_schema.writable,
                 ducklake_schema.ddl_enabled,
+                ducklake_schema.include.clone(),
             ))
         } else {
             Arc::new(DuckLakeSchemaProvider::new(
@@ -280,6 +288,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                 schema_name,
                 self.writable,
                 self.ddl_enabled,
+                self.include.clone(),
             ))
         };
 
@@ -392,6 +401,8 @@ pub struct DuckLakeSchemaProvider {
     writable: bool,
     /// Whether DDL operations are allowed
     ddl_enabled: bool,
+    /// Optional glob filter for table inclusion (`schema.table` format)
+    include: Option<Arc<GlobSet>>,
 }
 
 impl std::fmt::Debug for DuckLakeSchemaProvider {
@@ -415,6 +426,7 @@ impl DuckLakeSchemaProvider {
     /// * `schema_name` - The schema name
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
+    /// * `include` - Optional glob filter for table inclusion (`schema.table` format)
     #[must_use]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
@@ -423,6 +435,7 @@ impl DuckLakeSchemaProvider {
         schema_name: String,
         writable: bool,
         ddl_enabled: bool,
+        include: Option<Arc<GlobSet>>,
     ) -> Self {
         Self {
             pool,
@@ -432,6 +445,7 @@ impl DuckLakeSchemaProvider {
             tables: RwLock::new(HashMap::new()),
             writable,
             ddl_enabled,
+            include,
         }
     }
 
@@ -481,6 +495,14 @@ impl DuckLakeSchemaProvider {
 
         let mut tables = HashMap::new();
         for table_name in table_names {
+            let schema_with_table = format!("{}.{}", self.schema_name, table_name);
+            if let Some(include) = &self.include
+                && !include.is_match(&schema_with_table)
+            {
+                tracing::debug!("Table {schema_with_table} is not included, skipping");
+                continue;
+            }
+
             // Create a fully qualified table reference for the DuckLake table
             let table_ref = TableReference::full(
                 self.catalog_name.clone(),

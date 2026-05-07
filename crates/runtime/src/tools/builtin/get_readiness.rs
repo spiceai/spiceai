@@ -33,7 +33,7 @@ impl GetReadinessTool {
     pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
             name: name.unwrap_or("get_readiness").to_string(),
-            description: description.unwrap_or("Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.").to_string(),
+            description: description.unwrap_or("Report the readiness state of every Spice runtime component (datasets, accelerators, models, embeddings, catalogs). Call this when diagnosing why a query, model, or search call is failing or returning empty results, or to verify the runtime is healthy before issuing other tool calls. Takes no arguments. Returns a JSON object mapping component name to status (e.g. 'Ready', 'Initializing', 'Error').").to_string(),
             rt,
         }
     }
