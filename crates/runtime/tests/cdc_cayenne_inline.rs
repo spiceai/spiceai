@@ -116,21 +116,21 @@ fn make_create_envelope(id: i64, name: &str, counter: Arc<TokioMutex<usize>>) ->
 }
 
 /// Build a `ChangesStream` of N create-op envelopes sharing one commit counter.
-fn make_n_envelopes(n: usize, counter: Arc<TokioMutex<usize>>) -> ChangesStream {
+fn make_n_envelopes(n: usize, counter: &Arc<TokioMutex<usize>>) -> ChangesStream {
     let envelopes: Vec<Result<ChangeEnvelope, StreamError>> = (0..n)
         .map(|i| {
             let id = i64::try_from(i).expect("usize fits in i64");
             Ok(make_create_envelope(
                 id,
                 &format!("row-{i}"),
-                Arc::clone(&counter),
+                Arc::clone(counter),
             ))
         })
         .collect();
     fstream::iter(envelopes).boxed()
 }
 
-/// Construct a Cayenne table provider backed by a temp SQLite metastore and
+/// Construct a Cayenne table provider backed by a temp `SQLite` metastore and
 /// temp data directory.
 async fn setup_cayenne(
     table_name: &str,
@@ -220,7 +220,7 @@ async fn cdc_into_cayenne_data_inlining_e2e() {
         "cdc_inline_e2e",
     );
     let commit_count = Arc::new(TokioMutex::new(0usize));
-    let stream = make_n_envelopes(N, Arc::clone(&commit_count));
+    let stream = make_n_envelopes(N, &commit_count);
 
     let refresh = Arc::new(RwLock::new(Refresh::default()));
     task.start_changes_stream(
@@ -250,7 +250,8 @@ async fn cdc_into_cayenne_data_inlining_e2e() {
         .await
         .expect("get_inlined_data_count");
     assert_eq!(
-        inlined, N as i64,
+        inlined,
+        i64::try_from(N).expect("N fits in i64"),
         "small CDC bursts must take the data-inlining path"
     );
 }
