@@ -2038,11 +2038,13 @@ mod tests {
     #[tokio::test]
     async fn test_github_uses_source_rate_control_concurrency_limit() {
         let factory = GithubFactory::new();
-        let mut app_runtime = spicepod::component::runtime::Runtime::default();
-        app_runtime.source_rate_control = Some(spicepod::component::runtime::SourceRateControl {
-            github_concurrent_connections_limit: Some(2),
+        let app_runtime = spicepod::component::runtime::Runtime {
+            source_rate_control: Some(spicepod::component::runtime::SourceRateControl {
+                github_concurrent_connections_limit: Some(2),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
 
         let params = github_connector_params_with_runtime(
             "github_source_rate_control_concurrency",
@@ -2063,11 +2065,13 @@ mod tests {
     #[tokio::test]
     async fn test_github_source_rate_control_overrides_legacy_runtime_param() {
         let factory = GithubFactory::new();
-        let mut app_runtime = spicepod::component::runtime::Runtime::default();
-        app_runtime.source_rate_control = Some(spicepod::component::runtime::SourceRateControl {
-            github_concurrent_connections_limit: Some(2),
+        let mut app_runtime = spicepod::component::runtime::Runtime {
+            source_rate_control: Some(spicepod::component::runtime::SourceRateControl {
+                github_concurrent_connections_limit: Some(2),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         app_runtime.params.insert(
             "github_max_concurrent_connections".to_string(),
             "3".to_string(),
@@ -2116,11 +2120,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_rejects_zero_source_rate_control_concurrency_limit() {
-        let mut app_runtime = spicepod::component::runtime::Runtime::default();
-        app_runtime.source_rate_control = Some(spicepod::component::runtime::SourceRateControl {
-            github_concurrent_connections_limit: Some(0),
+        let app_runtime = spicepod::component::runtime::Runtime {
+            source_rate_control: Some(spicepod::component::runtime::SourceRateControl {
+                github_concurrent_connections_limit: Some(0),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
 
         let params = github_connector_params_with_runtime(
             "github_zero_source_rate_control_concurrency",

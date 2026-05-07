@@ -81,7 +81,7 @@ fn contains_persisted_limiter_state(path: &Path) -> bool {
                 .ok()
                 .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
                 .and_then(|value| value.get("limiters").cloned())
-                .and_then(|limiters| limiters.as_object().map(|limiters| limiters.len()))
+                .and_then(|limiters| limiters.as_object().map(serde_json::Map::len))
                 .is_some_and(|len| len > 0)
         {
             return true;
