@@ -735,7 +735,7 @@ mod write_maintenance_tests {
         async fn get_index_refresh_interval(
             &self,
             _index: &str,
-        ) -> elasticsearch::error::Result<Option<String>> {
+        ) -> elasticsearch::Result<Option<String>> {
             self.get_refresh_interval_calls
                 .fetch_add(1, Ordering::Relaxed);
             Ok(self.refresh_interval.lock().expect("lock poisoned").clone())
@@ -745,7 +745,7 @@ mod write_maintenance_tests {
             &self,
             _index: &str,
             _body: &serde_json::Value,
-        ) -> elasticsearch::error::Result<serde_json::Value> {
+        ) -> elasticsearch::Result<serde_json::Value> {
             self.put_settings_calls.fetch_add(1, Ordering::Relaxed);
             Ok(serde_json::json!({}))
         }
@@ -753,7 +753,7 @@ mod write_maintenance_tests {
         async fn refresh_index(
             &self,
             _index: &str,
-        ) -> elasticsearch::error::Result<serde_json::Value> {
+        ) -> elasticsearch::Result<serde_json::Value> {
             self.refresh_index_calls.fetch_add(1, Ordering::Relaxed);
             Ok(serde_json::json!({}))
         }
@@ -762,7 +762,7 @@ mod write_maintenance_tests {
             &self,
             _index: &str,
             max_num_segments: u32,
-        ) -> elasticsearch::error::Result<serde_json::Value> {
+        ) -> elasticsearch::Result<serde_json::Value> {
             self.force_merge_calls.fetch_add(1, Ordering::Relaxed);
             *self
                 .last_force_merge_segments
@@ -772,54 +772,54 @@ mod write_maintenance_tests {
         }
 
         // Remaining methods are unused by ElasticsearchIndexWriteMaintenance.
-        async fn get_mapping(&self, _: &str) -> elasticsearch::error::Result<MappingResponse> {
+        async fn get_mapping(&self, _: &str) -> elasticsearch::Result<MappingResponse> {
             unimplemented!()
         }
         async fn search(
             &self,
             _: &str,
             _: &SearchRequest,
-        ) -> elasticsearch::error::Result<SearchResponse> {
+        ) -> elasticsearch::Result<SearchResponse> {
             unimplemented!()
         }
         async fn search_raw(
             &self,
             _: &str,
             _: &serde_json::Value,
-        ) -> elasticsearch::error::Result<SearchResponse> {
+        ) -> elasticsearch::Result<SearchResponse> {
             unimplemented!()
         }
         async fn open_point_in_time(
             &self,
             _: &str,
             _: &str,
-        ) -> elasticsearch::error::Result<String> {
+        ) -> elasticsearch::Result<String> {
             unimplemented!()
         }
         async fn search_point_in_time(
             &self,
             _: &serde_json::Value,
-        ) -> elasticsearch::error::Result<SearchResponse> {
+        ) -> elasticsearch::Result<SearchResponse> {
             unimplemented!()
         }
-        async fn close_point_in_time(&self, _: &str) -> elasticsearch::error::Result<()> {
+        async fn close_point_in_time(&self, _: &str) -> elasticsearch::Result<()> {
             unimplemented!()
         }
-        async fn index_exists(&self, _: &str) -> elasticsearch::error::Result<bool> {
+        async fn index_exists(&self, _: &str) -> elasticsearch::Result<bool> {
             unimplemented!()
         }
         async fn create_index(
             &self,
             _: &str,
             _: &serde_json::Value,
-        ) -> elasticsearch::error::Result<serde_json::Value> {
+        ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }
         async fn put_mapping(
             &self,
             _: &str,
             _: &serde_json::Value,
-        ) -> elasticsearch::error::Result<serde_json::Value> {
+        ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }
         async fn index_document(
@@ -827,14 +827,14 @@ mod write_maintenance_tests {
             _: &str,
             _: &str,
             _: &serde_json::Value,
-        ) -> elasticsearch::error::Result<serde_json::Value> {
+        ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }
         async fn bulk_index(
             &self,
             _: &str,
             _: &[(Option<String>, serde_json::Value)],
-        ) -> elasticsearch::error::Result<serde_json::Value> {
+        ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }
     }
