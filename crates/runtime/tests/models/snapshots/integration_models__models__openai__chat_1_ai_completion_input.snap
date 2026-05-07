@@ -39,21 +39,21 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
   "tools": [
     {
       "function": {
-        "description": "Get the current UTC date and time in ISO 8601 format",
+        "description": "Return the current UTC date and time as an ISO 8601 timestamp. Call this whenever the model needs the actual current time to compute relative durations, evaluate freshness, or stamp generated content; do not guess or rely on training-data dates. Takes no arguments. Returns a string like '2026-05-06T13:45:00Z'.",
         "name": "get_current_datetime"
       },
       "type": "function"
     },
     {
       "function": {
-        "description": "Get the readiness status of the Spice.ai runtime",
+        "description": "Report the readiness state of every Spice runtime component (datasets, accelerators, models, embeddings, catalogs). Call this when diagnosing why a query, model, or search call is failing or returning empty results, or to verify the runtime is healthy before issuing other tool calls. Takes no arguments. Returns a JSON object mapping component name to status (e.g. 'Ready', 'Initializing', 'Error').",
         "name": "get_readiness"
       },
       "type": "function"
     },
     {
       "function": {
-        "description": "List available datasets",
+        "description": "List every dataset, view, and catalog visible to this runtime, with each entry's fully-qualified table name, description, columns, and capability flags (e.g. `can_search_documents`). Call this first whenever you need to discover what data is available before issuing `sql`, `search`, `table_schema`, or sample tools. Takes no arguments. Returns a JSON array; use the `table` field as the identifier for follow-up tool calls.",
         "name": "list_datasets"
       },
       "type": "function"
