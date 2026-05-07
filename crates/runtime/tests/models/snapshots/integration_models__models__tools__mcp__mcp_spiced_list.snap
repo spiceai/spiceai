@@ -237,7 +237,7 @@ expression: tools_list
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "query": {
-          "description": "The SQL query to run, written in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.",
+          "description": "The SQL query to run, written in the Spice.ai SQL Dialect (`DataFusion` SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.",
           "type": "string"
         }
       },
@@ -457,7 +457,7 @@ expression: tools_list
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "query": {
-          "description": "The SQL query to run, written in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.",
+          "description": "The SQL query to run, written in the Spice.ai SQL Dialect (`DataFusion` SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.",
           "type": "string"
         }
       },
