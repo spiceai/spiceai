@@ -60,7 +60,9 @@ pub enum Error {
     #[snafu(display("Failed to acquire semaphore permit. {source}"))]
     SemaphoreAcquireError { source: tokio::sync::AcquireError },
 
-    #[snafu(display("Cluster rate-control budget exhausted for origin {origin}; persisted store is unavailable and the lease has expired"))]
+    #[snafu(display(
+        "Cluster rate-control budget exhausted for origin {origin}; persisted store is unavailable and the lease has expired"
+    ))]
     ClusterBudgetExhausted { origin: String },
 
     #[snafu(display("Failed to refresh cluster rate-control lease for origin {origin}. {source}"))]
@@ -276,9 +278,10 @@ impl RateControllerBuilder {
             .max_concurrent_requests
             .map(|max_concurrent_requests| Arc::new(Semaphore::new(max_concurrent_requests)));
 
-        let weighted_rate_limiter = self.weighted_quota.as_ref().map(|q| {
-            Arc::new(GovernorRateLimiter::direct(q.quota))
-        });
+        let weighted_rate_limiter = self
+            .weighted_quota
+            .as_ref()
+            .map(|q| Arc::new(GovernorRateLimiter::direct(q.quota)));
 
         // Persistence path: each named quota becomes a LeasedBucket. We do NOT
         // also build a local governor limiter for that quota — the lease
@@ -528,18 +531,13 @@ impl RateController {
         }
         // Cluster leased buckets: each acquire consumes one token, may wait.
         for bucket in &self.leased_buckets {
-            bucket
-                .acquire()
-                .await
-                .map_err(|e| match e {
-                    leased::Error::FailClosed { origin } => {
-                        Error::ClusterBudgetExhausted { origin }
-                    }
-                    other => Error::LeaseRefresh {
-                        origin: other_origin(&other),
-                        source: Box::new(other),
-                    },
-                })?;
+            bucket.acquire().await.map_err(|e| match e {
+                leased::Error::FailClosed { origin } => Error::ClusterBudgetExhausted { origin },
+                other => Error::LeaseRefresh {
+                    origin: other_origin(&other),
+                    source: Box::new(other),
+                },
+            })?;
         }
         Ok(())
     }
@@ -702,9 +700,7 @@ mod tests {
         let rate_controller = RateControllerBuilder::new()
             .with_jitter(JitterConfig::zero())
             .with_max_concurrent_requests(5)
-            .add_quota(Quota::per_second(
-                NonZeroU32::new(10).expect("non-zero"),
-            ))
+            .add_quota(Quota::per_second(NonZeroU32::new(10).expect("non-zero")))
             .build();
 
         let permit = rate_controller.acquire().await.expect("acquire");

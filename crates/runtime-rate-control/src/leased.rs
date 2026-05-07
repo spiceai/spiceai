@@ -47,17 +47,13 @@ const STALE_WINDOW_RETENTION: u64 = 60;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(
-        "Failed to read persisted rate-control state for origin {origin}. {source}"
-    ))]
+    #[snafu(display("Failed to read persisted rate-control state for origin {origin}. {source}"))]
     Read {
         origin: String,
         source: Box<object_store_occ::Error>,
     },
 
-    #[snafu(display(
-        "Failed to write persisted rate-control state for origin {origin}. {source}"
-    ))]
+    #[snafu(display("Failed to write persisted rate-control state for origin {origin}. {source}"))]
     Write {
         origin: String,
         source: Box<object_store_occ::Error>,
@@ -222,8 +218,9 @@ pub(crate) struct LeasedBucket {
 
 impl LeasedBucket {
     pub fn new(config: LeasedBucketConfig) -> Arc<Self> {
-        let object_state =
-            Arc::new(ObjectState::new(Arc::clone(&config.store)).with_prefix(config.prefix.clone()));
+        let object_state = Arc::new(
+            ObjectState::new(Arc::clone(&config.store)).with_prefix(config.prefix.clone()),
+        );
         let now_ms = unix_millis_now();
         let window_id = window_id_for(now_ms, &config.window_duration);
         Arc::new(Self {
@@ -275,7 +272,9 @@ impl LeasedBucket {
                 // Out of local lease.
                 // Fail-closed condition: store is failing and our lease has fully expired.
                 if inner.last_attempt_failed && now_ms >= inner.lease_expires_at_ms {
-                    self.metrics.fail_closed_total.fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .fail_closed_total
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(Error::FailClosed {
                         origin: self.config.origin.clone(),
                     });
@@ -345,20 +344,25 @@ impl LeasedBucket {
             limiter.burst_per_window = self.config.burst_per_window;
 
             // Drop windows older than retention horizon.
-            limiter
-                .windows
-                .retain(|id, _| id.parse::<u64>().ok().is_some_and(|id| id + STALE_WINDOW_RETENTION >= now_window));
-
-            let window_key = now_window.to_string();
-            let window = limiter.windows.entry(window_key.clone()).or_insert_with(|| {
-                PersistedWindow {
-                    budget_remaining: self.config.burst_per_window,
-                    leases: HashMap::new(),
-                }
+            limiter.windows.retain(|id, _| {
+                id.parse::<u64>()
+                    .ok()
+                    .is_some_and(|id| id + STALE_WINDOW_RETENTION >= now_window)
             });
 
+            let window_key = now_window.to_string();
+            let window = limiter
+                .windows
+                .entry(window_key.clone())
+                .or_insert_with(|| PersistedWindow {
+                    budget_remaining: self.config.burst_per_window,
+                    leases: HashMap::new(),
+                });
+
             // Drop expired leases in this window.
-            window.leases.retain(|_, lease| lease.expires_at_unix_ms > now_ms);
+            window
+                .leases
+                .retain(|_, lease| lease.expires_at_unix_ms > now_ms);
 
             // Recompute budget_remaining from surviving leases (defensive).
             let leased: u64 = window.leases.values().map(|l| l.granted).sum();
@@ -408,10 +412,9 @@ impl LeasedBucket {
                 self.metrics
                     .cluster_budget_remaining
                     .store(window.budget_remaining, Ordering::Relaxed);
-                self.metrics.last_lease_acquire_micros.store(
-                    started.elapsed().as_micros() as u64,
-                    Ordering::Relaxed,
-                );
+                self.metrics
+                    .last_lease_acquire_micros
+                    .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                 return Ok(());
             }
 
@@ -444,10 +447,9 @@ impl LeasedBucket {
                     self.metrics
                         .cluster_budget_remaining
                         .store(remaining_after, Ordering::Relaxed);
-                    self.metrics.last_lease_acquire_micros.store(
-                        started.elapsed().as_micros() as u64,
-                        Ordering::Relaxed,
-                    );
+                    self.metrics
+                        .last_lease_acquire_micros
+                        .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 
                     self.notify.notify_waiters();
                     return Ok(());
@@ -593,10 +595,7 @@ mod tests {
         let inner = bucket.inner.lock().await;
         // Single replica: fair share = burst / 1, clamped to MAX_LEASE_PER_REPLICA = burst/2.
         assert_eq!(inner.granted_this_window, max_lease_per_replica(10));
-        assert_eq!(
-            bucket.metrics.lease_granted(),
-            max_lease_per_replica(10)
-        );
+        assert_eq!(bucket.metrics.lease_granted(), max_lease_per_replica(10));
     }
 
     #[tokio::test]
