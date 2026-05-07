@@ -103,7 +103,7 @@ impl StoreMemoryTool {
         Self {
             rt,
             name: name.unwrap_or("store_memory").to_string(),
-            description: description.unwrap_or("Record any details from 'user' messages that are worth remembering for future conversations.").to_string(),
+            description: description.unwrap_or("Persist short notes ('thoughts') from the current conversation so they can be retrieved in future sessions via `load_memory`. Call this when the user states a durable preference, fact, identity, or instruction worth remembering across conversations; do not record transient query inputs or tool results. Pass `thoughts` as a list of concise strings (each up to 4 KiB, at most 128 entries per call, 64 KiB total).").to_string(),
         }
     }
 }

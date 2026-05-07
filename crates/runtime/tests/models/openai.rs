@@ -126,6 +126,7 @@ mod nsql {
                     name: "openai_basic",
                     body: json!({
                         "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                        "model": "nql",
                         "sample_data_enabled": false,
                     }),
                 },
