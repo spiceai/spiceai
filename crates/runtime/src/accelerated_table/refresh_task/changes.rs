@@ -126,9 +126,7 @@ static CDC_CONFIG: std::sync::OnceLock<CdcConfig> = std::sync::OnceLock::new();
 /// startup, before any CDC stream is started. Subsequent calls are ignored.
 pub fn set_cdc_config(config: CdcConfig) {
     if CDC_CONFIG.set(config).is_err() {
-        tracing::warn!(
-            "CDC config already initialized; ignoring subsequent set_cdc_config call"
-        );
+        tracing::warn!("CDC config already initialized; ignoring subsequent set_cdc_config call");
     }
 }
 
@@ -188,9 +186,7 @@ fn resolve_cdc_param(
 /// Missing/unparseable/out-of-range values fall back to defaults with a
 /// warning.
 #[must_use]
-pub fn cdc_config_from_params(
-    params: &std::collections::HashMap<String, String>,
-) -> CdcConfig {
+pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>) -> CdcConfig {
     CdcConfig {
         prefetch_buffer: resolve_cdc_param(
             params,
@@ -216,13 +212,13 @@ fn parse_env_usize(var: &'static str, default: usize, max: usize) -> usize {
         Ok(raw) => match raw.trim().parse::<usize>() {
             Ok(n) if (1..=max).contains(&n) => n,
             Ok(n) => {
-                tracing::warn!(
-                    "{var}={n} is out of range [1, {max}]; using default {default}"
-                );
+                tracing::warn!("{var}={n} is out of range [1, {max}]; using default {default}");
                 default
             }
             Err(e) => {
-                tracing::warn!("{var}={raw:?} failed to parse as usize ({e}); using default {default}");
+                tracing::warn!(
+                    "{var}={raw:?} failed to parse as usize ({e}); using default {default}"
+                );
                 default
             }
         },
@@ -1664,8 +1660,15 @@ mod tests {
         // write of the burst it belongs to — i.e. no commit may appear before
         // any write in the trace, and every envelope's commit must be
         // observed exactly once.
-        assert_eq!(observed.len(), 4, "expected 1 write + 3 commits, got {observed:?}");
-        assert_eq!(observed[0], "write", "burst write must come before any commit");
+        assert_eq!(
+            observed.len(),
+            4,
+            "expected 1 write + 3 commits, got {observed:?}"
+        );
+        assert_eq!(
+            observed[0], "write",
+            "burst write must come before any commit"
+        );
         assert_eq!(
             observed.iter().filter(|s| **s == "commit").count(),
             3,

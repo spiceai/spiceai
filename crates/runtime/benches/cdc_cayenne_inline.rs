@@ -29,9 +29,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use arrow::array::{
-    ArrayRef, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
-};
+use arrow::array::{ArrayRef, Int64Array, ListArray, RecordBatch, StringArray, StructArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -91,21 +89,15 @@ fn make_create_envelope(id: i64) -> ChangeEnvelope {
     let id_array: ArrayRef = Arc::new(Int64Array::from(vec![id]));
     let name_array: ArrayRef = Arc::new(StringArray::from(vec![Some(format!("row-{id}"))]));
     let data_array: ArrayRef = Arc::new(StructArray::from(vec![
-        (
-            Arc::new(Field::new("id", DataType::Int64, false)),
-            id_array,
-        ),
+        (Arc::new(Field::new("id", DataType::Int64, false)), id_array),
         (
             Arc::new(Field::new("name", DataType::Utf8, true)),
             name_array,
         ),
     ]));
 
-    let record = RecordBatch::try_new(
-        Arc::new(wrapper),
-        vec![op_array, pk_array, data_array],
-    )
-    .expect("wrapper RecordBatch");
+    let record = RecordBatch::try_new(Arc::new(wrapper), vec![op_array, pk_array, data_array])
+        .expect("wrapper RecordBatch");
     let batch = ChangeBatch::try_new(record).expect("ChangeBatch");
 
     ChangeEnvelope::new(Box::new(NoopCommitter), batch, false)
@@ -113,7 +105,11 @@ fn make_create_envelope(id: i64) -> ChangeEnvelope {
 
 fn make_n_envelopes(n: usize) -> ChangesStream {
     let envelopes: Vec<Result<ChangeEnvelope, StreamError>> = (0..n)
-        .map(|i| Ok(make_create_envelope(i64::try_from(i).expect("usize fits in i64"))))
+        .map(|i| {
+            Ok(make_create_envelope(
+                i64::try_from(i).expect("usize fits in i64"),
+            ))
+        })
         .collect();
     fstream::iter(envelopes).boxed()
 }
