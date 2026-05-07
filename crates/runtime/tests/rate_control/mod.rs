@@ -91,6 +91,33 @@ fn contains_persisted_limiter_state(path: &Path) -> bool {
     false
 }
 
+fn max_persisted_instance_count(path: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+
+    let mut max_count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            max_count = max_count.max(max_persisted_instance_count(&path));
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            let instance_count = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+                .and_then(|value| value.get("instances").cloned())
+                .and_then(|instances| instances.as_object().map(serde_json::Map::len))
+                .unwrap_or_default();
+            max_count = max_count.max(instance_count);
+        }
+    }
+
+    max_count
+}
+
 async fn wait_for_persisted_file_state(state_dir: &Path) {
     let start = tokio::time::Instant::now();
     loop {
@@ -101,6 +128,22 @@ async fn wait_for_persisted_file_state(state_dir: &Path) {
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "file-backed rate-control state was not persisted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_persisted_instance_count(state_dir: &Path, expected_count: usize) {
+    let start = tokio::time::Instant::now();
+    loop {
+        let instance_count = max_persisted_instance_count(state_dir);
+        if instance_count >= expected_count {
+            return;
+        }
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "file-backed rate-control state persisted {instance_count} instances, expected at least {expected_count}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -152,6 +195,8 @@ async fn file_state_location_shares_global_http_rate_control_state() {
     let second_controller = second_shared
         .controller
         .expect("second rate controller should be enabled");
+
+    wait_for_persisted_instance_count(&state_dir, 2).await;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 

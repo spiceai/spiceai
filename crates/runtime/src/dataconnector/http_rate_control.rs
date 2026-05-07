@@ -33,6 +33,7 @@ use opentelemetry::KeyValue;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerMetrics};
 use tokio::sync::{Notify, RwLock};
 use url::Url;
+use uuid::Uuid;
 
 const DEFAULT_RATE_CONTROL_JITTER_MIN: Duration = Duration::from_millis(5);
 const DEFAULT_RATE_CONTROL_JITTER_MAX: Duration = Duration::from_millis(10);
@@ -41,6 +42,7 @@ const RUNTIME_REQUESTS_PER_SECOND_LIMIT: &str = "http_requests_per_second_limit"
 const RUNTIME_REQUESTS_PER_MINUTE_LIMIT: &str = "http_requests_per_minute_limit";
 const RUNTIME_RATE_CONTROL_JITTER_MIN: &str = "http_rate_control_jitter_min";
 const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
+const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
 
 // Fallback for direct connector construction without a Runtime. Factory-created
 // connectors use Runtime's per-instance registry so reloads/tests do not reuse
@@ -90,6 +92,8 @@ struct HttpRateControlPersistedState {
     store: Arc<dyn ObjectStore>,
     base_prefix: String,
     refresh_interval: Duration,
+    instance_id: String,
+    instance_ttl: Duration,
 }
 
 impl std::fmt::Debug for HttpRateControlPersistedState {
@@ -97,6 +101,8 @@ impl std::fmt::Debug for HttpRateControlPersistedState {
         f.debug_struct("HttpRateControlPersistedState")
             .field("base_prefix", &self.base_prefix)
             .field("refresh_interval", &self.refresh_interval)
+            .field("instance_id", &self.instance_id)
+            .field("instance_ttl", &self.instance_ttl)
             .finish_non_exhaustive()
     }
 }
@@ -596,6 +602,8 @@ impl HttpRateControlRegistry {
                 store,
                 base_prefix: base_prefix.into(),
                 refresh_interval,
+                instance_id: Uuid::new_v4().to_string(),
+                instance_ttl: persisted_instance_ttl(refresh_interval),
             }),
             ..Self::default()
         }
@@ -615,7 +623,7 @@ impl HttpRateControlRegistry {
         let notify = Arc::clone(&self.persistence_task_notify);
         let persistence_task = tokio::spawn(async move {
             if let Some(registry) = weak_registry.upgrade() {
-                registry.refresh_persisted_governor_states().await;
+                registry.refresh_and_persist_governor_states().await;
             }
 
             let first_tick = tokio::time::Instant::now() + refresh_interval;
@@ -628,7 +636,7 @@ impl HttpRateControlRegistry {
                         let Some(registry) = weak_registry.upgrade() else {
                             break;
                         };
-                        registry.refresh_persisted_governor_states().await;
+                        registry.refresh_and_persist_governor_states().await;
                     }
                     _ = tick.tick() => {
                         let Some(registry) = weak_registry.upgrade() else {
@@ -676,6 +684,19 @@ impl HttpRateControlRegistry {
                     "Failed to persist rate-control state: {error}"
                 );
             }
+        }
+    }
+
+    async fn initialize_persisted_rate_controller(
+        &self,
+        origin: &str,
+        controller: &Arc<RateController>,
+    ) {
+        if let Err(error) = controller.refresh_and_persist_state_snapshot().await {
+            tracing::warn!(
+                origin,
+                "Failed to initialize persisted rate-control state: {error}"
+            );
         }
     }
 
@@ -797,8 +818,10 @@ impl HttpRateControlRegistry {
             config,
             self.persisted_governor_state.as_ref(),
         );
-        let should_refresh_persisted_state =
-            self.persisted_governor_state.is_some() && shared.controller.is_some();
+        let controller_to_initialize = self
+            .persisted_governor_state
+            .as_ref()
+            .and_then(|_| shared.controller.as_ref().map(Arc::clone));
         rate_controllers.insert(
             key.clone(),
             SharedRateControllerEntry {
@@ -809,7 +832,9 @@ impl HttpRateControlRegistry {
         );
 
         drop(rate_controllers);
-        if should_refresh_persisted_state {
+        if let Some(controller) = controller_to_initialize {
+            self.initialize_persisted_rate_controller(&key, &controller)
+                .await;
             self.persistence_task_notify.notify_one();
         }
         Ok(SharedRateControllerReservation {
@@ -892,10 +917,12 @@ impl HttpRateControlRegistry {
             config,
             self.persisted_governor_state.as_ref(),
         );
-        let should_refresh_persisted_state =
-            self.persisted_governor_state.is_some() && shared.controller.is_some();
+        let controller_to_initialize = self
+            .persisted_governor_state
+            .as_ref()
+            .and_then(|_| shared.controller.as_ref().map(Arc::clone));
         rate_controllers.insert(
-            key,
+            key.clone(),
             SharedRateControllerEntry {
                 shared: shared.clone(),
                 pending_registrations: 0,
@@ -904,7 +931,9 @@ impl HttpRateControlRegistry {
         );
 
         drop(rate_controllers);
-        if should_refresh_persisted_state {
+        if let Some(controller) = controller_to_initialize {
+            self.initialize_persisted_rate_controller(&key, &controller)
+                .await;
             self.persistence_task_notify.notify_one();
         }
 
@@ -954,11 +983,13 @@ fn build_shared_rate_controller(
     let mut builder = RateController::builder()
         .with_jitter(JitterConfig::new(config.jitter_min, config.jitter_max));
     if let Some(persisted_state) = persisted_state {
-        builder = builder.with_object_store_persistence(
+        builder = builder.with_object_store_persistence_for_instance(
             Arc::clone(&persisted_state.store),
             persisted_state.base_prefix.clone(),
             rate_control_state_object_key(spicepod_name, origin_key),
             origin_key.to_string(),
+            persisted_state.instance_id.clone(),
+            persisted_state.instance_ttl,
         );
     }
     if let Some(max_concurrent_requests) = config.max_concurrent_requests {
@@ -1288,6 +1319,12 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn persisted_instance_ttl(refresh_interval: Duration) -> Duration {
+    refresh_interval
+        .saturating_mul(3)
+        .max(MIN_PERSISTED_INSTANCE_TTL)
 }
 
 #[cfg(test)]
