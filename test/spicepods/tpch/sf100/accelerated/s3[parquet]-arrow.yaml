@@ -13,13 +13,14 @@ datasets:
       s3_secret: ${secrets:S3_SECRET}
     acceleration: &acceleration
       enabled: true
-  # Limit large tables to ~50% of rows to prevent OOM on currently used CI runner (https://github.com/spiceai/spiceai/issues/10729)
+  # Limit large tables to prevent OOM on CI runner (https://github.com/spiceai/spiceai/issues/10729)
+  # lineitem: 150M/600M (~25%), orders: 75M/150M (~50%), partsupp: 40M/80M (~50%)
   - from: s3://benchmarks/tpch_sf100/lineitem.parquet
     name: lineitem
     params: *s3_params
     acceleration:
       enabled: true
-      refresh_sql: "SELECT * FROM lineitem LIMIT 300000000"
+      refresh_sql: "SELECT * FROM lineitem LIMIT 150000000"
   - from: s3://benchmarks/tpch_sf100/nation.parquet
     name: nation
     params: *s3_params
