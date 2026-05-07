@@ -79,12 +79,155 @@ macro_rules! extract_primary_key {
     }};
 }
 
-/// Channel depth between the CDC source-stream reader and the apply loop.
-/// Each slot can hold one decoded `ChangeEnvelope`, so peak prefetch memory
-/// is `CDC_PREFETCH_BUFFER * max_batch_bytes`. Tuned small to keep memory
-/// bounded for sources that emit large per-transaction batches (e.g.,
-/// Postgres logical replication during bulk inserts).
-const CDC_PREFETCH_BUFFER: usize = 4;
+/// Tunables for the CDC source-stream → apply pipeline.
+///
+/// Resolved once at process start, in this priority order:
+/// 1. `runtime.params.cdc_prefetch_buffer` / `runtime.params.cdc_max_coalesced_envelopes`
+///    from the spicepod (installed via [`set_cdc_config`]).
+/// 2. `SPICE_CDC_PREFETCH_BUFFER` / `SPICE_CDC_MAX_COALESCED_ENVELOPES`
+///    environment variables (useful for tests and ad-hoc tuning).
+/// 3. Built-in defaults.
+///
+/// Out-of-range or unparseable values fall back to the next source with a
+/// `tracing::warn!` so misconfiguration is visible rather than silent.
+#[derive(Debug, Clone, Copy)]
+pub struct CdcConfig {
+    /// Channel depth between the CDC source-stream reader and the apply
+    /// loop. Each slot holds one decoded `ChangeEnvelope`, so peak
+    /// prefetch memory is `prefetch_buffer * max_batch_bytes`.
+    pub prefetch_buffer: usize,
+    /// Hard upper bound on the number of `ChangeEnvelope`s coalesced into
+    /// a single accelerator write. Coalescing amortizes per-envelope
+    /// plan construction over the whole burst.
+    pub max_coalesced_envelopes: usize,
+}
+
+const CDC_PREFETCH_BUFFER_DEFAULT: usize = 32;
+const CDC_PREFETCH_BUFFER_MAX: usize = 1024;
+const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 64;
+const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 4096;
+
+impl Default for CdcConfig {
+    fn default() -> Self {
+        Self {
+            prefetch_buffer: CDC_PREFETCH_BUFFER_DEFAULT,
+            max_coalesced_envelopes: CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+        }
+    }
+}
+
+/// Process-wide CDC tunables. Set once at runtime startup from spicepod
+/// config; subsequent calls to [`set_cdc_config`] are ignored (with a
+/// warning) so tests don't accidentally fight each other.
+static CDC_CONFIG: std::sync::OnceLock<CdcConfig> = std::sync::OnceLock::new();
+
+/// Install the CDC configuration resolved from spicepod
+/// `runtime.params.cdc_*`. Should be called exactly once during runtime
+/// startup, before any CDC stream is started. Subsequent calls are ignored.
+pub fn set_cdc_config(config: CdcConfig) {
+    if CDC_CONFIG.set(config).is_err() {
+        tracing::warn!(
+            "CDC config already initialized; ignoring subsequent set_cdc_config call"
+        );
+    }
+}
+
+/// Returns the active CDC tunables, computing them on first access from
+/// (in order) the spicepod-installed config, env-var overrides, then
+/// built-in defaults.
+fn cdc_config() -> CdcConfig {
+    if let Some(cfg) = CDC_CONFIG.get() {
+        return *cfg;
+    }
+    CdcConfig {
+        prefetch_buffer: parse_env_usize(
+            "SPICE_CDC_PREFETCH_BUFFER",
+            CDC_PREFETCH_BUFFER_DEFAULT,
+            CDC_PREFETCH_BUFFER_MAX,
+        ),
+        max_coalesced_envelopes: parse_env_usize(
+            "SPICE_CDC_MAX_COALESCED_ENVELOPES",
+            CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+            CDC_MAX_COALESCED_ENVELOPES_MAX,
+        ),
+    }
+}
+
+/// Resolve a single CDC tunable from `runtime.params`, falling back to
+/// `default` (with a warning) when the value is unparseable or out of
+/// range. Centralized so the runtime startup path uses the same clamping
+/// semantics as env-var fallback.
+fn resolve_cdc_param(
+    params: &std::collections::HashMap<String, String>,
+    key: &'static str,
+    default: usize,
+    max: usize,
+) -> usize {
+    let Some(raw) = params.get(key) else {
+        return default;
+    };
+    match raw.parse::<usize>() {
+        Ok(n) if (1..=max).contains(&n) => n,
+        Ok(n) => {
+            tracing::warn!(
+                "runtime.params.{key}={n} is out of range [1, {max}]; using default {default}"
+            );
+            default
+        }
+        Err(e) => {
+            tracing::warn!(
+                "runtime.params.{key}={raw:?} is not a valid usize ({e}); using default {default}"
+            );
+            default
+        }
+    }
+}
+
+/// Build a [`CdcConfig`] from the spicepod `runtime.params` map, reading
+/// the `cdc_prefetch_buffer` and `cdc_max_coalesced_envelopes` keys.
+/// Missing/unparseable/out-of-range values fall back to defaults with a
+/// warning.
+#[must_use]
+pub fn cdc_config_from_params(
+    params: &std::collections::HashMap<String, String>,
+) -> CdcConfig {
+    CdcConfig {
+        prefetch_buffer: resolve_cdc_param(
+            params,
+            "cdc_prefetch_buffer",
+            CDC_PREFETCH_BUFFER_DEFAULT,
+            CDC_PREFETCH_BUFFER_MAX,
+        ),
+        max_coalesced_envelopes: resolve_cdc_param(
+            params,
+            "cdc_max_coalesced_envelopes",
+            CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+            CDC_MAX_COALESCED_ENVELOPES_MAX,
+        ),
+    }
+}
+
+/// Parse a positive `usize` from `var`, falling back to `default` on missing,
+/// unparseable, or out-of-range (`<1` or `> max`) values. Logs a warning
+/// when an explicit value is rejected so misconfiguration is visible.
+fn parse_env_usize(var: &'static str, default: usize, max: usize) -> usize {
+    match std::env::var(var) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if (1..=max).contains(&n) => n,
+            Ok(n) => {
+                tracing::warn!(
+                    "{var}={n} is out of range [1, {max}]; using default {default}"
+                );
+                default
+            }
+            Err(e) => {
+                tracing::warn!("{var}={raw:?} failed to parse as usize ({e}); using default {default}");
+                default
+            }
+        },
+    }
+}
 
 impl RefreshTask {
     pub async fn start_changes_stream(
@@ -101,6 +244,8 @@ impl RefreshTask {
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
+        let cdc_cfg = cdc_config();
+
         // Pipeline source-stream reads with apply+commit by running the source
         // in its own task on the refresh runtime and feeding a bounded channel.
         // While the apply loop writes batch N to the accelerator and commits
@@ -111,7 +256,7 @@ impl RefreshTask {
         // pulling, so we never accumulate unbounded memory.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<
             Result<cdc::ChangeEnvelope, cdc::StreamError>,
-        >(CDC_PREFETCH_BUFFER);
+        >(cdc_cfg.prefetch_buffer);
 
         let reader_dataset = dataset_name.clone();
         let reader_handle = tokio::spawn(async move {
@@ -146,71 +291,52 @@ impl RefreshTask {
             }
         });
 
-        while let Some(update) = rx.recv().await {
-            match update {
-                Ok(change_envelope) => {
-                    match self
-                        .write_change(change_envelope.change_batch.clone())
-                        .await
-                    {
-                        Ok(write_result) => {
-                            // Mark the dataset as ready if possible
-                            if change_envelope.is_dataset_ready() {
-                                initial_load_completed.store(true, Ordering::Relaxed);
-                                if let Some(ready_sender) = ready_sender.as_ref() {
-                                    ready_sender.notify_waiters();
-                                }
-                                self.update_component_status(status::ComponentStatus::Ready)
-                                    .await;
-                            }
+        // The previous burst's commit task. Commits are network round-trips
+        // to the source (PG `Standby Status Update`, Kafka offset commit,
+        // DynamoDB shard checkpoint) that don't need to gate the next apply.
+        // We keep at most one commit task in flight: by waiting on the
+        // previous commit before *spawning* the next one, we preserve
+        // strict commit ordering across bursts (LSN/offsets advance
+        // monotonically), while letting commit(N) overlap with apply(N+1) —
+        // the actual idle window in the original serial loop.
+        let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
 
-                            if let Err(e) = change_envelope.commit().await
-                                && !self.runtime_status.is_shutdown()
-                            {
-                                tracing::error!("Failed to commit CDC change envelope: {e}");
-                            }
-
-                            if write_result == WriteChangeResult::DataWritten
-                                && let Some(cache_provider_ref) = caching.as_ref()
-                                && let Some(cache_provider) = cache_provider_ref.upgrade()
-                                && let Err(e) =
-                                    cache_provider.invalidate_for_table(dataset_name.clone())
-                                && !self.runtime_status.is_shutdown()
-                            {
-                                // No cache provider means runtime is shutting down and cache is already cleaned up
-                                tracing::error!(
-                                    "Failed to invalidate cached results for dataset {}: {e}",
-                                    &dataset_name.to_string()
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            let error_message = format_datafusion_error(&e);
-                            self.set_refresh_status(
-                                refresh.read().await.display_sql().as_deref(),
-                                status::ComponentStatus::error_with_message(error_message),
-                            )
-                            .await;
-                            if !self.runtime_status.is_shutdown() {
-                                tracing::error!("Error writing change for {dataset_name}: {e}");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    // If the error is transient (e.g., Kafka poll timeout), continue without changing the refresh status to Error
-                    if handle_stream_error(&e, &self.dataset_name) == StreamErrorType::Transient {
-                        continue;
-                    }
-
-                    let error_message = format_datafusion_error(&e);
-                    self.set_refresh_status(
-                        refresh.read().await.display_sql().as_deref(),
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
+        while let Some(first) = rx.recv().await {
+            // Drain whatever is already buffered in the prefetch channel
+            // (no `await` between try_recv calls). Under low load the buffer
+            // is empty after the initial recv and `burst.len() == 1` — that
+            // path matches the pre-pipelining serial cost exactly. Under
+            // high load (PG WAL bulk insert, Debezium catch-up, Kafka
+            // backlog) we collect a contiguous run and apply it in one shot,
+            // amortizing the per-envelope `SessionContext` + `insert_into`
+            // planning cost over the whole burst.
+            let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
+                Vec::with_capacity(8);
+            burst.push(first);
+            let max_burst = cdc_cfg.max_coalesced_envelopes;
+            while burst.len() < max_burst {
+                match rx.try_recv() {
+                    Ok(item) => burst.push(item),
+                    Err(_) => break,
                 }
             }
+
+            self.apply_burst(
+                &refresh,
+                &dataset_name,
+                caching.as_ref(),
+                ready_sender.as_ref(),
+                &initial_load_completed,
+                &mut pending_commit,
+                burst,
+            )
+            .await;
+        }
+
+        // Drain the final in-flight commit before reporting end-of-stream so
+        // we don't leave the source-side offset un-acked.
+        if let Some(prev) = pending_commit.take() {
+            join_pending_commit(prev, &dataset_name, self.runtime_status.is_shutdown()).await;
         }
 
         // rx returned None: the reader dropped its sender. Three causes:
@@ -248,6 +374,195 @@ impl RefreshTask {
         }
 
         Ok(())
+    }
+
+    /// Apply a single coalesced burst of CDC items drained from the prefetch
+    /// channel. Splits the burst into contiguous runs of `Ok` envelopes
+    /// (which can be coalesced into one accelerator write) and `Err` items
+    /// (handled one-by-one as today). Within an `Ok` run we concatenate the
+    /// underlying `RecordBatch`es into a single `ChangeBatch` and call
+    /// `write_change` once — turning N small writes into one larger write
+    /// and amortizing the per-envelope `SessionContext` + `insert_into`
+    /// planning cost. After a successful write we hand the run's committers
+    /// to a background commit task so that commit(N) overlaps with apply(N+1).
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_burst(
+        &self,
+        refresh: &Arc<RwLock<Refresh>>,
+        dataset_name: &TableReference,
+        caching: Option<&Weak<Caching>>,
+        ready_sender: Option<&Arc<Notify>>,
+        initial_load_completed: &Arc<AtomicBool>,
+        pending_commit: &mut Option<tokio::task::JoinHandle<()>>,
+        burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+    ) {
+        // Walk the burst preserving arrival order, processing contiguous
+        // runs of Ok envelopes together and Err items individually so error
+        // handling and ordering semantics match the pre-coalesce behavior.
+        let mut iter = burst.into_iter().peekable();
+        while let Some(item) = iter.next() {
+            match item {
+                Ok(first_env) => {
+                    let mut envelopes = Vec::with_capacity(8);
+                    envelopes.push(first_env);
+                    while let Some(Ok(_)) = iter.peek() {
+                        let Some(Ok(next)) = iter.next() else {
+                            unreachable!("peeked Ok above");
+                        };
+                        envelopes.push(next);
+                    }
+
+                    self.apply_envelope_run(
+                        refresh,
+                        dataset_name,
+                        caching,
+                        ready_sender,
+                        initial_load_completed,
+                        pending_commit,
+                        envelopes,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    // Transient errors (e.g., Kafka poll timeout) keep the
+                    // refresh status healthy; fatal errors flip status to
+                    // Error but we do not abort the loop, matching the
+                    // pre-coalesce contract.
+                    if handle_stream_error(&e, dataset_name) == StreamErrorType::Transient {
+                        continue;
+                    }
+
+                    let error_message = format_datafusion_error(&e);
+                    self.set_refresh_status(
+                        refresh.read().await.display_sql().as_deref(),
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Apply a contiguous run of successful envelopes as a single coalesced
+    /// write, then schedule their commits in a background task that overlaps
+    /// with the next burst's apply.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_envelope_run(
+        &self,
+        refresh: &Arc<RwLock<Refresh>>,
+        dataset_name: &TableReference,
+        caching: Option<&Weak<Caching>>,
+        ready_sender: Option<&Arc<Notify>>,
+        initial_load_completed: &Arc<AtomicBool>,
+        pending_commit: &mut Option<tokio::task::JoinHandle<()>>,
+        envelopes: Vec<cdc::ChangeEnvelope>,
+    ) {
+        debug_assert!(
+            !envelopes.is_empty(),
+            "run must contain at least one envelope"
+        );
+
+        // Split envelopes into (committers, batches, ready_flags) preserving
+        // arrival order. Committers will be drained sequentially in the
+        // background commit task; per-source semantics (e.g., PG `Standby
+        // Status Update` carrying the latest LSN, Kafka per-partition
+        // offsets) require this ordering.
+        let any_ready = envelopes.iter().any(cdc::ChangeEnvelope::is_dataset_ready);
+        let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
+            Vec::with_capacity(envelopes.len());
+        let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
+        for env in envelopes {
+            let (committer, batch, _is_ready) = env.into_parts();
+            committers.push(committer);
+            batches.push(batch);
+        }
+
+        // Fast path: a single envelope (low-load / serial behavior). Skips
+        // concat allocation entirely so the no-coalesce path matches the
+        // pre-pipelining cost exactly.
+        let coalesced_batch = if batches.len() == 1 {
+            batches.into_iter().next().unwrap_or_else(|| unreachable!())
+        } else {
+            match concat_change_batches(&batches) {
+                Ok(b) => b,
+                Err(e) => {
+                    let error_message = format!(
+                        "Failed to coalesce {} CDC envelopes for {dataset_name}: {e}",
+                        batches.len()
+                    );
+                    tracing::error!("{error_message}");
+                    self.set_refresh_status(
+                        refresh.read().await.display_sql().as_deref(),
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    // Drop committers without acking — the source will
+                    // re-send these envelopes on reconnect, and CDC apply
+                    // is idempotent at the upsert/delete level.
+                    return;
+                }
+            }
+        };
+
+        match self.write_change(coalesced_batch).await {
+            Ok(write_result) => {
+                if any_ready {
+                    initial_load_completed.store(true, Ordering::Relaxed);
+                    if let Some(sender) = ready_sender {
+                        sender.notify_waiters();
+                    }
+                    self.update_component_status(status::ComponentStatus::Ready)
+                        .await;
+                }
+
+                if write_result == WriteChangeResult::DataWritten
+                    && let Some(cache_provider_ref) = caching
+                    && let Some(cache_provider) = cache_provider_ref.upgrade()
+                    && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
+                    && !self.runtime_status.is_shutdown()
+                {
+                    tracing::error!(
+                        "Failed to invalidate cached results for dataset {dataset_name}: {e}"
+                    );
+                }
+
+                // Wait for the previous burst's commit to land before
+                // spawning this burst's commit. This preserves strict
+                // commit ordering across bursts (LSN/offsets must advance
+                // monotonically) while letting commit(N) overlap with the
+                // next apply(N+1).
+                if let Some(prev) = pending_commit.take() {
+                    join_pending_commit(prev, dataset_name, self.runtime_status.is_shutdown())
+                        .await;
+                }
+
+                let runtime_status = Arc::clone(&self.runtime_status);
+                let commit_dataset = dataset_name.clone();
+                *pending_commit = Some(tokio::spawn(async move {
+                    for committer in committers {
+                        if let Err(e) = committer.commit().await
+                            && !runtime_status.is_shutdown()
+                        {
+                            tracing::error!(
+                                "Failed to commit CDC change envelope for {commit_dataset}: {e}"
+                            );
+                        }
+                    }
+                }));
+            }
+            Err(e) => {
+                let error_message = format_datafusion_error(&e);
+                self.set_refresh_status(
+                    refresh.read().await.display_sql().as_deref(),
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+                if !self.runtime_status.is_shutdown() {
+                    tracing::error!("Error writing change for {dataset_name}: {e}");
+                }
+                // Drop committers without acking — see comment above.
+            }
+        }
     }
 
     async fn write_change(
@@ -433,6 +748,54 @@ impl RefreshTask {
         self.update_last_updated_at();
 
         Ok(())
+    }
+}
+
+/// Concatenate the underlying `RecordBatch`es of multiple `ChangeBatch`es
+/// into a single `ChangeBatch` so a coalesced burst can be applied with one
+/// `insert_into` call. All batches in a single CDC stream share the same
+/// `changes_schema(table_schema)`, so the schema check inside
+/// `arrow::compute::concat_batches` will not fail in normal operation; if it
+/// does we surface the error and let the caller skip committing those
+/// envelopes (the source will redeliver them).
+fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::Result<ChangeBatch> {
+    debug_assert!(
+        !batches.is_empty(),
+        "concat_change_batches requires at least one batch",
+    );
+
+    let schema = batches[0].record.schema();
+    let records: Vec<&RecordBatch> = batches.iter().map(|b| &b.record).collect();
+    let combined = arrow::compute::concat_batches(&schema, records)
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+    ChangeBatch::try_new(combined).map_err(|e| {
+        // ChangeBatchError isn't part of the AcceleratedTable Error enum;
+        // wrap it in FailedToBuildRecordBatch so the caller's status path
+        // doesn't have to learn about a new variant.
+        crate::accelerated_table::Error::FailedToBuildRecordBatch {
+            source: arrow::error::ArrowError::ExternalError(Box::new(e)),
+        }
+    })
+}
+
+/// Await an in-flight commit task spawned by `apply_envelope_run`. Surfaces
+/// panics loudly (we must never silently swallow a commit-task panic — that
+/// would leave the dataset healthy while source-side offsets stop advancing)
+/// but treats cancellation during shutdown as expected.
+async fn join_pending_commit(
+    handle: tokio::task::JoinHandle<()>,
+    dataset_name: &TableReference,
+    is_shutdown: bool,
+) {
+    match handle.await {
+        Ok(()) => {}
+        Err(e) if e.is_cancelled() => {
+            tracing::debug!("CDC commit task for {dataset_name} was cancelled (likely shutdown)");
+        }
+        Err(e) if !is_shutdown => {
+            tracing::error!("CDC commit task for {dataset_name} ended unexpectedly: {e}");
+        }
+        Err(_) => {}
     }
 }
 
@@ -1295,12 +1658,23 @@ mod tests {
             .expect("start_changes_stream should succeed");
 
         let observed = combined.lock().await.clone();
-        // For each envelope: write must precede the next commit. With three
-        // envelopes the strict expected sequence is W,C,W,C,W,C.
+        // With coalescing, contiguous envelopes available on the stream are
+        // applied in one write and then their committers run in order. The
+        // invariant we still rely on is that *every* commit is preceded by a
+        // write of the burst it belongs to — i.e. no commit may appear before
+        // any write in the trace, and every envelope's commit must be
+        // observed exactly once.
+        assert_eq!(observed.len(), 4, "expected 1 write + 3 commits, got {observed:?}");
+        assert_eq!(observed[0], "write", "burst write must come before any commit");
         assert_eq!(
-            observed,
-            vec!["write", "commit", "write", "commit", "write", "commit"],
-            "each envelope must be written, then committed, in order"
+            observed.iter().filter(|s| **s == "commit").count(),
+            3,
+            "each envelope must be committed exactly once",
+        );
+        assert_eq!(
+            observed.iter().filter(|s| **s == "write").count(),
+            1,
+            "coalesced burst should produce a single accelerator write",
         );
     }
 
