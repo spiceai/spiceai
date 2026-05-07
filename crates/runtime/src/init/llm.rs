@@ -49,9 +49,18 @@ impl Runtime {
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
 
-        let mut responses_model = try_to_responses_model(&m, &params, Arc::new(self.clone()))
+        let mut responses_model = match try_to_responses_model(&m, &params, Arc::new(self.clone()))
             .await
-            .ok();
+        {
+            Ok(model) => Some(model),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to construct Responses API endpoint for model '{}': {e}. The model will not be available via /v1/responses.",
+                    m.name
+                );
+                None
+            }
+        };
 
         if let Some(model) = &responses_model
             && let Err(e) = model.health().await

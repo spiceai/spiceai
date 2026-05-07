@@ -78,7 +78,12 @@ pub(super) fn responses_request_from_chat_completion_request(
                 effort: Some(effort),
                 summary: None,
             }),
-        metadata: req.metadata.take().map(metadata_to_hash_map).transpose()?,
+        metadata: req
+            .metadata
+            .take()
+            .as_ref()
+            .map(metadata_to_hash_map)
+            .transpose()?,
         parallel_tool_calls: req.parallel_tool_calls,
         prompt_cache_key: req.prompt_cache_key.take().or(req.user.take()),
         safety_identifier: req.safety_identifier.take(),
@@ -142,7 +147,10 @@ pub(super) fn chat_completion_response_from_response(
             .transpose()?,
         system_fingerprint: None,
         object: "chat.completion".to_string(),
-        usage: response.usage.map(completion_usage_from_response_usage),
+        usage: response
+            .usage
+            .as_ref()
+            .map(completion_usage_from_response_usage),
     })
 }
 
@@ -259,16 +267,16 @@ fn input_item_from_chat_tool_call(
         }
         ChatCompletionMessageToolCalls::Custom(custom_call) => {
             Ok(InputItem::Item(Item::CustomToolCall(custom_tool_call(
-                custom_call.id.clone(),
-                custom_call.custom_tool.input,
-                custom_call.custom_tool.name,
-                custom_call.id,
+                &custom_call.id,
+                &custom_call.custom_tool.input,
+                &custom_call.custom_tool.name,
+                &custom_call.id,
             )?)))
         }
     }
 }
 
-fn metadata_to_hash_map(metadata: Metadata) -> Result<HashMap<String, String>, OpenAIError> {
+fn metadata_to_hash_map(metadata: &Metadata) -> Result<HashMap<String, String>, OpenAIError> {
     let Some(object) = metadata.as_value().as_object() else {
         return Err(OpenAIError::InvalidArgument(
             "Chat Completions metadata must be a JSON object when proxying to the Responses API"
@@ -283,18 +291,17 @@ fn metadata_to_hash_map(metadata: Metadata) -> Result<HashMap<String, String>, O
                 key.clone(),
                 value
                     .as_str()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| value.to_string()),
+                    .map_or_else(|| value.to_string(), ToString::to_string),
             )
         })
         .collect())
 }
 
 fn custom_tool_call(
-    call_id: String,
-    input: String,
-    name: String,
-    id: String,
+    call_id: &str,
+    input: &str,
+    name: &str,
+    id: &str,
 ) -> Result<CustomToolCall, OpenAIError> {
     serde_json::from_value(serde_json::json!({
         "type": "custom_tool_call",
@@ -487,7 +494,7 @@ fn response_tool_choice_from_chat_tool_choice(
                         .map(move |tool| (allowed.mode.clone(), tool))
                 })
                 .map(|(mode, tool)| {
-                    let chat_tool = serde_json::from_value::<ChatCompletionTools>(tool.clone())
+                    let chat_tool = serde_json::from_value::<ChatCompletionTools>(tool)
                         .map_err(|e| invalid_conversion("allowed tool", e))?;
                     let response_tool = response_tool_from_chat_tool(chat_tool)?;
                     let tool_value = serde_json::to_value(response_tool)
@@ -498,8 +505,7 @@ fn response_tool_choice_from_chat_tool_choice(
 
             let mode = tools
                 .first()
-                .map(|(mode, _)| mode.clone())
-                .unwrap_or(ChatToolChoiceAllowedMode::Auto);
+                .map_or(ChatToolChoiceAllowedMode::Auto, |(mode, _)| mode.clone());
 
             Ok(ResponsesToolChoiceParam::AllowedTools(
                 ResponsesToolChoiceAllowed {
@@ -718,7 +724,10 @@ fn chat_completion_stream_event_from_response_event(
                     response.id,
                     model,
                     vec![],
-                    response.usage.map(completion_usage_from_response_usage),
+                    response
+                        .usage
+                        .as_ref()
+                        .map(completion_usage_from_response_usage),
                     state,
                 ))
             } else {
@@ -733,7 +742,10 @@ fn chat_completion_stream_event_from_response_event(
                         None,
                         Some(FinishReason::Stop),
                     )],
-                    response.usage.map(completion_usage_from_response_usage),
+                    response
+                        .usage
+                        .as_ref()
+                        .map(completion_usage_from_response_usage),
                     state,
                 ))
             }
@@ -755,7 +767,10 @@ fn chat_completion_stream_event_from_response_event(
                     None,
                     Some(FinishReason::Length),
                 )],
-                response.usage.map(completion_usage_from_response_usage),
+                response
+                    .usage
+                    .as_ref()
+                    .map(completion_usage_from_response_usage),
                 state,
             ))
         }
@@ -845,7 +860,7 @@ fn chat_custom_tool_call_chunk_from_response_custom_call(
     }
 }
 
-fn completion_usage_from_response_usage(usage: ResponseUsage) -> CompletionUsage {
+fn completion_usage_from_response_usage(usage: &ResponseUsage) -> CompletionUsage {
     CompletionUsage {
         prompt_tokens: usage.input_tokens,
         completion_tokens: usage.output_tokens,
@@ -955,7 +970,7 @@ mod tests {
     #[test]
     fn maps_response_to_chat_completion_response() {
         let response: Response = serde_json::from_value(json!({
-            "created_at": 1755639134,
+            "created_at": 1_755_639_134,
             "id": "resp_123",
             "model": "backend-model",
             "object": "response",
@@ -1106,7 +1121,7 @@ mod tests {
 
     fn minimal_response_json(id: &str, status: &str) -> serde_json::Value {
         json!({
-            "created_at": 1755639134,
+            "created_at": 1_755_639_134,
             "id": id,
             "model": "backend-model",
             "object": "response",

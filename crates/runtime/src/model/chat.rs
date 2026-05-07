@@ -444,7 +444,7 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>
             param: "openai_usage_tier".to_string(),
             message: "Must be 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'".to_string(),
         })?;
-    let chat_backend = chat_backend(params, "openai_responses_api")?;
+    let chat_backend = chat_backend(params)?;
 
     if let Some(temperature_str) = params.get("temperature").expose().ok() {
         match temperature_str.parse::<f64>() {
@@ -493,7 +493,7 @@ fn azure(
     let deployment_name = params.get("deployment_name").expose().ok();
     let api_key = params.get("api_key").expose().ok();
     let entra_token = params.get("entra_token").expose().ok();
-    let chat_backend = chat_backend(params, "azure_responses_api")?;
+    let chat_backend = chat_backend(params)?;
 
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
@@ -532,7 +532,7 @@ fn azure(
     )) as Arc<dyn Chat>)
 }
 
-fn chat_backend(params: &Parameters, param_name: &'static str) -> Result<ChatBackend, LlmError> {
+fn chat_backend(params: &Parameters) -> Result<ChatBackend, LlmError> {
     let value = params
         .get("responses_api")
         .expose()
@@ -546,7 +546,7 @@ fn chat_backend(params: &Parameters, param_name: &'static str) -> Result<ChatBac
         Ok(ChatBackend::Responses)
     } else {
         Err(LlmError::InvalidParamValueError {
-            param: param_name.to_string(),
+            param: "responses_api".to_string(),
             message: "Must be 'enabled' or 'disabled'".to_string(),
         })
     }
@@ -622,8 +622,7 @@ mod test {
     fn responses_api_defaults_to_chat_completions() {
         let params = parameters_with_responses_api(None);
 
-        let api = chat_backend(&params, "openai_responses_api")
-            .expect("default responses_api should be valid");
+        let api = chat_backend(&params).expect("default responses_api should be valid");
 
         assert_eq!(api, ChatBackend::ChatCompletions);
     }
@@ -632,8 +631,7 @@ mod test {
     fn responses_api_enabled_uses_responses() {
         let params = parameters_with_responses_api(Some("enabled"));
 
-        let api = chat_backend(&params, "openai_responses_api")
-            .expect("enabled responses_api should be valid");
+        let api = chat_backend(&params).expect("enabled responses_api should be valid");
 
         assert_eq!(api, ChatBackend::Responses);
     }
@@ -642,13 +640,12 @@ mod test {
     fn responses_api_rejects_unknown_value() {
         let params = parameters_with_responses_api(Some("legacy"));
 
-        let err = chat_backend(&params, "openai_responses_api")
-            .expect_err("unknown responses_api should be invalid");
+        let err = chat_backend(&params).expect_err("unknown responses_api should be invalid");
 
         assert!(matches!(
             err,
             LlmError::InvalidParamValueError { ref param, .. }
-                if param == "openai_responses_api"
+                if param == "responses_api"
         ));
     }
 
