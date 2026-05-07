@@ -44,11 +44,8 @@ impl AccelerationSink {
             AccelerationSink::Table(sink) => {
                 AccelerationSink::Table(sink.with_sink_indexes(indexes))
             }
-            AccelerationSink::Multi(_) => {
-                // MultiSink does not support sink_indexes; this path is not reachable
-                // at construction time (sink_indexes are set before any synchronized
-                // tables are added).
-                self
+            AccelerationSink::Multi(sink) => {
+                AccelerationSink::Multi(sink.with_sink_indexes(indexes))
             }
         }
     }
@@ -58,7 +55,9 @@ impl AccelerationSink {
         match self {
             AccelerationSink::Table(table_sink) => {
                 let table_provider = Arc::clone(&table_sink.table_provider);
-                let multi_sink = MultiSink::new(table_provider, vec![synchronized_table]);
+                let sink_indexes = std::mem::take(&mut table_sink.sink_indexes);
+                let multi_sink = MultiSink::new(table_provider, vec![synchronized_table])
+                    .with_sink_indexes(sink_indexes);
                 *self = AccelerationSink::Multi(multi_sink);
             }
             AccelerationSink::Multi(sink) => sink.add_synchronized_table(synchronized_table),

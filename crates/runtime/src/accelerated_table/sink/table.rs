@@ -40,7 +40,7 @@ pub(crate) struct TableSink {
     ///
     /// Used for external indexes (e.g. Elasticsearch) that must be maintained on
     /// the accelerator write path but must never be visible to the query optimizer.
-    sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,
+    pub(super) sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl TableSink {
