@@ -398,6 +398,50 @@ mod tests {
     }
 
     #[test]
+    fn cloud_login_subscription_device_flag_parses() {
+        let cli = parse(&["spice", "cloud", "login", "subscription", "--device"]);
+
+        let Commands::Cloud(cloud::CloudArgs {
+            command: cloud::CloudCommands::Login(login_args),
+        }) = cli.command
+        else {
+            panic!("expected cloud login command");
+        };
+        let Some(cloud::LoginMethod::Subscription(args)) = login_args.method else {
+            panic!("expected subscription login method");
+        };
+
+        assert!(args.device);
+    }
+
+    #[test]
+    fn cloud_login_api_flags_parse_under_api_subcommand() {
+        let cli = parse(&[
+            "spice",
+            "cloud",
+            "login",
+            "api",
+            "--client-id",
+            "client-id",
+            "--client-secret",
+            "client-secret",
+        ]);
+
+        let Commands::Cloud(cloud::CloudArgs {
+            command: cloud::CloudCommands::Login(login_args),
+        }) = cli.command
+        else {
+            panic!("expected cloud login command");
+        };
+        let Some(cloud::LoginMethod::Api(args)) = login_args.method else {
+            panic!("expected api login method");
+        };
+
+        assert_eq!(args.client_id.as_deref(), Some("client-id"));
+        assert_eq!(args.client_secret.as_deref(), Some("client-secret"));
+    }
+
+    #[test]
     fn cloud_metrics_json_output_suppresses_banner() {
         assert!(is_json(&[
             "spice", "cloud", "metrics", "--app", "org/app", "--output", "json",

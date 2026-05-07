@@ -1,0 +1,95 @@
+version: v2
+kind: Spicepod
+name: spicepod_with_functions
+
+runtime:
+  functions:
+    enabled: true
+
+functions:
+  - name: double_it
+    from: sql
+    description: Double a 64-bit integer.
+    volatility: immutable
+    signature:
+      args:
+        - { name: x, type: int64 }
+      returns: int64
+    body: "x * 2"
+
+  - name: haversine_km
+    from: sql
+    description: Haversine distance in kilometres.
+    volatility: immutable
+    signature:
+      args:
+        - { name: lat1, type: float64 }
+        - { name: lon1, type: float64 }
+        - { name: lat2, type: float64 }
+        - { name: lon2, type: float64 }
+      returns: float64
+    body: |
+      6371 * acos(
+        cos(radians(lat1)) * cos(radians(lat2)) *
+        cos(radians(lon2) - radians(lon1)) +
+        sin(radians(lat1)) * sin(radians(lat2))
+      )
+
+  - name: shout
+    from: sql
+    description: Uppercase a string.
+    volatility: immutable
+    signature:
+      args:
+        - { name: s, type: utf8 }
+      returns: utf8
+    body: "upper(s)"
+
+  - name: classify_intent
+    from: http://classifier.internal/v1/classify
+    description: Classify a user prompt via a remote service.
+    volatility: volatile
+    signature:
+      args:
+        - { name: prompt, type: utf8 }
+      returns: utf8
+    params:
+      timeout: 2s
+      batch_size: 256
+
+  # Declared as a function but kept SQL-only (not exposed as a tool).
+  - name: internal_hash
+    from: sql
+    description: Internal hash — should not be surfaced to the LLM as a tool.
+    volatility: immutable
+    signature:
+      args: [{ name: x, type: int64 }]
+      returns: int64
+    body: "x * 2654435761"
+    as_tool: false
+
+  - name: duplicate_rows
+    from: sql
+    kind: table
+    description: Emit an input row and its successor.
+    volatility: immutable
+    signature:
+      args: [{ name: x, type: int64 }]
+      returns:
+        - { name: value, type: int64 }
+        - { name: doubled, type: int64 }
+    body: |
+      SELECT x AS value, x * 2 AS doubled FROM args
+      UNION ALL
+      SELECT x + 1 AS value, (x + 1) * 2 AS doubled FROM args
+    as_tool: false
+
+tools:
+  # A tool that's also callable as a SQL UDF.
+  - name: geocode
+    from: http://geocode.internal/v1/lookup
+    description: Resolve an address to lat/lon coordinates.
+    as_sql: true
+    signature:
+      args: [{ name: address, type: utf8 }]
+      returns: utf8

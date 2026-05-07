@@ -53,6 +53,7 @@ use arrow::array::RecordBatch;
 use itertools::Itertools;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
 use serde::{Deserialize, Serialize};
+use spicepod::component::model::ModelType;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tracing::Span;
@@ -138,29 +139,29 @@ pub struct Request {
     /// The natural language query to be converted into SQL
     pub query: String,
 
-    /// The name of the model to use for SQL generation. Default: "nql"
-    #[serde(default = "default_model")]
-    pub model: String,
+    /// The name of the model to use for SQL generation. If omitted, Spice defaults to the only compatible LLM model configured in the Spicepod.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 
     /// If true, streams the response instead of waiting for completion
     #[serde(default)]
     pub stream: bool,
 
-    /// Whether sample data is included in the context for SQL generation. Default: true
+    /// Whether sample data is included in the context for SQL generation. Default: false
     #[serde(default = "default_sample_data_enabled")]
     pub sample_data_enabled: bool,
 
     /// Names of datasets to sample from when constructing model context; this is a sampling hint and does not restrict which tables queries can target. If omitted, all datasets are used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datasets: Option<Vec<String>>,
+
+    /// Stable prompt-cache key forwarded to the configured NSQL model for provider-specific cache handling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 fn default_sample_data_enabled() -> bool {
-    true
-}
-
-fn default_model() -> String {
-    "nql".to_string()
+    false
 }
 
 /// Checks if the request is asking to only generate SQL.
@@ -189,10 +190,10 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
             Request = "application/json",
             example = json!({
                 "query": "Get the top 5 customers by total sales",
-                "model": "nql",
                 "stream": false,
-                "sample_data_enabled": true,
-                "datasets": ["sales_data"]
+                "sample_data_enabled": false,
+                "datasets": ["sales_data"],
+                "prompt_cache_key": "sales-dashboard"
             })
         ))
     ),
@@ -309,13 +310,27 @@ pub(crate) async fn handle_nsql_query(
     let df = get_current_datafusion(&context);
     let headers = HeaderMap::new();
 
+    // NSQL-scoped cancellation token (child of the request token). Used for
+    // both the LLM race and as the per-query cancellation token passed to
+    // `QueryBuilder`. This way `POST /v1/sql/{id}/cancel` against the
+    // NSQL-issued query reliably cancels NSQL end-to-end (the inner query
+    // registers this same token in the cancel registry).
+    let nsql_token = context.child_cancellation_token();
+
     let Request {
         query,
-        model,
+        model: requested_model,
         sample_data_enabled,
         datasets,
+        prompt_cache_key,
         ..
     } = payload;
+
+    let model = match resolve_nsql_model_name(requested_model, &rt).await {
+        Ok(model) => model,
+        Err((status, message)) => return (status, headers, message),
+    };
+
     let table_allowlist_opt = match table_allowlist(&model, &rt).await {
         Ok(ta) => ta,
         Err(e) => {
@@ -392,21 +407,37 @@ pub(crate) async fn handle_nsql_query(
         vec![]
     };
 
-    let models = llms.read().await;
-    let Some(nql_model) = models.get(&model) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            headers,
-            format!("Model {model} not found"),
-        );
+    let nql_model = {
+        let models = llms.read().await;
+        let Some(nql_model) = models.get(&model) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                headers,
+                format!("Model {model} not found"),
+            );
+        };
+        Arc::clone(nql_model)
     };
 
-    let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
+    let default_sql_generation = DefaultSqlGeneration {};
+    let sql_gen = nql_model.as_sql().unwrap_or(&default_sql_generation);
     // Tracks previously generated queries and associated errors to enable an efficient retry mechanism
     let mut sql_gen_ctx = QueryGenerationContext::default();
     let mut num_retries = 0;
 
     loop {
+        // Cooperative cancellation: bail out between LLM/query iterations if
+        // the NSQL token was cancelled (request token cancel propagates to
+        // this child, and admin cancel via the inner query id cancels this
+        // token directly).
+        if nsql_token.is_cancelled() {
+            return (
+                StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
+                headers,
+                "NSQL request cancelled".to_string(),
+            );
+        }
+
         let Ok(mut req) = sql_gen.create_request_for_query(&model, &query, &sql_gen_ctx) else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -417,12 +448,30 @@ pub(crate) async fn handle_nsql_query(
 
         req.messages.extend(schema_messages.clone());
         req.messages.extend(sample_data_messages.clone());
+        if let Some(prompt_cache_key) = &prompt_cache_key {
+            req.prompt_cache_key = Some(prompt_cache_key.clone());
+        }
 
-        let resp = match nql_model.chat_request(req).instrument(span.clone()).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Error running NQL model: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+        // Race the LLM call against the NSQL cancellation token so that a
+        // long-running model inference does not pin the request after a
+        // cancel/disconnect. Dropping the chat_request future tears down the
+        // underlying client/network resources.
+        let chat_fut = nql_model.chat_request(req).instrument(span.clone());
+        let resp = tokio::select! {
+            biased;
+            () = nsql_token.cancelled() => {
+                return (
+                    StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
+                    headers,
+                    "NSQL request cancelled".to_string(),
+                );
+            }
+            res = chat_fut => match res {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Error running NQL model: {e}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+                }
             }
         };
 
@@ -444,8 +493,9 @@ pub(crate) async fn handle_nsql_query(
                 // PREPARE/EXECUTE/DEALLOCATE) regardless of per-catalog writability,
                 // which mitigates model-mediated SQL injection on `/v1/nsql`.
                 let query_result = {
-                    let mut builder =
-                        QueryBuilder::new(&cleaned_query, Arc::clone(&df)).read_only(true);
+                    let mut builder = QueryBuilder::new(&cleaned_query, Arc::clone(&df))
+                        .read_only(true)
+                        .cancellation_token(nsql_token.clone());
                     if let Some(ref allowlist) = table_allowlist_opt {
                         builder = builder.allow_tables(allowlist.clone());
                     }
@@ -511,6 +561,49 @@ pub(crate) async fn handle_nsql_query(
     }
 }
 
+async fn resolve_nsql_model_name(
+    requested_model: Option<String>,
+    rt: &Arc<Runtime>,
+) -> Result<String, (StatusCode, String)> {
+    if let Some(model) = requested_model {
+        return Ok(model);
+    }
+
+    let Some(app) = rt.read_app().await else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Unexpected internal error. App not prepared in runtime.".to_string(),
+        ));
+    };
+
+    resolve_nsql_model_name_from_app(app.as_ref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+fn resolve_nsql_model_name_from_app(app: &app::App) -> Result<String, String> {
+    let compatible_models = compatible_nsql_model_names(app);
+
+    match compatible_models.as_slice() {
+        [] => Err(
+            "No model specified and no compatible LLM model is configured. Add exactly one LLM model to the Spicepod or include the 'model' field in the request."
+                .to_string(),
+        ),
+        [model] => Ok(model.clone()),
+        models => Err(format!(
+            "No model specified and multiple compatible LLM models are configured ({}). Include the 'model' field in the request.",
+            models.join(", ")
+        )),
+    }
+}
+
+fn compatible_nsql_model_names(app: &app::App) -> Vec<String> {
+    app.models
+        .iter()
+        .filter(|model| model.model_type() == Some(ModelType::Llm))
+        .map(|model| model.name.clone())
+        .collect()
+}
+
 /// Construct a [`ResolvedTableAwareAllowlist`] based on the `App`'s `model.datasets`.
 async fn table_allowlist(
     model_name: &str,
@@ -546,4 +639,83 @@ async fn table_allowlist(
         }
     };
     Ok(table_allowlist)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::AppBuilder;
+    use serde_json::json;
+    use spicepod::component::model::Model;
+
+    fn app_with_models(models: Vec<Model>) -> app::App {
+        let mut builder = AppBuilder::new("test");
+        for model in models {
+            builder = builder.with_model(model);
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn request_defaults_to_no_model_and_no_sample_data() {
+        let request: Request = serde_json::from_value(json!({
+            "query": "show total sales"
+        }))
+        .expect("request should deserialize with omitted optional fields");
+
+        assert_eq!(request.model, None);
+        assert!(!request.sample_data_enabled);
+    }
+
+    #[test]
+    fn omitted_model_uses_single_compatible_model() {
+        let app = app_with_models(vec![Model::new("openai:gpt-4o-mini", "llm_model")]);
+
+        let model_name = resolve_nsql_model_name_from_app(&app)
+            .expect("single compatible model should be selected");
+
+        assert_eq!(model_name, "llm_model");
+    }
+
+    #[test]
+    fn omitted_model_ignores_non_llm_models() {
+        let app = app_with_models(vec![
+            Model::new("spiceai:my-org/my-app/models/runnable", "ml_model"),
+            Model::new("openai:gpt-4o-mini", "llm_model"),
+        ]);
+
+        let model_name = resolve_nsql_model_name_from_app(&app)
+            .expect("single compatible model should be selected");
+
+        assert_eq!(model_name, "llm_model");
+    }
+
+    #[test]
+    fn omitted_model_errors_when_no_compatible_model_exists() {
+        let app = app_with_models(vec![]);
+
+        let error = resolve_nsql_model_name_from_app(&app)
+            .expect_err("omitted model should fail without compatible models");
+
+        assert_eq!(
+            error,
+            "No model specified and no compatible LLM model is configured. Add exactly one LLM model to the Spicepod or include the 'model' field in the request."
+        );
+    }
+
+    #[test]
+    fn omitted_model_errors_when_multiple_compatible_models_exist() {
+        let app = app_with_models(vec![
+            Model::new("openai:gpt-4o-mini", "first_model"),
+            Model::new("openai:gpt-4o", "second_model"),
+        ]);
+
+        let error = resolve_nsql_model_name_from_app(&app)
+            .expect_err("omitted model should fail with multiple compatible models");
+
+        assert_eq!(
+            error,
+            "No model specified and multiple compatible LLM models are configured (first_model, second_model). Include the 'model' field in the request."
+        );
+    }
 }

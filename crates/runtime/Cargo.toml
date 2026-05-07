@@ -73,6 +73,7 @@ governor.workspace = true
 graphql-parser.workspace = true
 headers-accept = "0.3.0"
 http.workspace = true
+http-body = "1.0.1"
 http-body-util = "0.1.3"
 humantime = { workspace = true, optional = true }
 hyper = "1.7.0"
@@ -84,6 +85,7 @@ iceberg-datafusion.workspace = true
 iceberg-storage-opendal.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
+logos.workspace = true
 opendal.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
@@ -161,6 +163,7 @@ serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
+spice-cloud-client.workspace = true
 spicepod = { path = "../spicepod" }
 sysinfo.workspace = true
 telemetry = { path = "../telemetry" }
@@ -183,7 +186,7 @@ tracing-subscriber.workspace = true
 turso = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
-util = { path = "../util", features = ["datafusion"] }
+util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = "9", features = [
     "axum",
@@ -305,6 +308,9 @@ dynamodb = [
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
+http-functions = ["runtime-datafusion-udfs/http-functions"]
+wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
+wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []
 imap = ["data_components/imap"]
 kafka = ["data_components/kafka"]

@@ -17,6 +17,7 @@ models:
     from: openai:gpt-4
     params:
       openai_api_key: sk-test
+      responses_api: enabled
       tools: auto
       system_prompt: You are a helpful assistant.
 

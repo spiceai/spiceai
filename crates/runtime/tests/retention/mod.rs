@@ -24,7 +24,7 @@ use spicepod::{
     component::dataset::{Dataset, TimeFormat},
     param::Params,
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 
@@ -49,6 +49,10 @@ fn make_spiceai_dataset(path: &str, name: &str, engine: &str, retention_sql: &st
         retention_check_interval: Some("200ms".to_string()),
         ..Default::default()
     });
+    ds.params = Some(Params::from_string_map(HashMap::from([(
+        "spiceai_region".to_string(),
+        "us-east-1".to_string(),
+    )])));
     ds
 }
 
@@ -205,17 +209,19 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
                 .await;
 
             let cloned_rt = Arc::new(rt.clone());
+            let load_rt = Arc::clone(&cloned_rt);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = cloned_rt.load_components() => {}
+                () = load_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
 
-            tokio::time::sleep(Duration::from_secs(1)).await; // Allow retention to complete
+            refresh_table(Arc::clone(&cloned_rt), "nation").await?;
+            refresh_table(Arc::clone(&cloned_rt), "taxi_trips").await?;
 
             for (sql, snapshot_name) in [
                 (

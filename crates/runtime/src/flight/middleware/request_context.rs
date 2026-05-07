@@ -104,12 +104,12 @@ impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for RequestContextMidd
 where
     S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
-    ResBody: Default,
+    ResBody: http_body::Body + Send + 'static,
     ReqBody: Send + 'static,
 {
-    type Response = S::Response;
+    type Response = http::Response<util::cancel_guard_body::CancelGuardBody<ResBody>>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<S::Response, S::Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -154,7 +154,17 @@ where
 
         Box::pin(Arc::clone(&request_context).scope(async move {
             request_context.load_extensions().await;
-            inner.call(req).await
+            // Drop guard cancels the request's cancellation token if the
+            // response body is dropped mid-flight (e.g. client disconnects
+            // during a long-running Flight DoGet stream). The guard is
+            // attached to the response body via `CancelGuardBody`, which
+            // disarms it once the body signals end-of-stream so normal
+            // completion does not cancel the token.
+            let cancel_guard = request_context.cancellation_token().clone().drop_guard();
+            let response = inner.call(req).await?;
+            let (parts, body) = response.into_parts();
+            let body = util::cancel_guard_body::CancelGuardBody::new(body, cancel_guard);
+            Ok(http::Response::from_parts(parts, body))
         }))
     }
 }

@@ -1105,6 +1105,7 @@ fn render_refresh_mode(mode: &spicepod::acceleration::RefreshMode) -> &'static s
         spicepod::acceleration::RefreshMode::Append => "append",
         spicepod::acceleration::RefreshMode::Changes => "changes",
         spicepod::acceleration::RefreshMode::Caching => "caching",
+        spicepod::acceleration::RefreshMode::Snapshot => "snapshot",
     }
 }
 

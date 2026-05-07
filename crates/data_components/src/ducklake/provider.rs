@@ -28,7 +28,9 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use globset::GlobSet;
 use snafu::prelude::*;
 
 use crate::RefreshableCatalogProvider;
@@ -75,6 +77,8 @@ pub struct DuckLakeCatalogProvider {
     writable: bool,
     /// Whether DDL operations are allowed
     ddl_enabled: bool,
+    /// Optional glob filter for table inclusion (`schema.table` format)
+    include: Option<Arc<GlobSet>>,
 }
 
 impl std::fmt::Debug for DuckLakeCatalogProvider {
@@ -95,12 +99,14 @@ impl DuckLakeCatalogProvider {
     /// * `catalog_name` - The catalog name as attached in `DuckDB`
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
+    /// * `include` - Optional glob filter for table inclusion (`schema.table` format)
     #[must_use]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
         catalog_name: String,
         writable: bool,
         ddl_enabled: bool,
+        include: Option<GlobSet>,
     ) -> Self {
         // Create a table factory that uses the same pool (with ducklake already attached)
         let duckdb_factory = Arc::new(DuckDBTableFactory::new(Arc::clone(&pool)));
@@ -111,6 +117,7 @@ impl DuckLakeCatalogProvider {
             schemas: RwLock::new(HashMap::new()),
             writable,
             ddl_enabled,
+            include: include.map(Arc::new),
         }
     }
 
@@ -137,23 +144,21 @@ impl DuckLakeCatalogProvider {
                 .connect_sync()
                 .map_err(|e| Error::ConnectionFailed { source: e })?;
 
-            let duckdb_conn = conn
+            let duckdb_wrapper = conn
                 .as_any()
-                .downcast_ref::<duckdb::Connection>()
+                .downcast_ref::<DuckDbConnection>()
                 .ok_or_else(|| Error::ConnectionFailed {
-                    source: "Failed to downcast to duckdb::Connection during schema refresh".into(),
+                    source: "Failed to downcast to DuckDbConnection during schema refresh".into(),
                 })?;
 
-            // Escape the catalog name for use as a quoted identifier by doubling any embedded quotes.
-            let escaped_catalog_name = catalog_name.replace('"', "\"\"");
-            let sql = format!(
-                r#"SELECT DISTINCT schema_name 
-                   FROM "{escaped_catalog_name}".information_schema.schemata 
+            // Query the global information_schema, filtering by catalog name.
+            // DuckLake catalogs don't expose information_schema under their own catalog prefix.
+            let sql = r"SELECT DISTINCT schema_name 
+                   FROM information_schema.schemata 
                    WHERE catalog_name = ?
-                   ORDER BY schema_name"#
-            );
+                   ORDER BY schema_name";
 
-            let mut stmt = duckdb_conn.prepare(&sql).context(QueryFailedSnafu)?;
+            let mut stmt = duckdb_wrapper.conn.prepare(sql).context(QueryFailedSnafu)?;
             let rows = stmt
                 .query_map([&catalog_name], |row| row.get::<_, String>(0))
                 .context(QueryFailedSnafu)?;
@@ -181,6 +186,7 @@ impl DuckLakeCatalogProvider {
                 schema_name.clone(),
                 self.writable,
                 self.ddl_enabled,
+                self.include.clone(),
             );
             schema_provider.refresh().await?;
             schemas.insert(schema_name, Arc::new(schema_provider));
@@ -241,12 +247,12 @@ impl CatalogProvider for DuckLakeCatalogProvider {
             .connect_sync()
             .map_err(datafusion::error::DataFusionError::External)?;
 
-        let duckdb_conn = conn
+        let duckdb_wrapper = conn
             .as_any()
-            .downcast_ref::<duckdb::Connection>()
+            .downcast_ref::<DuckDbConnection>()
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution(
-                    "Failed to downcast DuckLake connection to duckdb::Connection when registering schema"
+                    "Failed to downcast DuckLake connection to DuckDbConnection when registering schema"
                         .to_string(),
                 )
             })?;
@@ -256,7 +262,8 @@ impl CatalogProvider for DuckLakeCatalogProvider {
         let sql = format!(
             r#"CREATE SCHEMA IF NOT EXISTS "{escaped_catalog_name}"."{escaped_schema_name}""#
         );
-        duckdb_conn
+        duckdb_wrapper
+            .conn
             .execute(&sql, [])
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
@@ -271,6 +278,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                 schema_name,
                 ducklake_schema.writable,
                 ducklake_schema.ddl_enabled,
+                ducklake_schema.include.clone(),
             ))
         } else {
             Arc::new(DuckLakeSchemaProvider::new(
@@ -280,6 +288,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                 schema_name,
                 self.writable,
                 self.ddl_enabled,
+                self.include.clone(),
             ))
         };
 
@@ -337,12 +346,12 @@ impl CatalogProvider for DuckLakeCatalogProvider {
             .connect_sync()
             .map_err(datafusion::error::DataFusionError::External)?;
 
-        let duckdb_conn = conn
+        let duckdb_wrapper = conn
             .as_any()
-            .downcast_ref::<duckdb::Connection>()
+            .downcast_ref::<DuckDbConnection>()
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution(
-                    "Failed to downcast DuckLake connection to duckdb::Connection when deregistering schema"
+                    "Failed to downcast DuckLake connection to DuckDbConnection when deregistering schema"
                         .to_string(),
                 )
             })?;
@@ -354,7 +363,8 @@ impl CatalogProvider for DuckLakeCatalogProvider {
         if cascade {
             sql.push_str(" CASCADE");
         }
-        duckdb_conn
+        duckdb_wrapper
+            .conn
             .execute(&sql, [])
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
@@ -391,6 +401,8 @@ pub struct DuckLakeSchemaProvider {
     writable: bool,
     /// Whether DDL operations are allowed
     ddl_enabled: bool,
+    /// Optional glob filter for table inclusion (`schema.table` format)
+    include: Option<Arc<GlobSet>>,
 }
 
 impl std::fmt::Debug for DuckLakeSchemaProvider {
@@ -414,6 +426,7 @@ impl DuckLakeSchemaProvider {
     /// * `schema_name` - The schema name
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
+    /// * `include` - Optional glob filter for table inclusion (`schema.table` format)
     #[must_use]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
@@ -422,6 +435,7 @@ impl DuckLakeSchemaProvider {
         schema_name: String,
         writable: bool,
         ddl_enabled: bool,
+        include: Option<Arc<GlobSet>>,
     ) -> Self {
         Self {
             pool,
@@ -431,6 +445,7 @@ impl DuckLakeSchemaProvider {
             tables: RwLock::new(HashMap::new()),
             writable,
             ddl_enabled,
+            include,
         }
     }
 
@@ -446,24 +461,22 @@ impl DuckLakeSchemaProvider {
                 .connect_sync()
                 .map_err(|e| Error::ConnectionFailed { source: e })?;
 
-            let duckdb_conn = conn
+            let duckdb_wrapper = conn
                 .as_any()
-                .downcast_ref::<duckdb::Connection>()
+                .downcast_ref::<DuckDbConnection>()
                 .ok_or_else(|| Error::ConnectionFailed {
-                    source: "Failed to downcast to duckdb::Connection during table refresh".into(),
+                    source: "Failed to downcast to DuckDbConnection during table refresh".into(),
                 })?;
 
-            // Escape the catalog name for use as a quoted identifier by doubling any embedded quotes.
-            let escaped_catalog_name = catalog_name.replace('"', "\"\"");
-            let sql = format!(
-                r#"SELECT DISTINCT table_name 
-                   FROM "{escaped_catalog_name}".information_schema.tables 
+            // Query the global information_schema, filtering by catalog and schema name.
+            // DuckLake catalogs don't expose information_schema under their own catalog prefix.
+            let sql = r"SELECT DISTINCT table_name 
+                   FROM information_schema.tables 
                    WHERE table_catalog = ?
                      AND table_schema = ?
-                   ORDER BY table_name"#
-            );
+                   ORDER BY table_name";
 
-            let mut stmt = duckdb_conn.prepare(&sql).context(QueryFailedSnafu)?;
+            let mut stmt = duckdb_wrapper.conn.prepare(sql).context(QueryFailedSnafu)?;
             let rows = stmt
                 .query_map([&catalog_name, &schema_name], |row| row.get::<_, String>(0))
                 .context(QueryFailedSnafu)?;
@@ -482,6 +495,14 @@ impl DuckLakeSchemaProvider {
 
         let mut tables = HashMap::new();
         for table_name in table_names {
+            let schema_with_table = format!("{}.{}", self.schema_name, table_name);
+            if let Some(include) = &self.include
+                && !include.is_match(&schema_with_table)
+            {
+                tracing::debug!("Table {schema_with_table} is not included, skipping");
+                continue;
+            }
+
             // Create a fully qualified table reference for the DuckLake table
             let table_ref = TableReference::full(
                 self.catalog_name.clone(),
@@ -601,12 +622,12 @@ impl SchemaProvider for DuckLakeSchemaProvider {
             .connect_sync()
             .map_err(datafusion::error::DataFusionError::External)?;
 
-        let duckdb_conn = conn
+        let duckdb_wrapper = conn
             .as_any()
-            .downcast_ref::<duckdb::Connection>()
+            .downcast_ref::<DuckDbConnection>()
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution(
-                    "Failed to downcast DuckLake connection to duckdb::Connection when deregistering table"
+                    "Failed to downcast DuckLake connection to DuckDbConnection when deregistering table"
                         .to_string(),
                 )
             })?;
@@ -617,7 +638,8 @@ impl SchemaProvider for DuckLakeSchemaProvider {
         let sql = format!(
             r#"DROP TABLE IF EXISTS "{escaped_catalog_name}"."{escaped_schema_name}"."{escaped_table_name}""#
         );
-        duckdb_conn
+        duckdb_wrapper
+            .conn
             .execute(&sql, [])
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 

@@ -18,6 +18,7 @@ pub mod catalogs;
 pub mod chat;
 pub mod datasets;
 pub mod embeddings;
+pub mod functions;
 pub mod iceberg;
 pub mod inference;
 pub mod responses;
@@ -41,7 +42,10 @@ use crate::{
     component::dataset::Dataset,
     datafusion::{
         DataFusion,
-        query::{QueryBuilder, write_to_json_string, write_to_json_value},
+        query::{
+            Error as QueryError, QueryBuilder, is_cancellation_error, write_to_json_string,
+            write_to_json_value,
+        },
     },
     status::ComponentStatus,
 };
@@ -66,7 +70,7 @@ use snafu::ResultExt;
 use futures::TryStreamExt;
 
 use runtime_auth::AuthPrincipalRef;
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
@@ -247,7 +251,19 @@ pub async fn sql_to_http_response(
             Err(e) => {
                 let message = e.to_string();
                 tracing::debug!("Error executing query: {message}");
-                return (status_for_sql_error(&message), message).into_response();
+                let status = if e
+                    .downcast_ref::<datafusion::error::DataFusionError>()
+                    .is_some_and(is_cancellation_error)
+                    || e.downcast_ref::<QueryError>()
+                        .is_some_and(|err| matches!(err, QueryError::QueryCancelled { .. }))
+                {
+                    // 499 Client Closed Request: used for cancelled queries so
+                    // clients can distinguish cancellation from a bad request.
+                    StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
+                } else {
+                    status_for_sql_error(&message)
+                };
+                return (status, message).into_response();
             }
         };
 
@@ -348,9 +364,32 @@ fn attach_cache_headers(
         headers.insert("Results-Cache-Status", val);
     }
 
+    // Surface the cache scope so callers can tell whether a MISS came
+    // from per-user isolation (a coworker's cached entry is not visible)
+    // versus a true cold cache.
+    let cache_namespace = request_context.cache_namespace();
+    headers.insert(
+        "Results-Cache-Scope",
+        HeaderValue::from_static(cache_namespace.as_header_value()),
+    );
+
     // Tell CDN entry is unique per user cache key
     if user_key_specified {
-        headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
+        append_vary(headers, "Spice-Cache-Key");
+    }
+
+    // For per-user scope, additionally vary on every header that can
+    // identify a principal so an HTTP cache between Spice and the client
+    // never collapses entries belonging to different principals.
+    // - `Authorization` covers Bearer / Basic / future U2M flows.
+    // - `X-API-Key` is the header used by the API-key auth flow today;
+    //   without it shared proxies/CDNs would happily reuse Alice's
+    //   response for Bob.
+    // - `Cookie` covers any future session-cookie based auth.
+    if matches!(cache_namespace, CacheNamespace::Principal(_)) {
+        append_vary(headers, "Authorization");
+        append_vary(headers, "X-API-Key");
+        append_vary(headers, "Cookie");
     }
 
     // Add Cache-Control response header with stale-while-revalidate if configured
@@ -379,6 +418,29 @@ fn attach_cache_headers(
             }
         }
     }
+}
+
+/// Append `field` to the `Vary` response header, preserving any prior
+/// value(s). RFC 7231 §7.1.4 allows comma-separated field lists.
+pub(super) fn append_vary(headers: &mut HeaderMap, field: &'static str) {
+    use http::header::VARY;
+    if let Some(existing) = headers.get(VARY)
+        && let Ok(existing_str) = existing.to_str()
+    {
+        // Skip if already present.
+        if existing_str
+            .split(',')
+            .any(|f| f.trim().eq_ignore_ascii_case(field))
+        {
+            return;
+        }
+        let combined = format!("{existing_str}, {field}");
+        if let Ok(v) = HeaderValue::from_str(&combined) {
+            headers.insert(VARY, v);
+        }
+        return;
+    }
+    headers.insert(VARY, HeaderValue::from_static(field));
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.

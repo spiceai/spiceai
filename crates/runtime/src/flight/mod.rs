@@ -19,7 +19,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
-use crate::dataupdate::DataUpdate;
+use crate::dataupdate::DataUpdateBroadcaster;
 use crate::opentelemetry::create_metrics_service;
 use crate::tls::{TlsConfig, server_with_tls_config};
 use crate::{Runtime, metrics as runtime_metrics};
@@ -41,7 +41,6 @@ use cache::result::CacheStatus;
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::parser::ParserError;
 use flight_client::Error as FlightClientError;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -52,12 +51,9 @@ use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::prelude::*;
-use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::RwLock;
-use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -86,18 +82,20 @@ pub use session::SessionStore;
 pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
 
 pub struct Service {
-    channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
+    data_update_broadcaster: DataUpdateBroadcaster,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     session_store: SessionStore,
 }
 
 impl Service {
-    /// Creates a new Service with pre-allocated channel map capacity
+    /// Creates a new Flight service using the shared data update broadcaster.
     #[must_use]
-    pub fn new(basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>) -> Self {
+    pub fn new(
+        basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+        data_update_broadcaster: DataUpdateBroadcaster,
+    ) -> Self {
         Self {
-            // Pre-allocate for typical workloads (avoid reallocation)
-            channel_map: Arc::new(RwLock::new(HashMap::with_capacity(64))),
+            data_update_broadcaster,
             basic_auth,
             session_store: SessionStore::new(),
         }
@@ -217,7 +215,10 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
     ) -> Result<(Schema, Option<Schema>), Status> {
-        let query = QueryBuilder::new(sql, datafusion).build();
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+        let query = QueryBuilder::new(sql, datafusion)
+            .read_only(read_only)
+            .build();
 
         let (dataset_schema, parameter_schema) =
             query.get_schema().await.map_err(handle_datafusion_error)?;
@@ -246,9 +247,11 @@ impl Service {
         parameters: Option<ParamValues>,
         pre_parsed_plan: Option<LogicalPlan>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
         let query_result = if let Some(plan) = pre_parsed_plan {
             QueryBuilder::from_plan(plan, sql, Arc::clone(&datafusion))
                 .parameters(parameters)
+                .read_only(read_only)
                 .build()
                 .run()
                 .await
@@ -256,6 +259,7 @@ impl Service {
         } else {
             QueryBuilder::new(sql, Arc::clone(&datafusion))
                 .parameters(parameters)
+                .read_only(read_only)
                 .build()
                 .run()
                 .await
@@ -413,11 +417,15 @@ fn handle_query_error(e: query::Error) -> Status {
     match e {
         query::Error::BindingParameters { source }
         | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
+        query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
         _ => to_tonic_err(e),
     }
 }
 
 fn handle_datafusion_error(e: DataFusionError) -> Status {
+    if query::is_cancellation_error(&e) {
+        return Status::cancelled(e.to_string());
+    }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)
@@ -570,7 +578,10 @@ pub async fn start(
         });
     }
 
-    let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let service = Service::new(
+        endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
+        rt.datafusion().data_update_broadcaster(),
+    );
     let session_store = service.session_store.clone();
 
     let flight_message_size = app

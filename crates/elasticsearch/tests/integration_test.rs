@@ -178,7 +178,14 @@ async fn test_search_match_all() {
         ..Default::default()
     };
     let resp = client.search(index, &req).await.expect("search");
-    assert_eq!(resp.hits.total.value, 3);
+    assert_eq!(
+        resp.hits
+            .total
+            .as_ref()
+            .expect("search response should include total hits")
+            .value,
+        3
+    );
     assert_eq!(resp.hits.hits.len(), 3);
 }
 
@@ -266,7 +273,14 @@ async fn test_index_document_and_retrieve() {
         ..Default::default()
     };
     let resp = client.search(index, &req).await.expect("search");
-    assert_eq!(resp.hits.total.value, 1);
+    assert_eq!(
+        resp.hits
+            .total
+            .as_ref()
+            .expect("search response should include total hits")
+            .value,
+        1
+    );
     assert_eq!(resp.hits.hits[0].id, "test_1");
 }
 

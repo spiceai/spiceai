@@ -49,15 +49,17 @@ pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]>
     }
 }
 
-pub const PARAM_LEN: usize = 46;
-pub const PARAM_WITH_DEPRE_LEN: usize = 47;
+pub const PARAM_LEN: usize = 51;
+pub const PARAM_WITH_DEPRE_LEN: usize = 52;
 
 // Model parameters that are used for openai model provider. Those parameters are supported by other (non-openai) models as well.
 // OpenAI model is prefixed with `openai_`, use separate PARAMETERS constant to avoid confusion with other model providers.
 pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to use all available tools."),
+        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
+    ParameterSpec::runtime("tool_embedding_model")
+        .description("Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable."),
     ParameterSpec::runtime("system_prompt")
         .description("An additional system prompt used for all chat completions to this model."),
     ParameterSpec::runtime("parameterized_prompt"),
@@ -86,6 +88,8 @@ pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     ParameterSpec::runtime("top_p"),
     ParameterSpec::runtime("tool_choice"),
     ParameterSpec::runtime("parallel_tool_calls"),
+    ParameterSpec::runtime("prompt_cache_key"),
+    ParameterSpec::runtime("prompt_cache_retention"),
     ParameterSpec::runtime("user"),
     ParameterSpec::component("frequency_penalty").deprecated("Use 'frequency_penalty' without prefix"),
     ParameterSpec::component("logit_bias").deprecated("Use 'logit_bias' without prefix"),
@@ -107,6 +111,8 @@ pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     ParameterSpec::component("tools").deprecated("Use 'tools' without prefix"),
     ParameterSpec::component("tool_choice").deprecated("Use 'tool_choice' without prefix"),
     ParameterSpec::component("parallel_tool_calls").deprecated("Use 'parallel_tool_calls' without prefix"),
+    ParameterSpec::component("prompt_cache_key").deprecated("Use 'prompt_cache_key' without prefix"),
+    ParameterSpec::component("prompt_cache_retention").deprecated("Use 'prompt_cache_retention' without prefix"),
     ParameterSpec::component("user").deprecated("Use 'user' without prefix"),
 ];
 
@@ -114,7 +120,9 @@ pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
 pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to use all available tools."),
+        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
+    ParameterSpec::runtime("tool_embedding_model")
+        .description("Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable."),
     ParameterSpec::runtime("system_prompt")
         .description("An additional system prompt used for all chat completions to this model."),
     ParameterSpec::runtime("parameterized_prompt"),
@@ -144,6 +152,8 @@ pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DE
     ParameterSpec::component("tools"),
     ParameterSpec::component("tool_choice"),
     ParameterSpec::component("parallel_tool_calls"),
+    ParameterSpec::component("prompt_cache_key"),
+    ParameterSpec::component("prompt_cache_retention"),
     ParameterSpec::component("user"),
     // For model providers that are not OpenAI
     // The default Override parameters start with `openai_` is deprecated and will be removed in a future release.
@@ -168,5 +178,7 @@ pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DE
     ParameterSpec::runtime("openai_tools").deprecated(DEPRECATED_MESSAGE),
     ParameterSpec::runtime("openai_tool_choice").deprecated(DEPRECATED_MESSAGE),
     ParameterSpec::runtime("openai_parallel_tool_calls").deprecated(DEPRECATED_MESSAGE),
+    ParameterSpec::runtime("openai_prompt_cache_key").deprecated(DEPRECATED_MESSAGE),
+    ParameterSpec::runtime("openai_prompt_cache_retention").deprecated(DEPRECATED_MESSAGE),
     ParameterSpec::runtime("openai_user").deprecated(DEPRECATED_MESSAGE),
 ];

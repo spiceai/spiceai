@@ -212,8 +212,10 @@ pub async fn start_executor_flight_server(
     }
 
     // Create composite Flight service that handles both Ballista and Spice protocols
-    let spice_service =
-        SpiceFlightService::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let spice_service = SpiceFlightService::new(
+        endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
+        rt.datafusion().data_update_broadcaster(),
+    );
     let session_store = spice_service.session_store();
     let composite_service = CompositeFlightService::new(spice_service);
 

@@ -84,11 +84,15 @@ mod nsql {
                             row_ids: None,
                             chunking: None,
                             vector_size: None,
+                            engine: None,
+                            params: None,
                             aggregation: None,
                             max_elements_per_row: None,
                         }],
                         description: None,
                         full_text_search: None,
+                        r#type: None,
+                        nullable: None,
                         metadata: HashMap::new(),
                 }];
 
