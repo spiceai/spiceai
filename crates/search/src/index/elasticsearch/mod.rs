@@ -750,10 +750,7 @@ mod write_maintenance_tests {
             Ok(serde_json::json!({}))
         }
 
-        async fn refresh_index(
-            &self,
-            _index: &str,
-        ) -> elasticsearch::Result<serde_json::Value> {
+        async fn refresh_index(&self, _index: &str) -> elasticsearch::Result<serde_json::Value> {
             self.refresh_index_calls.fetch_add(1, Ordering::Relaxed);
             Ok(serde_json::json!({}))
         }
@@ -789,11 +786,7 @@ mod write_maintenance_tests {
         ) -> elasticsearch::Result<SearchResponse> {
             unimplemented!()
         }
-        async fn open_point_in_time(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> elasticsearch::Result<String> {
+        async fn open_point_in_time(&self, _: &str, _: &str) -> elasticsearch::Result<String> {
             unimplemented!()
         }
         async fn search_point_in_time(
