@@ -66,6 +66,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,11 +74,10 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use url::Url;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 use util::session_state::builder_from_existing;
-use x509_certificate::CapturedX509Certificate;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
@@ -413,6 +413,7 @@ pub mod datafusion;
 mod heartbeat;
 pub mod metrics_collector;
 pub mod partition;
+pub mod pki;
 mod reaper;
 pub(crate) mod scheduler_registry;
 mod servers;
@@ -434,101 +435,155 @@ pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
 /// mTLS configuration for cluster communications.
 ///
-/// This holds the loaded certificates and keys for both server and client TLS,
-/// enabling mutual TLS authentication between cluster nodes.
+/// Holds reloadable server identity + client-CA verifier (for accepting
+/// inbound mTLS connections) plus the on-disk paths required to
+/// reconstruct a `tonic::transport::ClientTlsConfig` on demand for
+/// outbound connections.
+///
+/// Hot-reload behavior:
+///
+/// * All three pieces (server cert, client verifier, outbound
+///   `ClientTlsConfig`) live in a single
+///   [`crate::cluster::pki::ClusterPkiBundle`] backed by one
+///   `ArcSwap<ClusterPkiSnapshot>`. When any of CA / cert / key change
+///   on disk we re-parse and validate the **whole** bundle; if anything
+///   is invalid the previous snapshot is kept (last-known-good).
+///   Successful rotations swap all three pointers in one operation, so
+///   the runtime can never observe a partial rotation (e.g., new server
+///   cert paired with stale verifier).
+///
+/// * Server side: the `rustls::ServerConfig` returned by
+///   [`Self::server_config`] installs the bundle as both
+///   `ResolvesServerCert` and `ClientCertVerifier`, so a single Arc
+///   serves both rustls slots.
+///
+/// * Client side: [`Self::client_tls_config`] returns a fresh
+///   `ClientTlsConfig` clone each call. tonic bakes the TLS config into
+///   a `Channel` at connect time, so live rotation requires the
+///   consumer to reconnect — the connection-rebuild loops in this
+///   module already do so on every transient error.
 #[derive(Debug, Clone)]
 pub struct ClusterTlsConfig {
-    /// CA certificate used to validate other cluster nodes
-    pub ca_certificate: Certificate,
-    /// Client TLS config with CA and client identity for mTLS
-    pub client_tls_config: ClientTlsConfig,
-    /// Server identity (cert + key) for serving TLS
-    pub server_identity: Identity,
+    inner: Arc<ClusterTlsConfigInner>,
+}
+
+#[derive(Debug)]
+struct ClusterTlsConfigInner {
+    /// Paths kept around for diagnostics / tests.
+    ca_path: PathBuf,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    /// rustls server config (h2 ALPN, mandatory client cert). The
+    /// resolver + verifier inside both delegate to `bundle`, so this
+    /// `ServerConfig` is built once and never rebuilt on rotation.
+    server_config: Arc<rustls::ServerConfig>,
+    /// Atomic bundle of (server cert+key, client verifier, outbound
+    /// `ClientTlsConfig`). All three rotate together via a single
+    /// `ArcSwap` swap inside the bundle.
+    bundle: Arc<crate::cluster::pki::ClusterPkiBundle>,
+    /// Drop-guard for the watcher. In the centralized path the binary
+    /// owns the [`crate::tls::TlsControl`] for the whole process; this
+    /// `Arc` is purely a safety net so the watcher dispatcher outlives
+    /// us if the caller drops their `TlsControl` first (notably the
+    /// test path that constructs a transient one).
+    #[expect(
+        dead_code,
+        reason = "drop-guard only; never read, but extends the watcher dispatcher's lifetime to match this struct"
+    )]
+    watcher_keepalive: Arc<crate::tls::CertWatcher>,
 }
 
 impl ClusterTlsConfig {
-    /// Creates a new `ClusterTlsConfig` by loading the CA, certificate, and key files.
+    /// Creates a new `ClusterTlsConfig` by loading the CA, certificate, and key files,
+    /// validating their lineage, and registering them for hot-reload on
+    /// the supplied process-wide [`crate::tls::TlsControl`].
     ///
     /// # Errors
     ///
-    /// Returns an error if any of the files cannot be read.
-    pub fn try_new(ca_cert_path: &str, cert_path: &str, key_path: &str) -> std::io::Result<Self> {
-        let ca_cert_pem = std::fs::read(ca_cert_path)?;
-        let cert_pem = std::fs::read(cert_path)?;
-        let key_pem = std::fs::read(key_path)?;
+    /// Returns an error if any of the files cannot be read, the certificates
+    /// fail to parse / validate, or the watcher refuses the registration.
+    pub fn try_new(
+        ca_cert_path: &str,
+        cert_path: &str,
+        key_path: &str,
+        control: &crate::tls::TlsControl,
+    ) -> std::io::Result<Self> {
+        let ca_path_buf = PathBuf::from(ca_cert_path);
+        let cert_path_buf = PathBuf::from(cert_path);
+        let key_path_buf = PathBuf::from(key_path);
 
-        let ca_x509 = CapturedX509Certificate::from_pem(&ca_cert_pem).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse cluster CA certificate at {ca_cert_path}: {err}"),
-            )
-        })?;
-        let node_x509 = CapturedX509Certificate::from_pem(&cert_pem).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse cluster node certificate at {cert_path}: {err}"),
-            )
-        })?;
+        // Build + register the atomic bundle. `try_new` performs the
+        // initial parse + chain validation before returning, so any
+        // bad starting state surfaces here as an `io::Error`.
+        let bundle = crate::cluster::pki::ClusterPkiBundle::try_new(
+            &crate::cluster::pki::ClusterPkiPaths {
+                ca: ca_path_buf.clone(),
+                cert: cert_path_buf.clone(),
+                key: key_path_buf.clone(),
+            },
+            control.watcher(),
+        )?;
 
-        let ca_name = ca_x509.subject_name().user_friendly_str().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Failed to read subject name from cluster CA certificate at {ca_cert_path}: {err}"
-                ),
-            )
-        })?;
-        let node_issuer = node_x509.issuer_name().user_friendly_str().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Failed to read issuer name from cluster node certificate at {cert_path}: {err}"
-                ),
-            )
-        })?;
-
-        let node_cn = node_x509
-            .subject_common_name()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        tracing::info!(
-            "Cluster mTLS configured with CA {ca_name} and node certificate CN {node_cn}"
-        );
-
-        if node_issuer != ca_name {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "The node certificate was not issued by the provided CA, expected {ca_name} but found issuer {node_issuer}"
-                ),
-            ));
-        }
-
-        if let Err(err) = node_x509.verify_signed_by_certificate(&ca_x509) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "The node certificate was not issued by the provided CA, signature verification failed for issuer {node_issuer}: {err}"
-                ),
-            ));
-        }
-
-        let ca_certificate = Certificate::from_pem(&ca_cert_pem);
-
-        // Client TLS config with mTLS: CA for server validation + client identity
-        let client_tls_config = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(&ca_cert_pem))
-            .identity(Identity::from_pem(&cert_pem, &key_pem));
-
-        // Server identity for TLS
-        let server_identity = Identity::from_pem(&cert_pem, &key_pem);
+        // The bundle implements both `ResolvesServerCert` and
+        // `ClientCertVerifier`, so a single `Arc<ClusterPkiBundle>` can
+        // be installed in both slots. Server-side reads from the same
+        // snapshot as outbound — no half-rotation window.
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(Arc::clone(&bundle) as Arc<_>)
+            .with_cert_resolver(Arc::clone(&bundle) as Arc<_>);
+        // Cluster gRPC is h2-only.
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let server_config = Arc::new(server_config);
 
         Ok(Self {
-            ca_certificate,
-            client_tls_config,
-            server_identity,
+            inner: Arc::new(ClusterTlsConfigInner {
+                ca_path: ca_path_buf,
+                cert_path: cert_path_buf,
+                key_path: key_path_buf,
+                server_config,
+                bundle,
+                watcher_keepalive: Arc::clone(control.watcher()),
+            }),
         })
     }
+
+    /// Reloadable `rustls::ServerConfig` for accepting inbound mTLS
+    /// connections (h2 ALPN, mandatory client cert).
+    #[must_use]
+    pub fn server_config(&self) -> Arc<rustls::ServerConfig> {
+        Arc::clone(&self.inner.server_config)
+    }
+
+    /// Snapshot of the current outbound `ClientTlsConfig`. Cheap to call
+    /// per connection — callers should prefer doing so over caching, since
+    /// only fresh snapshots reflect on-disk rotation.
+    #[must_use]
+    pub fn client_tls_config(&self) -> ClientTlsConfig {
+        (*self.inner.bundle.client_tls_config()).clone()
+    }
+
+    /// Paths the watcher is monitoring — exposed for tests.
+    #[must_use]
+    #[doc(hidden)]
+    pub fn watched_paths_for_tests(&self) -> (PathBuf, PathBuf, PathBuf) {
+        (
+            self.inner.ca_path.clone(),
+            self.inner.cert_path.clone(),
+            self.inner.key_path.clone(),
+        )
+    }
+
+    /// Atomic PKI bundle backing this cluster TLS config. Exposed for
+    /// tests that introspect the bundle (e.g. fingerprint comparisons).
+    #[must_use]
+    #[doc(hidden)]
+    pub fn bundle_for_tests(&self) -> Arc<crate::cluster::pki::ClusterPkiBundle> {
+        Arc::clone(&self.inner.bundle)
+    }
+}
+
+fn io_other<E: std::fmt::Display>(err: E) -> io::Error {
+    io::Error::other(err.to_string())
 }
 
 /// Cluster configuration with eagerly loaded TLS config.
@@ -559,6 +614,18 @@ impl ResolvedClusterConfig {
     /// - Cluster mode is set but advertise address is not specified
     /// - Certificate files cannot be read
     pub fn try_new(config: ClusterConfig) -> std::io::Result<Self> {
+        Self::try_new_with_tls(config, None)
+    }
+
+    /// Like [`Self::try_new`] but takes the process-wide
+    /// [`crate::tls::TlsControl`] so cluster mTLS reload events flow
+    /// through the same watcher as public TLS. Production callers
+    /// should always go through this constructor; the no-arg
+    /// `try_new` is preserved for tests that don't need centralization.
+    pub fn try_new_with_tls(
+        config: ClusterConfig,
+        control: Option<&crate::tls::TlsControl>,
+    ) -> std::io::Result<Self> {
         // Cluster mTLS configuration must be complete when provided
         let tls_config = match (
             &config.node_mtls_ca_certificate_file,
@@ -566,7 +633,24 @@ impl ResolvedClusterConfig {
             &config.node_mtls_key_file,
         ) {
             (Some(ca_path), Some(cert_path), Some(key_path)) => {
-                Some(ClusterTlsConfig::try_new(ca_path, cert_path, key_path)?)
+                // Use the shared TlsControl when available; otherwise
+                // (test path) spin up a private one whose lifetime is
+                // tied to the resulting `ClusterTlsConfig` via the
+                // bundle's registered callback.
+                let owned_control;
+                let control_ref = if let Some(c) = control {
+                    c
+                } else {
+                    owned_control =
+                        crate::tls::TlsControl::new().map_err(|e| io_other(e.to_string()))?;
+                    &owned_control
+                };
+                Some(ClusterTlsConfig::try_new(
+                    ca_path,
+                    cert_path,
+                    key_path,
+                    control_ref,
+                )?)
             }
             (None, None, None) => None,
             _ => {
@@ -757,10 +841,22 @@ impl ResolvedClusterConfig {
         self.config.allow_insecure_connections
     }
 
-    /// Returns the client TLS config for connecting to other cluster nodes.
+    /// Returns a fresh `ClientTlsConfig` snapshot for connecting to other
+    /// cluster nodes. Reflects on-disk rotation each call.
     #[must_use]
-    pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
-        self.tls_config.as_ref().map(|t| &t.client_tls_config)
+    pub fn client_tls_config(&self) -> Option<ClientTlsConfig> {
+        self.tls_config
+            .as_ref()
+            .map(ClusterTlsConfig::client_tls_config)
+    }
+
+    /// Reloadable rustls server config for accepting inbound mTLS
+    /// connections (h2 ALPN). `None` if cluster mTLS is disabled.
+    #[must_use]
+    pub fn cluster_server_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.tls_config
+            .as_ref()
+            .map(ClusterTlsConfig::server_config)
     }
 
     /// Get the node's advertise address for node identification
@@ -962,7 +1058,7 @@ pub async fn initialize_cluster_executor(
         });
     };
 
-    let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
+    let client_tls_config = rt.df.cluster_config.client_tls_config();
     let tls_enabled = client_tls_config.is_some();
 
     // Use the configured node_bind_address for the executor flight server.
@@ -1481,7 +1577,7 @@ async fn create_scheduler_server(
             Some(loc) => (Some("local".to_string()), Some(loc.to_string())), // Explicit local path
         };
 
-    let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
+    let client_tls_config = rt.df.cluster_config.client_tls_config();
     let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> =
         client_tls_config.clone().map(|tls_config| {
             Arc::new(move |ep: Endpoint| {
@@ -1988,8 +2084,18 @@ mod tests {
             .expect("key generation should succeed")
     }
 
+    fn install_crypto_provider() {
+        // The new ClusterTlsConfig builds a `rustls::ServerConfig`, which
+        // requires a process-wide CryptoProvider. Tests may run in any
+        // order so install idempotently.
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+    }
+
     #[test]
     fn cluster_tls_config_accepts_valid_node_certificate() {
+        install_crypto_provider();
         let temp_dir = TempDir::new().expect("temp dir should create");
         let ca_key = generate_key();
         let ca_cert = create_signed_certificate("Spice Test CA", "Spice Test CA", &ca_key, &ca_key);
@@ -2006,6 +2112,7 @@ mod tests {
         write_cert(&node_cert_path, &node_cert);
         write_key(&node_key_path, &node_key);
 
+        let control = crate::tls::TlsControl::new().expect("watcher");
         ClusterTlsConfig::try_new(
             ca_path.to_str().expect("ca path should be utf8"),
             node_cert_path
@@ -2014,12 +2121,14 @@ mod tests {
             node_key_path
                 .to_str()
                 .expect("node key path should be utf8"),
+            &control,
         )
         .expect("valid certificates should be accepted");
     }
 
     #[test]
     fn cluster_tls_config_rejects_mismatched_issuer_name() {
+        install_crypto_provider();
         let temp_dir = TempDir::new().expect("temp dir should create");
         let ca_key = generate_key();
         let ca_cert = create_signed_certificate("Spice Test CA", "Spice Test CA", &ca_key, &ca_key);
@@ -2036,6 +2145,7 @@ mod tests {
         write_cert(&node_cert_path, &node_cert);
         write_key(&node_key_path, &node_key);
 
+        let control = crate::tls::TlsControl::new().expect("watcher");
         let err = ClusterTlsConfig::try_new(
             ca_path.to_str().expect("ca path should be utf8"),
             node_cert_path
@@ -2044,6 +2154,7 @@ mod tests {
             node_key_path
                 .to_str()
                 .expect("node key path should be utf8"),
+            &control,
         )
         .expect_err("mismatched issuer should be rejected");
 
@@ -2056,6 +2167,7 @@ mod tests {
 
     #[test]
     fn cluster_tls_config_rejects_invalid_signature() {
+        install_crypto_provider();
         let temp_dir = TempDir::new().expect("temp dir should create");
         let ca_key = generate_key();
         let ca_cert = create_signed_certificate("Spice Test CA", "Spice Test CA", &ca_key, &ca_key);
@@ -2077,6 +2189,7 @@ mod tests {
         write_cert(&node_cert_path, &node_cert);
         write_key(&node_key_path, &node_key);
 
+        let control = crate::tls::TlsControl::new().expect("watcher");
         let err = ClusterTlsConfig::try_new(
             ca_path.to_str().expect("ca path should be utf8"),
             node_cert_path
@@ -2085,6 +2198,7 @@ mod tests {
             node_key_path
                 .to_str()
                 .expect("node key path should be utf8"),
+            &control,
         )
         .expect_err("invalid signature should be rejected");
 
