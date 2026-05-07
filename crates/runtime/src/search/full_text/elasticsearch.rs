@@ -38,7 +38,9 @@ use crate::component::{
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
-use crate::search::full_text::table::{add_elasticsearch_fts_to_table, build_elasticsearch_text_index};
+use crate::search::full_text::table::{
+    add_elasticsearch_fts_to_table, build_elasticsearch_text_index,
+};
 use crate::search::util::find_concrete_table_provider;
 use runtime_secrets::Secrets;
 
