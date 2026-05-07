@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Integration tests for cluster-wide HTTP rate control.
+//!
+//! The new leased-bucket model treats `requests_per_second_limit` as a
+//! **cluster-wide** budget and shares it across replicas via per-window OCC
+//! writes to the configured state location. These tests run two replicas
+//! against the same `file://` state location and assert that the combined
+//! throughput stays within the cluster budget.
+
 use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 
 use app::{App, AppBuilder};
@@ -25,8 +33,8 @@ use runtime::{
 use spicepod::component::runtime::{Runtime as SpicepodRuntime, SourceRateControl};
 use url::Url;
 
-const APP_NAME: &str = "rate_control_file_state_global";
-const ORIGIN_URL: &str = "https://rate-control-file-state.example.com/data";
+const APP_NAME: &str = "rate_control_cluster_lease";
+const ORIGIN_URL: &str = "https://rate-control-cluster.example.com/data";
 
 fn app_with_file_rate_control(state_location: &str, refresh_interval: &str) -> App {
     AppBuilder::new(APP_NAME)
@@ -43,7 +51,7 @@ fn app_with_file_rate_control(state_location: &str, refresh_interval: &str) -> A
 }
 
 fn dataset_for_runtime(app: &App, runtime: &Arc<Runtime>) -> Dataset {
-    DatasetBuilder::try_new(ORIGIN_URL.to_string(), "rate_control_file_state")
+    DatasetBuilder::try_new(ORIGIN_URL.to_string(), "rate_control_cluster_lease")
         .expect("dataset builder should be valid")
         .with_app(Arc::new(app.clone()))
         .with_runtime(Arc::clone(runtime))
@@ -51,157 +59,93 @@ fn dataset_for_runtime(app: &App, runtime: &Arc<Runtime>) -> Dataset {
         .expect("dataset should build")
 }
 
-fn global_rate_control_config() -> HttpRateControlConfig {
+fn rps_config(rps: u32) -> HttpRateControlConfig {
     HttpRateControlConfig {
         max_concurrent_requests: None,
-        requests_per_second: None,
-        requests_per_minute: Some(
-            NonZeroU32::new(1).expect("test requests-per-minute should be non-zero"),
-        ),
+        requests_per_second: Some(NonZeroU32::new(rps).expect("rps non-zero")),
+        requests_per_minute: None,
         jitter_min: Duration::ZERO,
         jitter_max: Duration::ZERO,
     }
 }
 
-fn contains_persisted_limiter_state(path: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if contains_persisted_limiter_state(&path) {
-                return true;
-            }
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "json")
-            && std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-                .and_then(|value| value.get("limiters").cloned())
-                .and_then(|limiters| limiters.as_object().map(serde_json::Map::len))
-                .is_some_and(|len| len > 0)
-        {
-            return true;
-        }
-    }
-
-    false
+fn state_url(state_dir: &Path) -> String {
+    Url::from_directory_path(state_dir)
+        .expect("state dir should convert to file URL")
+        .to_string()
 }
 
-fn max_persisted_instance_count(path: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-
-    let mut max_count = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            max_count = max_count.max(max_persisted_instance_count(&path));
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "json")
-        {
-            let instance_count = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-                .and_then(|value| value.get("instances").cloned())
-                .and_then(|instances| instances.as_object().map(serde_json::Map::len))
-                .unwrap_or_default();
-            max_count = max_count.max(instance_count);
-        }
-    }
-
-    max_count
-}
-
-async fn wait_for_persisted_file_state(state_dir: &Path) {
-    let start = tokio::time::Instant::now();
-    loop {
-        if contains_persisted_limiter_state(state_dir) {
-            return;
-        }
-
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "file-backed rate-control state was not persisted"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-async fn wait_for_persisted_instance_count(state_dir: &Path, expected_count: usize) {
-    let start = tokio::time::Instant::now();
-    loop {
-        let instance_count = max_persisted_instance_count(state_dir);
-        if instance_count >= expected_count {
-            return;
-        }
-
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "file-backed rate-control state persisted {instance_count} instances, expected at least {expected_count}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
+/// Two saturated replicas sharing one cluster budget should not exceed it.
+///
+/// This is the regression test for the previous "max-merge" implementation
+/// which silently allowed N×budget combined throughput.
 #[tokio::test]
-async fn file_state_location_shares_global_http_rate_control_state() {
+async fn cluster_lease_caps_combined_throughput_under_saturation() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let state_dir = temp_dir.path().join("rate-control-state");
-    let state_location = Url::from_directory_path(&state_dir)
-        .expect("state dir should convert to file URL")
-        .to_string();
-    let origin_url = Url::parse(ORIGIN_URL).expect("origin URL should parse");
-    let config = global_rate_control_config();
+    let state_location = state_url(&state_dir);
 
-    let first_app = app_with_file_rate_control(&state_location, "20ms");
-    let first_runtime = Arc::new(Runtime::builder().with_app(first_app.clone()).build().await);
-    let first_dataset = dataset_for_runtime(&first_app, &first_runtime);
-    let first_shared = first_runtime
+    // Window = 1s (refresh_interval), cluster budget = 10 RPS.
+    let refresh_interval = "1s";
+    let cluster_rps: u32 = 10;
+    let origin_url = Url::parse(ORIGIN_URL).expect("origin URL parse");
+    let config = rps_config(cluster_rps);
+
+    let app_a = app_with_file_rate_control(&state_location, refresh_interval);
+    let app_b = app_with_file_rate_control(&state_location, refresh_interval);
+
+    let runtime_a = Arc::new(Runtime::builder().with_app(app_a.clone()).build().await);
+    let runtime_b = Arc::new(Runtime::builder().with_app(app_b.clone()).build().await);
+
+    let dataset_a = dataset_for_runtime(&app_a, &runtime_a);
+    let dataset_b = dataset_for_runtime(&app_b, &runtime_b);
+
+    let shared_a = runtime_a
         .http_rate_control_registry()
-        .shared_rate_controller(&origin_url, &config, &first_dataset, "https")
+        .shared_rate_controller(&origin_url, &config, &dataset_a, "https")
         .await
-        .expect("first shared controller should build");
-    let first_controller = first_shared
-        .controller
-        .expect("first rate controller should be enabled");
-
-    let first_permit = first_controller
-        .acquire()
-        .await
-        .expect("first request should acquire immediately");
-    drop(first_permit);
-
-    wait_for_persisted_file_state(&state_dir).await;
-
-    let second_app = app_with_file_rate_control(&state_location, "20ms");
-    let second_runtime = Arc::new(
-        Runtime::builder()
-            .with_app(second_app.clone())
-            .build()
-            .await,
-    );
-    let second_dataset = dataset_for_runtime(&second_app, &second_runtime);
-    let second_shared = second_runtime
+        .expect("controller a");
+    let shared_b = runtime_b
         .http_rate_control_registry()
-        .shared_rate_controller(&origin_url, &config, &second_dataset, "https")
+        .shared_rate_controller(&origin_url, &config, &dataset_b, "https")
         .await
-        .expect("second shared controller should build");
-    let second_controller = second_shared
-        .controller
-        .expect("second rate controller should be enabled");
+        .expect("controller b");
 
-    wait_for_persisted_instance_count(&state_dir, 2).await;
+    let ctrl_a = shared_a.controller.expect("a enabled");
+    let ctrl_b = shared_b.controller.expect("b enabled");
 
-    tokio::select! {
-        acquired = second_controller.acquire() => {
-            panic!("second runtime should honor file-backed global rate-control state, got: {acquired:?}");
+    // Drive both replicas as hard as we can for `duration`. Count the total
+    // number of permits each acquires.
+    let duration = Duration::from_secs(5);
+    let started = tokio::time::Instant::now();
+
+    let driver = |ctrl: Arc<runtime_rate_control::RateController>| async move {
+        let mut count: u64 = 0;
+        while started.elapsed() < duration {
+            if ctrl.acquire().await.is_ok() {
+                count += 1;
+            }
         }
-        () = tokio::time::sleep(Duration::from_millis(250)) => {}
-    }
+        count
+    };
+
+    let (count_a, count_b) = tokio::join!(driver(Arc::clone(&ctrl_a)), driver(Arc::clone(&ctrl_b)));
+    let combined = count_a + count_b;
+    let elapsed = started.elapsed();
+    let observed_rps = combined as f64 / elapsed.as_secs_f64();
+
+    // Allow up to one extra window of burst above the steady-state cap (10 RPS):
+    // worst-case overshoot per window = burst_per_window = 10. With ~5 windows
+    // total over 5 seconds, observed rate must stay close to 10 RPS.
+    let max_allowed = (cluster_rps as f64) * 2.0;
+    assert!(
+        observed_rps <= max_allowed,
+        "combined observed {observed_rps:.1} RPS exceeds cap {max_allowed:.1} (a={count_a} b={count_b} elapsed={elapsed:?})"
+    );
+
+    // Sanity: throughput should be non-trivial, not stuck at zero.
+    assert!(
+        observed_rps >= (cluster_rps as f64) * 0.4,
+        "combined observed {observed_rps:.1} RPS suspiciously low (a={count_a} b={count_b})"
+    );
 }

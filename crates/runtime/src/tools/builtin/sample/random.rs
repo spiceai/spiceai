@@ -22,12 +22,14 @@ use std::{
 use super::SampleFrom;
 use crate::datafusion::DataFusion;
 use arrow::{array::RecordBatch, compute::concat_batches};
+use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use tracing::Span;
 use tracing_futures::Instrument;
+use util::security::quote_table_reference;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -54,12 +56,14 @@ impl SampleFrom for RandomSampleParams {
         df: Arc<DataFusion>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         let current_span = Span::current();
+        let tbl = TableReference::parse_str(self.tbl.as_str());
+        let tbl_quoted = quote_table_reference(&tbl);
 
         let batches = async {
             df.query_builder(&format!(
                 "SELECT * FROM {tbl} LIMIT {limit}",
                 limit = self.limit,
-                tbl = self.tbl,
+                tbl = tbl_quoted,
             ))
             .build()
             .run()
@@ -73,7 +77,7 @@ impl SampleFrom for RandomSampleParams {
         .instrument(current_span)
         .await?;
 
-        let schema = Arc::new(df.get_arrow_schema(self.tbl.as_str()).await.boxed()?);
+        let schema = Arc::new(df.get_arrow_schema(tbl).await.boxed()?);
 
         concat_batches(&schema, batches.iter()).boxed()
     }

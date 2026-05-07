@@ -41,6 +41,8 @@ use datafusion::{
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
 use moka::future::FutureExt;
+#[cfg(feature = "elasticsearch")]
+use search::index::elasticsearch::ElasticsearchTextIndex;
 use search::{
     generation::text_search::index::FullTextDatabaseIndex,
     index::SearchIndex,
@@ -202,6 +204,91 @@ impl TextSearchTableFunc {
 
     fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
         exec_err!("{TEXT_SEARCH_UDTF_NAME} does not support scalar invocation.")
+    }
+
+    /// Dispatch `text_search()` against a set of [`ElasticsearchTextIndex`] instances.
+    /// Mirrors the Tantivy dispatch path but uses `search_fields` directly instead of
+    /// `FullTextDatabaseIndex`-specific internals.
+    #[cfg(feature = "elasticsearch")]
+    fn call_with_es_indexes(
+        es_indexes: &[&ElasticsearchTextIndex],
+        args: &TextSearchTableFuncArgs,
+        table_provider: Arc<dyn datafusion::catalog::TableProvider>,
+    ) -> DataFusionResult<Arc<dyn datafusion::catalog::TableProvider>> {
+        if es_indexes.is_empty() {
+            return Err(DataFusionError::Plan(format!(
+                "Table '{}' does not have a full text search index.",
+                args.tbl
+            )));
+        }
+
+        let es_index: &ElasticsearchTextIndex = if let Some(ref requested) = args.column {
+            es_indexes
+                .iter()
+                .copied()
+                .find(|idx| idx.search_fields.contains(requested))
+                .ok_or_else(|| {
+                    let all: Vec<String> = es_indexes
+                        .iter()
+                        .flat_map(|idx| idx.search_fields.iter().cloned())
+                        .collect();
+                    DataFusionError::Plan(format!(
+                        "User function 'text_search' is called on table '{}' that does not have a full text search index on '{}' column. Indexed column(s): {}.{}",
+                        args.tbl,
+                        requested,
+                        all.join(", "),
+                        suggest_column(requested, &all)
+                            .map(|s| format!(" Did you mean '{s}'?"))
+                            .unwrap_or_default()
+                    ))
+                })?
+        } else if es_indexes.len() == 1 {
+            es_indexes[0]
+        } else {
+            let all: Vec<String> = es_indexes
+                .iter()
+                .flat_map(|idx| idx.search_fields.iter().cloned())
+                .collect();
+            return Err(DataFusionError::Plan(format!(
+                "User function 'text_search' is called on table '{}' that has {} full text search column(s) ({}). Must call 'text_search' with a column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
+                args.tbl,
+                all.len(),
+                all.join(", "),
+            )));
+        };
+
+        let column = args.column(&es_index.search_fields)?;
+        let mut owned = (*es_index).clone();
+        owned.search_fields = vec![column.clone()];
+        owned.search_column_name.clone_from(&column);
+
+        let udtf_source = UdtfSource::TextSearch {
+            table: args.tbl.to_string(),
+            query: args.query.clone(),
+            column: Some(column),
+            limit: args.limit,
+            include_score: args.include_score,
+        };
+
+        let normalized_table = owned.normalize_source_table(table_provider)?;
+
+        Ok(Arc::new(
+            SearchQueryProvider::try_from_index(
+                &(Arc::new(owned) as Arc<dyn SearchIndex>),
+                normalized_table,
+                args.query.as_str(),
+                args.limit,
+            )?
+            .with_udtf_source(udtf_source)
+            .with_include_score(args.include_score.unwrap_or(true))
+            .call_on_scan(Arc::new(|| {
+                async {
+                    let request_context = RequestContext::current(AsyncMarker::new().await);
+                    telemetry::track_text_search(&request_context.to_dimensions());
+                }
+                .boxed()
+            })),
+        ))
     }
 }
 
@@ -405,7 +492,19 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let fts_indexes = find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
+        let fts_indexes = find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider);
+
+        // Phase 2: try Elasticsearch-backed text indexes if Tantivy found nothing.
+        #[cfg(feature = "elasticsearch")]
+        if fts_indexes.is_none()
+            && let Some((es_indexes, _)) =
+                find_index_in_table_provider::<ElasticsearchTextIndex>(&table_provider)
+            && !es_indexes.is_empty()
+        {
+            return Self::call_with_es_indexes(&es_indexes, &args, Arc::clone(&table_provider));
+        }
+
+        let fts_indexes = fts_indexes
             .ok_or_else(|| {
                 DataFusionError::Plan(format!(
                     "Table '{}' does not have a full text search index.",

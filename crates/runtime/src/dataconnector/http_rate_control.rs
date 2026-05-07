@@ -618,13 +618,19 @@ impl HttpRateControlRegistry {
 
         let weak_registry = Arc::downgrade(self);
         let refresh_interval = persisted_state.refresh_interval;
+        // Tick faster than `refresh_interval` so a fresh lease is acquired
+        // shortly after each window rolls. With this cadence the worst-case
+        // dead-zone at a window boundary is `tick_interval` (≈1/4 of the
+        // window) rather than a full `refresh_interval`. Each tick is cheap
+        // when nothing has changed (no OCC write).
+        let tick_interval = (refresh_interval / 4).max(std::time::Duration::from_millis(100));
         let persistence_task = tokio::spawn(async move {
             if let Some(registry) = weak_registry.upgrade() {
                 registry.refresh_and_persist_governor_states().await;
             }
 
-            let first_tick = tokio::time::Instant::now() + refresh_interval;
-            let mut tick = tokio::time::interval_at(first_tick, refresh_interval);
+            let first_tick = tokio::time::Instant::now() + tick_interval;
+            let mut tick = tokio::time::interval_at(first_tick, tick_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
@@ -934,7 +940,7 @@ fn build_shared_rate_controller(
             rate_control_state_object_key(spicepod_name, origin_key),
             origin_key.to_string(),
             persisted_state.instance_id.clone(),
-            persisted_state.instance_ttl,
+            persisted_state.refresh_interval,
         );
     }
     if let Some(max_concurrent_requests) = config.max_concurrent_requests {
