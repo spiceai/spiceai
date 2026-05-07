@@ -24,6 +24,7 @@ use std::sync::Arc;
 use cedar_policy::{Authorizer, Decision, PolicySet, Schema};
 use tokio::sync::RwLock;
 
+use crate::compile::{AccessPlan, compile_access_plan, validate_policy_annotations};
 use crate::entities::{SpiceResource, build_entities};
 use crate::error::Error;
 use crate::request::build_request;
@@ -68,6 +69,7 @@ impl PolicyEngine {
     ///
     /// Returns an error if the Cedar schema fails to build.
     pub fn new(initial_policies: PolicySet) -> Result<Self, Error> {
+        validate_policy_annotations(&initial_policies)?;
         let schema = build_schema()?;
         let authorizer = Authorizer::new();
 
@@ -129,17 +131,88 @@ impl PolicyEngine {
         }
     }
 
+    /// Evaluate fine-grained read access for a dataset.
+    ///
+    /// The returned [`AccessPlan`] contains SQL row filters and column masks
+    /// from the permit policies that allowed the `read` action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Cedar entities or the request cannot be built, if
+    /// Cedar reports policy evaluation diagnostics, or if matching policy
+    /// annotations cannot be compiled into an access plan.
+    pub async fn evaluate_read_access(
+        &self,
+        principal: &AuthPrincipalRef,
+        resource: &SpiceResource,
+    ) -> Result<AccessPlan, Error> {
+        let inner = self.inner.read().await;
+
+        let entities = build_entities(principal, resource)?;
+        let request = build_request(
+            principal,
+            crate::request::SpiceAction::READ,
+            resource,
+            &inner.schema,
+        )?;
+
+        let response = inner
+            .authorizer
+            .is_authorized(&request, &inner.policy_set, &entities);
+
+        let errors = response
+            .diagnostics()
+            .errors()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            return Err(Error::PolicyEvaluation {
+                reason: errors.join(", "),
+            });
+        }
+
+        let policy_ids = response
+            .diagnostics()
+            .reason()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>();
+
+        match response.decision() {
+            Decision::Allow => {
+                let mut plan = compile_access_plan(
+                    &inner.policy_set,
+                    response.diagnostics().reason(),
+                    resource,
+                )?;
+                plan.policy_ids = policy_ids;
+                Ok(plan)
+            }
+            Decision::Deny => Ok(AccessPlan {
+                allowed: false,
+                policy_ids,
+                ..AccessPlan::default()
+            }),
+        }
+    }
+
     /// Replace the current policy set with new policies.
     ///
     /// This acquires a write lock briefly. In-flight authorization evaluations
     /// complete with the old policy set; subsequent evaluations use the new one.
-    pub async fn reload(&self, new_policies: PolicySet) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the replacement policy set contains invalid
+    /// fine-grained policy annotations.
+    pub async fn reload(&self, new_policies: PolicySet) -> Result<(), Error> {
+        validate_policy_annotations(&new_policies)?;
         let mut inner = self.inner.write().await;
         tracing::info!(
             policy_count = new_policies.policies().count(),
             "Reloading Cedar policy set"
         );
         inner.policy_set = new_policies;
+        Ok(())
     }
 
     /// Returns the number of policies currently loaded.
@@ -308,7 +381,10 @@ mod tests {
         // Reload with a deny-all policy
         let new_policies =
             parse_policies(r"forbid(principal, action, resource);").expect("valid policy");
-        engine.reload(new_policies).await;
+        engine
+            .reload(new_policies)
+            .await
+            .expect("reload should succeed");
 
         // Now denied
         assert!(

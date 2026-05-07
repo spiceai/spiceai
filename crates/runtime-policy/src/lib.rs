@@ -19,6 +19,7 @@ limitations under the License.
 //! Maps Spice concepts (users, datasets, models, tools) to Cedar entity types
 //! and evaluates authorization policies against them.
 
+pub mod compile;
 pub mod engine;
 pub mod entities;
 pub mod error;
@@ -26,5 +27,6 @@ pub mod provider;
 pub mod request;
 pub mod schema;
 
+pub use compile::{AccessPlan, ColumnMask, TagMask};
 pub use engine::{AuthzDecision, PolicyEngine};
 pub use error::Error;

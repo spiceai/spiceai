@@ -31,6 +31,7 @@ pub mod l2_norm;
 pub mod org;
 pub mod primitive_json_codec;
 pub mod role;
+pub mod role_check;
 pub mod session_property;
 pub mod truncate;
 pub mod user;

@@ -56,6 +56,7 @@ use runtime_datafusion_udfs::{
     l2_norm::{L2_NORM_UDF_NAME, L2Norm},
     org::{ORG_UDF_NAME, OrgUdf},
     role::{ROLE_UDF_NAME, RoleUdf},
+    role_check::CurrentUserHasRoleUdf,
     session_property::{SESSION_PROPERTY_UDF_NAME, SessionPropertyUdf},
     truncate::{TRUNCATE_SCALAR_UDF_NAME, Truncate},
     user::{USER_UDF_NAME, UserUdf},
@@ -88,6 +89,10 @@ pub fn register_core_scalar_udfs(ctx: &SessionContext) {
 pub async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
     register_core_scalar_udfs(ctx);
+
+    if runtime.df.policy_engine().is_some() {
+        ctx.register_udf(CurrentUserHasRoleUdf::new().into());
+    }
 
     ctx.register_udf(TextSearchTableFunc::new(Arc::downgrade(&runtime.df)).into());
     ctx.register_udtf(

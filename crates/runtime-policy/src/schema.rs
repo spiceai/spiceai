@@ -62,6 +62,11 @@ namespace Spice {
         resource: [Dataset],
     };
 
+    action "read" appliesTo {
+        principal: [User, Role],
+        resource: [Dataset],
+    };
+
     action "insert" appliesTo {
         principal: [User, Role],
         resource: [Dataset],

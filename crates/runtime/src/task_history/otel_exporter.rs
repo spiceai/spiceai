@@ -121,6 +121,20 @@ impl TaskHistoryExporter {
         ) || task.starts_with("tool_use::")
     }
 
+    fn is_policy_or_audit_task(task: &str) -> bool {
+        task.starts_with("policy_") || task.starts_with("audit_")
+    }
+
+    fn should_include_task_span(task_span: &TaskSpan, min_sql_duration_ms: Option<f64>) -> bool {
+        if task_span.labels.contains_key(PLAN_CAPTURE_LABEL)
+            || Self::is_policy_or_audit_task(task_span.task.as_ref())
+        {
+            return true;
+        }
+
+        min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
+    }
+
     fn process_context_payload(
         captured_context: &TaskHistoryCapturedContext,
         task: &str,
@@ -370,18 +384,10 @@ impl SpanExporter for TaskHistoryExporter {
         let min_plan_duration_ms = self.min_plan_duration_ms;
         let df = Arc::clone(&self.df);
 
-        let should_include = |task_span: &TaskSpan| {
-            // Always include plan capture spans regardless of duration since they are already
-            // filtered by min_plan_duration when created.
-            if task_span.labels.contains_key(PLAN_CAPTURE_LABEL) {
-                return true;
-            }
-            min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
-        };
         let spans: Vec<TaskSpan> = batch
             .into_iter()
             .map(|span| self.span_to_task_span(span))
-            .filter(should_include)
+            .filter(|task_span| Self::should_include_task_span(task_span, min_sql_duration_ms))
             .collect();
 
         async move {
@@ -475,7 +481,11 @@ mod tests {
         TRUNCATED_TASK_HISTORY_CONTEXT_SUFFIX, TaskHistoryExporter,
     };
     use spicepod::component::runtime::TaskHistoryCapturedContext;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::SystemTime;
+
+    use crate::task_history::TaskSpan;
 
     #[test]
     fn process_context_payload_truncates_context_by_default() {
@@ -540,5 +550,60 @@ mod tests {
     fn filter_event_keys_omits_sensitive_labels() {
         assert!(!super::filter_event_keys("prompt"));
         assert!(!super::filter_event_keys("metadata"));
+    }
+
+    #[test]
+    fn policy_and_audit_tasks_ignore_min_duration_filter() {
+        let policy_span = task_span("policy_audit", 1.0, HashMap::new());
+        let audit_span = task_span("audit_export", 1.0, HashMap::new());
+        let sql_span = task_span("sql_query", 1.0, HashMap::new());
+
+        assert!(TaskHistoryExporter::should_include_task_span(
+            &policy_span,
+            Some(1_000.0)
+        ));
+        assert!(TaskHistoryExporter::should_include_task_span(
+            &audit_span,
+            Some(1_000.0)
+        ));
+        assert!(!TaskHistoryExporter::should_include_task_span(
+            &sql_span,
+            Some(1_000.0)
+        ));
+    }
+
+    #[test]
+    fn plan_capture_tasks_ignore_min_duration_filter() {
+        let mut labels = HashMap::new();
+        labels.insert(Arc::<str>::from("plan_capture"), Arc::<str>::from("true"));
+        let span = task_span("plan", 1.0, labels);
+
+        assert!(TaskHistoryExporter::should_include_task_span(
+            &span,
+            Some(1_000.0)
+        ));
+    }
+
+    fn task_span(
+        task: &str,
+        execution_duration_ms: f64,
+        labels: HashMap<Arc<str>, Arc<str>>,
+    ) -> TaskSpan {
+        TaskSpan {
+            trace_id: Arc::<str>::from("00000000000000000000000000000000"),
+            trace_id_override: None,
+            span_id: Arc::<str>::from("0000000000000000"),
+            parent_span_id: None,
+            distributed_parent_id: None,
+            task: Arc::<str>::from(task),
+            input: Arc::<str>::from(""),
+            captured_output: None,
+            start_time: SystemTime::UNIX_EPOCH,
+            end_time: SystemTime::UNIX_EPOCH,
+            execution_duration_ms,
+            error_message: None,
+            labels,
+            node_id: None,
+        }
     }
 }

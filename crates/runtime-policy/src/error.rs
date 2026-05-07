@@ -27,6 +27,12 @@ pub enum Error {
     #[snafu(display("Failed to build Cedar entity: {reason}"))]
     EntityBuild { reason: String },
 
+    #[snafu(display("Invalid Cedar policy annotation on policy '{policy_id}': {reason}"))]
+    PolicyAnnotation { policy_id: String, reason: String },
+
+    #[snafu(display("Failed to evaluate Cedar policy: {reason}"))]
+    PolicyEvaluation { reason: String },
+
     #[snafu(display("Failed to read policy file '{path}': {source}"))]
     PolicyFileRead {
         path: String,

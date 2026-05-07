@@ -828,6 +828,14 @@ impl DataFusion {
         self.policy_engine.as_ref()
     }
 
+    fn wrap_policy_table_provider(
+        &self,
+        table_name: TableReference,
+        provider: Arc<dyn TableProvider>,
+    ) -> Arc<dyn TableProvider> {
+        policy_enforcer::wrap_policy_table_provider(table_name, provider, self.policy_engine())
+    }
+
     #[must_use]
     pub fn query_cancel_registry(&self) -> Arc<QueryCancelRegistry> {
         Arc::clone(&self.query_cancel_registry)
@@ -984,11 +992,12 @@ impl DataFusion {
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
                     let notifier = accelerated_table.refresher().on_complete_notification();
+                    let table_provider = self.wrap_policy_table_provider(
+                        dataset_table_ref.clone(),
+                        accelerated_table.table_provider(),
+                    );
                     self.ctx
-                        .register_table(
-                            dataset_table_ref.clone(),
-                            accelerated_table.table_provider(),
-                        )
+                        .register_table(dataset_table_ref.clone(), table_provider)
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                     notifier
@@ -2675,11 +2684,13 @@ impl DataFusion {
             .await
             .context(AccelerationRegistrationSnafu)?;
 
+        let table_provider = self.wrap_policy_table_provider(
+            dataset.name.clone(),
+            Arc::new(accelerated_table).table_provider(),
+        );
+
         self.ctx
-            .register_table(
-                dataset.name.clone(),
-                Arc::new(accelerated_table).table_provider(),
-            )
+            .register_table(dataset.name.clone(), table_provider)
             .map_err(find_datafusion_root)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
@@ -2891,18 +2902,28 @@ impl DataFusion {
             .await
             .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
-        if let Some(adaptor) = table
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()
-        {
-            if let Some(nested_table) = adaptor.table_provider.clone() {
-                table = nested_table;
-            } else {
+        loop {
+            let unwrapped = policy_enforcer::unwrap_policy_table_provider(Arc::clone(&table));
+            if !Arc::ptr_eq(&unwrapped, &table) {
+                table = unwrapped;
+                continue;
+            }
+
+            if let Some(adaptor) = table
+                .as_any()
+                .downcast_ref::<FederatedTableProviderAdaptor>()
+            {
+                if let Some(nested_table) = adaptor.table_provider.clone() {
+                    table = nested_table;
+                    continue;
+                }
                 return UnableToRetrieveTableFromFederationSnafu {
                     table_name: dataset_name.to_string(),
                 }
                 .fail();
             }
+
+            break;
         }
         Ok(table)
     }
@@ -2938,6 +2959,9 @@ impl DataFusion {
 
         self.register_metadata_table(dataset, Arc::clone(&source))
             .await?;
+
+        let source_table_provider =
+            self.wrap_policy_table_provider(dataset.name.clone(), source_table_provider);
 
         self.ctx
             .register_table(dataset.name.clone(), source_table_provider)

@@ -43,6 +43,11 @@ pub enum SpiceResource {
 }
 
 impl SpiceResource {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.entity_id()
+    }
+
     fn entity_type_name(&self) -> &'static str {
         match self {
             SpiceResource::Dataset { .. } => "Spice::Dataset",

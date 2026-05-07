@@ -27,6 +27,7 @@ pub struct SpiceAction;
 
 impl SpiceAction {
     pub const QUERY: &str = "query";
+    pub const READ: &str = "read";
     pub const INSERT: &str = "insert";
     pub const UPDATE: &str = "update";
     pub const DELETE: &str = "delete";
