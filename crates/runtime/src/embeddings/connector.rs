@@ -319,9 +319,7 @@ impl DataConnector for EmbeddingConnector {
             );
             let accelerator = builder.get_accelerator();
             let mut indexed_accelerator = accelerator;
-            for (effective_vector_store, columns) in
-                vector_index_groups(vector_engine, dataset)
-            {
+            for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
                 indexed_accelerator = crate::embeddings::index::table::wrap_accelerator_with_elasticsearch_vector_indexes(
                     &self.embedding_models,
                     &self.secrets,

@@ -714,7 +714,9 @@ mod write_maintenance_tests {
 
     use std::sync::atomic::AtomicU32;
 
-    use elasticsearch::{Elasticsearch as ElasticsearchTrait, MappingResponse, SearchRequest, SearchResponse};
+    use elasticsearch::{
+        Elasticsearch as ElasticsearchTrait, MappingResponse, SearchRequest, SearchResponse,
+    };
 
     /// Minimal mock that records calls to the maintenance-related Elasticsearch methods.
     /// All other methods are unused by `ElasticsearchIndexWriteMaintenance` and will panic.
@@ -730,42 +732,116 @@ mod write_maintenance_tests {
 
     #[async_trait::async_trait]
     impl ElasticsearchTrait for MockElasticsearch {
-        async fn get_index_refresh_interval(&self, _index: &str) -> elasticsearch::error::Result<Option<String>> {
-            self.get_refresh_interval_calls.fetch_add(1, Ordering::Relaxed);
+        async fn get_index_refresh_interval(
+            &self,
+            _index: &str,
+        ) -> elasticsearch::error::Result<Option<String>> {
+            self.get_refresh_interval_calls
+                .fetch_add(1, Ordering::Relaxed);
             Ok(self.refresh_interval.lock().expect("lock poisoned").clone())
         }
 
-        async fn put_index_settings(&self, _index: &str, _body: &serde_json::Value) -> elasticsearch::error::Result<serde_json::Value> {
+        async fn put_index_settings(
+            &self,
+            _index: &str,
+            _body: &serde_json::Value,
+        ) -> elasticsearch::error::Result<serde_json::Value> {
             self.put_settings_calls.fetch_add(1, Ordering::Relaxed);
             Ok(serde_json::json!({}))
         }
 
-        async fn refresh_index(&self, _index: &str) -> elasticsearch::error::Result<serde_json::Value> {
+        async fn refresh_index(
+            &self,
+            _index: &str,
+        ) -> elasticsearch::error::Result<serde_json::Value> {
             self.refresh_index_calls.fetch_add(1, Ordering::Relaxed);
             Ok(serde_json::json!({}))
         }
 
-        async fn force_merge(&self, _index: &str, max_num_segments: u32) -> elasticsearch::error::Result<serde_json::Value> {
+        async fn force_merge(
+            &self,
+            _index: &str,
+            max_num_segments: u32,
+        ) -> elasticsearch::error::Result<serde_json::Value> {
             self.force_merge_calls.fetch_add(1, Ordering::Relaxed);
-            *self.last_force_merge_segments.lock().expect("lock poisoned") = Some(max_num_segments);
+            *self
+                .last_force_merge_segments
+                .lock()
+                .expect("lock poisoned") = Some(max_num_segments);
             Ok(serde_json::json!({}))
         }
 
         // Remaining methods are unused by ElasticsearchIndexWriteMaintenance.
-        async fn get_mapping(&self, _: &str) -> elasticsearch::error::Result<MappingResponse> { unimplemented!() }
-        async fn search(&self, _: &str, _: &SearchRequest) -> elasticsearch::error::Result<SearchResponse> { unimplemented!() }
-        async fn search_raw(&self, _: &str, _: &serde_json::Value) -> elasticsearch::error::Result<SearchResponse> { unimplemented!() }
-        async fn open_point_in_time(&self, _: &str, _: &str) -> elasticsearch::error::Result<String> { unimplemented!() }
-        async fn search_point_in_time(&self, _: &serde_json::Value) -> elasticsearch::error::Result<SearchResponse> { unimplemented!() }
-        async fn close_point_in_time(&self, _: &str) -> elasticsearch::error::Result<()> { unimplemented!() }
-        async fn index_exists(&self, _: &str) -> elasticsearch::error::Result<bool> { unimplemented!() }
-        async fn create_index(&self, _: &str, _: &serde_json::Value) -> elasticsearch::error::Result<serde_json::Value> { unimplemented!() }
-        async fn put_mapping(&self, _: &str, _: &serde_json::Value) -> elasticsearch::error::Result<serde_json::Value> { unimplemented!() }
-        async fn index_document(&self, _: &str, _: &str, _: &serde_json::Value) -> elasticsearch::error::Result<serde_json::Value> { unimplemented!() }
-        async fn bulk_index(&self, _: &str, _: &[(Option<String>, serde_json::Value)]) -> elasticsearch::error::Result<serde_json::Value> { unimplemented!() }
+        async fn get_mapping(&self, _: &str) -> elasticsearch::error::Result<MappingResponse> {
+            unimplemented!()
+        }
+        async fn search(
+            &self,
+            _: &str,
+            _: &SearchRequest,
+        ) -> elasticsearch::error::Result<SearchResponse> {
+            unimplemented!()
+        }
+        async fn search_raw(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> elasticsearch::error::Result<SearchResponse> {
+            unimplemented!()
+        }
+        async fn open_point_in_time(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> elasticsearch::error::Result<String> {
+            unimplemented!()
+        }
+        async fn search_point_in_time(
+            &self,
+            _: &serde_json::Value,
+        ) -> elasticsearch::error::Result<SearchResponse> {
+            unimplemented!()
+        }
+        async fn close_point_in_time(&self, _: &str) -> elasticsearch::error::Result<()> {
+            unimplemented!()
+        }
+        async fn index_exists(&self, _: &str) -> elasticsearch::error::Result<bool> {
+            unimplemented!()
+        }
+        async fn create_index(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> elasticsearch::error::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn put_mapping(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> elasticsearch::error::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn index_document(
+            &self,
+            _: &str,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> elasticsearch::error::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn bulk_index(
+            &self,
+            _: &str,
+            _: &[(Option<String>, serde_json::Value)],
+        ) -> elasticsearch::error::Result<serde_json::Value> {
+            unimplemented!()
+        }
     }
 
-    fn make_maintenance(opts: ElasticsearchIndexWriteOptions) -> ElasticsearchIndexWriteMaintenance {
+    fn make_maintenance(
+        opts: ElasticsearchIndexWriteOptions,
+    ) -> ElasticsearchIndexWriteMaintenance {
         ElasticsearchIndexWriteMaintenance::new(opts)
     }
 
@@ -775,7 +851,9 @@ mod write_maintenance_tests {
         let client = MockElasticsearch::default();
         let m = make_maintenance(ElasticsearchIndexWriteOptions::default());
 
-        m.on_write_start(&client, "my-index").await.expect("on_write_start should succeed");
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("on_write_start should succeed");
 
         assert_eq!(client.get_refresh_interval_calls.load(Ordering::Relaxed), 0);
         assert_eq!(client.put_settings_calls.load(Ordering::Relaxed), 0);
@@ -794,16 +872,24 @@ mod write_maintenance_tests {
         });
 
         // Simulate three batches before on_write_complete.
-        m.on_write_start(&client, "my-index").await.expect("first start");
-        m.on_write_start(&client, "my-index").await.expect("second start — must be no-op");
-        m.on_write_start(&client, "my-index").await.expect("third start — must be no-op");
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("first start");
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("second start — must be no-op");
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("third start — must be no-op");
 
         assert_eq!(
-            client.get_refresh_interval_calls.load(Ordering::Relaxed), 1,
+            client.get_refresh_interval_calls.load(Ordering::Relaxed),
+            1,
             "refresh_interval must be fetched exactly once per write cycle, not once per batch"
         );
         assert_eq!(
-            client.put_settings_calls.load(Ordering::Relaxed), 1,
+            client.put_settings_calls.load(Ordering::Relaxed),
+            1,
             "refresh_interval must be overridden exactly once per write cycle, not once per batch"
         );
     }
@@ -822,19 +908,24 @@ mod write_maintenance_tests {
         });
 
         m.on_write_start(&client, "my-index").await.expect("start");
-        m.on_write_complete(&client, "my-index").await.expect("complete");
+        m.on_write_complete(&client, "my-index")
+            .await
+            .expect("complete");
 
         // put_settings: once to override (set -1), once to restore (set 30s).
         assert_eq!(
-            client.put_settings_calls.load(Ordering::Relaxed), 2,
+            client.put_settings_calls.load(Ordering::Relaxed),
+            2,
             "settings should be applied on start and restored on complete"
         );
         assert_eq!(
-            client.refresh_index_calls.load(Ordering::Relaxed), 1,
+            client.refresh_index_calls.load(Ordering::Relaxed),
+            1,
             "index should be refreshed once after write completes"
         );
         assert_eq!(
-            client.force_merge_calls.load(Ordering::Relaxed), 0,
+            client.force_merge_calls.load(Ordering::Relaxed),
+            0,
             "force_merge must not be called when force_merge_segments is None"
         );
     }
@@ -849,14 +940,20 @@ mod write_maintenance_tests {
         });
 
         m.on_write_start(&client, "my-index").await.expect("start");
-        m.on_write_complete(&client, "my-index").await.expect("complete");
+        m.on_write_complete(&client, "my-index")
+            .await
+            .expect("complete");
 
         assert_eq!(
-            client.force_merge_calls.load(Ordering::Relaxed), 1,
+            client.force_merge_calls.load(Ordering::Relaxed),
+            1,
             "force_merge must be called once after write completes"
         );
         assert_eq!(
-            *client.last_force_merge_segments.lock().expect("lock poisoned"),
+            *client
+                .last_force_merge_segments
+                .lock()
+                .expect("lock poisoned"),
             Some(1),
             "force_merge must use the configured segment count"
         );
@@ -876,20 +973,28 @@ mod write_maintenance_tests {
         });
 
         // First write cycle fails.
-        m.on_write_start(&client, "my-index").await.expect("start cycle 1");
-        m.on_write_failed(&client, "my-index").await.expect("failed cycle 1");
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("start cycle 1");
+        m.on_write_failed(&client, "my-index")
+            .await
+            .expect("failed cycle 1");
 
         // Second write cycle — must re-apply the override.
-        m.on_write_start(&client, "my-index").await.expect("start cycle 2");
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("start cycle 2");
 
         // get_interval: once per cycle start → 2 total.
         assert_eq!(
-            client.get_refresh_interval_calls.load(Ordering::Relaxed), 2,
+            client.get_refresh_interval_calls.load(Ordering::Relaxed),
+            2,
             "each write cycle must independently fetch the current refresh_interval"
         );
         // put_settings: set -1 (cycle 1) + restore on failure + set -1 (cycle 2) = 3.
         assert_eq!(
-            client.put_settings_calls.load(Ordering::Relaxed), 3,
+            client.put_settings_calls.load(Ordering::Relaxed),
+            3,
             "settings must be applied on each start and restored on each failure"
         );
     }

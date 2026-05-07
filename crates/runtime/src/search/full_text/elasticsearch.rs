@@ -168,15 +168,21 @@ impl DataConnector for ElasticsearchFullTextConnector {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let inner = self.inner_connector.read_provider(dataset).await?;
-        add_elasticsearch_fts_to_table(inner, &dataset.columns, &dataset.name, &self.fts_params, false)
-            .await
-            .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
-            .map_err(|e| DataConnectorError::InvalidConfiguration {
-                dataconnector: dataset.source().to_string(),
-                message: e.to_string(),
-                connector_component: dataset.into(),
-                source: e,
-            })
+        add_elasticsearch_fts_to_table(
+            inner,
+            &dataset.columns,
+            &dataset.name,
+            &self.fts_params,
+            false,
+        )
+        .await
+        .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: e,
+        })
     }
 
     async fn read_write_provider(
