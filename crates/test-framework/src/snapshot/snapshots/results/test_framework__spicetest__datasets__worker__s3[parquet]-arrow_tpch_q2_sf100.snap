@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q2"
+---
++-----------+--------------------+---------+-----------+----------------+------------------------------------------+-----------------+---------------------------------------------------------------------------------+
+| s_acctbal | s_name             | n_name  | p_partkey | p_mfgr         | s_address                                | s_phone         | s_comment                                                                       |
++-----------+--------------------+---------+-----------+----------------+------------------------------------------+-----------------+---------------------------------------------------------------------------------+
+| 9999.65   | Supplier#000143654 | FRANCE  | 2393647   | Manufacturer#3 | HhHCZ,RosE8He4uYvyIDqsPZe,7cZiJh1y9,     | 16-166-504-5864 |  special accounts. never dogged deposits                                        |
+| 9997.85   | Supplier#000718770 | ROMANIA | 718769    | Manufacturer#1 | 2173woKsCg7zpHCqhiEXFTmYYqpT4XONnRAsUryE | 29-663-409-2865 | posits sleep across the blithely express requests.                              |
+| 9997.46   | Supplier#000906546 | FRANCE  | 1406543   | Manufacturer#2 | aMZ13ITqaYCGwqW42qXJ92ho                 | 16-249-122-4511 | endencies above the furiously even                                              |
+| 9997.20   | Supplier#000487664 | FRANCE  | 2737657   | Manufacturer#2 |  ShFSQYlV,8EvuNQkB7B                     | 16-714-518-5435 | mong the ideas. accounts poach p                                                |
+| 9995.79   | Supplier#000998425 | FRANCE  | 248424    | Manufacturer#4 | tjoKE1Srnp3l9lpwSP40nMonOOM7F2fa         | 16-228-926-9937 | ding foxes haggle fluffily. carefully ironic ideas                              |
+| 9994.85   | Supplier#000581928 | GERMANY | 2831921   | Manufacturer#1 | UbBVSalX1YIGla9W564VvUVr9F8a83qdz        | 17-230-642-6940 | e evenly slyly special asymptotes. blithely pending packages cajole slyly unusu |
+| 9991.82   | Supplier#000754421 | GERMANY | 3504417   | Manufacturer#2 | Jg6ETXggGL8tfX                           | 17-908-303-8190 | ost slyly. carefully bold deposits use furiously around the slyly regul         |
+| 9991.77   | Supplier#000514042 | ROMANIA | 1014039   | Manufacturer#1 | ND8g73JbcuugDphHmWqxNV,oBDDyUJjYpR8snJ   | 29-100-282-1954 | ave to affix furiously. special asymptotes about the ironic foxes sleep qui     |
+| 9990.13   | Supplier#000138240 | FRANCE  | 1888238   | Manufacturer#4 | nOOS2ksL4euund3hoZfGvFj6LiiUl8v,GRInYEqP | 16-206-608-6166 | lar requests. pending foxes at the carefully final accounts haggle slyly under  |
+| 9988.29   | Supplier#000273304 | ROMANIA | 3273303   | Manufacturer#4 | rVw7T,PbkYA35J,                          | 29-238-280-6619 | r accounts. fluffily ironic foxes against the carefully eve                     |
++-----------+--------------------+---------+-----------+----------------+------------------------------------------+-----------------+---------------------------------------------------------------------------------+
