@@ -125,7 +125,7 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
     use runtime_datafusion_index::Index;
     let index =
-        build_elasticsearch_text_index(inner_table_provider.clone(), columns, tbl, fts_params)
+        build_elasticsearch_text_index(Arc::clone(&inner_table_provider), columns, tbl, fts_params)
             .await?;
     let mut provider: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
         .as_any()

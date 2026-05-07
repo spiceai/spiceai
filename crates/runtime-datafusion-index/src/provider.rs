@@ -40,8 +40,6 @@ pub struct IndexedTableProvider {
     ///
     /// In the future, indexes will be required to implement a trait - but for now all existing
     /// use-cases are supported via UDTFs that downcast indexes to the correct type.
-    ///
-    /// These indexes are visible to the query optimizer and may be used to rewrite table scans.
     pub indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 

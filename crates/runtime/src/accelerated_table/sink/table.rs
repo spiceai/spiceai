@@ -123,7 +123,7 @@ impl TableSink {
         let provider_indexes_before: Vec<Arc<dyn Index + Send + Sync>> = providers_before_write
             .iter()
             .filter_map(|p| p.as_any().downcast_ref::<IndexedTableProvider>())
-            .flat_map(|idx| idx.get_all_indexes())
+            .flat_map(IndexedTableProvider::get_all_indexes)
             .collect();
 
         for index in provider_indexes_before
@@ -176,7 +176,7 @@ impl TableSink {
         let provider_indexes_after: Vec<Arc<dyn Index + Send + Sync>> = providers_after_write
             .iter()
             .filter_map(|p| p.as_any().downcast_ref::<IndexedTableProvider>())
-            .flat_map(|idx| idx.get_all_indexes())
+            .flat_map(IndexedTableProvider::get_all_indexes)
             .collect();
 
         for index in provider_indexes_after
@@ -208,7 +208,7 @@ async fn run_on_write_failed(
     let provider_indexes: Vec<Arc<dyn Index + Send + Sync>> = providers
         .iter()
         .filter_map(|p| p.as_any().downcast_ref::<IndexedTableProvider>())
-        .flat_map(|idx| idx.get_all_indexes())
+        .flat_map(IndexedTableProvider::get_all_indexes)
         .collect();
 
     for index in provider_indexes.iter().chain(sink_indexes.iter()) {
