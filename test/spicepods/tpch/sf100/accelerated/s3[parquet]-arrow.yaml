@@ -20,7 +20,9 @@ datasets:
     params: *s3_params
     acceleration:
       enabled: true
-      refresh_sql: "SELECT * FROM lineitem LIMIT 150000000"
+      # SF100 has 600M lineitem rows. Order keys go up to ~600M
+      # l_orderkey <= 150M keeps ~150M rows.
+      refresh_sql: 'SELECT * FROM lineitem WHERE l_orderkey <= 150000000'
   - from: s3://benchmarks/tpch_sf100/nation.parquet
     name: nation
     params: *s3_params
@@ -30,7 +32,9 @@ datasets:
     params: *s3_params
     acceleration:
       enabled: true
-      refresh_sql: "SELECT * FROM orders LIMIT 75000000"
+      # SF100 has 150M orders rows. Order keys are sparse (max ~600M, ~25% density).
+      # o_orderkey <= 300M keeps ~75M rows
+      refresh_sql: 'SELECT * FROM orders WHERE o_orderkey <= 300000000'
   - from: s3://benchmarks/tpch_sf100/part.parquet
     name: part
     params: *s3_params
@@ -40,7 +44,9 @@ datasets:
     params: *s3_params
     acceleration:
       enabled: true
-      refresh_sql: "SELECT * FROM partsupp LIMIT 40000000"
+      # SF100 has 80M partsupp rows (20M parts × 4 suppliers each).
+      # ps_partkey <= 10M keeps 40M rows
+      refresh_sql: 'SELECT * FROM partsupp WHERE ps_partkey <= 10000000'
   - from: s3://benchmarks/tpch_sf100/region.parquet
     name: region
     params: *s3_params
