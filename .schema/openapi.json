@@ -843,6 +843,12 @@
           "200": {
             "description": "SSE stream (`text/event-stream`) of server-originated MCP messages."
           },
+          "401": {
+            "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
+          },
+          "403": {
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
+          },
           "404": {
             "description": "Unknown or expired `Mcp-Session-Id`."
           }
@@ -873,6 +879,12 @@
           "400": {
             "description": "Malformed JSON-RPC payload."
           },
+          "401": {
+            "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
+          },
+          "403": {
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list. Configure `runtime.mcp.allowed_hosts` or set it to `[\"*\"]` to allow all hosts."
+          },
           "404": {
             "description": "Unknown or expired `Mcp-Session-Id`."
           },
@@ -899,6 +911,12 @@
         "responses": {
           "204": {
             "description": "Session terminated."
+          },
+          "401": {
+            "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
+          },
+          "403": {
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
           },
           "404": {
             "description": "Unknown or already-terminated `Mcp-Session-Id`."

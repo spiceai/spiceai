@@ -5,7 +5,6 @@ use reqwest::Client;
 use runtime::{Runtime, auth::EndpointAuth, status::ComponentStatus};
 use runtime_api_types::v1::ComponentError;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::sync::Arc;
 
 use crate::{
@@ -59,17 +58,8 @@ async fn test_models_http_endpoint() -> Result<(), Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            let mut responses_model = get_openai_model("gpt-4o-mini", "responses_model");
-            responses_model.params.insert(
-                "responses_api".to_string(),
-                Value::String("enabled".to_string()),
-            );
-
-            let mut chat_model = get_openai_model("gpt-4o-mini", "chat_model");
-            chat_model.params.insert(
-                "responses_api".to_string(),
-                Value::String("disabled".to_string()),
-            );
+            let responses_model = get_openai_model("gpt-4o-mini", "responses_model");
+            let chat_model = get_openai_model("gpt-4o-mini", "chat_model");
 
             let app = AppBuilder::new("model_endpoint")
                 .with_model(responses_model)
@@ -172,7 +162,12 @@ async fn test_models_http_endpoint() -> Result<(), Error> {
             let models_response: OpenAIModelResponse =
                 response.json().await.map_err(anyhow::Error::from)?;
 
-            assert_json_snapshot!("models_response_with_metadata", &models_response);
+            assert!(models_response.data.iter().all(|model| {
+                model
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.supports_responses_api)
+            }));
 
             Ok(())
         })

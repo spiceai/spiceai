@@ -47,7 +47,7 @@ impl ListDatasetsTool {
             rt,
             name: name.unwrap_or("list_datasets").to_string(),
             description: description
-                .unwrap_or("List all SQL tables available.")
+                .unwrap_or("List every dataset, view, and catalog visible to this runtime, with each entry's fully-qualified table name, description, columns, and capability flags (e.g. `can_search_documents`). Call this first whenever you need to discover what data is available before issuing `sql`, `search`, `table_schema`, or sample tools. Takes no arguments. Returns a JSON array; use the `table` field as the identifier for follow-up tool calls.")
                 .to_string(),
             table_allowlist,
         }
