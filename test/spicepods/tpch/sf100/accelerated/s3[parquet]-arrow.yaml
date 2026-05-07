@@ -2,10 +2,12 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-arrow
 
-# Limit query execution memory to prevent OOM on CI runner
+# Limit query execution memory to prevent OOM on CI runner.
+# HashJoin cannot spill to disk, so the limit must be high enough to fit
+# the build side of the largest joins (Q18, Q20).
 runtime:
   query:
-    memory_limit: 12GiB
+    memory_limit: 18GiB
 
 datasets:
   - from: s3://benchmarks/tpch_sf100/customer.parquet
@@ -20,7 +22,7 @@ datasets:
     acceleration: &acceleration
       enabled: true
   # Limit large tables to prevent OOM on CI runner (https://github.com/spiceai/spiceai/issues/10729)
-  # lineitem: 150M/600M (~25%), orders: 75M/150M (~50%), partsupp: 40M/80M (~50%)
+  # lineitem: 150M/600M (~25%), orders: 37.5M/150M (~25%), partsupp: 20M/80M (~25%)
   - from: s3://benchmarks/tpch_sf100/lineitem.parquet
     name: lineitem
     params: *s3_params
@@ -39,8 +41,8 @@ datasets:
     acceleration:
       enabled: true
       # SF100 has 150M orders rows. Order keys are sparse (max ~600M, ~25% density).
-      # o_orderkey <= 300M keeps ~75M rows
-      refresh_sql: 'SELECT * FROM orders WHERE o_orderkey <= 300000000'
+      # o_orderkey <= 150M keeps ~37.5M rows
+      refresh_sql: 'SELECT * FROM orders WHERE o_orderkey <= 150000000'
   - from: s3://benchmarks/tpch_sf100/part.parquet
     name: part
     params: *s3_params
@@ -51,8 +53,8 @@ datasets:
     acceleration:
       enabled: true
       # SF100 has 80M partsupp rows (20M parts × 4 suppliers each).
-      # ps_partkey <= 10M keeps 40M rows
-      refresh_sql: 'SELECT * FROM partsupp WHERE ps_partkey <= 10000000'
+      # ps_partkey <= 5M keeps 20M rows
+      refresh_sql: 'SELECT * FROM partsupp WHERE ps_partkey <= 5000000'
   - from: s3://benchmarks/tpch_sf100/region.parquet
     name: region
     params: *s3_params
