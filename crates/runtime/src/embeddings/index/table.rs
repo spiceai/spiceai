@@ -373,6 +373,119 @@ fn get_partition_expressions(
     Ok(partition_by)
 }
 
+/// Wraps an **accelerator-side** [`TableProvider`] with Elasticsearch vector indexes.
+///
+/// Unlike [`wrap_table_as_index_elasticsearch`] (which is used on the federated/read side),
+/// this function keeps `inner_table_provider` as the `underlying` of the returned
+/// [`IndexedTableProvider`] — it does **not** replace `underlying` with a
+/// [`VectorScanTableProvider`].  This is required so that
+/// [`IndexedTableProvider::insert_into`] continues to delegate to the writable Arrow
+/// accelerator rather than the read-only Elasticsearch scan provider.
+///
+/// At query time the accelerator side scans from Arrow; vector search goes through the
+/// federated [`IndexedTableProvider`] which *does* have `VectorScanTableProvider` as
+/// `underlying`.
+#[cfg(feature = "elasticsearch")]
+pub(crate) async fn wrap_accelerator_with_elasticsearch_vector_indexes(
+    embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+    secrets: &Arc<RwLock<Secrets>>,
+    tbl: &TableReference,
+    columns: &[Column],
+    file_format: Option<&str>,
+    inner_table_provider: Arc<dyn TableProvider + 'static>,
+    vector_store: &VectorStore,
+) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("Elasticsearch vector engine for table {tbl} initializing...");
+    let start = std::time::Instant::now();
+
+    let embedding_columns: Vec<_> = columns
+        .iter()
+        .filter_map(|c| {
+            c.embeddings
+                .first()
+                .map(|embed| (c.name.clone(), embed.clone()))
+        })
+        .collect();
+
+    // Keep `underlying` pointing at the Arrow accelerator throughout — never replace it
+    // with VectorScanTableProvider (that is for the federated/read side only).
+    let mut provider = if let Some(indexed) = inner_table_provider
+        .as_any()
+        .downcast_ref::<IndexedTableProvider>()
+    {
+        indexed.clone()
+    } else {
+        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+    };
+
+    for (column, config) in embedding_columns {
+        let (augmented_columns, index_schema) =
+            if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
+                updated_chunked_search_index_format(&inner_table_provider, columns, &column)
+            } else {
+                (columns.to_vec(), inner_table_provider.schema())
+            };
+
+        let es_index = super::elasticsearch::try_from_table(
+            tbl,
+            column.clone(),
+            config.clone(),
+            vector_store,
+            &inner_table_provider,
+            Arc::clone(&index_schema),
+            Arc::clone(embedding_models),
+            augmented_columns,
+            Arc::clone(secrets),
+        )
+        .await?;
+
+        if let Some(ref chunking) = config.chunking
+            && chunking.enabled
+        {
+            tracing::debug!(
+                "[Elasticsearch][table={tbl}] Chunking column {} (accelerator side)",
+                column
+            );
+            let chunker = construct_chunker(
+                config.model.as_str(),
+                &ChunkingConfig {
+                    target_chunk_size: chunking.target_chunk_size,
+                    overlap_size: chunking.overlap_size,
+                    trim_whitespace: chunking.trim_whitespace,
+                    file_format,
+                },
+                embedding_models,
+            )
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+            let mut es_index_augmented = es_index;
+            es_index_augmented.primary_key =
+                ChunkedSearchIndex::augment_primary_key(es_index_augmented.primary_key);
+
+            let idx = Arc::new(es_index_augmented);
+            let chunked_idx = Arc::new(ChunkedSearchIndex::new(
+                idx as Arc<dyn SearchIndex>,
+                chunker,
+            ));
+            // Register as write-only so TableSink fires write lifecycle hooks, but the query
+            // optimizer (IndexTableScanOptimizerRule) never sees this index and cannot rewrite
+            // table scans to use the accelerator-side Arrow MemTable for vector search.
+            provider = provider.add_write_only_index(Arc::clone(&chunked_idx) as Arc<dyn Index>);
+        } else {
+            let idx = Arc::new(es_index);
+            // Same rationale: write-only on accelerator side.
+            provider = provider.add_write_only_index(Arc::clone(&idx) as Arc<dyn Index>);
+        }
+    }
+
+    tracing::info!(
+        "Elasticsearch vector engine for table {tbl} initialized in {:?}",
+        start.elapsed()
+    );
+    Ok(Arc::new(provider))
+}
+
 #[cfg(feature = "elasticsearch")]
 async fn wrap_table_as_index_elasticsearch(
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,

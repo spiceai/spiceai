@@ -104,7 +104,7 @@ impl TableSink {
 
         for provider in &providers_before_write {
             if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
-                let indexes = indexed.get_all_indexes();
+                let indexes = indexed.get_all_write_hooks();
                 tracing::debug!(
                     index_names = ?indexes.iter().map(|i| i.name()).collect::<Vec<_>>(),
                     "Running on_write_start for indexes"
@@ -153,7 +153,7 @@ impl TableSink {
             // Uses IF NOT EXISTS semantics: creates index after overwrite (new table),
             // no-op after append (index already exists). CDC skips this path entirely.
             if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
-                let indexes = indexed.get_all_indexes();
+                let indexes = indexed.get_all_write_hooks();
                 tracing::debug!(
                     index_names = ?indexes.iter().map(|i| i.name()).collect::<Vec<_>>(),
                     "Running on_write_complete for indexes"
@@ -181,7 +181,7 @@ impl TableSink {
 async fn run_on_write_failed(providers: &[Arc<dyn TableProvider>]) {
     for provider in providers {
         if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
-            for index in indexed.get_all_indexes() {
+            for index in indexed.get_all_write_hooks() {
                 if let Err(e) = index.on_write_failed().await {
                     tracing::warn!(
                         "TableSink: on_write_failed failed for index '{}': {e}. Index write state may need manual cleanup.",

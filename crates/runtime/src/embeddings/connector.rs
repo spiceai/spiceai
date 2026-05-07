@@ -322,8 +322,7 @@ impl DataConnector for EmbeddingConnector {
             for (effective_vector_store, columns) in
                 vector_index_groups(vector_engine, dataset)
             {
-                indexed_accelerator = crate::embeddings::index::table::wrap_table_as_index(
-                    &dataset.runtime().datafusion().ctx,
+                indexed_accelerator = crate::embeddings::index::table::wrap_accelerator_with_elasticsearch_vector_indexes(
                     &self.embedding_models,
                     &self.secrets,
                     &dataset.name,

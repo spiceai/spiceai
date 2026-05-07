@@ -111,12 +111,19 @@ pub(crate) fn add_full_text_search_to_table(
 /// per batch indexes every FTS column as fields of the same ES document — the correct
 /// Elasticsearch model. At query time `call_with_es_indexes` in the UDTF dispatcher
 /// selects the requested column from `search_fields` on that shared instance.
+///
+/// When `write_only` is `true` the index is registered via
+/// [`IndexedTableProvider::add_write_only_index`] so that `TableSink` fires write lifecycle hooks
+/// but the query optimizer (`IndexTableScanOptimizerRule`) never rewrites table scans against it.
+/// Pass `write_only = true` when adding to an accelerator-side table; pass `false` for the
+/// federated-side table where the UDTF needs to discover the index for `text_search()` queries.
 #[cfg(feature = "elasticsearch")]
 pub(crate) async fn add_elasticsearch_fts_to_table(
     inner_table_provider: Arc<dyn TableProvider>,
     columns: &[spicepod::semantic::Column],
     tbl: &datafusion::sql::TableReference,
     fts_params: &crate::search::full_text::elasticsearch::ElasticsearchFtsParams,
+    write_only: bool,
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
     use crate::component::column::full_text_search_config;
     use crate::component::dataset::FullTextSearchDatasetConfig;
@@ -233,7 +240,11 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
         batch_write_rows: fts_params.batch_write_rows,
         write_maintenance: Arc::clone(&write_maintenance),
     });
-    provider = provider.add_index(index as Arc<dyn Index + Send + Sync>);
+    provider = if write_only {
+        provider.add_write_only_index(index as Arc<dyn Index + Send + Sync>)
+    } else {
+        provider.add_index(index as Arc<dyn Index + Send + Sync>)
+    };
 
     Ok(provider)
 }
@@ -270,7 +281,7 @@ mod tests {
         };
         let table_ref = datafusion::sql::TableReference::parse_str("docs");
 
-        let err = add_elasticsearch_fts_to_table(table, &columns, &table_ref, &fts_params)
+        let err = add_elasticsearch_fts_to_table(table, &columns, &table_ref, &fts_params, false)
             .await
             .expect_err("missing row_id column should fail before indexing");
 

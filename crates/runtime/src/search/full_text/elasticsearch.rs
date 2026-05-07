@@ -168,7 +168,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let inner = self.inner_connector.read_provider(dataset).await?;
-        add_elasticsearch_fts_to_table(inner, &dataset.columns, &dataset.name, &self.fts_params)
+        add_elasticsearch_fts_to_table(inner, &dataset.columns, &dataset.name, &self.fts_params, false)
             .await
             .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
             .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -190,6 +190,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
                     &dataset.columns,
                     &dataset.name,
                     &self.fts_params,
+                    false,
                 )
                 .await
                 .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
@@ -249,6 +250,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
             &dataset.columns,
             &dataset.name,
             &self.fts_params,
+            true, // write-only: TableSink fires hooks; optimizer never rewrites against accelerator
         )
         .await?;
         builder.set_accelerator(Arc::new(indexed_accelerator));
