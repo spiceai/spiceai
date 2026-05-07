@@ -18,6 +18,7 @@ use datafusion::{
     catalog::TableProvider, logical_expr::dml::InsertOp, physical_plan::RecordBatchStream,
 };
 use multi::MultiSink;
+use runtime_datafusion_index::Index;
 use std::{pin::Pin, sync::Arc};
 use table::TableSink;
 use util::RetryError;
@@ -36,6 +37,20 @@ pub enum AccelerationSink {
 impl AccelerationSink {
     pub fn new(table_provider: Arc<dyn TableProvider>) -> Self {
         Self::Table(TableSink::new(table_provider))
+    }
+
+    pub fn with_sink_indexes(self, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
+        match self {
+            AccelerationSink::Table(sink) => {
+                AccelerationSink::Table(sink.with_sink_indexes(indexes))
+            }
+            AccelerationSink::Multi(_) => {
+                // MultiSink does not support sink_indexes; this path is not reachable
+                // at construction time (sink_indexes are set before any synchronized
+                // tables are added).
+                self
+            }
+        }
     }
 
     // Adds a table provider to the AccelerationSink, converting a TableSink to a MultiSink if necessary

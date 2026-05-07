@@ -315,23 +315,24 @@ impl DataConnector for EmbeddingConnector {
         {
             tracing::debug!(
                 dataset = %dataset.name,
-                "Wrapping accelerator with Elasticsearch vector indexes"
+                "Collecting Elasticsearch vector sink indexes for accelerator"
             );
             let accelerator = builder.get_accelerator();
-            let mut indexed_accelerator = accelerator;
             for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
-                indexed_accelerator = crate::embeddings::index::table::wrap_accelerator_with_elasticsearch_vector_indexes(
+                let (_, sink_indexes) = crate::embeddings::index::table::wrap_accelerator_with_elasticsearch_vector_indexes(
                     &self.embedding_models,
                     &self.secrets,
                     &dataset.name,
                     &columns,
                     dataset.params.get("file_format").map(String::as_str),
-                    indexed_accelerator,
+                    Arc::clone(&accelerator),
                     &effective_vector_store,
                 )
                 .await?;
+                for idx in sink_indexes {
+                    builder.add_sink_index(idx);
+                }
             }
-            builder.set_accelerator(indexed_accelerator);
         }
 
         Ok(())

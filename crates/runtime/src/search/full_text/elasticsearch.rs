@@ -168,21 +168,15 @@ impl DataConnector for ElasticsearchFullTextConnector {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let inner = self.inner_connector.read_provider(dataset).await?;
-        add_elasticsearch_fts_to_table(
-            inner,
-            &dataset.columns,
-            &dataset.name,
-            &self.fts_params,
-            false,
-        )
-        .await
-        .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
-        .map_err(|e| DataConnectorError::InvalidConfiguration {
-            dataconnector: dataset.source().to_string(),
-            message: e.to_string(),
-            connector_component: dataset.into(),
-            source: e,
-        })
+        add_elasticsearch_fts_to_table(inner, &dataset.columns, &dataset.name, &self.fts_params)
+            .await
+            .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+            .map_err(|e| DataConnectorError::InvalidConfiguration {
+                dataconnector: dataset.source().to_string(),
+                message: e.to_string(),
+                connector_component: dataset.into(),
+                source: e,
+            })
     }
 
     async fn read_write_provider(
@@ -196,7 +190,6 @@ impl DataConnector for ElasticsearchFullTextConnector {
                     &dataset.columns,
                     &dataset.name,
                     &self.fts_params,
-                    false,
                 )
                 .await
                 .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
@@ -247,19 +240,19 @@ impl DataConnector for ElasticsearchFullTextConnector {
             .on_accelerator_setup(dataset, builder)
             .await?;
 
-        use crate::search::full_text::table::add_elasticsearch_fts_to_table;
+        use crate::search::full_text::table::build_elasticsearch_text_index;
+        use runtime_datafusion_index::Index;
         use std::sync::Arc;
 
         let accelerator = builder.get_accelerator();
-        let indexed_accelerator = add_elasticsearch_fts_to_table(
+        let index = build_elasticsearch_text_index(
             accelerator,
             &dataset.columns,
             &dataset.name,
             &self.fts_params,
-            true, // write-only: TableSink fires hooks; optimizer never rewrites against accelerator
         )
         .await?;
-        builder.set_accelerator(Arc::new(indexed_accelerator));
+        builder.add_sink_index(index as Arc<dyn Index + Send + Sync>);
 
         Ok(())
     }

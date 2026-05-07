@@ -44,6 +44,7 @@ use opentelemetry::KeyValue;
 use rand::RngExt;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::ForceCreate;
+use runtime_datafusion_index::Index;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -665,6 +666,8 @@ pub struct Refresher {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// Indexes that receive write lifecycle hooks but are invisible to the query optimizer.
+    sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -719,6 +722,7 @@ impl Refresher {
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
             is_s3_express_acceleration: false,
+            sink_indexes: vec![],
         }
     }
 
@@ -822,6 +826,13 @@ impl Refresher {
     /// Set whether the acceleration uses S3 Express One Zone storage.
     pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    /// Register indexes that receive write lifecycle hooks but are invisible to the query
+    /// optimizer. See [`crate::accelerated_table::sink::table::TableSink`] for details.
+    pub fn with_sink_indexes(&mut self, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> &mut Self {
+        self.sink_indexes = indexes;
         self
     }
 
@@ -969,6 +980,8 @@ impl Refresher {
 
         refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
+
+        refresh_task_runner = refresh_task_runner.with_sink_indexes(self.sink_indexes.clone());
 
         let mut refresh_task_runner = refresh_task_runner.build();
 
@@ -1210,6 +1223,7 @@ impl Refresher {
             .with_on_stream_batch_process_callback(on_batch_process_callback)
             .with_last_updated_at(Arc::clone(&self.last_updated_at))
             .with_s3_express_acceleration(self.is_s3_express_acceleration)
+            .with_sink_indexes(self.sink_indexes.clone())
             .build(),
         );
 

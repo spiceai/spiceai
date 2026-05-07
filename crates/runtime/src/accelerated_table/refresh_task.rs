@@ -73,6 +73,7 @@ use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
 use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
 use runtime_datafusion::optimizer_rule::avoid_vector_columns_on_index::AvoidDerivedVectorColumnOnIndexRule;
+use runtime_datafusion_index::Index;
 use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
@@ -132,6 +133,10 @@ pub struct RefreshTaskBuilder {
     /// State for `refresh_mode: snapshot`. Required when the refresh mode is
     /// [`RefreshMode::Snapshot`]; ignored otherwise.
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    /// Indexes that receive write lifecycle hooks (`on_write_start`, `on_write_failed`,
+    /// `on_write_complete`) but are not registered in the accelerator-side
+    /// [`IndexedTableProvider`] and therefore invisible to the query optimizer.
+    sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl RefreshTaskBuilder {
@@ -162,6 +167,7 @@ impl RefreshTaskBuilder {
             last_updated_at: Arc::new(AtomicI64::new(0)),
             is_s3_express_acceleration: false,
             snapshot_refresh_state: None,
+            sink_indexes: vec![],
         }
     }
 
@@ -231,6 +237,18 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Register indexes that receive write lifecycle hooks but are invisible to the query
+    /// optimizer. Used for external indexes (e.g. Elasticsearch) maintained alongside the
+    /// accelerator without being stored in it.
+    #[must_use]
+    pub fn with_sink_indexes(
+        mut self,
+        indexes: Vec<Arc<dyn Index + Send + Sync>>,
+    ) -> RefreshTaskBuilder {
+        self.sink_indexes = indexes;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -252,9 +270,10 @@ impl RefreshTaskBuilder {
         // if the task is never executed, but simplifies the builder API and ownership model.
         // The alternative of lazy initialization would add complexity without meaningful benefit
         // given the typical usage pattern.
-        let sink = Arc::new(RwLock::new(AccelerationSink::new(Arc::clone(
-            &self.accelerator,
-        ))));
+        let sink = Arc::new(RwLock::new(
+            AccelerationSink::new(Arc::clone(&self.accelerator))
+                .with_sink_indexes(self.sink_indexes),
+        ));
 
         RefreshTask {
             runtime_status: self.runtime_status,

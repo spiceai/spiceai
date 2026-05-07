@@ -43,15 +43,6 @@ pub struct IndexedTableProvider {
     ///
     /// These indexes are visible to the query optimizer and may be used to rewrite table scans.
     pub indexes: Vec<Arc<dyn Index + Send + Sync>>,
-
-    /// Write-only indexes that participate in write lifecycle hooks (`on_write_start`,
-    /// `on_write_failed`, `on_write_complete`) but are **not** visible to the query optimizer.
-    ///
-    /// Use this for external indexes (e.g. Elasticsearch) that are maintained on the accelerator
-    /// write path but must never be picked up by `IndexTableScanOptimizerRule` for query rewrites,
-    /// since the accelerator storage (Arrow MemTable) does not hold the vector data in the format
-    /// expected by those indexes.
-    pub write_only_indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl IndexedTableProvider {
@@ -66,7 +57,6 @@ impl IndexedTableProvider {
         Self {
             underlying,
             indexes,
-            write_only_indexes: vec![],
         }
     }
 
@@ -74,26 +64,6 @@ impl IndexedTableProvider {
     pub fn add_index(mut self, index: Arc<dyn Index + Send + Sync>) -> Self {
         self.indexes.push(index);
         self
-    }
-
-    /// Register an index that participates in write lifecycle hooks but is invisible to the
-    /// query optimizer. See [`Self::write_only_indexes`] for details.
-    #[must_use]
-    pub fn add_write_only_index(mut self, index: Arc<dyn Index + Send + Sync>) -> Self {
-        self.write_only_indexes.push(index);
-        self
-    }
-
-    /// Returns all indexes that should receive write lifecycle hook calls (`on_write_start`,
-    /// `on_write_failed`, `on_write_complete`). This includes both query-visible indexes and
-    /// write-only indexes.
-    #[must_use]
-    pub fn get_all_write_hooks(&self) -> Vec<Arc<dyn Index + Send + Sync>> {
-        self.indexes
-            .iter()
-            .chain(self.write_only_indexes.iter())
-            .cloned()
-            .collect()
     }
 
     #[must_use]

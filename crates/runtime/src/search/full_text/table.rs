@@ -112,19 +112,48 @@ pub(crate) fn add_full_text_search_to_table(
 /// Elasticsearch model. At query time `call_with_es_indexes` in the UDTF dispatcher
 /// selects the requested column from `search_fields` on that shared instance.
 ///
-/// When `write_only` is `true` the index is registered via
-/// [`IndexedTableProvider::add_write_only_index`] so that `TableSink` fires write lifecycle hooks
-/// but the query optimizer (`IndexTableScanOptimizerRule`) never rewrites table scans against it.
-/// Pass `write_only = true` when adding to an accelerator-side table; pass `false` for the
-/// federated-side table where the UDTF needs to discover the index for `text_search()` queries.
+/// The index is registered via [`IndexedTableProvider::add_index`] so it is visible to the
+/// query optimizer and can be discovered by `find_index_in_table_provider` for `text_search()`
+/// queries. Use [`build_elasticsearch_text_index`] + [`crate::accelerated_table::Builder::add_sink_index`]
+/// for the accelerator-side path where optimizer visibility is not desired.
 #[cfg(feature = "elasticsearch")]
 pub(crate) async fn add_elasticsearch_fts_to_table(
     inner_table_provider: Arc<dyn TableProvider>,
     columns: &[spicepod::semantic::Column],
     tbl: &datafusion::sql::TableReference,
     fts_params: &crate::search::full_text::elasticsearch::ElasticsearchFtsParams,
-    write_only: bool,
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+    use runtime_datafusion_index::Index;
+    let index =
+        build_elasticsearch_text_index(inner_table_provider.clone(), columns, tbl, fts_params)
+            .await?;
+    let mut provider: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
+        .as_any()
+        .downcast_ref::<IndexedTableProvider>(
+    ) {
+        idx_tbl.clone()
+    } else {
+        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+    };
+    provider = provider.add_index(index as Arc<dyn Index + Send + Sync>);
+    Ok(provider)
+}
+
+/// Builds (but does not register) an [`ElasticsearchTextIndex`] for all FTS-enabled columns.
+///
+/// Use this on the accelerator write path where the index should be registered as a
+/// `sink_index` on [`crate::accelerated_table::Builder`] rather than inside the accelerator's
+/// [`IndexedTableProvider`].
+#[cfg(feature = "elasticsearch")]
+pub(crate) async fn build_elasticsearch_text_index(
+    inner_table_provider: Arc<dyn TableProvider>,
+    columns: &[spicepod::semantic::Column],
+    tbl: &datafusion::sql::TableReference,
+    fts_params: &crate::search::full_text::elasticsearch::ElasticsearchFtsParams,
+) -> Result<
+    Arc<search::index::elasticsearch::ElasticsearchTextIndex>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     use crate::component::column::full_text_search_config;
     use crate::component::dataset::FullTextSearchDatasetConfig;
     use crate::embeddings::index::elasticsearch::{
@@ -210,15 +239,6 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     )
     .await?;
 
-    let mut provider: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
-        .as_any()
-        .downcast_ref::<IndexedTableProvider>(
-    ) {
-        idx_tbl.clone()
-    } else {
-        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
-    };
-
     // Create a single ElasticsearchTextIndex covering all FTS columns so that one _bulk
     // write per batch indexes every column as fields of the same ES document.
     // search_column_name is set to the first field as a fallback for single-column
@@ -230,23 +250,16 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
         .ok_or_else(|| Box::<dyn std::error::Error + Send + Sync>::from(
             format!("Attempted to add Elasticsearch FTS to '{tbl}', but search_fields is empty after configuration")
         ))?;
-    let index = Arc::new(ElasticsearchTextIndex {
+    Ok(Arc::new(ElasticsearchTextIndex {
         client: Arc::clone(&client),
         es_index: fts_params.es_index.clone(),
         search_column_name: first_field,
         search_fields,
-        primary_key: pk_fields.clone(),
+        primary_key: pk_fields,
         source_schema: Arc::clone(&source_schema),
         batch_write_rows: fts_params.batch_write_rows,
         write_maintenance: Arc::clone(&write_maintenance),
-    });
-    provider = if write_only {
-        provider.add_write_only_index(index as Arc<dyn Index + Send + Sync>)
-    } else {
-        provider.add_index(index as Arc<dyn Index + Send + Sync>)
-    };
-
-    Ok(provider)
+    }))
 }
 
 #[cfg(all(test, feature = "elasticsearch"))]
