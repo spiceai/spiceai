@@ -815,6 +815,33 @@ mod tests {
             Err(unexpected_call_error("put_mapping"))
         }
 
+        async fn get_index_refresh_interval(
+            &self,
+            _index: &str,
+        ) -> elasticsearch::Result<Option<String>> {
+            Err(unexpected_call_error("get_index_refresh_interval"))
+        }
+
+        async fn put_index_settings(
+            &self,
+            _index: &str,
+            _body: &serde_json::Value,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            Err(unexpected_call_error("put_index_settings"))
+        }
+
+        async fn refresh_index(&self, _index: &str) -> elasticsearch::Result<serde_json::Value> {
+            Err(unexpected_call_error("refresh_index"))
+        }
+
+        async fn force_merge(
+            &self,
+            _index: &str,
+            _max_num_segments: u32,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            Err(unexpected_call_error("force_merge"))
+        }
+
         async fn index_document(
             &self,
             _index: &str,
