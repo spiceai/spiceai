@@ -169,12 +169,12 @@ This provides **linearizable writes** without external coordination services.
 
 ### Supported Object Stores
 
-| Store | OCC Support | Notes |
-|-------|-------------|-------|
-| Amazon S3 | ✅ Full | Native conditional writes |
-| Google Cloud Storage | ✅ Full | Generation-based versioning |
-| Azure Blob Storage | ✅ Full | ETag-based |
-| Local Filesystem | ✅ Local | Simulates conditional writes with an advisory lock file and ETag re-check |
+| Store                | OCC Support | Notes                                                                     |
+| -------------------- | ----------- | ------------------------------------------------------------------------- |
+| Amazon S3            | ✅ Full      | Native conditional writes                                                 |
+| Google Cloud Storage | ✅ Full      | Generation-based versioning                                               |
+| Azure Blob Storage   | ✅ Full      | ETag-based                                                                |
+| Local Filesystem     | ✅ Local     | Simulates conditional writes with an advisory lock file and ETag re-check |
 
 ## Design Principles
 
