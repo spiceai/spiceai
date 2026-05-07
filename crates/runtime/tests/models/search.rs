@@ -303,13 +303,11 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: b
 }
 
 fn use_structural_search_response_validation(test_name: &str) -> bool {
-    let is_s3_vectors_composite = test_name.starts_with("s3vectors_composite");
-    let is_s3_vectors_chunking_keywords =
-        test_name.starts_with("s3vectors_chunking") && test_name.contains("_keywords");
+    let is_s3_vectors_composite =
+        test_name.starts_with("s3vectors_composite") && !test_name.contains("with_where");
+    let is_s3_vectors_chunking = test_name.starts_with("s3vectors_chunking");
 
-    (is_s3_vectors_composite || is_s3_vectors_chunking_keywords)
-        && !test_name.contains("vector_search_sql")
-        && !test_name.contains("with_where")
+    (is_s3_vectors_composite || is_s3_vectors_chunking) && !test_name.contains("vector_search_sql")
 }
 
 /// Validate the structure and invariants of a search response without asserting exact item content.
