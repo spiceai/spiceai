@@ -38,7 +38,7 @@ use data_components::postgres_replication::{
 };
 use futures::StreamExt;
 use secrecy::SecretString;
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, error::SqlState};
 
 use crate::init_tracing;
 use crate::postgres::common;
@@ -273,11 +273,35 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     // Clean up slots so subsequent runs don't trip on orphans.
     drop(stream_a);
     drop(stream_b);
-    tokio::time::sleep(Duration::from_secs(1)).await;
     for slot in &["spice_itest_slot_r1", "spice_itest_slot_r2"] {
-        let _ = source
-            .execute("SELECT pg_drop_replication_slot($1)", &[slot])
-            .await;
+        drop_replication_slot_when_inactive(&source, slot).await?;
     }
     Ok(())
+}
+
+async fn drop_replication_slot_when_inactive(
+    source: &tokio_postgres::Client,
+    slot: &str,
+) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let timeout = Duration::from_secs(10);
+    let mut last_error = None;
+
+    while start_time.elapsed() <= timeout {
+        match source
+            .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if error.code() == Some(&SqlState::UNDEFINED_OBJECT) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Timed out waiting to drop Postgres replication slot {slot}. Last error: {}",
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
 }

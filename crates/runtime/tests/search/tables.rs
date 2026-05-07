@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use spicepod::{
     acceleration::Acceleration,
     component::{Nameable, dataset::Dataset, view::View},
+    fts::FtsStore,
     semantic::Column,
     vector::VectorStore,
 };
@@ -35,6 +36,7 @@ pub fn enrich_table(
     t: SearchTable,
     columns: Vec<Column>,
     vector: Option<VectorStore>,
+    fts: Option<&FtsStore>,
     acceleration: &Acceleration,
 ) -> (Vec<View>, Vec<Dataset>) {
     let SearchTable {
@@ -47,6 +49,7 @@ pub fn enrich_table(
         ds.acceleration = Some(acceleration.clone());
         ds.columns.extend(columns.clone());
         ds.vectors.clone_from(&vector);
+        ds.full_text_search = fts.cloned();
     }
 
     if let Some(v) = views.iter_mut().find(|v| v.name() == table_name) {

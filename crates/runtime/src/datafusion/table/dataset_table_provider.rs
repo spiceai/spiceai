@@ -50,6 +50,7 @@ use datafusion::datasource::TableType;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
+use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use snafu::Snafu;
 use tokio::sync::OnceCell;
@@ -128,26 +129,29 @@ impl DatasetTableProvider {
     /// At-most-once initialization. Concurrent callers wait for the
     /// in-flight call and observe its result.
     pub async fn ensure_ready(&self) -> Result<Arc<DatasetReady>, Arc<InitError>> {
-        let result = self
-            .ready
-            .get_or_init(|| async {
-                let init = self.init.lock().take().ok_or_else(|| {
+        let result = self.ready.get_or_init(|| self.initialize_ready()).await;
+        result.clone()
+    }
+
+    fn initialize_ready(&self) -> BoxFuture<'_, Result<Arc<DatasetReady>, Arc<InitError>>> {
+        Box::pin(async move {
+            let init = {
+                self.init.lock().take().ok_or_else(|| {
                     Arc::new(InitError::AlreadyConsumed {
                         name: self.name.clone(),
                     })
-                })?;
+                })?
+            };
 
-                let ready = Box::pin(init.initialize()).await.map_err(|err| {
-                    Arc::new(InitError::InitializationFailed {
-                        name: self.name.clone(),
-                        source: Box::new(err),
-                    })
-                })?;
+            let ready = Box::pin(init.initialize()).await.map_err(|err| {
+                Arc::new(InitError::InitializationFailed {
+                    name: self.name.clone(),
+                    source: Box::new(err),
+                })
+            })?;
 
-                Ok(Arc::new(ready))
-            })
-            .await;
-        result.clone()
+            Ok(Arc::new(ready))
+        })
     }
 
     /// True iff `ensure_ready` has been called and produced a result

@@ -417,11 +417,15 @@ fn handle_query_error(e: query::Error) -> Status {
     match e {
         query::Error::BindingParameters { source }
         | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
+        query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
         _ => to_tonic_err(e),
     }
 }
 
 fn handle_datafusion_error(e: DataFusionError) -> Status {
+    if query::is_cancellation_error(&e) {
+        return Status::cancelled(e.to_string());
+    }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)

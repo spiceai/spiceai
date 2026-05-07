@@ -20,6 +20,8 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 
+#[cfg(feature = "http")]
+pub mod cancel_guard_body;
 pub mod fibonacci_backoff;
 pub mod home_dir;
 pub mod levenshtein;
