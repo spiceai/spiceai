@@ -1126,9 +1126,8 @@
               },
               "example": {
                 "query": "Get the top 5 customers by total sales",
-                "model": "nql",
                 "stream": false,
-                "sample_data_enabled": true,
+                "sample_data_enabled": false,
                 "datasets": [
                   "sales_data"
                 ],
@@ -1498,6 +1497,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "The specified model provider does not support the Responses API or the request is invalid"
           },
           "404": {
             "description": "The specified model was not found"
@@ -1963,12 +1965,12 @@
                 "example": [
                   {
                     "name": "get_readiness",
-                    "description": "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.",
+                    "description": "Report the readiness state of every Spice runtime component (datasets, accelerators, models, embeddings, catalogs).",
                     "parameters": null
                   },
                   {
                     "name": "list_datasets",
-                    "description": "List all SQL tables available.",
+                    "description": "List every dataset, view, and catalog visible to this runtime.",
                     "parameters": null
                   }
                 ]
@@ -2036,7 +2038,7 @@
                   },
                   {
                     "name": "list_datasets",
-                    "description": "List all SQL tables available.",
+                    "description": "List every dataset, view, and catalog visible to this runtime.",
                     "parameters": null
                   }
                 ]
@@ -10077,8 +10079,11 @@
             "description": "Names of datasets to sample from when constructing model context; this is a sampling hint and does not restrict which tables queries can target. If omitted, all datasets are used."
           },
           "model": {
-            "type": "string",
-            "description": "The name of the model to use for SQL generation. Default: \"nql\""
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name of the model to use for SQL generation. If omitted, Spice defaults to the only compatible LLM model configured in the Spicepod."
           },
           "prompt_cache_key": {
             "type": [
@@ -10093,7 +10098,7 @@
           },
           "sample_data_enabled": {
             "type": "boolean",
-            "description": "Whether sample data is included in the context for SQL generation. Default: true"
+            "description": "Whether sample data is included in the context for SQL generation. Default: false"
           },
           "stream": {
             "type": "boolean",
