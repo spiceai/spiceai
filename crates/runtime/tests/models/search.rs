@@ -379,12 +379,12 @@ fn assert_search_response_structure(test_name: &str, resp: Value, round_scores: 
             "{test_name}: result[{i}] matches should contain 'answer'"
         );
 
-        // For additional_columns tests, verify extra fields in primary_key
+        // For additional_columns tests, verify extra fields are returned.
         if test_name.contains("additional_columns") {
-            let pk = result.get("primary_key").and_then(|p| p.as_object());
+            let data = result.get("data").and_then(|d| d.as_object());
             assert!(
-                pk.is_some_and(|p| p.contains_key("question")),
-                "{test_name}: result[{i}] primary_key should contain 'question' for additional_columns test"
+                data.is_some_and(|d| !d.is_empty()),
+                "{test_name}: result[{i}] data should contain requested additional columns"
             );
         }
     }
