@@ -665,17 +665,6 @@ impl HttpRateControlRegistry {
             .collect()
     }
 
-    async fn refresh_persisted_governor_states(&self) {
-        for (origin, controller) in self.persisted_rate_controllers().await {
-            if let Err(error) = controller.refresh_persisted_state().await {
-                tracing::warn!(
-                    origin = origin.as_str(),
-                    "Failed to refresh persisted rate-control state: {error}"
-                );
-            }
-        }
-    }
-
     async fn refresh_and_persist_governor_states(&self) {
         for (origin, controller) in self.persisted_rate_controllers().await {
             if let Err(error) = controller.refresh_and_persist_state_snapshot().await {
