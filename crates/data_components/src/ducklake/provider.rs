@@ -33,7 +33,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use globset::GlobSet;
 use snafu::prelude::*;
 
-use crate::RefreshableCatalogProvider;
+use crate::{ReadWrite, RefreshableCatalogProvider};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -510,8 +510,14 @@ impl DuckLakeSchemaProvider {
                 table_name.clone(),
             );
 
-            // Use the DuckDB table factory (which shares the same pool with ducklake attached)
-            match self.duckdb_factory.table_provider(table_ref).await {
+            // Use the DuckDB table factory (which shares the same pool with ducklake attached).
+            // When writable, use ReadWrite provider to support INSERT/UPDATE/DELETE.
+            let provider_result = if self.writable {
+                ReadWrite::table_provider(self.duckdb_factory.as_ref(), table_ref).await
+            } else {
+                self.duckdb_factory.table_provider(table_ref).await
+            };
+            match provider_result {
                 Ok(provider) => {
                     tables.insert(table_name, provider);
                 }

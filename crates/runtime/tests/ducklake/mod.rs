@@ -414,3 +414,105 @@ async fn ducklake_standalone_dataset() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+/// Tests that INSERT works on a `DuckLake` catalog table when `access: read_write` is set.
+#[tokio::test]
+async fn ducklake_catalog_read_write_insert() -> Result<(), anyhow::Error> {
+    use spicepod::component::access::AccessMode;
+
+    let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));
+    register_test_connectors().await;
+
+    let tmp_dir = TempDir::new()?;
+    let metadata_path = tmp_dir
+        .path()
+        .join("test_rw.ducklake")
+        .display()
+        .to_string();
+    let data_path = tmp_dir.path().join("data_rw").display().to_string();
+    std::fs::create_dir_all(&data_path)?;
+
+    bootstrap_ducklake(&metadata_path, &data_path);
+
+    test_request_context()
+        .scope(async {
+            let mut catalog = Catalog::new("ducklake".to_string(), "rw_lake".to_string())
+                .with_access(AccessMode::ReadWrite);
+            catalog.params = Some(make_ducklake_catalog_params(&metadata_path));
+
+            let app = AppBuilder::new("ducklake_rw_test")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Verify initial data
+            let result = rt
+                .datafusion()
+                .query_builder("SELECT COUNT(*) AS cnt FROM rw_lake.main.orders")
+                .build()
+                .run()
+                .await?;
+            let results: Vec<RecordBatch> = result.data.try_collect().await?;
+            assert_batches_eq!(
+                &[
+                    "+-----+",
+                    "| cnt |",
+                    "+-----+",
+                    "| 3   |",
+                    "+-----+",
+                ],
+                &results
+            );
+
+            // INSERT a new row (drain the stream to ensure the INSERT completes)
+            let insert_result = rt
+                .datafusion()
+                .query_builder(
+                    "INSERT INTO rw_lake.main.orders (id, customer_id, total) VALUES (4, 30, 75.25)",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("INSERT failed: {e}"))?;
+            let _: Vec<RecordBatch> = insert_result.data.try_collect().await?;
+
+            // Verify the row was inserted
+            let result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT id, customer_id, total FROM rw_lake.main.orders ORDER BY id",
+                )
+                .build()
+                .run()
+                .await?;
+            let results: Vec<RecordBatch> = result.data.try_collect().await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------------+-------+",
+                    "| id | customer_id | total |",
+                    "+----+-------------+-------+",
+                    "| 1  | 10          | 99.99 |",
+                    "| 2  | 20          | 149.5 |",
+                    "| 3  | 10          | 25.0  |",
+                    "| 4  | 30          | 75.25 |",
+                    "+----+-------------+-------+",
+                ],
+                &results
+            );
+
+            Ok(())
+        })
+        .await
+}
