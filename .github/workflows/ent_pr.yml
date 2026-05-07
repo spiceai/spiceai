@@ -77,10 +77,13 @@ jobs:
         variant:
           - name: Rust Lint
             command: lint-rust
+            spiceio_bind: 127.0.0.1:8333
           - name: Rust Lint (Models)
             command: lint-rust-models
+            spiceio_bind: 127.0.0.1:8334
           - name: Rust Lint (NAS)
             command: lint-rust-nas
+            spiceio_bind: 127.0.0.1:8335
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -104,6 +107,25 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
 
+      - name: Reap orphan spiceio
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          # Self-hosted runners can leak spiceio processes from prior jobs whose
+          # setup failed before producing a pid output (skipping the cleanup step).
+          # Any survivors hold the bind port and cause the next setup to time out.
+          pkill -f '^spiceio( |$)' 2>/dev/null || true
+          # Also clear anything still bound to the port we're about to use.
+          PORT="${BIND##*:}"
+          if command -v lsof >/dev/null 2>&1; then
+            PIDS="$(lsof -ti tcp:"$PORT" 2>/dev/null || true)"
+            if [[ -n "$PIDS" ]]; then
+              echo "Killing leftover listeners on tcp:$PORT: $PIDS"
+              kill -9 $PIDS 2>/dev/null || true
+            fi
+          fi
+        env:
+          BIND: ${{ matrix.variant.spiceio_bind }}
+
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true'
         id: setup-spiceio
@@ -114,6 +136,7 @@ jobs:
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          bind: ${{ matrix.variant.spiceio_bind }}
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'

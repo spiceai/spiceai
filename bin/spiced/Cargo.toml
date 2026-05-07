@@ -83,7 +83,9 @@ default = [
     "adbc",
     "duckdb",
     "postgres",
+    "postgres-accel",
     "sqlite",
+    "turso",
     "mysql",
     "flightsql",
     "delta_lake",
@@ -91,6 +93,7 @@ default = [
     "dremio",
     "clickhouse",
     "cosmosdb",
+    "elasticsearch",
     "sharepoint",
     "snowflake",
     "snapshots",
@@ -110,10 +113,10 @@ default = [
     "smb",
     "pingora",
     "scylladb",
-    "models",
     "odbc",
     "vortex",
     "http-functions",
+    "wasm-functions",
 ]
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -133,7 +136,7 @@ kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]
-models = ["runtime/models"]
+models = ["runtime/models", "mcp"]
 mongodb = ["connector-mongodb", "runtime/mongodb"]
 mssql = ["connector-mssql", "runtime/mssql"]
 mysql = ["connector-mysql", "runtime/mysql"]

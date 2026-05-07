@@ -373,4 +373,3 @@ to `runtime.task_history` when task history is enabled, even when
   reduce-leak surface but do not give DP guarantees.
 * Per-cell encryption. Out of scope; column masks are deterministic
   scalar SQL, not crypto.
-
