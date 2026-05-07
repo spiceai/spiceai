@@ -31,7 +31,7 @@ use governor::Quota;
 use object_store::ObjectStore;
 use opentelemetry::KeyValue;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerMetrics};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
 
@@ -57,7 +57,6 @@ pub struct HttpRateControlRegistry {
     metric_owners: StdRwLock<HashMap<String, String>>,
     persisted_governor_state: Option<HttpRateControlPersistedState>,
     persistence_task_started: AtomicBool,
-    persistence_task_notify: Arc<Notify>,
 }
 
 impl std::fmt::Debug for HttpRateControlRegistry {
@@ -82,7 +81,6 @@ impl Default for HttpRateControlRegistry {
             metric_owners: StdRwLock::new(HashMap::new()),
             persisted_governor_state: None,
             persistence_task_started: AtomicBool::new(false),
-            persistence_task_notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -620,7 +618,6 @@ impl HttpRateControlRegistry {
 
         let weak_registry = Arc::downgrade(self);
         let refresh_interval = persisted_state.refresh_interval;
-        let notify = Arc::clone(&self.persistence_task_notify);
         let persistence_task = tokio::spawn(async move {
             if let Some(registry) = weak_registry.upgrade() {
                 registry.refresh_and_persist_governor_states().await;
@@ -631,20 +628,11 @@ impl HttpRateControlRegistry {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                tokio::select! {
-                    () = notify.notified() => {
-                        let Some(registry) = weak_registry.upgrade() else {
-                            break;
-                        };
-                        registry.refresh_and_persist_governor_states().await;
-                    }
-                    _ = tick.tick() => {
-                        let Some(registry) = weak_registry.upgrade() else {
-                            break;
-                        };
-                        registry.refresh_and_persist_governor_states().await;
-                    }
-                }
+                tick.tick().await;
+                let Some(registry) = weak_registry.upgrade() else {
+                    break;
+                };
+                registry.refresh_and_persist_governor_states().await;
             }
         });
         drop(persistence_task);
@@ -673,19 +661,6 @@ impl HttpRateControlRegistry {
                     "Failed to persist rate-control state: {error}"
                 );
             }
-        }
-    }
-
-    async fn initialize_persisted_rate_controller(
-        &self,
-        origin: &str,
-        controller: &Arc<RateController>,
-    ) {
-        if let Err(error) = controller.refresh_and_persist_state_snapshot().await {
-            tracing::warn!(
-                origin,
-                "Failed to initialize persisted rate-control state: {error}"
-            );
         }
     }
 
@@ -807,10 +782,6 @@ impl HttpRateControlRegistry {
             config,
             self.persisted_governor_state.as_ref(),
         );
-        let controller_to_initialize = self
-            .persisted_governor_state
-            .as_ref()
-            .and_then(|_| shared.controller.as_ref().map(Arc::clone));
         rate_controllers.insert(
             key.clone(),
             SharedRateControllerEntry {
@@ -821,11 +792,6 @@ impl HttpRateControlRegistry {
         );
 
         drop(rate_controllers);
-        if let Some(controller) = controller_to_initialize {
-            self.initialize_persisted_rate_controller(&key, &controller)
-                .await;
-            self.persistence_task_notify.notify_one();
-        }
         Ok(SharedRateControllerReservation {
             registry: self,
             key,
@@ -906,10 +872,6 @@ impl HttpRateControlRegistry {
             config,
             self.persisted_governor_state.as_ref(),
         );
-        let controller_to_initialize = self
-            .persisted_governor_state
-            .as_ref()
-            .and_then(|_| shared.controller.as_ref().map(Arc::clone));
         rate_controllers.insert(
             key.clone(),
             SharedRateControllerEntry {
@@ -920,12 +882,6 @@ impl HttpRateControlRegistry {
         );
 
         drop(rate_controllers);
-        if let Some(controller) = controller_to_initialize {
-            self.initialize_persisted_rate_controller(&key, &controller)
-                .await;
-            self.persistence_task_notify.notify_one();
-        }
-
         Ok(shared)
     }
 }

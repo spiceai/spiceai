@@ -179,7 +179,7 @@ async fn file_state_location_shares_global_http_rate_control_state() {
 
     wait_for_persisted_file_state(&state_dir).await;
 
-    let second_app = app_with_file_rate_control(&state_location, "30s");
+    let second_app = app_with_file_rate_control(&state_location, "20ms");
     let second_runtime = Arc::new(
         Runtime::builder()
             .with_app(second_app.clone())
@@ -197,8 +197,6 @@ async fn file_state_location_shares_global_http_rate_control_state() {
         .expect("second rate controller should be enabled");
 
     wait_for_persisted_instance_count(&state_dir, 2).await;
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     tokio::select! {
         acquired = second_controller.acquire() => {

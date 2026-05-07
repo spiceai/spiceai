@@ -210,14 +210,7 @@ impl StateStore for SharedGovernorState {
 #[derive(Clone, Debug)]
 struct PersistedLimiterBinding {
     key: String,
-    quota: Quota,
-    is_weighted: bool,
     state: SharedGovernorState,
-}
-
-enum PersistedAcquireAttempt {
-    Ready(PersistedRateControlState),
-    Wait(Duration),
 }
 
 enum PersistedWriteResult {
@@ -323,42 +316,6 @@ impl RateControllerPersistence {
         Ok(PersistResult::Conflict)
     }
 
-    async fn acquire(&self, weight: Option<u32>) -> Result<()> {
-        let mut remote = self.remote_state().await?;
-
-        loop {
-            for _ in 0..MAX_PERSISTENCE_WRITE_ATTEMPTS {
-                if let Some(remote) = &remote {
-                    self.apply_remote(remote)?;
-                }
-
-                match self.acquire_attempt(remote.as_ref(), weight)? {
-                    PersistedAcquireAttempt::Ready(snapshot) => {
-                        match self.write_snapshot(remote.is_some(), &snapshot).await? {
-                            PersistedWriteResult::Written => {
-                                self.apply_remote(&snapshot)?;
-                                return Ok(());
-                            }
-                            PersistedWriteResult::Conflict(current) => {
-                                if let Some(current) = &current {
-                                    self.apply_remote(current)?;
-                                }
-                                remote = current;
-                            }
-                        }
-                    }
-                    PersistedAcquireAttempt::Wait(wait_duration) => {
-                        tokio::time::sleep(wait_duration).await;
-                        remote = self.remote_state().await?;
-                        break;
-                    }
-                }
-            }
-
-            tokio::task::yield_now().await;
-        }
-    }
-
     async fn write_snapshot(
         &self,
         remote_exists: bool,
@@ -394,60 +351,6 @@ impl RateControllerPersistence {
                 .remote_state()
                 .await
                 .map(PersistedWriteResult::Conflict),
-        }
-    }
-
-    fn acquire_attempt(
-        &self,
-        remote: Option<&PersistedRateControlState>,
-        weight: Option<u32>,
-    ) -> Result<PersistedAcquireAttempt> {
-        if let Some(remote) = remote {
-            self.validate_remote(remote)?;
-        }
-
-        let now_ms = unix_millis_now();
-        let now_nanos = unix_nanos_now();
-        let mut snapshot = self.snapshot(remote)?;
-        let mut wait_duration = Duration::ZERO;
-
-        for binding in &self.limiters {
-            let permit_count = if binding.is_weighted {
-                let Some(weight) = weight else {
-                    continue;
-                };
-                weight
-            } else {
-                1
-            };
-
-            let Some(nonzero_permit_count) = NonZeroU32::new(permit_count) else {
-                continue;
-            };
-
-            if let Some(next_wait_duration) = reserve_persisted_limiter(
-                &mut snapshot.limiters,
-                &binding.key,
-                binding.quota,
-                nonzero_permit_count,
-                now_nanos,
-            )? {
-                wait_duration = wait_duration.max(next_wait_duration);
-            }
-        }
-
-        if wait_duration.is_zero() {
-            snapshot.updated_at_unix_ms = now_ms;
-            snapshot.instances.insert(
-                self.instance_id.clone(),
-                PersistedInstanceState {
-                    updated_at_unix_ms: now_ms,
-                    limiters: snapshot.limiters.clone(),
-                },
-            );
-            Ok(PersistedAcquireAttempt::Ready(snapshot))
-        } else {
-            Ok(PersistedAcquireAttempt::Wait(wait_duration))
         }
     }
 
@@ -762,8 +665,6 @@ impl RateControllerBuilder {
                 let fallback_name = format!("quota-{index}");
                 persisted_limiters.push(PersistedLimiterBinding {
                     key: quota_definition.persistence_key(&fallback_name),
-                    quota: quota_definition.quota,
-                    is_weighted: false,
                     state: state.clone(),
                 });
                 Arc::new(RateLimiter::new(
@@ -778,8 +679,6 @@ impl RateControllerBuilder {
             let state = SharedGovernorState::new();
             persisted_limiters.push(PersistedLimiterBinding {
                 key: quota_definition.persistence_key("weighted"),
-                quota: quota_definition.quota,
-                is_weighted: true,
                 state: state.clone(),
             });
             Arc::new(RateLimiter::new(
@@ -1047,11 +946,7 @@ impl RateController {
     }
 
     async fn wait_for_rate_limiters(self: &Arc<Self>, weight: Option<u32>) -> Result<()> {
-        if let Some(persistence) = &self.persistence {
-            persistence.acquire(weight).await
-        } else {
-            Arc::clone(self).until_weighted_ready(weight).await
-        }
+        Arc::clone(self).until_weighted_ready(weight).await
     }
 
     /// Acquires a permit from the rate controller with a specified weight.
@@ -1129,53 +1024,6 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 
 fn duration_nanos_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-fn reserve_persisted_limiter(
-    limiters: &mut HashMap<String, PersistedLimiterState>,
-    limiter_key: &str,
-    quota: Quota,
-    permit_count: NonZeroU32,
-    now_nanos: u64,
-) -> Result<Option<Duration>> {
-    let replenish_nanos = duration_nanos_u64(quota.replenish_interval()).max(1);
-    let additional_weight_nanos =
-        replenish_nanos.saturating_mul(u64::from(permit_count.get().saturating_sub(1)));
-    let burst_tolerance_nanos =
-        replenish_nanos.saturating_mul(u64::from(quota.burst_size().get().saturating_sub(1)));
-
-    if additional_weight_nanos > burst_tolerance_nanos {
-        return Err(Error::InsufficientCapacity {
-            weight: permit_count.get(),
-        });
-    }
-
-    let current_theoretical_arrival_nanos =
-        limiters.get(limiter_key).map_or(now_nanos, |limiter| {
-            limiter.theoretical_arrival_time_unix_nanos
-        });
-    let earliest_ready_nanos = current_theoretical_arrival_nanos
-        .saturating_add(additional_weight_nanos)
-        .saturating_sub(burst_tolerance_nanos);
-
-    if now_nanos < earliest_ready_nanos {
-        return Ok(Some(Duration::from_nanos(
-            earliest_ready_nanos.saturating_sub(now_nanos),
-        )));
-    }
-
-    let next_theoretical_arrival_nanos = current_theoretical_arrival_nanos
-        .max(now_nanos)
-        .saturating_add(replenish_nanos)
-        .saturating_add(additional_weight_nanos);
-    limiters.insert(
-        limiter_key.to_string(),
-        PersistedLimiterState {
-            theoretical_arrival_time_unix_nanos: next_theoretical_arrival_nanos,
-        },
-    );
-
-    Ok(None)
 }
 
 fn normalize_object_state_prefix(prefix: &str) -> String {
@@ -1301,7 +1149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquiring_permit_writes_persisted_state_on_query_path() {
+    async fn acquiring_permit_does_not_write_persisted_state_on_query_path() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let object_key = "test_spicepod/api.example.com_443";
         let object_state: ObjectState<PersistedRateControlState> =
@@ -1321,11 +1169,46 @@ mod tests {
             .expect("controller should acquire immediately");
         drop(permit);
 
+        assert!(
+            object_state
+                .get(object_key)
+                .await
+                .expect("read persisted state")
+                .is_none(),
+            "acquiring a permit must not write persisted state on the query path"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_persistence_writes_persisted_state() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let object_key = "test_spicepod/api.example.com_443";
+        let object_state: ObjectState<PersistedRateControlState> =
+            ObjectState::new(Arc::clone(&store));
+        let quota = Quota::with_period(Duration::from_millis(500))
+            .expect("quota period should be non-zero")
+            .allow_burst(NonZeroU32::new(1).expect("burst should be non-zero"));
+
+        let rate_controller = RateControllerBuilder::new()
+            .add_quota_with_name("requests", quota)
+            .with_object_store_persistence(store, "", object_key, "https://api.example.com:443")
+            .build();
+
+        let permit = rate_controller
+            .acquire()
+            .await
+            .expect("controller should acquire immediately");
+        drop(permit);
+        rate_controller
+            .refresh_and_persist_state_snapshot()
+            .await
+            .expect("background persistence caller should write persisted state");
+
         let persisted = object_state
             .get(object_key)
             .await
             .expect("read persisted state")
-            .expect("acquiring a permit should write persisted state");
+            .expect("background persistence should write persisted state");
         assert!(!persisted.limiters.is_empty());
         assert!(persisted.instances.contains_key("default"));
     }
@@ -1441,10 +1324,6 @@ mod tests {
             },
             vec![PersistedLimiterBinding {
                 key: "current-limiter".to_string(),
-                quota: Quota::per_second(
-                    NonZeroU32::new(1).expect("test quota should be non-zero"),
-                ),
-                is_weighted: false,
                 state: limiter_state,
             }],
         );
@@ -1494,10 +1373,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_acquire_uses_shared_global_limiter_state() {
+    async fn persisted_background_refresh_uses_shared_global_limiter_state() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let object_key = "test_spicepod/api.example.com_443";
-        let quota = Quota::with_period(Duration::from_millis(200))
+        let quota = Quota::with_period(Duration::from_secs(1))
             .expect("quota period should be non-zero")
             .allow_burst(NonZeroU32::new(1).expect("burst should be non-zero"));
 
@@ -1527,14 +1406,22 @@ mod tests {
         let first_permit = first_controller
             .acquire()
             .await
-            .expect("first acquire should update persisted state");
+            .expect("first acquire should update local governor state");
         drop(first_permit);
+        first_controller
+            .refresh_and_persist_state_snapshot()
+            .await
+            .expect("background persistence should write first instance state");
+        second_controller
+            .refresh_persisted_state()
+            .await
+            .expect("second instance should refresh persisted state");
 
         tokio::select! {
             second = second_controller.acquire() => {
                 panic!("second instance should wait on the shared persisted limiter, got: {second:?}");
             }
-            () = tokio::time::sleep(Duration::from_millis(150)) => {}
+            () = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
 
         tokio::select! {
@@ -1542,10 +1429,14 @@ mod tests {
                 let permit = second.expect("second instance should acquire after the shared quota replenishes");
                 drop(permit);
             }
-            () = tokio::time::sleep(Duration::from_millis(200)) => {
+            () = tokio::time::sleep(Duration::from_millis(1_200)) => {
                 panic!("second instance waited longer than one quota interval");
             }
         }
+        second_controller
+            .refresh_and_persist_state_snapshot()
+            .await
+            .expect("background persistence should write second instance state");
 
         let persisted = ObjectState::<PersistedRateControlState>::new(store)
             .get(object_key)
@@ -1582,40 +1473,45 @@ mod tests {
             )]),
         };
 
-        let persistence = RateControllerPersistence::new(
-            RateControllerPersistenceConfig {
-                store,
-                prefix: String::new(),
-                object_key: object_key.to_string(),
-                origin: "https://api.example.com:443".to_string(),
-                instance_id: "active-instance".to_string(),
-                instance_ttl: Duration::from_millis(10),
-            },
-            vec![PersistedLimiterBinding {
-                key: quota_definition.persistence_key("requests"),
-                quota,
-                is_weighted: false,
-                state: SharedGovernorState::new(),
-            }],
-        );
+        let object_state = ObjectState::<PersistedRateControlState>::new(Arc::clone(&store));
         assert_eq!(
-            persistence
-                .object_state
+            object_state
                 .insert_or_update(object_key, &seeded_state)
                 .await
                 .expect("seed stale persisted state"),
             WriteResult::Inserted
         );
+        let controller = RateControllerBuilder::new()
+            .add_quota_with_name("requests", quota)
+            .with_object_store_persistence_for_instance(
+                store,
+                "",
+                object_key,
+                "https://api.example.com:443",
+                "active-instance",
+                Duration::from_millis(10),
+            )
+            .build();
+        controller
+            .refresh_persisted_state()
+            .await
+            .expect("background refresh should ignore stale persisted state");
 
         tokio::select! {
-            acquired = persistence.acquire(None) => acquired.expect("active instance should acquire after stale state expires"),
+            acquired = controller.acquire() => {
+                let permit = acquired.expect("active instance should acquire after stale state expires");
+                drop(permit);
+            }
             () = tokio::time::sleep(Duration::from_millis(50)) => {
                 panic!("expired instance state should not hold the shared budget");
             }
         }
+        controller
+            .refresh_and_persist_state_snapshot()
+            .await
+            .expect("background persistence should prune stale instance state");
 
-        let persisted = persistence
-            .object_state
+        let persisted = object_state
             .get(object_key)
             .await
             .expect("read persisted state")
