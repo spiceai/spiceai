@@ -46,6 +46,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::{Notify, RwLock};
 
+struct ApplyContext<'a> {
+    refresh: &'a Arc<RwLock<Refresh>>,
+    dataset_name: &'a TableReference,
+    caching: Option<&'a Weak<Caching>>,
+    ready_sender: Option<&'a Arc<Notify>>,
+    initial_load_completed: &'a Arc<AtomicBool>,
+    pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
+}
+
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
 ///
 /// # Example
@@ -317,16 +326,15 @@ impl RefreshTask {
                 }
             }
 
-            self.apply_burst(
-                &refresh,
-                &dataset_name,
-                caching.as_ref(),
-                ready_sender.as_ref(),
-                &initial_load_completed,
-                &mut pending_commit,
-                burst,
-            )
-            .await;
+            let mut apply_context = ApplyContext {
+                refresh: &refresh,
+                dataset_name: &dataset_name,
+                caching: caching.as_ref(),
+                ready_sender: ready_sender.as_ref(),
+                initial_load_completed: &initial_load_completed,
+                pending_commit: &mut pending_commit,
+            };
+            self.apply_burst(&mut apply_context, burst).await;
         }
 
         // Drain the final in-flight commit before reporting end-of-stream so
@@ -381,15 +389,9 @@ impl RefreshTask {
     /// and amortizing the per-envelope `SessionContext` + `insert_into`
     /// planning cost. After a successful write we hand the run's committers
     /// to a background commit task so that commit(N) overlaps with apply(N+1).
-    #[allow(clippy::too_many_arguments)]
     async fn apply_burst(
         &self,
-        refresh: &Arc<RwLock<Refresh>>,
-        dataset_name: &TableReference,
-        caching: Option<&Weak<Caching>>,
-        ready_sender: Option<&Arc<Notify>>,
-        initial_load_completed: &Arc<AtomicBool>,
-        pending_commit: &mut Option<tokio::task::JoinHandle<()>>,
+        context: &mut ApplyContext<'_>,
         burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
     ) {
         // Walk the burst preserving arrival order, processing contiguous
@@ -408,29 +410,20 @@ impl RefreshTask {
                         envelopes.push(next);
                     }
 
-                    self.apply_envelope_run(
-                        refresh,
-                        dataset_name,
-                        caching,
-                        ready_sender,
-                        initial_load_completed,
-                        pending_commit,
-                        envelopes,
-                    )
-                    .await;
+                    self.apply_envelope_run(context, envelopes).await;
                 }
                 Err(e) => {
                     // Transient errors (e.g., Kafka poll timeout) keep the
                     // refresh status healthy; fatal errors flip status to
                     // Error but we do not abort the loop, matching the
                     // pre-coalesce contract.
-                    if handle_stream_error(&e, dataset_name) == StreamErrorType::Transient {
+                    if handle_stream_error(&e, context.dataset_name) == StreamErrorType::Transient {
                         continue;
                     }
 
                     let error_message = format_datafusion_error(&e);
                     self.set_refresh_status(
-                        refresh.read().await.display_sql().as_deref(),
+                        context.refresh.read().await.display_sql().as_deref(),
                         status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
@@ -442,15 +435,9 @@ impl RefreshTask {
     /// Apply a contiguous run of successful envelopes as a single coalesced
     /// write, then schedule their commits in a background task that overlaps
     /// with the next burst's apply.
-    #[allow(clippy::too_many_arguments)]
     async fn apply_envelope_run(
         &self,
-        refresh: &Arc<RwLock<Refresh>>,
-        dataset_name: &TableReference,
-        caching: Option<&Weak<Caching>>,
-        ready_sender: Option<&Arc<Notify>>,
-        initial_load_completed: &Arc<AtomicBool>,
-        pending_commit: &mut Option<tokio::task::JoinHandle<()>>,
+        context: &mut ApplyContext<'_>,
         envelopes: Vec<cdc::ChangeEnvelope>,
     ) {
         debug_assert!(
@@ -483,12 +470,13 @@ impl RefreshTask {
                 Ok(b) => b,
                 Err(e) => {
                     let error_message = format!(
-                        "Failed to coalesce {} CDC envelopes for {dataset_name}: {e}",
-                        batches.len()
+                        "Failed to coalesce {} CDC envelopes for {}: {e}",
+                        batches.len(),
+                        context.dataset_name,
                     );
                     tracing::error!("{error_message}");
                     self.set_refresh_status(
-                        refresh.read().await.display_sql().as_deref(),
+                        context.refresh.read().await.display_sql().as_deref(),
                         status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
@@ -503,8 +491,10 @@ impl RefreshTask {
         match self.write_change(coalesced_batch).await {
             Ok(write_result) => {
                 if any_ready {
-                    initial_load_completed.store(true, Ordering::Relaxed);
-                    if let Some(sender) = ready_sender {
+                    context
+                        .initial_load_completed
+                        .store(true, Ordering::Relaxed);
+                    if let Some(sender) = context.ready_sender {
                         sender.notify_waiters();
                     }
                     self.update_component_status(status::ComponentStatus::Ready)
@@ -512,13 +502,15 @@ impl RefreshTask {
                 }
 
                 if write_result == WriteChangeResult::DataWritten
-                    && let Some(cache_provider_ref) = caching
+                    && let Some(cache_provider_ref) = context.caching
                     && let Some(cache_provider) = cache_provider_ref.upgrade()
-                    && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
+                    && let Err(e) =
+                        cache_provider.invalidate_for_table(context.dataset_name.clone())
                     && !self.runtime_status.is_shutdown()
                 {
                     tracing::error!(
-                        "Failed to invalidate cached results for dataset {dataset_name}: {e}"
+                        "Failed to invalidate cached results for dataset {}: {e}",
+                        context.dataset_name
                     );
                 }
 
@@ -527,14 +519,18 @@ impl RefreshTask {
                 // commit ordering across bursts (LSN/offsets must advance
                 // monotonically) while letting commit(N) overlap with the
                 // next apply(N+1).
-                if let Some(prev) = pending_commit.take() {
-                    join_pending_commit(prev, dataset_name, self.runtime_status.is_shutdown())
-                        .await;
+                if let Some(prev) = context.pending_commit.take() {
+                    join_pending_commit(
+                        prev,
+                        context.dataset_name,
+                        self.runtime_status.is_shutdown(),
+                    )
+                    .await;
                 }
 
                 let runtime_status = Arc::clone(&self.runtime_status);
-                let commit_dataset = dataset_name.clone();
-                *pending_commit = Some(tokio::spawn(async move {
+                let commit_dataset = context.dataset_name.clone();
+                *context.pending_commit = Some(tokio::spawn(async move {
                     for committer in committers {
                         if let Err(e) = committer.commit().await
                             && !runtime_status.is_shutdown()
@@ -549,12 +545,12 @@ impl RefreshTask {
             Err(e) => {
                 let error_message = format_datafusion_error(&e);
                 self.set_refresh_status(
-                    refresh.read().await.display_sql().as_deref(),
+                    context.refresh.read().await.display_sql().as_deref(),
                     status::ComponentStatus::error_with_message(error_message),
                 )
                 .await;
                 if !self.runtime_status.is_shutdown() {
-                    tracing::error!("Error writing change for {dataset_name}: {e}");
+                    tracing::error!("Error writing change for {}: {e}", context.dataset_name);
                 }
                 // Drop committers without acking — see comment above.
             }
@@ -784,14 +780,13 @@ async fn join_pending_commit(
     is_shutdown: bool,
 ) {
     match handle.await {
-        Ok(()) => {}
         Err(e) if e.is_cancelled() => {
             tracing::debug!("CDC commit task for {dataset_name} was cancelled (likely shutdown)");
         }
         Err(e) if !is_shutdown => {
             tracing::error!("CDC commit task for {dataset_name} ended unexpectedly: {e}");
         }
-        Err(_) => {}
+        Ok(()) | Err(_) => {}
     }
 }
 
