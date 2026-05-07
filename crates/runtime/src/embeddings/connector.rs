@@ -305,6 +305,36 @@ impl DataConnector for EmbeddingConnector {
                 )
                 .await?;
             builder.set_accelerator(indexed_accelerator);
+            return Ok(());
+        }
+
+        #[cfg(feature = "elasticsearch")]
+        if let Some(vector_engine) = &dataset.vectors
+            && vector_engine.enabled
+            && vector_engine.engine.as_deref() == Some("elasticsearch")
+        {
+            tracing::debug!(
+                dataset = %dataset.name,
+                "Wrapping accelerator with Elasticsearch vector indexes"
+            );
+            let accelerator = builder.get_accelerator();
+            let mut indexed_accelerator = accelerator;
+            for (effective_vector_store, columns) in
+                vector_index_groups(vector_engine, dataset)
+            {
+                indexed_accelerator = crate::embeddings::index::table::wrap_table_as_index(
+                    &dataset.runtime().datafusion().ctx,
+                    &self.embedding_models,
+                    &self.secrets,
+                    &dataset.name,
+                    &columns,
+                    dataset.params.get("file_format").map(String::as_str),
+                    indexed_accelerator,
+                    &effective_vector_store,
+                )
+                .await?;
+            }
+            builder.set_accelerator(indexed_accelerator);
         }
 
         Ok(())

@@ -29,7 +29,7 @@ use runtime_datafusion_index::IndexedTableProvider;
 use secrecy::ExposeSecret;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
@@ -228,6 +228,32 @@ impl DataConnector for ElasticsearchFullTextConnector {
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         self.inner_connector.metrics_provider()
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    async fn on_accelerator_setup(
+        &self,
+        dataset: &Dataset,
+        builder: &mut accelerated_table::Builder,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner_connector
+            .on_accelerator_setup(dataset, builder)
+            .await?;
+
+        use crate::search::full_text::table::add_elasticsearch_fts_to_table;
+        use std::sync::Arc;
+
+        let accelerator = builder.get_accelerator();
+        let indexed_accelerator = add_elasticsearch_fts_to_table(
+            accelerator,
+            &dataset.columns,
+            &dataset.name,
+            &self.fts_params,
+        )
+        .await?;
+        builder.set_accelerator(Arc::new(indexed_accelerator));
+
+        Ok(())
     }
 
     async fn on_accelerated_table_registration(
