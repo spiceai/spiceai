@@ -1047,7 +1047,21 @@ impl Runtime {
         }
 
         if ds.has_full_text_column() {
-            data_connector = Arc::new(FullTextConnector::new(data_connector));
+            #[cfg(feature = "elasticsearch")]
+            if ds.fts_engine() == Some("elasticsearch") {
+                use crate::search::full_text::elasticsearch::ElasticsearchFullTextConnector;
+                data_connector = Arc::new(
+                    ElasticsearchFullTextConnector::try_new(data_connector, &ds, self.secrets())
+                        .await
+                        .context(UnableToInitializeDataConnectorSnafu)?,
+                );
+            } else {
+                data_connector = Arc::new(FullTextConnector::new(data_connector));
+            }
+            #[cfg(not(feature = "elasticsearch"))]
+            {
+                data_connector = Arc::new(FullTextConnector::new(data_connector));
+            }
         }
 
         if data_connector.initialization().is_on_trigger() {
@@ -1580,5 +1594,39 @@ mod tests {
             Some(&status::ComponentStatus::Ready)
         );
         assert!(runtime.df.has_pending_initializations());
+    }
+
+    #[tokio::test]
+    async fn elasticsearch_full_text_requires_acceleration() {
+        let mut dataset = spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        dataset.columns = vec![
+            spicepod::semantic::Column::new("body").with_full_text_search(
+                spicepod::semantic::FullTextSearchConfig::enabled().with_row_id("id"),
+            ),
+        ];
+        dataset.full_text_search = Some(spicepod::fts::FtsStore {
+            enabled: true,
+            engine: Some("elasticsearch".to_string()),
+            params: None,
+        });
+
+        let app = app::AppBuilder::new("fts_validation")
+            .with_dataset(dataset.clone())
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let dataset = DatasetBuilder::try_from(dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(runtime)
+            .build()
+            .expect("valid runtime dataset");
+
+        let err = validate_dataset(&Arc::new(dataset))
+            .expect_err("elasticsearch fts should require acceleration");
+        assert!(
+            err.to_string()
+                .contains("acceleration is required for full text search"),
+            "unexpected error: {err}"
+        );
     }
 }

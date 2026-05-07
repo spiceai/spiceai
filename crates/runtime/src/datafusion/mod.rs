@@ -4181,6 +4181,7 @@ mod tests {
                 metrics: Metrics::default(),
                 runtime: Arc::new(runtime),
                 vectors: None,
+                full_text_search: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
             }
         }

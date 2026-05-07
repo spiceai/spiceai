@@ -24,6 +24,7 @@ use serde_json::Value;
 use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
 use crate::acceleration::Acceleration;
 use crate::component::access::AccessMode;
+use crate::fts::FtsStore;
 use crate::metric::Metrics;
 use crate::param::Params;
 use crate::semantic::Column;
@@ -181,6 +182,12 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors: Option<VectorStore>,
 
+    /// Dataset-level full-text search store configuration.
+    /// When present, overrides the per-column `index_store` setting and routes
+    /// FTS through the specified external engine (e.g. `elasticsearch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text_search: Option<FtsStore>,
+
     /// Configures whether the dataset availability monitor is enabled for this dataset.
     /// When enabled, the runtime will periodically check dataset availability
     /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
@@ -218,6 +225,7 @@ impl Dataset {
             ready_state: ReadyState::default(),
             metrics: None,
             vectors: None,
+            full_text_search: None,
             check_availability: CheckAvailability::default(),
         }
     }
@@ -306,6 +314,7 @@ impl WithDependsOn<Dataset> for Dataset {
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
+            full_text_search: self.full_text_search.clone(),
             check_availability: self.check_availability,
         }
     }
@@ -382,6 +391,8 @@ struct DatasetDeserializer {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vectors: Option<VectorStore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    full_text_search: Option<FtsStore>,
     #[serde(default, skip_serializing_if = "is_default")]
     check_availability: CheckAvailability,
 }
@@ -434,6 +445,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
+            full_text_search: deserializer.full_text_search,
             check_availability: deserializer.check_availability,
         })
     }
