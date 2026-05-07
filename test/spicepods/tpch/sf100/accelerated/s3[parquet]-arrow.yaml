@@ -1,6 +1,12 @@
 version: v1
 kind: Spicepod
 name: s3[parquet]-arrow
+
+# Limit query execution memory to prevent OOM on CI runner
+runtime:
+  query:
+    memory_limit: 12GiB
+
 datasets:
   - from: s3://benchmarks/tpch_sf100/customer.parquet
     name: customer
