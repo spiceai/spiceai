@@ -706,12 +706,7 @@ async fn openai_responses_api_non_streaming() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
-
-            model.params.insert(
-                "responses_api".to_string(),
-                Value::String("enabled".to_string()),
-            );
+            let model = get_openai_model("gpt-4o-mini", "openai_model");
 
             let app = AppBuilder::new("responses_api").with_model(model).build();
 
@@ -761,11 +756,7 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
-            model.params.insert(
-                "responses_api".to_string(),
-                Value::String("enabled".to_string()),
-            );
+            let model = get_openai_model("gpt-4o-mini", "openai_model");
 
             let app = AppBuilder::new("responses_api").with_model(model).build();
 
@@ -856,11 +847,6 @@ async fn openai_responses_api_with_tools_streaming() -> Result<(), anyhow::Error
                 .params
                 .insert("tools".to_string(), Value::String("auto".to_string()));
 
-            model.params.insert(
-                "responses_api".to_string(),
-                Value::String("enabled".to_string()),
-            );
-
             let app = AppBuilder::new("responses_api")
                 .with_model(model)
                 .with_dataset(get_taxi_trips_dataset())
@@ -950,11 +936,6 @@ async fn openai_responses_api_with_tools_non_streaming() -> Result<(), anyhow::E
 
             let mut model = get_openai_model("gpt-4o-mini", "openai_model");
 
-            model.params.insert(
-                "responses_api".to_string(),
-                Value::String("enabled".to_string()),
-            );
-
             model
                 .params
                 .insert("tools".to_string(), Value::String("auto".to_string()));
@@ -1013,10 +994,6 @@ fn get_responses_model_with_tools(
     model
         .params
         .insert("tools".into(), serde_json::Value::String("auto".into()));
-    model.params.insert(
-        "responses_api".into(),
-        serde_json::Value::String("enabled".into()),
-    );
     model
 }
 

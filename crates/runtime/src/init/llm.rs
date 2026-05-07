@@ -27,21 +27,7 @@ use llms::{
 };
 use secrecy::SecretString;
 use snafu::ResultExt;
-use spicepod::component::model::{Model as SpicepodModel, ModelSource};
-
-fn supports_responses_api(m: &SpicepodModel, params: &HashMap<String, SecretString>) -> bool {
-    // xAI always uses Responses API (chat/completions is legacy)
-    if m.get_source() == Some(ModelSource::Xai) {
-        return true;
-    }
-
-    params
-        .get("responses_api")
-        .map(secrecy::ExposeSecret::expose_secret)
-        .unwrap_or_default()
-        .trim()
-        .eq_ignore_ascii_case("enabled")
-}
+use spicepod::component::model::Model as SpicepodModel;
 
 impl Runtime {
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
@@ -63,12 +49,17 @@ impl Runtime {
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
 
-        let mut responses_model = if supports_responses_api(&m, &params) {
-            try_to_responses_model(&m, &params, Arc::new(self.clone()))
-                .await
-                .ok()
-        } else {
-            None
+        let mut responses_model = match try_to_responses_model(&m, &params, Arc::new(self.clone()))
+            .await
+        {
+            Ok(model) => Some(model),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to construct Responses API endpoint for model '{}': {e}. The model will not be available via /v1/responses.",
+                    m.name
+                );
+                None
+            }
         };
 
         if let Some(model) = &responses_model
