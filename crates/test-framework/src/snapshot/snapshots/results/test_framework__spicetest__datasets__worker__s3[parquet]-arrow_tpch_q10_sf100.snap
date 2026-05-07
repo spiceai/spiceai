@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q10"
+---
++-----------+--------------------+-------------+-----------+--------------+-------------------------------------+-----------------+--------------------------------------------------------------------------------------------------------------+
+| c_custkey | c_name             | revenue     | c_acctbal | n_name       | c_address                           | c_phone         | c_comment                                                                                                    |
++-----------+--------------------+-------------+-----------+--------------+-------------------------------------+-----------------+--------------------------------------------------------------------------------------------------------------+
+| 1660261   | Customer#001660261 | 741887.7559 | 2351.51   | KENYA        | MRVCm,D2hd0                         | 24-698-376-9439 | e blithely requests. furiously special deposits                                                              |
+| 399901    | Customer#000399901 | 633999.4273 | -336.07   | RUSSIA       | du7COdbarAqc3d,VVH1XddxWy,hfdXkHUCT | 32-144-241-1106 | r foxes doubt blithely slyly special deposits. brave requests h                                              |
+| 4393444   | Customer#004393444 | 604112.6294 | -299.38   | VIETNAM      | qIT5agoqKfLJkTGGiZbkl0ojkRIV4H2nsn  | 31-940-981-6206 | pendencies use furiously along the braids                                                                    |
+| 11361613  | Customer#011361613 | 561921.3815 | 4644.71   | INDONESIA    | jWKghIqWp5Vzt2s                     | 19-344-539-9187 | latelets cajole slyly along the unusual accounts. dependencies use furiously ironic requests. enticingly iro |
+| 9719947   | Customer#009719947 | 561114.1465 | 7523.50   | ALGERIA      | VEMQBr7M2PXFjL                      | 10-676-929-6761 | eposits haggle after the special asymptotes. unusual courts about the slyly special pinto beans are instead  |
+| 4969222   | Customer#004969222 | 560388.7949 | 3544.13   | SAUDI ARABIA | 4elwjSts fSK                        | 30-785-556-9654 | uctions sleep blithely into th                                                                               |
+| 11962732  | Customer#011962732 | 550376.5271 | 5173.72   | IRAQ         | ECwPoCK8y5QNcB7i                    | 21-219-731-2595 | foxes haggle furiously. fluffily even forges sleep furiously. blithely ironic asymptotes haggle fluffily.    |
+| 5039803   | Customer#005039803 | 544741.2940 | 7953.98   | KENYA        | rMMinEiBc4jiCr8A9PEba               | 24-425-357-2669 | kly regular accounts haggle blithely fluffily final pinto beans. unusual depos                               |
+| 14998741  | Customer#014998741 | 538060.0760 | 9392.94   | MOROCCO      | KGY3U7NAW,Q                         | 25-805-934-5895 |  requests cajole blithely. blithely pending dolphins sleep carefully dogged, regular requests. carefull      |
+| 6225475   | Customer#006225475 | 537190.3203 | 7751.83   | INDONESIA    | rmL0Vb0gpsF,                        | 19-935-426-6840 | ly regular braids. requests according to the blithely unu                                                    |
++-----------+--------------------+-------------+-----------+--------------+-------------------------------------+-----------------+--------------------------------------------------------------------------------------------------------------+
