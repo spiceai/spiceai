@@ -244,10 +244,13 @@ mod tests {
             schema,
             vec![
                 Arc::new(StringArray::from(
-                    plan_types.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    plan_types
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(
-                    plans.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    plans.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 )),
             ],
         )
@@ -257,8 +260,8 @@ mod tests {
     #[test]
     fn test_sanitize_no_filters() {
         let batch = make_batch(&["logical_plan"], &["Scan /tmp/abc/data"]);
-        let result =
-            sanitize_record_batches(&[batch.clone()], &[] as &[(&str, &str)]).expect("to sanitize");
+        let result = sanitize_record_batches(std::slice::from_ref(&batch), &[] as &[(&str, &str)])
+            .expect("to sanitize");
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].column(1).as_string::<i32>().value(0),
