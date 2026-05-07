@@ -520,7 +520,7 @@ impl RateController {
     /// # Errors
     ///
     /// Currently never returns an error.
-    pub async fn refresh_persisted_state(&self) -> Result<()> {
+    pub fn refresh_persisted_state(&self) -> Result<()> {
         Ok(())
     }
 

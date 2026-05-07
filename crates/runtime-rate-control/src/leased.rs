@@ -135,7 +135,7 @@ impl std::fmt::Debug for LeasedBucketConfig {
             .field("window_duration", &self.window_duration)
             .field("limiter_key", &self.limiter_key)
             .field("burst_per_window", &self.burst_per_window)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -262,7 +262,7 @@ impl LeasedBucket {
             let wait = {
                 let mut inner = self.inner.lock().await;
 
-                self.roll_window_locked(&mut inner, now_window);
+                Self::roll_window_locked(&mut inner, now_window);
 
                 if inner.consumed_this_window < inner.granted_this_window {
                     inner.consumed_this_window += 1;
@@ -292,7 +292,7 @@ impl LeasedBucket {
 
     /// Roll over per-window state if the window has changed. Caller must hold
     /// the inner lock.
-    fn roll_window_locked(&self, inner: &mut LeasedBucketInner, now_window: u64) {
+    fn roll_window_locked(inner: &mut LeasedBucketInner, now_window: u64) {
         if now_window != inner.current_window_id {
             inner.current_window_id = now_window;
             inner.consumed_this_window = 0;
@@ -399,7 +399,7 @@ impl LeasedBucket {
             if !must_write {
                 // Update local granted in case window rolled silently.
                 let mut inner = self.inner.lock().await;
-                self.roll_window_locked(&mut inner, now_window);
+                Self::roll_window_locked(&mut inner, now_window);
                 inner.granted_this_window = new_grant;
                 inner.lease_expires_at_ms = window_end_ms;
                 inner.last_lease_refresh_ms = now_ms;
@@ -411,9 +411,10 @@ impl LeasedBucket {
                 self.metrics
                     .cluster_budget_remaining
                     .store(window.budget_remaining, Ordering::Relaxed);
-                self.metrics
-                    .last_lease_acquire_micros
-                    .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                self.metrics.last_lease_acquire_micros.store(
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
                 return Ok(());
             }
 
@@ -433,7 +434,7 @@ impl LeasedBucket {
             match self.write_state(state).await {
                 Ok(WriteOutcome::Written) => {
                     let mut inner = self.inner.lock().await;
-                    self.roll_window_locked(&mut inner, now_window);
+                    Self::roll_window_locked(&mut inner, now_window);
                     inner.granted_this_window = new_grant;
                     inner.lease_expires_at_ms = window_end_ms;
                     inner.last_lease_refresh_ms = now_ms;
@@ -446,9 +447,10 @@ impl LeasedBucket {
                     self.metrics
                         .cluster_budget_remaining
                         .store(remaining_after, Ordering::Relaxed);
-                    self.metrics
-                        .last_lease_acquire_micros
-                        .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    self.metrics.last_lease_acquire_micros.store(
+                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
 
                     self.notify.notify_waiters();
                     return Ok(());
