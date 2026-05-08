@@ -631,7 +631,7 @@ impl QueryHandle {
         // If TLS is configured, create a custom endpoint override function
         let customize_endpoint =
             if let Some(tls_config) = self.df.cluster_config.client_tls_config() {
-                let tls = tls_config.clone();
+                let tls = tls_config;
                 let override_fn: ballista_core::extension::EndpointOverrideFn =
                     Arc::new(move |endpoint: tonic::transport::Endpoint| {
                         endpoint
