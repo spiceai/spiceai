@@ -41,6 +41,7 @@ use datafusion::{
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engine};
 use futures::Stream;
+use runtime_rate_control::RateController;
 use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{
     DataFrame, SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col,
@@ -55,6 +56,7 @@ pub mod federation;
 pub struct SparkConnect {
     session: Arc<RwLock<SparkSession>>,
     join_push_down_context: String,
+    rate_controller: Option<Arc<RateController>>,
 }
 
 impl SparkConnect {
@@ -66,7 +68,17 @@ impl SparkConnect {
     }
 
     pub async fn from_connection(connection: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Self::from_connection_with_rate_controller(connection, None).await
+    }
+
+    pub async fn from_connection_with_rate_controller(
+        connection: &str,
+        rate_controller: Option<Arc<RateController>>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let rate_controller_permit =
+            acquire_rate_controller_permit(rate_controller.as_ref()).await?;
         let session = SparkSessionBuilder::remote(connection)?.build().await?;
+        drop(rate_controller_permit);
 
         let session = Arc::new(RwLock::new(session));
 
@@ -90,6 +102,7 @@ impl SparkConnect {
         Ok(Self {
             session,
             join_push_down_context,
+            rate_controller,
         })
     }
 
@@ -109,6 +122,7 @@ impl Read for SparkConnect {
             Arc::clone(&self.session),
             table_reference,
             self.join_push_down_context.clone(),
+            self.rate_controller.clone(),
         )
         .await?;
         let provider = Arc::new(provider.create_federated_table_provider());
@@ -120,6 +134,7 @@ async fn get_table_provider(
     spark_session: Arc<RwLock<SparkSession>>,
     table_reference: TableReference,
     join_push_down_context: String,
+    rate_controller: Option<Arc<RateController>>,
 ) -> Result<Arc<SparkConnectTableProvider>, Box<dyn Error + Send + Sync>> {
     let spark_table_reference = match table_reference {
         TableReference::Bare { ref table } => format!("`{table}`"),
@@ -140,13 +155,16 @@ async fn get_table_provider(
     let session = Arc::new(session_guard.clone());
     let dataframe = session.table(spark_table_reference.as_str())?;
 
+    let rate_controller_permit = acquire_rate_controller_permit(rate_controller.as_ref()).await?;
     let arrow_schema = dataframe.clone().limit(0).collect().await?.schema();
+    drop(rate_controller_permit);
 
     Ok(Arc::new(SparkConnectTableProvider {
         dataframe,
         table_reference: spark_table_reference.into(),
         join_push_down_context,
         schema: arrow_schema,
+        rate_controller,
     }))
 }
 
@@ -156,6 +174,7 @@ struct SparkConnectTableProvider {
     dataframe: DataFrame,
     join_push_down_context: String,
     schema: SchemaRef,
+    rate_controller: Option<Arc<RateController>>,
 }
 
 #[async_trait]
@@ -200,6 +219,7 @@ impl TableProvider for SparkConnectTableProvider {
             projection,
             filters,
             limit,
+            self.rate_controller.clone(),
         )?))
     }
 }
@@ -211,6 +231,7 @@ struct SparkConnectExecutionPlan {
     filters: Vec<String>,
     limit: Option<i32>,
     properties: PlanProperties,
+    rate_controller: Option<Arc<RateController>>,
 }
 
 impl SparkConnectExecutionPlan {
@@ -221,6 +242,7 @@ impl SparkConnectExecutionPlan {
         projections: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
+        rate_controller: Option<Arc<RateController>>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(&schema, projections)?;
         let limit = limit
@@ -254,6 +276,7 @@ impl SparkConnectExecutionPlan {
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
+            rate_controller,
         })
     }
 }
@@ -318,7 +341,10 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
             Some(limit) => df.limit(limit),
             None => df,
         };
-        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), dataframe_to_stream(df));
+        let stream_adapter = RecordBatchStreamAdapter::new(
+            self.schema(),
+            dataframe_to_stream(df, self.rate_controller.clone()),
+        );
         Ok(Box::pin(stream_adapter))
     }
 
@@ -338,16 +364,33 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
     }
 }
 
-fn dataframe_to_stream(dataframe: DataFrame) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+fn dataframe_to_stream(
+    dataframe: DataFrame,
+    rate_controller: Option<Arc<RateController>>,
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
+        let rate_controller_permit = acquire_rate_controller_permit(rate_controller.as_ref())
+            .await
+            .map_err(DataFusionError::External)?;
         let data = dataframe
             .collect()
             .await
             .map_err(map_error_to_datafusion_err)?;
+        drop(rate_controller_permit);
         yield (Ok(data))
     }
 }
 
 fn map_error_to_datafusion_err(e: SparkError) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::External(Box::new(e))
+}
+
+pub(super) async fn acquire_rate_controller_permit(
+    rate_controller: Option<&Arc<RateController>>,
+) -> Result<Option<runtime_rate_control::Permit>, Box<dyn Error + Send + Sync>> {
+    let Some(rate_controller) = rate_controller else {
+        return Ok(None);
+    };
+
+    Ok(Some(rate_controller.acquire().await?))
 }

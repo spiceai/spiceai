@@ -85,6 +85,7 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
+mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
 mod metadata;
@@ -101,6 +102,8 @@ mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
+#[cfg(feature = "rate-control")]
+mod rate_control;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
@@ -131,6 +134,7 @@ mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;
+mod tls_reload;
 #[cfg(feature = "postgres-accel")]
 mod tpcds_postgres;
 mod utils;

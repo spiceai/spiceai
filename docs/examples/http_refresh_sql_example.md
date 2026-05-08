@@ -8,6 +8,9 @@ This example demonstrates how to use `refresh_sql` with filters in the HTTP data
 
 ```yaml
 runtime:
+  source_rate_control:
+    state_location: s3://my-bucket/spice-rate-control
+    refresh_interval: 30s
   params:
     http_max_concurrent_requests: 8
     http_requests_per_second_limit: 10
@@ -197,6 +200,7 @@ The HTTP connector provides metadata columns:
 - Use `retry_jitter` parameter to add randomization to retry delays (0.0 to 1.0, default: 0.3)
 - Use `runtime.params.http_max_concurrent_requests` to set a default concurrent request limit for HTTP-based connectors; use dataset `max_concurrent_requests` to override it for a specific dataset/origin
 - Limits are shared by upstream origin (`scheme://host:port`), so five datasets targeting the same API with a limit of `5` share five permits rather than each getting five
+- `runtime.source_rate_control.state_location` is a Spice.ai Enterprise feature for persisting HTTP request-rate state and active instance heartbeats per origin in object storage, allowing multiple Spice instances or clusters to coordinate the same HTTP request budget. Persisted state is refreshed and written by the runtime background worker on `refresh_interval`, not on the request path. Stale instance heartbeat state expires after missed refreshes so offline instances stop contributing to the shared budget. OSS builds ignore this section and use in-memory state. `file://`, `s3://`, `abfs://`, and `abfss://` locations are supported; `refresh_interval` defaults to `30s`, and `runtime.source_rate_control.params` accepts the matching object-store parameters such as S3 `s3_region`/`s3_endpoint`/`s3_key`/`s3_secret` or ABFS `account`/`access_key`/`client_id`/`tenant_id`/`endpoint`
 - Use `runtime.params.http_requests_per_second_limit` and `runtime.params.http_requests_per_minute_limit` for default request-rate budgets; use dataset `requests_per_second_limit` and `requests_per_minute_limit` for per-dataset/origin overrides
 - Use `runtime.params.http_rate_control_jitter_min` and `runtime.params.http_rate_control_jitter_max` for default jitter controls; use dataset `rate_control_jitter_min` and `rate_control_jitter_max` to override them. Set both to `0ms` to disable rate-control jitter
 - HTTP rate-control parameters apply to dynamic JSON HTTP API datasets and HTTP-family connectors such as GraphQL. Structured HTTP file datasets that route through the listing connector (`csv`, `parquet`, `arrow`, `avro`, `jsonl`, `ndjson`, and similar formats) currently reject these parameters; omit the runtime defaults for those sources or use a dynamic JSON HTTP API dataset

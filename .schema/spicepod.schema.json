@@ -543,6 +543,16 @@
             }
           ]
         },
+        "source_rate_control": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceRateControl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "functions": {
           "$ref": "#/$defs/Functions"
         }
@@ -1253,6 +1263,44 @@
       "required": [
         "state_location"
       ]
+    },
+    "SourceRateControl": {
+      "type": "object",
+      "properties": {
+        "state_location": {
+          "description": "Root URI for globally persisted source rate-control state.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Optional object store params for source rate-control state.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "refresh_interval": {
+          "description": "How often each runtime refreshes and persists per-source rate-control state in object storage.",
+          "type": "string",
+          "default": "30s"
+        },
+        "github_concurrent_connections_limit": {
+          "description": "Maximum number of concurrent GitHub HTTP requests for this authentication context.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     },
     "Params": {
       "type": "object",

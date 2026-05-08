@@ -11,7 +11,13 @@ version.workspace = true
 [dependencies]
 futures.workspace = true
 governor = { workspace = true, features = ["std"] }
+object_store.workspace = true
+object_store_occ = { path = "../object_store_occ" }
 rand.workspace = true
+serde.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

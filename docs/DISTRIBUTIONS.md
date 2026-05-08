@@ -245,6 +245,7 @@ make install-odbc
 The following features are available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise). Open source builds can enable some of these features locally with the listed Cargo feature flags, but they are not included in the default open source distribution.
 
 - **Acceleration Snapshots** - Bootstrap accelerated datasets from durable snapshot storage for fast cold starts, recovery after ephemeral storage loss, and controlled rollback to a previous acceleration state. Local open source builds can enable this with `snapshots`.
+- **Globally Persisted HTTP Rate-Control State** - Persist request-rate state and expiring active instance heartbeats per origin from a background worker so multiple Spice instances or clusters coordinate a shared request budget. Local open source builds can enable this with `rate-control`.
 - **Function Servers** - Run HTTP-backed user-defined scalar and table functions from `functions:` declarations. The default open source distribution supports inline SQL functions only; local builds can enable HTTP-backed function servers with `http-functions`.
 - **WASM Functions** - Run sandboxed WebAssembly table functions from `functions:` declarations using Arrow IPC batches as the data ABI. Local open source builds can enable precompiled modules with `wasm-functions`; compiling Rust sources to WASM at startup additionally requires `wasm-functions-compile`.
 - **OIDC Token Verification** - Validate identity tokens from enterprise providers (Okta, Azure AD, Auth0, Google, etc.) for secure access to Spice runtime endpoints.
@@ -279,6 +280,9 @@ SPICED_NON_DEFAULT_FEATURES="wasm-functions-compile" make install
 
 # Build with acceleration snapshots
 SPICED_NON_DEFAULT_FEATURES="snapshots" make install
+
+# Build with globally persisted HTTP rate-control state
+SPICED_NON_DEFAULT_FEATURES="rate-control" make install
 
 # Build with non-default features added to defaults
 SPICED_NON_DEFAULT_FEATURES="odbc" make install
