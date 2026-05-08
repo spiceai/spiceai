@@ -27,6 +27,13 @@ use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
+use datafusion::sql::{
+    TableReference,
+    sqlparser::{
+        dialect::GenericDialect,
+        parser::{Parser, ParserError},
+    },
+};
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use itertools::Itertools;
@@ -185,18 +192,61 @@ impl From<ReadProviderError> for DataConnectorError {
     }
 }
 
-fn snowflake_table_path(dataset: &Dataset) -> String {
-    dataset
-        .path()
-        .split('.')
-        .map(|part| {
-            if part.starts_with('"') && part.ends_with('"') {
-                return part.into();
-            }
+fn snowflake_table_path(dataset: &Dataset) -> DataConnectorResult<String> {
+    quote_snowflake_table_path(dataset.path()).map_err(|source| {
+        DataConnectorError::InvalidConfiguration {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "The specified table name in dataset path is invalid '{}'. Ensure the table name uses valid Snowflake identifier syntax and try again.",
+                dataset.path()
+            ),
+            source: Box::new(source),
+        }
+    })
+}
 
-            format!("\"{part}\"")
-        })
-        .join(".")
+fn quote_snowflake_table_path(path: &str) -> std::result::Result<String, ParserError> {
+    let table_reference = parse_snowflake_table_reference(path)?;
+    let identifier_parts = table_reference.to_vec();
+
+    if identifier_parts.iter().any(|part| part.contains('\0')) {
+        return Err(ParserError::ParserError(
+            "Snowflake identifiers cannot contain NUL bytes".to_string(),
+        ));
+    }
+
+    Ok(identifier_parts
+        .iter()
+        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+        .join("."))
+}
+
+fn parse_snowflake_table_reference(path: &str) -> std::result::Result<TableReference, ParserError> {
+    let dialect = GenericDialect {};
+    let identifier_parts = Parser::new(&dialect)
+        .try_with_sql(path)?
+        .parse_multipart_identifier()?
+        .into_iter()
+        .map(|identifier| identifier.value)
+        .collect::<Vec<_>>();
+
+    match identifier_parts.as_slice() {
+        [table] => Ok(TableReference::bare(table.clone())),
+        [schema, table] => Ok(TableReference::partial(schema.clone(), table.clone())),
+        [catalog, schema, table] => Ok(TableReference::full(
+            catalog.clone(),
+            schema.clone(),
+            table.clone(),
+        )),
+        [] => Err(ParserError::ParserError(
+            "Snowflake table path is empty".to_string(),
+        )),
+        _ => Err(ParserError::ParserError(format!(
+            "Snowflake table path has {} parts; expected 1 to 3",
+            identifier_parts.len()
+        ))),
+    }
 }
 
 #[async_trait]
@@ -209,7 +259,7 @@ impl DataConnector for Snowflake {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let path = snowflake_table_path(dataset);
+        let path = snowflake_table_path(dataset)?;
 
         Ok(Read::table_provider(&self.table_factory, path.into())
             .await
@@ -223,7 +273,10 @@ impl DataConnector for Snowflake {
         &self,
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        let path = snowflake_table_path(dataset);
+        let path = match snowflake_table_path(dataset) {
+            Ok(path) => path,
+            Err(error) => return Some(Err(error)),
+        };
 
         Some(
             ReadWrite::table_provider(&self.table_factory, path.into())
@@ -287,5 +340,35 @@ mod tests {
             private_key.secret,
             "private_key holds PEM key material and must be marked secret"
         );
+    }
+
+    #[test]
+    fn snowflake_table_path_quotes_each_identifier() {
+        assert_eq!(
+            quote_snowflake_table_path("database.schema.table").expect("path should be quoted"),
+            "\"database\".\"schema\".\"table\""
+        );
+    }
+
+    #[test]
+    fn snowflake_table_path_preserves_quoted_dots() {
+        assert_eq!(
+            quote_snowflake_table_path(r#""my.schema".table"#).expect("path should be quoted"),
+            "\"my.schema\".\"table\""
+        );
+    }
+
+    #[test]
+    fn snowflake_table_path_escapes_embedded_double_quotes() {
+        assert_eq!(
+            quote_snowflake_table_path(r#"schema."a""b""#).expect("path should be quoted"),
+            "\"schema\".\"a\"\"b\""
+        );
+    }
+
+    #[test]
+    fn snowflake_table_path_rejects_invalid_identifier_paths() {
+        assert!(quote_snowflake_table_path(r#""unterminated.table"#).is_err());
+        assert!(quote_snowflake_table_path("a.b.c.d").is_err());
     }
 }
