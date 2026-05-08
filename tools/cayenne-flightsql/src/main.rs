@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
             Arc::new(cayenne::CayenneDdlHandler {}) as Arc<dyn datafusion_ddl::CatalogDdlHandler>;
 
         ctx.add_analyzer_rule(Arc::new(DdlAnalyzerRule::new(
-            &ctx.state().catalog_list(),
+            ctx.state().catalog_list(),
             &ddl_enabled_catalogs,
             ddl_store,
             ddl_handler,
