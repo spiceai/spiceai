@@ -373,35 +373,21 @@ fn get_partition_expressions(
     Ok(partition_by)
 }
 
-/// Wraps an **accelerator-side** [`TableProvider`] with Elasticsearch vector indexes.
-///
-/// Unlike [`wrap_table_as_index_elasticsearch`] (which is used on the federated/read side),
-/// this function keeps `inner_table_provider` as the `underlying` of the returned
-/// [`IndexedTableProvider`] — it does **not** replace `underlying` with a
-/// [`VectorScanTableProvider`].  This is required so that
-/// [`IndexedTableProvider::insert_into`] continues to delegate to the writable Arrow
-/// accelerator rather than the read-only Elasticsearch scan provider.
-///
-/// Returns the (possibly unchanged) accelerator provider and a list of ES indexes that
-/// should be registered as `sink_indexes` on [`crate::accelerated_table::Builder`] so that
+/// Builds one [`Arc<dyn Index>`] per embedding column configured on `columns`, without
+/// wrapping the table provider. Used by the accelerator path where the indexes are
+/// registered as sink indexes on [`crate::accelerated_table::Builder`] so that
 /// [`crate::accelerated_table::sink::table::TableSink`] fires write lifecycle hooks for
 /// them without exposing them to the query optimizer.
 #[cfg(feature = "elasticsearch")]
-pub(crate) async fn wrap_accelerator_with_elasticsearch_vector_indexes(
+pub(crate) async fn build_elasticsearch_sink_indexes(
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     secrets: &Arc<RwLock<Secrets>>,
     tbl: &TableReference,
     columns: &[Column],
     file_format: Option<&str>,
-    inner_table_provider: Arc<dyn TableProvider + 'static>,
+    inner_table_provider: &Arc<dyn TableProvider + 'static>,
     vector_store: &VectorStore,
-) -> Result<
-    (Arc<dyn TableProvider>, Vec<Arc<dyn Index + Send + Sync>>),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    tracing::info!("Elasticsearch vector engine for table {tbl} initializing...");
-    let start = std::time::Instant::now();
-
+) -> Result<Vec<Arc<dyn Index + Send + Sync>>, Box<dyn std::error::Error + Send + Sync>> {
     let embedding_columns: Vec<_> = columns
         .iter()
         .filter_map(|c| {
@@ -416,7 +402,7 @@ pub(crate) async fn wrap_accelerator_with_elasticsearch_vector_indexes(
     for (column, config) in embedding_columns {
         let (augmented_columns, index_schema) =
             if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
-                updated_chunked_search_index_format(&inner_table_provider, columns, &column)
+                updated_chunked_search_index_format(inner_table_provider, columns, &column)
             } else {
                 (columns.to_vec(), inner_table_provider.schema())
             };
@@ -426,7 +412,7 @@ pub(crate) async fn wrap_accelerator_with_elasticsearch_vector_indexes(
             column.clone(),
             config.clone(),
             vector_store,
-            &inner_table_provider,
+            inner_table_provider,
             Arc::clone(&index_schema),
             Arc::clone(embedding_models),
             augmented_columns,
@@ -470,11 +456,7 @@ pub(crate) async fn wrap_accelerator_with_elasticsearch_vector_indexes(
         }
     }
 
-    tracing::info!(
-        "Elasticsearch vector engine for table {tbl} initialized in {:?}",
-        start.elapsed()
-    );
-    Ok((inner_table_provider, sink_indexes))
+    Ok(sink_indexes)
 }
 
 #[cfg(feature = "elasticsearch")]
@@ -490,15 +472,6 @@ async fn wrap_table_as_index_elasticsearch(
     tracing::info!("Elasticsearch vector engine for table {tbl} initializing...");
     let start = std::time::Instant::now();
 
-    let embedding_columns: Vec<_> = columns
-        .iter()
-        .filter_map(|c| {
-            c.embeddings
-                .first()
-                .map(|embed| (c.name.clone(), embed.clone()))
-        })
-        .collect();
-
     let mut provider = if let Some(indexed) = inner_table_provider
         .as_any()
         .downcast_ref::<runtime_datafusion_index::IndexedTableProvider>(
@@ -508,53 +481,25 @@ async fn wrap_table_as_index_elasticsearch(
         runtime_datafusion_index::IndexedTableProvider::new(Arc::clone(&inner_table_provider))
     };
 
-    for (column, config) in embedding_columns {
-        let (augmented_columns, index_schema) =
-            if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
-                updated_chunked_search_index_format(&inner_table_provider, columns, &column)
-            } else {
-                (columns.to_vec(), inner_table_provider.schema())
-            };
+    let sink_indexes = build_elasticsearch_sink_indexes(
+        embedding_models,
+        secrets,
+        tbl,
+        columns,
+        file_format,
+        &inner_table_provider,
+        vector_store,
+    )
+    .await?;
 
-        let es_index = super::elasticsearch::try_from_table(
-            tbl,
-            column.clone(),
-            config.clone(),
-            vector_store,
-            &inner_table_provider,
-            Arc::clone(&index_schema),
-            Arc::clone(embedding_models),
-            augmented_columns,
-            Arc::clone(secrets),
-        )
-        .await?;
-
-        if let Some(ref chunking) = config.chunking
-            && chunking.enabled
-        {
-            tracing::debug!(
-                "[Elasticsearch][table={tbl}] Chunking column {}",
-                es_index.embedded_column
-            );
-            provider = construct_elasticsearch_chunked_vector_index(
-                provider,
-                embedding_models,
-                chunking,
-                es_index,
-                config.model.as_str(),
-                file_format,
-            )
-            .await?;
-        } else {
-            let idx = Arc::new(es_index);
-            let vector_index = Arc::clone(&idx) as Arc<dyn search::index::VectorIndex>;
-
+    for idx in sink_indexes {
+        if let Some(vector_index) = Arc::clone(&idx).as_vector_index() {
             provider.underlying = Arc::new(
                 VectorScanTableProvider::try_new(provider.underlying, &vector_index)
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
             ) as Arc<dyn TableProvider>;
-            provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
         }
+        provider = provider.add_index(idx);
     }
 
     tracing::info!(
