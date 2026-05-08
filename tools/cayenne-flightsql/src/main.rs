@@ -14,50 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cayenne::{
-    CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
-};
+
+use cayenne::{CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider};
 use clap::Parser;
 use data_components::RefreshableCatalogProvider as _;
-use datafusion::catalog::{CatalogProvider as _, SchemaProvider};
-use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner};
-use datafusion::execution::SessionStateBuilder;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::{
+    catalog::{CatalogProvider as _, SchemaProvider},
+    execution::SessionStateBuilder,
+    physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner},
+    prelude::{SessionConfig, SessionContext},
+};
 use datafusion_ddl::{DdlAnalyzerRule, DdlExtensionPlanner, new_shared_store};
 use datafusion_flightsql::FlightSqlService;
 use snafu::prelude::*;
 use tonic::transport::Server;
-
-// ── Extension planner wrapper ─────────────────────────────────────────────────
-
-/// [`QueryPlanner`] that delegates to a [`DefaultPhysicalPlanner`] pre-loaded
-/// with extension planners (e.g. [`DdlExtensionPlanner`]).
-struct ExtensionQueryPlanner(Arc<dyn datafusion::physical_planner::PhysicalPlanner>);
-
-impl std::fmt::Debug for ExtensionQueryPlanner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExtensionQueryPlanner").finish()
-    }
-}
-
-#[async_trait]
-impl datafusion::execution::context::QueryPlanner for ExtensionQueryPlanner {
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &datafusion::logical_expr::LogicalPlan,
-        session_state: &datafusion::execution::SessionState,
-    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        self.0
-            .create_physical_plan(logical_plan, session_state)
-            .await
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
 #[command(
@@ -168,32 +143,30 @@ async fn main() -> Result<()> {
 
     // Register DdlExtensionPlanner so that CREATE TABLE / DROP TABLE / CREATE SCHEMA
     // executed via Flight SQL create real Cayenne (Vortex) tables, not in-memory ones.
-    let extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
-        vec![Arc::new(DdlExtensionPlanner)];
-    let physical_planner = Arc::new(
-        DefaultPhysicalPlanner::with_extension_planners(extension_planners),
-    );
     let state = SessionStateBuilder::new()
         .with_config(session_config)
         .with_default_features()
-        .with_query_planner(Arc::new(ExtensionQueryPlanner(physical_planner)))
+        .with_query_planner(Arc::new(
+            ExtensionPlanQueryPlanner::from_extension_planners(vec![Arc::new(DdlExtensionPlanner)]),
+        ))
         .build();
     let ctx = Arc::new(SessionContext::new_with_state(state));
 
-    let provider_config = CayenneCatalogProviderConfig {
-        data_dir: args.cayenne_data_dir.clone(),
-        metadata_dir: args.cayenne_metadata_dir.clone(),
-        spice_data_base_path: args.spice_data_base_path.clone(),
-        footer_cache_mb: args.cayenne_footer_cache_mb,
-        segment_cache_mb: args.cayenne_segment_cache_mb,
-        target_file_size_mb: args.cayenne_target_file_size_mb,
-        compression_strategy: None,
-    };
-
     let provider = Arc::new(
-        CayenneCatalogProvider::try_new(provider_config, ctx.runtime_env())
-            .await
-            .context(CayenneCatalogInitSnafu)?,
+        CayenneCatalogProvider::try_new(
+            CayenneCatalogProviderConfig {
+                data_dir: args.cayenne_data_dir.clone(),
+                metadata_dir: args.cayenne_metadata_dir.clone(),
+                spice_data_base_path: args.spice_data_base_path.clone(),
+                footer_cache_mb: args.cayenne_footer_cache_mb,
+                segment_cache_mb: args.cayenne_segment_cache_mb,
+                target_file_size_mb: args.cayenne_target_file_size_mb,
+                compression_strategy: None,
+            },
+            ctx.runtime_env(),
+        )
+        .await
+        .context(CayenneCatalogInitSnafu)?,
     );
 
     provider
@@ -211,13 +184,10 @@ async fn main() -> Result<()> {
     // Register CayenneDdlHandler so that CREATE TABLE / DROP TABLE / CREATE SCHEMA
     // executed via Flight SQL create real Cayenne (Vortex) tables, not in-memory ones.
     {
-        use std::collections::HashSet;
-        use std::sync::RwLock;
-
         let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::from([args.catalog.clone()])));
         let ddl_store = new_shared_store(&args.catalog, &args.default_schema);
-        let ddl_handler = Arc::new(cayenne::CayenneDdlHandler {})
-            as Arc<dyn datafusion_ddl::CatalogDdlHandler>;
+        let ddl_handler =
+            Arc::new(cayenne::CayenneDdlHandler {}) as Arc<dyn datafusion_ddl::CatalogDdlHandler>;
 
         ctx.add_analyzer_rule(Arc::new(DdlAnalyzerRule::new(
             &ctx.state().catalog_list(),
@@ -265,7 +235,7 @@ async fn main() -> Result<()> {
         .add_service(
             FlightSqlService::new(Arc::clone(&ctx))
                 .into_server()
-                .max_decoding_message_size(256 * 1024 * 1024), // 256 MiB — large for lineitem batches
+                .max_decoding_message_size(256 * 1024 * 1024),
         )
         .serve_with_shutdown(args.addr, util::shutdown_signal())
         .await;

@@ -55,9 +55,7 @@ async fn run_local_spiced_mode(args: &args::LocalSpicedArgs) -> anyhow::Result<(
     local_spiced_server::run_local_spiced_server(args).await
 }
 
-async fn run_cayenne_flightsql_mode(
-    args: &args::CayenneFlightsqlArgs,
-) -> anyhow::Result<()> {
+async fn run_cayenne_flightsql_mode(args: &args::CayenneFlightsqlArgs) -> anyhow::Result<()> {
     eprintln!("Starting spidapter cayenne-flightsql stdio JSON-RPC server");
     cayenne_server::run_cayenne_flightsql_server(args).await
 }

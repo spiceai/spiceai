@@ -201,9 +201,8 @@ fn coerce_batches_to_schema(
                     if col.data_type() == target_field.data_type() {
                         Ok(Arc::clone(col))
                     } else {
-                        cast(col, target_field.data_type()).map_err(|e| {
-                            DataFusionError::ArrowError(Box::new(e), None)
-                        })
+                        cast(col, target_field.data_type())
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                     }
                 })
                 .collect::<DFResult<Vec<_>>>()?;

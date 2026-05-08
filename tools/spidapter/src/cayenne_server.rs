@@ -124,25 +124,31 @@ impl Handler for CayenneFlightsqlHandler {
             working_dir,
         };
 
-        wait_for_grpc_ready(&addr, &mut state.child, Duration::from_secs(self.args.ready_wait))
-            .await
-            .map_err(|e| format!("cayenne-flightsql did not become ready: {e}"))?;
+        wait_for_grpc_ready(
+            &addr,
+            &mut state.child,
+            Duration::from_secs(self.args.ready_wait),
+        )
+        .await
+        .map_err(|e| format!("cayenne-flightsql did not become ready: {e}"))?;
 
         eprintln!("[cayenne] setup: cayenne-flightsql ready at {flight_url}");
 
         // When used as an ADBC ETL sink, pre-create all target tables so the
         // benchmark framework can bulk-ingest into them immediately.
         if etl_sink_type == Some(EtlSinkType::Adbc) {
-            create_adbc_tables(&state.grpc_http_url, &state.catalog, &state.schema, &datasets)
-                .await
-                .map_err(|e| format!("Failed to create ADBC tables: {e}"))?;
+            create_adbc_tables(
+                &state.grpc_http_url,
+                &state.catalog,
+                &state.schema,
+                &datasets,
+            )
+            .await
+            .map_err(|e| format!("Failed to create ADBC tables: {e}"))?;
         }
 
         let db_kwargs = HashMap::from([
-            (
-                "uri".to_string(),
-                serde_json::Value::String(flight_url),
-            ),
+            ("uri".to_string(), serde_json::Value::String(flight_url)),
             (
                 "username".to_string(),
                 serde_json::Value::String(String::new()),
@@ -252,13 +258,9 @@ impl Handler for CayenneFlightsqlHandler {
         // `CREATE TABLE ... LIKE` requires CayenneDdlHandler which is not
         // registered in the standalone cayenne-flightsql server. Generate
         // explicit column-by-column DDL from the stored schema instead.
-        let ddl = generate_create_table_ddl(
-            &state.catalog,
-            &state.schema,
-            staging_table_name,
-            source,
-        )
-        .map_err(|e| format!("Failed to generate staging table DDL: {e}"))?;
+        let ddl =
+            generate_create_table_ddl(&state.catalog, &state.schema, staging_table_name, source)
+                .map_err(|e| format!("Failed to generate staging table DDL: {e}"))?;
 
         eprintln!(
             "[cayenne] create_staging_table: source={source_dataset}, \
@@ -292,7 +294,11 @@ fn reserve_local_port(host: &str) -> anyhow::Result<u16> {
 }
 
 /// Build the CLI argument list to pass to `cayenne-flightsql`.
-fn build_cayenne_args(args: &CayenneFlightsqlArgs, addr: &str, working_dir: &std::path::Path) -> Vec<String> {
+fn build_cayenne_args(
+    args: &CayenneFlightsqlArgs,
+    addr: &str,
+    working_dir: &std::path::Path,
+) -> Vec<String> {
     let mut cmd_args = vec![
         "--addr".to_string(),
         addr.to_string(),
@@ -420,9 +426,7 @@ fn generate_create_table_ddl(
         let schema_cols: HashSet<_> = dataset.schema.fields().iter().map(|f| f.name()).collect();
         for pk in &dataset.primary_key_columns {
             if !schema_cols.contains(pk) {
-                anyhow::bail!(
-                    "Dataset '{dataset_name}' primary key '{pk}' not present in schema"
-                );
+                anyhow::bail!("Dataset '{dataset_name}' primary key '{pk}' not present in schema");
             }
         }
         let pks = dataset
@@ -459,4 +463,3 @@ async fn execute_flight_sql_update(grpc_http_url: &str, sql: &str) -> anyhow::Re
         .await
         .map_err(|e| anyhow::anyhow!("Flight SQL execute_update failed: {e}"))
 }
-
