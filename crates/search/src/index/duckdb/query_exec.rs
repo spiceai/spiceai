@@ -122,7 +122,11 @@ impl DisplayAs for DuckDBVectorQueryExec {
         write!(
             f,
             ", scan={}, projection=[{}]",
-            if self.filters.is_empty() { "hnsw" } else { "brute_force" },
+            if self.filters.is_empty() {
+                "hnsw"
+            } else {
+                "brute_force"
+            },
             self.projected_columns.join(", "),
         )?;
 
