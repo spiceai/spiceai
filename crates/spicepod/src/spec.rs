@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use regex::Regex;
 #[cfg(feature = "schemars")]
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt::{self, Display, Formatter};
+use std::str::FromStr;
+use std::sync::OnceLock;
 use std::{collections::HashMap, fmt::Debug};
 
 use crate::component::catalog::Catalog;
@@ -36,18 +39,185 @@ use crate::component::{
 };
 use crate::extension::Extension;
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum SpicepodVersion {
-    V1,
-    #[default]
-    V2,
+/// The version of a Spicepod definition.
+///
+/// Accepts free-form version strings of the form:
+/// - `v1`, `v2` — major only
+/// - `v2.0` — major.minor
+/// - `v2.0.0` — major.minor.patch
+/// - `v2.0.0-rc.1` — major.minor.patch with a pre-release identifier
+///
+/// Equality is structural: `v1` and `v1.0.0` are not equal.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct SpicepodVersion {
+    major: u64,
+    minor: Option<u64>,
+    patch: Option<u64>,
+    pre_release: Option<String>,
+}
+
+impl SpicepodVersion {
+    /// `v1` — equivalent to parsing the string `"v1"`.
+    pub const V1: Self = Self {
+        major: 1,
+        minor: None,
+        patch: None,
+        pre_release: None,
+    };
+
+    /// `v2` — equivalent to parsing the string `"v2"`.
+    pub const V2: Self = Self {
+        major: 2,
+        minor: None,
+        patch: None,
+        pre_release: None,
+    };
+
+    #[must_use]
+    pub fn major(&self) -> u64 {
+        self.major
+    }
+
+    #[must_use]
+    pub fn minor(&self) -> Option<u64> {
+        self.minor
+    }
+
+    #[must_use]
+    pub fn patch(&self) -> Option<u64> {
+        self.patch
+    }
+
+    #[must_use]
+    pub fn pre_release(&self) -> Option<&str> {
+        self.pre_release.as_deref()
+    }
+}
+
+impl Default for SpicepodVersion {
+    fn default() -> Self {
+        Self::V2
+    }
 }
 
 impl Display for SpicepodVersion {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{self:?}")
+        write!(f, "v{}", self.major)?;
+        if let Some(minor) = self.minor {
+            write!(f, ".{minor}")?;
+        }
+        if let Some(patch) = self.patch {
+            write!(f, ".{patch}")?;
+        }
+        if let Some(pre) = &self.pre_release {
+            write!(f, "-{pre}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Error returned when a spicepod version string is not in the expected format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpicepodVersionParseError {
+    input: String,
+}
+
+impl Display for SpicepodVersionParseError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "invalid spicepod version '{}': expected a version string like 'v1', 'v2', 'v2.0', 'v2.0.0', or 'v2.0.0-rc.1'",
+            self.input
+        )
+    }
+}
+
+impl std::error::Error for SpicepodVersionParseError {}
+
+fn version_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^v(\d+)(?:\.(\d+)(?:\.(\d+))?)?(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$")
+            .expect("spicepod version regex must compile")
+    })
+}
+
+impl FromStr for SpicepodVersion {
+    type Err = SpicepodVersionParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let captures = version_regex()
+            .captures(s)
+            .ok_or_else(|| SpicepodVersionParseError {
+                input: s.to_string(),
+            })?;
+
+        let parse_num = |idx: usize| -> Result<Option<u64>, SpicepodVersionParseError> {
+            captures
+                .get(idx)
+                .map(|m| {
+                    m.as_str()
+                        .parse::<u64>()
+                        .map_err(|_| SpicepodVersionParseError {
+                            input: s.to_string(),
+                        })
+                })
+                .transpose()
+        };
+
+        let major = parse_num(1)?.ok_or_else(|| SpicepodVersionParseError {
+            input: s.to_string(),
+        })?;
+        let minor = parse_num(2)?;
+        let patch = parse_num(3)?;
+        let pre_release = captures.get(4).map(|m| m.as_str().to_string());
+
+        // Pre-release requires a full major.minor.patch — otherwise the regex
+        // would have matched the pre-release as part of the minor/patch slots.
+        if pre_release.is_some() && (minor.is_none() || patch.is_none()) {
+            return Err(SpicepodVersionParseError {
+                input: s.to_string(),
+            });
+        }
+
+        Ok(Self {
+            major,
+            minor,
+            patch,
+            pre_release,
+        })
+    }
+}
+
+impl Serialize for SpicepodVersion {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SpicepodVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::from_str(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "schemars")]
+impl JsonSchema for SpicepodVersion {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SpicepodVersion".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::SpicepodVersion").into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "pattern": r"^v\d+(\.\d+(\.\d+)?)?(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$",
+            "description": "Spicepod schema version. Examples: 'v1', 'v2', 'v2.0', 'v2.0.0', 'v2.0.0-rc.1'."
+        })
     }
 }
 
