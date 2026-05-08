@@ -3933,6 +3933,7 @@ dependencies = [
  "opentelemetry",
  "paste",
  "runtime",
+ "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
  "snafu",
@@ -14816,6 +14817,7 @@ version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10b99e0098aa4082912d4c649628623db6aba77335e4f4569ff5083a6448b32e"
 dependencies = [
+ "aws-lc-rs",
  "pem",
  "ring",
  "rustls-pki-types",
@@ -15481,6 +15483,7 @@ dependencies = [
  "adbc_driver_manager",
  "anyhow",
  "app",
+ "arc-swap",
  "arrow",
  "arrow-csv",
  "arrow-flight",
@@ -15617,6 +15620,7 @@ dependencies = [
  "prost 0.14.3",
  "rand 0.10.1",
  "rayon",
+ "rcgen",
  "rdkafka",
  "regex",
  "repl",
@@ -15971,8 +15975,12 @@ version = "2.0.0-unstable"
 dependencies = [
  "futures",
  "governor",
+ "object_store",
+ "object_store_occ",
  "rand 0.10.1",
+ "serde",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -22875,6 +22883,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
 dependencies = [
  "asn1-rs 0.7.1",
+ "aws-lc-rs",
  "data-encoding",
  "der-parser 10.0.0",
  "lazy_static",
