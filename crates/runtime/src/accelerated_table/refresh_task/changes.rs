@@ -99,7 +99,7 @@ macro_rules! extract_primary_key {
 ///
 /// Out-of-range or unparseable values fall back to the next source with a
 /// `tracing::warn!` so misconfiguration is visible rather than silent.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CdcConfig {
     /// Channel depth between the CDC source-stream reader and the apply
     /// loop. Each slot holds one decoded `ChangeEnvelope`, so peak
@@ -126,16 +126,23 @@ impl Default for CdcConfig {
 }
 
 /// Process-wide CDC tunables. Set once at runtime startup from spicepod
-/// config; subsequent calls to [`set_cdc_config`] are ignored (with a
-/// warning) so tests don't accidentally fight each other.
+/// config; repeated calls with the same value are ignored quietly so tests
+/// and multi-runtime processes don't emit noise. A different later value is
+/// ignored with a warning because active CDC streams may already be using the
+/// first config.
 static CDC_CONFIG: std::sync::OnceLock<CdcConfig> = std::sync::OnceLock::new();
 
 /// Install the CDC configuration resolved from spicepod
 /// `runtime.params.cdc_*`. Should be called exactly once during runtime
 /// startup, before any CDC stream is started. Subsequent calls are ignored.
 pub fn set_cdc_config(config: CdcConfig) {
-    if CDC_CONFIG.set(config).is_err() {
-        tracing::warn!("CDC config already initialized; ignoring subsequent set_cdc_config call");
+    if let Err(new_config) = CDC_CONFIG.set(config)
+        && let Some(existing) = CDC_CONFIG.get()
+        && *existing != new_config
+    {
+        tracing::warn!(
+            "CDC config already initialized with {existing:?}; ignoring different config {new_config:?}"
+        );
     }
 }
 
@@ -160,52 +167,52 @@ fn cdc_config() -> CdcConfig {
     }
 }
 
-/// Resolve a single CDC tunable from `runtime.params`, falling back to
-/// `default` (with a warning) when the value is unparseable or out of
-/// range. Centralized so the runtime startup path uses the same clamping
-/// semantics as env-var fallback.
+/// Resolve a single CDC tunable from `runtime.params`, falling back to the
+/// matching env var and then `default` when the param is missing,
+/// unparseable, or out of range.
 fn resolve_cdc_param(
     params: &std::collections::HashMap<String, String>,
     key: &'static str,
+    env_var: &'static str,
     default: usize,
     max: usize,
 ) -> usize {
-    let Some(raw) = params.get(key) else {
-        return default;
-    };
-    match raw.parse::<usize>() {
-        Ok(n) if (1..=max).contains(&n) => n,
-        Ok(n) => {
-            tracing::warn!(
-                "runtime.params.{key}={n} is out of range [1, {max}]; using default {default}"
-            );
-            default
-        }
-        Err(e) => {
-            tracing::warn!(
-                "runtime.params.{key}={raw:?} is not a valid usize ({e}); using default {default}"
-            );
-            default
+    if let Some(raw) = params.get(key) {
+        match raw.trim().parse::<usize>() {
+            Ok(n) if (1..=max).contains(&n) => return n,
+            Ok(n) => {
+                tracing::warn!(
+                    "runtime.params.{key}={n} is out of range [1, {max}]; falling back to {env_var}/default"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "runtime.params.{key}={raw:?} is not a valid usize ({e}); falling back to {env_var}/default"
+                );
+            }
         }
     }
+    parse_env_usize(env_var, default, max)
 }
 
 /// Build a [`CdcConfig`] from the spicepod `runtime.params` map, reading
 /// the `cdc_prefetch_buffer` and `cdc_max_coalesced_envelopes` keys.
-/// Missing/unparseable/out-of-range values fall back to defaults with a
-/// warning.
+/// Missing/unparseable/out-of-range params fall back to the corresponding
+/// `SPICE_CDC_*` env var, then defaults.
 #[must_use]
 pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>) -> CdcConfig {
     CdcConfig {
         prefetch_buffer: resolve_cdc_param(
             params,
             "cdc_prefetch_buffer",
+            "SPICE_CDC_PREFETCH_BUFFER",
             CDC_PREFETCH_BUFFER_DEFAULT,
             CDC_PREFETCH_BUFFER_MAX,
         ),
         max_coalesced_envelopes: resolve_cdc_param(
             params,
             "cdc_max_coalesced_envelopes",
+            "SPICE_CDC_MAX_COALESCED_ENVELOPES",
             CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
             CDC_MAX_COALESCED_ENVELOPES_MAX,
         ),
@@ -334,13 +341,22 @@ impl RefreshTask {
                 initial_load_completed: &initial_load_completed,
                 pending_commit: &mut pending_commit,
             };
-            self.apply_burst(&mut apply_context, burst).await;
+            if !self.apply_burst(&mut apply_context, burst).await {
+                break;
+            }
         }
 
         // Drain the final in-flight commit before reporting end-of-stream so
         // we don't leave the source-side offset un-acked.
-        if let Some(prev) = pending_commit.take() {
-            join_pending_commit(prev, &dataset_name, self.runtime_status.is_shutdown()).await;
+        if let Some(prev) = pending_commit.take()
+            && let Some(error_message) =
+                join_pending_commit(prev, &dataset_name, self.runtime_status.is_shutdown()).await
+        {
+            self.set_refresh_status(
+                refresh.read().await.display_sql().as_deref(),
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
         }
 
         // rx returned None: the reader dropped its sender. Three causes:
@@ -393,7 +409,7 @@ impl RefreshTask {
         &self,
         context: &mut ApplyContext<'_>,
         burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
-    ) {
+    ) -> bool {
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error
         // handling and ordering semantics match the pre-coalesce behavior.
@@ -410,7 +426,9 @@ impl RefreshTask {
                         envelopes.push(next);
                     }
 
-                    self.apply_envelope_run(context, envelopes).await;
+                    if !self.apply_envelope_run(context, envelopes).await {
+                        return false;
+                    }
                 }
                 Err(e) => {
                     // Transient errors (e.g., Kafka poll timeout) keep the
@@ -430,6 +448,7 @@ impl RefreshTask {
                 }
             }
         }
+        true
     }
 
     /// Apply a contiguous run of successful envelopes as a single coalesced
@@ -439,7 +458,7 @@ impl RefreshTask {
         &self,
         context: &mut ApplyContext<'_>,
         envelopes: Vec<cdc::ChangeEnvelope>,
-    ) {
+    ) -> bool {
         debug_assert!(
             !envelopes.is_empty(),
             "run must contain at least one envelope"
@@ -483,7 +502,7 @@ impl RefreshTask {
                     // Drop committers without acking — the source will
                     // re-send these envelopes on reconnect, and CDC apply
                     // is idempotent at the upsert/delete level.
-                    return;
+                    return true;
                 }
             }
         };
@@ -519,13 +538,20 @@ impl RefreshTask {
                 // commit ordering across bursts (LSN/offsets must advance
                 // monotonically) while letting commit(N) overlap with the
                 // next apply(N+1).
-                if let Some(prev) = context.pending_commit.take() {
-                    join_pending_commit(
+                if let Some(prev) = context.pending_commit.take()
+                    && let Some(error_message) = join_pending_commit(
                         prev,
                         context.dataset_name,
                         self.runtime_status.is_shutdown(),
                     )
+                    .await
+                {
+                    self.set_refresh_status(
+                        context.refresh.read().await.display_sql().as_deref(),
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
                     .await;
+                    return false;
                 }
 
                 let runtime_status = Arc::clone(&self.runtime_status);
@@ -555,6 +581,7 @@ impl RefreshTask {
                 // Drop committers without acking — see comment above.
             }
         }
+        true
     }
 
     async fn write_change(
@@ -778,15 +805,19 @@ async fn join_pending_commit(
     handle: tokio::task::JoinHandle<()>,
     dataset_name: &TableReference,
     is_shutdown: bool,
-) {
+) -> Option<String> {
     match handle.await {
         Err(e) if e.is_cancelled() => {
             tracing::debug!("CDC commit task for {dataset_name} was cancelled (likely shutdown)");
+            None
         }
         Err(e) if !is_shutdown => {
-            tracing::error!("CDC commit task for {dataset_name} ended unexpectedly: {e}");
+            let error_message =
+                format!("CDC commit task for {dataset_name} ended unexpectedly: {e}");
+            tracing::error!("{error_message}");
+            Some(error_message)
         }
-        Ok(()) | Err(_) => {}
+        Ok(()) | Err(_) => None,
     }
 }
 
@@ -1570,7 +1601,7 @@ mod tests {
     #[derive(Debug)]
     struct WriteOrderRecordingProvider {
         inner: Arc<dyn TableProvider>,
-        write_log: Arc<TokioMutex<Vec<&'static str>>>,
+        write_log: Arc<TokioMutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -1599,7 +1630,7 @@ mod tests {
             input: Arc<dyn ExecutionPlan>,
             insert_op: InsertOp,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.write_log.lock().await.push("write");
+            self.write_log.lock().await.push("write".to_string());
             self.inner.insert_into(state, input, insert_op).await
         }
     }
@@ -1608,19 +1639,20 @@ mod tests {
     /// can assert the interleaved write/commit sequence in
     /// `test_start_changes_stream_commits_after_write`.
     struct SequencedCommitter {
-        log: Arc<TokioMutex<Vec<&'static str>>>,
+        id: i32,
+        log: Arc<TokioMutex<Vec<String>>>,
     }
     #[async_trait]
     impl CommitChange for SequencedCommitter {
         async fn commit(&self) -> Result<(), CommitError> {
-            self.log.lock().await.push("commit");
+            self.log.lock().await.push(format!("commit:{}", self.id));
             Ok(())
         }
     }
 
     #[tokio::test]
     async fn test_start_changes_stream_commits_after_write() {
-        let write_log: Arc<TokioMutex<Vec<&'static str>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let write_log: Arc<TokioMutex<Vec<String>>> = Arc::new(TokioMutex::new(Vec::new()));
         let provider = Arc::new(WriteOrderRecordingProvider {
             inner: make_mem_table() as Arc<dyn TableProvider>,
             write_log: Arc::clone(&write_log),
@@ -1629,13 +1661,14 @@ mod tests {
 
         // Use a single shared log; both `insert_into` and `commit()` push
         // markers, so we can read off the interleaved write/commit sequence.
-        let combined: Arc<TokioMutex<Vec<&'static str>>> = Arc::clone(&write_log);
+        let combined: Arc<TokioMutex<Vec<String>>> = Arc::clone(&write_log);
 
         let mk = |id: i32| -> ChangeEnvelope {
             let batch =
                 create_test_change_batch(vec!["c"], &[vec!["id"]], vec![id], vec![Some("row")]);
             ChangeEnvelope::new(
                 Box::new(SequencedCommitter {
+                    id,
                     log: Arc::clone(&combined),
                 }),
                 batch,
@@ -1664,10 +1697,14 @@ mod tests {
             observed[0], "write",
             "burst write must come before any commit"
         );
+        let commits: Vec<&str> = observed
+            .iter()
+            .filter_map(|event| event.strip_prefix("commit:"))
+            .collect();
         assert_eq!(
-            observed.iter().filter(|s| **s == "commit").count(),
-            3,
-            "each envelope must be committed exactly once",
+            commits,
+            vec!["1", "2", "3"],
+            "committers must run in stream order",
         );
         assert_eq!(
             observed.iter().filter(|s| **s == "write").count(),

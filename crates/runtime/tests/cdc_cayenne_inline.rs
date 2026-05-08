@@ -62,23 +62,23 @@ fn data_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Counter committer: increments a shared count when committed. Used to assert
-/// every envelope's source-side offset is committed exactly once.
-struct CountingCommitter {
-    counter: Arc<TokioMutex<usize>>,
+/// Records each committed envelope id. Used to assert every envelope's
+/// source-side offset is committed exactly once, in stream order.
+struct RecordingCommitter {
+    id: i64,
+    commits: Arc<TokioMutex<Vec<i64>>>,
 }
 
 #[async_trait]
-impl CommitChange for CountingCommitter {
+impl CommitChange for RecordingCommitter {
     async fn commit(&self) -> Result<(), CommitError> {
-        let mut g = self.counter.lock().await;
-        *g += 1;
+        self.commits.lock().await.push(self.id);
         Ok(())
     }
 }
 
 /// Build a single-row create-op `ChangeEnvelope` for `(id, name)`.
-fn make_create_envelope(id: i64, name: &str, counter: Arc<TokioMutex<usize>>) -> ChangeEnvelope {
+fn make_create_envelope(id: i64, name: &str, commits: Arc<TokioMutex<Vec<i64>>>) -> ChangeEnvelope {
     let data = data_schema();
     let wrapper = changes_schema(&data);
 
@@ -112,18 +112,18 @@ fn make_create_envelope(id: i64, name: &str, counter: Arc<TokioMutex<usize>>) ->
         .expect("wrapper RecordBatch");
     let batch = ChangeBatch::try_new(record).expect("ChangeBatch");
 
-    ChangeEnvelope::new(Box::new(CountingCommitter { counter }), batch, false)
+    ChangeEnvelope::new(Box::new(RecordingCommitter { id, commits }), batch, false)
 }
 
-/// Build a `ChangesStream` of N create-op envelopes sharing one commit counter.
-fn make_n_envelopes(n: usize, counter: &Arc<TokioMutex<usize>>) -> ChangesStream {
+/// Build a `ChangesStream` of N create-op envelopes sharing one commit log.
+fn make_n_envelopes(n: usize, commits: &Arc<TokioMutex<Vec<i64>>>) -> ChangesStream {
     let envelopes: Vec<Result<ChangeEnvelope, StreamError>> = (0..n)
         .map(|i| {
             let id = i64::try_from(i).expect("usize fits in i64");
             Ok(make_create_envelope(
                 id,
                 &format!("row-{i}"),
-                Arc::clone(counter),
+                Arc::clone(commits),
             ))
         })
         .collect();
@@ -142,7 +142,9 @@ async fn setup_cayenne(
 ) {
     let temp = TempDir::new().expect("temp dir");
     let data_path = temp.path().join("data");
-    std::fs::create_dir_all(&data_path).expect("data dir");
+    tokio::fs::create_dir_all(&data_path)
+        .await
+        .expect("data dir");
     let db_path = temp.path().join("test.db");
     let conn = format!("sqlite://{}", db_path.to_string_lossy());
 
@@ -203,7 +205,7 @@ async fn count_rows(provider: &Arc<CayenneTableProvider>) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cdc_into_cayenne_data_inlining_e2e() {
-    // Three concurrent envelopes: small enough that the Cayenne sink should
+    // Sixteen envelopes: small enough that the Cayenne sink should
     // store them as inlined data in the metastore (well under the 1024-row
     // inlining threshold).
     const N: usize = 16;
@@ -219,8 +221,8 @@ async fn cdc_into_cayenne_data_inlining_e2e() {
         Arc::clone(&table) as Arc<dyn TableProvider>,
         "cdc_inline_e2e",
     );
-    let commit_count = Arc::new(TokioMutex::new(0usize));
-    let stream = make_n_envelopes(N, &commit_count);
+    let commits = Arc::new(TokioMutex::new(Vec::new()));
+    let stream = make_n_envelopes(N, &commits);
 
     let refresh = Arc::new(RwLock::new(Refresh::default()));
     task.start_changes_stream(
@@ -233,11 +235,14 @@ async fn cdc_into_cayenne_data_inlining_e2e() {
     .await
     .expect("start_changes_stream");
 
-    // Every envelope's commit should have fired exactly once.
+    // Every envelope's commit should have fired exactly once, in stream order.
+    let expected_commits: Vec<i64> = (0..N)
+        .map(|i| i64::try_from(i).expect("usize fits in i64"))
+        .collect();
     assert_eq!(
-        *commit_count.lock().await,
-        N,
-        "every envelope must be committed once"
+        *commits.lock().await,
+        expected_commits,
+        "every envelope must be committed once, in stream order"
     );
 
     // All rows must be visible via the Cayenne provider's scan path.

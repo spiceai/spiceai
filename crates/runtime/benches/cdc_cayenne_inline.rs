@@ -17,10 +17,11 @@ limitations under the License.
 //! End-to-end throughput benchmark for the CDC apply pipeline writing into a
 //! Cayenne accelerator via the data-inlining write path.
 //!
-//! Each iteration builds a synthetic `ChangesStream` of N create-op envelopes
-//! sharing one prefetch buffer, runs them through `RefreshTask::start_changes_stream`,
-//! and times the full apply+commit loop end to end. Throughput is reported in
-//! envelopes/sec via `criterion::Throughput::Elements`.
+//! Each iteration builds a synthetic `ChangesStream` of N create-op envelopes,
+//! runs them through `RefreshTask::start_changes_stream` (which creates the
+//! bounded prefetch channel internally), and times the full apply+commit loop
+//! end to end. Throughput is reported in envelopes/sec via
+//! `criterion::Throughput::Elements`.
 
 #![cfg(not(windows))]
 #![allow(clippy::expect_used)]
@@ -123,7 +124,9 @@ struct CayenneFixture {
 async fn make_cayenne_fixture(table_name: &str) -> CayenneFixture {
     let temp = TempDir::new().expect("temp dir");
     let data_path = temp.path().join("data");
-    std::fs::create_dir_all(&data_path).expect("data dir");
+    tokio::fs::create_dir_all(&data_path)
+        .await
+        .expect("data dir");
     let db_path = temp.path().join("test.db");
     let conn = format!("sqlite://{}", db_path.to_string_lossy());
 
