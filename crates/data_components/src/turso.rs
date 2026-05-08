@@ -1856,7 +1856,7 @@ impl DataSink for TursoDataSink {
 
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
+        data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::error::Result<u64> {
         if self.overwrite == InsertOp::Overwrite {
