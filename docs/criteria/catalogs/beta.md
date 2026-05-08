@@ -11,7 +11,7 @@ All criteria must be met for the Catalog to be considered Beta, with exceptions 
 | ADBC          | ➖            |                 |
 | Cayenne       | ➖            |                 |
 | Databricks    | ✅            | @Sevenannn      |
-| DuckLake      | ➖            |                 |
+| DuckLake      | ✅            | @sgrebnov       |
 | Glue          | ➖            |                 |
 | Iceberg       | ✅            | @phillipleblanc |
 | MS SQL        | ➖            |                 |
