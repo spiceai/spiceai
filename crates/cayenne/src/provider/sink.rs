@@ -285,30 +285,29 @@ impl CayenneDataSink {
                 }
             }
 
-            if !exceeded && total_rows > 0 {
-                if self.table.try_inline_batches(&batches).await? {
-                    // Persist stats from the inlined batches
-                    let stats_acc = super::table::ColumnStatsAccumulator::new(&schema);
-                    for batch in &batches {
-                        stats_acc.update(batch);
-                    }
-                    self.table.persist_table_stats(&stats_acc).await;
-
-                    // Auto-checkpoint when accumulated inline data reaches 10K rows
-                    let inlined_count = self.table.cached_inlined_row_count();
-                    if inlined_count >= 10_000
-                        && let Err(e) = self.table.checkpoint_inlined_data().await
-                    {
-                        tracing::warn!(
-                            "Auto-checkpoint of inlined data failed for {}: {e}",
-                            self.table.table_name(),
-                        );
-                    }
-
-                    return Ok(u64::try_from(total_rows).unwrap_or(u64::MAX));
+            if !exceeded && total_rows > 0 && self.table.try_inline_batches(&batches).await? {
+                // Persist stats from the inlined batches
+                let stats_acc = super::table::ColumnStatsAccumulator::new(&schema);
+                for batch in &batches {
+                    stats_acc.update(batch);
                 }
-                // Fell through — batch was too large after IPC serialization.
+
+                self.table.persist_table_stats(&stats_acc).await;
+
+                // Auto-checkpoint when accumulated inline data reaches 10K rows
+                let inlined_count = self.table.cached_inlined_row_count();
+                if inlined_count >= 10_000
+                    && let Err(e) = self.table.checkpoint_inlined_data().await
+                {
+                    tracing::warn!(
+                        "Auto-checkpoint of inlined data failed for {}: {e}",
+                        self.table.table_name(),
+                    );
+                }
+
+                return Ok(u64::try_from(total_rows).unwrap_or(u64::MAX));
             }
+            // Fell through — batch was too large after IPC serialization.
 
             // Exceeded threshold or IPC too large. Chain the already-read batches
             // with the remaining stream so nothing is lost or fully buffered.
