@@ -131,7 +131,7 @@ impl Default for PartitionedArrowAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::runtime("hash_index")
-        .description("Enable hash index for fast primary key lookups. Set to 'enabled' to enable (requires primary_key). Default: disabled."),
+        .description("Enable hash index for fast primary key lookups and upserts. Automatically enabled when primary_key is supplied."),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
@@ -175,6 +175,16 @@ impl DataAccelerator for PartitionedArrowAccelerator {
             if matches!(acceleration.refresh_mode, Some(RefreshMode::Caching)) {
                 cmd.constraints = Constraints::new_unverified(vec![]);
             }
+        }
+
+        if !source
+            .as_ref()
+            .and_then(|s| s.acceleration())
+            .is_some_and(|acceleration| {
+                matches!(acceleration.refresh_mode, Some(RefreshMode::Caching))
+            })
+        {
+            super::arrow::enable_hash_index_for_primary_key(&mut cmd);
         }
 
         let schema = Arc::new(cmd.schema.as_arrow().clone());

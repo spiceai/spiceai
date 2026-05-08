@@ -18,8 +18,11 @@ use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, common::Constraints, datasource::TableProvider,
-    execution::context::SessionContext, logical_expr::CreateExternalTable,
+    catalog::TableProviderFactory,
+    common::{Constraint, Constraints},
+    datasource::TableProvider,
+    execution::context::SessionContext,
+    logical_expr::CreateExternalTable,
 };
 use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
@@ -53,10 +56,32 @@ impl Default for ArrowAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::runtime("hash_index")
-        .description("Enable hash index for fast primary key lookups. Set to 'enabled' to enable (requires primary_key). Default: disabled."),
+        .description("Enable hash index for fast primary key lookups and upserts. Automatically enabled when primary_key is supplied."),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
+
+pub(crate) fn enable_hash_index_for_primary_key(cmd: &mut CreateExternalTable) {
+    let has_primary_key = cmd.constraints.iter().any(
+        |constraint| matches!(constraint, Constraint::PrimaryKey(columns) if !columns.is_empty()),
+    );
+
+    if !has_primary_key {
+        return;
+    }
+
+    if let Some(value) = cmd.options.get("hash_index")
+        && !value.eq_ignore_ascii_case("enabled")
+    {
+        tracing::warn!(
+            hash_index = %value,
+            "Arrow acceleration with primary_key requires hash_index; overriding hash_index to enabled"
+        );
+    }
+
+    cmd.options
+        .insert("hash_index".to_string(), "enabled".to_string());
+}
 
 #[async_trait]
 impl DataAccelerator for ArrowAccelerator {
@@ -104,6 +129,10 @@ impl DataAccelerator for ArrowAccelerator {
         {
             cmd.options
                 .insert("hash_index".to_string(), hash_index_str.clone());
+        }
+
+        if !is_caching_mode {
+            enable_hash_index_for_primary_key(&mut cmd);
         }
 
         let ctx = SessionContext::new();

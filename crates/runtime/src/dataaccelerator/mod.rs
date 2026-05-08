@@ -1002,6 +1002,125 @@ mod test {
         assert!(path.is_file());
         fs::remove_file(path).expect("file removed");
     }
+
+    #[tokio::test]
+    async fn test_arrow_primary_key_enables_hash_index_and_upsert() {
+        use crate::builder::RuntimeBuilder;
+        use ::arrow::array::{Int64Array, RecordBatch, StringArray};
+        use data_components::{
+            arrow::IndexedMemTable, index_maintenance::perform_index_maintenance,
+        };
+        use datafusion::{assert_batches_eq, logical_expr::dml::InsertOp, physical_plan::collect};
+        use datafusion_table_providers::util::{column_reference::ColumnReference, test::MockExec};
+
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let acceleration_settings = Acceleration {
+            enabled: true,
+            mode: Mode::Memory,
+            engine: Engine::Arrow,
+            primary_key: Some(ColumnReference::new(vec!["id".to_string()])),
+            ..Acceleration::default()
+        };
+
+        let table = runtime
+            .accelerator_engine_registry
+            .create_accelerator_table(
+                "arrow_pk_upsert".into(),
+                Arc::clone(&schema),
+                None,
+                &acceleration_settings,
+                Arc::new(RwLock::new(Secrets::new())),
+                None,
+                Arc::clone(&ctx),
+            )
+            .await
+            .expect("accelerator table should be created");
+
+        let indexed = table
+            .as_any()
+            .downcast_ref::<IndexedMemTable>()
+            .expect("primary key should create an IndexedMemTable");
+        assert!(indexed.has_index());
+        assert_eq!(indexed.primary_key_columns(), &["id".to_string()]);
+
+        let initial = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec!["old"])),
+            ],
+        )
+        .expect("initial batch should be created");
+        let initial_insert = table
+            .insert_into(
+                &ctx.state(),
+                Arc::new(MockExec::new(vec![Ok(initial)], Arc::clone(&schema))),
+                InsertOp::Append,
+            )
+            .await
+            .expect("initial insert plan should be created");
+        collect(initial_insert, ctx.task_ctx())
+            .await
+            .expect("initial insert should succeed");
+
+        let update = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(StringArray::from(vec!["new", "second"])),
+            ],
+        )
+        .expect("update batch should be created");
+        let upsert = table
+            .insert_into(
+                &ctx.state(),
+                Arc::new(MockExec::new(vec![Ok(update)], Arc::clone(&schema))),
+                InsertOp::Append,
+            )
+            .await
+            .expect("upsert plan should be created");
+        collect(upsert, ctx.task_ctx())
+            .await
+            .expect("upsert should succeed");
+        perform_index_maintenance(table.as_ref())
+            .await
+            .expect("index maintenance should succeed");
+
+        ctx.register_table("arrow_pk_upsert", Arc::clone(&table))
+            .expect("table should be registered");
+        let result = ctx
+            .sql("SELECT id, name FROM arrow_pk_upsert ORDER BY id")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect("query should succeed");
+
+        let expected = [
+            "+----+--------+",
+            "| id | name   |",
+            "+----+--------+",
+            "| 1  | new    |",
+            "| 2  | second |",
+            "+----+--------+",
+        ];
+        assert_batches_eq!(&expected, &result);
+
+        let result = ctx
+            .sql("SELECT name FROM arrow_pk_upsert WHERE id = 1")
+            .await
+            .expect("point lookup should plan")
+            .collect()
+            .await
+            .expect("point lookup should succeed");
+        let expected = ["+------+", "| name |", "+------+", "| new  |", "+------+"];
+        assert_batches_eq!(&expected, &result);
+    }
 }
 
 #[cfg(test)]

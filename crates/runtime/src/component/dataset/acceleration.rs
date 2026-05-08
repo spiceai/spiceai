@@ -357,11 +357,13 @@ impl Acceleration {
     /// Returns whether `hash_index` is explicitly enabled in the acceleration params.
     #[must_use]
     pub fn is_hash_index_enabled(&self) -> bool {
-        self.engine == Engine::Arrow
-            && self
+        matches!(self.engine, Engine::Arrow | Engine::PartitionedArrow)
+            && (self
                 .params
                 .get("hash_index")
                 .is_some_and(|v| v.eq_ignore_ascii_case("enabled"))
+                || (self.primary_key.is_some()
+                    && !matches!(self.refresh_mode, Some(RefreshMode::Caching))))
     }
 }
 
@@ -432,11 +434,17 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             engine => engine,
         };
 
-        // Only warn about primary_key if hash_index is not enabled
+        // Arrow acceleration automatically enables hash_index when primary_key is supplied.
         let hash_index_enabled = params
             .as_ref()
             .and_then(|p| p.data.get("hash_index"))
-            .is_some_and(|v| v.as_string().eq_ignore_ascii_case("enabled"));
+            .is_some_and(|v| v.as_string().eq_ignore_ascii_case("enabled"))
+            || (matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
+                && primary_key.is_some()
+                && !matches!(
+                    acceleration.refresh_mode,
+                    Some(spicepod_acceleration::RefreshMode::Caching)
+                ));
 
         // Indexes require hash_index to be enabled for Arrow engine
         if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
@@ -447,20 +455,14 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 "Indexes specified but hash_index is not enabled for Arrow engine. Add 'hash_index: enabled' to use indexes for fast lookups."
             );
         }
-        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
-            && primary_key.is_some()
-            && !hash_index_enabled
-        {
-            tracing::warn!(
-                "Primary key specified but hash_index is not enabled for Arrow engine. \
-                 Add 'hash_index: enabled' to use primary_key for fast lookups. Note, hash_index is experimental in Arrow acceleration."
-            );
-        }
         // Note: The warning for hash_index being experimental is logged once
         // at dataset registration time in init/dataset.rs, not during parsing.
-        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow) && !on_conflict.is_empty() {
+        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
+            && !on_conflict.is_empty()
+            && primary_key.is_none()
+        {
             tracing::warn!(
-                "Conflict resolution is not supported for Arrow engine acceleration. Ignoring on_conflict."
+                "Conflict resolution for Arrow engine acceleration requires primary_key. Ignoring on_conflict."
             );
         }
 
