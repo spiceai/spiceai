@@ -807,7 +807,7 @@ async fn join_pending_commit(
     is_shutdown: bool,
 ) -> Option<String> {
     match handle.await {
-        Err(e) if e.is_cancelled() => {
+        Err(e) if e.is_cancelled() && is_shutdown => {
             tracing::debug!("CDC commit task for {dataset_name} was cancelled (likely shutdown)");
             None
         }
@@ -1682,20 +1682,14 @@ mod tests {
             .expect("start_changes_stream should succeed");
 
         let observed = combined.lock().await.clone();
-        // With coalescing, contiguous envelopes available on the stream are
-        // applied in one write and then their committers run in order. The
-        // invariant we still rely on is that *every* commit is preceded by a
-        // write of the burst it belongs to — i.e. no commit may appear before
-        // any write in the trace, and every envelope's commit must be
-        // observed exactly once.
-        assert_eq!(
-            observed.len(),
-            4,
-            "expected 1 write + 3 commits, got {observed:?}"
-        );
+        // Coalescing depends on how many envelopes the reader has already
+        // buffered when the applier drains with `try_recv`, so Tokio
+        // scheduling can legitimately produce one or more writes here. The
+        // invariant is that no commit happens before a write, and committers
+        // run in stream order.
         assert_eq!(
             observed[0], "write",
-            "burst write must come before any commit"
+            "a write must happen before the first commit"
         );
         let commits: Vec<&str> = observed
             .iter()
@@ -1706,10 +1700,9 @@ mod tests {
             vec!["1", "2", "3"],
             "committers must run in stream order",
         );
-        assert_eq!(
-            observed.iter().filter(|s| **s == "write").count(),
-            1,
-            "coalesced burst should produce a single accelerator write",
+        assert!(
+            observed.iter().any(|event| event == "write"),
+            "at least one accelerator write should occur",
         );
     }
 
