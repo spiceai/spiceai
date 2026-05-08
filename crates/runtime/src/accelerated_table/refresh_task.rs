@@ -110,19 +110,19 @@ struct RefreshStat {
     pub memory_size: usize,
 }
 
-/// Walks the federated provider chain and collects indexes from **every** [`IndexedTableProvider`]
-/// layer encountered. Known wrapper types (`FederatedTableProviderAdaptor`, `EmbeddingTable`) are
-/// unwrapped so that indexes nested inside them are not silently missed. These indexes receive
-/// write lifecycle hooks alongside accelerator refreshes.
-async fn indexes_from_federated(
-    federated: &Arc<FederatedTable>,
+/// Synchronous traversal: walks a provider chain and collects indexes from every
+/// [`IndexedTableProvider`] layer. Kept as a plain fn (not async) so that the
+/// `HashSet<*const ()>` used for dedup never appears inside an async fn and cannot
+/// make the enclosing future non-`Send`.
+fn collect_indexes_from_provider(
+    root: Arc<dyn datafusion::catalog::TableProvider>,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
     use crate::embeddings::table::EmbeddingTable;
     use runtime_datafusion_index::IndexedTableProvider;
 
     let mut indexes: Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut current = Some(federated.table_provider().await);
+    let mut current = Some(root);
 
     while let Some(provider) = current.take() {
         if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
@@ -149,6 +149,17 @@ async fn indexes_from_federated(
     }
 
     indexes
+}
+
+/// Walks the federated provider chain and collects indexes from **every** [`IndexedTableProvider`]
+/// layer encountered. Known wrapper types (`FederatedTableProviderAdaptor`, `EmbeddingTable`) are
+/// unwrapped so that indexes nested inside them are not silently missed. These indexes receive
+/// write lifecycle hooks alongside accelerator refreshes.
+async fn indexes_from_federated(
+    federated: &Arc<FederatedTable>,
+) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+    let root = federated.table_provider().await;
+    collect_indexes_from_provider(root)
 }
 
 pub struct RefreshTaskBuilder {
