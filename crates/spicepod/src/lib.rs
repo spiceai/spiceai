@@ -714,6 +714,35 @@ mod version_tests {
         assert_eq!(original.to_string(), "v2.0.0-rc.1");
     }
 
+    /// End-to-end: a full `vMAJOR.MINOR.PATCH-PRERELEASE` tag in a complete
+    /// `SpicepodDefinition` YAML deserializes and round-trips through serialization.
+    #[test]
+    fn test_full_version_tag_in_spicepod_definition() {
+        let yaml = r"
+            version: v2.0.0-rc.1
+            kind: Spicepod
+            name: prerelease_pod
+        ";
+        let def: SpicepodDefinition =
+            yaml::from_str(yaml).expect("Should parse SpicepodDefinition with v2.0.0-rc.1");
+        assert_eq!(def.version.to_string(), "v2.0.0-rc.1");
+        assert_eq!(def.version.major(), 2);
+        assert_eq!(def.version.minor(), Some(0));
+        assert_eq!(def.version.patch(), Some(0));
+        assert_eq!(def.version.pre_release(), Some("rc.1"));
+        assert_eq!(def.name, "prerelease_pod");
+
+        // Round-trip through serialize → deserialize preserves the version tag exactly.
+        let serialized = yaml::to_string(&def).expect("Should serialize");
+        assert!(
+            serialized.contains("version: v2.0.0-rc.1"),
+            "Serialized YAML should preserve full version tag, got:\n{serialized}"
+        );
+        let reparsed: SpicepodDefinition =
+            yaml::from_str(&serialized).expect("Should re-parse round-tripped YAML");
+        assert_eq!(reparsed.version, def.version);
+    }
+
     // ========================================================================
     // v1 schema support (backward compat with release/1.11)
     // ========================================================================

@@ -144,10 +144,25 @@ impl Display for SpicepodVersionParseError {
             ),
             SpicepodVersionParseErrorKind::UnsupportedMajor(major) => write!(
                 f,
-                "unsupported spicepod version '{}': major version v{major} is not supported (supported majors: v1, v2)",
-                self.input
+                "unsupported spicepod version '{}': major version v{major} is not supported (supported majors: {})",
+                self.input, FormatSupportedMajors,
             ),
         }
+    }
+}
+
+/// Renders [`SUPPORTED_MAJORS`] as a comma-separated list of `vN` tags (e.g. `v1, v2`).
+struct FormatSupportedMajors;
+
+impl Display for FormatSupportedMajors {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        for (i, major) in SUPPORTED_MAJORS.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "v{major}")?;
+        }
+        Ok(())
     }
 }
 
@@ -162,15 +177,25 @@ impl std::error::Error for SpicepodVersionParseError {}
 /// validates that the parsed major is in [`SUPPORTED_MAJORS`].
 const VERSION_PATTERN: &str = r"^v(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)?)?$";
 
-/// Currently supported major versions. Keep [`VERSION_SCHEMA_PATTERN`] in sync.
+/// Currently supported major versions.
+///
+/// To add or remove a supported major, edit this list — the parser error message and the
+/// JSON Schema `pattern` are derived from it, so they stay in sync automatically.
 const SUPPORTED_MAJORS: &[u64] = &[1, 2];
 
-/// JSON Schema pattern — restricted to currently supported major versions
-/// so external schema validators reject unsupported majors up-front.
-/// Keep in sync with [`SUPPORTED_MAJORS`].
+/// JSON Schema pattern — restricted to currently supported major versions so external
+/// schema validators reject unsupported majors up-front. Built once from [`SUPPORTED_MAJORS`].
 #[cfg(feature = "schemars")]
-const VERSION_SCHEMA_PATTERN: &str =
-    r"^v(1|2)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)?)?$";
+static VERSION_SCHEMA_PATTERN: LazyLock<String> = LazyLock::new(|| {
+    let majors = SUPPORTED_MAJORS
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        r"^v({majors})(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)?)?$"
+    )
+});
 
 #[expect(clippy::expect_used)]
 static VERSION_REGEX: LazyLock<Regex> =
@@ -238,10 +263,14 @@ impl JsonSchema for SpicepodVersion {
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        let pattern: &str = &VERSION_SCHEMA_PATTERN;
+        let description = format!(
+            "Spicepod schema version. Supported majors: {FormatSupportedMajors}. Examples: 'v1', 'v2', 'v2.0', 'v2.0.0', 'v2.0.0-rc.1'."
+        );
         json_schema!({
             "type": "string",
-            "pattern": VERSION_SCHEMA_PATTERN,
-            "description": "Spicepod schema version. Supported majors: v1, v2. Examples: 'v1', 'v2', 'v2.0', 'v2.0.0', 'v2.0.0-rc.1'."
+            "pattern": pattern,
+            "description": description,
         })
     }
 }
