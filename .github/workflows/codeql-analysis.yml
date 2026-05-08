@@ -18,7 +18,7 @@ on:
 jobs:
   analyze:
     name: Analyze
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     env:
       HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
       AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
