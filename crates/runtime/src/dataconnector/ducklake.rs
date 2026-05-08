@@ -325,6 +325,21 @@ impl DataConnectorFactory for DuckLakeFactory {
     }
 }
 
+impl DuckLake {
+    /// Builds a fully-qualified `TableReference` for the given dataset path.
+    ///
+    /// If the path contains a dot (e.g. `schema.table`), it is prefixed with the catalog name.
+    /// Otherwise, the default `main` schema is assumed: `catalog.main.table`.
+    fn resolve_table_reference(&self, dataset: &Dataset) -> TableReference {
+        let path = dataset.path();
+        if path.contains('.') {
+            format!("{}.{path}", self.catalog_name).into()
+        } else {
+            format!("{}.main.{path}", self.catalog_name).into()
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for DuckLake {
     fn as_any(&self) -> &dyn Any {
@@ -335,16 +350,7 @@ impl DataConnector for DuckLake {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        // The dataset path should be in the format "schema.table" or just "table"
-        // We need to prefix it with the catalog name to form a fully qualified reference
-        let path = dataset.path();
-        let table_ref: TableReference = if path.contains('.') {
-            // Already has schema, prefix with catalog
-            format!("{}.{}", self.catalog_name, path).into()
-        } else {
-            // Just table name, use catalog.main.table (DuckLake default schema is "main")
-            format!("{}.main.{}", self.catalog_name, path).into()
-        };
+        let table_ref = self.resolve_table_reference(dataset);
 
         Ok(Read::table_provider(&self.duckdb_factory, table_ref)
             .await
@@ -358,13 +364,7 @@ impl DataConnector for DuckLake {
         &self,
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        let path = dataset.path();
-        // TODO: Refactor to use `TableReference::full()` for safer, explicit table reference construction
-        let table_ref: TableReference = if path.contains('.') {
-            format!("{}.{}", self.catalog_name, path).into()
-        } else {
-            format!("{}.main.{}", self.catalog_name, path).into()
-        };
+        let table_ref = self.resolve_table_reference(dataset);
 
         let read_provider = match Read::table_provider(&self.duckdb_factory, table_ref.clone())
             .await

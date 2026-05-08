@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A federated DuckDB table writer that bypasses the acceleration-oriented
+//! A federated `DuckDB` table writer that bypasses the acceleration-oriented
 //! write path in `datafusion-table-providers`, which was designed for acceleration tables and:
 //! 1. Does not support multi-part table references, flattening them into a single quoted identifier (by design)
 //! 2. Has acceleration-specific logic for managing internal tables, views, indexes, and other optimizations
@@ -28,6 +28,7 @@ limitations under the License.
 use std::any::Any;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::{RecordBatch, RecordBatchReader};
 use arrow::datatypes::SchemaRef;
@@ -48,37 +49,13 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::duckdb::DuckDB;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use futures::StreamExt;
-use snafu::prelude::*;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Failed to get DuckDB connection: {source}"))]
-    ConnectionFailed {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+/// Process-wide counter to guarantee unique temporary view names.
+static VIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    #[snafu(display("Failed to begin transaction: {source}"))]
-    TransactionFailed { source: duckdb::Error },
-
-    #[snafu(display("Failed to commit transaction: {source}"))]
-    CommitFailed { source: duckdb::Error },
-
-    #[snafu(display("Failed to register Arrow scan view: {source}"))]
-    RegisterScanViewFailed { source: duckdb::Error },
-
-    #[snafu(display("Failed to execute INSERT: {source}"))]
-    InsertFailed { source: duckdb::Error },
-
-    #[snafu(display("Failed to drop temporary view: {source}"))]
-    DropViewFailed { source: duckdb::Error },
-
-    #[snafu(display("Failed to downcast DuckDB connection"))]
-    DowncastFailed,
-}
-
-/// A federated DuckDB table writer that properly handles multi-part table references.
+/// A federated `DuckDB` table writer that properly handles multi-part table references.
 ///
 /// Unlike the acceleration-oriented `DuckDBTableWriter` in `datafusion-table-providers`, this writer:
 /// - Stores `TableReference` directly (no `RelationName` flattening)
@@ -95,7 +72,7 @@ impl Debug for DuckDbFederatedTableWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DuckDbFederatedTableWriter")
             .field("table_reference", &self.table_reference)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -103,7 +80,7 @@ impl DuckDbFederatedTableWriter {
     /// Create a new `DuckDbFederatedTableWriter`.
     ///
     /// - `read_provider`: The underlying read-only `TableProvider` (for `scan` delegation).
-    /// - `pool`: `DuckDB` connection pool with the `ducklake` catalog already ATTACHed.
+    /// - `pool`: `DuckDB` connection pool with the `ducklake` catalog already attached.
     /// - `table_reference`: Fully-qualified table reference (e.g. `Full("catalog", "schema", "table")`).
     #[must_use]
     pub fn new(
@@ -180,7 +157,7 @@ impl Debug for DuckDbFederatedDataSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DuckDbFederatedDataSink")
             .field("table_reference", &self.table_reference)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -226,9 +203,7 @@ impl DataSink for DuckDbFederatedDataSink {
 
         let write_handle: JoinHandle<datafusion::common::Result<u64>> = tokio::task::spawn_blocking(
             move || {
-                let mut db_conn = pool
-                    .connect_sync()
-                    .map_err(|e| DataFusionError::External(e))?;
+                let mut db_conn = pool.connect_sync().map_err(DataFusionError::External)?;
 
                 let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -257,7 +232,8 @@ impl DataSink for DuckDbFederatedDataSink {
                 //  2. Open a transaction for the INSERT (writes only to the target).
                 //  3. Commit or roll back.
                 //  4. Drop the view (best-effort).
-                let view_name = format!("__scan_{current_ts}");
+                let view_id = VIEW_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let view_name = format!("__scan_{current_ts}_{view_id}");
                 duckdb_conn
                     .conn
                     .register_arrow_scan_view(&view_name, &stream)
@@ -279,8 +255,7 @@ impl DataSink for DuckDbFederatedDataSink {
                         }
 
                         let insert_sql = format!(
-                            r#"INSERT INTO {table_ref} SELECT * FROM "{view_name}""#,
-                            table_ref = table_ref_quoted,
+                            r#"INSERT INTO {table_ref_quoted} SELECT * FROM "{view_name}""#
                         );
                         tracing::debug!("{insert_sql}");
 
@@ -312,9 +287,16 @@ impl DataSink for DuckDbFederatedDataSink {
                 };
 
                 // Best-effort cleanup: drop the temporary view after the transaction is resolved.
-                let _ = duckdb_conn
+                if let Err(e) = duckdb_conn
                     .conn
-                    .execute(&format!(r#"DROP VIEW IF EXISTS "{view_name}""#), []);
+                    .execute(&format!(r#"DROP VIEW IF EXISTS "{view_name}""#), [])
+                {
+                    tracing::warn!(
+                        view_name = %view_name,
+                        error = %e,
+                        "Failed to drop temporary DuckDB arrow scan view after insert"
+                    );
+                }
 
                 result
             },
@@ -361,7 +343,7 @@ impl DataSink for DuckDbFederatedDataSink {
 }
 
 /// Bridges an async `mpsc::Receiver<RecordBatch>` to a synchronous `RecordBatchReader`
-/// for use with DuckDB's `register_arrow_scan_view`.
+/// for use with `DuckDB`'s `register_arrow_scan_view`.
 struct SyncRecordBatchReceiver {
     rx: mpsc::Receiver<RecordBatch>,
     schema: SchemaRef,

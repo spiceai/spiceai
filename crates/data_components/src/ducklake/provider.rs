@@ -82,8 +82,8 @@ pub struct DuckLakeCatalogProvider {
     /// Optional glob filter for table inclusion (`schema.table` format)
     include: Option<Arc<GlobSet>>,
     /// Shared write lock to serialize concurrent writes across all schemas.
-    /// All schemas share one DuckDB instance which enforces single-writer semantics;
-    /// serializing here avoids wasting blocking threads that would just wait on DuckDB's
+    /// All schemas share one `DuckDB` instance which enforces single-writer semantics;
+    /// serializing here avoids wasting blocking threads that would just wait on `DuckDB`'s
     /// internal write lock.
     write_lock: Arc<Mutex<()>>,
 }
@@ -415,8 +415,8 @@ pub struct DuckLakeSchemaProvider {
     /// Optional glob filter for table inclusion (`schema.table` format)
     include: Option<Arc<GlobSet>>,
     /// Shared write lock to serialize concurrent writes across all schemas.
-    /// All schemas share one DuckDB instance which enforces single-writer semantics;
-    /// serializing here avoids wasting blocking threads that would just wait on DuckDB's
+    /// All schemas share one `DuckDB` instance which enforces single-writer semantics;
+    /// serializing here avoids wasting blocking threads that would just wait on `DuckDB`'s
     /// internal write lock.
     write_lock: Arc<Mutex<()>>,
 }
@@ -444,6 +444,10 @@ impl DuckLakeSchemaProvider {
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
     /// * `include` - Optional glob filter for table inclusion (`schema.table` format)
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "schema provider requires all these configuration parameters"
+    )]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
         duckdb_factory: Arc<DuckDBTableFactory>,
