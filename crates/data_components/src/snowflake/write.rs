@@ -39,6 +39,10 @@ use snafu::prelude::*;
 use snowflake_api::{QueryResult, SnowflakeApi};
 use tokio::sync::Mutex;
 
+use datafusion_federation::{
+    FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan, FederationProvider,
+};
+
 use super::SnowflakeConnectionPool;
 
 const INSERT_BATCH_ROWS: usize = 1_000;
@@ -121,15 +125,51 @@ impl SnowflakeTableProvider {
         schema: SchemaRef,
         dialect: Arc<dyn Dialect + Send + Sync>,
         write_lock: Arc<Mutex<()>>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            read_provider,
+    ) -> Arc<dyn TableProvider> {
+        let write_provider = Arc::new(Self {
+            read_provider: Arc::clone(&read_provider),
             pool,
             table_reference,
             schema,
             dialect,
             write_lock,
-        })
+        });
+
+        // Re-wrap in a FederatedTableProviderAdaptor so that datafusion-federation's
+        // analyzer still recognises this as a federated table (it only downcasts to
+        // FederatedTableProviderAdaptor). The source carries the fully-qualified SQL;
+        // the fallback provider is our write-capable SnowflakeTableProvider.
+        if let Some(adaptor) = read_provider
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+        {
+            return Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+                Arc::clone(&adaptor.source),
+                write_provider,
+            ));
+        }
+
+        write_provider
+    }
+}
+
+impl FederationProvider for SnowflakeTableProvider {
+    fn name(&self) -> &'static str {
+        "SnowflakeTableProvider"
+    }
+
+    fn compute_context(&self) -> Option<String> {
+        self.read_provider
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .and_then(|a| a.source.federation_provider().compute_context())
+    }
+
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
+        self.read_provider
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .and_then(|a| a.source.federation_provider().analyzer(plan))
     }
 }
 
@@ -200,6 +240,7 @@ impl TableProvider for SnowflakeTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        tracing::info!(table_reference = ?self.table_reference, "SnowflakeTableProvider::insert_into");
         if matches!(insert_op, InsertOp::Replace) {
             return Err(DataFusionError::Plan(
                 "Snowflake tables do not support INSERT REPLACE semantics".to_string(),
@@ -312,6 +353,7 @@ impl DataSink for SnowflakeDataSink {
     ) -> DataFusionResult<u64> {
         let _write_guard = self.write_lock.lock().await;
         let table_name = self.table_reference.to_quoted_string();
+        tracing::info!(table_reference = ?self.table_reference, table_name = %table_name, "SnowflakeDataSink::write_all");
         let api = snowflake_api_from_pool(&self.pool, &table_name).await?;
 
         let mut transaction_started = false;

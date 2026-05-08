@@ -20,7 +20,7 @@ use super::DataConnector;
 use super::DataConnectorFactory;
 use super::ParameterSpec;
 use async_trait::async_trait;
-use data_components::Read;
+use data_components::{Read, ReadWrite};
 use data_components::snowflake::SnowflakeTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
@@ -187,6 +187,32 @@ impl DataConnector for Snowflake {
                 dataconnector: "snowflake",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
+    }
+
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        let path = dataset
+            .path()
+            .split('.')
+            .map(|x| {
+                if x.starts_with('"') && x.ends_with('"') {
+                    return x.into();
+                }
+
+                format!("\"{x}\"")
+            })
+            .join(".");
+
+        Some(
+            ReadWrite::table_provider(&self.table_factory, path.into())
+                .await
+                .context(super::UnableToGetReadWriteProviderSnafu {
+                    dataconnector: "snowflake",
+                    connector_component: ConnectorComponent::from(dataset),
+                }),
+        )
     }
 }
 

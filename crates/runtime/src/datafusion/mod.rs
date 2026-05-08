@@ -2907,7 +2907,7 @@ impl DataFusion {
 
         let federated_table_provider = federated_read_table.table_provider().await;
 
-        let source_table_provider = match dataset.access() {
+        let source_table_provider: Arc<dyn TableProvider> = match dataset.access() {
             AccessMode::Read => federated_table_provider,
             AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
                 .read_write_provider(dataset)
