@@ -113,6 +113,7 @@ mod metrics;
 pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
+mod object_store_state;
 mod opentelemetry;
 pub mod otel_push_exporter;
 pub mod resource_monitor;

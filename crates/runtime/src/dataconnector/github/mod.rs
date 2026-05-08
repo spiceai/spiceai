@@ -88,6 +88,10 @@ static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
 static UNAUTHENTICATED_AUTH_CONTEXT: &str = "unauthenticated";
 const GITHUB_CONNECTOR_DOCS_URL: &str =
     "https://spiceai.org/docs/components/data-connectors/github";
+const RUNTIME_SOURCE_GITHUB_CONCURRENT_CONNECTIONS_LIMIT: &str =
+    "runtime.source_rate_control.github_concurrent_connections_limit";
+const LEGACY_RUNTIME_GITHUB_MAX_CONCURRENT_CONNECTIONS: &str =
+    "runtime.params.github_max_concurrent_connections";
 
 fn sanitize_github_validation_body(body: &str) -> String {
     body.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -770,7 +774,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run. Defaults to 'disabled'.")
         .default("disabled"),
     ParameterSpec::runtime("max_concurrent_requests")
-        .description("Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.params.github_max_concurrent_connections or the connector default."),
+        .description("Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.source_rate_control.github_concurrent_connections_limit, deprecated runtime.params.github_max_concurrent_connections, or the connector default."),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -843,16 +847,17 @@ impl DataConnectorFactory for GithubFactory {
             },
         };
 
-        let app_max_concurrent_connections = params
-            .app
-            .and_then(|app| {
-                app.runtime
-                    .params
-                    .get("github_max_concurrent_connections")
-                    .cloned()
-            })
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0);
+        let app_max_concurrent_connections = if dataset_max_concurrent_requests.is_some() {
+            None
+        } else {
+            match resolve_runtime_github_concurrent_connections_limit(
+                params.app.as_deref(),
+                &connector_component,
+            ) {
+                Ok(value) => value,
+                Err(error) => return Box::pin(async move { Err(Box::new(error) as _) }),
+            }
+        };
 
         let max_concurrent_connections = dataset_max_concurrent_requests
             .or(app_max_concurrent_connections)
@@ -929,6 +934,50 @@ impl DataConnectorFactory for GithubFactory {
 }
 
 register_data_connector!("github", GithubFactory);
+
+fn resolve_runtime_github_concurrent_connections_limit(
+    app: Option<&app::App>,
+    connector_component: &ConnectorComponent,
+) -> Result<Option<usize>, DataConnectorError> {
+    let Some(app) = app else {
+        return Ok(None);
+    };
+
+    let source_limit = app
+        .runtime
+        .source_rate_control
+        .as_ref()
+        .and_then(|config| config.github_concurrent_connections_limit);
+    let legacy_limit = app
+        .runtime
+        .params
+        .get("github_max_concurrent_connections")
+        .map(String::as_str);
+
+    if legacy_limit.is_some() {
+        tracing::warn!(
+            "`{LEGACY_RUNTIME_GITHUB_MAX_CONCURRENT_CONNECTIONS}` is deprecated; use `{RUNTIME_SOURCE_GITHUB_CONCURRENT_CONNECTIONS_LIMIT}` instead."
+        );
+    }
+
+    if let Some(source_limit) = source_limit {
+        if source_limit == 0 {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "github".to_string(),
+                connector_component: connector_component.clone(),
+                message: format!(
+                    "`{RUNTIME_SOURCE_GITHUB_CONCURRENT_CONNECTIONS_LIMIT}` must be greater than 0."
+                ),
+            });
+        }
+
+        return Ok(Some(source_limit));
+    }
+
+    Ok(legacy_limit
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0))
+}
 
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) enum GitHubQueryMode {
@@ -1838,7 +1887,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{GithubFactory, PARAMETERS, parse_github_path, sanitize_github_validation_body};
+    use super::{
+        Github, GithubFactory, PARAMETERS, parse_github_path, sanitize_github_validation_body,
+    };
     use crate::Runtime;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::{
@@ -1853,6 +1904,21 @@ mod tests {
         dataset_name: &str,
         token: &str,
         extra: &[(&str, &str)],
+    ) -> ConnectorParams {
+        github_connector_params_with_runtime(
+            dataset_name,
+            token,
+            extra,
+            spicepod::component::runtime::Runtime::default(),
+        )
+        .await
+    }
+
+    async fn github_connector_params_with_runtime(
+        dataset_name: &str,
+        token: &str,
+        extra: &[(&str, &str)],
+        app_runtime: spicepod::component::runtime::Runtime,
     ) -> ConnectorParams {
         let mut params = vec![("github_token".to_string(), token.to_string().into())];
         params.extend(
@@ -1871,7 +1937,9 @@ mod tests {
         .await
         .expect("test GitHub parameters should be valid");
 
-        let app = app::AppBuilder::new(dataset_name.to_string()).build();
+        let app = app::AppBuilder::new(dataset_name.to_string())
+            .with_runtime(app_runtime)
+            .build();
         let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
         let app = Arc::new(app);
         let dataset = DatasetBuilder::try_new(
@@ -1892,6 +1960,15 @@ mod tests {
             runtime: Some(runtime),
             io_runtime: tokio::runtime::Handle::current(),
         }
+    }
+
+    fn github_available_permits(connector: &Arc<dyn crate::dataconnector::DataConnector>) -> usize {
+        connector
+            .as_any()
+            .downcast_ref::<Github>()
+            .expect("connector should be GitHub")
+            .semaphore
+            .available_permits()
     }
 
     fn expect_invalid_configuration_message(
@@ -1949,6 +2026,118 @@ mod tests {
 
         let Err(error) = GithubFactory::new().create(params).await else {
             panic!("zero GitHub max_concurrent_requests should be rejected");
+        };
+        let message = expect_invalid_configuration_message(error);
+
+        assert!(
+            message.contains("must be greater than 0"),
+            "expected zero-limit validation error, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_github_uses_source_rate_control_concurrency_limit() {
+        let factory = GithubFactory::new();
+        let app_runtime = spicepod::component::runtime::Runtime {
+            source_rate_control: Some(spicepod::component::runtime::SourceRateControl {
+                github_concurrent_connections_limit: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let params = github_connector_params_with_runtime(
+            "github_source_rate_control_concurrency",
+            "github-source-rate-control-token",
+            &[],
+            app_runtime,
+        )
+        .await;
+
+        let connector = factory
+            .create(params)
+            .await
+            .expect("GitHub connector should be created");
+
+        assert_eq!(github_available_permits(&connector), 2);
+    }
+
+    #[tokio::test]
+    async fn test_github_source_rate_control_overrides_legacy_runtime_param() {
+        let factory = GithubFactory::new();
+        let mut app_runtime = spicepod::component::runtime::Runtime {
+            source_rate_control: Some(spicepod::component::runtime::SourceRateControl {
+                github_concurrent_connections_limit: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        app_runtime.params.insert(
+            "github_max_concurrent_connections".to_string(),
+            "3".to_string(),
+        );
+
+        let params = github_connector_params_with_runtime(
+            "github_source_rate_control_overrides_legacy",
+            "github-source-rate-control-overrides-legacy-token",
+            &[],
+            app_runtime,
+        )
+        .await;
+
+        let connector = factory
+            .create(params)
+            .await
+            .expect("GitHub connector should be created");
+
+        assert_eq!(github_available_permits(&connector), 2);
+    }
+
+    #[tokio::test]
+    async fn test_github_keeps_legacy_runtime_concurrency_param() {
+        let factory = GithubFactory::new();
+        let mut app_runtime = spicepod::component::runtime::Runtime::default();
+        app_runtime.params.insert(
+            "github_max_concurrent_connections".to_string(),
+            "3".to_string(),
+        );
+
+        let params = github_connector_params_with_runtime(
+            "github_legacy_runtime_concurrency",
+            "github-legacy-runtime-concurrency-token",
+            &[],
+            app_runtime,
+        )
+        .await;
+
+        let connector = factory
+            .create(params)
+            .await
+            .expect("GitHub connector should be created");
+
+        assert_eq!(github_available_permits(&connector), 3);
+    }
+
+    #[tokio::test]
+    async fn test_github_rejects_zero_source_rate_control_concurrency_limit() {
+        let app_runtime = spicepod::component::runtime::Runtime {
+            source_rate_control: Some(spicepod::component::runtime::SourceRateControl {
+                github_concurrent_connections_limit: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let params = github_connector_params_with_runtime(
+            "github_zero_source_rate_control_concurrency",
+            "github-zero-source-rate-control-token",
+            &[],
+            app_runtime,
+        )
+        .await;
+
+        let Err(error) = GithubFactory::new().create(params).await else {
+            panic!("zero source_rate_control GitHub limit should be rejected");
         };
         let message = expect_invalid_configuration_message(error);
 

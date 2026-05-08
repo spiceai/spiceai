@@ -102,6 +102,8 @@ mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
+#[cfg(feature = "rate-control")]
+mod rate_control;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;

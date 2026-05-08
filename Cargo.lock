@@ -3933,6 +3933,7 @@ dependencies = [
  "opentelemetry",
  "paste",
  "runtime",
+ "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
  "snafu",
@@ -15974,8 +15975,12 @@ version = "2.0.0-unstable"
 dependencies = [
  "futures",
  "governor",
+ "object_store",
+ "object_store_occ",
  "rand 0.10.1",
+ "serde",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
 ]
