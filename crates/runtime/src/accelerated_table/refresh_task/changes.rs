@@ -958,7 +958,7 @@ mod tests {
         Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
     }
 
-    async fn make_refresh_task(accelerator: Arc<dyn TableProvider>) -> RefreshTask {
+    fn make_refresh_task(accelerator: Arc<dyn TableProvider>) -> RefreshTask {
         use crate::accelerated_table::refresh_task::RefreshTaskBuilder;
         use crate::federated_table::FederatedTable;
         use tokio::runtime::Handle;
@@ -975,12 +975,11 @@ mod tests {
             Arc::new(Mutex::new(())),
         )
         .build()
-        .await
     }
 
     #[tokio::test]
     async fn test_write_change_upsert_returns_data_written() {
-        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let change_batch =
             create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
         assert_eq!(
@@ -993,7 +992,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_change_delete_returns_data_written() {
-        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let change_batch =
             create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
         assert_eq!(
@@ -1006,7 +1005,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_returns_no_change() {
-        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         // Any unrecognized op string maps to ChangeOperation::Unknown
         let change_batch = create_test_change_batch(vec![], &[], vec![], vec![]);
         assert_eq!(
@@ -1189,7 +1188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_changes_stream_processes_envelopes_in_order() {
-        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let log = CommitLog::new();
         let stream = make_changes_stream(vec![
             Ok(make_tracked_envelope(1, Arc::clone(&log), false)),
@@ -1272,7 +1271,7 @@ mod tests {
             inner: make_mem_table() as Arc<dyn TableProvider>,
             write_log: Arc::clone(&write_log),
         });
-        let task = make_refresh_task(provider as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
 
         // Use a single shared log; both `insert_into` and `commit()` push
         // markers, so we can read off the interleaved write/commit sequence.
@@ -1309,7 +1308,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_changes_stream_continues_after_stream_error() {
-        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let log = CommitLog::new();
 
         // Sandwich a fatal stream error between two healthy envelopes; both
@@ -1336,7 +1335,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_changes_stream_terminates_on_stream_end() {
-        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let log = CommitLog::new();
 
         // Empty stream: returns None immediately. start_changes_stream must
@@ -1357,7 +1356,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_changes_stream_signals_dataset_ready() {
-        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let log = CommitLog::new();
         let initial_load = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(Notify::new());
@@ -1481,7 +1480,7 @@ mod tests {
             delay: Duration::from_millis(80),
             writes_started: Arc::clone(&writes_started),
         });
-        let task = make_refresh_task(slow as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(slow as Arc<dyn TableProvider>);
 
         let log = CommitLog::new();
         let envelopes: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=6)
@@ -1568,7 +1567,7 @@ mod tests {
             }
         }
 
-        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>).await;
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let log = CommitLog::new();
         let drop_signal = Arc::new(Notify::new());
 

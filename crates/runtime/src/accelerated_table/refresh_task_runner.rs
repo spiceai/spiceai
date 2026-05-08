@@ -153,7 +153,7 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
-    pub async fn build(self) -> RefreshTaskRunner {
+    pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
             self.dataset_name.clone(),
@@ -183,7 +183,7 @@ impl RefreshTaskRunnerBuilder {
         refresh_task_builder =
             refresh_task_builder.with_snapshot_refresh_state(self.snapshot_refresh_state);
 
-        let refresh_task = Arc::new(refresh_task_builder.build().await);
+        let refresh_task = Arc::new(refresh_task_builder.build());
 
         RefreshTaskRunner {
             dataset_name: self.dataset_name,

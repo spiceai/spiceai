@@ -166,8 +166,7 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
         Handle::current(),
         Arc::new(Mutex::new(())),
     )
-    .build()
-    .await;
+    .build();
 
     let (start_refresh, mut on_refresh_complete) =
         runner.start().expect("Should start refresh task");

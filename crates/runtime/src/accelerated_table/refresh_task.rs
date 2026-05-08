@@ -155,10 +155,15 @@ fn collect_indexes_from_provider(
 /// layer encountered. Known wrapper types (`FederatedTableProviderAdaptor`, `EmbeddingTable`) are
 /// unwrapped so that indexes nested inside them are not silently missed. These indexes receive
 /// write lifecycle hooks alongside accelerator refreshes.
-async fn indexes_from_federated(
-    federated: &Arc<FederatedTable>,
+///
+/// Uses `try_table_provider_sync` to avoid blocking when the federated provider is deferred
+/// (e.g. during schema evolution). If the provider is not yet available, returns an empty list.
+fn indexes_from_federated(
+    federated: &FederatedTable,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
-    let root = federated.table_provider().await;
+    let Some(root) = federated.try_table_provider_sync() else {
+        return Vec::new();
+    };
     collect_indexes_from_provider(root)
 }
 
@@ -284,7 +289,7 @@ impl RefreshTaskBuilder {
     }
 
     #[must_use]
-    pub async fn build(self) -> RefreshTask {
+    pub fn build(self) -> RefreshTask {
         let semaphore = self
             .semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
@@ -306,7 +311,7 @@ impl RefreshTaskBuilder {
         // given the typical usage pattern.
         // Extract indexes from the federated provider chain so they receive write
         // lifecycle hooks without needing to be manually plumbed through as sink_indexes.
-        let federated_indexes = indexes_from_federated(&self.federated).await;
+        let federated_indexes = indexes_from_federated(&self.federated);
         let sink = Arc::new(RwLock::new(
             AccelerationSink::new(Arc::clone(&self.accelerator))
                 .with_sink_indexes(federated_indexes),
@@ -2791,8 +2796,7 @@ mod tests {
             Handle::current(),
             Arc::new(Mutex::new(())),
         )
-        .build()
-        .await;
+        .build();
 
         // The refresh must have a time_column so the dedup path is entered.
         // append_overlap of 1s ensures the overlap window includes the existing

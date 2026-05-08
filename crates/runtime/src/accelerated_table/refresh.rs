@@ -970,7 +970,7 @@ impl Refresher {
         refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
 
-        let mut refresh_task_runner = refresh_task_runner.build().await;
+        let mut refresh_task_runner = refresh_task_runner.build();
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start()?;
         self.refresh_task_runner = Some(refresh_task_runner);
@@ -1216,7 +1216,7 @@ impl Refresher {
 
         let notifier = self.on_complete_notification.clone();
         tokio::spawn(async move {
-            let refresh_task = refresh_task_builder.build().await;
+            let refresh_task = refresh_task_builder.build();
             if let Err(err) = refresh_task
                 .start_changes_stream(
                     refresh,
