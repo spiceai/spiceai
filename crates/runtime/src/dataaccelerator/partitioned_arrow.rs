@@ -160,7 +160,12 @@ impl DataAccelerator for PartitionedArrowAccelerator {
             }
         );
 
-        if let Some(acceleration) = source.as_ref().and_then(|s| s.acceleration()) {
+        let acceleration = source.as_ref().and_then(|s| s.acceleration());
+        let is_caching_mode = acceleration.is_some_and(|acceleration| {
+            matches!(acceleration.refresh_mode, Some(RefreshMode::Caching))
+        });
+
+        if let Some(acceleration) = acceleration {
             if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
                 cmd.options
                     .insert("sort_columns".to_string(), sort_cols_str.clone());
@@ -172,18 +177,12 @@ impl DataAccelerator for PartitionedArrowAccelerator {
             // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
             // which overwrites the entire table. Primary key constraints cause uniqueness validation
             // errors during inserts because Arrow doesn't support upsert operations.
-            if matches!(acceleration.refresh_mode, Some(RefreshMode::Caching)) {
+            if is_caching_mode {
                 cmd.constraints = Constraints::new_unverified(vec![]);
             }
         }
 
-        if !source
-            .as_ref()
-            .and_then(|s| s.acceleration())
-            .is_some_and(|acceleration| {
-                matches!(acceleration.refresh_mode, Some(RefreshMode::Caching))
-            })
-        {
+        if !is_caching_mode {
             super::arrow::enable_hash_index_for_primary_key(&mut cmd);
         }
 

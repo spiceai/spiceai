@@ -356,14 +356,26 @@ impl Acceleration {
 
     /// Returns whether `hash_index` is explicitly enabled in the acceleration params.
     #[must_use]
-    pub fn is_hash_index_enabled(&self) -> bool {
+    pub fn is_hash_index_explicitly_enabled(&self) -> bool {
         matches!(self.engine, Engine::Arrow | Engine::PartitionedArrow)
-            && (self
+            && self
                 .params
                 .get("hash_index")
                 .is_some_and(|v| v.eq_ignore_ascii_case("enabled"))
-                || (self.primary_key.is_some()
-                    && !matches!(self.refresh_mode, Some(RefreshMode::Caching))))
+    }
+
+    /// Returns whether `hash_index` is automatically enabled because `primary_key` is configured.
+    #[must_use]
+    pub fn is_hash_index_auto_enabled_by_primary_key(&self) -> bool {
+        matches!(self.engine, Engine::Arrow | Engine::PartitionedArrow)
+            && self.primary_key.is_some()
+            && !matches!(self.refresh_mode, Some(RefreshMode::Caching))
+    }
+
+    /// Returns whether Arrow `hash_index` is effectively enabled, either explicitly or via `primary_key`.
+    #[must_use]
+    pub fn is_hash_index_enabled(&self) -> bool {
+        self.is_hash_index_explicitly_enabled() || self.is_hash_index_auto_enabled_by_primary_key()
     }
 }
 

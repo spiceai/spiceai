@@ -459,9 +459,7 @@ fn select_data_rows(
         .collect::<Result<Vec<_>, _>>()
         .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
 
-    let indices_array = UInt32Array::from(
-        indices,
-    );
+    let indices_array = UInt32Array::from(indices);
 
     let selected_columns: Vec<ArrayRef> = data_batch
         .columns()
