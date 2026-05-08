@@ -606,6 +606,9 @@ impl VectorSearchTableFunc {
         let federated_tbl_storage: Arc<dyn TableProvider>;
         #[cfg(feature = "elasticsearch")]
         let normalized_tbl_storage: Arc<dyn TableProvider>;
+        // For Elasticsearch indexes, normalize the base table provider schema to match
+        // what the ES HTTP client produces (e.g. LargeUtf8 → Utf8). This ensures that
+        // HashJoinExec key types match on both sides of the join.
         #[cfg(feature = "elasticsearch")]
         let tbl: &Arc<dyn TableProvider> =
             if let Some(es_index) = vector_index.as_any().downcast_ref::<ElasticsearchIndex>() {
