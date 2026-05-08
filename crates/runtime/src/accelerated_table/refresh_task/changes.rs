@@ -440,6 +440,86 @@ impl RefreshTask {
     }
 }
 
+fn select_data_rows(
+    data_batch: &RecordBatch,
+    row_indices: &[usize],
+) -> crate::accelerated_table::Result<RecordBatch> {
+    let indices_array = UInt32Array::from(
+        row_indices
+            .iter()
+            .filter_map(|&idx| u32::try_from(idx).ok())
+            .collect::<Vec<_>>(),
+    );
+
+    let selected_columns: Vec<ArrayRef> = data_batch
+        .columns()
+        .iter()
+        .map(|col| arrow::compute::take(col.as_ref(), &indices_array, None))
+        .collect::<Result<Vec<_>, _>>()
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+
+    RecordBatch::try_new(data_batch.schema(), selected_columns)
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)
+}
+
+async fn delete_matching_rows_from_arrow_provider(
+    provider: &Arc<dyn TableProvider>,
+    rows: &RecordBatch,
+) -> crate::accelerated_table::Result<Option<u64>> {
+    if let Some(table) = provider.as_any().downcast_ref::<MemTable>() {
+        return table
+            .delete_matching_rows(rows)
+            .await
+            .map(Some)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu);
+    }
+
+    if let Some(table) = provider.as_any().downcast_ref::<IndexedMemTable>() {
+        return table
+            .delete_matching_rows(rows)
+            .await
+            .map(Some)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu);
+    }
+
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+        let mut deleted = 0_u64;
+        let mut matched_arrow_provider = false;
+        for partition_provider in partitioned.partition_table_providers().await {
+            if let Some(partition_deleted) =
+                Box::pin(delete_matching_rows_from_arrow_provider(&partition_provider, rows))
+                    .await?
+            {
+                deleted += partition_deleted;
+                matched_arrow_provider = true;
+            }
+        }
+
+        return Ok(matched_arrow_provider.then_some(deleted));
+    }
+
+    Ok(None)
+}
+
+async fn perform_change_write_maintenance(
+    provider: &Arc<dyn TableProvider>,
+) -> crate::accelerated_table::Result<()> {
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+        for partition_provider in partitioned.partition_table_providers().await {
+            Box::pin(perform_change_write_maintenance(&partition_provider)).await?;
+        }
+        return Ok(());
+    }
+
+    perform_index_maintenance(provider.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(find_datafusion_root)
+        .context(crate::accelerated_table::FailedToWriteDataSnafu)
+}
+
 pub(crate) fn get_primary_key_value(
     data: &RecordBatch,
     key: &str,
