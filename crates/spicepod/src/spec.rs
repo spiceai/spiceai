@@ -21,7 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use std::{collections::HashMap, fmt::Debug};
 
 use crate::component::catalog::Catalog;
@@ -134,51 +134,35 @@ impl Display for SpicepodVersionParseError {
 
 impl std::error::Error for SpicepodVersionParseError {}
 
-fn version_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^v(\d+)(?:\.(\d+)(?:\.(\d+))?)?(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$")
-            .expect("spicepod version regex must compile")
-    })
-}
+/// Pattern accepted by [`SpicepodVersion::from_str`].
+///
+/// Numeric components disallow leading zeros (`v01`, `v2.01.0` are invalid).
+/// A pre-release identifier is only valid alongside a full `major.minor.patch`.
+const VERSION_PATTERN: &str = r"^v(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)?)?$";
+
+static VERSION_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(VERSION_PATTERN).expect("spicepod version regex must compile"));
 
 impl FromStr for SpicepodVersion {
     type Err = SpicepodVersionParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let captures = version_regex()
-            .captures(s)
-            .ok_or_else(|| SpicepodVersionParseError {
-                input: s.to_string(),
-            })?;
+        let err = || SpicepodVersionParseError {
+            input: s.to_string(),
+        };
+        let captures = VERSION_REGEX.captures(s).ok_or_else(err)?;
 
         let parse_num = |idx: usize| -> Result<Option<u64>, SpicepodVersionParseError> {
             captures
                 .get(idx)
-                .map(|m| {
-                    m.as_str()
-                        .parse::<u64>()
-                        .map_err(|_| SpicepodVersionParseError {
-                            input: s.to_string(),
-                        })
-                })
+                .map(|m| m.as_str().parse::<u64>().map_err(|_| err()))
                 .transpose()
         };
 
-        let major = parse_num(1)?.ok_or_else(|| SpicepodVersionParseError {
-            input: s.to_string(),
-        })?;
+        let major = parse_num(1)?.ok_or_else(err)?;
         let minor = parse_num(2)?;
         let patch = parse_num(3)?;
         let pre_release = captures.get(4).map(|m| m.as_str().to_string());
-
-        // Pre-release requires a full major.minor.patch — otherwise the regex
-        // would have matched the pre-release as part of the minor/patch slots.
-        if pre_release.is_some() && (minor.is_none() || patch.is_none()) {
-            return Err(SpicepodVersionParseError {
-                input: s.to_string(),
-            });
-        }
 
         Ok(Self {
             major,
@@ -215,7 +199,7 @@ impl JsonSchema for SpicepodVersion {
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         json_schema!({
             "type": "string",
-            "pattern": r"^v\d+(\.\d+(\.\d+)?)?(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$",
+            "pattern": VERSION_PATTERN,
             "description": "Spicepod schema version. Examples: 'v1', 'v2', 'v2.0', 'v2.0.0', 'v2.0.0-rc.1'."
         })
     }

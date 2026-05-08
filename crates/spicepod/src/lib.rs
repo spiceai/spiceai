@@ -642,7 +642,19 @@ mod version_tests {
     #[test]
     fn test_malformed_version_error_message() {
         let cases = [
-            "v1beta1", "1.0.0", "vfoo", "v", "v1.", "v1.0.0-", "v1-rc.1", "v1.0.0.0",
+            "v1beta1",
+            "1.0.0",
+            "vfoo",
+            "v",
+            "v1.",
+            "v1.0.0-",
+            "v1-rc.1",
+            "v1.0-rc.1",
+            "v1.0.0.0",
+            "v01",
+            "v2.01",
+            "v2.0.01",
+            "v02.0.0",
         ];
         for case in cases {
             let result: Result<SpicepodVersion, _> = yaml::from_str(case);
