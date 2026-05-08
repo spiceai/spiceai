@@ -2,16 +2,16 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q4"
 ---
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                      |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                                 |
-|               |  Projection: avg(hits.UserID)                                                                                                                             |
-|               |   Aggregate: groupBy=[[]], aggr=[[avg(hits.UserID)]]                                                                                                      |
-|               |     TableScan: hits projection=[UserID]                                                                                                                   |
-| physical_plan | SchemaCastScanExec                                                                                                                                        |
-|               |   CooperativeExec                                                                                                                                         |
-|               |     BytesProcessedExec                                                                                                                                    |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                 |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                            |
+|               |  Projection: avg(hits.UserID)                                                                                                        |
+|               |   Aggregate: groupBy=[[]], aggr=[[avg(hits.UserID)]]                                                                                 |
+|               |     TableScan: hits projection=[UserID]                                                                                              |
+| physical_plan | SchemaCastScanExec                                                                                                                   |
+|               |   CooperativeExec                                                                                                                    |
+|               |     BytesProcessedExec                                                                                                               |
 |               |       VirtualExecutionPlan name=sqlite compute_context=//data/accelerated_sqlite.db base_sql=SELECT avg(`hits`.`UserID`) FROM `hits` |
-|               |                                                                                                                                                           |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+
+|               |                                                                                                                                      |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------+

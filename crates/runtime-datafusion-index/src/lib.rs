@@ -49,6 +49,22 @@ pub trait Index: Debug + Send + Sync + 'static {
         Ok(batches)
     }
 
+    /// Called before data is written via the [`TableSink`] path (full refresh or append).
+    ///
+    /// Default is a no-op. Implementations use this to prepare external index state for a
+    /// bounded write window. Not called for CDC writes.
+    async fn on_write_start(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called if a [`TableSink`] write fails after [`Index::on_write_start`] ran.
+    ///
+    /// Default is a no-op. Implementations use this to restore temporary external index
+    /// settings when a refresh or append fails before [`Index::on_write_complete`] can run.
+    async fn on_write_failed(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Called after data has been written via the [`TableSink`] path (full refresh or append).
     ///
     /// Default is a no-op. Implementations use this to create or verify persistent structures

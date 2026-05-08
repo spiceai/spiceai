@@ -98,6 +98,8 @@ model_components = { path = "../model_components" }
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
+arc-swap = "1.7"
+sha2 = { workspace = true }
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
 object_store_occ = { path = "../object_store_occ" }
@@ -162,7 +164,6 @@ search = { path = "../search", default-features = false, features = [
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spice-cloud-client.workspace = true
@@ -207,6 +208,7 @@ yaml = { path = "../yaml" }
 anyhow.workspace = true
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 aws-credential-types = { workspace = true, features = [
     "hardcoded-credentials",
 ] }
@@ -271,7 +273,6 @@ adbc = [
     "dep:adbc_core",
     "dep:adbc_driver_manager",
     "dep:blake3",
-    "dep:sha2",
     "data_components/adbc",
     "datafusion-table-providers/adbc-federation",
 ]
@@ -319,6 +320,7 @@ flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
 hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
 http-functions = ["runtime-datafusion-udfs/http-functions"]
+rate-control = []
 wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
 wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []

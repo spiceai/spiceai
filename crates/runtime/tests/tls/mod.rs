@@ -106,8 +106,7 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
             let api_config = Config::new()
                 .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
                 .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
-            let tls_config =
-                TlsConfig::try_new(cert_bytes.clone(), key_bytes).expect("valid TlsConfig");
+            let tls_config = TlsConfig::try_new(&cert_bytes, &key_bytes).expect("valid TlsConfig");
 
             let registry = prometheus::Registry::new();
             let app = app::AppBuilder::new("test_app").build();
@@ -274,7 +273,7 @@ async fn test_ballista_cluster_tls_config() -> Result<(), anyhow::Error> {
             tracing::info!("✅ Executor cluster config validated");
 
             // Build TLS config that would be used for cluster communication
-            let _tls_config = TlsConfig::try_new(cert_bytes, key_bytes).expect("valid TlsConfig");
+            let _tls_config = TlsConfig::try_new(&cert_bytes, &key_bytes).expect("valid TlsConfig");
 
             // Verify TLS config was created successfully
             // The TLS config is used by both the runtime servers and the Ballista cluster

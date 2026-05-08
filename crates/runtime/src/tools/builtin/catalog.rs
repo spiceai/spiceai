@@ -32,6 +32,7 @@ use crate::{
 
 use super::{
     SpiceModelTool,
+    get_current_datetime::GetCurrentDateTimeTool,
     get_readiness::GetReadinessTool,
     list_datasets::ListDatasetsTool,
     sample::{SampleTableMethod, tool::SampleDataTool},
@@ -82,6 +83,7 @@ impl BuiltinToolCatalog {
     pub(crate) fn is_builtin_tool(name: &str) -> bool {
         [
             "get_readiness",
+            "get_current_datetime",
             "search",
             "table_schema",
             "sql",
@@ -102,23 +104,11 @@ impl BuiltinToolCatalog {
     ) -> Result<Arc<dyn SpiceModelTool>> {
         let name = name.unwrap_or(id);
 
-        // Get default description if none is provided
-        let description = match (id, description) {
-            (_, Some(desc)) => desc, // Use provided description if available
-            ("get_readiness", None) => "Get the readiness status of the Spice.ai runtime",
-            ("search", None) => "Search across available, searchable datasets in Spice.ai runtime",
-            ("table_schema", None) => "Get the schema of the Spice.ai dataset",
-            ("sql", None) => "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
-            ("sample_distinct_columns", None) => {
-                "Sample distinct column values from a Spice.ai dataset"
-            }
-            ("random_sample", None) => "Get a random sample of rows from a Spice.ai dataset",
-            ("top_n_sample", None) => {
-                "Get top N samples from a Spice.ai dataset based on a specified ordering"
-            }
-            ("list_datasets", None) => "List available datasets",
-            (_, None) => "",
-        };
+        // Built-in tool defaults live inside each tool's own constructor so the
+        // canonical description has a single source of truth. When the operator
+        // has not supplied a description, pass `None` through and let the tool
+        // pick its default. Otherwise use the operator override verbatim.
+        let description: Option<&str> = description;
 
         // Use model-level table allowlist if set, otherwise parse from params
         let table_allowlist: Option<ResolvedTableAwareAllowlist> =
@@ -145,40 +135,44 @@ impl BuiltinToolCatalog {
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(
                 Arc::clone(&self.rt),
                 Some(name),
-                Some(description),
+                description,
+            ))),
+            "get_current_datetime" => Ok(Arc::new(GetCurrentDateTimeTool::new(
+                Some(name),
+                description,
             ))),
             "search" => Ok(Arc::new(
-                SearchTool::new(Arc::clone(&self.rt), Some(name), Some(description))
+                SearchTool::new(Arc::clone(&self.rt), Some(name), description)
                     .with_table_allowlist(table_allowlist),
             )),
             "table_schema" => Ok(Arc::new(
-                TableSchemaTool::new(Arc::clone(&self.rt), Some(name), Some(description))
+                TableSchemaTool::new(Arc::clone(&self.rt), Some(name), description)
                     .with_table_allowlist(table_allowlist),
             )),
             "sql" => Ok(Arc::new(SqlTool::new(
                 self.rt.datafusion(),
                 Some(name),
-                Some(description),
+                description,
                 table_allowlist,
             ))),
             "sample_distinct_columns" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::DistinctColumns)
-                    .with_overrides(Some(name), Some(description))
+                    .with_overrides(Some(name), description)
                     .with_table_allowlist(table_allowlist),
             )),
             "random_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::RandomSample)
-                    .with_overrides(Some(name), Some(description))
+                    .with_overrides(Some(name), description)
                     .with_table_allowlist(table_allowlist),
             )),
             "top_n_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::TopNSample)
-                    .with_overrides(Some(name), Some(description))
+                    .with_overrides(Some(name), description)
                     .with_table_allowlist(table_allowlist),
             )),
             "list_datasets" => Ok(Arc::new(ListDatasetsTool::new(
                 Some(name),
-                Some(description),
+                description,
                 table_allowlist,
                 Arc::clone(&self.rt),
             ))),

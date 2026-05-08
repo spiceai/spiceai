@@ -113,6 +113,7 @@ mod metrics;
 pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
+mod object_store_state;
 mod opentelemetry;
 pub mod otel_push_exporter;
 pub mod resource_monitor;
@@ -1038,7 +1039,7 @@ impl Runtime {
                         metrics_server::cluster::ClusterMetricsCollector::new(
                             Arc::clone(peers),
                             Arc::clone(executor_registry),
-                            self.df.cluster_config.client_tls_config().cloned(),
+                            self.df.cluster_config.client_tls_config(),
                             self.df.cluster_config.node_id(),
                             local_metrics_collector,
                         ),

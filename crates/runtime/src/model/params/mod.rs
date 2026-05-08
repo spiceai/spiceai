@@ -57,7 +57,7 @@ pub const PARAM_WITH_DEPRE_LEN: usize = 52;
 pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
+        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
     ParameterSpec::runtime("tool_embedding_model")
         .description("Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable."),
     ParameterSpec::runtime("system_prompt")
@@ -120,7 +120,7 @@ pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
 pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
+        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
     ParameterSpec::runtime("tool_embedding_model")
         .description("Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable."),
     ParameterSpec::runtime("system_prompt")

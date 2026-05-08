@@ -52,6 +52,7 @@ const PORT4: u16 = 8004;
 const PORT5: u16 = 8005;
 const PORT6: u16 = 8006;
 const PORT7: u16 = 8007;
+const DYNAMODB_HOST_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[instrument]
 pub async fn start_dynamodb_docker_container(
@@ -78,8 +79,87 @@ pub async fn start_dynamodb_docker_container(
         .run(None)
         .await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    wait_for_dynamodb_host_port(port).await?;
     Ok(running_container)
+}
+
+async fn wait_for_dynamodb_host_port(port: u16) -> Result<(), anyhow::Error> {
+    let client = get_client(port, "foo", "bar");
+    let start_time = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start_time.elapsed() <= DYNAMODB_HOST_READY_TIMEOUT {
+        match client.list_tables().send().await {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "DynamoDB Local container started but host port {port} was not ready within {}s. Last error: {}",
+        DYNAMODB_HOST_READY_TIMEOUT.as_secs(),
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
+}
+
+async fn wait_for_dynamodb_source_rows(
+    client: &Client,
+    table_name: &str,
+    expected_rows: usize,
+    timeout_secs: u64,
+) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start_time.elapsed() <= Duration::from_secs(timeout_secs) {
+        match client.scan().table_name(table_name).send().await {
+            Ok(output) => {
+                let actual_rows = usize::try_from(output.count()).unwrap_or(0);
+                if actual_rows >= expected_rows {
+                    return Ok(());
+                }
+                last_error = Some(format!(
+                    "source table has {actual_rows} rows; expected at least {expected_rows}"
+                ));
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Timed out waiting for DynamoDB source table {table_name} to have at least {expected_rows} rows within {timeout_secs}s. Last error: {}",
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
+}
+
+async fn ensure_dataset_rows(
+    rt: &Runtime,
+    table_name: &str,
+    expected_rows: usize,
+    timeout_secs: u64,
+) -> Result<(), anyhow::Error> {
+    anyhow::ensure!(
+        wait_for_dataset_rows(rt, table_name, expected_rows, timeout_secs).await,
+        "Timed out waiting for dataset {table_name} to have at least {expected_rows} rows within {timeout_secs}s"
+    );
+    Ok(())
+}
+
+async fn ensure_exact_dataset_rows(
+    rt: &Runtime,
+    table_name: &str,
+    expected_rows: usize,
+    timeout_secs: u64,
+) -> Result<(), anyhow::Error> {
+    anyhow::ensure!(
+        wait_for_exact_row_count(rt, table_name, expected_rows, timeout_secs).await,
+        "Timed out waiting for dataset {table_name} to have exactly {expected_rows} rows within {timeout_secs}s"
+    );
+    Ok(())
 }
 
 pub fn make_dynamodb_dataset(
@@ -215,7 +295,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
             create_table(&client, table_name).await;
             insert_rows(&client, "test_table", 0..5).await;
-            sleep(Duration::from_secs(2)).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
             let app = AppBuilder::new("dynamodb_integration_test")
                 .with_dataset(make_dynamodb_dataset(
@@ -240,7 +320,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             }
 
             runtime_ready_check(&rt).await;
-            sleep(Duration::from_secs(2)).await;
+            ensure_dataset_rows(&rt, table_name, 5, 30).await?;
             run_and_snapshot_query(
                 &rt,
                 &format!("SELECT * FROM {table_name} ORDER BY id"),
@@ -249,7 +329,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             .await?;
 
             insert_rows(&client, "test_table", 5..7).await;
-            sleep(Duration::from_secs(2)).await;
+            ensure_dataset_rows(&rt, table_name, 7, 30).await?;
             run_and_snapshot_query(
                 &rt,
                 &format!("SELECT * FROM {table_name} ORDER BY id"),
@@ -258,7 +338,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             .await?;
 
             insert_rows(&client, "test_table", 7..10).await;
-            sleep(Duration::from_secs(2)).await;
+            ensure_dataset_rows(&rt, table_name, 10, 30).await?;
             run_and_snapshot_query(
                 &rt,
                 &format!("SELECT * FROM {table_name} ORDER BY id"),
@@ -317,7 +397,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
             delete_item(&client, table_name, "id-6").await;
             delete_item(&client, table_name, "id-7").await;
 
-            sleep(Duration::from_secs(1)).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
             let app = AppBuilder::new("dynamodb_batch_delete_test")
                 .with_dataset(make_dynamodb_dataset(
@@ -341,7 +421,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
             }
 
             runtime_ready_check(&rt).await;
-            sleep(Duration::from_secs(3)).await;
+            ensure_exact_dataset_rows(&rt, table_name, 5, 30).await?;
 
             run_and_snapshot_query(
                 &rt,
@@ -731,7 +811,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
-            sleep(Duration::from_secs(2)).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
             let temp_dir = tempfile::tempdir()?;
             let duckdb_path = temp_dir.path().join("test.duckdb");
@@ -766,7 +846,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 }
 
                 runtime_ready_check(&rt).await;
-                sleep(Duration::from_secs(3)).await;
+                ensure_exact_dataset_rows(&rt, table_name, 5, 30).await?;
 
                 let initial_count = get_acceleration_row_count(duckdb_path_str, table_name);
                 assert_eq!(initial_count, 5, "Phase 1: Should have 5 rows after initial load");
@@ -853,7 +933,7 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
-            sleep(Duration::from_secs(2)).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
             // Create temp DuckDB file and insert fake checkpoint with FRESH timestamp (1h ago)
             let temp_dir = tempfile::tempdir()?;
@@ -922,7 +1002,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
-            sleep(Duration::from_secs(2)).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
             // Create temp DuckDB file for acceleration
             let temp_dir = tempfile::tempdir()?;
@@ -959,7 +1039,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
 
                 // Wait for data to be loaded and checkpoint created
                 runtime_ready_check(&rt).await;
-                sleep(Duration::from_secs(3)).await;
+                ensure_exact_dataset_rows(&rt, table_name, 5, 30).await?;
 
                 // Verify initial data is loaded
                 let initial_count = get_acceleration_row_count(duckdb_path_str, table_name);
@@ -979,7 +1059,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
 
             // Add new records to DynamoDB while Spice is down
             insert_rows(&client, table_name, 5..8).await;
-            sleep(Duration::from_secs(1)).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 8, 30).await?;
 
             // === PHASE 3: Start Spice again - should detect ShardNotFound and rebootstrap ===
             {
@@ -1043,7 +1123,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
-            sleep(Duration::from_secs(2)).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
             // Create temp DuckDB file for acceleration
             let temp_dir = tempfile::tempdir()?;
@@ -1080,7 +1160,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
 
                 // Wait for data to be loaded and checkpoint created
                 runtime_ready_check(&rt).await;
-                sleep(Duration::from_secs(3)).await;
+                ensure_exact_dataset_rows(&rt, table_name, 5, 30).await?;
 
                 // Verify initial data is loaded
                 let initial_count = get_acceleration_row_count(duckdb_path_str, table_name);
@@ -1100,7 +1180,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
 
             // Add new records to DynamoDB while Spice is down
             insert_rows(&client, table_name, 5..8).await;
-            sleep(Duration::from_secs(1)).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 8, 30).await?;
 
             // === PHASE 3: Start Spice again - should detect ShardNotFound and rebootstrap ===
             {
@@ -1233,7 +1313,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
                 .await
                 .expect("Failed to insert item");
 
-            sleep(Duration::from_secs(2)).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 1, 30).await?;
 
             let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
                 .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
@@ -1256,7 +1336,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
                 () = cloned_rt.load_components() => {}
             }
             runtime_ready_check(&rt).await;
-            sleep(Duration::from_secs(2)).await;
+            ensure_exact_dataset_rows(&rt, table_name, 1, 30).await?;
 
             run_and_snapshot_query(
                 &rt,
