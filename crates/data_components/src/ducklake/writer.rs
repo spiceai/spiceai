@@ -26,6 +26,7 @@ limitations under the License.
 //! 4. Drops the temporary view and commits (or rolls back on error)
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,12 +36,12 @@ use arrow::datatypes::SchemaRef;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{DataFusionError, SchemaExt};
+use datafusion::common::{Constraints, DataFusionError, SchemaExt};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{Expr, LogicalPlan, TableType};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
@@ -55,12 +56,7 @@ use tokio::task::JoinHandle;
 /// Process-wide counter to guarantee unique temporary view names.
 static VIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A federated `DuckDB` table writer that properly handles multi-part table references.
-///
-/// Unlike the acceleration-oriented `DuckDBTableWriter` in `datafusion-table-providers`, this writer:
-/// - Stores `TableReference` directly (no `RelationName` flattening)
-/// - Generates SQL with `to_quoted_string()` for proper multi-part quoting
-/// - Skips internal table management, schema validation, and index management
+/// A federated `DuckDB` table writer.
 pub struct DuckDbFederatedTableWriter {
     read_provider: Arc<dyn TableProvider>,
     pool: Arc<DuckDbConnectionPool>,
@@ -80,8 +76,8 @@ impl DuckDbFederatedTableWriter {
     /// Create a new `DuckDbFederatedTableWriter`.
     ///
     /// - `read_provider`: The underlying read-only `TableProvider` (for `scan` delegation).
-    /// - `pool`: `DuckDB` connection pool with the `ducklake` catalog already attached.
-    /// - `table_reference`: Fully-qualified table reference (e.g. `Full("catalog", "schema", "table")`).
+    /// - `pool`: `DuckDB` connection pool; might have additionally attached catalogs (e.g., `ducklake`).
+    /// - `table_reference`: Table reference used in SQL generation (supports `Bare`, `Partial`, and `Full`).
     #[must_use]
     pub fn new(
         read_provider: Arc<dyn TableProvider>,
@@ -108,8 +104,35 @@ impl TableProvider for DuckDbFederatedTableWriter {
         self.read_provider.schema()
     }
 
+    fn constraints(&self) -> Option<&Constraints> {
+        self.read_provider.constraints()
+    }
+
     fn table_type(&self) -> TableType {
-        TableType::Base
+        self.read_provider.table_type()
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.read_provider.get_table_definition()
+    }
+
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
+        self.read_provider.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.read_provider.get_column_default(column)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.read_provider.supports_filters_pushdown(filters)
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.read_provider.statistics()
     }
 
     async fn scan(
@@ -124,12 +147,26 @@ impl TableProvider for DuckDbFederatedTableWriter {
             .await
     }
 
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DFResult<datafusion::catalog::ScanResult> {
+        self.read_provider.scan_with_args(state, args).await
+    }
+
     async fn insert_into(
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         op: datafusion::logical_expr::dml::InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if op == InsertOp::Replace {
+            return Err(DataFusionError::NotImplemented(
+                "REPLACE INTO is not supported".to_string(),
+            ));
+        }
+
         self.schema()
             .logically_equivalent_names_and_types(&input.schema())?;
 
