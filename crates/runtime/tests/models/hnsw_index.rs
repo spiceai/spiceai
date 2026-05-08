@@ -35,6 +35,7 @@ use runtime::auth::EndpointAuth;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::Embeddings;
+use spicepod::component::view::View;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 use spicepod::vector::VectorStore;
@@ -61,7 +62,8 @@ fn model2vec_embedding() -> Embeddings {
     Embeddings::new("model2vec:minishlab/potion-base-2M", "test_embed")
 }
 
-fn hnsw_dataset(name: &str, db_path: &str, refresh_mode: RefreshMode) -> Dataset {
+/// Helper: creates a source dataset for the mega-science S3 data (no acceleration).
+fn mega_science_source_dataset(name: &str) -> Dataset {
     let mut dataset = Dataset::new(
         "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
         name,
@@ -71,6 +73,11 @@ fn hnsw_dataset(name: &str, db_path: &str, refresh_mode: RefreshMode) -> Dataset
             .into_iter()
             .collect(),
     ));
+    dataset
+}
+
+fn hnsw_dataset(name: &str, db_path: &str, refresh_mode: RefreshMode) -> Dataset {
+    let mut dataset = mega_science_source_dataset(name);
 
     let accel_params: HashMap<String, String> =
         HashMap::from([("duckdb_file".to_string(), db_path.to_string())]);
@@ -208,10 +215,10 @@ async fn test_hnsw_index_created_after_full_refresh() -> Result<(), anyhow::Erro
     let db_path = "./test_hnsw_refresh.db";
     let ds_name = "hnsw_test_ds";
 
-    cleanup_db_path(db_path);
-
     test_request_context()
         .scope(async {
+            cleanup_db_path(db_path);
+
             let app = AppBuilder::new("hnsw_index_refresh_test")
                 .with_embedding(model2vec_embedding())
                 .with_dataset(hnsw_dataset(ds_name, db_path, RefreshMode::Full))
@@ -296,14 +303,14 @@ async fn test_hnsw_index_created_after_append_refresh() -> Result<(), anyhow::Er
     let db_path = "./test_hnsw_append_refresh.db";
     let ds_name = "hnsw_append_ds";
 
-    cleanup_db_path(db_path);
-
     let test_data = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/models/test_data/mega-science-sample.jsonl");
     let source = format!("file://{}", test_data.display());
 
     test_request_context()
         .scope(async {
+            cleanup_db_path(db_path);
+
             let mut dataset = hnsw_dataset(ds_name, db_path, RefreshMode::Append);
             dataset.from = source;
             dataset.time_column = Some("created_at".to_string());
@@ -372,10 +379,10 @@ async fn test_hnsw_index_survives_multiple_refreshes() -> Result<(), anyhow::Err
     let db_path = "./test_hnsw_multi_refresh.db";
     let ds_name = "hnsw_multi_ds";
 
-    cleanup_db_path(db_path);
-
     test_request_context()
         .scope(async {
+            cleanup_db_path(db_path);
+
             let app = AppBuilder::new("hnsw_multi_refresh_test")
                 .with_embedding(model2vec_embedding())
                 .with_dataset(hnsw_dataset(ds_name, db_path, RefreshMode::Full))
@@ -431,6 +438,129 @@ async fn test_hnsw_index_survives_multiple_refreshes() -> Result<(), anyhow::Err
 
             cleanup_db_path(db_path);
 
+            Ok(())
+        })
+        .await
+}
+
+/// Helper: creates an accelerated view with `DuckDB` + HNSW vector indexes over a source dataset.
+fn hnsw_view(view_name: &str, source_ds: &str, db_path: &str) -> View {
+    let accel_params: HashMap<String, String> =
+        HashMap::from([("duckdb_file".to_string(), db_path.to_string())]);
+
+    let mut view = View::new(view_name.to_string());
+    view.sql = Some(format!(
+        "SELECT question, id, answer, subject, reference_answer, source FROM {source_ds} LIMIT 64"
+    ));
+    view.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        params: Some(Params::from_string_map(accel_params)),
+        ..Acceleration::default()
+    });
+
+    view.vectors = Some(VectorStore {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        partition_by: Vec::new(),
+        params: Some(Params::from_string_map(HashMap::from([
+            ("duckdb_distance_metric".to_string(), "cosine".to_string()),
+            ("duckdb_hnsw_m".to_string(), "8".to_string()),
+            ("duckdb_hnsw_ef_construction".to_string(), "24".to_string()),
+            ("duckdb_hnsw_ef_search".to_string(), "12".to_string()),
+        ]))),
+    });
+
+    view.columns = vec![
+        Column::new("question")
+            .with_embedding(ColumnLevelEmbeddingConfig::model("test_embed").with_row_id("id")),
+    ];
+
+    view
+}
+
+/// Verifies HNSW index on an accelerated **view** is created after initial load
+/// and survives a full (overwrite) refresh.
+#[tokio::test]
+async fn test_hnsw_index_on_view_created_after_full_refresh() -> Result<(), anyhow::Error> {
+    let _test_lock = HNSW_TEST_MUTEX.lock().await;
+    let _tracing = init_tracing(Some(
+        "integration_models=debug,runtime=debug,search=debug,info",
+    ));
+
+    let db_path = "./test_hnsw_view_refresh.db";
+    let view_name = "hnsw_view_ds";
+    let source_ds = "hnsw_view_source";
+
+    test_request_context()
+        .scope(async {
+            cleanup_db_path(db_path);
+
+            let app = AppBuilder::new("hnsw_view_refresh_test")
+                .with_embedding(model2vec_embedding())
+                .with_dataset(mega_science_source_dataset(source_ds))
+                .with_view(hnsw_view(view_name, source_ds, db_path))
+                .build();
+
+            let rt = start_runtime(app).await;
+
+            // 1. Verify vector search works after initial load
+            let batches = execute_sql(
+                &rt,
+                &format!(
+                    "SELECT id, _score FROM vector_search({view_name}, 'second') ORDER BY _score DESC LIMIT 4"
+                ),
+            )
+            .await?;
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            anyhow::ensure!(
+                total_rows == 4,
+                "Expected 4 rows from initial view vector_search, got {total_rows}"
+            );
+            tracing::info!("Initial view vector search returned {total_rows} rows");
+
+            // 2. Trigger a manual full refresh — HNSW index must be recreated afterward.
+            refresh_table(&rt, view_name).await?;
+
+            // 3. Verify vector search STILL works after refresh
+            let batches = execute_sql(
+                &rt,
+                &format!(
+                    "SELECT id, _score FROM vector_search({view_name}, 'second') ORDER BY _score DESC LIMIT 4"
+                ),
+            )
+            .await?;
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            anyhow::ensure!(
+                total_rows == 4,
+                "Expected 4 rows from post-refresh view vector_search, got {total_rows}"
+            );
+            tracing::info!("Post-refresh view vector search returned {total_rows} rows");
+
+            // 4. Shutdown runtime and verify index via native DuckDB connection
+            rt.shutdown().await;
+            drop(rt);
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+            let indexes = query_native_duckdb_indexes(db_path).await?;
+            tracing::info!("Native DuckDB indexes for view: {indexes:?}");
+
+            anyhow::ensure!(
+                !indexes.is_empty(),
+                "Expected at least one __spice_vss_ HNSW index in DuckDB file for view"
+            );
+
+            for (index_name, _table_name) in &indexes {
+                anyhow::ensure!(
+                    index_name.contains("question_embedding"),
+                    "Index name {index_name} should reference question_embedding column"
+                );
+                tracing::info!("Verified HNSW index {index_name} on view accelerator");
+            }
+
+            cleanup_db_path(db_path);
             Ok(())
         })
         .await

@@ -22,7 +22,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error};
 use serde_json::Value;
 
-use crate::component::embeddings::{EmbeddingAggregation, EmbeddingChunkConfig};
+use crate::{
+    component::embeddings::{EmbeddingAggregation, EmbeddingChunkConfig},
+    param::Params,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -162,6 +165,14 @@ pub struct ColumnLevelEmbeddingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_size: Option<usize>,
 
+    /// Optional search engine override for this embedding column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+
+    /// Optional engine parameters for this embedding column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
     /// Aggregation strategy for multi-vector embeddings. Only meaningful
     /// when the underlying column is list-typed. Defaults to `max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -181,6 +192,8 @@ impl ColumnLevelEmbeddingConfig {
             chunking: None,
             row_ids: None,
             vector_size: None,
+            engine: None,
+            params: None,
             aggregation: None,
             max_elements_per_row: None,
         }
@@ -271,6 +284,14 @@ pub struct FullTextSearchConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_directory: Option<String>,
+
+    /// Optional text search engine override for this column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+
+    /// Optional engine parameters for this text search column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -299,6 +320,8 @@ impl FullTextSearchConfig {
             row_ids: None,
             index_store: Some(IndexStore::default()),
             index_directory: None,
+            engine: None,
+            params: None,
         }
     }
 
@@ -309,6 +332,8 @@ impl FullTextSearchConfig {
             row_ids: None,
             index_store: Some(IndexStore::default()),
             index_directory: None,
+            engine: None,
+            params: None,
         }
     }
 

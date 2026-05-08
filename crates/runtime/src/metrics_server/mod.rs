@@ -28,11 +28,11 @@ use governor::{
 use http::{HeaderValue, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::{
-    body::Incoming,
+    body::{self, Incoming},
     header::{CONTENT_TYPE, RETRY_AFTER},
     server::conn::http1::Builder,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::{rt::TokioIo, server::conn::auto::Builder as AutoBuilder};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use prometheus::{
     Encoder, TextEncoder,
@@ -191,7 +191,7 @@ async fn serve_connection<S>(
         }
     });
 
-    if let Err(err) = Builder::new()
+    if let Err(err) = AutoBuilder::new(hyper_util::rt::TokioExecutor::new())
         .serve_connection(TokioIo::new(stream), service)
         .await
     {

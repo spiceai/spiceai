@@ -248,7 +248,11 @@ impl SearchEngine {
                 _ => CacheKey::Search(&search_key),
             };
 
-            let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
+            let raw_cache_key = {
+                let ns = request_context.cache_namespace();
+                let (ns_tag, ns_id) = ns.hash_inputs();
+                cache_key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
+            };
 
             match (
                 cache_control,

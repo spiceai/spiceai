@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tracing::instrument;
 
-use crate::docker::{ContainerRunnerBuilder, RunningContainer};
+use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port};
 
 pub fn make_mssql_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("mssql:{path}"), name.to_string());
@@ -43,6 +43,8 @@ pub fn make_mssql_dataset(path: &str, name: &str, port: u16) -> Dataset {
 }
 
 pub const MSSQL_ROOT_PASSWORD: &str = "S3cret-integration-test-p@ss";
+const MSSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const MSSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[instrument]
 pub async fn start_mssql_docker_container(
@@ -61,16 +63,16 @@ pub async fn start_mssql_docker_container(
                     "/opt/mssql-tools18/bin/sqlcmd -C -U sa -P {MSSQL_ROOT_PASSWORD} -Q \"SELECT 1\""
                 ),
             ]),
-            interval: Some(250_000_000),
-            timeout: Some(100_000_000),
-            retries: Some(5),
-            start_period: Some(500_000_000),
+            interval: Some(1_000_000_000),
+            timeout: Some(5_000_000_000),
+            retries: Some(120),
+            start_period: Some(30_000_000_000),
             start_interval: None,
         })
         .build()?
-        .run(None)
+        .run(Some(MSSQL_CONTAINER_START_TIMEOUT))
         .await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    wait_for_tcp_port("127.0.0.1", port, MSSQL_HOST_PORT_READY_TIMEOUT).await?;
     Ok(running_container)
 }

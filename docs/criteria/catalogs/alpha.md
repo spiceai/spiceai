@@ -11,7 +11,7 @@ All criteria must be met for the Catalog to be considered Alpha. As Alpha signif
 | ADBC          | ➖             |                 |
 | Cayenne       | ➖             |                 |
 | Databricks    | ✅             | @Sevenannn      |
-| DuckLake      | ➖             |                 |
+| DuckLake      | ✅             | @sgrebnov       |
 | Glue          | ✅             | @kczimm         |
 | Iceberg       | ✅             | @phillipleblanc |
 | MS SQL        | ➖             |                 |

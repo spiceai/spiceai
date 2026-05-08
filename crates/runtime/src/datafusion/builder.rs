@@ -531,6 +531,7 @@ impl DataFusionBuilder {
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
             pending_initializations: TokioRwLock::new(HashMap::new()),
             pending_initializations_count: std::sync::atomic::AtomicUsize::new(0),
+            query_cancel_registry: Arc::new(super::query::registry::QueryCancelRegistry::new()),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,

@@ -608,7 +608,7 @@ impl ClusterService for ClusterServiceImpl {
             &executor_url
         };
 
-        let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
+        let tls_config_opt = self.datafusion.cluster_config.client_tls_config();
         match create_executor_flight_client(&executor_url, tls_config_opt) {
             Ok(client) => {
                 self.executor_registry

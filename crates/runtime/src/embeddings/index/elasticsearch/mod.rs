@@ -26,7 +26,9 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use elasticsearch::{Client, ClientOptions, Elasticsearch};
 use search::generation::util::get_primary_keys;
-pub(crate) use search::index::elasticsearch::ElasticsearchIndex;
+pub(crate) use search::index::elasticsearch::{
+    ElasticsearchIndex, ElasticsearchIndexWriteMaintenance, ElasticsearchIndexWriteOptions,
+};
 use search::metadata::{MetadataColumn, MetadataColumns};
 use spicepod::{
     param::Params,
@@ -79,6 +81,27 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::component("batch_write_rows").description(
         "Maximum number of rows to include in a single Elasticsearch _bulk request. Used to control memory usage and payload size during writes. Default: 1000.",
+    ),
+    ParameterSpec::component("index_settings").description(
+        "JSON object passed as Elasticsearch index settings when creating the index. Existing indexes are not recreated.",
+    ),
+    ParameterSpec::component("number_of_shards").description(
+        "Elasticsearch number_of_shards index setting to use when creating the index. Existing indexes are not recreated.",
+    ),
+    ParameterSpec::component("number_of_replicas").description(
+        "Elasticsearch number_of_replicas index setting to use when creating the index. Existing indexes are not recreated.",
+    ),
+    ParameterSpec::component("refresh_interval").description(
+        "Elasticsearch refresh_interval index setting to use when creating the index. Existing indexes are not recreated.",
+    ),
+    ParameterSpec::component("bulk_load_refresh_interval").description(
+        "Temporary Elasticsearch index.refresh_interval to apply before full/append writes, then restore afterward. Set to -1 to disable refresh during bulk loading.",
+    ),
+    ParameterSpec::component("force_merge_after_write")
+        .description("Run Elasticsearch _forcemerge after full/append writes. Default: false.")
+        .one_of(&["true", "false"]),
+    ParameterSpec::component("force_merge_segments").description(
+        "Maximum number of segments to use with _forcemerge after full/append writes. Setting this also enables force merge. Default when force_merge_after_write=true: 1.",
     ),
     ParameterSpec::component("partition_by")
         .description("Not yet supported for the Elasticsearch vector engine."),
@@ -221,6 +244,8 @@ pub async fn try_from_table(
 
     // Parse optional vector-mapping tuning params.
     let mapping_opts = parse_mapping_options(&params)?;
+    let index_settings = parse_index_settings(&params)?;
+    let write_options = parse_write_options(&params)?;
 
     // Parse optional batch write size.
     let batch_write_rows = string_from_params(&params, "batch_write_rows")
@@ -293,11 +318,14 @@ pub async fn try_from_table(
     ensure_index_with_mapping(
         client.as_ref(),
         &es_index,
-        &vector_field,
-        dims,
-        &text_fields,
-        &mapping_opts,
-        &metadata_columns,
+        VectorIndexMapping {
+            vector_field: &vector_field,
+            dims,
+            text_fields: &text_fields,
+            mapping_opts: &mapping_opts,
+            metadata_columns: &metadata_columns,
+            index_settings: index_settings.as_ref(),
+        },
     )
     .await?;
 
@@ -313,6 +341,7 @@ pub async fn try_from_table(
         source_schema,
         metadata_columns,
         batch_write_rows,
+        write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::new(write_options)),
     })
 }
 
@@ -363,6 +392,158 @@ fn parse_mapping_options(
     Ok(opts)
 }
 
+fn parse_index_settings(
+    params: &Parameters,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut settings = serde_json::Map::new();
+
+    if let Some(raw) = string_from_params(params, "index_settings") {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Invalid JSON for Elasticsearch parameter 'index_settings': {e}").into()
+            })?;
+        let Some(obj) = value.as_object() else {
+            return Err(
+                "Invalid Elasticsearch parameter 'index_settings': expected a JSON object.".into(),
+            );
+        };
+        settings.extend(obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
+    for key in ["number_of_shards", "number_of_replicas", "refresh_interval"] {
+        if let Some(value) = string_from_params(params, key) {
+            settings.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+    }
+
+    if settings.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::Value::Object(settings)))
+    }
+}
+
+pub(crate) fn parse_index_settings_from_map(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut settings = serde_json::Map::new();
+
+    if let Some(raw) = params.get("index_settings") {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Invalid JSON for Elasticsearch parameter 'index_settings': {e}").into()
+            })?;
+        let Some(obj) = value.as_object() else {
+            return Err(
+                "Invalid Elasticsearch parameter 'index_settings': expected a JSON object.".into(),
+            );
+        };
+        settings.extend(obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
+    for key in ["number_of_shards", "number_of_replicas", "refresh_interval"] {
+        if let Some(value) = params.get(key) {
+            settings.insert(key.to_string(), serde_json::Value::String(value.clone()));
+        }
+    }
+
+    if settings.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::Value::Object(settings)))
+    }
+}
+
+pub(crate) fn parse_write_options_from_map(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<ElasticsearchIndexWriteOptions, Box<dyn std::error::Error + Send + Sync>> {
+    let refresh_interval_during_write = params
+        .get("bulk_load_refresh_interval")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    let force_merge_after_write = params
+        .get("force_merge_after_write")
+        .map(String::as_str)
+        .map(parse_bool_value)
+        .transpose()?
+        .unwrap_or(false);
+    let force_merge_segments = params
+        .get("force_merge_segments")
+        .map(String::as_str)
+        .map(|value| parse_positive_u32_value(value, "force_merge_segments"))
+        .transpose()?;
+
+    Ok(ElasticsearchIndexWriteOptions {
+        refresh_interval_during_write,
+        force_merge_segments: match (force_merge_after_write, force_merge_segments) {
+            (true, None) => Some(1),
+            (_, Some(value)) => Some(value),
+            (false, None) => None,
+        },
+    })
+}
+
+fn parse_write_options(
+    params: &Parameters,
+) -> Result<ElasticsearchIndexWriteOptions, Box<dyn std::error::Error + Send + Sync>> {
+    let refresh_interval_during_write = string_from_params(params, "bulk_load_refresh_interval")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    let force_merge_after_write = string_from_params(params, "force_merge_after_write")
+        .map(parse_bool_value)
+        .transpose()?
+        .unwrap_or(false);
+    let force_merge_segments = string_from_params(params, "force_merge_segments")
+        .map(|value| parse_positive_u32_value(value, "force_merge_segments"))
+        .transpose()?;
+
+    Ok(ElasticsearchIndexWriteOptions {
+        refresh_interval_during_write,
+        force_merge_segments: match (force_merge_after_write, force_merge_segments) {
+            (true, None) => Some(1),
+            (_, Some(value)) => Some(value),
+            (false, None) => None,
+        },
+    })
+}
+
+fn parse_bool_value(value: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => Err(format!(
+            "Invalid boolean value for Elasticsearch parameter 'force_merge_after_write': '{value}'. Expected true or false."
+        )
+        .into()),
+    }
+}
+
+fn parse_positive_u32_value(
+    value: &str,
+    key: &str,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: u32 = value
+        .parse()
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("Invalid value for Elasticsearch parameter '{key}': '{value}': {e}").into()
+        })?;
+    if parsed == 0 {
+        return Err(format!(
+            "Invalid value for Elasticsearch parameter '{key}': expected a positive integer."
+        )
+        .into());
+    }
+    Ok(parsed)
+}
+
 fn parse_u32_param(
     params: &Parameters,
     key: &str,
@@ -392,7 +573,7 @@ fn parse_duration_param(
     )
 }
 
-fn build_client_options(
+pub(crate) fn build_client_options(
     params: &Parameters,
 ) -> Result<ClientOptions, Box<dyn std::error::Error + Send + Sync>> {
     let mut opts = ClientOptions::default();
@@ -444,12 +625,17 @@ fn es_metadata_columns(
 async fn ensure_index_with_mapping(
     client: &dyn Elasticsearch,
     es_index: &str,
-    vector_field: &str,
-    dims: i32,
-    text_fields: &[String],
-    mapping_opts: &VectorMappingOptions,
-    metadata_columns: &MetadataColumns,
+    mapping: VectorIndexMapping<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let VectorIndexMapping {
+        vector_field,
+        dims,
+        text_fields,
+        mapping_opts,
+        metadata_columns,
+        index_settings,
+    } = mapping;
+
     if dims <= 0 {
         return Err(format!(
             "Failed to prepare Elasticsearch index '{es_index}': embedding dimension must be positive, got {dims}. Check that the embedding model reports a valid output dimension."
@@ -547,7 +733,12 @@ async fn ensure_index_with_mapping(
         return Ok(());
     }
 
-    let create_body = serde_json::json!({ "mappings": { "properties": properties } });
+    let mut create_body = serde_json::json!({ "mappings": { "properties": properties } });
+    if let Some(settings) = index_settings
+        && let Some(obj) = create_body.as_object_mut()
+    {
+        obj.insert("settings".to_string(), settings.clone());
+    }
     match client.create_index(es_index, &create_body).await {
         Ok(_) => {
             tracing::info!(
@@ -573,9 +764,18 @@ async fn ensure_index_with_mapping(
     }
 }
 
+struct VectorIndexMapping<'a> {
+    vector_field: &'a str,
+    dims: i32,
+    text_fields: &'a [String],
+    mapping_opts: &'a VectorMappingOptions,
+    metadata_columns: &'a MetadataColumns,
+    index_settings: Option<&'a serde_json::Value>,
+}
+
 /// Check whether an error from `create_index` indicates the index already exists
 /// (e.g. because another runtime instance created it concurrently).
-fn is_index_already_exists_error(error: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_index_already_exists_error(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(err) = current {
         let message = err.to_string();
@@ -619,7 +819,7 @@ fn arrow_type_to_es_mapping(dt: &DataType) -> serde_json::Value {
 /// - `LargeUtf8` → `Utf8`: ES always deserializes strings as `StringArray` (Utf8).
 /// - `FixedSizeList` with any inner field → `FixedSizeList` with `Field::new("item", Float32, false)`:
 ///   `build_dense_vector_array` always produces this exact inner field.
-fn normalize_es_data_type(dt: &DataType) -> DataType {
+pub(crate) fn normalize_es_data_type(dt: &DataType) -> DataType {
     match dt {
         DataType::LargeUtf8 | DataType::Utf8View => DataType::Utf8,
         DataType::FixedSizeList(_, dim) => DataType::FixedSizeList(
@@ -630,7 +830,7 @@ fn normalize_es_data_type(dt: &DataType) -> DataType {
     }
 }
 
-fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
+pub(crate) fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
     p.get(key).expose().ok()
 }
 
@@ -656,4 +856,149 @@ async fn get_store_params(
     .await?;
 
     Ok(params)
+}
+
+/// Build an Elasticsearch client from a raw params map.
+/// Used by the FTS connector path which reads params from `dataset.params`.
+pub(crate) fn get_fts_client(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<Arc<dyn Elasticsearch>, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = params.get("endpoint").ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "Missing required parameter 'endpoint' for Elasticsearch FTS.",
+        )
+    })?;
+    let user = params
+        .get("user")
+        .map(String::as_str)
+        .map(ToString::to_string);
+    let pass = params
+        .get("pass")
+        .map(String::as_str)
+        .map(ToString::to_string);
+
+    let mut opts = ClientOptions::default();
+    if let Some(s) = params.get("client_timeout")
+        && let Ok(d) = duration_parse::parse_duration(s)
+    {
+        opts.request_timeout = d;
+    }
+    if let Some(s) = params.get("connect_timeout")
+        && let Ok(d) = duration_parse::parse_duration(s)
+    {
+        opts.connect_timeout = d;
+    }
+
+    let client = Client::new_with_options(endpoint, user.as_deref(), pass.as_deref(), &opts)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+    Ok(Arc::new(client) as Arc<dyn Elasticsearch>)
+}
+
+/// Ensure the Elasticsearch index exists with `text` field mappings for the given fields.
+/// Does NOT create a `dense_vector` field. Best-effort: if the index already exists, leaves it.
+pub(crate) async fn ensure_index_with_text_mapping(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    text_fields: &[String],
+    index_settings: Option<&serde_json::Value>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut properties = serde_json::Map::new();
+    for field in text_fields {
+        properties.insert(
+            field.clone(),
+            serde_json::json!({
+                "type": "text",
+                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+            }),
+        );
+    }
+
+    let exists = client
+        .index_exists(es_index)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+    let mapping_body = serde_json::json!({ "properties": properties });
+
+    if exists {
+        if let Err(e) = client.put_mapping(es_index, &mapping_body).await {
+            tracing::warn!(
+                "Elasticsearch FTS index '{es_index}' exists but mapping update failed (continuing): {e}"
+            );
+        }
+        return Ok(());
+    }
+
+    let mut create_body = serde_json::json!({ "mappings": { "properties": properties } });
+    if let Some(settings) = index_settings
+        && let Some(obj) = create_body.as_object_mut()
+    {
+        obj.insert("settings".to_string(), settings.clone());
+    }
+    match client.create_index(es_index, &create_body).await {
+        Ok(_) => {
+            tracing::info!("Created Elasticsearch FTS index '{es_index}'.");
+            Ok(())
+        }
+        Err(e) if is_index_already_exists_error(&e) => Ok(()),
+        Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+
+    #[test]
+    fn parse_index_settings_from_map_combines_json_and_shortcuts() {
+        let params = HashMap::from([
+            (
+                "index_settings".to_string(),
+                r#"{"analysis":{"analyzer":{"default":{"type":"standard"}}}}"#.to_string(),
+            ),
+            ("number_of_shards".to_string(), "2".to_string()),
+            ("number_of_replicas".to_string(), "0".to_string()),
+            ("refresh_interval".to_string(), "30s".to_string()),
+        ]);
+
+        let settings = parse_index_settings_from_map(&params)
+            .expect("valid index settings should parse")
+            .expect("settings should be present");
+
+        assert_eq!(
+            settings,
+            serde_json::json!({
+                "analysis": {"analyzer": {"default": {"type": "standard"}}},
+                "number_of_shards": "2",
+                "number_of_replicas": "0",
+                "refresh_interval": "30s",
+            })
+        );
+    }
+
+    #[test]
+    fn parse_write_options_from_map_enables_force_merge_with_default_segments() {
+        let params = HashMap::from([
+            ("bulk_load_refresh_interval".to_string(), "-1".to_string()),
+            ("force_merge_after_write".to_string(), "true".to_string()),
+        ]);
+
+        let options =
+            parse_write_options_from_map(&params).expect("valid write options should parse");
+
+        assert_eq!(options.refresh_interval_during_write.as_deref(), Some("-1"));
+        assert_eq!(options.force_merge_segments, Some(1));
+    }
+
+    #[test]
+    fn parse_write_options_from_map_rejects_zero_force_merge_segments() {
+        let params = HashMap::from([("force_merge_segments".to_string(), "0".to_string())]);
+
+        let error = parse_write_options_from_map(&params)
+            .expect_err("zero force_merge_segments should fail");
+
+        assert!(error.to_string().contains("positive integer"));
+    }
 }

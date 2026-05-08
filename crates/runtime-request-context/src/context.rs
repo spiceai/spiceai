@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
+use super::{CacheControl, CacheKeyType, CacheNamespace, Protocol, UserAgent, baggage};
 use crate::TraceParent;
 use app::App;
 use futures::{Stream, StreamExt};
@@ -36,6 +36,7 @@ use std::{
         atomic::{AtomicI16, AtomicU8},
     },
 };
+use tokio_util::sync::CancellationToken;
 
 static HTTP_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
 static FLIGHT_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
@@ -49,6 +50,13 @@ pub struct RequestContext {
     protocol: AtomicU8,
     cache_control: CacheControl,
     client_supplied_cache_key: Option<String>,
+    /// Optional explicit override for the cache namespace. When `None`, the
+    /// namespace is derived from `protocol` + `auth_principal` on demand by
+    /// [`Self::cache_namespace`]. Set explicitly by callers that need to
+    /// inherit a namespace from another context (e.g. SWR background
+    /// revalidation must run under the originating user's namespace, not
+    /// `System`).
+    cache_namespace_override: Option<CacheNamespace>,
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
@@ -57,6 +65,13 @@ pub struct RequestContext {
     /// The raw `authorization` header value from the incoming request, if present.
     /// Used to forward credentials when proxying requests (e.g. scheduler → executor).
     authorization_header: Option<String>,
+    /// Cancellation token for cooperative cancellation of work performed on behalf
+    /// of this request (query execution, search, LLM tool loops, etc.).
+    ///
+    /// The token is cancelled either when the request future is dropped (e.g. the
+    /// client disconnects) via a drop-guard installed by the transport layer, or
+    /// when an administrative cancel is issued against a registered query id.
+    cancellation_token: CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -195,6 +210,12 @@ impl RequestContext {
     pub fn to_dimensions(&self) -> Vec<KeyValue> {
         let mut dimensions = vec![KeyValue::new("protocol", self.protocol().as_str())];
         dimensions.extend(self.dimensions.iter().cloned());
+        // Low-cardinality scope dimension: `public` / `principal` / `system`.
+        // Never includes the principal id.
+        dimensions.push(KeyValue::new(
+            "cache_namespace_kind",
+            self.cache_namespace().kind(),
+        ));
         dimensions
     }
 
@@ -229,6 +250,33 @@ impl RequestContext {
     #[must_use]
     pub fn cache_control(&self) -> CacheControl {
         self.cache_control
+    }
+
+    /// The cache namespace this request is executing under.
+    ///
+    /// Computed once per call from `protocol` + `auth_principal`, unless an
+    /// explicit override was set on the builder (used by SWR background
+    /// revalidation and similar flows that must inherit the originating
+    /// request's namespace).
+    ///
+    /// Mapping:
+    /// - `Protocol::Internal` → [`CacheNamespace::System`].
+    /// - Authenticated principal whose `stable_id()` is `Some(id)` →
+    ///   [`CacheNamespace::Principal(id)`].
+    /// - Anything else (no principal, anonymous principal) →
+    ///   [`CacheNamespace::Public`].
+    #[must_use]
+    pub fn cache_namespace(&self) -> CacheNamespace {
+        if let Some(ns) = &self.cache_namespace_override {
+            return ns.clone();
+        }
+        if matches!(self.protocol(), Protocol::Internal) {
+            return CacheNamespace::System;
+        }
+        match self.auth_principal.get().and_then(|p| p.stable_id()) {
+            Some(id) => CacheNamespace::Principal(Arc::from(id.as_ref())),
+            None => CacheNamespace::Public,
+        }
     }
 
     #[must_use]
@@ -298,6 +346,38 @@ impl RequestContext {
     pub fn exited_top_level_query(&self) -> bool {
         self.nested_query_level.fetch_add(-1, Ordering::Relaxed) == 1
     }
+
+    /// Returns the cancellation token bound to this request's lifetime.
+    ///
+    /// The token is cancelled when the request is aborted (client disconnect,
+    /// administrative cancel, or transport-level shutdown). Long-running work
+    /// performed on behalf of this request should check this token cooperatively.
+    #[must_use]
+    pub fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation_token
+    }
+
+    /// Returns a child cancellation token that is cancelled when either this
+    /// request's token is cancelled or the child is cancelled explicitly.
+    ///
+    /// Use this to create scoped cancellation for a sub-operation (for example,
+    /// a single query within a request that may execute many queries).
+    #[must_use]
+    pub fn child_cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.child_token()
+    }
+
+    /// Returns `true` if cancellation has been requested for this request.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
+    }
+
+    /// Cancels this request's cancellation token, signalling all cooperating
+    /// operations to stop. This is used by the administrative cancel paths.
+    pub fn cancel(&self) {
+        self.cancellation_token.cancel();
+    }
 }
 
 impl AuthRequestContext for RequestContext {
@@ -319,12 +399,14 @@ pub struct RequestContextBuilder {
     protocol: Protocol,
     cache_control: CacheControl,
     client_supplied_cache_key: Option<String>,
+    cache_namespace_override: Option<CacheNamespace>,
     app: Option<Arc<App>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
     extensions: Extensions,
     trace_parent: Option<TraceParent>,
     authorization_header: Option<String>,
+    cancellation_token: Option<CancellationToken>,
 }
 
 impl RequestContextBuilder {
@@ -334,12 +416,14 @@ impl RequestContextBuilder {
             protocol,
             cache_control: CacheControl::Cache(CacheKeyType::Default),
             client_supplied_cache_key: None,
+            cache_namespace_override: None,
             app: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
             extensions: Extensions::default(),
             trace_parent: None,
             authorization_header: None,
+            cancellation_token: None,
         }
     }
 
@@ -414,6 +498,19 @@ impl RequestContextBuilder {
         self
     }
 
+    /// Override the cache namespace for this request, bypassing the
+    /// `protocol` + `auth_principal` derivation in
+    /// [`RequestContext::cache_namespace`]. Use this only for flows that
+    /// must inherit a namespace from another request — most importantly
+    /// SWR background revalidation, which runs under `Protocol::Internal`
+    /// (would otherwise be `System`) but must store its result under the
+    /// originating user's namespace so the user actually sees the refresh.
+    #[must_use]
+    pub fn with_cache_namespace(mut self, cache_namespace: CacheNamespace) -> Self {
+        self.cache_namespace_override = Some(cache_namespace);
+        self
+    }
+
     #[must_use]
     pub fn with_baggage(mut self, baggage: Vec<KeyValue>) -> Self {
         self.baggage = baggage;
@@ -429,6 +526,18 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_authorization_header(mut self, authorization_header: Option<String>) -> Self {
         self.authorization_header = authorization_header;
+        self
+    }
+
+    /// Supplies a pre-existing cancellation token to use as this request's
+    /// cancellation token. If unset, a fresh token is created in `build()`.
+    ///
+    /// Use this to parent a request's cancellation token to a broader scope
+    /// (for example, a scheduler-side request token derived from an executor-side
+    /// token so that cancellation cascades).
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 
@@ -522,12 +631,14 @@ impl RequestContextBuilder {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
             client_supplied_cache_key: user_cache_key,
+            cache_namespace_override: self.cache_namespace_override,
             dimensions,
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
             trace_parent: self.trace_parent,
             nested_query_level: AtomicI16::new(0),
             authorization_header: self.authorization_header,
+            cancellation_token: self.cancellation_token.unwrap_or_default(),
         }
     }
 
@@ -652,5 +763,48 @@ mod tests {
             ctx.scoped_client_supplied_cache_key().as_deref(),
             Some("anonymous:shared-key")
         );
+    }
+
+    #[test]
+    fn test_cancellation_token_starts_uncancelled() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        assert!(!ctx.is_cancelled());
+        assert!(!ctx.cancellation_token().is_cancelled());
+    }
+
+    #[test]
+    fn test_cancel_signals_token() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        ctx.cancel();
+        assert!(ctx.is_cancelled());
+        assert!(ctx.cancellation_token().is_cancelled());
+    }
+
+    #[test]
+    fn test_child_cancellation_token_inherits_parent_cancel() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        let child = ctx.child_cancellation_token();
+        assert!(!child.is_cancelled());
+        ctx.cancel();
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancelling_child_does_not_cancel_parent() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        let child = ctx.child_cancellation_token();
+        child.cancel();
+        assert!(child.is_cancelled());
+        assert!(!ctx.is_cancelled());
+    }
+
+    #[test]
+    fn test_with_cancellation_token_uses_supplied_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = RequestContextBuilder::new(Protocol::Internal)
+            .with_cancellation_token(token.clone())
+            .build();
+        token.cancel();
+        assert!(ctx.is_cancelled());
     }
 }

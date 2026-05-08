@@ -132,8 +132,27 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
+    // Resolve effective MCP config following the same pattern as builder.rs (L208-212):
+    // Config.runtime, if present, replaces the whole runtime — read .mcp from that.
+    // Otherwise fall back to the app's runtime .mcp. This mirrors how all other runtime
+    // fields are resolved: one effective SpicepodRuntime is chosen, then fields are read
+    // from it, rather than merging individual fields from both sources.
+    #[cfg(feature = "mcp")]
+    let mcp_config: Option<spicepod::component::runtime::McpConfig> =
+        config.runtime.as_ref().map_or_else(
+            || app.as_ref().and_then(|a| a.runtime.mcp.clone()),
+            |r| r.mcp.clone(),
+        );
     let auth_layer = auth_provider.map(AuthLayer::new);
-    let routes = routes::routes(&rt, config, vsearch, auth_layer, &cors_config);
+    let routes = routes::routes(
+        &rt,
+        config,
+        vsearch,
+        auth_layer,
+        &cors_config,
+        #[cfg(feature = "mcp")]
+        mcp_config.as_ref(),
+    );
     drop(app);
 
     let listener = TcpListener::bind(&bind_address)

@@ -21,7 +21,7 @@ use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
 use crate::opentelemetry::create_metrics_service;
-use crate::tls::{TlsConfig, server_with_tls_config};
+use crate::tls::TlsConfig;
 use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
@@ -417,11 +417,15 @@ fn handle_query_error(e: query::Error) -> Status {
     match e {
         query::Error::BindingParameters { source }
         | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
+        query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
         _ => to_tonic_err(e),
     }
 }
 
 fn handle_datafusion_error(e: DataFusionError) -> Status {
+    if query::is_cancellation_error(&e) {
+        return Status::cancelled(e.to_string());
+    }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)
@@ -514,6 +518,12 @@ pub enum Error {
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
     UnableToConfigureTls { source: tonic::transport::Error },
 
+    #[snafu(display("Unable to bind Flight TCP listener: {source}"))]
+    UnableToBindFlightListener { source: std::io::Error },
+
+    #[snafu(display("Unable to bind cluster TCP listener: {source}"))]
+    UnableToBindClusterListener { source: std::io::Error },
+
     #[snafu(display(
         "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
     ))]
@@ -599,13 +609,7 @@ pub async fn start(
             flight_message_size.unwrap_or(flight_client::MAX_ENCODING_MESSAGE_SIZE),
         );
 
-    let mut server = Server::builder();
-
-    if let Some(ref tls_config) = tls_config {
-        server = server_with_tls_config(server, tls_config).context(UnableToConfigureTlsSnafu)?;
-    }
-
-    // Wrap the auth in session-awareness to accept session IDs as bearer tokens
+    let server = Server::builder();
     let session_aware_auth = session_auth::with_session_awareness(
         endpoint_auth.flight_basic_auth,
         session_store.clone(),
@@ -636,17 +640,55 @@ pub async fn start(
         .add_service(spice_flight_service)
         .add_service(otel_service);
 
-    tracing::info!("Spice Runtime Flight listening on {bind_address}");
-    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
-
-    if let Some(token) = shutdown_signal {
+    let serve_result = if let Some(ref tls_config) = tls_config {
+        // TLS path: bind a TCP listener ourselves, run tokio-rustls per
+        // connection so we can hot-swap the cert via the resolver, and feed
+        // the resulting TlsStreams into tonic via serve_with_incoming. This
+        // replaces the legacy `Server::tls_config(ServerTlsConfig::new()...)`
+        // approach which baked the cert in once at startup.
+        let listener = tokio::net::TcpListener::bind(bind_address)
+            .await
+            .map_err(|source| {
+                if source.kind() == std::io::ErrorKind::AddrInUse {
+                    Error::AddressAlreadyInUse {
+                        addr: bind_address.to_string(),
+                    }
+                } else {
+                    Error::UnableToBindFlightListener { source }
+                }
+            })?;
+        // Bind succeeded; emit the started log + metric now so a failed
+        // bind doesn't show up as a phantom "Flight listening" line.
+        tracing::info!("Spice Runtime Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
+        let incoming = crate::tls::flight_incoming::tls_incoming(
+            listener,
+            Arc::clone(&tls_config.server_config),
+        );
+        if let Some(token) = shutdown_signal {
+            server
+                .serve_with_incoming_shutdown(incoming, token.cancelled())
+                .await
+        } else {
+            server.serve_with_incoming(incoming).await
+        }
+    } else if let Some(token) = shutdown_signal {
+        // Plain (no-TLS) path: tonic binds internally so we can't gate
+        // the log on a successful bind without a refactor; the
+        // is_address_in_use_error mapping below still surfaces
+        // bind-time failures to the caller.
+        tracing::info!("Spice Runtime Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         server
             .serve_with_shutdown(bind_address, token.cancelled())
             .await
     } else {
+        tracing::info!("Spice Runtime Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         server.serve(bind_address).await
-    }
-    .map_err(|e| {
+    };
+
+    serve_result.map_err(|e| {
         if is_address_in_use_error(&e) {
             return Error::AddressAlreadyInUse {
                 addr: bind_address.to_string(),

@@ -342,6 +342,49 @@ pub struct Args {
     pub open_telemetry_deprecated: bool,
 }
 
+/// Spawn a tokio task that listens for `SIGHUP` and asks the
+/// process-wide [`runtime::tls::TlsControl`] to reload every TLS
+/// material the runtime is watching. Mirrors the `nginx -s reload` /
+/// `kill -HUP <pid>` convention.
+///
+/// The reload itself is **best-effort and asynchronous**:
+/// `TlsControl::reload_all` enqueues a sentinel op on the watcher's
+/// dispatcher channel and returns as soon as the op is queued. The
+/// actual parse + validate + `ArcSwap::store` runs on the dispatcher
+/// thread shortly after; operators that need to confirm the rotation
+/// landed should watch the `tls_reload_total{result="ok"}` metric.
+///
+/// On Windows or other targets without SIGHUP semantics this is a
+/// no-op: rotation still works via the polling filesystem watcher.
+fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!("TLS reload: failed to install SIGHUP handler: {err}");
+                    return;
+                }
+            };
+            tracing::info!("TLS reload: SIGHUP handler installed");
+            while sighup.recv().await.is_some() {
+                tracing::info!("TLS reload: SIGHUP received, reloading TLS material");
+                if let Err(err) = control.reload_all() {
+                    tracing::warn!("TLS reload: SIGHUP reload failed: {err}");
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix platforms have no SIGHUP equivalent; rotation still
+        // works via the polling filesystem watcher.
+        let _ = control;
+    }
+}
+
 pub async fn run(args: Args) -> Result<()> {
     // Register external data connectors before runtime initialization.
     // This makes connectors from extracted crates available to the runtime.
@@ -408,8 +451,23 @@ pub async fn run(args: Args) -> Result<()> {
         limits
     };
 
-    let resolved_cluster_config =
-        in_tracing_context(|| ResolvedClusterConfig::try_new(args.runtime.cluster.clone()));
+    // Single, process-wide TLS reload control plane. Both public TLS
+    // (HTTP / Flight / Metrics) and cluster mTLS register their reload
+    // callbacks here so we have one watcher, one dispatcher thread, one
+    // SIGHUP target. Created lazily on success of `TlsControl::new`; if
+    // the watcher fails to spawn we surface the error eagerly.
+    let tls_control = std::sync::Arc::new(runtime::tls::TlsControl::new().map_err(|e| {
+        Error::UnableToInitializeTls {
+            source: Box::new(e),
+        }
+    })?);
+
+    let resolved_cluster_config = in_tracing_context(|| {
+        ResolvedClusterConfig::try_new_with_tls(
+            args.runtime.cluster.clone(),
+            Some(tls_control.as_ref()),
+        )
+    });
 
     let mut builder = Runtime::builder()
         .with_app_opt(app.clone())
@@ -602,9 +660,19 @@ pub async fn run(args: Args) -> Result<()> {
         .context(UnableToInitializeMetricsSnafu)?;
     }
 
-    let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
-        .await
-        .context(UnableToInitializeTlsSnafu)?;
+    let tls_config = tls::load_tls_config(
+        &args,
+        spicepod_tls_config.as_ref(),
+        rt.secrets(),
+        tls_control.as_ref(),
+    )
+    .await
+    .context(UnableToInitializeTlsSnafu)?;
+
+    // Wire SIGHUP -> tls_control.reload_all() once. Both public and
+    // cluster TLS register on the same `TlsControl`, so a single signal
+    // pickup rotates everything atomically.
+    spawn_sighup_reload_task(std::sync::Arc::clone(&tls_control));
 
     let telemetry_enabled = args.telemetry_enabled;
     let telemetry_config_clone = Arc::clone(&telemetry_config);
