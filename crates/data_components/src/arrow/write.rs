@@ -37,6 +37,7 @@ use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use arrow_row::{RowConverter, SortField};
 use async_trait::async_trait;
 use datafusion::common::{Constraint, Constraints, SchemaExt};
 use datafusion::datasource::{TableProvider, TableType, provider_as_source};
@@ -356,6 +357,109 @@ impl TableProvider for MemTable {
             &filters,
         )))))
     }
+}
+
+impl MemTable {
+    /// Deletes one matching row from this table for each row in `rows`, matching by the
+    /// full Arrow row representation.
+    ///
+    /// This is used by CDC streams that do not have a primary key but include a full
+    /// before-image for deletes. It preserves duplicate row multiplicity by removing at
+    /// most one existing row per delete row.
+    pub async fn delete_matching_rows(&self, rows: &RecordBatch) -> Result<u64> {
+        if rows.num_rows() == 0 {
+            return Ok(0);
+        }
+
+        self.schema
+            .logically_equivalent_names_and_types(&rows.schema())
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Deleting rows by full-row match requires the same schema as the table. {e}"
+                ))
+            })?;
+
+        let converter = row_converter_for_schema(&self.schema)?;
+        let mut delete_counts = row_key_counts(rows, &converter)?;
+        let mut deleted = 0_u64;
+
+        for partition in &self.batches {
+            let mut partition_batches = partition.write().await;
+            let mut filtered_batches = Vec::with_capacity(partition_batches.len());
+
+            for batch in partition_batches.drain(..) {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
+                let existing_rows = converter
+                    .convert_columns(batch.columns())
+                    .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+                let mut keep_row_builder = BooleanBuilder::with_capacity(batch.num_rows());
+                let mut removed_from_batch = false;
+
+                for row_idx in 0..batch.num_rows() {
+                    let key = existing_rows.row(row_idx);
+                    let should_delete = if let Some(count) = delete_counts.get_mut(key.as_ref()) {
+                        if *count > 0 {
+                            *count -= 1;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if should_delete {
+                        deleted += 1;
+                        removed_from_batch = true;
+                    }
+                    keep_row_builder.append_value(!should_delete);
+                }
+
+                if removed_from_batch {
+                    let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
+                    if filtered_batch.num_rows() > 0 {
+                        filtered_batches.push(filtered_batch);
+                    }
+                } else {
+                    filtered_batches.push(batch);
+                }
+            }
+
+            *partition_batches = filtered_batches;
+        }
+
+        Ok(deleted)
+    }
+}
+
+fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {
+    let sort_fields = schema
+        .fields()
+        .iter()
+        .map(|field| SortField::new(field.data_type().clone()))
+        .collect();
+
+    RowConverter::new(sort_fields)
+        .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))
+}
+
+fn row_key_counts(
+    batch: &RecordBatch,
+    converter: &RowConverter,
+) -> Result<HashMap<Vec<u8>, usize>> {
+    let rows = converter
+        .convert_columns(batch.columns())
+        .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+    let mut counts = HashMap::with_capacity(batch.num_rows());
+
+    for row_idx in 0..rows.num_rows() {
+        *counts.entry(rows.row(row_idx).as_ref().to_vec()).or_insert(0) += 1;
+    }
+
+    Ok(counts)
 }
 
 /// Implements for writing to a [`MemTable`]

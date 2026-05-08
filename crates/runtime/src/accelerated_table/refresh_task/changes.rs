@@ -23,6 +23,7 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use cache::Caching;
+use data_components::arrow::{IndexedMemTable, write::MemTable};
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 #[cfg(feature = "dynamodb")]
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
@@ -31,6 +32,8 @@ use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+use data_components::index_maintenance::perform_index_maintenance;
+use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
@@ -40,6 +43,7 @@ use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -317,22 +321,7 @@ impl RefreshTask {
             );
         }
 
-        let indices_array = UInt32Array::from(
-            row_indices
-                .iter()
-                .filter_map(|&i| u32::try_from(i).ok())
-                .collect::<Vec<_>>(),
-        );
-
-        let selected_columns: Vec<ArrayRef> = data_batch
-            .columns()
-            .iter()
-            .map(|col| arrow::compute::take(col.as_ref(), &indices_array, None))
-            .collect::<Result<Vec<_>, _>>()
-            .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
-
-        let selected_batch = RecordBatch::try_new(data_batch.schema(), selected_columns)
-            .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+        let selected_batch = select_data_rows(&data_batch, row_indices)?;
 
         let ctx = SessionContext::new();
         let session_state = ctx.state();
@@ -362,6 +351,7 @@ impl RefreshTask {
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        perform_change_write_maintenance(&self.accelerator).await?;
 
         self.update_last_updated_at();
 
@@ -390,6 +380,7 @@ impl RefreshTask {
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        perform_change_write_maintenance(&self.accelerator).await?;
 
         self.update_last_updated_at();
         Ok(())
@@ -406,6 +397,18 @@ impl RefreshTask {
             "Processing delete batch for {dataset_name} with {} rows",
             row_indices.len()
         );
+
+        if change_batch.primary_keys(row_indices[0]).is_empty() {
+            let selected_batch = select_data_rows(&change_batch.data_batch(), row_indices)?;
+            if delete_matching_rows_from_arrow_provider(&self.accelerator, &selected_batch)
+                .await?
+                .is_some()
+            {
+                perform_change_write_maintenance(&self.accelerator).await?;
+                self.update_last_updated_at();
+                return Ok(());
+            }
+        }
 
         let combined = build_batch_delete_expr_from_change_batch(
             change_batch,
@@ -428,6 +431,7 @@ impl RefreshTask {
                 .await
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            perform_change_write_maintenance(&self.accelerator).await?;
         }
 
         self.update_last_updated_at();

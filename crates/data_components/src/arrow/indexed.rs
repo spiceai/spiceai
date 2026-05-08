@@ -482,6 +482,11 @@ impl IndexedMemTable {
         self.inner = self.inner.with_column_defaults(column_defaults);
         self
     }
+
+    /// Deletes one matching row for each row in `rows`, matching by the full Arrow row.
+    pub async fn delete_matching_rows(&self, rows: &RecordBatch) -> Result<u64> {
+        self.inner.delete_matching_rows(rows).await
+    }
 }
 
 /// Represents a primary key value for lookup.

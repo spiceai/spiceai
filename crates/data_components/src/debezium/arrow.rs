@@ -112,6 +112,11 @@ pub enum Error {
     #[snafu(display("A deletion change was received without a 'before' field."))]
     DeleteOpWithoutBeforeField,
 
+    #[snafu(display(
+        "An update change without primary keys was received without a 'before' field. Configure Debezium to include the full before image for keyless updates."
+    ))]
+    UpdateOpWithoutBeforeField,
+
     #[snafu(display("Invalid decimal JSON: {reason}"))]
     InvalidDecimalJson { reason: String },
 

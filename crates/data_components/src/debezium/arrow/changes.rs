@@ -24,7 +24,7 @@ use crate::{
 };
 use arrow::{
     array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder},
-    datatypes::SchemaRef,
+    datatypes::{Schema, SchemaRef},
 };
 use snafu::prelude::*;
 
@@ -38,45 +38,7 @@ pub fn to_change_batch(
 
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), 1);
 
-    struct_builder.append(true);
-
-    for (idx, field) in schema.fields().iter().enumerate() {
-        let field_builder = struct_builder.field_builder_array(idx);
-        match field.name().as_str() {
-            "op" => {
-                let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
-                str_builder.append_value(change.payload.op.to_string());
-            }
-            "primary_keys" => {
-                let list_builder =
-                    downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)?;
-                if primary_key.is_empty() {
-                    list_builder.append(false);
-                } else {
-                    let str_builder = downcast_builder::<StringBuilder>(list_builder.values())?;
-                    for key in primary_key {
-                        str_builder.append_value(key);
-                    }
-                    list_builder.append(true);
-                }
-            }
-            "data" => {
-                let change_data = match change.payload.op {
-                    Op::Delete => change
-                        .payload
-                        .before
-                        .clone()
-                        .context(super::DeleteOpWithoutBeforeFieldSnafu)?,
-                    _ => change.payload.after.clone(),
-                };
-
-                let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)?;
-
-                super::append_value_to_struct_builder(change_data, data_struct_builder)?;
-            }
-            _ => unreachable!("Unexpected field in changes schema {}", field.name()),
-        }
-    }
+    append_change_event(&mut struct_builder, &schema, primary_key, change)?;
 
     let struct_array = struct_builder.finish();
     let record_batch: RecordBatch = struct_array.into();
@@ -100,45 +62,7 @@ pub fn vector_to_change_batch(
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), changes.len());
 
     for change in changes {
-        struct_builder.append(true);
-
-        for (idx, field) in schema.fields().iter().enumerate() {
-            let field_builder = struct_builder.field_builder_array(idx);
-            match field.name().as_str() {
-                "op" => {
-                    let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
-                    str_builder.append_value(change.payload.op.to_string());
-                }
-                "primary_keys" => {
-                    let list_builder =
-                        downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)?;
-                    if primary_key.is_empty() {
-                        list_builder.append(false);
-                    } else {
-                        let str_builder = downcast_builder::<StringBuilder>(list_builder.values())?;
-                        for key in primary_key {
-                            str_builder.append_value(key);
-                        }
-                        list_builder.append(true);
-                    }
-                }
-                "data" => {
-                    let change_data = match change.payload.op {
-                        Op::Delete => change
-                            .payload
-                            .before
-                            .clone()
-                            .context(super::DeleteOpWithoutBeforeFieldSnafu)?,
-                        _ => change.payload.after.clone(),
-                    };
-
-                    let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)?;
-
-                    super::append_value_to_struct_builder(change_data, data_struct_builder)?;
-                }
-                _ => unreachable!("Unexpected field in changes schema {}", field.name()),
-            }
-        }
+        append_change_event(&mut struct_builder, &schema, primary_key, change)?;
     }
 
     let struct_array = struct_builder.finish();
@@ -151,4 +75,80 @@ pub fn vector_to_change_batch(
     };
 
     Ok(change_batch)
+}
+
+fn append_change_event(
+    struct_builder: &mut StructBuilder,
+    schema: &Schema,
+    primary_key: &[String],
+    change: &ChangeEvent,
+) -> super::Result<()> {
+    if primary_key.is_empty() && matches!(change.payload.op, Op::Update) {
+        let before = change
+            .payload
+            .before
+            .clone()
+            .context(super::UpdateOpWithoutBeforeFieldSnafu)?;
+        append_change_row(struct_builder, schema, primary_key, "d", before)?;
+        append_change_row(
+            struct_builder,
+            schema,
+            primary_key,
+            "c",
+            change.payload.after.clone(),
+        )?;
+        return Ok(());
+    }
+
+    let op = change.payload.op.to_string();
+    let change_data = match change.payload.op {
+        Op::Delete => change
+            .payload
+            .before
+            .clone()
+            .context(super::DeleteOpWithoutBeforeFieldSnafu)?,
+        _ => change.payload.after.clone(),
+    };
+
+    append_change_row(struct_builder, schema, primary_key, &op, change_data)
+}
+
+fn append_change_row(
+    struct_builder: &mut StructBuilder,
+    schema: &Schema,
+    primary_key: &[String],
+    op: &str,
+    change_data: serde_json::Value,
+) -> super::Result<()> {
+    struct_builder.append(true);
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let field_builder = struct_builder.field_builder_array(idx);
+        match field.name().as_str() {
+            "op" => {
+                let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                str_builder.append_value(op);
+            }
+            "primary_keys" => {
+                let list_builder =
+                    downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)?;
+                if primary_key.is_empty() {
+                    list_builder.append(false);
+                } else {
+                    let str_builder = downcast_builder::<StringBuilder>(list_builder.values())?;
+                    for key in primary_key {
+                        str_builder.append_value(key);
+                    }
+                    list_builder.append(true);
+                }
+            }
+            "data" => {
+                let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)?;
+                super::append_value_to_struct_builder(change_data, data_struct_builder)?;
+            }
+            _ => unreachable!("Unexpected field in changes schema {}", field.name()),
+        }
+    }
+
+    Ok(())
 }
