@@ -721,21 +721,34 @@ impl ReciprocalRankFusion {
         let (subquery_dfs, join_key) = self.prepare_and_execute_subqueries(args, filters)?;
         let score_expr = Self::compute_score_expr(args, &subquery_dfs)?;
 
-        // Create column expressions for final projection
+        // Create column expressions for final projection.
+        // Only include columns that exist in *all* subquery schemas so that
+        // cross-backend RRF (e.g. vector_search + Elasticsearch text_search)
+        // doesn't fail when one backend returns extra columns (e.g. `_value`,
+        // `content_offset`) that the other doesn't.
         let mut columns: Vec<Expr> = vec![score_expr];
         columns.extend(subquery_dfs[0].schema().columns().iter().filter_map(|c| {
             match c.name.as_str() {
                 "rank" | "_score" => None,
                 // TODO: do we want the embedding in the final projection?
                 other if other.ends_with("_embedding") => None,
-                other => Some(
-                    coalesce(
-                        (0..subquery_dfs.len())
-                            .map(|i| col_qualified!(format!("search_{i}"), other))
-                            .collect(),
+                other => {
+                    // Skip columns that don't exist in every subquery schema.
+                    let in_all = subquery_dfs
+                        .iter()
+                        .all(|df| df.schema().has_column_with_unqualified_name(other));
+                    if !in_all {
+                        return None;
+                    }
+                    Some(
+                        coalesce(
+                            (0..subquery_dfs.len())
+                                .map(|i| col_qualified!(format!("search_{i}"), other))
+                                .collect(),
+                        )
+                        .alias(other),
                     )
-                    .alias(other),
-                ),
+                }
             }
         }));
 
@@ -977,6 +990,27 @@ impl ReciprocalRankFusion {
     fn fold_join(a: DataFrame, b: DataFrame, join_key: &str) -> Result<DataFrame> {
         let (tbl_a, id_a) = Self::first_qualified_field(&a, join_key)?;
         let (tbl_b, id_b) = Self::first_qualified_field(&b, join_key)?;
+
+        // Drop embedding columns before the full outer join — they are non-nullable
+        // in Arrow but the join produces nulls for unmatched rows, causing a schema
+        // violation. They are excluded from the final projection anyway.
+        let drop_embedding_cols = |df: DataFrame| -> Result<DataFrame> {
+            let to_drop: Vec<String> = df
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| f.name().ends_with("_embedding"))
+                .map(|f| f.name().clone())
+                .collect();
+            if to_drop.is_empty() {
+                Ok(df)
+            } else {
+                let to_drop_refs: Vec<&str> = to_drop.iter().map(String::as_str).collect();
+                df.drop_columns(&to_drop_refs)
+            }
+        };
+        let a = drop_embedding_cols(a)?;
+        let b = drop_embedding_cols(b)?;
 
         a.join_on(
             b,

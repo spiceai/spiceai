@@ -24,6 +24,8 @@ mod caching_mode;
 #[cfg(feature = "duckdb")]
 mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
+mod caching_mode_post_filter;
+#[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
 #[cfg(feature = "postgres-accel")]
 mod checkpoint_postgres;
@@ -45,6 +47,7 @@ mod on_conflict_options;
 mod partition_by_arrow;
 #[cfg(not(target_os = "windows"))]
 mod partition_by_cayenne;
+#[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
 #[cfg(feature = "duckdb")]

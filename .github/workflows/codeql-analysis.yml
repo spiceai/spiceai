@@ -18,9 +18,11 @@ on:
 jobs:
   analyze:
     name: Analyze
-    runs-on: self-hosted
+    runs-on: spicehq-dev-runners
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
     permissions:
       actions: read
       contents: read
@@ -40,22 +42,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up spiceio
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
-        id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
-        with:
-          smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
-          token: ${{ github.token }}
-          bucket: sccache
-          region: us-west-1
-
-      - name: Set up sccache
-        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
+      - name: Set up sccache with local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
       # Initializes the CodeQL tools for scanning.
       - name: Initialize CodeQL
@@ -92,12 +83,8 @@ jobs:
       #   make release
 
       - name: Show sccache stats
-        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
         run: sccache --show-stats
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@e46ed2cbd01164d986452f91f178727624ae40d7 # v4
-
-      - name: Kill spiceio
-        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true

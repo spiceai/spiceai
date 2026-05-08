@@ -72,8 +72,8 @@ pub(crate) struct SearchToolsQuery {
             status = 200,  body = [ListToolElement],
             description = "All tools available in the Spice runtime",
             example = json!([
-                {"name": "get_readiness", "description": "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.", "parameters": null},
-                {"name": "list_datasets", "description": "List all SQL tables available.", "parameters": null}
+                {"name": "get_readiness", "description": "Report the readiness state of every Spice runtime component (datasets, accelerators, models, embeddings, catalogs).", "parameters": null},
+                {"name": "list_datasets", "description": "List every dataset, view, and catalog visible to this runtime.", "parameters": null}
             ])
         ),
         (
@@ -110,7 +110,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
             example = json!([
                 {"name": "tool_search", "description": "Search the Spice tool registry for tools relevant to the current task.", "parameters": {"type": "object"}},
                 {"name": "tool_invoke", "description": "Invoke one Spice tool returned by tool_search.", "parameters": {"type": "object"}},
-                {"name": "list_datasets", "description": "List all SQL tables available.", "parameters": null}
+                {"name": "list_datasets", "description": "List every dataset, view, and catalog visible to this runtime.", "parameters": null}
             ])
         ),
         (status = 400, description = "Searchable tool registry is not configured", body = serde_json::Value),

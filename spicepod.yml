@@ -7,8 +7,8 @@ runtime:
     sql_results:
       enabled: true
       item_ttl: 5s
-  params:
-    github_max_concurrent_connections: 5 # Defaults to 10
+  source_rate_control:
+    github_concurrent_connections_limit: 5 # Defaults to 10
   dataset_load_parallelism: 1
 
 datasets:

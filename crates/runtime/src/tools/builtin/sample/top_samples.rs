@@ -26,6 +26,7 @@ use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::{
     error::DataFusionError,
     sql::{
+        TableReference,
         parser::{DFParser, Statement},
         sqlparser::{
             ast::{
@@ -42,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu, ensure};
 use tracing::Span;
 use tracing_futures::Instrument;
+use util::security::{quote_sql_identifier, quote_table_reference};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -93,12 +95,14 @@ impl SampleFrom for TopSamplesParams {
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let current_span = Span::current();
+        let tbl = TableReference::parse_str(self.tbl.as_str());
+        let tbl_quoted = quote_table_reference(&tbl);
 
         let batches = async {
             df.query_builder(&format!(
                 "SELECT * FROM {tbl} ORDER BY {order_by} LIMIT {limit}",
                 limit = self.limit,
-                tbl = self.tbl,
+                tbl = tbl_quoted,
             ))
             .build()
             .run()
@@ -112,7 +116,7 @@ impl SampleFrom for TopSamplesParams {
         .instrument(current_span)
         .await?;
 
-        let schema = Arc::new(df.get_arrow_schema(self.tbl.as_str()).await.boxed()?);
+        let schema = Arc::new(df.get_arrow_schema(tbl).await.boxed()?);
 
         concat_batches(&schema, batches.iter()).boxed()
     }
@@ -125,8 +129,12 @@ fn sanitize_order_by(order_by_raw: &str) -> Result<String> {
     }
 
     let order_by = strip_order_by_prefix(order_by_raw)?;
-    let order_expr = parse_order_by_expression(order_by, order_by_raw)?;
-    format_order_by_clause(&order_expr, order_by_raw)
+    match parse_order_by_expression(order_by, order_by_raw)
+        .and_then(|order_expr| format_order_by_clause(&order_expr, order_by_raw))
+    {
+        Ok(order_by) => Ok(order_by),
+        Err(_) => sanitize_simple_identifier_order_by(order_by, order_by_raw),
+    }
 }
 
 fn strip_order_by_prefix(order_by_raw: &str) -> Result<&str> {
@@ -224,7 +232,7 @@ fn format_order_by_clause(order_expr: &OrderByExpr, order_by_raw: &str) -> Resul
             if ident.value.eq_ignore_ascii_case("all") {
                 return Err(invalid_order_by(order_by_raw));
             }
-            ident.to_string()
+            quote_sql_identifier(&ident.value)
         }
         SqlExpr::CompoundIdentifier(idents) => idents_to_string(idents),
         _ => return Err(invalid_order_by(order_by_raw)),
@@ -245,10 +253,57 @@ fn invalid_order_by(order_by_raw: &str) -> Error {
     }
 }
 
+fn sanitize_simple_identifier_order_by(order_by: &str, order_by_raw: &str) -> Result<String> {
+    let mut parts = order_by.split_ascii_whitespace();
+    let Some(identifier) = parts.next() else {
+        return Err(invalid_order_by(order_by_raw));
+    };
+    let direction = parts.next();
+    if parts.next().is_some() {
+        return Err(invalid_order_by(order_by_raw));
+    }
+
+    let mut sanitized = quote_compound_identifier_literal(identifier, order_by_raw)?;
+    match direction {
+        Some(direction) if direction.eq_ignore_ascii_case("asc") => sanitized.push_str(" ASC"),
+        Some(direction) if direction.eq_ignore_ascii_case("desc") => sanitized.push_str(" DESC"),
+        Some(_) => return Err(invalid_order_by(order_by_raw)),
+        None => {}
+    }
+
+    Ok(sanitized)
+}
+
+fn quote_compound_identifier_literal(identifier: &str, order_by_raw: &str) -> Result<String> {
+    if identifier.eq_ignore_ascii_case("all") {
+        return Err(invalid_order_by(order_by_raw));
+    }
+
+    let mut quoted = Vec::new();
+    for part in identifier.split('.') {
+        if !is_simple_identifier_part(part) {
+            return Err(invalid_order_by(order_by_raw));
+        }
+        quoted.push(quote_sql_identifier(part));
+    }
+
+    Ok(quoted.join("."))
+}
+
+fn is_simple_identifier_part(part: &str) -> bool {
+    let mut chars = part.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 fn idents_to_string(idents: &[Ident]) -> String {
     idents
         .iter()
-        .map(Ident::to_string)
+        .map(|ident| quote_sql_identifier(&ident.value))
         .collect::<Vec<_>>()
         .join(".")
 }
@@ -260,13 +315,19 @@ mod tests {
     #[test]
     fn parses_simple_identifier() {
         let order_by = sanitize_order_by("column").expect("order_by to parse");
-        assert_eq!(order_by, "column");
+        assert_eq!(order_by, "\"column\"");
     }
 
     #[test]
     fn parses_prefixed_order_by_keyword() {
         let order_by = sanitize_order_by("ORDER BY column").expect("order_by to parse");
-        assert_eq!(order_by, "column");
+        assert_eq!(order_by, "\"column\"");
+    }
+
+    #[test]
+    fn parses_reserved_identifier() {
+        let order_by = sanitize_order_by("interval DESC").expect("order_by to parse");
+        assert_eq!(order_by, "\"interval\" DESC");
     }
 
     #[test]
@@ -279,13 +340,13 @@ mod tests {
     #[test]
     fn parses_compound_identifier_with_direction() {
         let order_by = sanitize_order_by("schema.table.column DESC").expect("order_by to parse");
-        assert_eq!(order_by, "schema.table.column DESC");
+        assert_eq!(order_by, "\"schema\".\"table\".\"column\" DESC");
     }
 
     #[test]
     fn parses_identifier_with_asc() {
         let order_by = sanitize_order_by("column asc").expect("order_by to parse");
-        assert_eq!(order_by, "column ASC");
+        assert_eq!(order_by, "\"column\" ASC");
     }
 
     #[test]

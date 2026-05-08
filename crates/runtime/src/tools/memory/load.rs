@@ -88,7 +88,7 @@ impl LoadMemoryTool {
             rt,
             name: name.unwrap_or("load_memory").to_string(),
             description: description
-                .unwrap_or("Load memories previously saved by the language model.")
+                .unwrap_or("Retrieve thoughts previously persisted via `store_memory`. Call this at the start of a conversation, or whenever the user references prior context (e.g. 'as we discussed', 'like last time'), to recover relevant background. `last` is a duration string (e.g. '1h', '24h', '7d') bounding how far back to look. Use `limit` (1-500, default 100) and `offset` for pagination. Returns the matching memory entries with their timestamps.")
                 .to_string(),
         }
     }

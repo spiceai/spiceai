@@ -111,7 +111,7 @@ lint: lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## Default variant: covers all default-distribution features (no models, no mcp, no nfs)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions --workspace --exclude libnfs -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -126,7 +126,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -146,7 +146,7 @@ lint-rust:
 .PHONY: lint-rust-models
 lint-rust-models:
 	## Models variant lint (default distribution + models)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions --workspace --exclude libnfs -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -161,7 +161,7 @@ lint-rust-models:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -181,7 +181,7 @@ lint-rust-models:
 .PHONY: lint-rust-nas
 lint-rust-nas:
 	## NAS variant lint (default distribution + nfs; requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -196,7 +196,7 @@ lint-rust-nas:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -215,7 +215,7 @@ lint-rust-nas:
 
 ## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
 ## Optional: FEATURES="feat1,feat2" to override features
-## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions for workspace (unless PACKAGES is set, then uses package defaults)
+## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control for workspace (unless PACKAGES is set, then uses package defaults)
 ## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
 PACKAGES ?=
 FEATURES ?=
@@ -233,7 +233,7 @@ _FEATURES_FLAGS := --features $(FEATURES)
 else ifdef PACKAGES
 _FEATURES_FLAGS :=
 else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions
+_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control
 endif
 
 lint-rust-fix:

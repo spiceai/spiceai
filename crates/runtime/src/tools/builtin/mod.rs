@@ -17,6 +17,7 @@ use super::SpiceModelTool;
 
 pub mod catalog;
 pub mod function_tool;
+pub mod get_current_datetime;
 pub mod get_readiness;
 pub mod list_datasets;
 pub mod sample;

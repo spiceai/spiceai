@@ -3780,6 +3780,14 @@ async fn build_snapshot_creation_config(
         Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
     >,
 ) -> Result<Option<SnapshotCreationConfig>> {
+    // `refresh_mode: snapshot` is a read-only snapshot consumer. Even when the
+    // dataset uses `acceleration.snapshots: enabled` (which normally enables
+    // both bootstrap and creation), snapshot refresh mode must not publish new
+    // snapshots or run the refresh-complete snapshot creation path.
+    if matches!(refresh_mode, RefreshMode::Snapshot) {
+        return Ok(None);
+    }
+
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
@@ -4220,6 +4228,7 @@ mod tests {
                 metrics: Metrics::default(),
                 runtime: Arc::new(runtime),
                 vectors: None,
+                full_text_search: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
             }
         }
@@ -4279,6 +4288,64 @@ mod tests {
             .await;
 
             assert!(result.expect("config should exist").is_none());
+        }
+
+        #[tokio::test]
+        async fn test_snapshot_refresh_mode_is_reader_only() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::RefreshComplete),
+                None,
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Snapshot,
+                AccelerationLayout::file(snapshot_path),
+                None,
+            )
+            .await;
+
+            assert!(
+                result.expect("snapshot reader should not error").is_none(),
+                "refresh_mode: snapshot must not create a snapshot creation config"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_snapshot_refresh_mode_ignores_create_trigger_validation() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                Some("not-a-valid-batch-count".to_string()),
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Snapshot,
+                AccelerationLayout::file(snapshot_path),
+                None,
+            )
+            .await;
+
+            assert!(
+                result
+                    .expect("snapshot reader should ignore creation trigger config")
+                    .is_none(),
+                "refresh_mode: snapshot should ignore snapshot creation trigger settings"
+            );
         }
 
         #[tokio::test]

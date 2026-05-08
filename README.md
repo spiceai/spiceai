@@ -248,6 +248,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `cosmosdb`                         | Azure Cosmos DB (NoSQL)                | Release Candidate |                           |
 | `git`                              | Git repositories                       | Release Candidate |                           |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]               | Beta              | [Spark Connect][spark]    |
+| `ducklake`                         | [DuckLake][ducklake]                   | Beta              | Parquet                   |
 | `flightsql`                        | FlightSQL                              | Beta              | Arrow Flight SQL          |
 | `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Beta              | Parquet                   |
 | `mssql`                            | Microsoft SQL Server                   | Beta              | Tabular Data Stream (TDS) |
@@ -259,7 +260,6 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `abfs`                             | Azure BlobFS                           | Alpha             | Parquet, CSV              |
 | `clickhouse`                       | ClickHouse                             | Alpha             |                           |
 | `debezium`                         | Debezium CDC                           | Alpha             | Kafka + JSON              |
-| `ducklake`                         | DuckLake                               | Alpha             |                           |
 | `elasticsearch`                    | Elasticsearch (BM25 + kNN + RRF)       | Alpha             |                           |
 | `gcs`, `gs`                        | [Google Cloud Storage][gcs]            | Alpha             | Parquet, CSV, JSON        |
 | `kafka`                            | Kafka                                  | Alpha             | Kafka + JSON              |
@@ -273,6 +273,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `smb`                              | SMB 3.1.1                              | Alpha             | SMB                       |
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
+[ducklake]: https://ducklake.select/
 [spark]: https://spark.apache.org/docs/latest/spark-connect-overview.html
 [gcs]: docs/features/gcs-connector.md
 [s3]: https://github.com/spiceai/cookbook/tree/trunk/s3#readme
@@ -343,6 +344,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `unity_catalog` | Unity Catalog           | Stable | Delta Lake                   |
 | `databricks`    | Databricks              | Beta   | Spark Connect, S3/Delta Lake |
 | `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
+| `ducklake`      | DuckLake                | Beta   | Parquet                      |
 | `glue`          | AWS Glue                | Alpha  | CSV, Parquet, Iceberg        |
 
 ## Supported Secret Stores

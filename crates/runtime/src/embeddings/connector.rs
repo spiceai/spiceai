@@ -41,8 +41,10 @@ use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::VectorScanTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
+use spicepod::semantic::Column;
 #[cfg(feature = "duckdb")]
-use spicepod::{semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
+use spicepod::semantic::ColumnLevelEmbeddingConfig;
+use spicepod::vector::VectorStore;
 use std::any::Any;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -114,22 +116,29 @@ impl EmbeddingConnector {
                 });
             }
 
-            return wrap_table_as_index(
-                &dataset.runtime().datafusion().ctx,
-                &self.embedding_models,
-                &self.secrets,
-                &dataset.name,
-                &dataset.columns,
-                dataset.params.get("file_format").map(String::as_str),
-                Arc::clone(&inner_table_provider),
-                vector_engine,
-            )
-            .await
-            .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
-                dataconnector: dataset.source().to_string(),
-                connector_component: dataset.into(),
-                source: e,
-            });
+            let mut provider = Arc::clone(&inner_table_provider);
+            for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
+                provider = wrap_table_as_index(
+                    &dataset.runtime().datafusion().ctx,
+                    &self.embedding_models,
+                    &self.secrets,
+                    &dataset.name,
+                    &columns,
+                    dataset.params.get("file_format").map(String::as_str),
+                    provider,
+                    &effective_vector_store,
+                )
+                .await
+                .map_err(|e| {
+                    DataConnectorError::InvalidConfigurationSourceOnly {
+                        dataconnector: dataset.source().to_string(),
+                        connector_component: dataset.into(),
+                        source: e,
+                    }
+                })?;
+            }
+
+            return Ok(provider);
         }
 
         // Add in embedding columns from `dataset.columns.embeddings`.
@@ -476,6 +485,83 @@ fn duckdb_vector_store_for_accelerated_table(dataset: &Dataset) -> Option<Vector
     crate::embeddings::index::duckdb::vector_store_from_embedding_params(&acceleration.params)
 }
 
+fn vector_index_groups(
+    vector_store: &VectorStore,
+    dataset: &Dataset,
+) -> Vec<(VectorStore, Vec<Column>)> {
+    let has_column_overrides = dataset.columns.iter().any(|column| {
+        column
+            .embeddings
+            .first()
+            .is_some_and(|embedding| embedding.engine.is_some() || embedding.params.is_some())
+    });
+
+    if !has_column_overrides {
+        return vec![(vector_store.clone(), dataset.columns.clone())];
+    }
+
+    let mut groups: Vec<(VectorStore, Vec<Column>)> = Vec::new();
+    for column in &dataset.columns {
+        let Some(embedding) = column.embeddings.first() else {
+            continue;
+        };
+
+        let effective_vector_store = vector_store_for_embedding(vector_store, embedding);
+        let mut grouped_column = column.clone();
+        grouped_column.embeddings = vec![embedding.clone()];
+
+        if let Some((_, columns)) = groups
+            .iter_mut()
+            .find(|(group_vector_store, _)| group_vector_store == &effective_vector_store)
+        {
+            if let Some(candidate) = columns
+                .iter_mut()
+                .find(|candidate| candidate.name == grouped_column.name)
+            {
+                candidate.embeddings.clone_from(&grouped_column.embeddings);
+            } else {
+                columns.push(grouped_column);
+            }
+        } else {
+            let mut columns = dataset.columns.clone();
+            for candidate in &mut columns {
+                candidate.embeddings.clear();
+            }
+            if let Some(candidate) = columns
+                .iter_mut()
+                .find(|candidate| candidate.name == grouped_column.name)
+            {
+                candidate.embeddings.clone_from(&grouped_column.embeddings);
+            }
+            groups.push((effective_vector_store, columns));
+        }
+    }
+
+    groups
+}
+
+fn vector_store_for_embedding(
+    vector_store: &VectorStore,
+    embedding: &spicepod::semantic::ColumnLevelEmbeddingConfig,
+) -> VectorStore {
+    let mut effective = vector_store.clone();
+    if let Some(engine) = embedding.engine.as_ref() {
+        effective.engine = Some(engine.clone());
+    }
+
+    if let Some(params) = embedding.params.as_ref() {
+        let mut merged = effective.params.clone().unwrap_or_default();
+        spicepod::param::merge_params(&mut merged, Some(params));
+        effective.params = if merged.data.is_empty() {
+            None
+        } else {
+            Some(merged)
+        };
+    }
+
+    effective
+}
+
 #[cfg(feature = "duckdb")]
 fn duckdb_embedding_columns(dataset: &Dataset) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
     let mut embedding_columns = dataset
@@ -489,6 +575,8 @@ fn duckdb_embedding_columns(dataset: &Dataset) -> Vec<(String, ColumnLevelEmbedd
                     chunking: embedding.chunking.clone(),
                     row_ids: embedding.primary_keys.clone(),
                     vector_size: embedding.vector_size,
+                    engine: None,
+                    params: None,
                     aggregation: embedding.aggregation,
                     max_elements_per_row: embedding.max_elements_per_row,
                 },

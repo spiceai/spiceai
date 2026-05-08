@@ -553,6 +553,16 @@
             }
           ]
         },
+        "source_rate_control": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceRateControl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "functions": {
           "$ref": "#/$defs/Functions"
         }
@@ -1490,6 +1500,44 @@
         "state_location"
       ]
     },
+    "SourceRateControl": {
+      "type": "object",
+      "properties": {
+        "state_location": {
+          "description": "Root URI for globally persisted source rate-control state.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Optional object store params for source rate-control state.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "refresh_interval": {
+          "description": "How often each runtime refreshes and persists per-source rate-control state in object storage.",
+          "type": "string",
+          "default": "30s"
+        },
+        "github_concurrent_connections_limit": {
+          "description": "Maximum number of concurrent GitHub HTTP requests for this authentication context.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "Params": {
       "type": "object",
       "additionalProperties": {
@@ -1955,6 +2003,16 @@
                 }
               ]
             },
+            "full_text_search": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FtsStore"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "check_availability": {
               "$ref": "#/$defs/CheckAvailability"
             },
@@ -2311,6 +2369,24 @@
           "format": "uint",
           "minimum": 0
         },
+        "engine": {
+          "description": "Optional search engine override for this embedding column.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Optional engine parameters for this embedding column.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "aggregation": {
           "description": "Aggregation strategy for multi-vector embeddings. Only meaningful\nwhen the underlying column is list-typed. Defaults to `max`.",
           "anyOf": [
@@ -2396,6 +2472,24 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "engine": {
+          "description": "Optional text search engine override for this column.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Optional engine parameters for this text search column.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
@@ -2835,12 +2929,21 @@
       ]
     },
     "RefreshMode": {
-      "type": "string",
-      "enum": [
-        "full",
-        "append",
-        "changes",
-        "caching"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "full",
+            "append",
+            "changes",
+            "caching"
+          ]
+        },
+        {
+          "description": "Refresh exclusively by reloading newer snapshots from the configured\nsnapshot location. The federated source is never queried for refreshes.\nRequires `snapshots` to be enabled and a snapshot-supporting engine.",
+          "type": "string",
+          "const": "snapshot"
+        }
       ]
     },
     "ZeroResultsAction": {
@@ -3091,6 +3194,34 @@
         }
       },
       "additionalProperties": false
+    },
+    "FtsStore": {
+      "description": "Dataset-level full-text search store configuration.\n\nSelects which engine backs the full-text search index for this dataset and\nsupplies the connection parameters needed to reach it.\n\nWhen absent, the runtime defaults to the built-in Tantivy in-process engine\n(controlled by the column-level `full_text_search.index_store` field).\n\n# Example\n\n```yaml\ndatasets:\n  - from: postgres:my_table\n    name: docs\n    acceleration:\n      enabled: true\n    full_text_search:\n      engine: elasticsearch\n      params:\n        endpoint: https://my-cluster.es.io:9200\n        index: spice-docs\n        user: ${secrets:ES_USER}\n        pass: ${secrets:ES_PASS}\n    columns:\n      - name: body\n        full_text_search:\n          enabled: true\n          row_id: id\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "engine": {
+          "description": "FTS engine name. Currently only `\"elasticsearch\"` is supported.\nWhen absent (or when the `elasticsearch` feature is disabled), the\nruntime falls back to the Tantivy in-process engine.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Engine-specific connection parameters.\n\nFor `engine: elasticsearch`:\n- `endpoint` (required) — Elasticsearch cluster URL, e.g. `https://localhost:9200`\n- `index` (optional) — ES index name; defaults to the dataset name\n- `user` / `pass` (optional) — HTTP Basic Auth credentials\n- `client_timeout` / `connect_timeout` (optional) — timeout durations, e.g. `30s`",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
     },
     "CheckAvailability": {
       "description": "Controls whether the federated table periodically has its availability checked.",
@@ -3615,25 +3746,55 @@
       ]
     },
     "Signature": {
-      "description": "Typed function signature.\n\n`returns` names the output Arrow type.",
+      "description": "Typed function signature.\n\n`returns` names the output Arrow type for scalar functions, or the\noutput columns for table functions.",
       "type": "object",
       "properties": {
+        "tables": {
+          "description": "Table inputs consumed by function backends that accept relational input.\nWhen a function accepts table and scalar arguments, table inputs\nare the leading arguments and scalar arguments follow them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FunctionTableArg"
+          }
+        },
         "args": {
-          "description": "Positional argument list. Empty for niladic functions.",
+          "description": "Positional scalar argument list. Empty for niladic functions.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/FunctionArg"
           }
         },
         "returns": {
-          "description": "Return Arrow type. Required for scalar functions.",
-          "type": [
-            "string",
-            "null"
+          "description": "Return Arrow type for scalar functions, or output columns for table functions.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FunctionReturns"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
       "additionalProperties": false
+    },
+    "FunctionTableArg": {
+      "description": "A declared table input for function backends.\n\nThe `name` is the logical input name exposed to the backend. `columns`\ndeclares the Arrow schema expected by the backend. The actual input data can\ncome from a backend-specific parameter, such as `params.input_table`, or from\na SQL `body`/`body_ref` query that produces the declared columns.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FunctionArg"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
     },
     "FunctionArg": {
       "description": "A single named argument or output column.\n\nThe `type` field is an Arrow logical-type string (e.g. `float64`,\n`utf8`, `list<int32>`, `decimal(38, 10)`, `timestamp(us, utc)`). The\nparser retains it verbatim; tier-specific function factories validate\naccepted type strings when the function is registered.",
@@ -3650,6 +3811,20 @@
       "required": [
         "name",
         "type"
+      ]
+    },
+    "FunctionReturns": {
+      "description": "Function return declaration.\n\nScalar functions use a single Arrow type string:\n\n```yaml\nreturns: int64\n```\n\nTable functions use a list of named output columns:\n\n```yaml\nreturns:\n  - { name: value, type: int64 }\n  - { name: label, type: utf8 }\n```",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FunctionArg"
+          }
+        }
       ]
     },
     "ComponentOrReference8": {
@@ -3777,7 +3952,7 @@
       ]
     },
     "Function": {
-      "description": "A user-defined scalar SQL function registered into the `DataFusion` session context.\n\nThe `from` field selects the execution tier:\n  * `sql` — inline SQL body (tier T0, in-process, no sandbox).\n  * `http://…` | `https://…` — remote endpoint invoked over HTTP + JSON (tier T2).\n\nSupported at runtime: `sql`, `http://…`, `https://…`.\n\nRegistration is disabled by default. Set `runtime.functions.enabled: true`\nin the spicepod to activate declared functions.",
+      "description": "A user-defined function registered into the `DataFusion` session context.\n\nThe `from` field selects the execution tier:\n  * `sql` - inline SQL body (tier T0, in-process, no sandbox).\n  * `http://...` | `https://...` - remote endpoint invoked over HTTP + JSON (tier T2).\n  * `wasm` - WebAssembly module invoked with Arrow IPC batches.\n\nSupported at runtime by default: `sql`. HTTP-backed functions require a\nruntime built with the `http-functions` feature. WebAssembly functions\nrequire a runtime built with the `wasm-functions` feature.\n\nRegistration is disabled by default. Set `runtime.functions.enabled: true`\nin the spicepod to activate declared functions.",
       "type": "object",
       "properties": {
         "name": {
@@ -3801,7 +3976,7 @@
           ]
         },
         "kind": {
-          "description": "Function kind. Only scalar functions are supported in the beta surface.\nDefaults to [`FunctionKind::Scalar`].",
+          "description": "Defaults to [`FunctionKind::Scalar`].",
           "$ref": "#/$defs/FunctionKind",
           "default": "scalar"
         },
@@ -3857,7 +4032,7 @@
           ]
         },
         "as_tool": {
-          "description": "Whether this function is also exposed as an LLM tool. Defaults to\n`true` — every declared function automatically becomes callable\nboth via SQL (`SELECT my_fn(x)`) and via the tool registry (LLM\ntool-calling, `POST /v1/tools/<name>`, `/v1/tools` listing).\n\nSet to `false` to keep the function SQL-only.",
+          "description": "Whether this scalar function is also exposed as an LLM tool. Defaults\nto `true` — scalar functions automatically become callable both via SQL\n(`SELECT my_fn(x)`) and via the tool registry (LLM tool-calling,\n`POST /v1/tools/<name>`, `/v1/tools` listing). Table functions are\nalways SQL-only.\n\nSet to `false` to keep the function SQL-only.",
           "type": "boolean",
           "default": true
         }
@@ -3870,10 +4045,11 @@
       ]
     },
     "FunctionKind": {
-      "description": "Function kind. The beta user-defined-function surface supports scalar functions.",
+      "description": "Function kind.",
       "type": "string",
       "enum": [
-        "scalar"
+        "scalar",
+        "table"
       ]
     },
     "Volatility": {
@@ -5773,7 +5949,7 @@
           "type": "string"
         },
         "pagination_max_pages": {
-          "description": "Maximum number of pages to fetch for pagination. Default: 100.",
+          "description": "Maximum number of pages to fetch for pagination. Default: 100. Set to 'nolimit' to disable the limit.",
           "type": "string"
         },
         "pagination_data_map_to_array": {
@@ -6105,7 +6281,7 @@
           "type": "string"
         },
         "pagination_max_pages": {
-          "description": "Maximum number of pages to fetch for pagination. Default: 100.",
+          "description": "Maximum number of pages to fetch for pagination. Default: 100. Set to 'nolimit' to disable the limit.",
           "type": "string"
         },
         "pagination_data_map_to_array": {
@@ -7473,9 +7649,13 @@
           ]
         },
         "responses_api": {
-          "description": "Whether to enable use of this model via the Responses API. `disabled` by default.",
+          "description": "Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.",
           "type": "string",
-          "default": "disabled"
+          "default": "disabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
         },
         "openai_responses_tools": {
           "description": "The OpenAI Responses tools to use when calling the model from the Responses API",
@@ -7560,6 +7740,12 @@
           "type": "string"
         },
         "parallel_tool_calls": {
+          "type": "string"
+        },
+        "prompt_cache_key": {
+          "type": "string"
+        },
+        "prompt_cache_retention": {
           "type": "string"
         },
         "user": {
@@ -7665,6 +7851,16 @@
           "type": "string",
           "deprecated": true
         },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: Use 'prompt_cache_key' without prefix",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
+          "description": "**DEPRECATED**: Use 'prompt_cache_retention' without prefix",
+          "type": "string",
+          "deprecated": true
+        },
         "openai_user": {
           "description": "**DEPRECATED**: Use 'user' without prefix",
           "type": "string",
@@ -7703,9 +7899,13 @@
           "default": ""
         },
         "responses_api": {
-          "description": "Whether to enable use of this model via the Responses API. `disabled` by default.",
+          "description": "Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.",
           "type": "string",
-          "default": "disabled"
+          "default": "disabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
         },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
@@ -7788,6 +7988,12 @@
           "type": "string"
         },
         "azure_parallel_tool_calls": {
+          "type": "string"
+        },
+        "azure_prompt_cache_key": {
+          "type": "string"
+        },
+        "azure_prompt_cache_retention": {
           "type": "string"
         },
         "azure_user": {
@@ -7893,6 +8099,16 @@
           "type": "string",
           "deprecated": true
         },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
         "openai_user": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -7990,6 +8206,12 @@
           "type": "string"
         },
         "file_parallel_tool_calls": {
+          "type": "string"
+        },
+        "file_prompt_cache_key": {
+          "type": "string"
+        },
+        "file_prompt_cache_retention": {
           "type": "string"
         },
         "file_user": {
@@ -8091,6 +8313,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -8206,6 +8438,12 @@
         "databricks_parallel_tool_calls": {
           "type": "string"
         },
+        "databricks_prompt_cache_key": {
+          "type": "string"
+        },
+        "databricks_prompt_cache_retention": {
+          "type": "string"
+        },
         "databricks_user": {
           "type": "string"
         },
@@ -8305,6 +8543,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -8416,6 +8664,12 @@
         "huggingface_parallel_tool_calls": {
           "type": "string"
         },
+        "huggingface_prompt_cache_key": {
+          "type": "string"
+        },
+        "huggingface_prompt_cache_retention": {
+          "type": "string"
+        },
         "huggingface_user": {
           "type": "string"
         },
@@ -8515,6 +8769,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -8630,6 +8894,12 @@
         "anthropic_parallel_tool_calls": {
           "type": "string"
         },
+        "anthropic_prompt_cache_key": {
+          "type": "string"
+        },
+        "anthropic_prompt_cache_retention": {
+          "type": "string"
+        },
         "anthropic_user": {
           "type": "string"
         },
@@ -8729,6 +8999,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -8836,6 +9116,12 @@
         "xai_parallel_tool_calls": {
           "type": "string"
         },
+        "xai_prompt_cache_key": {
+          "type": "string"
+        },
+        "xai_prompt_cache_retention": {
+          "type": "string"
+        },
         "xai_user": {
           "type": "string"
         },
@@ -8935,6 +9221,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -9079,6 +9375,12 @@
         "bedrock_parallel_tool_calls": {
           "type": "string"
         },
+        "bedrock_prompt_cache_key": {
+          "type": "string"
+        },
+        "bedrock_prompt_cache_retention": {
+          "type": "string"
+        },
         "bedrock_user": {
           "type": "string"
         },
@@ -9182,6 +9484,16 @@
           "type": "string",
           "deprecated": true
         },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
         "openai_user": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -9279,6 +9591,12 @@
           "type": "string"
         },
         "google_parallel_tool_calls": {
+          "type": "string"
+        },
+        "google_prompt_cache_key": {
+          "type": "string"
+        },
+        "google_prompt_cache_retention": {
           "type": "string"
         },
         "google_user": {
@@ -9380,6 +9698,16 @@
           "deprecated": true
         },
         "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -9541,6 +9869,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -9718,6 +10056,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -9883,6 +10231,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -10060,6 +10418,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -10225,6 +10593,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -10402,6 +10780,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -10567,6 +10955,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -10744,6 +11142,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -10909,6 +11317,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -11086,6 +11504,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -11251,6 +11679,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -11428,6 +11866,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -11593,6 +12041,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -11770,6 +12228,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -11935,6 +12403,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -12112,6 +12590,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -12277,6 +12765,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -12454,6 +12952,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -12619,6 +13127,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -12796,6 +13314,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -12961,6 +13489,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -13147,6 +13685,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -13321,6 +13869,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -13507,6 +14065,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -13681,6 +14249,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -13867,6 +14445,16 @@
             }
           ]
         },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -14041,6 +14629,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"
@@ -15122,6 +15720,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
             },
             {
               "type": "null"

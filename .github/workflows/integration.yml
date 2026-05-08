@@ -49,7 +49,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CONTAINER_REGISTRY: spiceaitestimages.azurecr.io/
   # CI performance optimizations
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
@@ -325,20 +324,20 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
 
-      - name: Login to ACR
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+      - name: Login to DockerHub
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Pull the Postgres/MySQL images
+      - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          echo ${{ env.CONTAINER_REGISTRY }}
-          docker pull ${{ env.CONTAINER_REGISTRY }}postgres:latest
-          docker pull ${{ env.CONTAINER_REGISTRY }}mysql:latest
+          docker pull docker.io/library/postgres:latest
+          docker pull docker.io/library/mysql:latest
+          docker pull docker.io/library/mongo:latest
+          docker pull docker.io/gvenzl/oracle-free:latest
 
       - name: Set up Spice.ai API Key
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -764,10 +763,6 @@ jobs:
           registry: spiceaitestimages.azurecr.io
           username: spiceai-repo-pull
           password: ${{ secrets.AZCR_PASSWORD }}
-
-      - name: Use public ECR for forks
-        if: github.repository != 'spiceai/spiceai'
-        run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
 
       - name: Run partition table integration test
         env:

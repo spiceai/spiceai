@@ -34,6 +34,8 @@ const VAULT_DOCKER_CONTAINER: &str = "runtime-integration-test-vault";
 /// Pinned to a recent Vault Enterprise/OSS image; using a tagged version
 /// keeps the test reproducible if upstream bumps the `latest` tag.
 const VAULT_IMAGE: &str = "hashicorp/vault:1.18";
+const VAULT_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const VAULT_SECRET_MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[instrument]
 pub async fn start_vault_docker_container(
@@ -65,15 +67,39 @@ pub async fn start_vault_docker_container(
             start_interval: None,
         })
         .build()?
-        .run(None)
+        .run(Some(VAULT_CONTAINER_START_TIMEOUT))
         .await?;
 
-    // Wait an extra beat for the dev-mode KV mount provisioning to
-    // settle. Vault accepts requests as soon as the listener is up but
-    // the default `secret/` mount is created asynchronously by
-    // `vault server -dev`.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_secret_mount(port).await?;
     Ok(running_container)
+}
+
+async fn wait_for_secret_mount(port: u16) -> Result<(), anyhow::Error> {
+    let url = format!("{}/v1/sys/mounts/secret/tune", vault_address(port));
+    let client = client()?;
+    let start_time = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start_time.elapsed() <= VAULT_SECRET_MOUNT_READY_TIMEOUT {
+        match client
+            .get(&url)
+            .header("X-Vault-Token", VAULT_ROOT_TOKEN)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => last_error = Some(response.status().to_string()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Vault container started but secret mount was not ready within {}s. Last error: {}",
+        VAULT_SECRET_MOUNT_READY_TIMEOUT.as_secs(),
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
 }
 
 fn vault_address(port: u16) -> String {
