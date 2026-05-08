@@ -29,11 +29,11 @@ description: "Query: tpch_q13"
 |               |                   RepartitionExec: partitioning=Hash([c_custkey@0], 32), input_partitions=1                                                                                |
 |               |                     SchemaCastScanExec                                                                                                                                     |
 |               |                       BytesProcessedExec                                                                                                                                   |
-|               |                         DataSourceExec: partitions=1, partition_sizes=[<redacted>]                                                                                                 |
+|               |                         DataSourceExec: partitions=1, partition_sizes=[<redacted>]                                                                                         |
 |               |                   RepartitionExec: partitioning=Hash([o_custkey@1], 32), input_partitions=32                                                                               |
 |               |                     FilterExec: o_comment@2 NOT LIKE %special%requests%, projection=[o_orderkey@0, o_custkey@1]                                                            |
 |               |                       SchemaCastScanExec                                                                                                                                   |
 |               |                         BytesProcessedExec                                                                                                                                 |
-|               |                           DataSourceExec: partitions=32, partition_sizes=[<redacted>]  |
+|               |                           DataSourceExec: partitions=32, partition_sizes=[<redacted>]                                                                                      |
 |               |                                                                                                                                                                            |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
