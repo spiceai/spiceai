@@ -964,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn changes_refresh_disables_duckdb_recompute_statistics_by_default() {
+    fn duckdb_write_settings_changes_refresh_disables_recompute_statistics_by_default() {
         let mut external_table = external_table_with_options(HashMap::new());
 
         super::apply_changes_refresh_write_defaults(&mut external_table, true);
@@ -976,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn changes_refresh_preserves_explicit_duckdb_recompute_statistics_setting() {
+    fn duckdb_write_settings_changes_refresh_preserves_explicit_recompute_statistics_setting() {
         let mut options = HashMap::new();
         options.insert(
             "recompute_statistics_on_write".to_string(),
@@ -993,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn non_changes_refresh_keeps_duckdb_write_settings_unset() {
+    fn duckdb_write_settings_non_changes_refresh_keeps_recompute_statistics_unset() {
         let mut external_table = external_table_with_options(HashMap::new());
 
         super::apply_changes_refresh_write_defaults(&mut external_table, false);
