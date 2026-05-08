@@ -132,20 +132,24 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
     let (count_a, count_b) = tokio::join!(driver(Arc::clone(&ctrl_a)), driver(Arc::clone(&ctrl_b)));
     let combined = count_a + count_b;
     let elapsed = started.elapsed();
-    let observed_rps = combined as f64 / elapsed.as_secs_f64();
+    let observed_rps =
+        f64::from(u32::try_from(combined).expect("combined acquisition count should fit in u32"))
+            / elapsed.as_secs_f64();
 
     // Allow up to one extra window of burst above the steady-state cap (10 RPS):
     // worst-case overshoot per window = burst_per_window = 10. With ~5 windows
     // total over 5 seconds, observed rate must stay close to 10 RPS.
-    let max_allowed = (cluster_rps as f64) * 2.0;
+    let max_allowed = f64::from(cluster_rps) * 2.0;
     assert!(
         observed_rps <= max_allowed,
         "combined observed {observed_rps:.1} RPS exceeds cap {max_allowed:.1} (a={count_a} b={count_b} elapsed={elapsed:?})"
     );
 
-    // Sanity: throughput should be non-trivial, not stuck at zero.
+    // With pre-leasing of the next window, the dead-zone at window boundaries
+    // is eliminated and combined throughput should approach the cluster cap.
+    // Allow some slack for the first-window startup and timing noise.
     assert!(
-        observed_rps >= (cluster_rps as f64) * 0.4,
-        "combined observed {observed_rps:.1} RPS suspiciously low (a={count_a} b={count_b})"
+        observed_rps >= f64::from(cluster_rps) * 0.7,
+        "combined observed {observed_rps:.1} RPS below 70% of cap {cluster_rps} (a={count_a} b={count_b})"
     );
 }
