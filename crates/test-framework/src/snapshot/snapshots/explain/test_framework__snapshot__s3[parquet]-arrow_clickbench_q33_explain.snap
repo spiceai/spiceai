@@ -17,6 +17,6 @@ description: "Query: clickbench_q33"
 |               |           AggregateExec: mode=Partial, gby=[WatchID@0 as WatchID, ClientIP@1 as ClientIP], aggr=[count(Int64(1)), sum(hits.IsRefresh), avg(hits.ResolutionWidth)]                                       |
 |               |             SchemaCastScanExec                                                                                                                                                                          |
 |               |               BytesProcessedExec                                                                                                                                                                        |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                         |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                                                                             |
 |               |                                                                                                                                                                                                         |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

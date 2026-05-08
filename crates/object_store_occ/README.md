@@ -159,26 +159,26 @@ pub enum UpdateResult<T> {
 
 ## Concurrency Control
 
-This crate uses **optimistic concurrency control** via HTTP conditional requests:
+This crate uses **optimistic concurrency control** via conditional writes:
 
 1. **On read**: Store the ETag (entity tag) from the response
-2. **On write**: Send `If-Match: <etag>` header with the stored ETag
-3. **On conflict**: Object store returns `412 Precondition Failed`
+2. **On write**: Send `If-Match: <etag>` with remote stores, or take a local advisory lock and re-check the ETag for `file://` stores
+3. **On conflict**: Object store returns `412 Precondition Failed`, or the local wrapper returns an equivalent precondition error
 
-This provides **linearizable writes** without locks or coordination services.
+This provides **linearizable writes** without external coordination services.
 
 ### Supported Object Stores
 
-| Store | OCC Support | Notes |
-|-------|-------------|-------|
-| Amazon S3 | ✅ Full | Native conditional writes |
-| Google Cloud Storage | ✅ Full | Generation-based versioning |
-| Azure Blob Storage | ✅ Full | ETag-based |
-| Local Filesystem | ⚠️ Limited | Uses file locking (best-effort) |
+| Store                | OCC Support | Notes                                                                     |
+| -------------------- | ----------- | ------------------------------------------------------------------------- |
+| Amazon S3            | ✅ Full      | Native conditional writes                                                 |
+| Google Cloud Storage | ✅ Full      | Generation-based versioning                                               |
+| Azure Blob Storage   | ✅ Full      | ETag-based                                                                |
+| Local Filesystem     | ✅ Local     | Simulates conditional writes with an advisory lock file and ETag re-check |
 
 ## Design Principles
 
 1. **Correctness over performance**: OCC ensures data integrity even under concurrent access
 2. **No hidden state**: All state lives in the object store; cache is explicitly managed
 3. **Explicit conflict handling**: Conflicts surface to the caller for domain-specific resolution
-4. **Zero coordination**: No locks, leases, or external services required
+4. **No external coordination**: Remote stores use native conditional writes; local files use a lock file in the state directory

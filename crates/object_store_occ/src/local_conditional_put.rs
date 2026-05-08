@@ -21,19 +21,19 @@ limitations under the License.
 //! file-based scheduler state.
 //!
 //! This wrapper intercepts `PutMode::Update` requests and implements them by
-//! checking the current `ETag` under an async mutex, then writing with
-//! `PutMode::Overwrite` if the `ETag` matches.
+//! checking the current `ETag` under a file-backed advisory lock, then writing
+//! with `PutMode::Overwrite` if the `ETag` matches.
 //!
-//! **Concurrency model**: the mutex serializes conditional writes within a
-//! single [`LocalConditionalPut`] instance.  Callers must share one `Arc`-wrapped
-//! instance to get proper serialization.  This is sufficient for `file://`
-//! scheduler state, which is intended for single-node / development use.
-//! For multi-process safety, use an S3-compatible store.
+//! **Concurrency model**: a lock file under the local state root serializes
+//! conditional writes across [`LocalConditionalPut`] instances and across local
+//! processes that use this wrapper for the same directory.
 //!
 //! [`LocalFileSystem`]: object_store::local::LocalFileSystem
 //! [`Error::NotImplemented`]: object_store::Error::NotImplemented
 
 use std::fmt::{self, Display, Formatter};
+use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -44,29 +44,65 @@ use object_store::{
     Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use tokio::sync::Mutex;
 
 /// Wraps a [`LocalFileSystem`] to add `PutMode::Update` support.
 ///
 /// For `PutMode::Update`, it:
-/// 1. Acquires an instance-level async mutex
+/// 1. Acquires a file-backed advisory lock for the local state root
 /// 2. Reads the current `ETag` of the target file via `head()`
 /// 3. Compares with the expected `ETag` from the [`UpdateVersion`]
 /// 4. Writes with `PutMode::Overwrite` if they match
-/// 5. Releases the mutex
+/// 5. Releases the advisory lock
 ///
 /// All other operations are delegated directly to the inner `LocalFileSystem`.
-///
-/// **Important**: callers must share a single `Arc<LocalConditionalPut>` to get
-/// proper serialization of conditional writes.  Creating multiple instances that
-/// point at the same directory will bypass the mutex.
 ///
 /// [`UpdateVersion`]: object_store::UpdateVersion
 pub struct LocalConditionalPut {
     inner: LocalFileSystem,
     root: PathBuf,
-    /// Serializes conditional put operations within this instance.
-    write_mutex: Mutex<()>,
+    semaphore: LocalFileSemaphore,
+}
+
+#[derive(Debug, Clone)]
+struct LocalFileSemaphore {
+    lock_path: PathBuf,
+}
+
+struct LocalFileSemaphoreGuard {
+    _file: File,
+}
+
+impl LocalFileSemaphore {
+    fn new(root: &std::path::Path) -> Self {
+        Self {
+            lock_path: root.join(".spice-object-store-occ.lock"),
+        }
+    }
+
+    async fn acquire(&self) -> Result<LocalFileSemaphoreGuard, ObjectStoreError> {
+        let lock_path = self.lock_path.clone();
+        let file = tokio::task::spawn_blocking(move || -> io::Result<File> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)?;
+            file.lock()?;
+            Ok(file)
+        })
+        .await
+        .map_err(|source| ObjectStoreError::Generic {
+            store: "LocalConditionalPut",
+            source: Box::new(source),
+        })?
+        .map_err(|source| ObjectStoreError::Generic {
+            store: "LocalConditionalPut",
+            source: Box::new(source),
+        })?;
+
+        Ok(LocalFileSemaphoreGuard { _file: file })
+    }
 }
 
 impl std::fmt::Debug for LocalConditionalPut {
@@ -90,10 +126,11 @@ impl LocalConditionalPut {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
         let root = root.into();
         let inner = LocalFileSystem::new_with_prefix(&root)?;
+        let semaphore = LocalFileSemaphore::new(&root);
         Ok(Self {
             inner,
             root,
-            write_mutex: Mutex::new(()),
+            semaphore,
         })
     }
 }
@@ -114,7 +151,7 @@ impl ObjectStore for LocalConditionalPut {
     ) -> Result<PutResult, ObjectStoreError> {
         if let PutMode::Update(expected) = &opts.mode {
             let expected = expected.clone();
-            let _guard = self.write_mutex.lock().await;
+            let _guard = self.semaphore.acquire().await?;
 
             // Read current ETag.
             // Note: only `e_tag` is compared because `LocalFileSystem` does not
@@ -451,6 +488,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_conditional_update_compares_etag_without_version() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new(dir.path()).expect("create store");
+
+        let path = Path::from("test/etag-only.json");
+        let create_result = store
+            .put_opts(
+                &path,
+                b"v1".as_slice().into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create should succeed");
+
+        let version = UpdateVersion {
+            e_tag: create_result.e_tag,
+            version: Some("local-store-has-no-version".to_string()),
+        };
+
+        store
+            .put_opts(
+                &path,
+                b"v2".as_slice().into(),
+                PutOptions::from(PutMode::Update(version)),
+            )
+            .await
+            .expect("etag-matched update should ignore version");
+
+        let bytes = store
+            .get(&path)
+            .await
+            .expect("get should succeed")
+            .bytes()
+            .await
+            .expect("read bytes");
+        assert_eq!(bytes.as_ref(), b"v2");
+    }
+
+    #[tokio::test]
     async fn test_concurrent_conditional_updates_one_wins() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let store =
@@ -512,8 +588,87 @@ mod tests {
             "exactly one writer should succeed; r1={r1:?}, r2={r2:?}"
         );
         assert!(
-            successes.iter().any(|s| !s),
-            "exactly one writer should fail with Precondition"
+            matches!(r1, Err(ObjectStoreError::Precondition { .. }))
+                || matches!(r2, Err(ObjectStoreError::Precondition { .. })),
+            "exactly one writer should fail with Precondition; r1={r1:?}, r2={r2:?}"
+        );
+
+        let final_bytes = store
+            .get(&path)
+            .await
+            .expect("get final value")
+            .bytes()
+            .await
+            .expect("read final bytes");
+        assert!(
+            matches!(final_bytes.as_ref(), b"writer-1" | b"writer-2"),
+            "final value should be from the winning writer, got {final_bytes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_conditional_updates_across_instances_one_wins() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let first_store =
+            std::sync::Arc::new(LocalConditionalPut::new(dir.path()).expect("create first store"));
+        let second_store =
+            std::sync::Arc::new(LocalConditionalPut::new(dir.path()).expect("create second store"));
+
+        let path = Path::from("test/concurrent-across-instances.json");
+        let create_result = first_store
+            .put_opts(
+                &path,
+                b"v1".as_slice().into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create");
+        let same_version = UpdateVersion {
+            e_tag: create_result.e_tag,
+            version: None,
+        };
+
+        let store1 = std::sync::Arc::clone(&first_store);
+        let v1 = same_version.clone();
+        let p1 = path.clone();
+        let h1 = tokio::spawn(async move {
+            store1
+                .put_opts(
+                    &p1,
+                    b"writer-1".as_slice().into(),
+                    PutOptions::from(PutMode::Update(v1)),
+                )
+                .await
+        });
+
+        let store2 = std::sync::Arc::clone(&second_store);
+        let p2 = path.clone();
+        let h2 = tokio::spawn(async move {
+            store2
+                .put_opts(
+                    &p2,
+                    b"writer-2".as_slice().into(),
+                    PutOptions::from(PutMode::Update(same_version)),
+                )
+                .await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        let r1 = r1.expect("join h1");
+        let r2 = r2.expect("join h2");
+
+        assert_eq!(
+            [r1.is_ok(), r2.is_ok()]
+                .into_iter()
+                .filter(|success| *success)
+                .count(),
+            1,
+            "exactly one writer should succeed; r1={r1:?}, r2={r2:?}"
+        );
+        assert!(
+            matches!(r1, Err(ObjectStoreError::Precondition { .. }))
+                || matches!(r2, Err(ObjectStoreError::Precondition { .. })),
+            "exactly one writer should fail with Precondition; r1={r1:?}, r2={r2:?}"
         );
     }
 }
