@@ -24,10 +24,26 @@ use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
+use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use tempfile::TempDir;
+
+/// Run `EXPLAIN` and return pretty-formatted output for snapshot comparison.
+async fn explain_plan(rt: &Runtime, sql: &str) -> String {
+    let result = rt
+        .datafusion()
+        .query_builder(&format!("EXPLAIN {sql}"))
+        .build()
+        .run()
+        .await
+        .expect("EXPLAIN should succeed");
+    let batches: Vec<RecordBatch> = result.data.try_collect().await.expect("collect");
+    arrow::util::pretty::pretty_format_batches(&batches)
+        .expect("format")
+        .to_string()
+}
 
 /// Bootstrap a `DuckLake` catalog at the given metadata path with test tables.
 ///
@@ -267,6 +283,17 @@ async fn ducklake_catalog_no_filter() -> Result<(), anyhow::Error> {
                 &results
             );
 
+            // Verify single-table query is federated
+            let plan = explain_plan(&rt, "SELECT id, total FROM all_tables.main.orders WHERE id > 1").await;
+            insta::assert_snapshot!("read_only_catalog_single_table", plan);
+
+            // Verify cross-table JOIN is federated
+            let plan = explain_plan(
+                &rt,
+                "SELECT o.id, c.name, o.total FROM all_tables.main.orders o JOIN all_tables.main.customers c ON o.customer_id = c.id",
+            ).await;
+            insta::assert_snapshot!("read_only_catalog_cross_table_join", plan);
+
             Ok(())
         })
         .await
@@ -418,8 +445,6 @@ async fn ducklake_standalone_dataset() -> Result<(), anyhow::Error> {
 /// Tests that INSERT works on a standalone `DuckLake` dataset when `access: read_write` is set.
 #[tokio::test]
 async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
-    use spicepod::component::access::AccessMode;
-
     let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));
     register_test_connectors().await;
 
@@ -464,6 +489,10 @@ async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
             }
 
             runtime_ready_check(&rt).await;
+
+            // Verify standalone dataset query is federated with read_write access
+            let plan = explain_plan(&rt, "SELECT id, total FROM my_orders WHERE id > 1").await;
+            insta::assert_snapshot!("read_write_standalone_single_table", plan);
 
             // Verify initial data
             let result = rt
@@ -520,8 +549,6 @@ async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
 /// Tests that INSERT works on a `DuckLake` catalog table when `access: read_write` is set.
 #[tokio::test]
 async fn ducklake_catalog_read_write_insert() -> Result<(), anyhow::Error> {
-    use spicepod::component::access::AccessMode;
-
     let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));
     register_test_connectors().await;
 
@@ -577,6 +604,17 @@ async fn ducklake_catalog_read_write_insert() -> Result<(), anyhow::Error> {
                 ],
                 &results
             );
+
+            // Verify single-table query is federated even with read_write access
+            let plan = explain_plan(&rt, "SELECT id, total FROM rw_lake.main.orders WHERE id > 1").await;
+            insta::assert_snapshot!("read_write_catalog_single_table", plan);
+
+            // Verify cross-table JOIN is federated as a single pushed-down query
+            let plan = explain_plan(
+                &rt,
+                "SELECT o.id, c.name, o.total FROM rw_lake.main.orders o JOIN rw_lake.main.customers c ON o.customer_id = c.id",
+            ).await;
+            insta::assert_snapshot!("read_write_catalog_cross_table_join", plan);
 
             // INSERT a new row (drain the stream to ensure the INSERT completes)
             let insert_result = rt

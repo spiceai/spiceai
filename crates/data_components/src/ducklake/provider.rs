@@ -539,12 +539,12 @@ impl DuckLakeSchemaProvider {
             match provider_result {
                 Ok(provider) => {
                     let provider: Arc<dyn TableProvider> = if self.writable {
-                        Arc::new(DuckDbFederatedTableWriter::new(
+                        DuckDbFederatedTableWriter::create(
                             provider,
                             Arc::clone(&self.pool),
-                            table_ref,
+                            &table_ref,
                             Arc::clone(&self.write_lock),
-                        ))
+                        )
                     } else {
                         provider
                     };

@@ -376,12 +376,12 @@ impl DataConnector for DuckLake {
             Err(e) => return Some(Err(e)),
         };
 
-        Some(Ok(Arc::new(DuckDbFederatedTableWriter::new(
+        Some(Ok(DuckDbFederatedTableWriter::create(
             read_provider,
             Arc::clone(&self.pool),
-            table_ref,
+            &table_ref,
             Arc::clone(&self.write_lock),
-        ))))
+        )))
     }
 }
 

@@ -47,6 +47,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::sql::TableReference;
+use datafusion_federation::FederatedTableProviderAdaptor;
 use datafusion_table_providers::duckdb::DuckDB;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use futures::StreamExt;
@@ -73,23 +74,38 @@ impl Debug for DuckDbFederatedTableWriter {
 }
 
 impl DuckDbFederatedTableWriter {
-    /// Create a new `DuckDbFederatedTableWriter`.
+    /// Create a writable `TableProvider` that preserves federation pushdown.
     ///
-    /// - `read_provider`: The underlying read-only `TableProvider` (for `scan` delegation).
-    /// - `pool`: `DuckDB` connection pool; might have additionally attached catalogs (e.g., `ducklake`).
-    /// - `table_reference`: Table reference used in SQL generation (supports `Bare`, `Partial`, and `Full`).
+    /// Extracts the `FederatedTableSource` from `read_provider` (if present)
+    /// and re-wraps the writer in a `FederatedTableProviderAdaptor` so the
+    /// federation optimizer can still detect it.
     #[must_use]
-    pub fn new(
+    pub fn create(
         read_provider: Arc<dyn TableProvider>,
         pool: Arc<DuckDbConnectionPool>,
-        table_reference: TableReference,
+        table_reference: &TableReference,
         write_lock: Arc<Mutex<()>>,
-    ) -> Self {
-        Self {
+    ) -> Arc<dyn TableProvider> {
+        let fed_source = read_provider
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .map(|adaptor| Arc::clone(&adaptor.source));
+
+        let writer: Arc<dyn TableProvider> = Arc::new(Self {
             read_provider,
             pool,
-            table_reference,
+            table_reference: table_reference.clone(),
             write_lock,
+        });
+
+        if let Some(source) = fed_source {
+            tracing::debug!(%table_reference, "Created federated writable DuckDB table provider");
+            Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+                source, writer,
+            ))
+        } else {
+            tracing::debug!(%table_reference, "Created non-federated writable DuckDB table provider");
+            writer
         }
     }
 }
