@@ -114,8 +114,8 @@ pub(crate) fn add_full_text_search_to_table(
 ///
 /// The index is registered via [`IndexedTableProvider::add_index`] so it is visible to the
 /// query optimizer and can be discovered by `find_index_in_table_provider` for `text_search()`
-/// queries. Use [`build_elasticsearch_text_index`] + [`crate::accelerated_table::Builder::add_sink_index`]
-/// for the accelerator-side path where optimizer visibility is not desired.
+/// queries. For the accelerator-side path, indexes are automatically discovered from the
+/// federated provider chain — no manual registration is needed.
 #[cfg(feature = "elasticsearch")]
 pub(crate) async fn add_elasticsearch_fts_to_table(
     inner_table_provider: Arc<dyn TableProvider>,

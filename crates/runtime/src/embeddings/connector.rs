@@ -308,34 +308,6 @@ impl DataConnector for EmbeddingConnector {
             return Ok(());
         }
 
-        #[cfg(feature = "elasticsearch")]
-        if let Some(vector_engine) = &dataset.vectors
-            && vector_engine.enabled
-            && vector_engine.engine.as_deref() == Some("elasticsearch")
-        {
-            tracing::debug!(
-                dataset = %dataset.name,
-                "Collecting Elasticsearch vector sink indexes for accelerator"
-            );
-            let accelerator = builder.get_accelerator();
-            for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
-                let sink_indexes =
-                    crate::embeddings::index::table::build_elasticsearch_sink_indexes(
-                        &self.embedding_models,
-                        &self.secrets,
-                        &dataset.name,
-                        &columns,
-                        dataset.params.get("file_format").map(String::as_str),
-                        &Arc::clone(&accelerator),
-                        &effective_vector_store,
-                    )
-                    .await?;
-                for idx in sink_indexes {
-                    builder.add_sink_index(idx);
-                }
-            }
-        }
-
         Ok(())
     }
 

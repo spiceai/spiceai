@@ -21,7 +21,6 @@ use super::{
     synchronized_table::SynchronizedTable,
 };
 use futures::{FutureExt, future::BoxFuture};
-use runtime_datafusion_index::Index;
 use tokio::{
     runtime::Handle,
     select,
@@ -61,8 +60,6 @@ pub struct RefreshTaskRunnerBuilder {
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
-    /// Indexes that receive write lifecycle hooks but are invisible to the query optimizer.
-    sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -95,7 +92,6 @@ impl RefreshTaskRunnerBuilder {
             last_updated_at: Arc::new(AtomicI64::new(0)),
             is_s3_express_acceleration: false,
             snapshot_refresh_state: None,
-            sink_indexes: vec![],
         }
     }
 
@@ -156,16 +152,8 @@ impl RefreshTaskRunnerBuilder {
         self
     }
 
-    /// Register indexes that receive write lifecycle hooks but are invisible to the query
-    /// optimizer. See [`crate::accelerated_table::sink::table::TableSink`] for details.
     #[must_use]
-    pub fn with_sink_indexes(mut self, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
-        self.sink_indexes = indexes;
-        self
-    }
-
-    #[must_use]
-    pub fn build(self) -> RefreshTaskRunner {
+    pub async fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
             self.dataset_name.clone(),
@@ -195,9 +183,7 @@ impl RefreshTaskRunnerBuilder {
         refresh_task_builder =
             refresh_task_builder.with_snapshot_refresh_state(self.snapshot_refresh_state);
 
-        refresh_task_builder = refresh_task_builder.with_sink_indexes(self.sink_indexes);
-
-        let refresh_task = Arc::new(refresh_task_builder.build());
+        let refresh_task = Arc::new(refresh_task_builder.build().await);
 
         RefreshTaskRunner {
             dataset_name: self.dataset_name,

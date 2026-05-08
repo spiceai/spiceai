@@ -44,7 +44,6 @@ use opentelemetry::KeyValue;
 use rand::RngExt;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::ForceCreate;
-use runtime_datafusion_index::Index;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -666,8 +665,6 @@ pub struct Refresher {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
-    /// Indexes that receive write lifecycle hooks but are invisible to the query optimizer.
-    sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -722,7 +719,6 @@ impl Refresher {
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
             is_s3_express_acceleration: false,
-            sink_indexes: vec![],
         }
     }
 
@@ -826,13 +822,6 @@ impl Refresher {
     /// Set whether the acceleration uses S3 Express One Zone storage.
     pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
-        self
-    }
-
-    /// Register indexes that receive write lifecycle hooks but are invisible to the query
-    /// optimizer. See [`crate::accelerated_table::sink::table::TableSink`] for details.
-    pub fn with_sink_indexes(&mut self, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> &mut Self {
-        self.sink_indexes = indexes;
         self
     }
 
@@ -981,9 +970,7 @@ impl Refresher {
         refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
 
-        refresh_task_runner = refresh_task_runner.with_sink_indexes(self.sink_indexes.clone());
-
-        let mut refresh_task_runner = refresh_task_runner.build();
+        let mut refresh_task_runner = refresh_task_runner.build().await;
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start()?;
         self.refresh_task_runner = Some(refresh_task_runner);
@@ -1207,25 +1194,21 @@ impl Refresher {
         changes_stream: ChangesStream,
         on_batch_process_callback: Option<SnapshotCallback>,
     ) -> tokio::task::JoinHandle<()> {
-        let refresh_task = Arc::new(
-            RefreshTask::builder(
-                Arc::clone(&self.runtime_status),
-                self.dataset_name.clone(),
-                Arc::clone(&self.federated),
-                self.federated_source.clone(),
-                Arc::clone(&self.accelerator),
-                self.io_runtime.clone(),
-                Arc::clone(&self.accelerator_write_mutex),
-            )
-            .with_disable_federation(self.disable_federation)
-            .with_cpu_runtime(self.cpu_runtime.clone())
-            .with_metrics(self.metrics.clone())
-            .with_on_stream_batch_process_callback(on_batch_process_callback)
-            .with_last_updated_at(Arc::clone(&self.last_updated_at))
-            .with_s3_express_acceleration(self.is_s3_express_acceleration)
-            .with_sink_indexes(self.sink_indexes.clone())
-            .build(),
-        );
+        let refresh_task_builder = RefreshTask::builder(
+            Arc::clone(&self.runtime_status),
+            self.dataset_name.clone(),
+            Arc::clone(&self.federated),
+            self.federated_source.clone(),
+            Arc::clone(&self.accelerator),
+            self.io_runtime.clone(),
+            Arc::clone(&self.accelerator_write_mutex),
+        )
+        .with_disable_federation(self.disable_federation)
+        .with_cpu_runtime(self.cpu_runtime.clone())
+        .with_metrics(self.metrics.clone())
+        .with_on_stream_batch_process_callback(on_batch_process_callback)
+        .with_last_updated_at(Arc::clone(&self.last_updated_at))
+        .with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
@@ -1233,6 +1216,7 @@ impl Refresher {
 
         let notifier = self.on_complete_notification.clone();
         tokio::spawn(async move {
+            let refresh_task = Arc::new(refresh_task_builder.build().await);
             if let Err(err) = refresh_task
                 .start_changes_stream(
                     refresh,

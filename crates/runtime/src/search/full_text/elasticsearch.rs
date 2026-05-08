@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use runtime_datafusion_index::IndexedTableProvider;
 use secrecy::ExposeSecret;
 use tokio::sync::{Mutex, RwLock};
 
@@ -38,9 +38,7 @@ use crate::component::{
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
-use crate::search::full_text::table::{
-    add_elasticsearch_fts_to_table, build_elasticsearch_text_index,
-};
+use crate::search::full_text::table::add_elasticsearch_fts_to_table;
 use crate::search::util::find_concrete_table_provider;
 use runtime_secrets::Secrets;
 
@@ -241,16 +239,6 @@ impl DataConnector for ElasticsearchFullTextConnector {
         self.inner_connector
             .on_accelerator_setup(dataset, builder)
             .await?;
-
-        let accelerator = builder.get_accelerator();
-        let index = build_elasticsearch_text_index(
-            accelerator,
-            &dataset.columns,
-            &dataset.name,
-            &self.fts_params,
-        )
-        .await?;
-        builder.add_sink_index(index as Arc<dyn Index + Send + Sync>);
 
         Ok(())
     }

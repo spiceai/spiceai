@@ -51,7 +51,7 @@ use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
     schema_cast::SchemaCastScanExec, wrap_with_filter,
 };
-use runtime_datafusion_index::Index;
+
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
@@ -366,10 +366,6 @@ pub struct Builder {
     cluster_role: Option<ClusterRole>,
     user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
-    /// Indexes that receive write lifecycle hooks (`on_write_start`, `on_write_failed`,
-    /// `on_write_complete`) but are not stored in the accelerator-side
-    /// [`IndexedTableProvider`] and therefore invisible to the query optimizer.
-    sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl Builder {
@@ -419,7 +415,6 @@ impl Builder {
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
-            sink_indexes: vec![],
         }
     }
 
@@ -486,17 +481,6 @@ impl Builder {
     /// refresher (created during build) receives the updated provider.
     pub fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
         self.accelerator = accelerator;
-    }
-
-    /// Register an index that receives write lifecycle hooks (`on_write_start`,
-    /// `on_write_failed`, `on_write_complete`) but is not stored in the accelerator-side
-    /// [`IndexedTableProvider`] and therefore invisible to the query optimizer.
-    ///
-    /// Intended for external indexes (e.g. Elasticsearch) that must be maintained in
-    /// lock-step with accelerator refreshes without participating in query planning.
-    pub fn add_sink_index(&mut self, index: Arc<dyn Index + Send + Sync>) -> &mut Self {
-        self.sink_indexes.push(index);
-        self
     }
 
     /// Set to only write to the accelerator (not replicate to federated source).
@@ -864,7 +848,6 @@ impl Builder {
         }
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
-        refresher.with_sink_indexes(self.sink_indexes);
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
