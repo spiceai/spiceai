@@ -27,12 +27,12 @@ use data_components::arrow::{IndexedMemTable, write::MemTable};
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 #[cfg(feature = "dynamodb")]
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
+use data_components::index_maintenance::perform_index_maintenance;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
-use data_components::index_maintenance::perform_index_maintenance;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
@@ -398,7 +398,10 @@ impl RefreshTask {
             row_indices.len()
         );
 
-        if change_batch.primary_keys(row_indices[0]).is_empty() {
+        if row_indices
+            .first()
+            .is_some_and(|row| change_batch.primary_keys(*row).is_empty())
+        {
             let selected_batch = select_data_rows(&change_batch.data_batch(), row_indices)?;
             if delete_matching_rows_from_arrow_provider(&self.accelerator, &selected_batch)
                 .await?
@@ -444,11 +447,20 @@ fn select_data_rows(
     data_batch: &RecordBatch,
     row_indices: &[usize],
 ) -> crate::accelerated_table::Result<RecordBatch> {
+    let indices = row_indices
+        .iter()
+        .map(|&idx| {
+            u32::try_from(idx).map_err(|_| {
+                arrow::error::ArrowError::InvalidArgumentError(format!(
+                    "CDC row index {idx} exceeds u32::MAX"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+
     let indices_array = UInt32Array::from(
-        row_indices
-            .iter()
-            .filter_map(|&idx| u32::try_from(idx).ok())
-            .collect::<Vec<_>>(),
+        indices,
     );
 
     let selected_columns: Vec<ArrayRef> = data_batch
@@ -488,9 +500,11 @@ async fn delete_matching_rows_from_arrow_provider(
         let mut deleted = 0_u64;
         let mut matched_arrow_provider = false;
         for partition_provider in partitioned.partition_table_providers().await {
-            if let Some(partition_deleted) =
-                Box::pin(delete_matching_rows_from_arrow_provider(&partition_provider, rows))
-                    .await?
+            if let Some(partition_deleted) = Box::pin(delete_matching_rows_from_arrow_provider(
+                &partition_provider,
+                rows,
+            ))
+            .await?
             {
                 deleted += partition_deleted;
                 matched_arrow_provider = true;
