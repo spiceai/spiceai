@@ -141,9 +141,10 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
 
 /// Builds (but does not register) an [`ElasticsearchTextIndex`] for all FTS-enabled columns.
 ///
-/// Use this on the accelerator write path where the index should be registered as a
-/// `sink_index` on [`crate::accelerated_table::Builder`] rather than inside the accelerator's
-/// [`IndexedTableProvider`].
+/// The returned index is added to the federated provider chain via
+/// [`IndexedTableProvider::add_index`] in [`add_elasticsearch_fts_to_table`]. On the
+/// accelerator write path, indexes are automatically discovered from the federated provider
+/// chain by [`RefreshTaskBuilder::build`] — no manual sink_index plumbing is needed.
 #[cfg(feature = "elasticsearch")]
 pub(crate) async fn build_elasticsearch_text_index(
     inner_table_provider: Arc<dyn TableProvider>,

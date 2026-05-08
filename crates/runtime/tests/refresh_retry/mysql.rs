@@ -123,7 +123,8 @@ async fn create_refresh_task(
             Arc::new(tokio::sync::Mutex::new(())),
         )
         .with_cpu_runtime(rt.datafusion().refresh_runtime().cloned())
-        .build(),
+        .build()
+        .await,
         accelerated_table.refresh_params().read().await.clone(),
     ))
 }

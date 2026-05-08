@@ -127,7 +127,7 @@ fn collect_indexes_from_provider(
     while let Some(provider) = current.take() {
         if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
             for index in indexed.get_all_indexes() {
-                let ptr = Arc::as_ptr(&index) as *const ();
+                let ptr = Arc::as_ptr(&index).cast::<()>();
                 if seen.insert(ptr) {
                     indexes.push(index);
                 }
@@ -2791,7 +2791,8 @@ mod tests {
             Handle::current(),
             Arc::new(Mutex::new(())),
         )
-        .build();
+        .build()
+        .await;
 
         // The refresh must have a time_column so the dedup path is entered.
         // append_overlap of 1s ensures the overlap window includes the existing
