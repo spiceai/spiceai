@@ -456,7 +456,9 @@ fn row_key_counts(
     let mut counts = HashMap::with_capacity(batch.num_rows());
 
     for row_idx in 0..rows.num_rows() {
-        *counts.entry(rows.row(row_idx).as_ref().to_vec()).or_insert(0) += 1;
+        *counts
+            .entry(rows.row(row_idx).as_ref().to_vec())
+            .or_insert(0) += 1;
     }
 
     Ok(counts)
