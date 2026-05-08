@@ -43,6 +43,17 @@ pub enum RefreshMode {
     Append,
     Changes,
     Caching,
+    /// Reload accelerator data from newer snapshots only; the federated
+    /// source is never queried for refreshes.
+    Snapshot,
+}
+
+impl RefreshMode {
+    /// Returns true if this refresh mode never reads from the federated source.
+    #[must_use]
+    pub const fn is_snapshot_only(&self) -> bool {
+        matches!(self, RefreshMode::Snapshot)
+    }
 }
 
 impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
@@ -52,6 +63,7 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
             spicepod_acceleration::RefreshMode::Append => RefreshMode::Append,
             spicepod_acceleration::RefreshMode::Changes => RefreshMode::Changes,
             spicepod_acceleration::RefreshMode::Caching => RefreshMode::Caching,
+            spicepod_acceleration::RefreshMode::Snapshot => RefreshMode::Snapshot,
         }
     }
 }
@@ -307,6 +319,8 @@ pub struct Acceleration {
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
+    pub write_mode: spicepod_acceleration::WriteMode,
+
     pub disable_federation: bool,
 
     pub partition_by: Vec<PartitionedBy>,
@@ -522,6 +536,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             indexes,
             primary_key,
             on_conflict,
+            write_mode: acceleration.write_mode,
             partition_by: acceleration.partition_by,
             snapshot_behavior: SnapshotBehavior::disabled(),
             snapshots_trigger: acceleration.snapshots_trigger,
@@ -564,6 +579,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            write_mode: spicepod_acceleration::WriteMode::default(),
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],

@@ -630,8 +630,8 @@ impl ClusterService for ClusterServiceImpl {
         let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
             let max_partitions_per_executor = app.runtime.scheduler.as_ref().map_or(
-                runtime::PartitionManagement::default().max_partitions_per_executor,
-                runtime::Scheduler::max_partitions_per_executor,
+                runtime::default_max_partitions_per_executor(),
+                |scheduler| scheduler.max_partitions_per_executor,
             );
 
             // Find accelerated datasets with partitioning

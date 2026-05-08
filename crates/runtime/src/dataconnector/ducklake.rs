@@ -18,15 +18,15 @@ limitations under the License.
 //!
 //! Connects to specific tables in a `DuckLake` catalog using `DuckDB` with the `ducklake` extension.
 
-use crate::{
-    component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect,
-};
+use crate::{component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect};
 use async_trait::async_trait;
 use data_components::Read;
+use data_components::ducklake::{DuckLakeS3Params, configure_duckdb_httpfs};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use snafu::prelude::*;
@@ -94,6 +94,20 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("open").description(
         "Optional path to an existing DuckDB file. If not provided, an in-memory DuckDB is used.",
     ),
+    ParameterSpec::component("aws_region")
+        .description("The AWS region for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_access_key_id")
+        .description("The AWS access key ID for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_secret_access_key")
+        .description("The AWS secret access key for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_endpoint")
+        .description("Custom S3-compatible endpoint URL (e.g. for MinIO).")
+        .secret(),
+    ParameterSpec::component("aws_allow_http")
+        .description("Allow HTTP (non-TLS) connections to S3."),
 ];
 
 fn create_ducklake_factory(
@@ -142,9 +156,9 @@ fn create_ducklake_factory(
         }
     })?;
 
-    let duckdb_conn = conn
+    let duckdb_wrapper = conn
         .as_any()
-        .downcast_ref::<duckdb::Connection>()
+        .downcast_ref::<DuckDbConnection>()
         .ok_or_else(|| DataConnectorError::InvalidConfiguration {
             dataconnector: "ducklake".to_string(),
             connector_component: params.component.clone(),
@@ -153,7 +167,8 @@ fn create_ducklake_factory(
         })?;
 
     // Install and load the ducklake extension
-    duckdb_conn
+    duckdb_wrapper
+        .conn
         .execute("INSTALL ducklake", [])
         .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
         .map_err(|e| DataConnectorError::UnableToConnectInternal {
@@ -162,8 +177,50 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    duckdb_conn
+    duckdb_wrapper
+        .conn
         .execute("LOAD ducklake", [])
+        .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
+        .map_err(|e| DataConnectorError::UnableToConnectInternal {
+            dataconnector: "ducklake".to_string(),
+            connector_component: params.component.clone(),
+            source: Box::new(e),
+        })?;
+
+    let s3_params = DuckLakeS3Params {
+        region: params
+            .parameters
+            .get("aws_region")
+            .expose()
+            .ok()
+            .map(ToString::to_string),
+        access_key_id: params
+            .parameters
+            .get("aws_access_key_id")
+            .expose()
+            .ok()
+            .map(ToString::to_string),
+        secret_access_key: params
+            .parameters
+            .get("aws_secret_access_key")
+            .expose()
+            .ok()
+            .map(ToString::to_string),
+        endpoint: params
+            .parameters
+            .get("aws_endpoint")
+            .expose()
+            .ok()
+            .map(ToString::to_string),
+        allow_http: params
+            .parameters
+            .get("aws_allow_http")
+            .expose()
+            .ok()
+            .is_some_and(|v| v == "true"),
+    };
+
+    configure_duckdb_httpfs(&duckdb_wrapper.conn, &s3_params)
         .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
         .map_err(|e| DataConnectorError::UnableToConnectInternal {
             dataconnector: "ducklake".to_string(),
@@ -176,7 +233,8 @@ fn create_ducklake_factory(
     let escaped_catalog_name = catalog_name.replace('"', "\"\"");
     let attach_sql =
         format!("ATTACH 'ducklake:{escaped_connection_string}' AS \"{escaped_catalog_name}\"");
-    duckdb_conn
+    duckdb_wrapper
+        .conn
         .execute(&attach_sql, [])
         .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
         .map_err(|e| DataConnectorError::UnableToConnectInternal {

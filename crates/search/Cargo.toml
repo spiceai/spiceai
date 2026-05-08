@@ -3,7 +3,7 @@ description = "Components for a search system "
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "search"
 repository.workspace = true
 rust-version.workspace = true
@@ -20,6 +20,8 @@ data_components = { path = "../data_components", optional = true }
 datafusion.workspace = true
 datafusion-expr.workspace = true
 datafusion-functions-json = { workspace = true }
+datafusion-table-providers = { workspace = true, optional = true }
+duckdb = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 datafusion-optimizer-rules = {path = "../datafusion-optimizer-rules"}
 futures.workspace = true
@@ -37,6 +39,7 @@ util = { path = "../util", features = ["datafusion"] }
 
 [features]
 default = ["text_search", "s3_vectors"]
+duckdb = ["datafusion-table-providers/duckdb", "dep:datafusion-table-providers", "dep:duckdb", "llms"]
 elasticsearch = ["data_components/elasticsearch", "dep:elasticsearch", "llms"]
 llms = ["dep:llms"]
 s3_vectors = ["data_components/s3_vectors", "llms"]

@@ -271,6 +271,15 @@ struct TursoRow {
 }
 
 impl MetastoreRow for TursoRow {
+    fn get_value(&self, index: usize) -> CatalogResult<MetastoreValue> {
+        self.values
+            .get(index)
+            .cloned()
+            .ok_or_else(|| CatalogError::Database {
+                message: format!("Column index {index} out of bounds"),
+            })
+    }
+
     fn get_i64(&self, index: usize) -> CatalogResult<i64> {
         let value = self
             .values

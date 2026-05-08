@@ -15,8 +15,10 @@ limitations under the License.
 */
 
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
+use crate::rate_limit::RateLimiter;
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
+    compute::cast,
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
@@ -41,14 +43,16 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
     Client,
-    header::{CACHE_CONTROL, HeaderMap},
+    header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
+use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
     any::Any,
     borrow::ToOwned,
     fmt,
+    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -69,6 +73,9 @@ pub enum Error {
 
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
+
+    #[snafu(display("HTTP request was rate limited: {message}"))]
+    RateLimited { message: String },
 
     #[snafu(display(
         "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
@@ -116,6 +123,9 @@ impl From<Error> for DataFusionError {
                     "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
                 ))))
             }
+            Error::RateLimited { message } => DataFusionError::External(Box::new(
+                std::io::Error::other(format!("HTTP request was rate limited: {message}")),
+            )),
             // All other errors are internal/external errors
             Error::HttpRequest { source } => DataFusionError::External(Box::new(source)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
@@ -134,9 +144,16 @@ impl From<Error> for DataFusionError {
 
 pub const DEFAULT_MAX_QUERY_LENGTH: usize = 1024;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
+pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
-type PartitionSpec = (Option<String>, Option<String>, Option<String>);
+const PAGINATION_REPEAT_DETECTION_WINDOW: usize = 1024;
+pub type PartitionSpec = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// Configuration for paginated HTTP API requests.
 ///
@@ -168,8 +185,8 @@ pub struct PaginationConfig {
     /// When set, only the array at this path is returned as data rows.
     pub data_pointer: Option<String>,
 
-    /// Maximum number of pages to fetch. Default: 100
-    pub max_pages: usize,
+    /// Maximum number of pages to fetch. Default: 100. `None` disables the limit.
+    pub max_pages: Option<usize>,
 
     /// When `true`, if the data at `data_pointer` (or the top-level response) is a JSON
     /// object/map, extract its values as rows instead of treating it as a single row.
@@ -194,7 +211,7 @@ impl Default for PaginationConfig {
             use_link_header: true,
             token_param: None,
             data_pointer: None,
-            max_pages: DEFAULT_PAGINATION_MAX_PAGES,
+            max_pages: Some(DEFAULT_PAGINATION_MAX_PAGES),
             data_map_to_array: false,
             query_params: None,
             page_size: None,
@@ -222,14 +239,28 @@ impl CachedResponse {
     }
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum RequestFilterKind {
+    Path,
+    Query,
+    Body,
+    Headers,
+}
+
 #[derive(Default)]
 struct PartitionAccumulator {
     paths: HashSet<String>,
     queries: Vec<Option<String>>,
     bodies: Vec<Option<String>>,
-    has_path_filter: bool,
-    has_query_filter: bool,
-    has_body_filter: bool,
+    headers: Vec<Option<String>>,
+    seen_filters: HashSet<RequestFilterKind>,
+}
+
+struct PartitionValues {
+    paths: Vec<String>,
+    queries: Vec<Option<String>>,
+    bodies: Vec<Option<String>>,
+    headers: Vec<Option<String>>,
 }
 
 impl PartitionAccumulator {
@@ -237,9 +268,13 @@ impl PartitionAccumulator {
         Self::default()
     }
 
+    fn has_filter(&self, kind: RequestFilterKind) -> bool {
+        self.seen_filters.contains(&kind)
+    }
+
     fn record_path(&mut self, value: String) {
         self.paths.insert(value);
-        self.has_path_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Path);
     }
 
     fn record_query(&mut self, value: String) {
@@ -247,7 +282,7 @@ impl PartitionAccumulator {
         if !self.queries.contains(&entry) {
             self.queries.push(entry);
         }
-        self.has_query_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Query);
     }
 
     fn record_body(&mut self, value: String) {
@@ -255,11 +290,24 @@ impl PartitionAccumulator {
         if !self.bodies.contains(&entry) {
             self.bodies.push(entry);
         }
-        self.has_body_filter = true;
+        self.seen_filters.insert(RequestFilterKind::Body);
     }
 
-    fn finalize(mut self) -> (Vec<String>, Vec<Option<String>>, Vec<Option<String>>) {
-        let mut paths: Vec<String> = if self.has_path_filter {
+    fn record_headers(&mut self, value: String) {
+        let entry = Some(value);
+        if !self.headers.contains(&entry) {
+            self.headers.push(entry);
+        }
+        self.seen_filters.insert(RequestFilterKind::Headers);
+    }
+
+    fn finalize(mut self) -> PartitionValues {
+        let has_path_filter = self.has_filter(RequestFilterKind::Path);
+        let has_query_filter = self.has_filter(RequestFilterKind::Query);
+        let has_body_filter = self.has_filter(RequestFilterKind::Body);
+        let has_header_filter = self.has_filter(RequestFilterKind::Headers);
+
+        let mut paths: Vec<String> = if has_path_filter {
             self.paths.into_iter().collect()
         } else {
             vec![String::new()]
@@ -267,13 +315,52 @@ impl PartitionAccumulator {
         // Sort paths for deterministic ordering
         paths.sort();
 
-        if !self.has_query_filter {
+        if !has_query_filter {
             self.queries.push(None);
         }
-        if !self.has_body_filter {
+        if !has_body_filter {
             self.bodies.push(None);
         }
-        (paths, self.queries, self.bodies)
+        if !has_header_filter {
+            self.headers.push(None);
+        }
+        PartitionValues {
+            paths,
+            queries: self.queries,
+            bodies: self.bodies,
+            headers: self.headers,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequestFilterOptions {
+    enabled_filters: HashSet<RequestFilterKind>,
+    max_query_length: usize,
+    max_body_bytes: usize,
+    max_headers_length: usize,
+    allowed_headers: HashSet<HeaderName>,
+}
+
+impl Default for RequestFilterOptions {
+    fn default() -> Self {
+        Self {
+            enabled_filters: HashSet::new(),
+            max_query_length: DEFAULT_MAX_QUERY_LENGTH,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_headers_length: DEFAULT_MAX_HEADERS_LENGTH,
+            allowed_headers: HashSet::new(),
+        }
+    }
+}
+
+impl RequestFilterOptions {
+    fn enable(&mut self, kind: RequestFilterKind) {
+        self.enabled_filters.insert(kind);
+    }
+
+    fn is_enabled(&self, kind: RequestFilterKind) -> bool {
+        self.enabled_filters.contains(&kind)
     }
 }
 
@@ -295,6 +382,41 @@ impl HttpFetchResult {
     }
 }
 
+enum CacheWriteMode {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct CacheKey {
+    path: String,
+    query: Option<String>,
+    body: Option<String>,
+    request_headers: Option<String>,
+}
+
+impl CacheKey {
+    fn new(
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Self {
+        Self {
+            path: path.to_string(),
+            query: query.map(ToString::to_string),
+            body: body.map(ToString::to_string),
+            request_headers: request_headers.map(ToString::to_string),
+        }
+    }
+
+    fn redacted_label(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        format!("http-cache-key:{:016x}", hasher.finish())
+    }
+}
+
 /// A table provider that fetches data from HTTP endpoints based on path and query filters
 #[derive(Clone)]
 pub struct HttpTableProvider {
@@ -303,19 +425,19 @@ pub struct HttpTableProvider {
     file_format: String,
     schema: SchemaRef,
     constraints: Constraints,
-    cache: Arc<RwLock<HashMap<String, CachedResponse>>>,
+    cache: Arc<RwLock<HashMap<CacheKey, CachedResponse>>>,
     acceleration_enabled: bool,
     retry_strategy: RetryBackoff,
     content_type: Option<String>,
     custom_headers: HeaderMap,
     allowed_paths: Option<(GlobSet, Vec<String>)>,
-    allow_query_filters: bool,
-    max_query_length: usize,
-    allow_body_filters: bool,
-    max_body_bytes: usize,
+    request_filter_options: RequestFilterOptions,
+    max_request_partitions: Option<usize>,
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
     auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
+    rate_limiter: Option<Arc<dyn RateLimiter>>,
+    rate_controller: Option<Arc<RateController>>,
     /// When set, JSON response rows are decomposed into the declared
     /// static columns plus a catch-all JSON column. Schema is replaced
     /// with the user-declared columns (all `Utf8`).
@@ -359,29 +481,57 @@ impl HttpTableProvider {
             content_type: None,
             custom_headers: HeaderMap::new(),
             allowed_paths: None,
-            allow_query_filters: false,
-            max_query_length: DEFAULT_MAX_QUERY_LENGTH,
-            allow_body_filters: false,
-            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            request_filter_options: RequestFilterOptions::default(),
+            max_request_partitions: None,
             health_probe: None,
             pagination: None,
             auth: None,
+            rate_limiter: None,
+            rate_controller: None,
             json_nesting: None,
         }
     }
 
-    /// Configure JSON schema decomposition. Replaces the provider's
-    /// schema with one built from the user-declared columns (all
-    /// `Utf8`, nullable). Each scanned JSON response row is decomposed
-    /// at query time via [`decompose_json_row`].
     #[must_use]
-    pub fn with_json_nesting(mut self, nesting: HttpJsonNesting) -> Self {
-        let fields: Vec<Field> = nesting
-            .column_order
-            .iter()
-            .map(|name| Field::new(name, DataType::Utf8, true))
-            .collect();
-        self.schema = Arc::new(Schema::new(fields));
+    pub fn with_rate_limiter(mut self, rate_limiter: Option<Arc<dyn RateLimiter>>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Option<Arc<RateController>>) -> Self {
+        self.rate_controller = rate_controller;
+        self
+    }
+
+    /// Configure JSON schema decomposition. Replaces the provider's
+    /// schema with one built from the user-declared columns. Body-derived
+    /// columns are typed as `Utf8` (nullable); columns declared with
+    /// names matching [`Self::base_table_schema`] fields are passed
+    /// through with their original type so queries can reference HTTP
+    /// metadata (e.g. filter on `request_path` for direct fetches).
+    /// Each scanned JSON response row is decomposed at query time via
+    /// [`decompose_json_row`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `nesting.metadata_fields` contains a name that is not
+    /// a column in [`Self::base_table_schema`]. Callers (notably
+    /// `parse_http_json_nesting` in the HTTPS data connector) are
+    /// responsible for validating this invariant.
+    #[must_use]
+    /// Replace the provider schema with a caller-supplied JSON-nesting
+    /// schema. The schema's field order MUST equal `nesting.column_order`,
+    /// and it MUST contain a field named `nesting.json_field_name`. Field
+    /// types are taken from the supplied schema (typically the catch-all
+    /// JSON column is `Utf8`; other static fields use whatever types the
+    /// caller declared, defaulting to `Utf8` when no type was specified).
+    /// HTTP metadata fields (see [`HttpJsonNesting::metadata_fields`]) MUST
+    /// be present in `schema` with the types from
+    /// [`Self::base_table_schema`]; the caller is responsible for
+    /// resolving them.
+    pub fn with_json_nesting(mut self, nesting: HttpJsonNesting, schema: SchemaRef) -> Self {
+        self.schema = schema;
         self.json_nesting = Some(nesting);
         self
     }
@@ -439,15 +589,67 @@ impl HttpTableProvider {
 
     #[must_use]
     pub fn enable_query_filters(mut self, max_length: usize) -> Self {
-        self.allow_query_filters = true;
-        self.max_query_length = max_length.min(DEFAULT_MAX_QUERY_LENGTH * 4);
+        self.request_filter_options.enable(RequestFilterKind::Query);
+        self.request_filter_options.max_query_length = max_length.min(DEFAULT_MAX_QUERY_LENGTH * 4);
         self
     }
 
     #[must_use]
     pub fn enable_body_filters(mut self, max_bytes: usize) -> Self {
-        self.allow_body_filters = true;
-        self.max_body_bytes = max_bytes.min(DEFAULT_MAX_BODY_BYTES * 4);
+        self.request_filter_options.enable(RequestFilterKind::Body);
+        self.request_filter_options.max_body_bytes = max_bytes.min(DEFAULT_MAX_BODY_BYTES * 4);
+        self
+    }
+
+    pub fn enable_header_filters<I, S>(mut self, max_length: usize, header_names: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut allowed_headers = HashSet::new();
+        for header_name in header_names {
+            let raw = header_name.as_ref().trim();
+            ensure!(
+                !raw.is_empty(),
+                ConfigurationSnafu {
+                    message: "request_header_allowlist entries cannot be empty".to_string()
+                }
+            );
+            let parsed = HeaderName::try_from(raw).map_err(|e| Error::Configuration {
+                message: format!("Invalid request_header_allowlist entry '{raw}': {e}"),
+            })?;
+            ensure!(
+                !(self.auth.is_some() && parsed == AUTHORIZATION),
+                ConfigurationSnafu {
+                    message: "request_header_allowlist cannot include 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_header_allowlist or disable HTTP authentication.".to_string()
+                }
+            );
+            allowed_headers.insert(parsed);
+        }
+
+        ensure!(
+            !allowed_headers.is_empty(),
+            ConfigurationSnafu {
+                message: "request_header_filters requires request_header_allowlist to contain at least one header name".to_string()
+            }
+        );
+
+        self.request_filter_options
+            .enable(RequestFilterKind::Headers);
+        self.request_filter_options.max_headers_length =
+            max_length.min(DEFAULT_MAX_HEADERS_LENGTH * 4);
+        self.request_filter_options.allowed_headers = allowed_headers;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.max_request_partitions
+    }
+
+    #[must_use]
+    pub fn with_max_request_partitions(mut self, max_request_partitions: Option<usize>) -> Self {
+        self.max_request_partitions = max_request_partitions;
         self
     }
 
@@ -586,12 +788,14 @@ impl HttpTableProvider {
                 });
             }
         }
-        ensure!(
-            config.max_pages > 0,
-            ConfigurationSnafu {
-                message: "pagination_max_pages must be greater than 0".to_string()
-            }
-        );
+        if let Some(max_pages) = config.max_pages {
+            ensure!(
+                max_pages > 0,
+                ConfigurationSnafu {
+                    message: "pagination_max_pages must be greater than 0".to_string()
+                }
+            );
+        }
         if let Some(ref pointer) = config.next_pointer {
             ensure!(
                 pointer.starts_with('/'),
@@ -627,6 +831,7 @@ impl HttpTableProvider {
             Field::new("request_path", DataType::Utf8, false),
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
+            Field::new("request_headers", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
             Field::new("response_status", DataType::UInt16, false),
             Field::new(
@@ -653,13 +858,13 @@ impl HttpTableProvider {
     }
 
     /// Extract path and query from filters
-    fn get_cache_key(path: &str, query: Option<&str>, body: Option<&str>) -> String {
-        format!(
-            "{}?{}&body={}",
-            path,
-            query.unwrap_or(""),
-            body.unwrap_or("")
-        )
+    fn get_cache_key(
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> CacheKey {
+        CacheKey::new(path, query, body, request_headers)
     }
 
     /// Validates the HTTP endpoint by attempting a request to a custom health probe path if configured,
@@ -690,8 +895,12 @@ impl HttpTableProvider {
 
         tracing::debug!("Validating HTTP endpoint: {test_url}");
 
+        let _rate_control_permit = self.acquire_rate_control_permit().await?;
+
         match self.client.get(test_url.clone()).send().await {
             Ok(response) => {
+                self.update_rate_limiter_from_headers(response.headers())
+                    .await;
                 let status = response.status();
                 if self.health_probe.is_some() {
                     tracing::debug!(
@@ -848,14 +1057,44 @@ impl HttpTableProvider {
         Ok(url)
     }
 
+    async fn acquire_rate_control_permit(&self) -> Result<Option<Permit>> {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter
+                .check_rate_limit()
+                .await
+                .map_err(|e| Error::RateLimited {
+                    message: e.to_string(),
+                })?;
+        }
+
+        if let Some(rate_controller) = &self.rate_controller {
+            return rate_controller
+                .acquire()
+                .await
+                .map(Some)
+                .map_err(|e| Error::RateLimited {
+                    message: e.to_string(),
+                });
+        }
+
+        Ok(None)
+    }
+
+    async fn update_rate_limiter_from_headers(&self, headers: &HeaderMap) {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter.update_from_headers(headers).await;
+        }
+    }
+
     async fn cache_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
         result: &HttpFetchResult,
     ) {
-        let cache_key = Self::get_cache_key(path, query, body);
+        let cache_key = Self::get_cache_key(path, query, body, request_headers);
         let cached_response = CachedResponse {
             content: Arc::new(result.content.clone()),
             cached_at: SystemTime::now(),
@@ -874,23 +1113,32 @@ impl HttpTableProvider {
         &self,
         url: Url,
         body: Option<&str>,
+        request_headers: Option<&HeaderMap>,
         path_label: &str,
     ) -> Result<HttpFetchResult> {
         let retry_strategy = self.retry_strategy.clone();
         let this = self.clone();
         let url_clone = url.clone();
         let body_owned = body.map(ToOwned::to_owned);
+        let request_headers_owned = request_headers.cloned();
         let path_owned = path_label.to_string();
 
         let result = retry(retry_strategy, || {
             let this = this.clone();
             let url = url_clone.clone();
             let body = body_owned.clone();
+            let request_headers = request_headers_owned.clone();
             let path = path_owned.clone();
 
             async move {
-                this.perform_single_request(&url, body.as_deref(), &path, false)
-                    .await
+                this.perform_single_request(
+                    &url,
+                    body.as_deref(),
+                    request_headers.as_ref(),
+                    &path,
+                    false,
+                )
+                .await
             }
         })
         .await;
@@ -904,7 +1152,7 @@ impl HttpTableProvider {
             tracing::debug!(
                 "Retries exhausted for {url}, making final attempt accepting any status"
             );
-            self.perform_single_request(&url, body, path_label, true)
+            self.perform_single_request(&url, body, request_headers, path_label, true)
                 .await
                 .map_err(|e| match e {
                     RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
@@ -929,9 +1177,15 @@ impl HttpTableProvider {
         &self,
         url: &Url,
         body: Option<&str>,
+        request_headers: Option<&HeaderMap>,
         path_label: &str,
         accept_retryable: bool,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        let _rate_control_permit = self
+            .acquire_rate_control_permit()
+            .await
+            .map_err(RetryError::transient)?;
+
         let mut request_builder = if let Some(body_content) = body {
             let mut req = self.client.post(url.clone());
             let ct = self.content_type.as_deref().unwrap_or("application/json");
@@ -941,8 +1195,18 @@ impl HttpTableProvider {
             self.client.get(url.clone())
         };
 
-        for (name, value) in &self.custom_headers {
-            request_builder = request_builder.header(name, value);
+        if let Some(request_headers) = request_headers {
+            let mut merged_headers = self.custom_headers.clone();
+            for (name, value) in request_headers {
+                merged_headers.insert(name.clone(), value.clone());
+            }
+            for (name, value) in &merged_headers {
+                request_builder = request_builder.header(name, value);
+            }
+        } else {
+            for (name, value) in &self.custom_headers {
+                request_builder = request_builder.header(name, value);
+            }
         }
 
         if let Some(auth) = self.auth.as_ref() {
@@ -955,6 +1219,9 @@ impl HttpTableProvider {
         })?;
 
         let status_code = response.status().as_u16();
+        let response_headers = response.headers().clone();
+        self.update_rate_limiter_from_headers(&response_headers)
+            .await;
 
         // 5xx/429: retry with backoff (transient server issue or rate limiting)
         // After retries exhausted, we'll accept the response as valid data.
@@ -1032,26 +1299,39 @@ impl HttpTableProvider {
         })
     }
 
-    async fn fetch_and_cache(
+    async fn fetch_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
+        cache_write_mode: CacheWriteMode,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
         let query_owned = query.map(ToOwned::to_owned);
         let body_owned = body.map(ToOwned::to_owned);
+        let request_headers_owned = request_headers.map(ToOwned::to_owned);
+        let parsed_request_headers = request_headers_owned
+            .as_deref()
+            .map(|headers| self.parse_request_headers(headers))
+            .transpose()?;
 
         let fetch_result = self
-            .perform_request_with_retry(url, body_owned.as_deref(), &path_owned)
+            .perform_request_with_retry(
+                url,
+                body_owned.as_deref(),
+                parsed_request_headers.as_ref(),
+                &path_owned,
+            )
             .await?;
 
-        if fetch_result.should_cache() {
+        if matches!(cache_write_mode, CacheWriteMode::Enabled) && fetch_result.should_cache() {
             self.cache_response(
                 &path_owned,
                 query_owned.as_deref(),
                 body_owned.as_deref(),
+                request_headers_owned.as_deref(),
                 &fetch_result,
             )
             .await;
@@ -1060,18 +1340,32 @@ impl HttpTableProvider {
         Ok(fetch_result)
     }
 
+    async fn fetch_and_cache(
+        &self,
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Result<HttpFetchResult> {
+        self.fetch_response(path, query, body, request_headers, CacheWriteMode::Enabled)
+            .await
+    }
+
     async fn get_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
     ) -> Result<HttpFetchResult> {
-        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it
+        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
-            return self.fetch_and_cache(path, query, body).await;
+            return self
+                .fetch_response(path, query, body, request_headers, CacheWriteMode::Disabled)
+                .await;
         }
 
-        let cache_key = Self::get_cache_key(path, query, body);
+        let cache_key = Self::get_cache_key(path, query, body, request_headers);
 
         // Try to get from cache
         let cached = {
@@ -1082,14 +1376,17 @@ impl HttpTableProvider {
         if let Some(cached_response) = cached
             && cached_response.is_fresh()
         {
-            if let Some(ref format) = cached_response.detected_format {
-                tracing::debug!(
-                    "Returning fresh cached content for {} (detected format: {})",
-                    cache_key,
-                    format
-                );
-            } else {
-                tracing::debug!("Returning fresh cached content for {}", cache_key);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let cache_key_label = cache_key.redacted_label();
+                if let Some(ref format) = cached_response.detected_format {
+                    tracing::debug!(
+                        "Returning fresh cached content for {} (detected format: {})",
+                        cache_key_label,
+                        format
+                    );
+                } else {
+                    tracing::debug!("Returning fresh cached content for {}", cache_key_label);
+                }
             }
             return Ok(HttpFetchResult {
                 content: (*cached_response.content).clone(),
@@ -1102,7 +1399,8 @@ impl HttpTableProvider {
         }
 
         // Fetch fresh content
-        self.fetch_and_cache(path, query, body).await
+        self.fetch_and_cache(path, query, body, request_headers)
+            .await
     }
 
     fn get_projected_schema(
@@ -1207,9 +1505,42 @@ pub struct HttpExec {
     partitions: Vec<PartitionSpec>,
     limit: Option<usize>,
     properties: PlanProperties,
+    /// When `true`, the partitions are a template that will be expanded
+    /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
+    deferred_partitions: bool,
 }
 
 impl HttpExec {
+    /// Returns the provider used by this exec.
+    #[must_use]
+    pub fn provider(&self) -> &Arc<HttpTableProvider> {
+        &self.provider
+    }
+
+    /// Returns the maximum number of request partitions allowed, if configured.
+    #[must_use]
+    pub fn max_request_partitions(&self) -> Option<usize> {
+        self.provider.max_request_partitions()
+    }
+
+    /// Returns the partition specs.
+    #[must_use]
+    pub fn partitions(&self) -> &[PartitionSpec] {
+        &self.partitions
+    }
+
+    /// Returns the limit.
+    #[must_use]
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Returns the projected schema.
+    #[must_use]
+    pub fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
     #[must_use]
     pub fn new(
         projected_schema: SchemaRef,
@@ -1229,7 +1560,83 @@ impl HttpExec {
             partitions,
             limit,
             properties,
+            deferred_partitions: false,
         }
+    }
+
+    /// Mark this `HttpExec` as having dynamic partitions that will be
+    /// expanded at runtime. Affects EXPLAIN display only.
+    #[must_use]
+    pub fn with_deferred_partitions(mut self) -> Self {
+        self.deferred_partitions = true;
+        self
+    }
+
+    /// Create a new `HttpExec` whose partitions are the cross-product of the
+    /// current partitions and the given `values`, injected into the column
+    /// identified by `col_name` (`request_path`, `request_query`,
+    /// `request_body`, or `request_headers`).
+    ///
+    /// Returns an error if the resulting partition count would exceed
+    /// `max_request_partitions`.
+    pub fn with_expanded_params(
+        &self,
+        col_name: &str,
+        values: &[String],
+    ) -> DataFusionResult<Self> {
+        let existing = &self.partitions;
+        let new_count = existing.len() * values.len();
+
+        if let Some(max) = self.max_request_partitions()
+            && new_count > max
+        {
+            return Err(DataFusionError::Plan(format!(
+                "HttpExec: expanding params would create {new_count} partitions (existing {} x {} values), which exceeds max_request_partitions={max}. Reduce the number of dynamic values or increase max_request_partitions.",
+                existing.len(),
+                values.len(),
+            )));
+        }
+
+        let mut new_partitions = Vec::with_capacity(new_count);
+
+        for partition in existing {
+            for value in values {
+                let mut p = partition.clone();
+                match col_name {
+                    "request_path" => {
+                        p.0 = Some(self.provider.ensure_allowed_path(value)?);
+                    }
+                    "request_query" => {
+                        p.1 = Some(self.provider.ensure_allowed_query(value)?);
+                    }
+                    "request_body" => {
+                        p.2 = Some(self.provider.ensure_allowed_body(value)?);
+                    }
+                    "request_headers" => {
+                        p.3 = Some(self.provider.ensure_allowed_headers(value)?);
+                    }
+                    other => {
+                        return Err(DataFusionError::Internal(format!(
+                            "HttpExec::with_expanded_params: unsupported column '{other}'. Expected one of: request_path, request_query, request_body, request_headers"
+                        )));
+                    }
+                }
+                new_partitions.push(p);
+            }
+        }
+
+        tracing::debug!(
+            "HttpExec::with_expanded_params: replacing partitions with {} (was {}) for column '{col_name}'",
+            new_partitions.len(),
+            existing.len(),
+        );
+
+        Ok(Self::new(
+            Arc::clone(&self.projected_schema),
+            Arc::clone(&self.provider),
+            new_partitions,
+            self.limit,
+        ))
     }
 
     async fn fetch_and_create_batch(
@@ -1237,24 +1644,26 @@ impl HttpExec {
         provider: &HttpTableProvider,
         partition: usize,
     ) -> DataFusionResult<RecordBatch> {
-        let (path, query, body) = &self.partitions[partition];
+        let (path, query, body, request_headers) = &self.partitions[partition];
 
         // Use the filter path or empty string (base URL only)
         let path_val = path.as_deref().unwrap_or("");
         let query_val = query.as_deref();
         let body_val = body.as_deref();
+        let request_headers_val = request_headers.as_deref();
 
         tracing::debug!(
-            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}",
+            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}, request_headers_present={}",
             partition,
             path_val,
             query_val,
-            body_val
+            body_val,
+            request_headers_val.is_some()
         );
 
         // Fetch content with path, query, and body
         let result = provider
-            .get_response(path_val, query_val, body_val)
+            .get_response(path_val, query_val, body_val, request_headers_val)
             .await
             .map_err(DataFusionError::from)?;
 
@@ -1270,6 +1679,7 @@ impl HttpExec {
             path.as_deref(),
             query.as_deref(),
             body.as_deref(),
+            request_headers.as_deref(),
             &content_rows,
             &result,
         )
@@ -1281,6 +1691,7 @@ impl HttpExec {
         path: Option<&str>,
         query: Option<&str>,
         body: Option<&str>,
+        request_headers: Option<&str>,
         content_rows: &[String],
         fetch_result: &HttpFetchResult,
     ) -> DataFusionResult<RecordBatch> {
@@ -1299,13 +1710,22 @@ impl HttpExec {
         }
 
         if let Some(nesting) = &self.provider.json_nesting {
-            return self.create_batch_from_rows_nested(content_rows, nesting);
+            return self.create_batch_from_rows_nested(
+                path,
+                query,
+                body,
+                request_headers,
+                content_rows,
+                fetch_result,
+                nesting,
+            );
         }
 
         // Store the actual values from the partition for the primary key
         let path_for_batch = path.unwrap_or("");
         let query_for_batch = query.unwrap_or("");
         let body_for_batch = body.unwrap_or("");
+        let headers_for_batch = request_headers.unwrap_or("");
 
         tracing::debug!(
             "Creating batch with request_path={:?}, content_len={}, num_rows={}",
@@ -1315,77 +1735,24 @@ impl HttpExec {
         );
 
         // Use response Date header if available, otherwise use current time
-        let timestamp_nanos = if let Some(date) = fetch_result.response_date {
-            i64::try_from(
-                date.duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| DataFusionError::Execution(format!("Invalid response date: {e}")))?
-                    .as_nanos(),
-            )
-            .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))?
-        } else {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to get current time: {e}"))
-                })?;
-            i64::try_from(now.as_nanos())
-                .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))?
-        };
+        let timestamp_nanos = Self::compute_fetched_at_nanos(fetch_result)?;
 
         let columns = self
             .projected_schema
             .fields()
             .iter()
-            .map(|field| match field.name().as_str() {
-                "request_path" => {
-                    Ok(Arc::new(StringArray::from(vec![path_for_batch; num_rows])) as ArrayRef)
-                }
-                "request_query" => {
-                    Ok(Arc::new(StringArray::from(vec![query_for_batch; num_rows])) as ArrayRef)
-                }
-                "request_body" => {
-                    Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
-                }
-                "content" => Ok(Arc::new(StringArray::from_iter_values(
-                    content_rows.iter().map(String::as_str),
-                )) as ArrayRef),
-                "response_status" => Ok(Arc::new(UInt16Array::from(vec![
-                    fetch_result
-                        .response_status;
-                    num_rows
-                ])) as ArrayRef),
-                "response_headers" => {
-                    let mut builder = MapBuilder::new(
-                        Some(MapFieldNames {
-                            entry: "entries".to_string(),
-                            key: "keys".to_string(),
-                            value: "values".to_string(),
-                        }),
-                        StringBuilder::new(),
-                        StringBuilder::new(),
-                    );
-                    for _ in 0..num_rows {
-                        for (k, v) in &fetch_result.response_headers {
-                            builder.keys().append_value(k);
-                            builder.values().append_value(v);
-                        }
-                        builder
-                            .append(true)
-                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                    }
-                    Ok(Arc::new(builder.finish()) as ArrayRef)
-                }
-                "fetched_at" => {
-                    use arrow::array::TimestampNanosecondArray;
-                    Ok(Arc::new(TimestampNanosecondArray::from(vec![
-                        timestamp_nanos;
-                        num_rows
-                    ])) as ArrayRef)
-                }
-                _ => Err(DataFusionError::Execution(format!(
-                    "Unsupported field name: {}",
-                    field.name()
-                ))),
+            .map(|field| {
+                Self::build_metadata_array(
+                    field.name().as_str(),
+                    path_for_batch,
+                    query_for_batch,
+                    body_for_batch,
+                    headers_for_batch,
+                    content_rows,
+                    fetch_result,
+                    timestamp_nanos,
+                    num_rows,
+                )
             })
             .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
 
@@ -1394,26 +1761,146 @@ impl HttpExec {
         Ok(batch)
     }
 
+    /// Build a single Arrow array for one of the HTTP connector's
+    /// built-in metadata columns. Used by both the default scan path
+    /// and the JSON-decomposition path so that metadata columns behave
+    /// identically in both modes.
+    #[expect(clippy::too_many_arguments)]
+    fn build_metadata_array(
+        name: &str,
+        path_for_batch: &str,
+        query_for_batch: &str,
+        body_for_batch: &str,
+        headers_for_batch: &str,
+        content_rows: &[String],
+        fetch_result: &HttpFetchResult,
+        timestamp_nanos: i64,
+        num_rows: usize,
+    ) -> DataFusionResult<ArrayRef> {
+        match name {
+            "request_path" => {
+                Ok(Arc::new(StringArray::from(vec![path_for_batch; num_rows])) as ArrayRef)
+            }
+            "request_query" => {
+                Ok(Arc::new(StringArray::from(vec![query_for_batch; num_rows])) as ArrayRef)
+            }
+            "request_body" => {
+                Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
+            }
+            "request_headers" => {
+                Ok(Arc::new(StringArray::from(vec![headers_for_batch; num_rows])) as ArrayRef)
+            }
+            "content" => Ok(Arc::new(StringArray::from_iter_values(
+                content_rows.iter().map(String::as_str),
+            )) as ArrayRef),
+            "response_status" => Ok(Arc::new(UInt16Array::from(vec![
+                fetch_result.response_status;
+                num_rows
+            ])) as ArrayRef),
+            "response_headers" => {
+                let mut builder = MapBuilder::new(
+                    Some(MapFieldNames {
+                        entry: "entries".to_string(),
+                        key: "keys".to_string(),
+                        value: "values".to_string(),
+                    }),
+                    StringBuilder::new(),
+                    StringBuilder::new(),
+                );
+                for _ in 0..num_rows {
+                    for (k, v) in &fetch_result.response_headers {
+                        builder.keys().append_value(k);
+                        builder.values().append_value(v);
+                    }
+                    builder
+                        .append(true)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
+            "fetched_at" => {
+                use arrow::array::TimestampNanosecondArray;
+                Ok(Arc::new(TimestampNanosecondArray::from(vec![
+                    timestamp_nanos;
+                    num_rows
+                ])) as ArrayRef)
+            }
+            other => Err(DataFusionError::Execution(format!(
+                "Unsupported field name: {other}"
+            ))),
+        }
+    }
+
+    /// Compute the per-batch `fetched_at` timestamp in nanoseconds since
+    /// the Unix epoch, preferring the response `Date` header and falling
+    /// back to the current system time.
+    fn compute_fetched_at_nanos(fetch_result: &HttpFetchResult) -> DataFusionResult<i64> {
+        if let Some(date) = fetch_result.response_date {
+            i64::try_from(
+                date.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| DataFusionError::Execution(format!("Invalid response date: {e}")))?
+                    .as_nanos(),
+            )
+            .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to get current time: {e}"))
+                })?;
+            i64::try_from(now.as_nanos())
+                .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))
+        }
+    }
+
     /// Create a `RecordBatch` for the user-declared columns by
     /// decomposing each JSON response row according to the nesting
-    /// configuration. All output columns are `Utf8`.
+    /// configuration. Body-derived columns are produced as `Utf8` from
+    /// the decomposed JSON; columns whose names match HTTP metadata
+    /// fields (see [`HttpJsonNesting::metadata_fields`]) are populated
+    /// from the request/response metadata via [`Self::build_metadata_array`]
+    /// with their original types.
     ///
     /// Fast path: when the catch-all column is not in the projected
     /// schema we skip building the catch-all `BTreeMap` and re-
     /// serializing it, which is the dominant cost for wide JSON rows.
     /// Non-object rows still fall through to `decompose_json_row` so
     /// static columns become NULL and no data is dropped.
+    #[expect(clippy::too_many_arguments)]
     fn create_batch_from_rows_nested(
         &self,
+        path: Option<&str>,
+        query: Option<&str>,
+        body: Option<&str>,
+        request_headers: Option<&str>,
         content_rows: &[String],
+        fetch_result: &HttpFetchResult,
         nesting: &HttpJsonNesting,
     ) -> DataFusionResult<RecordBatch> {
         let fields = self.projected_schema.fields();
-        let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
-        let catchall_projected = field_names.contains(&nesting.json_field_name.as_str());
+        let num_rows = content_rows.len();
 
-        let mut builders: Vec<StringBuilder> = std::iter::repeat_with(StringBuilder::new)
-            .take(fields.len())
+        // Per-batch values for metadata columns. Computed lazily-ish:
+        // cheap enough to always derive, and only used when at least
+        // one metadata column is projected.
+        let path_for_batch = path.unwrap_or("");
+        let query_for_batch = query.unwrap_or("");
+        let body_for_batch = body.unwrap_or("");
+        let headers_for_batch = request_headers.unwrap_or("");
+        let timestamp_nanos = Self::compute_fetched_at_nanos(fetch_result)?;
+
+        // Identify which projected fields are body-derived vs metadata.
+        let body_field_names: Vec<&str> = fields
+            .iter()
+            .filter(|f| !nesting.metadata_fields.contains(f.name()))
+            .map(|f| f.name().as_str())
+            .collect();
+        let catchall_projected = body_field_names.contains(&nesting.json_field_name.as_str());
+
+        // Build body-derived columns via string builders, in projected
+        // (not full-schema) order, restricted to non-metadata fields.
+        let mut body_builders: Vec<StringBuilder> = std::iter::repeat_with(StringBuilder::new)
+            .take(body_field_names.len())
             .collect();
 
         for row in content_rows {
@@ -1421,7 +1908,7 @@ impl HttpExec {
                 && let Ok(serde_json::Value::Object(obj)) =
                     serde_json::from_str::<serde_json::Value>(row)
             {
-                for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+                for (builder, name) in body_builders.iter_mut().zip(body_field_names.iter()) {
                     match obj.get(*name) {
                         None | Some(serde_json::Value::Null) => builder.append_null(),
                         Some(serde_json::Value::String(s)) => builder.append_value(s),
@@ -1434,7 +1921,7 @@ impl HttpExec {
             let decomposed = decompose_json_row(row, nesting).map_err(|source| {
                 DataFusionError::External(Box::new(Error::JsonNesting { source }))
             })?;
-            for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+            for (builder, name) in body_builders.iter_mut().zip(body_field_names.iter()) {
                 match decomposed.get(*name).and_then(|v| v.as_deref()) {
                     Some(v) => builder.append_value(v),
                     None => builder.append_null(),
@@ -1442,10 +1929,56 @@ impl HttpExec {
             }
         }
 
-        let columns: Vec<ArrayRef> = builders
+        let mut body_arrays: std::collections::VecDeque<ArrayRef> = body_builders
             .into_iter()
-            .map(|mut b| Arc::new(b.finish()) as ArrayRef)
-            .collect();
+            .zip(body_field_names.iter())
+            .map(|(mut b, name)| {
+                let arr: ArrayRef = Arc::new(b.finish());
+                let field = fields.iter().find(|f| f.name() == *name).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "json-nested batch: body field `{name}` missing from projected schema"
+                    ))
+                })?;
+                if field.data_type() == &DataType::Utf8 {
+                    Ok(arr)
+                } else {
+                    cast(&arr, field.data_type()).map_err(|e| {
+                        DataFusionError::External(Box::new(ArrowError::CastError(format!(
+                            "failed to cast json_nest column `{}` from Utf8 to {:?}: {e}",
+                            field.name(),
+                            field.data_type()
+                        ))))
+                    })
+                }
+            })
+            .collect::<DataFusionResult<_>>()?;
+
+        // Stitch together the final column list in projected-schema
+        // order, slotting metadata-built arrays where appropriate.
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+        for field in fields {
+            if nesting.metadata_fields.contains(field.name()) {
+                columns.push(Self::build_metadata_array(
+                    field.name().as_str(),
+                    path_for_batch,
+                    query_for_batch,
+                    body_for_batch,
+                    headers_for_batch,
+                    content_rows,
+                    fetch_result,
+                    timestamp_nanos,
+                    num_rows,
+                )?);
+            } else {
+                let array = body_arrays.pop_front().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "json-nested batch: body array count does not match non-metadata projected fields"
+                            .to_string(),
+                    )
+                })?;
+                columns.push(array);
+            }
+        }
 
         RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
             .map_err(DataFusionError::from)
@@ -1521,20 +2054,27 @@ impl DisplayAs for HttpExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "HttpExec: base_url={}, format={}, partitions=[",
+            "HttpExec: base_url={}, format={}, ",
             self.provider.base_url, self.provider.file_format
         )?;
 
-        for (i, (path, query, body)) in self.partitions.iter().enumerate() {
+        if self.deferred_partitions {
+            return write!(f, "partitions=deferred");
+        }
+
+        write!(f, "partitions=[")?;
+
+        for (i, (path, query, body, request_headers)) in self.partitions.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
             write!(
                 f,
-                "(path={:?}, query={:?}, body={:?})",
+                "(path={:?}, query={:?}, body={:?}, request_headers_present={})",
                 path.as_deref().unwrap_or(""),
                 query.as_deref().unwrap_or(""),
-                body.as_deref().unwrap_or("")
+                body.as_deref().unwrap_or(""),
+                request_headers.is_some()
             )?;
         }
 
@@ -1582,7 +2122,7 @@ impl ExecutionPlan for HttpExec {
         let schema = Arc::clone(&self.projected_schema);
 
         if provider.is_paginated() {
-            let (path, query, body) = self.partitions[partition].clone();
+            let (path, query, body, request_headers) = self.partitions[partition].clone();
             let limit = self.limit;
 
             let initial_state = PaginationState {
@@ -1592,10 +2132,12 @@ impl ExecutionPlan for HttpExec {
                 path,
                 query,
                 body,
+                request_headers,
                 limit,
                 done: false,
                 last_page_path: None,
                 last_page_query: None,
+                recent_page_urls: VecDeque::new(),
             };
 
             let stream = futures::stream::try_unfold(initial_state, move |mut state| {
@@ -1612,10 +2154,12 @@ impl ExecutionPlan for HttpExec {
                             DataFusionError::Internal("Pagination config missing".to_string())
                         })?;
 
-                        if state.page >= config.max_pages {
+                        if let Some(max_pages) = config.max_pages
+                            && state.page >= max_pages
+                        {
                             tracing::warn!(
                                 "HTTP pagination reached the configured safety limit of {} pages. Increase `pagination_max_pages` to fetch additional pages.",
-                                config.max_pages
+                                max_pages
                             );
                             return Ok(None);
                         }
@@ -1630,8 +2174,7 @@ impl ExecutionPlan for HttpExec {
 
                         // Fetch this page
                         let fetch_result = if state.page == 0 {
-                            let path_val = state.path.as_deref().unwrap_or("");
-                            let body_val = state.body.as_deref();
+                            let path_val = state.path.clone().unwrap_or_default();
                             let merged_query = if let Some(ref template) = config.query_params {
                                 let page_size = config.page_size.unwrap_or(0);
                                 let expanded =
@@ -1647,17 +2190,35 @@ impl ExecutionPlan for HttpExec {
                                     state.query.as_deref(),
                                 )
                             };
+                            let request_url = provider
+                                .build_request_url(&path_val, merged_query.as_deref())
+                                .map_err(DataFusionError::from)?;
+                            record_pagination_request_url(&mut state, &request_url)
+                                .map_err(DataFusionError::from)?;
                             state.last_page_path = state.path.clone();
                             state.last_page_query = merged_query.clone();
+                            let body_val = state.body.as_deref();
                             provider
-                                .get_response(path_val, merged_query.as_deref(), body_val)
+                                .get_response(
+                                    &path_val,
+                                    merged_query.as_deref(),
+                                    body_val,
+                                    state.request_headers.as_deref(),
+                                )
                                 .await
                                 .map_err(DataFusionError::from)?
                         } else {
+                            let parsed_request_headers = state
+                                .request_headers
+                                .as_deref()
+                                .map(|headers| provider.parse_request_headers(headers))
+                                .transpose()
+                                .map_err(DataFusionError::from)?;
+
                             // Subsequent pages bypass the HTTP cache intentionally:
                             // each page has unique content that shouldn't be cached
                             // under the same key as the base request.
-                            match &state.next_info {
+                            match state.next_info.clone() {
                                 Some(NextPageInfo::Url(url)) => {
                                     if let Some((globset, patterns)) = &provider.allowed_paths
                                         && !globset.is_match(url.path())
@@ -1676,12 +2237,15 @@ impl ExecutionPlan for HttpExec {
                                             },
                                         )));
                                     }
+                                    record_pagination_request_url(&mut state, &url)
+                                        .map_err(DataFusionError::from)?;
                                     state.last_page_path = Some(url.path().to_string());
                                     state.last_page_query = url.query().map(ToString::to_string);
                                     provider
                                         .perform_request_with_retry(
-                                            url.clone(),
+                                            url,
                                             state.body.as_deref(),
+                                            parsed_request_headers.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -1696,17 +2260,20 @@ impl ExecutionPlan for HttpExec {
                                         base_query,
                                         state.query.as_deref(),
                                         token_param,
-                                        token,
+                                        &token,
                                     );
                                     state.last_page_path = state.path.clone();
                                     state.last_page_query = Some(merged_query.clone());
                                     let url = provider
                                         .build_request_url(path_val, Some(&merged_query))
                                         .map_err(DataFusionError::from)?;
+                                    record_pagination_request_url(&mut state, &url)
+                                        .map_err(DataFusionError::from)?;
                                     provider
                                         .perform_request_with_retry(
                                             url,
                                             state.body.as_deref(),
+                                            parsed_request_headers.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -1717,7 +2284,7 @@ impl ExecutionPlan for HttpExec {
                                     let template = config.query_params.as_deref().unwrap_or("");
                                     let page_size = config.page_size.unwrap_or(0);
                                     let expanded =
-                                        expand_query_params_template(template, *page, page_size)?;
+                                        expand_query_params_template(template, page, page_size)?;
                                     let merged_query =
                                         merge_base_and_partition_queries_with_override(
                                             provider.base_url.query(),
@@ -1729,10 +2296,13 @@ impl ExecutionPlan for HttpExec {
                                     let url = provider
                                         .build_request_url(path_val, Some(&merged_query))
                                         .map_err(DataFusionError::from)?;
+                                    record_pagination_request_url(&mut state, &url)
+                                        .map_err(DataFusionError::from)?;
                                     provider
                                         .perform_request_with_retry(
                                             url,
                                             state.body.as_deref(),
+                                            parsed_request_headers.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -1818,6 +2388,7 @@ impl ExecutionPlan for HttpExec {
                             state.last_page_path.as_deref(),
                             state.last_page_query.as_deref(),
                             state.body.as_deref(),
+                            state.request_headers.as_deref(),
                             &content_rows,
                             &fetch_result,
                         )?;
@@ -1876,12 +2447,38 @@ struct PaginationState {
     path: Option<String>,
     query: Option<String>,
     body: Option<String>,
+    request_headers: Option<String>,
     limit: Option<usize>,
     done: bool,
     /// The actual path/query used for the most recent page fetch.
     /// Used to populate accurate `request_path`/`request_query` columns.
     last_page_path: Option<String>,
     last_page_query: Option<String>,
+    recent_page_urls: VecDeque<String>,
+}
+
+fn pagination_request_label(url: &Url) -> String {
+    let mut hasher = DefaultHasher::new();
+    url.as_str().hash(&mut hasher);
+    format!("http-pagination-request:{:016x}", hasher.finish())
+}
+
+fn record_pagination_request_url(state: &mut PaginationState, url: &Url) -> Result<()> {
+    let request_url = url.as_str().to_string();
+    ensure!(
+        !state.recent_page_urls.contains(&request_url),
+        PaginationSnafu {
+            message: format!(
+                "HTTP pagination detected a repeated next page request ({}). The connector stopped before fetching duplicate rows. Check pagination_next_pointer, pagination_link_header, pagination_token_param, or pagination_query_params.",
+                pagination_request_label(url)
+            )
+        }
+    );
+    state.recent_page_urls.push_back(request_url);
+    if state.recent_page_urls.len() > PAGINATION_REPEAT_DETECTION_WINDOW {
+        state.recent_page_urls.pop_front();
+    }
+    Ok(())
 }
 
 /// Resolve a next-page URL string (absolute or relative) against the base URL
@@ -2236,14 +2833,22 @@ fn merge_base_and_partition_queries_with_override(
 }
 
 impl HttpTableProvider {
-    /// Extract paths from filters for creating partitions. Query and body filters are validated but not used for partitioning.
+    /// Extract request partition values from filters.
+    ///
+    /// Path, query, body, and header filters are all used to build the partition
+    /// cross product, with each unique combination producing a separate HTTP
+    /// request partition.
     fn extract_partitions(&self, filters: &[Expr]) -> DataFusionResult<Vec<PartitionSpec>> {
         tracing::trace!(
-            "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}",
+            "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}, allow_header_filters={}",
             filters.len(),
             self.allowed_paths,
-            self.allow_query_filters,
-            self.allow_body_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Query),
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Body),
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Headers)
         );
 
         let mut accumulator = PartitionAccumulator::new();
@@ -2254,30 +2859,42 @@ impl HttpTableProvider {
         }
 
         tracing::trace!(
-            "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}",
-            accumulator.has_path_filter,
-            accumulator.has_query_filter,
-            accumulator.has_body_filter
+            "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}, has_header_filter={}",
+            accumulator.has_filter(RequestFilterKind::Path),
+            accumulator.has_filter(RequestFilterKind::Query),
+            accumulator.has_filter(RequestFilterKind::Body),
+            accumulator.has_filter(RequestFilterKind::Headers)
         );
 
-        let (paths, queries, bodies) = accumulator.finalize();
+        let partition_values = accumulator.finalize();
 
         tracing::trace!(
-            "After finalize: paths={:?}, queries={:?}, bodies={:?}",
-            paths,
-            queries,
-            bodies
+            "After finalize: paths={:?}, queries={:?}, bodies={:?}, headers_count={}",
+            partition_values.paths,
+            partition_values.queries,
+            partition_values.bodies,
+            partition_values.headers.len()
         );
 
+        self.ensure_request_partition_count(
+            partition_values.paths.len(),
+            partition_values.queries.len(),
+            partition_values.bodies.len(),
+            partition_values.headers.len(),
+        )?;
+
         let mut partitions = vec![];
-        for p in &paths {
-            for q in &queries {
-                for b in &bodies {
-                    partitions.push((
-                        if p.is_empty() { None } else { Some(p.clone()) },
-                        q.clone(),
-                        b.clone(),
-                    ));
+        for p in &partition_values.paths {
+            for q in &partition_values.queries {
+                for b in &partition_values.bodies {
+                    for h in &partition_values.headers {
+                        partitions.push((
+                            if p.is_empty() { None } else { Some(p.clone()) },
+                            q.clone(),
+                            b.clone(),
+                            h.clone(),
+                        ));
+                    }
                 }
             }
         }
@@ -2304,11 +2921,64 @@ impl HttpTableProvider {
     ) -> Result<()> {
         match expr.op {
             Operator::Eq => self.handle_equality_expr(expr, accumulator),
-            Operator::Or | Operator::And => {
+            Operator::And => {
+                self.extract_filter_values(expr.left.as_ref(), accumulator)?;
+                self.extract_filter_values(expr.right.as_ref(), accumulator)
+            }
+            Operator::Or => {
+                // OR within a single HTTP virtual filter column is treated as
+                // an IN list (alternative values). OR across different
+                // columns would be silently rewritten as a cross product
+                // (AND) by the partition accumulator, causing the connector
+                // to issue combined HTTP requests instead of separate ones.
+                // Reject the cross-column case explicitly. (Note: SQL
+                // `IN (...)` is sometimes pre-rewritten by DataFusion into a
+                // chain of OR-of-equality, which is why same-column OR must
+                // still be accepted.)
+                let mut columns = HashSet::new();
+                Self::collect_http_filter_columns(expr.left.as_ref(), &mut columns);
+                Self::collect_http_filter_columns(expr.right.as_ref(), &mut columns);
+                if columns.len() > 1 {
+                    let mut names: Vec<&str> = columns.into_iter().collect();
+                    names.sort_unstable();
+                    return Err(Error::FilterRejected {
+                        message: format!(
+                            "OR across different HTTP filter columns ({}) is not supported because the connector would otherwise issue combined HTTP requests instead of separate ones. Use IN (...) to enumerate values on a single column, or run separate queries (e.g. UNION ALL) for alternative requests.",
+                            names.join(", ")
+                        ),
+                    });
+                }
                 self.extract_filter_values(expr.left.as_ref(), accumulator)?;
                 self.extract_filter_values(expr.right.as_ref(), accumulator)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Walk an expression tree and collect the names of any HTTP virtual
+    /// filter columns (`request_path`, `request_query`, `request_body`,
+    /// `request_headers`) referenced anywhere inside it.
+    fn collect_http_filter_columns(expr: &Expr, columns: &mut HashSet<&'static str>) {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+                Self::collect_http_filter_columns(left.as_ref(), columns);
+                Self::collect_http_filter_columns(right.as_ref(), columns);
+            }
+            Expr::InList(in_list) => {
+                Self::collect_http_filter_columns(in_list.expr.as_ref(), columns);
+            }
+            Expr::Column(column) => {
+                if let Some(static_name) = match column.name.as_str() {
+                    "request_path" => Some("request_path"),
+                    "request_query" => Some("request_query"),
+                    "request_body" => Some("request_body"),
+                    "request_headers" => Some("request_headers"),
+                    _ => None,
+                } {
+                    columns.insert(static_name);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2333,7 +3003,7 @@ impl HttpTableProvider {
         if let Expr::Column(column) = in_list.expr.as_ref()
             && matches!(
                 column.name.as_str(),
-                "request_path" | "request_query" | "request_body"
+                "request_path" | "request_query" | "request_body" | "request_headers"
             )
         {
             for expr in &in_list.list {
@@ -2351,11 +3021,19 @@ impl HttpTableProvider {
         value: &str,
         accumulator: &mut PartitionAccumulator,
     ) -> Result<()> {
-        tracing::trace!(
-            "apply_literal_filter: column={}, value={}",
-            column_name,
-            value
-        );
+        if column_name == "request_headers" {
+            tracing::trace!(
+                "apply_literal_filter: column={}, value=<redacted {} bytes>",
+                column_name,
+                value.len()
+            );
+        } else {
+            tracing::trace!(
+                "apply_literal_filter: column={}, value={}",
+                column_name,
+                value
+            );
+        }
         match column_name {
             "request_path" => {
                 let normalized = self.ensure_allowed_path(value)?;
@@ -2372,6 +3050,11 @@ impl HttpTableProvider {
                 tracing::trace!("Body filter validated and normalized: {}", normalized);
                 accumulator.record_body(normalized);
             }
+            "request_headers" => {
+                let normalized = self.ensure_allowed_headers(value)?;
+                tracing::trace!("Header filter validated: {} bytes", normalized.len());
+                accumulator.record_headers(normalized);
+            }
             _ => {
                 tracing::debug!("Ignoring filter on column: {}", column_name);
             }
@@ -2380,7 +3063,7 @@ impl HttpTableProvider {
     }
 
     /// Check if a filter expression can be pushed down to HTTP requests
-    /// Note: This returns true if the filter is on `request_path`, `request_query`, or `request_body` columns.
+    /// Note: This returns true if the filter is on `request_path`, `request_query`, `request_body`, or `request_headers` columns.
     /// Actual validation (whether the feature is enabled/configured) happens in `extract_partitions` with user-friendly errors.
     fn can_pushdown_filter(filter: &Expr) -> bool {
         match filter {
@@ -2390,7 +3073,7 @@ impl HttpTableProvider {
                     if let Expr::Literal(ScalarValue::Utf8(Some(_value)), _) = right.as_ref() {
                         matches!(
                             col.name.as_str(),
-                            "request_path" | "request_query" | "request_body"
+                            "request_path" | "request_query" | "request_body" | "request_headers"
                         )
                     } else {
                         false
@@ -2404,7 +3087,7 @@ impl HttpTableProvider {
                 if let Expr::Column(col) = in_list.expr.as_ref() {
                     matches!(
                         col.name.as_str(),
-                        "request_path" | "request_query" | "request_body"
+                        "request_path" | "request_query" | "request_body" | "request_headers"
                     )
                 } else {
                     false
@@ -2484,22 +3167,26 @@ impl HttpTableProvider {
         tracing::debug!(
             "ensure_allowed_query called with raw={}, allow_query_filters={}",
             raw,
-            self.allow_query_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Query)
         );
 
-        if !self.allow_query_filters {
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Query)
+        {
             tracing::warn!("Query filter attempted but allow_query_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_query' because query filtering is disabled for this dataset. To enable, set the 'request_query_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
-        if raw.len() > self.max_query_length {
+        if raw.len() > self.request_filter_options.max_query_length {
             return Err(Error::FilterRejected {
                 message: format!(
                     "The 'request_query' value is too long ({} characters). Maximum allowed length is {} characters. You can increase this limit using the 'max_request_query_length' parameter.",
                     raw.len(),
-                    self.max_query_length
+                    self.request_filter_options.max_query_length
                 ),
             });
         }
@@ -2523,27 +3210,157 @@ impl HttpTableProvider {
         tracing::debug!(
             "ensure_allowed_body called with raw={}, allow_body_filters={}",
             raw,
-            self.allow_body_filters
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Body)
         );
 
-        if !self.allow_body_filters {
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Body)
+        {
             tracing::warn!("Body filter attempted but allow_body_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_body' because body filtering is disabled for this dataset. To enable, set the 'request_body_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
-        if raw.len() > self.max_body_bytes {
+        if raw.len() > self.request_filter_options.max_body_bytes {
             return Err(Error::FilterRejected {
                 message: format!(
                     "The 'request_body' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_body_bytes' parameter.",
                     raw.len(),
-                    self.max_body_bytes
+                    self.request_filter_options.max_body_bytes
                 ),
             });
         }
 
         Ok(raw.to_string())
+    }
+
+    fn ensure_allowed_headers(&self, raw: &str) -> Result<String> {
+        tracing::debug!(
+            "ensure_allowed_headers called with allow_header_filters={}, bytes={}",
+            self.request_filter_options
+                .is_enabled(RequestFilterKind::Headers),
+            raw.len()
+        );
+
+        if !self
+            .request_filter_options
+            .is_enabled(RequestFilterKind::Headers)
+        {
+            tracing::warn!("Header filter attempted but allow_header_filters is false");
+            return Err(Error::FilterRejected {
+                message:
+                    "Cannot filter by 'request_headers' because header filtering is disabled for this dataset. To enable, set the 'request_header_filters' parameter to 'enabled' and configure 'request_header_allowlist' with the header names that may vary."
+                        .to_string(),
+            });
+        }
+        if raw.len() > self.request_filter_options.max_headers_length {
+            return Err(Error::FilterRejected {
+                message: format!(
+                    "The 'request_headers' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_headers_length' parameter.",
+                    raw.len(),
+                    self.request_filter_options.max_headers_length
+                ),
+            });
+        }
+
+        self.parse_request_headers(raw)?;
+        Ok(raw.to_string())
+    }
+
+    fn parse_request_headers(&self, raw: &str) -> Result<HeaderMap> {
+        let parsed = serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
+            Error::FilterRejected {
+                message: format!(
+                    "The 'request_headers' value must be a JSON object with string header values. Failed to parse JSON: {e}"
+                ),
+            }
+        })?;
+
+        let serde_json::Value::Object(headers_object) = parsed else {
+            return Err(Error::FilterRejected {
+                message: "The 'request_headers' value must be a JSON object with string header values, such as '{\"x-sandbox-id\":\"sandbox-1\"}'.".to_string(),
+            });
+        };
+
+        let mut headers = HeaderMap::new();
+        for (name, value) in headers_object {
+            let header_name = HeaderName::try_from(name.as_str()).map_err(|e| {
+                Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' object contains invalid HTTP header name '{name}': {e}"
+                    ),
+                }
+            })?;
+
+            if !self
+                .request_filter_options
+                .allowed_headers
+                .contains(&header_name)
+            {
+                return Err(Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' object contains header '{name}', which is not in request_header_allowlist. Add '{name}' to request_header_allowlist or remove it from the filter."
+                    ),
+                });
+            }
+
+            if self.auth.is_some() && header_name == AUTHORIZATION {
+                return Err(Error::FilterRejected {
+                    message: "The 'request_headers' object cannot set 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_headers or disable HTTP authentication.".to_string(),
+                });
+            }
+
+            let Some(header_value) = value.as_str() else {
+                return Err(Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' value for header '{name}' must be a string."
+                    ),
+                });
+            };
+
+            let header_value = HeaderValue::from_str(header_value).map_err(|_| {
+                Error::FilterRejected {
+                    message: format!(
+                        "The 'request_headers' value for header '{name}' is not a valid HTTP header value."
+                    ),
+                }
+            })?;
+            headers.insert(header_name, header_value);
+        }
+
+        Ok(headers)
+    }
+
+    fn ensure_request_partition_count(
+        &self,
+        path_count: usize,
+        query_count: usize,
+        body_count: usize,
+        header_count: usize,
+    ) -> Result<()> {
+        let partition_count = path_count
+            .checked_mul(query_count)
+            .and_then(|count| count.checked_mul(body_count))
+            .and_then(|count| count.checked_mul(header_count))
+            .ok_or_else(|| Error::FilterRejected {
+                message: "The HTTP request partition count overflowed while combining request_path, request_query, request_body, and request_headers filters. Reduce the number of filter values.".to_string(),
+            })?;
+
+        if let Some(max_request_partitions) = self.max_request_partitions {
+            ensure!(
+                partition_count <= max_request_partitions,
+                FilterRejectedSnafu {
+                    message: format!(
+                        "The HTTP connector would create {partition_count} request partitions, which exceeds max_request_partitions={max_request_partitions}. Reduce the number of request_path, request_query, request_body, or request_headers filter values, or increase max_request_partitions."
+                    )
+                }
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -2555,9 +3372,18 @@ mod tests {
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::AtomicUsize};
     use std::time::Duration;
     use url::Url;
+
+    #[derive(Debug)]
+    struct TestAuthenticator;
+
+    impl super::super::auth::HttpAuthenticator for TestAuthenticator {
+        fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            builder.header(AUTHORIZATION, "Bearer token")
+        }
+    }
 
     /// Build a query string by adding or replacing a token parameter.
     fn build_query_with_token(existing_query: Option<&str>, param: &str, token: &str) -> String {
@@ -2618,6 +3444,42 @@ mod tests {
         )
     }
 
+    /// Test helper: build the legacy all-Utf8 nesting schema that
+    /// `with_json_nesting` produced before it became schema-driven.
+    fn nesting_schema_utf8(nesting: &HttpJsonNesting) -> SchemaRef {
+        let fields: Vec<Field> = nesting
+            .column_order
+            .iter()
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Test helper: build a nesting schema where HTTP metadata
+    /// columns inherit base-schema types and other columns are `Utf8`.
+    fn nesting_schema_with_metadata(nesting: &HttpJsonNesting) -> SchemaRef {
+        let base = HttpTableProvider::base_table_schema();
+        let fields: Vec<Field> = nesting
+            .column_order
+            .iter()
+            .map(|name| {
+                if nesting.metadata_fields.contains(name)
+                    && let Ok(f) = base.field_with_name(name)
+                {
+                    return f.clone();
+                }
+                Field::new(name, DataType::Utf8, true)
+            })
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    fn header_provider() -> HttpTableProvider {
+        base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id", "x-region"])
+            .expect("header filters should enable")
+    }
+
     #[test]
     fn test_extract_partitions_with_path_and_query_filters() {
         let provider = base_provider()
@@ -2646,13 +3508,14 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Only path creates partition, query is validated but not used for partitioning
+        // Path and query filters together produce one partition tuple containing both values.
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
             (
                 Some("/singlesearch/shows".to_string()),
                 Some("q=South%20Park".to_string()),
+                None,
                 None
             )
         );
@@ -2675,7 +3538,10 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/data".to_string()), None, None));
+        assert_eq!(
+            partitions[0],
+            (Some("/api/data".to_string()), None, None, None)
+        );
     }
 
     #[test]
@@ -2687,7 +3553,7 @@ mod tests {
             .expect("partitions");
 
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (None, None, None));
+        assert_eq!(partitions[0], (None, None, None, None));
     }
 
     #[test]
@@ -2717,8 +3583,8 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/path1".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/path2".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/path1".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/path2".to_string()), None, None, None)));
     }
 
     #[test]
@@ -2742,8 +3608,8 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/api/v1/users".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/api/v1/posts".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/api/v1/users".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/api/v1/posts".to_string()), None, None, None)));
     }
 
     #[test]
@@ -2761,11 +3627,17 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Query filters don't create partitions, only path filters do
-        // This will create a single partition with no path
+        // Query filters in an IN list produce one extracted partition tuple per query value.
+        // These partitions do not constrain the path, so `request_path` remains `None`.
         assert_eq!(partitions.len(), 2);
-        assert_eq!(partitions[0], (None, Some("limit=10".to_string()), None));
-        assert_eq!(partitions[1], (None, Some("limit=20".to_string()), None));
+        assert_eq!(
+            partitions[0],
+            (None, Some("limit=10".to_string()), None, None)
+        );
+        assert_eq!(
+            partitions[1],
+            (None, Some("limit=20".to_string()), None, None)
+        );
     }
 
     #[test]
@@ -2797,8 +3669,84 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/api/v1".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/api/v2".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/api/v1".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/api/v2".to_string()), None, None, None)));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_query_filters(64);
+        // request_path = '/a' OR request_query = 'b=1'
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_query"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("b=1".to_string())),
+                    None,
+                )),
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("OR across different HTTP filter columns"),
+            "unexpected error message: {message}"
+        );
+        assert!(message.contains("request_path"));
+        assert!(message.contains("request_query"));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_or_across_columns_nested_is_rejected() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/a".to_string()])
+            .expect("allowed paths")
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-sandbox-id".to_string()])
+            .expect("enable header filters");
+        // request_path = '/a' OR request_headers IN ('{"x-sandbox-id":"a"}')
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/a".to_string())),
+                    None,
+                )),
+            })),
+            op: Operator::Or,
+            right: Box::new(Expr::InList(InList {
+                expr: Box::new(Expr::Column(Column::from_name("request_headers"))),
+                list: vec![Expr::Literal(
+                    ScalarValue::Utf8(Some(r#"{"x-sandbox-id":"a"}"#.to_string())),
+                    None,
+                )],
+                negated: false,
+            })),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("OR across HTTP virtual columns must be rejected");
+        assert!(
+            err.to_string()
+                .contains("OR across different HTTP filter columns")
+        );
     }
 
     #[test]
@@ -2829,13 +3777,14 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Only path creates partition; query filters are validated but don't create separate partitions
+        // The path filter is crossed with each query value to produce separate partitions.
         assert_eq!(partitions.len(), 2);
         assert_eq!(
             partitions[0],
             (
                 Some("/api/users".to_string()),
                 Some("limit=10".to_string()),
+                None,
                 None
             )
         );
@@ -2844,6 +3793,7 @@ mod tests {
             (
                 Some("/api/users".to_string()),
                 Some("limit=20".to_string()),
+                None,
                 None
             )
         );
@@ -2965,6 +3915,164 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_partitions_with_request_headers_in_list() {
+        let provider = header_provider();
+        let headers_1 = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
+        let headers_2 = r#"{"x-sandbox-id":"sandbox-2","x-region":"us-west"}"#.to_string();
+        let filters = vec![Expr::InList(InList::new(
+            Box::new(Expr::Column(Column::from_name("request_headers"))),
+            vec![
+                Expr::Literal(ScalarValue::Utf8(Some(headers_1.clone())), None),
+                Expr::Literal(ScalarValue::Utf8(Some(headers_2.clone())), None),
+            ],
+            false,
+        ))];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0], (None, None, None, Some(headers_1)));
+        assert_eq!(partitions[1], (None, None, None, Some(headers_2)));
+    }
+
+    #[test]
+    fn test_request_headers_filter_needs_enable() {
+        let provider = base_provider();
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"x-sandbox-id":"sandbox-1"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("request_header_filters"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_headers_filter_rejects_unallowlisted_header() {
+        let provider = header_provider();
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"authorization":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("request_header_allowlist"));
+                assert!(message.contains("authorization"));
+                assert!(!message.contains("secret"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_headers_filter_rejects_authorization_with_auth() {
+        let provider = base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["authorization"])
+            .expect("authorization should be allowlisted before auth is configured")
+            .with_auth(Arc::new(TestAuthenticator));
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"authorization":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("authorization"));
+                assert!(message.contains("HTTP authentication"));
+                assert!(!message.contains("secret"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_headers_filter_rejects_invalid_json() {
+        let provider = header_provider();
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("not json".to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("JSON object"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_max_request_partitions_rejects_large_cross_product() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/users".to_string(), "/api/posts".to_string()])
+            .expect("allowed paths")
+            .enable_query_filters(64)
+            .with_max_request_partitions(Some(3));
+        let filters = vec![
+            Expr::InList(InList::new(
+                Box::new(Expr::Column(Column::from_name("request_path"))),
+                vec![
+                    Expr::Literal(ScalarValue::Utf8(Some("/api/users".to_string())), None),
+                    Expr::Literal(ScalarValue::Utf8(Some("/api/posts".to_string())), None),
+                ],
+                false,
+            )),
+            Expr::InList(InList::new(
+                Box::new(Expr::Column(Column::from_name("request_query"))),
+                vec![
+                    Expr::Literal(ScalarValue::Utf8(Some("status=active".to_string())), None),
+                    Expr::Literal(ScalarValue::Utf8(Some("status=inactive".to_string())), None),
+                ],
+                false,
+            )),
+        ];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected partition cap rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("4 request partitions"));
+                assert!(message.contains("max_request_partitions=3"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_url_construction_with_base_path() {
         // Test that path from filter is appended to base URL path
         let base_url = Url::parse("https://api.example.com/v1").expect("valid URL");
@@ -3038,18 +4146,33 @@ mod tests {
 
     #[test]
     fn test_cache_key_generation() {
-        let key1 = HttpTableProvider::get_cache_key("/path", Some("query"), None);
-        let key2 = HttpTableProvider::get_cache_key("/path", None, None);
-        let key3 = HttpTableProvider::get_cache_key("/other", Some("query"), None);
-        let key4 = HttpTableProvider::get_cache_key("/path", Some("query"), Some("body"));
+        let key1 = HttpTableProvider::get_cache_key("/path", Some("query"), None, None);
+        let key2 = HttpTableProvider::get_cache_key("/path", None, None, None);
+        let key3 = HttpTableProvider::get_cache_key("/other", Some("query"), None, None);
+        let key4 = HttpTableProvider::get_cache_key("/path", Some("query"), Some("body"), None);
+        let key5 = HttpTableProvider::get_cache_key(
+            "/path",
+            Some("query"),
+            Some("body"),
+            Some(r#"{"x-sandbox-id":"sandbox-1"}"#),
+        );
+        let collision_candidate_1 =
+            HttpTableProvider::get_cache_key("/path", Some("q&body=b"), Some(""), None);
+        let collision_candidate_2 =
+            HttpTableProvider::get_cache_key("/path", Some("q"), Some("b&body="), None);
 
-        assert_eq!(key1, "/path?query&body=");
-        assert_eq!(key2, "/path?&body=");
-        assert_eq!(key3, "/other?query&body=");
-        assert_eq!(key4, "/path?query&body=body");
-        assert_ne!(key1, key2);
-        assert_ne!(key1, key3);
-        assert_ne!(key1, key4);
+        assert!(key1 == CacheKey::new("/path", Some("query"), None, None));
+        assert!(key1 != key2);
+        assert!(key1 != key3);
+        assert!(key1 != key4);
+        assert!(key4 != key5);
+        assert!(collision_candidate_1 != collision_candidate_2);
+
+        let redacted_label = key5.redacted_label();
+        assert!(redacted_label.starts_with("http-cache-key:"));
+        assert!(!redacted_label.contains("/path"));
+        assert!(!redacted_label.contains("body"));
+        assert!(!redacted_label.contains("sandbox-1"));
     }
 
     #[test]
@@ -3103,39 +4226,43 @@ mod tests {
     fn test_base_table_schema() {
         let schema = HttpTableProvider::base_table_schema();
 
-        assert_eq!(schema.fields().len(), 7);
+        assert_eq!(schema.fields().len(), 8);
         assert_eq!(schema.field(0).name(), "request_path");
         assert_eq!(schema.field(1).name(), "request_query");
         assert_eq!(schema.field(2).name(), "request_body");
-        assert_eq!(schema.field(3).name(), "content");
-        assert_eq!(schema.field(4).name(), "response_status");
-        assert_eq!(schema.field(5).name(), "response_headers");
-        assert_eq!(schema.field(6).name(), "fetched_at");
+        assert_eq!(schema.field(3).name(), "request_headers");
+        assert_eq!(schema.field(4).name(), "content");
+        assert_eq!(schema.field(5).name(), "response_status");
+        assert_eq!(schema.field(6).name(), "response_headers");
+        assert_eq!(schema.field(7).name(), "fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
-        assert_eq!(*schema.field(4).data_type(), DataType::UInt16);
+        assert_eq!(*schema.field(4).data_type(), DataType::Utf8);
+        assert_eq!(*schema.field(5).data_type(), DataType::UInt16);
         assert!(matches!(
-            schema.field(5).data_type(),
+            schema.field(6).data_type(),
             DataType::Map(_, false)
         ));
         assert_eq!(
-            *schema.field(6).data_type(),
+            *schema.field(7).data_type(),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
         );
         assert!(!schema.field(0).is_nullable()); // request_path is not nullable
         assert!(schema.field(1).is_nullable()); // request_query is nullable
         assert!(schema.field(2).is_nullable()); // request_body is nullable
-        assert!(!schema.field(3).is_nullable()); // content is not nullable
-        assert!(!schema.field(4).is_nullable()); // response_status is not nullable
-        assert!(schema.field(5).is_nullable()); // response_headers is nullable
-        assert!(schema.field(6).is_nullable()); // fetched_at is nullable
+        assert!(schema.field(3).is_nullable()); // request_headers is nullable
+        assert!(!schema.field(4).is_nullable()); // content is not nullable
+        assert!(!schema.field(5).is_nullable()); // response_status is not nullable
+        assert!(schema.field(6).is_nullable()); // response_headers is nullable
+        assert!(schema.field(7).is_nullable()); // fetched_at is nullable
     }
 
     #[tokio::test]
     async fn test_fetch_and_create_batch_includes_response_headers() {
         let provider = Arc::new(base_provider());
+        let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
             max_age: Duration::from_secs(60),
@@ -3148,13 +4275,18 @@ mod tests {
             ],
         };
         provider
-            .cache_response("/posts", None, None, &fetch_result)
+            .cache_response("/posts", None, None, Some(&request_headers), &fetch_result)
             .await;
 
         let exec = HttpExec::new(
             HttpTableProvider::base_table_schema().into(),
             Arc::clone(&provider),
-            vec![(Some("/posts".to_string()), None, None)],
+            vec![(
+                Some("/posts".to_string()),
+                None,
+                None,
+                Some(request_headers.clone()),
+            )],
             None,
         );
 
@@ -3169,8 +4301,16 @@ mod tests {
             "JSON array content should yield two rows"
         );
 
+        let request_headers_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("request_headers should be a StringArray");
+        assert_eq!(request_headers_col.value(0), request_headers);
+        assert_eq!(request_headers_col.value(1), request_headers);
+
         let headers_col = batch
-            .column(5)
+            .column(6)
             .as_any()
             .downcast_ref::<arrow::array::MapArray>()
             .expect("response_headers should be a MapArray");
@@ -3379,7 +4519,10 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+        assert_eq!(
+            partitions[0],
+            (Some("/api/users".to_string()), None, None, None)
+        );
     }
 
     #[test]
@@ -3402,7 +4545,7 @@ mod tests {
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
-            (Some("/api/v1/users/123".to_string()), None, None)
+            (Some("/api/v1/users/123".to_string()), None, None, None)
         );
     }
 
@@ -3426,7 +4569,7 @@ mod tests {
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
-            (Some("/api/v1/users".to_string()), None, None)
+            (Some("/api/v1/users".to_string()), None, None, None)
         );
     }
 
@@ -3569,8 +4712,8 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
         assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(Some("/api/users".to_string()), None, None)));
-        assert!(partitions.contains(&(Some("/v1/search".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/api/users".to_string()), None, None, None)));
+        assert!(partitions.contains(&(Some("/v1/search".to_string()), None, None, None)));
     }
 
     #[test]
@@ -3591,7 +4734,10 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("should match");
         assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+        assert_eq!(
+            partitions[0],
+            (Some("/api/users".to_string()), None, None, None)
+        );
     }
 
     #[test]
@@ -4236,7 +5382,7 @@ mod tests {
                 query_params: Some("offset={offset}&limit={limit}".to_string()),
                 page_size: Some(3),
                 data_pointer: Some("/docs".to_string()),
-                max_pages: 2,
+                max_pages: Some(2),
                 use_link_header: false,
                 ..Default::default()
             })
@@ -4541,6 +5687,212 @@ mod tests {
             ..Default::default()
         });
         assert!(result.is_ok(), "should accept link_header pagination");
+    }
+
+    #[test]
+    fn test_pagination_config_valid_with_no_max_pages_limit() {
+        let provider = base_provider();
+        let result = provider.with_pagination(PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            use_link_header: false,
+            max_pages: None,
+            ..Default::default()
+        });
+        assert!(result.is_ok(), "should accept no max-pages limit");
+    }
+
+    #[test]
+    fn test_pagination_config_rejects_zero_max_pages() {
+        let provider = base_provider();
+        let error = provider
+            .with_pagination(PaginationConfig {
+                next_pointer: Some("/next".to_string()),
+                use_link_header: false,
+                max_pages: Some(0),
+                ..Default::default()
+            })
+            .expect_err("zero max_pages should fail");
+        match error {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("pagination_max_pages"),
+                    "error should mention pagination_max_pages: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pagination_rejects_repeated_request_url() {
+        let mut state = PaginationState {
+            page: 1,
+            next_info: None,
+            rows_fetched: 0,
+            path: None,
+            query: None,
+            body: None,
+            request_headers: None,
+            limit: None,
+            done: false,
+            last_page_path: None,
+            last_page_query: None,
+            recent_page_urls: VecDeque::new(),
+        };
+        let url =
+            Url::parse("https://api.example.com/items?page=2").expect("test URL should be valid");
+
+        record_pagination_request_url(&mut state, &url).expect("first request should be accepted");
+        let error = record_pagination_request_url(&mut state, &url)
+            .expect_err("repeated request should fail");
+
+        match error {
+            Error::Pagination { message } => {
+                assert!(
+                    message.contains("repeated next page request"),
+                    "error should mention repeated pagination request: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pagination_repeated_request_tracking_is_bounded() {
+        let mut state = PaginationState {
+            page: 1,
+            next_info: None,
+            rows_fetched: 0,
+            path: None,
+            query: None,
+            body: None,
+            request_headers: None,
+            limit: None,
+            done: false,
+            last_page_path: None,
+            last_page_query: None,
+            recent_page_urls: VecDeque::new(),
+        };
+
+        for page in 0..=PAGINATION_REPEAT_DETECTION_WINDOW {
+            let url = Url::parse(&format!("https://api.example.com/items?page={page}"))
+                .expect("test URL should be valid");
+            record_pagination_request_url(&mut state, &url)
+                .expect("unique request should be accepted");
+        }
+
+        assert_eq!(
+            state.recent_page_urls.len(),
+            PAGINATION_REPEAT_DETECTION_WINDOW,
+            "recent URL tracking should be capped"
+        );
+
+        let evicted_url =
+            Url::parse("https://api.example.com/items?page=0").expect("test URL should be valid");
+        record_pagination_request_url(&mut state, &evicted_url)
+            .expect("evicted URL should not be retained forever");
+    }
+
+    async fn start_query_param_pagination_server(stop_offset: usize) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                    request_count.fetch_add(1, Ordering::SeqCst);
+
+                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                    let request_target = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let request_url = Url::parse(&format!("http://localhost{request_target}"))
+                        .expect("request target should form a valid URL");
+                    let offset = request_url
+                        .query_pairs()
+                        .find_map(|(key, value)| {
+                            (key == "offset")
+                                .then(|| value.parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+
+                    let body = if offset < stop_offset {
+                        format!(r#"{{"docs":[{{"id":{offset}}}]}}"#)
+                    } else {
+                        r#"{"docs":[]}"#.to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_pagination_without_max_pages_fetches_past_default_limit() {
+        use datafusion::prelude::SessionContext;
+        use std::sync::atomic::Ordering;
+
+        let rows_to_return = DEFAULT_PAGINATION_MAX_PAGES + 5;
+        let (base_url, request_count) = start_query_param_pagination_server(rows_to_return).await;
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            .with_pagination(PaginationConfig {
+                query_params: Some("offset={offset}&limit={limit}".to_string()),
+                page_size: Some(1),
+                data_pointer: Some("/docs".to_string()),
+                max_pages: None,
+                use_link_header: false,
+                ..Default::default()
+            })
+            .expect("pagination config should be valid");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+
+        let results = ctx
+            .sql("SELECT content FROM items")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, rows_to_return,
+            "unlimited pagination should fetch beyond the default safety limit"
+        );
+        assert!(
+            request_count.load(Ordering::SeqCst) > DEFAULT_PAGINATION_MAX_PAGES,
+            "execution should request pages beyond the old safety limit"
+        );
     }
 
     #[test]
@@ -5271,11 +6623,35 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             column_order.iter().map(|s| (*s).to_string()).collect(),
             json_field.to_string(),
+            std::collections::HashSet::new(),
         );
-        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let provider = Arc::new(
+            base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
+        );
         let schema = provider.schema();
-        let exec = HttpExec::new(schema, provider, vec![(None, None, None)], None);
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
         (exec, nesting)
+    }
+
+    fn empty_fetch_result() -> HttpFetchResult {
+        HttpFetchResult {
+            content: String::new(),
+            max_age: std::time::Duration::from_secs(0),
+            detected_format: "application/json".to_string(),
+            response_date: None,
+            response_status: 200,
+            response_headers: Vec::new(),
+        }
+    }
+
+    /// Like `nested_exec`, but accepts an explicit Arrow schema so a
+    /// caller can mix typed and Utf8 fields. Used to verify that
+    /// `create_batch_from_rows_nested` casts decomposed JSON values to
+    /// the declared field types.
+    fn nested_exec_with_schema(nesting: HttpJsonNesting, schema: SchemaRef) -> HttpExec {
+        let provider = Arc::new(base_provider().with_json_nesting(nesting, schema));
+        let schema = provider.schema();
+        HttpExec::new(schema, provider, vec![(None, None, None, None)], None)
     }
 
     fn string_col(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
@@ -5300,6 +6676,70 @@ mod tests {
     }
 
     #[test]
+    fn create_batch_from_rows_nested_casts_typed_columns() {
+        // Mixed schema: id is Int64 (was Utf8 before typed-json_nest
+        // support), name is Utf8 (default), completed is Boolean,
+        // details is the catch-all Utf8 JSON column.
+        let nesting = HttpJsonNesting::new(
+            vec![
+                "id".to_string(),
+                "name".to_string(),
+                "completed".to_string(),
+                "details".to_string(),
+            ],
+            "details".to_string(),
+            std::collections::HashSet::new(),
+        );
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("completed", DataType::Boolean, true),
+            Field::new("details", DataType::Utf8, true),
+        ]));
+        let exec = nested_exec_with_schema(nesting.clone(), schema);
+        let rows = vec![
+            r#"{"id":1,"name":"alpha","completed":true,"extra":"x"}"#.to_string(),
+            r#"{"id":2,"name":"beta","completed":false,"k":42}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
+            .expect("batch should be created with cast columns");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 4);
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(batch.schema().field(2).data_type(), &DataType::Boolean);
+
+        let id = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("id should be Int64");
+        assert_eq!(id.value(0), 1);
+        assert_eq!(id.value(1), 2);
+
+        let completed = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("completed should be Boolean");
+        assert!(completed.value(0));
+        assert!(!completed.value(1));
+
+        // Catch-all stays Utf8 with the residual JSON.
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some(r#"{"extra":"x"}"#));
+        assert_eq!(details[1].as_deref(), Some(r#"{"k":42}"#));
+    }
+
+    #[test]
     fn create_batch_from_rows_nested_decomposes_object_rows() {
         let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
         let rows = vec![
@@ -5307,7 +6747,15 @@ mod tests {
             r#"{"id":"2","name":"beta","k":42}"#.to_string(),
         ];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 3);
@@ -5329,7 +6777,15 @@ mod tests {
         let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
         let rows = vec![r#"{"id":"1"}"#.to_string()];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(string_col(&batch, "id"), vec![Some("1".to_string())]);
         assert_eq!(string_col(&batch, "name"), vec![None]);
@@ -5344,7 +6800,15 @@ mod tests {
             r#"{"name":"beta"}"#.to_string(),
         ];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
 
@@ -5367,7 +6831,15 @@ mod tests {
             "42".to_string(),
         ];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 3);
         for v in string_col(&batch, "id") {
@@ -5387,7 +6859,15 @@ mod tests {
         let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
         let rows = vec![r#"{"id":"1","name":"alpha"}"#.to_string()];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(string_col(&batch, "id")[0].as_deref(), Some("1"));
@@ -5405,8 +6885,11 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             vec!["id".to_string(), "name".to_string(), "details".to_string()],
             "details".to_string(),
+            std::collections::HashSet::new(),
         );
-        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let provider = Arc::new(
+            base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
+        );
         // Project only static columns, not "details".
         let full_schema = provider.schema();
         let projected = Arc::new(
@@ -5417,10 +6900,18 @@ mod tests {
                 ])
                 .expect("projection should succeed"),
         );
-        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
         let rows = vec![r#"{"id":"42","name":"fast","extra":"ignored"}"#.to_string()];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("fast-path batch should be created");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 2);
@@ -5436,16 +6927,27 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
+            std::collections::HashSet::new(),
         );
-        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let provider = Arc::new(
+            base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
+        );
         let full_schema = provider.schema();
         let id_idx = full_schema.index_of("id").expect("id in schema");
         let projected = datafusion::common::project_schema(&full_schema, Some(&vec![id_idx]))
             .expect("project schema");
-        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
         let rows = vec!["[1,2,3]".to_string(), r#"{"id":"x"}"#.to_string()];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 1);
@@ -5459,8 +6961,11 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
+            std::collections::HashSet::new(),
         );
-        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let provider = Arc::new(
+            base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
+        );
         let full_schema = provider.schema();
         let projected =
             HttpTableProvider::get_projected_schema(&full_schema, Some(&vec![])).expect("schema");
@@ -5469,16 +6974,136 @@ mod tests {
             1,
             "empty projection should fall back to a single field"
         );
-        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None, None)], None);
         let rows = vec![
             r#"{"id":"1","extra":"x"}"#.to_string(),
             r#"{"id":"2"}"#.to_string(),
         ];
         let batch = exec
-            .create_batch_from_rows_nested(&rows, &nesting)
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_passes_through_metadata_columns() {
+        // Mix decomposed body columns with HTTP metadata columns. The
+        // metadata columns should keep their base-schema types and be
+        // populated from the per-batch HTTP request/response values,
+        // not from the JSON body.
+        let nesting = HttpJsonNesting::new(
+            vec![
+                "request_path".to_string(),
+                "response_status".to_string(),
+                "id".to_string(),
+                "details".to_string(),
+            ],
+            "details".to_string(),
+            ["request_path".to_string(), "response_status".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let provider = Arc::new(
+            base_provider()
+                .with_json_nesting(nesting.clone(), nesting_schema_with_metadata(&nesting)),
+        );
+        let schema = provider.schema();
+
+        // Schema should keep base-table types for metadata columns.
+        assert_eq!(
+            schema
+                .field_with_name("request_path")
+                .expect("request_path field")
+                .data_type(),
+            &arrow::datatypes::DataType::Utf8
+        );
+        assert_eq!(
+            schema
+                .field_with_name("response_status")
+                .expect("response_status field")
+                .data_type(),
+            &arrow::datatypes::DataType::UInt16
+        );
+
+        let exec = HttpExec::new(
+            Arc::clone(&schema),
+            provider,
+            vec![(Some("/shows/1".to_string()), None, None, None)],
+            None,
+        );
+        let fetch_result = HttpFetchResult {
+            content: String::new(),
+            max_age: Duration::from_secs(0),
+            detected_format: "json".to_string(),
+            response_date: None,
+            response_status: 201,
+            response_headers: Vec::new(),
+        };
+        // Body has a key colliding with a metadata name; it must be
+        // ignored in favor of the actual HTTP value.
+        let rows = vec![
+            r#"{"id":"1","request_path":"/from-body","extra":"x"}"#.to_string(),
+            r#"{"id":"2"}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(
+                Some("/shows/1"),
+                None,
+                None,
+                None,
+                &rows,
+                &fetch_result,
+                &nesting,
+            )
+            .expect("batch should be created");
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 4);
+
+        // request_path: from HTTP metadata, repeated per row.
+        assert_eq!(
+            string_col(&batch, "request_path"),
+            vec![Some("/shows/1".to_string()), Some("/shows/1".to_string())]
+        );
+
+        // response_status: typed UInt16 from fetch_result.
+        let status = batch
+            .column(
+                batch
+                    .schema()
+                    .index_of("response_status")
+                    .expect("response_status column index"),
+            )
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("response_status should be UInt16");
+        assert_eq!(status.value(0), 201);
+        assert_eq!(status.value(1), 201);
+
+        // id: decomposed from body.
+        assert_eq!(
+            string_col(&batch, "id"),
+            vec![Some("1".to_string()), Some("2".to_string())]
+        );
+
+        // catch-all: must NOT contain `request_path` (it was a metadata
+        // collision), but must contain `extra` for row 0.
+        let details = string_col(&batch, "details");
+        let parsed: serde_json::Value =
+            serde_json::from_str(details[0].as_deref().expect("row 0 details"))
+                .expect("row 0 details parses as JSON");
+        assert!(parsed.get("request_path").is_none());
+        assert_eq!(parsed["extra"], "x");
+        assert!(details[1].is_none());
     }
 
     #[test]
@@ -5497,11 +7122,177 @@ mod tests {
             response_headers: Vec::new(),
         };
         let batch = exec
-            .create_batch_from_rows(None, None, None, &rows, &fetch_result)
+            .create_batch_from_rows(None, None, None, None, &rows, &fetch_result)
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
         let schema = batch.schema();
         let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(field_names, vec!["id", "name", "details"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_expanded_params unit tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an `HttpExec` with the given partitions and optional max.
+    ///
+    /// Enables all filter types (path, query, body, headers) so that
+    /// `with_expanded_params` validation passes for any column.
+    fn make_exec(
+        partitions: Vec<PartitionSpec>,
+        max_request_partitions: Option<usize>,
+    ) -> HttpExec {
+        let provider = base_provider()
+            .with_allowed_paths(["/*"])
+            .expect("valid path glob")
+            .enable_query_filters(DEFAULT_MAX_QUERY_LENGTH)
+            .enable_body_filters(DEFAULT_MAX_BODY_BYTES)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-test"])
+            .expect("header filters should enable")
+            .with_max_request_partitions(max_request_partitions);
+        HttpExec::new(
+            HttpTableProvider::base_table_schema().into(),
+            Arc::new(provider),
+            partitions,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_with_expanded_params_request_path() {
+        let exec = make_exec(vec![(None, None, None, None)], None);
+        let result = exec
+            .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
+            .expect("expand should succeed");
+
+        assert_eq!(result.partitions.len(), 2);
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/b".to_string()));
+        // Other tuple positions remain None.
+        assert_eq!(result.partitions[0].1, None);
+        assert_eq!(result.partitions[0].2, None);
+        assert_eq!(result.partitions[0].3, None);
+    }
+
+    #[test]
+    fn test_with_expanded_params_cross_product() {
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            None,
+        );
+        let result = exec
+            .with_expanded_params(
+                "request_query",
+                &["q1".to_string(), "q2".to_string(), "q3".to_string()],
+            )
+            .expect("expand should succeed");
+
+        // 2 existing × 3 values = 6 partitions
+        assert_eq!(result.partitions.len(), 6);
+
+        // First existing partition (/a) crossed with all three values
+        assert_eq!(result.partitions[0].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[0].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[1].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[1].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[2].0, Some("/a".to_string()));
+        assert_eq!(result.partitions[2].1, Some("q3".to_string()));
+
+        // Second existing partition (/b) crossed with all three values
+        assert_eq!(result.partitions[3].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[3].1, Some("q1".to_string()));
+        assert_eq!(result.partitions[4].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[4].1, Some("q2".to_string()));
+        assert_eq!(result.partitions[5].0, Some("/b".to_string()));
+        assert_eq!(result.partitions[5].1, Some("q3".to_string()));
+    }
+
+    #[test]
+    fn test_with_expanded_params_exceeds_max() {
+        // max=3, but 2 partitions × 2 query values = 4 → should fail
+        let exec = make_exec(
+            vec![
+                (Some("/a".to_string()), None, None, None),
+                (Some("/b".to_string()), None, None, None),
+            ],
+            Some(3),
+        );
+
+        _ = exec
+            .with_expanded_params("request_query", &["q=1".to_string(), "q=2".to_string()])
+            .expect_err("should exceed max_request_partitions");
+    }
+
+    type PartitionAccessor = Box<dyn Fn(&PartitionSpec) -> &Option<String>>;
+
+    #[test]
+    fn test_with_expanded_params_all_columns() {
+        // Values must satisfy each column's validation rules:
+        // - request_path: must start with '/'
+        // - request_query: plain query string
+        // - request_body: plain body text
+        // - request_headers: JSON with allowed header names
+        let cases: Vec<(&str, &str, PartitionAccessor)> = vec![
+            ("/val", "request_path", Box::new(|p: &PartitionSpec| &p.0)),
+            ("val", "request_query", Box::new(|p: &PartitionSpec| &p.1)),
+            ("val", "request_body", Box::new(|p: &PartitionSpec| &p.2)),
+            (
+                r#"{"x-test":"val"}"#,
+                "request_headers",
+                Box::new(|p: &PartitionSpec| &p.3),
+            ),
+        ];
+
+        for (test_value, col_name, accessor) in &cases {
+            let exec = make_exec(vec![(None, None, None, None)], None);
+            let result = exec
+                .with_expanded_params(col_name, &[test_value.to_string()])
+                .unwrap_or_else(|e| panic!("expand for {col_name} should succeed: {e}"));
+
+            assert_eq!(
+                result.partitions.len(),
+                1,
+                "one partition expected for {col_name}"
+            );
+            assert_eq!(
+                *accessor(&result.partitions[0]),
+                Some(test_value.to_string()),
+                "{col_name} should be set"
+            );
+
+            // Verify the OTHER positions are still None.
+            let all_accessors: Vec<PartitionAccessor> = vec![
+                Box::new(|p: &PartitionSpec| &p.0),
+                Box::new(|p: &PartitionSpec| &p.1),
+                Box::new(|p: &PartitionSpec| &p.2),
+                Box::new(|p: &PartitionSpec| &p.3),
+            ];
+            let col_names = [
+                "request_path",
+                "request_query",
+                "request_body",
+                "request_headers",
+            ];
+            for (other_name, other_accessor) in col_names.iter().zip(all_accessors.iter()) {
+                if *other_name != *col_name {
+                    assert_eq!(
+                        *other_accessor(&result.partitions[0]),
+                        None,
+                        "{other_name} should remain None when expanding {col_name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_expanded_params_unknown_column_errors() {
+        let exec = make_exec(vec![(Some("/orig".to_string()), None, None, None)], None);
+        let _ = exec
+            .with_expanded_params("nonexistent_column", &["x".to_string()])
+            .expect_err("unknown column should error");
     }
 }

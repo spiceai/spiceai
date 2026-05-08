@@ -58,6 +58,7 @@ pub mod turso;
 
 pub(crate) mod snapshots;
 pub mod spice_sys;
+pub mod swappable;
 pub mod upsert_dedup;
 
 pub(crate) use snapshots::validate_snapshot_paths;
@@ -496,6 +497,91 @@ pub trait DataAccelerator: Send + Sync {
     async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
+
+    /// Whether this accelerator supports reloading its data from a freshly
+    /// downloaded snapshot file after [`DataAccelerator::init`] has already
+    /// produced a [`TableProvider`].
+    ///
+    /// Returning `true` indicates that [`DataAccelerator::reload_from_snapshot`]
+    /// is implemented; in-memory accelerators (e.g. Arrow) and accelerators
+    /// without a stable on-disk snapshot format must return `false`.
+    fn supports_snapshot_reload(&self) -> bool {
+        false
+    }
+
+    /// Reload the accelerator from a snapshot file that has already been
+    /// downloaded and written to the accelerator's primary path on disk
+    /// (i.e. `acceleration_layout(source).primary_path()`).
+    ///
+    /// The runtime guarantees the per-dataset accelerator write mutex is held
+    /// for the duration of this call. Implementations must:
+    ///   1. Drop or clear any cached engine state (open connections, pool
+    ///      entries, file handles, cached schema views, etc.) holding the
+    ///      previous file open.
+    ///   2. Invoke `provider_factory` to construct a fresh [`TableProvider`]
+    ///      backed by the now-replaced file at the primary path.
+    ///
+    /// `provider_factory` re-runs the same `create_accelerator_table` flow
+    /// used at startup, so the returned provider has the same logical schema,
+    /// constraints, and indexes as `previous_provider`.
+    ///
+    /// The default implementation rejects the call. File-based accelerators
+    /// that participate in `refresh_mode: snapshot` must override this.
+    async fn reload_from_snapshot(
+        &self,
+        _source: &dyn AccelerationSource,
+        _previous_provider: Arc<dyn TableProvider>,
+        _provider_factory: ReloadProviderFactory,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(SnapshotReloadUnsupported {
+            engine: self.name(),
+        }))
+    }
+
+    /// Optional engine-specific [`SnapshotEngine`] used for snapshot create/extract.
+    ///
+    /// Engines that need to customise the on-disk archive contents (e.g.
+    /// Cayenne, which ships a per-dataset metastore-slice JSON instead of
+    /// the raw `cayenne.db` file) override this to return their engine.
+    /// File-based accelerators (`DuckDB` / `SQLite` / `Turso`) return `None` and
+    /// the default `SnapshotManager` engine selection applies.
+    async fn snapshot_engine_for_source(
+        &self,
+        _source: &dyn AccelerationSource,
+    ) -> Option<Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>> {
+        None
+    }
+}
+
+/// Factory that re-runs the `create_accelerator_table` registry flow to
+/// produce a fresh [`TableProvider`] for an already-initialized dataset.
+///
+/// Used by [`DataAccelerator::reload_from_snapshot`] so engines don't need
+/// to re-derive table options, attach databases, write handlers, etc.
+pub type ReloadProviderFactory = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Arc<dyn TableProvider>,
+                            Box<dyn std::error::Error + Send + Sync>,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Error returned by the default [`DataAccelerator::reload_from_snapshot`]
+/// implementation when an engine does not support snapshot-based reloads.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Acceleration engine '{engine}' does not support reloading from a snapshot. \
+     `refresh_mode: snapshot` requires a snapshot-capable file-based engine \
+     (DuckDB, SQLite, Cayenne, or Turso)."
+))]
+pub struct SnapshotReloadUnsupported {
+    pub engine: &'static str,
 }
 
 pub struct AcceleratorExternalTableBuilder {
@@ -782,6 +868,16 @@ impl BootstrapStatus {
         match self {
             Self::None => None,
             Self::Bootstrapped(info) => info.last_updated_at,
+        }
+    }
+
+    /// The `snapshot_id` of the snapshot that was loaded at bootstrap, if any.
+    /// `None` when no bootstrap occurred (no snapshot, or snapshots disabled).
+    #[must_use]
+    pub const fn loaded_snapshot_id(&self) -> Option<u64> {
+        match self {
+            Self::None => None,
+            Self::Bootstrapped(info) => Some(info.snapshot_id),
         }
     }
 }

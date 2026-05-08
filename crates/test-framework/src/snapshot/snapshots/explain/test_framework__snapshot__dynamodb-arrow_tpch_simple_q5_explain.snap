@@ -24,10 +24,10 @@ description: "Query: tpch_simple_q5"
 |               |               RepartitionExec: partitioning=Hash([o_orderkey@0], 32), input_partitions=32                                                                                                           |
 |               |                 SchemaCastScanExec                                                                                                                                                                  |
 |               |                   BytesProcessedExec                                                                                                                                                                |
-|               |                     DataSourceExec: partitions=32, partition_sizes=[12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11, 11, 20] |
+|               |                     DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |               RepartitionExec: partitioning=Hash([l_orderkey@1], 32), input_partitions=32                                                                                                           |
 |               |                 SchemaCastScanExec                                                                                                                                                                  |
 |               |                   BytesProcessedExec                                                                                                                                                                |
-|               |                     DataSourceExec: partitions=32, partition_sizes=[47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 46, 46, 76] |
+|               |                     DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |                                                                                                                                                                                                     |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

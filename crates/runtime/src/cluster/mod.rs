@@ -18,13 +18,13 @@ use crate::Error::{self, FailedToStartClusterExecutor};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::cluster::partition::{
     executor_request_initial_partitions,
-    scheduler_task::{PartitionManagementConfig, PartitionManagementTask},
+    scheduler_task::{PartitionAssignmentConfig, PartitionAssignmentTask},
 };
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::jobs::JobExecutor;
 use crate::status::ComponentStatus;
 use crate::{
-    CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_MANAGEMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
+    CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
@@ -836,7 +836,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     if let Some(config) = app.runtime.scheduler.clone() {
         if rt.partition_store().is_some() {
             // Validate all accelerated datasets/views have partition keys
-            // for distributed partition management.
+            // for distributed partition assignment.
             partition::validate_partition_keys(&app).map_err(|e| {
                 crate::Error::FailedToStartClusterScheduler {
                     source: Box::new(e),
@@ -860,18 +860,13 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                 );
             }
 
-            // Start partition management task
-            let pm_shutdown = CancellationToken::new();
-            let pm_config = match config
-                .partition_management
-                .clone()
-                .map(PartitionManagementConfig::try_from)
-            {
-                Some(Ok(cfg)) => cfg,
-                None => PartitionManagementConfig::default(),
-                Some(Err(err)) => {
+            // Start partition assignment task
+            let pa_shutdown = CancellationToken::new();
+            let pa_config = match PartitionAssignmentConfig::try_from(config.clone()) {
+                Ok(cfg) => cfg,
+                Err(err) => {
                     tracing::warn!(
-                        "Failed to parse partition management config, partition management task will not be started: {err}"
+                        "Failed to parse partition assignment config, partition assignment task will not be started: {err}"
                     );
                     return Ok(None);
                 }
@@ -881,20 +876,20 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             rt.status
                 .update_component_status("partition_metadata", ComponentStatus::Initializing);
 
-            let pm_task = PartitionManagementTask::new(
+            let pa_task = PartitionAssignmentTask::new(
                 rt.datafusion(),
                 Arc::clone(&rt.status),
-                pm_config.interval,
-                pm_shutdown.clone(),
+                pa_config.interval,
+                pa_shutdown.clone(),
             );
 
             futures.push(Box::pin(
                 self_for_task
                     .start_runtime_task(
-                        CLUSTER_PARTITION_MANAGEMENT_TASK,
-                        Some(pm_shutdown),
+                        CLUSTER_PARTITION_ASSIGNMENT_TASK,
+                        Some(pa_shutdown),
                         async move {
-                            pm_task
+                            pa_task
                                 .run()
                                 .await
                                 .boxed()

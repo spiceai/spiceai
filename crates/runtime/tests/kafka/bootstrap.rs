@@ -31,6 +31,9 @@ pub const KAFKA_SASL_USERNAME: &str = "kafka";
 pub const KAFKA_SASL_PASSWORD: &str = "kafka123";
 pub const KAFKA_SASL_MECHANISM: &str = "SCRAM-SHA-256";
 
+const REDPANDA_IMAGE: &str = "docker.redpanda.com/redpandadata/redpanda:v26.1.6";
+const KAFKA_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+
 #[instrument]
 pub async fn start_kafka_docker_container(
     port: u16,
@@ -42,7 +45,7 @@ pub async fn start_kafka_docker_container(
         // Use Redpanda (Kafka-API compatible) as for dev/test purpose:
         // single binary (no JVM), fast startup, smaller CPU/RAM footprint
         // than apache/kafka - ideal for CI and local tests.
-        .image("redpandadata/redpanda:latest".to_string())
+        .image(REDPANDA_IMAGE.to_string())
         .command([
             "redpanda",
             "start",
@@ -66,14 +69,14 @@ pub async fn start_kafka_docker_container(
                 "CMD-SHELL".to_string(),
                 "rpk cluster health | grep -E 'Healthy:.+true' || exit 1".to_string(),
             ]),
-            interval: Some(250_000_000), // 250ms
-            timeout: Some(100_000_000),  // 100ms
-            retries: Some(10),
-            start_period: Some(500_000_000), // 500ms
+            interval: Some(1_000_000_000), // 1s
+            timeout: Some(5_000_000_000),  // 5s
+            retries: Some(60),
+            start_period: Some(10_000_000_000), // 10s
             start_interval: None,
         })
         .build()?
-        .run(None)
+        .run(Some(KAFKA_CONTAINER_START_TIMEOUT))
         .await?;
 
     tracing::debug!("Kafka user creation command result: {}", running_container.exec_cmd(
@@ -104,10 +107,6 @@ pub async fn start_kafka_docker_container(
 
     // Verify broker is ready to accept connections by fetching metadata
     verify_broker_ready(&producer, topics).await?;
-
-    // Additional stabilization delay to ensure broker is fully ready for message production
-    // This helps avoid race conditions in CI environments with resource contention
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     Ok((running_container, producer))
 }

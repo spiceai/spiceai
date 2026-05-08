@@ -406,6 +406,9 @@ impl RuntimeBuilder {
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
             model_rate_controllers: Arc::new(RwLock::new(HashMap::new())),
+            http_rate_control_registry: Arc::new(
+                dataconnector::http_rate_control::HttpRateControlRegistry::default(),
+            ),
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
@@ -431,6 +434,9 @@ impl RuntimeBuilder {
             distributed,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
+            dataset_load_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
+            )),
             telemetry_config: self.telemetry_config,
         };
 

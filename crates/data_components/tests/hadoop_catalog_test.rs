@@ -100,6 +100,60 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
         .set_property(S3_SECRET_ACCESS_KEY, secret_key)
 }
 
+/// Regression test helper for scheme inference: configures the warehouse root
+/// as `s3://hadoop/` while the underlying table metadata uses `s3a://hadoop/`.
+///
+/// Uses `with_storage_factory_builder` so that when the Hadoop catalog infers the
+/// `s3a` scheme from the metadata locations, the storage factory is rebuilt with
+/// `configured_scheme: "s3a"`. Without this rebuild, the rebuilt `FileIO` would
+/// reject `s3a://...` paths because the original factory was configured for `s3`.
+#[expect(clippy::expect_used)]
+fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
+    #[cfg(not(feature = "test_hadoop_catalog_docker"))]
+    let minio_endpoint = std::env::var("MINIO_ENDPOINT")
+        .expect("Should have MINIO_ENDPOINT environment variable set");
+
+    #[cfg(feature = "test_hadoop_catalog_docker")]
+    let minio_endpoint = {
+        let guard = DOCKER_COMPOSE_ENV
+            .read()
+            .expect("Should acquire read lock on DOCKER_COMPOSE_ENV");
+        let docker_compose = guard.as_ref().expect("Should have DockerCompose instance");
+        let minio_ip = docker_compose.get_container_ip("minio");
+        let minio_socket_addr = SocketAddr::new(minio_ip, MINIO_PORT);
+        format!("http://{minio_socket_addr}")
+    };
+
+    let access_key = std::env::var("MINIO_ACCESS_KEY_ID").unwrap_or("admin".to_string());
+    let secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY").unwrap_or("password".to_string());
+
+    let mut s3_config = opendal::services::S3Config::default();
+    s3_config.bucket = "hadoop".to_string();
+    s3_config.root = Some("/".to_string());
+    s3_config.endpoint = Some(minio_endpoint.clone());
+    s3_config.region = Some("us-east-1".to_string());
+    s3_config.access_key_id = Some(access_key.clone());
+    s3_config.secret_access_key = Some(secret_key.clone());
+
+    let operator = opendal::Operator::new(s3_config.into_builder())
+        .expect("Should build S3 operator")
+        .finish();
+
+    HadoopCatalogBuilder::default()
+        .with_warehouse_root("s3://hadoop/")
+        .with_storage_factory_builder(|scheme| {
+            Arc::new(OpenDalStorageFactory::S3 {
+                configured_scheme: scheme.to_string(),
+                customized_credential_load: None,
+            })
+        })
+        .with_operator(operator)
+        .set_property(S3_REGION, "us-east-1")
+        .set_property(S3_ENDPOINT, minio_endpoint)
+        .set_property(S3_ACCESS_KEY_ID, access_key)
+        .set_property(S3_SECRET_ACCESS_KEY, secret_key)
+}
+
 #[cfg(feature = "test_hadoop_catalog_docker")]
 #[ctor]
 #[expect(clippy::expect_used)]
@@ -146,6 +200,13 @@ async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
                 .build()
                 .await
                 .expect("Should build S3A catalog"),
+        ),
+        (
+            "s3-to-s3a-inferred",
+            get_s3_to_s3a_inferred_hadoop_catalog()
+                .build()
+                .await
+                .expect("Should build S3-to-S3A inferred catalog (regression test for scheme inference rebuilding the storage factory)"),
         ),
     ]
 }

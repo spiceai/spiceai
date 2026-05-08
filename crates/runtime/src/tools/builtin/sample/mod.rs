@@ -69,11 +69,13 @@ impl SampleTableMethod {
     pub fn description(&self) -> &str {
         match self {
             SampleTableMethod::DistinctColumns => {
-                "Generate synthetic data by sampling distinct column values from a table."
+                "Return up to `limit` rows from `dataset` chosen to surface distinct values per column. Use this to quickly understand the value distribution and cardinality of columns without running a full SQL query. Specify `cols` to restrict to particular columns; otherwise all columns are sampled. Returns a JSON array of rows."
             }
-            SampleTableMethod::RandomSample => "Sample random rows from a table.",
+            SampleTableMethod::RandomSample => {
+                "Return `limit` random rows from `dataset`. Use this to inspect representative example data when realistic row content is needed but no particular ordering or distinctness is required. Returns a JSON array of rows."
+            }
             SampleTableMethod::TopNSample => {
-                "Sample the top N rows from a table based on a specified ordering"
+                "Return the first `limit` rows from `dataset` after applying `order_by`. Use this to inspect the largest, smallest, newest, or oldest rows by a single column. `order_by` must be a single column reference, optionally followed by `ASC` or `DESC` (e.g. `created_at DESC`); reserved-keyword column names are accepted. Returns a JSON array of rows."
             }
         }
     }

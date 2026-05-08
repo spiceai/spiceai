@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use futures::StreamExt;
 use google_genai::generate::{GenerateContentRequest, GenerateContentResponse};
-use google_genai::types::{Content, FunctionDeclaration, FunctionResponse, Part};
+use google_genai::types::{CachedContent, Content, FunctionDeclaration, FunctionResponse, Part};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::SystemTime;
@@ -83,9 +83,15 @@ impl Chat for Google {
 }
 
 fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateContentRequest {
+    let CreateChatCompletionRequest {
+        messages,
+        prompt_cache_key,
+        tools,
+        ..
+    } = req;
     let mut contents = Vec::new();
 
-    for message in req.messages {
+    for message in messages {
         let content = match message {
             ChatCompletionRequestMessage::User(msg) => {
                 let text = match msg.content {
@@ -204,7 +210,13 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
     let mut google_req = GenerateContentRequest::new(contents);
 
     // Convert tools if present
-    if let Some(openai_tools) = req.tools {
+    if let Some(prompt_cache_key) = prompt_cache_key {
+        google_req = google_req.with_cached_content(CachedContent {
+            name: Some(prompt_cache_key),
+        });
+    }
+
+    if let Some(openai_tools) = tools {
         let google_tools: Vec<google_genai::types::Tool> = openai_tools
             .into_iter()
             .filter_map(|tool| {
@@ -442,4 +454,38 @@ fn convert_google_stream_to_openai(
         convert_google_stream_response_to_openai(pkt.map_err(|e| openai_api_error(e.to_string()))?)
             .map_err(|e| openai_api_error(e.to_string()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::chat::{
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
+    };
+
+    #[test]
+    fn forwards_prompt_cache_key_as_cached_content() {
+        let req = CreateChatCompletionRequest {
+            messages: vec![
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content("What did the cached context say?")
+                    .build()
+                    .expect("user message should build")
+                    .into(),
+            ],
+            prompt_cache_key: Some("cachedContents/schema-cache".to_string()),
+            ..CreateChatCompletionRequest::default()
+        };
+
+        let google_req = convert_to_google_request(req);
+
+        assert_eq!(
+            google_req
+                .cached_content
+                .expect("cached content should be set")
+                .name
+                .as_deref(),
+            Some("cachedContents/schema-cache")
+        );
+    }
 }

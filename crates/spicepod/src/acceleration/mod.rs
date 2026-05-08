@@ -33,6 +33,32 @@ pub enum RefreshMode {
     Append,
     Changes,
     Caching,
+    /// Refresh exclusively by reloading newer snapshots from the configured
+    /// snapshot location. The federated source is never queried for refreshes.
+    /// Requires `snapshots` to be enabled and a snapshot-supporting engine.
+    Snapshot,
+}
+
+/// Controls the write behavior for accelerated read-write datasets.
+///
+/// - `write_through` (default): Writes go to the federated source (e.g. Postgres)
+///   synchronously. The user receives confirmation after a full ACID commit to the
+///   source. The local accelerator is updated via the normal refresh mechanism
+///   (e.g. WAL replication with `refresh_mode: changes`).
+///
+/// - `write_back`: Writes commit to the local accelerator first and return after
+///   that accelerator commit completes. The same mutation is then forwarded to
+///   the federated source asynchronously, so the source may lag and source
+///   persistence failures are logged rather than returned to the caller. This
+///   mode requires `replication.enabled: true` as an explicit opt-in to those
+///   asynchronous source durability semantics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMode {
+    #[default]
+    WriteThrough,
+    WriteBack,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -304,6 +330,11 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub on_conflict: HashMap<String, OnConflictBehavior>,
 
+    /// Controls write behavior for read-write accelerated datasets.
+    /// Only applies when `access: read_write` and the dataset is accelerated.
+    #[serde(default, skip_serializing_if = "is_default_write_mode")]
+    pub write_mode: WriteMode,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
@@ -365,6 +396,11 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_write_mode(mode: &WriteMode) -> bool {
+    *mode == WriteMode::WriteThrough
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -397,6 +433,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            write_mode: WriteMode::default(),
             metrics: None,
             partition_by: vec![],
             snapshots: SnapshotBehavior::Disabled,
@@ -506,6 +543,33 @@ mod tests {
             let accel: Acceleration =
                 yaml::from_str(&yaml).unwrap_or_else(|_| panic!("should parse mode '{s}'"));
             assert_eq!(accel.mode, mode, "round-trip failed for mode '{s}'");
+        }
+    }
+
+    #[test]
+    fn test_deserialize_refresh_mode_snapshot() {
+        let yaml = "refresh_mode: snapshot";
+        let accel: Acceleration = yaml::from_str(yaml).expect("should parse");
+        assert_eq!(accel.refresh_mode, Some(RefreshMode::Snapshot));
+    }
+
+    #[test]
+    fn test_deserialize_all_refresh_modes() {
+        for (yaml_value, expected) in [
+            ("full", RefreshMode::Full),
+            ("append", RefreshMode::Append),
+            ("changes", RefreshMode::Changes),
+            ("caching", RefreshMode::Caching),
+            ("snapshot", RefreshMode::Snapshot),
+        ] {
+            let yaml = format!("refresh_mode: {yaml_value}");
+            let accel: Acceleration = yaml::from_str(&yaml)
+                .unwrap_or_else(|_| panic!("should parse refresh_mode '{yaml_value}'"));
+            assert_eq!(
+                accel.refresh_mode,
+                Some(expected),
+                "unexpected parse for '{yaml_value}'"
+            );
         }
     }
 }

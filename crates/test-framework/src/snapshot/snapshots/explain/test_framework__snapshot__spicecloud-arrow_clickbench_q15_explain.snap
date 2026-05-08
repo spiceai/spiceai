@@ -19,6 +19,6 @@ description: "Query: clickbench_q15"
 |               |             FilterExec: SearchPhrase@1 !=                                                                                                                         |
 |               |               SchemaCastScanExec                                                                                                                                  |
 |               |                 BytesProcessedExec                                                                                                                                |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1587, 7343] |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>] |
 |               |                                                                                                                                                                   |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+

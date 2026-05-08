@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Configuration for the periodic partition-management scheduler task.
+//! Configuration for the periodic partition-assignment scheduler task.
 //!
-//! The task orchestrator itself (`PartitionManagementTask`) lives in the
+//! The task orchestrator itself (`PartitionAssignmentTask`) lives in the
 //! `runtime` crate — it's tightly coupled to the runtime `DataFusion` struct,
 //! `App`-driven metadata seeding, and `RuntimeStatus` reporting. Only the
 //! configuration and `TryFrom` conversion from spicepod live here, so callers
@@ -27,12 +27,12 @@ use std::time::Duration;
 use snafu::prelude::*;
 
 #[derive(Debug, Clone)]
-pub struct PartitionManagementConfig {
-    /// How often to run the management cycle
+pub struct PartitionAssignmentConfig {
+    /// How often to run the assignment cycle
     pub interval: Duration,
 
-    /// Maximum partitions to assign per cycle
-    pub max_assignments_per_cycle: usize,
+    /// Maximum partitions to assign per interval
+    pub max_assignments_per_interval: usize,
 
     /// Maximum partitions per executor (soft limit)
     pub max_partitions_per_executor: usize,
@@ -43,44 +43,43 @@ pub struct PartitionManagementConfig {
 
 #[derive(Debug, Snafu)]
 pub enum ConfigError {
-    #[snafu(display("Invalid partition management interval '{interval}': {source}"))]
+    #[snafu(display("Invalid partition assignment interval '{interval}': {source}"))]
     InvalidInterval {
         interval: String,
         source: fundu::ParseError,
     },
 
-    #[snafu(display("Partition management interval must be greater than zero"))]
+    #[snafu(display("Partition assignment interval must be greater than zero"))]
     IntervalIsZero,
 
-    #[snafu(display("Invalid partition management discovery timeout '{timeout}': {source}"))]
+    #[snafu(display("Invalid partition discovery timeout '{timeout}': {source}"))]
     InvalidDiscoveryTimeout {
         timeout: String,
         source: fundu::ParseError,
     },
 
-    #[snafu(display("Partition management discovery timeout must be greater than zero"))]
+    #[snafu(display("Partition discovery timeout must be greater than zero"))]
     DiscoveryTimeoutIsZero,
 }
 
-impl TryFrom<spicepod::component::runtime::PartitionManagement> for PartitionManagementConfig {
+impl TryFrom<spicepod::component::runtime::Scheduler> for PartitionAssignmentConfig {
     type Error = ConfigError;
 
-    fn try_from(
-        config: spicepod::component::runtime::PartitionManagement,
-    ) -> Result<Self, Self::Error> {
-        let interval = fundu::parse_duration(&config.interval).context(InvalidIntervalSnafu {
-            interval: &config.interval,
-        })?;
+    fn try_from(config: spicepod::component::runtime::Scheduler) -> Result<Self, Self::Error> {
+        let interval = fundu::parse_duration(&config.partition_assignment_interval).context(
+            InvalidIntervalSnafu {
+                interval: &config.partition_assignment_interval,
+            },
+        )?;
 
         if interval.is_zero() {
             return Err(ConfigError::IntervalIsZero);
         }
 
-        let discovery_timeout = fundu::parse_duration(&config.discovery_timeout).context(
-            InvalidDiscoveryTimeoutSnafu {
-                timeout: &config.discovery_timeout,
-            },
-        )?;
+        let discovery_timeout = fundu::parse_duration(&config.partition_discovery_timeout)
+            .context(InvalidDiscoveryTimeoutSnafu {
+                timeout: &config.partition_discovery_timeout,
+            })?;
 
         if discovery_timeout.is_zero() {
             return Err(ConfigError::DiscoveryTimeoutIsZero);
@@ -88,18 +87,18 @@ impl TryFrom<spicepod::component::runtime::PartitionManagement> for PartitionMan
 
         Ok(Self {
             interval,
-            max_assignments_per_cycle: config.max_assignments_per_cycle,
+            max_assignments_per_interval: config.max_partition_assignments_per_interval,
             max_partitions_per_executor: config.max_partitions_per_executor,
             discovery_timeout,
         })
     }
 }
 
-impl Default for PartitionManagementConfig {
+impl Default for PartitionAssignmentConfig {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(30),
-            max_assignments_per_cycle: 100,
+            max_assignments_per_interval: 100,
             max_partitions_per_executor: 1000,
             discovery_timeout: Duration::from_secs(60),
         }

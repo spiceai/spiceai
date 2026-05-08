@@ -2,7 +2,7 @@
 description = "All loaded components from the root Spicepod and its dependencies"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "app"
 repository.workspace = true
 rust-version.workspace = true

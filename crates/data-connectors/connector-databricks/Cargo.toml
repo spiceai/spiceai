@@ -19,7 +19,7 @@ name = "connector-databricks"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Databricks data and catalog connector for Spice.ai runtime"
 
 [dependencies]

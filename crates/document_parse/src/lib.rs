@@ -28,8 +28,12 @@ use tokio::sync::Mutex;
 
 mod docx;
 mod pdf;
+mod pptx;
+mod xlsx;
 pub use docx::DocxParser;
 pub use pdf::PdfParser;
+pub use pptx::PptxParser;
+pub use xlsx::XlsxParser;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -49,6 +53,8 @@ static DOCUMENT_PARSER_FACTORY_REGISTRY: LazyLock<
 pub async fn register_all() {
     register_parser_factory("docx", Arc::new(docx::DocxParserFactory {})).await;
     register_parser_factory("pdf", Arc::new(pdf::PdfParserFactory {})).await;
+    register_parser_factory("pptx", Arc::new(pptx::PptxParserFactory {})).await;
+    register_parser_factory("xlsx", Arc::new(xlsx::XlsxParserFactory {})).await;
 }
 
 pub async fn unregister_all() {
@@ -93,6 +99,8 @@ pub trait Document {
 pub enum DocumentType {
     Pdf,
     Docx,
+    Pptx,
+    Xlsx,
 }
 
 impl Display for DocumentType {
@@ -100,6 +108,8 @@ impl Display for DocumentType {
         match self {
             DocumentType::Pdf => write!(f, "PDF"),
             DocumentType::Docx => write!(f, "DOCX"),
+            DocumentType::Pptx => write!(f, "PPTX"),
+            DocumentType::Xlsx => write!(f, "XLSX"),
         }
     }
 }

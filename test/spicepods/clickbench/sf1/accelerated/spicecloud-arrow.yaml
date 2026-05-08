@@ -24,3 +24,4 @@ datasets:
         LIMIT 50000000
     params:
       spiceai_api_key: ${secrets:SPICEAI_CLICKBENCH_API_KEY}
+      spiceai_region: us-east-1

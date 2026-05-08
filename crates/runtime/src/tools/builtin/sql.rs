@@ -32,17 +32,17 @@ use tracing_futures::Instrument;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct SqlToolParams {
-    /// The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query
+    /// The SQL query to run, written in the Spice.ai SQL Dialect (`DataFusion` SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.
     query: String,
 }
 
 /// Default description advertised to LLMs / tool selection when the `sql` tool
 /// is in its read-only posture (the default).
-const DEFAULT_READ_ONLY_DESCRIPTION: &str = "Run a read-only SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. DDL and write statements (INSERT/UPDATE/DELETE/COPY/CREATE/DROP) are rejected, as are session-mutating statements (PREPARE/EXECUTE/DEALLOCATE).";
+const DEFAULT_READ_ONLY_DESCRIPTION: &str = "Execute a read-only SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. DDL and write statements (INSERT/UPDATE/DELETE/COPY/CREATE/DROP) and session-mutating statements (PREPARE/EXECUTE/DEALLOCATE) are rejected; use `list_datasets` and `table_schema` first to discover tables and columns.";
 
 /// Default description advertised to LLMs / tool selection when the operator
 /// has opted the tool into writable mode via [`SqlTool::allow_writes`].
-const DEFAULT_WRITABLE_DESCRIPTION: &str = "Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. This tool accepts write statements (INSERT/UPDATE/DELETE/DDL); use with caution.";
+const DEFAULT_WRITABLE_DESCRIPTION: &str = "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. This variant accepts write statements (INSERT/UPDATE/DELETE/DDL) - use with caution and only when mutation is the explicit goal. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Use `list_datasets` and `table_schema` first to discover tables and columns.";
 
 pub struct SqlTool {
     name: String,

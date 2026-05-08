@@ -79,3 +79,24 @@ app.kubernetes.io/name: {{ include "spiceai.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Render a Kubernetes probe with built-in HTTP defaults.
+*/}}
+{{- define "spiceai.probe" -}}
+{{- $probe := .probe -}}
+{{- if $probe -}}
+{{- if or $probe.exec $probe.tcpSocket $probe.grpc -}}
+{{- omit $probe "httpGet" | toYaml -}}
+{{- else -}}
+{{- toYaml $probe -}}
+{{- end -}}
+{{- else -}}
+httpGet:
+  path: {{ .path }}
+  port: {{ .port }}
+timeoutSeconds: 1
+periodSeconds: 10
+failureThreshold: 3
+{{- end -}}
+{{- end -}}

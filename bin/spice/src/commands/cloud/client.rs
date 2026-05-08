@@ -44,6 +44,11 @@ impl CloudClient {
     /// Create a new authenticated cloud client.
     pub fn new() -> Result<Self> {
         let token = get_auth_token()?;
+        Self::with_token(token)
+    }
+
+    /// Create a new authenticated cloud client with an explicit bearer token.
+    pub fn with_token(token: impl Into<String>) -> Result<Self> {
         Ok(Self {
             inner: InnerCloudClient::new(&get_base_url())
                 .map_err(into_cli)?
@@ -66,6 +71,31 @@ impl CloudClient {
     /// Exchange an auth code for an access token.
     pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
         self.inner.exchange_code(auth_code).await.map_err(into_cli)
+    }
+
+    /// Exchange `OAuth2` client credentials for an access token.
+    pub async fn exchange_client_credentials(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<String> {
+        let response = self
+            .inner
+            .exchange_client_credentials(client_id, client_secret)
+            .await
+            .map_err(into_cli)?;
+
+        if response.token_type.eq_ignore_ascii_case("bearer") {
+            Ok(response.access_token)
+        } else {
+            InvalidResponseSnafu {
+                message: format!(
+                    "Failed to exchange client credentials: unsupported OAuth token type '{}'; expected 'Bearer'",
+                    response.token_type
+                ),
+            }
+            .fail()
+        }
     }
 
     /// Get the auth context for the current user.

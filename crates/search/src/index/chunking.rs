@@ -76,6 +76,18 @@ impl Index for ChunkedSearchIndex {
         try_join_all(futs).await
     }
 
+    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+        self.inner.on_write_start().await
+    }
+
+    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+        self.inner.on_write_failed().await
+    }
+
+    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+        self.inner.on_write_complete().await
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -615,6 +627,18 @@ impl Index for ChunkedVectorIndex {
         }
         .compute_index(batches)
         .await
+    }
+
+    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+        self.inner.on_write_start().await
+    }
+
+    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+        self.inner.on_write_failed().await
+    }
+
+    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+        self.inner.on_write_complete().await
     }
 
     fn as_any(&self) -> &dyn Any {

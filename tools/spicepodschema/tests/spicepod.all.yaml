@@ -149,6 +149,12 @@ runtime:
   # Runtime params
   params:
     custom_runtime_param: value
+    http_max_concurrent_requests: '8'
+    http_requests_per_second_limit: '10'
+    http_requests_per_minute_limit: '300'
+    http_rate_control_jitter_min: 2ms
+    http_rate_control_jitter_max: 8ms
+    github_max_concurrent_connections: '5'
 
 # =============================================================================
 # MANAGEMENT CONFIGURATION
@@ -338,6 +344,12 @@ datasets:
         description: Text content for embeddings
         embeddings:
           - from: openai_embeddings
+            engine: elasticsearch
+            params:
+              endpoint: &elasticsearch_endpoint http://localhost:9200
+              user: ${secrets:ES_USER}
+              pass: ${secrets:ES_PASS}
+              index: content_vectors
             chunking:
               enabled: true
               target_chunk_size: 512
@@ -348,10 +360,16 @@ datasets:
             vector_size: 1536
         full_text_search:
           enabled: true
+          engine: elasticsearch
           row_id:
             - id
           index_store: memory # memory, file
           index_directory: /tmp/fts-index
+          params:
+            endpoint: *elasticsearch_endpoint
+            user: ${secrets:ES_USER}
+            pass: ${secrets:ES_PASS}
+            index: content_text
     params:
       pg_connection_string: postgresql://user:pass@localhost:5432/db
       pg_host: localhost
@@ -382,6 +400,14 @@ datasets:
           expression: category
       params:
         duckdb_file: ./vectors.duckdb
+    full_text_search:
+      enabled: true
+      engine: elasticsearch
+      params:
+        endpoint: *elasticsearch_endpoint
+        user: ${secrets:ES_USER}
+        pass: ${secrets:ES_PASS}
+        index: articles_index
     acceleration:
       enabled: true
       engine: duckdb
@@ -657,6 +683,7 @@ datasets:
       delta_lake_azure_storage_account_key: key
       delta_lake_azure_storage_client_id: client-id
       delta_lake_azure_storage_client_secret: secret
+      delta_lake_azure_storage_tenant_id: tenant-id
       delta_lake_azure_storage_sas_key: sas
       delta_lake_azure_storage_endpoint: endpoint
       # GCP params
@@ -791,6 +818,7 @@ datasets:
       github_max_comments_fetched: '100'
       github_include_commits: 'true'
       github_workflow_logs: 'true'
+      max_concurrent_requests: '6'
       include: '*.md'
 
   # ---------------------------------------------------------------------------
@@ -817,6 +845,16 @@ datasets:
       graphql_query: 'query { users { id name } }'
       json_pointer: /data/users
       unnest_depth: '2'
+      max_concurrent_requests: '4'
+      requests_per_second_limit: '2'
+      requests_per_minute_limit: '60'
+      rate_control_jitter_min: 2ms
+      rate_control_jitter_max: 8ms
+    metrics:
+      - name: rate_control_acquisitions_total
+      - name: rate_control_wait_duration_ms
+      - name: rate_limit_retry_after_waits_total
+      - name: rate_limit_retry_after_remaining_ms
 
   # ---------------------------------------------------------------------------
   # HTTP/HTTPS connector
@@ -836,6 +874,11 @@ datasets:
       retry_backoff_method: fibonacci
       retry_max_duration: '60s'
       retry_jitter: '0.3'
+      max_concurrent_requests: '4'
+      requests_per_second_limit: '2'
+      requests_per_minute_limit: '60'
+      rate_control_jitter_min: 2ms
+      rate_control_jitter_max: 8ms
       allowed_request_paths: '/api/v1,/api/v2'
       request_query_filters: enabled # enabled, disabled
       max_request_query_length: '2048'
@@ -843,6 +886,11 @@ datasets:
       max_request_body_bytes: '32768'
       health_probe: /health
       file_format: json
+    metrics:
+      - name: rate_control_acquisitions_total
+      - name: rate_control_wait_duration_ms
+      - name: rate_limit_retry_after_waits_total
+      - name: rate_limit_retry_after_remaining_ms
 
   # ---------------------------------------------------------------------------
   # Iceberg connector

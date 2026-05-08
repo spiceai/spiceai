@@ -25,6 +25,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+#[cfg(not(feature = "snapshots"))]
+use runtime_acceleration::snapshot::SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE;
 use runtime_acceleration::snapshot::{SnapshotApiError, SnapshotBehavior, SnapshotManager, api};
 use serde::{Deserialize, Serialize};
 use spicepod::component::snapshot::Snapshots;
@@ -47,12 +49,6 @@ fn snapshots_feature_response() -> Option<Response> {
     reason = "mirrors the snapshots-on impl which returns Option"
 )]
 fn snapshots_feature_response() -> Option<Response> {
-    /// Message shown when the snapshots feature is not compiled into this build.
-    ///
-    /// In OSS default builds the `snapshots` cargo feature is disabled and snapshot
-    /// support is shipped only in the Spice.ai enterprise build.
-    const SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE: &str = "Acceleration Snapshots are included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise";
-
     Some(
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -391,5 +387,64 @@ fn snapshot_api_error_to_response(error: &SnapshotApiError) -> Response {
             }),
         )
             .into_response(),
+    }
+}
+
+#[cfg(all(test, not(feature = "snapshots")))]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    async fn assert_enterprise_only_response(response: Response) {
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("Failed to collect snapshots response body")
+            .to_bytes();
+        let body: MessageResponse =
+            serde_json::from_slice(&body_bytes).expect("Failed to deserialize message response");
+
+        assert_eq!(body.message, SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn snapshot_handlers_return_enterprise_only_response_without_feature() {
+        let app = Arc::new(RwLock::new(None));
+        let runtime = Arc::new(Runtime::builder().build().await);
+
+        assert_enterprise_only_response(
+            list_snapshots(
+                Extension(Arc::clone(&app)),
+                Extension(Arc::clone(&runtime)),
+                Path("test_dataset".to_string()),
+                Query(ListSnapshotsQuery { limit: None }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_enterprise_only_response(
+            get_snapshot(
+                Extension(Arc::clone(&app)),
+                Extension(Arc::clone(&runtime)),
+                Path(("test_dataset".to_string(), 1)),
+            )
+            .await,
+        )
+        .await;
+
+        assert_enterprise_only_response(
+            set_current_snapshot(
+                Extension(app),
+                Extension(runtime),
+                Path("test_dataset".to_string()),
+                Json(api::SetCurrentSnapshotRequest { snapshot_id: 1 }),
+            )
+            .await,
+        )
+        .await;
     }
 }

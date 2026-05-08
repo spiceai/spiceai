@@ -19,6 +19,7 @@ limitations under the License.
 pub(crate) mod caching;
 pub(crate) mod catalog;
 pub(crate) mod dataset;
+pub(crate) mod dataset_initialization;
 pub(crate) mod embedding;
 pub(crate) mod extension;
 pub(crate) mod llm;

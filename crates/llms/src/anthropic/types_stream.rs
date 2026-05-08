@@ -19,8 +19,9 @@ use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionStreamResponse,
-        FinishReason, FunctionCallStream, FunctionType, Role,
+        ChatCompletionStreamResponseDelta, CompletionTokensDetails, CompletionUsage,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType,
+        PromptTokensDetails, Role,
     },
 };
 use futures::{Stream, StreamExt};
@@ -258,13 +259,7 @@ pub fn transform_stream(
                     }) => {
                         state.role = MessageRole::from_opt(&inner_role);
                         state.id = Some(inner_id);
-                        state.usage = Some(CompletionUsage {
-                            prompt_tokens: inner_usage.input_tokens,
-                            completion_tokens: inner_usage.output_tokens,
-                            total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
-                            prompt_tokens_details: None,
-                            completion_tokens_details: None,
-                        });
+                        state.usage = Some(inner_usage.into());
                         state.model = Some(model);
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
@@ -318,9 +313,7 @@ pub fn transform_stream(
                     }) => {
                         // Update usage
                         if let Some(ref mut u) = state.usage {
-                            u.prompt_tokens += inner_usage.input_tokens;
-                            u.completion_tokens += inner_usage.output_tokens;
-                            u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
+                            add_usage_delta(u, inner_usage);
                         }
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
@@ -378,6 +371,71 @@ pub fn transform_stream(
     Box::pin(transformed_stream)
 }
 
+fn add_usage_delta(usage: &mut CompletionUsage, delta: Usage) {
+    let delta = CompletionUsage::from(delta);
+
+    usage.prompt_tokens = usage.prompt_tokens.saturating_add(delta.prompt_tokens);
+    usage.completion_tokens = usage
+        .completion_tokens
+        .saturating_add(delta.completion_tokens);
+    usage.total_tokens = usage.total_tokens.saturating_add(delta.total_tokens);
+    usage.prompt_tokens_details = combine_prompt_token_details(
+        usage.prompt_tokens_details.take(),
+        delta.prompt_tokens_details,
+    );
+    usage.completion_tokens_details = combine_completion_token_details(
+        usage.completion_tokens_details.take(),
+        delta.completion_tokens_details,
+    );
+}
+
+fn combine_prompt_token_details(
+    current: Option<PromptTokensDetails>,
+    delta: Option<PromptTokensDetails>,
+) -> Option<PromptTokensDetails> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(PromptTokensDetails {
+            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
+            cached_tokens: combine_opt_u32(current.cached_tokens, delta.cached_tokens),
+        }),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+fn combine_completion_token_details(
+    current: Option<CompletionTokensDetails>,
+    delta: Option<CompletionTokensDetails>,
+) -> Option<CompletionTokensDetails> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(CompletionTokensDetails {
+            accepted_prediction_tokens: combine_opt_u32(
+                current.accepted_prediction_tokens,
+                delta.accepted_prediction_tokens,
+            ),
+            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
+            reasoning_tokens: combine_opt_u32(current.reasoning_tokens, delta.reasoning_tokens),
+            rejected_prediction_tokens: combine_opt_u32(
+                current.rejected_prediction_tokens,
+                delta.rejected_prediction_tokens,
+            ),
+        }),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+fn combine_opt_u32(current: Option<u32>, delta: Option<u32>) -> Option<u32> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(current.saturating_add(delta)),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
 fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
     let OpenAIError::ApiError(api_error) = error else {
         return error;
@@ -429,4 +487,84 @@ fn create_anthropic_stream_response(
     };
 
     crate::streaming_utils::create_stream_response(id, model, choices, usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_delta_accumulates_cache_tokens() {
+        let mut usage = Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_read_input_tokens: Some(3),
+            ..Usage::default()
+        }
+        .into();
+
+        add_usage_delta(
+            &mut usage,
+            Usage {
+                input_tokens: 2,
+                output_tokens: 4,
+                cache_creation_input_tokens: Some(5),
+                cache_read_input_tokens: Some(7),
+                ..Usage::default()
+            },
+        );
+
+        assert_eq!(usage.prompt_tokens, 27);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 32);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn usage_delta_saturates_token_counts() {
+        let mut usage = CompletionUsage {
+            prompt_tokens: u32::MAX - 1,
+            completion_tokens: u32::MAX - 1,
+            total_tokens: u32::MAX - 1,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(u32::MAX - 1),
+                audio_tokens: Some(u32::MAX - 1),
+            }),
+            completion_tokens_details: None,
+        };
+
+        add_usage_delta(
+            &mut usage,
+            Usage {
+                input_tokens: 2,
+                output_tokens: 2,
+                cache_read_input_tokens: Some(2),
+                ..Usage::default()
+            },
+        );
+
+        assert_eq!(usage.prompt_tokens, u32::MAX);
+        assert_eq!(usage.completion_tokens, u32::MAX);
+        assert_eq!(usage.total_tokens, u32::MAX);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.audio_tokens),
+            Some(u32::MAX - 1)
+        );
+    }
 }
