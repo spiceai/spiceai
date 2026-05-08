@@ -110,27 +110,45 @@ struct RefreshStat {
     pub memory_size: usize,
 }
 
-/// Walks the federated provider chain and collects indexes from any [`IndexedTableProvider`]
-/// layer. These indexes receive write lifecycle hooks alongside accelerator refreshes.
+/// Walks the federated provider chain and collects indexes from **every** [`IndexedTableProvider`]
+/// layer encountered. Known wrapper types (`FederatedTableProviderAdaptor`, `EmbeddingTable`) are
+/// unwrapped so that indexes nested inside them are not silently missed. These indexes receive
+/// write lifecycle hooks alongside accelerator refreshes.
 async fn indexes_from_federated(
     federated: &Arc<FederatedTable>,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+    use crate::embeddings::table::EmbeddingTable;
     use runtime_datafusion_index::IndexedTableProvider;
-    let provider = federated.table_provider().await;
-    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
-        return indexed.get_all_indexes();
-    }
-    if let Some(adaptor) = provider
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
-    {
-        if let Some(inner) = &adaptor.table_provider {
-            if let Some(indexed) = inner.as_any().downcast_ref::<IndexedTableProvider>() {
-                return indexed.get_all_indexes();
+
+    let mut indexes: Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut current = Some(federated.table_provider().await);
+
+    while let Some(provider) = current.take() {
+        if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+            for index in indexed.get_all_indexes() {
+                let ptr = Arc::as_ptr(&index) as *const ();
+                if seen.insert(ptr) {
+                    indexes.push(index);
+                }
             }
         }
+
+        current = if let Some(adaptor) = provider
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+        {
+            adaptor.table_provider.as_ref().map(Arc::clone)
+        } else if let Some(embedding_table) = provider.as_any().downcast_ref::<EmbeddingTable>() {
+            Some(Arc::clone(embedding_table.get_underlying_ref()))
+        } else if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+            Some(indexed.get_underlying())
+        } else {
+            None
+        };
     }
-    vec![]
+
+    indexes
 }
 
 pub struct RefreshTaskBuilder {
