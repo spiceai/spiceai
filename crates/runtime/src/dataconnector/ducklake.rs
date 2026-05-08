@@ -21,6 +21,7 @@ limitations under the License.
 use crate::{component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect};
 use async_trait::async_trait;
 use data_components::Read;
+use data_components::ducklake::writer::DuckDbFederatedTableWriter;
 use data_components::ducklake::{DuckLakeS3Params, configure_duckdb_httpfs};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -34,6 +35,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use super::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
@@ -58,7 +60,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckLake {
     duckdb_factory: DuckDBTableFactory,
+    pool: Arc<DuckDbConnectionPool>,
     catalog_name: String,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for DuckLake {
@@ -115,7 +119,7 @@ fn create_ducklake_factory(
     catalog_name: &str,
     open_path: Option<&str>,
     params: &ConnectorParams,
-) -> AnyErrorResult<(DuckDBTableFactory, String)> {
+) -> AnyErrorResult<(DuckDBTableFactory, Arc<DuckDbConnectionPool>, String)> {
     // Create the DuckDB connection pool
     let pool = if let Some(path) = open_path {
         Arc::new(
@@ -243,8 +247,8 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    let factory = DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect());
-    Ok((factory, catalog_name.to_string()))
+    let factory = DuckDBTableFactory::new(Arc::clone(&pool)).with_dialect(new_duckdb_dialect());
+    Ok((factory, pool, catalog_name.to_string()))
 }
 
 impl DataConnectorFactory for DuckLakeFactory {
@@ -284,7 +288,7 @@ impl DataConnectorFactory for DuckLakeFactory {
                 .map(ToString::to_string);
 
             let params_for_factory = params.clone();
-            let (duckdb_factory, catalog_name) = tokio::task::spawn_blocking(move || {
+            let (duckdb_factory, pool, catalog_name) = tokio::task::spawn_blocking(move || {
                 create_ducklake_factory(
                     &connection_string,
                     &catalog_name,
@@ -301,7 +305,9 @@ impl DataConnectorFactory for DuckLakeFactory {
 
             Ok(Arc::new(DuckLake {
                 duckdb_factory,
+                pool,
                 catalog_name,
+                write_lock: Arc::new(Mutex::new(())),
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -346,6 +352,36 @@ impl DataConnector for DuckLake {
                 dataconnector: "ducklake",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
+    }
+
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        let path = dataset.path();
+        // TODO: Refactor to use `TableReference::full()` for safer, explicit table reference construction
+        let table_ref: TableReference = if path.contains('.') {
+            format!("{}.{}", self.catalog_name, path).into()
+        } else {
+            format!("{}.main.{}", self.catalog_name, path).into()
+        };
+
+        let read_provider = match Read::table_provider(&self.duckdb_factory, table_ref.clone())
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "ducklake",
+                connector_component: ConnectorComponent::from(dataset),
+            }) {
+            Ok(provider) => provider,
+            Err(e) => return Some(Err(e)),
+        };
+
+        Some(Ok(Arc::new(DuckDbFederatedTableWriter::new(
+            read_provider,
+            Arc::clone(&self.pool),
+            table_ref,
+            Arc::clone(&self.write_lock),
+        ))))
     }
 }
 
