@@ -10,11 +10,11 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
+          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
         ]
       },
       "primary_key": {
-        "id": 525
+        "id": 708
       }
     },
     {
@@ -22,11 +22,11 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+          "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
         ]
       },
       "primary_key": {
-        "id": 468
+        "id": 525
       }
     },
     {
@@ -46,11 +46,11 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+          "a. \\( h(7) = -3(7) - 4 = -21 - 4 = \\boxed{-25} \\)\nb. \\( h(-4) = -3(-4) - 4 = 12 - 4 = \\boxed{8} \\)"
         ]
       },
       "primary_key": {
-        "id": 1277
+        "id": 255
       }
     }
   ]

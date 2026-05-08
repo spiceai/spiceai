@@ -68,21 +68,7 @@ pub use utils::to_cached_record_batch_stream;
 /// Keep this list in sync with:
 /// - `datafusion_ddl::DdlExtensionNode` → `"DdlExtension"`
 /// - `datafusion_dml::DmlExtensionNode` → `"DmlExtension"`
-/// - `cayenne::ddl::logical_nodes::CayenneMergeNode` → `"CayenneMerge"`
-/// - `runtime::datafusion::cayenne_ddl::logical_nodes::DistributedCayenne{Insert,Update,Delete}Node`
-///   → `"CayenneInsert"` / `"CayenneUpdate"` / `"CayenneDelete"` (they reuse the
-///   non-distributed names by design)
-/// - `runtime::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneMergeNode`
-///   → `"DistributedCayenneMerge"`
-pub const WRITE_CAPABLE_EXTENSION_NAMES: &[&str] = &[
-    "DdlExtension",
-    "DmlExtension",
-    "CayenneInsert",
-    "CayenneUpdate",
-    "CayenneDelete",
-    "CayenneMerge",
-    "DistributedCayenneMerge",
-];
+pub const WRITE_CAPABLE_EXTENSION_NAMES: &[&str] = &["DdlExtension", "DmlExtension"];
 
 use crate::result::embeddings::CachedEmbeddingResult;
 

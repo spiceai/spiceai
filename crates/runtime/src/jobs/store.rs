@@ -130,12 +130,18 @@ impl JobStore {
     }
 
     /// Creates a new pending job and stores it.
-    pub async fn create_job(&self, request: SubmitQueryRequest) -> Result<JobState> {
+    pub async fn create_job(
+        &self,
+        request: SubmitQueryRequest,
+        read_only: bool,
+    ) -> Result<JobState> {
         let job_id = Self::generate_job_id();
         let mut state = JobState::new_pending(job_id, request.sql, request.parameters)
             .with_timeout_seconds(request.timeout_seconds)
             .with_maximum_size(request.maximum_size)
             .with_allow_accelerated_tables(request.allow_accelerated_tables);
+        state.read_only = read_only;
+
         self.write_job_state(&mut state).await?;
         Ok(state)
     }
@@ -743,7 +749,7 @@ mod tests {
         let job_store = JobStore::new(store, "test", "node-1");
 
         let state = job_store
-            .create_job(make_request("SELECT 1"))
+            .create_job(make_request("SELECT 1"), false)
             .await
             .expect("to create job");
 
@@ -763,7 +769,7 @@ mod tests {
 
         // Create job
         let state = job_store
-            .create_job(make_request("SELECT * FROM test"))
+            .create_job(make_request("SELECT * FROM test"), false)
             .await
             .expect("to create job");
         let job_id = state.job_id.clone();
@@ -805,7 +811,7 @@ mod tests {
         let job_store = JobStore::new(store, "test", "node-1");
 
         let state = job_store
-            .create_job(make_request("SELECT 1"))
+            .create_job(make_request("SELECT 1"), false)
             .await
             .expect("to create job");
 
@@ -853,7 +859,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test WHERE 1=0"))
+                .create_job(make_request("SELECT * FROM test WHERE 1=0"), false)
                 .await
                 .expect("to create job");
 
@@ -885,7 +891,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(100);
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"))
+                .create_job(make_request("SELECT * FROM test"), false)
                 .await
                 .expect("to create job");
 
@@ -923,7 +929,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(100);
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"))
+                .create_job(make_request("SELECT * FROM test"), false)
                 .await
                 .expect("to create job");
 
@@ -961,7 +967,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"))
+                .create_job(make_request("SELECT * FROM test"), false)
                 .await
                 .expect("to create job");
 
@@ -1018,7 +1024,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"))
+                .create_job(make_request("SELECT * FROM test"), false)
                 .await
                 .expect("to create job");
 
@@ -1047,7 +1053,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"))
+                .create_job(make_request("SELECT * FROM test"), false)
                 .await
                 .expect("to create job");
 
@@ -1093,10 +1099,10 @@ mod tests {
 
             // Create job with a generous maximum size limit
             let state = job_store
-                .create_job(make_request_with_maximum_size(
-                    "SELECT * FROM test",
-                    Some(10_000),
-                ))
+                .create_job(
+                    make_request_with_maximum_size("SELECT * FROM test", Some(10_000)),
+                    false,
+                )
                 .await
                 .expect("to create job");
 
@@ -1129,10 +1135,10 @@ mod tests {
 
             // Create job with a very small maximum size limit (1 byte)
             let state = job_store
-                .create_job(make_request_with_maximum_size(
-                    "SELECT * FROM test",
-                    Some(1),
-                ))
+                .create_job(
+                    make_request_with_maximum_size("SELECT * FROM test", Some(1)),
+                    false,
+                )
                 .await
                 .expect("to create job");
 
@@ -1172,10 +1178,10 @@ mod tests {
 
             // Create job with a very small maximum size limit
             let state = job_store
-                .create_job(make_request_with_maximum_size(
-                    "SELECT * FROM test",
-                    Some(1),
-                ))
+                .create_job(
+                    make_request_with_maximum_size("SELECT * FROM test", Some(1)),
+                    false,
+                )
                 .await
                 .expect("to create job");
 
@@ -1207,7 +1213,10 @@ mod tests {
 
             // Create job without a maximum size limit
             let state = job_store
-                .create_job(make_request_with_maximum_size("SELECT * FROM test", None))
+                .create_job(
+                    make_request_with_maximum_size("SELECT * FROM test", None),
+                    false,
+                )
                 .await
                 .expect("to create job");
 
@@ -1243,7 +1252,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job(make_request("SELECT 1"))
+                .create_job(make_request("SELECT 1"), false)
                 .await
                 .expect("to create job");
 
@@ -1260,7 +1269,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let created = job_store
-                .create_job(make_request("SELECT 1"))
+                .create_job(make_request("SELECT 1"), false)
                 .await
                 .expect("to create job");
 
@@ -1283,7 +1292,7 @@ mod tests {
 
             // Create job
             let created = job_store
-                .create_job(make_request("SELECT 1"))
+                .create_job(make_request("SELECT 1"), false)
                 .await
                 .expect("to create job");
             let job_id = created.job_id.clone();
@@ -1333,7 +1342,7 @@ mod tests {
 
             // Create job
             let created = job_store
-                .create_job(make_request("SELECT 1"))
+                .create_job(make_request("SELECT 1"), false)
                 .await
                 .expect("to create job");
             let job_id = created.job_id.clone();
@@ -1366,7 +1375,7 @@ mod tests {
 
             // Create job
             let created = job_store
-                .create_job(make_request("SELECT 1"))
+                .create_job(make_request("SELECT 1"), false)
                 .await
                 .expect("to create job");
             let job_id = created.job_id.clone();
@@ -1403,7 +1412,7 @@ mod tests {
 
             // Create first job and write chunks
             let state1 = job_store
-                .create_job(make_request("SELECT * FROM test"))
+                .create_job(make_request("SELECT * FROM test"), false)
                 .await
                 .expect("to create first job");
 

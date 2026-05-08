@@ -16,8 +16,9 @@ limitations under the License.
 
 //! DELETE planning for the unified Spice planner.
 //!
-//! In distributed (scheduler) mode, produces a [`DistributedCayenneDeleteNode`]
-//! that forwards the DELETE to executor nodes.
+//! In distributed (scheduler) mode, wraps target Cayenne DELETE statements in a
+//! generic [`datafusion_dml::DmlExtensionNode`] with a distributed Cayenne DML
+//! handler.
 //!
 //! In local mode, DELETE is handled by Cayenne's `TableProvider` implementation
 //! through `DataFusion`'s standard physical planning — no interception needed.
@@ -26,27 +27,30 @@ use std::sync::Arc;
 
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Extension, LogicalPlan};
+use datafusion_dml::{CatalogDmlHandler, DeleteParams, DmlExtensionNode, DmlNodeOp};
 use datafusion_expr::DmlStatement;
 
 use crate::datafusion::cayenne_ddl::dml_planner::extract_filters;
-use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneDeleteNode;
 
-/// Wrap a `DataFusion` `DmlStatement` (DELETE) into a distributed Cayenne
-/// extension node for forwarding to executor nodes.
+/// Wrap a `DataFusion` `DmlStatement` (DELETE) into a generic DML extension
+/// node for forwarding to executor nodes.
 ///
 /// This rewrite is only used for scheduler-side distributed overlay paths.
-///
-/// This is only called in distributed (scheduler) mode. In local mode,
-/// the standard `DataFusion` plan is returned unchanged by the caller.
-pub(super) fn plan_distributed_delete(dml: &DmlStatement) -> DFResult<LogicalPlan> {
+pub(super) fn plan_distributed_delete(
+    dml: &DmlStatement,
+    handler: Arc<dyn CatalogDmlHandler>,
+) -> DFResult<LogicalPlan> {
     let filters = extract_filters(&dml.input)?;
 
     Ok(LogicalPlan::Extension(Extension {
-        node: Arc::new(DistributedCayenneDeleteNode::new(
-            dml.table_name.clone(),
-            Arc::clone(&dml.input),
+        node: Arc::new(DmlExtensionNode::new(
+            DmlNodeOp::Delete(DeleteParams {
+                table_name: dml.table_name.clone(),
+                filters,
+            }),
+            handler,
+            vec![Arc::clone(&dml.input)],
             Arc::clone(&dml.output_schema),
-            filters,
         )),
     }))
 }

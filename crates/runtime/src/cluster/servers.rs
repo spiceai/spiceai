@@ -74,6 +74,7 @@ pub async fn start_internal_cluster_server(
     };
 
     let tls_config = rt.df.cluster_config.tls_config();
+    let mtls_enabled = tls_config.is_some();
     let mut server = Server::builder();
 
     if let Some(tls_config) = tls_config {
@@ -120,6 +121,7 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
             executor_streams,
+            mtls_enabled,
         )
     } else {
         ClusterServiceImpl::new(
@@ -130,6 +132,7 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&rt.df),
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
+            mtls_enabled,
         )
     };
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
@@ -209,8 +212,10 @@ pub async fn start_executor_flight_server(
     }
 
     // Create composite Flight service that handles both Ballista and Spice protocols
-    let spice_service =
-        SpiceFlightService::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let spice_service = SpiceFlightService::new(
+        endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
+        rt.datafusion().data_update_broadcaster(),
+    );
     let session_store = spice_service.session_store();
     let composite_service = CompositeFlightService::new(spice_service);
 

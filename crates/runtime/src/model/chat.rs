@@ -20,7 +20,7 @@ use llms::{
     bedrock::chat::{BedrockConverse, guardrail::GuardRail},
     chat::{Chat, Error as LlmError},
     google::Google,
-    openai::UsageTier,
+    openai::{ChatBackend, UsageTier},
     xai::Xai,
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
@@ -43,6 +43,7 @@ use crate::{
     parameters::Parameters,
     tools::{
         options::SpiceToolsOptions,
+        registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools},
         utils::{create_table_allowlist, get_tools_with_allowlist},
     },
 };
@@ -110,16 +111,27 @@ pub async fn try_to_chat_model(
         // Prevent infinite recursion in case of circular tool calls.
         .or(Some(DEFAULT_SPICE_TOOL_RECURSION_LIMIT));
 
-    // Create table allowlist from model's datasets if specified
-    let table_allowlist = create_table_allowlist(&component.datasets);
+    let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
 
     let tool_model = match spice_tool_opt {
-        Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingChat::new(
-            model,
-            Arc::clone(&rt),
-            get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await,
-            spice_recursion_limit,
-        )),
+        Some(opts) if opts.can_use_tools() => {
+            let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
+                LlmError::ModelParameterFailed {
+                    model: component.name.clone(),
+                    source: e,
+                }
+            })?;
+            let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
+            let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
+                .await
+                .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+            Arc::new(ToolUsingChat::new(
+                model,
+                Arc::clone(&rt),
+                tools,
+                spice_recursion_limit,
+            ))
+        }
         Some(_) | None => model,
     };
     Ok(tool_model)
@@ -432,6 +444,7 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>
             param: "openai_usage_tier".to_string(),
             message: "Must be 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'".to_string(),
         })?;
+    let chat_backend = chat_backend(params)?;
 
     if let Some(temperature_str) = params.get("temperature").expose().ok() {
         match temperature_str.parse::<f64>() {
@@ -452,13 +465,14 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>
         }
     }
 
-    Ok(Arc::new(llms::openai::new_openai_client(
+    Ok(Arc::new(llms::openai::new_openai_client_with_chat_backend(
         model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
         api_base,
         api_key,
         org_id,
         project_id,
         usage_tier,
+        chat_backend,
     )) as Arc<dyn Chat>)
 }
 
@@ -479,6 +493,7 @@ fn azure(
     let deployment_name = params.get("deployment_name").expose().ok();
     let api_key = params.get("api_key").expose().ok();
     let entra_token = params.get("entra_token").expose().ok();
+    let chat_backend = chat_backend(params)?;
 
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
@@ -506,14 +521,35 @@ fn azure(
         });
     }
 
-    Ok(Arc::new(llms::openai::new_azure_client(
+    Ok(Arc::new(llms::openai::new_azure_client_with_chat_backend(
         model_name,
         api_base,
         api_version,
         deployment_name,
         entra_token,
         api_key,
+        chat_backend,
     )) as Arc<dyn Chat>)
+}
+
+fn chat_backend(params: &Parameters) -> Result<ChatBackend, LlmError> {
+    let value = params
+        .get("responses_api")
+        .expose()
+        .ok()
+        .unwrap_or("disabled")
+        .trim();
+
+    if value.eq_ignore_ascii_case("disabled") {
+        Ok(ChatBackend::ChatCompletions)
+    } else if value.eq_ignore_ascii_case("enabled") {
+        Ok(ChatBackend::Responses)
+    } else {
+        Err(LlmError::InvalidParamValueError {
+            param: "responses_api".to_string(),
+            message: "Must be 'enabled' or 'disabled'".to_string(),
+        })
+    }
 }
 
 #[cfg(feature = "models")]
@@ -569,6 +605,50 @@ mod test {
     use serde_json::Number;
     use spicepod::component::model::Model;
 
+    fn parameters_with_responses_api(value: Option<&str>) -> Parameters {
+        Parameters::new(
+            value.map_or_else(Vec::new, |value| {
+                vec![(
+                    "responses_api".to_string(),
+                    SecretString::from(value.to_string()),
+                )]
+            }),
+            "openai",
+            crate::model::params::openai::PARAMETERS,
+        )
+    }
+
+    #[test]
+    fn responses_api_defaults_to_chat_completions() {
+        let params = parameters_with_responses_api(None);
+
+        let api = chat_backend(&params).expect("default responses_api should be valid");
+
+        assert_eq!(api, ChatBackend::ChatCompletions);
+    }
+
+    #[test]
+    fn responses_api_enabled_uses_responses() {
+        let params = parameters_with_responses_api(Some("enabled"));
+
+        let api = chat_backend(&params).expect("enabled responses_api should be valid");
+
+        assert_eq!(api, ChatBackend::Responses);
+    }
+
+    #[test]
+    fn responses_api_rejects_unknown_value() {
+        let params = parameters_with_responses_api(Some("legacy"));
+
+        let err = chat_backend(&params).expect_err("unknown responses_api should be invalid");
+
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. }
+                if param == "responses_api"
+        ));
+    }
+
     #[test]
     fn test_get_openai_request_overrides_with_deprecated() {
         let mut model = Model::new("hf:test_model", "test_model");
@@ -601,6 +681,25 @@ mod test {
             overrides
                 .iter()
                 .any(|(k, v)| k == "max_completion_tokens" && v == &Value::Number(1.into()))
+        );
+    }
+
+    #[test]
+    fn test_get_openai_request_overrides_with_prompt_cache_key() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "hf_prompt_cache_key".to_string(),
+            Value::String("schema-context".to_string()),
+        );
+
+        let overrides = get_openai_request_overrides(&model, "hf");
+
+        assert_eq!(overrides.len(), 1);
+        assert!(
+            overrides
+                .iter()
+                .any(|(key, value)| key == "prompt_cache_key"
+                    && value == &Value::String("schema-context".to_string()))
         );
     }
 

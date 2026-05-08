@@ -20,7 +20,7 @@ use runtime_datafusion_index::IndexedTableProvider;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
@@ -141,6 +141,16 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.metrics_provider()
     }
 
+    async fn on_accelerator_setup(
+        &self,
+        dataset: &Dataset,
+        builder: &mut accelerated_table::Builder,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner_connector
+            .on_accelerator_setup(dataset, builder)
+            .await
+    }
+
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
@@ -165,6 +175,7 @@ impl DataConnector for FullTextConnector {
         dataset: &Dataset,
         accelerated_table_provider: Arc<dyn TableProvider>,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
             inner.changes_stream(
@@ -172,6 +183,7 @@ impl DataConnector for FullTextConnector {
                 dataset,
                 Arc::clone(&accelerated_table_provider),
                 Arc::clone(&accelerator_write_mutex),
+                cpu_runtime.clone(),
             )
         })
     }

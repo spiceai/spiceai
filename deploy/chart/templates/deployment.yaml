@@ -83,17 +83,11 @@ spec:
             - containerPort: 50051
               name: flight
           livenessProbe:
-            httpGet:
-              path: /health
-              port: 8090
+            {{- include "spiceai.probe" (dict "probe" .Values.livenessProbe "path" "/health" "port" 8090) | nindent 12 }}
           readinessProbe:
-            httpGet:
-              path: /v1/ready
-              port: 8090
+            {{- include "spiceai.probe" (dict "probe" .Values.readinessProbe "path" "/v1/ready" "port" 8090) | nindent 12 }}
           startupProbe:
-            httpGet:
-              path: /health
-              port: 8090
+            {{- include "spiceai.probe" (dict "probe" .Values.startupProbe "path" "/health" "port" 8090) | nindent 12 }}
           volumeMounts:
             {{- if .Values.volumeMounts }}
             {{- .Values.volumeMounts | toYaml | nindent 12 }}

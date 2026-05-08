@@ -2,7 +2,7 @@
 description = "Spice OSS"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "spiced"
 repository.workspace = true
 rust-version.workspace = true
@@ -74,6 +74,7 @@ alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 azure-keyvault = ["runtime/azure-keyvault"]
+hashicorp_vault = ["runtime/hashicorp_vault"]
 clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
 cosmosdb = ["runtime/cosmosdb"]
 cuda = ["runtime/cuda"]
@@ -92,7 +93,6 @@ default = [
     "clickhouse",
     "cosmosdb",
     "sharepoint",
-    "snapshots",
     "snowflake",
     "spark",
     "ftp",
@@ -122,6 +122,9 @@ duckdb = ["connector-duckdb", "runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
+http-functions = ["runtime/http-functions"]
+wasm-functions = ["runtime/wasm-functions"]
+wasm-functions-compile = ["runtime/wasm-functions-compile"]
 iceberg-write = ["runtime/iceberg-write"]
 imap = ["connector-imap", "runtime/imap"]
 kafka = ["runtime/kafka"]
@@ -139,7 +142,7 @@ oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]
 postgres-accel = ["runtime/postgres-accel"]
-postgres-write = ["runtime/postgres-write"]
+
 release = []
 scylladb = ["connector-scylladb", "runtime/scylladb"]
 sftp = ["connector-sftp", "runtime/sftp"]

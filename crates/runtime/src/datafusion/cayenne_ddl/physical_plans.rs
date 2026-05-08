@@ -328,6 +328,9 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
             }
 
             // 4. Build and forward CREATE TABLE DDL SQL.
+            // Intentionally omit PARTITION BY when forwarding to executors:
+            // the scheduler owns distributed partition metadata/routing, while
+            // executors store plain local Cayenne tables for the assigned rows.
             {
                 let columns_sql: Vec<String> = arrow_schema_fwd
                     .fields()

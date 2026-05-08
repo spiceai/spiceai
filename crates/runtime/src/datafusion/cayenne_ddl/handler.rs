@@ -77,6 +77,16 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
         catalog_list: Arc<dyn CatalogProviderList>,
         session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let table_ref = format!(
+            "{}.{}.{}",
+            params.catalog_name, params.schema_name, params.table_name
+        );
+        let Some(partition_expr_sql) = params.extension.partition_by else {
+            return Err(datafusion::error::DataFusionError::Plan(format!(
+                "Failed to create table {table_ref} (cayenne): PARTITION BY is required in distributed mode"
+            )));
+        };
+
         Ok(Arc::new(DistributedCayenneCreateTableExec::new(
             operations::CreateTableParams {
                 table_name: params.table_name,
@@ -84,7 +94,7 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
                 catalog_name: params.catalog_name,
                 arrow_schema: params.arrow_schema,
                 primary_key: params.primary_key,
-                partition_expr_sql: params.extension.partition_by.map(|e| e.to_string()),
+                partition_expr_sql: Some(partition_expr_sql.to_string()),
                 if_not_exists: params.if_not_exists,
                 like_source_table: params.like_source_table,
                 ctx: Some(Arc::new(SessionContext::new_with_state(

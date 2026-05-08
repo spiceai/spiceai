@@ -16,12 +16,18 @@ limitations under the License.
 
 pub mod allowlist;
 pub mod analyzer_rule;
+pub mod composed_catalog;
 pub mod config;
+pub mod dialect;
+pub mod error;
 pub mod execution_plan;
 pub mod extension;
 pub mod join_accumulator;
+pub mod managed_runtime;
 pub mod optimizer_rule;
+pub mod param_utils;
 pub mod schema_provider;
+pub mod sort_columns;
 pub mod url_table;
 use snafu::prelude::*;
 

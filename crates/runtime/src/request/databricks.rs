@@ -140,7 +140,7 @@ impl DatabricksAuthExtension {
                         return None;
                     }
 
-                    if df.table_exists(TableReference::from(&dataset.name)) {
+                    if df.table_exists(&TableReference::from(&dataset.name)) {
                         return None;
                     }
 

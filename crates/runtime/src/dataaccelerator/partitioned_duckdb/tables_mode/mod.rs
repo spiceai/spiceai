@@ -65,7 +65,7 @@ use crate::{
             ExpectedAccelerationSourceSnafu, FailedToCreateConnectionPoolSnafu, FileModeOnlySnafu,
         },
     },
-    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
+    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_functions_for_duckdb},
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator,
@@ -454,7 +454,7 @@ fn create_factory() -> DuckDBTableProviderFactory {
         .with_settings_registry(
             DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
         )
-        .with_function_support(deny_spice_specific_functions().clone())
+        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
 }
 
 async fn get_pool(

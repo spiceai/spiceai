@@ -8,27 +8,27 @@ expression: resp?
     "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.541
+    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.539
   },
   {
     "id": 1277,
     "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.538
+    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.539
   },
   {
     "id": 189,
     "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.537
+    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.538
   },
   {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.529
+    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.528
   }
 ]

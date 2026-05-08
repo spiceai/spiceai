@@ -31,7 +31,7 @@ use opentelemetry_sdk::{
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use runtime::{Runtime, task_history::otel_exporter::TaskHistoryExporter};
 use serde::Deserialize;
-use spicepod::component::runtime::TaskHistoryCapturedOutput;
+use spicepod::component::runtime::{TaskHistoryCapturedContext, TaskHistoryCapturedOutput};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::{EnvFilter, Layer, filter, fmt, layer::SubscriberExt};
 
@@ -152,6 +152,18 @@ pub(crate) fn init_tracing_with_task_history(
     default_level: Option<&str>,
     rt: &Runtime,
 ) -> (DefaultGuard, SdkTracerProvider) {
+    init_tracing_with_task_history_captured_context(
+        default_level,
+        rt,
+        TaskHistoryCapturedContext::Truncated,
+    )
+}
+
+pub(crate) fn init_tracing_with_task_history_captured_context(
+    default_level: Option<&str>,
+    rt: &Runtime,
+    captured_context: TaskHistoryCapturedContext,
+) -> (DefaultGuard, SdkTracerProvider) {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
@@ -163,6 +175,7 @@ pub(crate) fn init_tracing_with_task_history(
     let task_history_exporter = TaskHistoryExporter::new(
         rt.datafusion(),
         TaskHistoryCapturedOutput::Truncated,
+        captured_context,
         None, // min_sql_duration_ms
         spicepod::component::runtime::TaskHistoryCapturedPlan::None,
         None, // min_plan_duration_ms

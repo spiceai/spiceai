@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{AuthVerdict, HttpAuth};
+use crate::{AuthRequestContext, AuthVerdict, HttpAuth};
 use axum::{
     body::Body,
     http::StatusCode,
@@ -74,7 +74,18 @@ where
             let (parts, body) = req.into_parts();
 
             match auth_verifier.http_verify(&parts) {
-                Ok(AuthVerdict::Allow(_)) => inner.call(Request::from_parts(parts, body)).await,
+                Ok(AuthVerdict::Allow(principal)) => {
+                    let mut request = Request::from_parts(parts, body);
+                    if let Some(context) = request
+                        .extensions()
+                        .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+                        && let Err(err) = context.set_auth_principal(Arc::clone(&principal))
+                    {
+                        tracing::warn!(%err, "Failed to set auth principal on request context");
+                    }
+                    request.extensions_mut().insert(principal);
+                    inner.call(request).await
+                }
                 Ok(AuthVerdict::Deny) => Ok(unauthorized_response()),
                 Err(e) => {
                     tracing::error!("{e}");

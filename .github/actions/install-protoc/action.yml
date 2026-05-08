@@ -1,0 +1,217 @@
+name: Install protoc
+description: 'Install the protoc compiler from GitHub releases for consistent versions across platforms'
+
+inputs:
+  version:
+    description: 'Version of protoc to install (e.g. "v29.3"). If empty, installs the latest release.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Determine version and download protoc (Linux/macOS)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        # Ensure jq is available
+        if ! command -v jq &>/dev/null; then
+          echo "jq not found, installing..."
+          if [ "$(uname -s)" = "Darwin" ]; then
+            brew install jq
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          fi
+        fi
+
+        # Fetch release metadata
+        if [ -z "${INPUT_VERSION}" ]; then
+          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest)
+        else
+          QUERY_VERSION="${INPUT_VERSION}"
+          if [[ ! "${QUERY_VERSION}" =~ ^v ]]; then
+            QUERY_VERSION="v${QUERY_VERSION}"
+          fi
+          RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/${QUERY_VERSION}")
+        fi
+
+        VERSION=$(echo "${RELEASE_JSON}" | jq -r '.tag_name')
+        if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
+          echo "Failed to determine protoc version from release metadata" >&2
+          exit 1
+        fi
+
+        # Ensure version starts with 'v'
+        if [[ ! "${VERSION}" =~ ^v ]]; then
+          VERSION="v${VERSION}"
+        fi
+
+        # Strip leading 'v' for filename
+        FILE_VERSION="${VERSION#v}"
+
+        # Handle rc releases (e.g. 28.0rc1 or 28.0-rc1 -> 28.0-rc-1)
+        if [[ "${FILE_VERSION}" == *rc* ]]; then
+          FILE_VERSION=$(echo "${FILE_VERSION}" | sed -E 's/-?rc([0-9]+)$/-rc-\1/')
+        fi
+
+        # Determine OS
+        OS="$(uname -s)"
+        case "${OS}" in
+          Linux)  OS_NAME="linux" ;;
+          Darwin) OS_NAME="osx" ;;
+          *)      echo "Unsupported OS: ${OS}" && exit 1 ;;
+        esac
+
+        # Determine architecture
+        ARCH="$(uname -m)"
+        case "${ARCH}" in
+          x86_64)  ARCH_SUFFIX="x86_64" ;;
+          aarch64) ARCH_SUFFIX="aarch_64" ;;
+          arm64)   ARCH_SUFFIX="aarch_64" ;;
+          s390x)   ARCH_SUFFIX="s390_64" ;;
+          ppc64le) ARCH_SUFFIX="ppcle_64" ;;
+          *)
+            echo "Unsupported architecture for protoc release asset selection: ${ARCH}" >&2
+            exit 1
+            ;;
+        esac
+
+        FILENAME="protoc-${FILE_VERSION}-${OS_NAME}-${ARCH_SUFFIX}.zip"
+        DOWNLOAD_URL="https://github.com/protocolbuffers/protobuf/releases/download/${VERSION}/${FILENAME}"
+
+        # Extract expected SHA256 from release metadata
+        EXPECTED_SHA256=$(echo "${RELEASE_JSON}" | jq -r --arg name "${FILENAME}" '.assets[] | select(.name == $name) | .digest' | sed 's/^sha256://')
+        if [ -z "${EXPECTED_SHA256}" ] || [ "${EXPECTED_SHA256}" = "null" ]; then
+          echo "Failed to find SHA256 digest for asset '${FILENAME}' in release metadata" >&2
+          exit 1
+        fi
+
+        echo "Downloading protoc ${VERSION}: ${DOWNLOAD_URL}"
+        echo "Expected SHA256: ${EXPECTED_SHA256}"
+
+        INSTALL_DIR="${HOME}/.local"
+        mkdir -p "${INSTALL_DIR}"
+
+        TEMP_ZIP="$(mktemp)"
+        curl -fsSL -o "${TEMP_ZIP}" "${DOWNLOAD_URL}"
+
+        # Validate SHA256
+        if command -v sha256sum &>/dev/null; then
+          ACTUAL_SHA256=$(sha256sum "${TEMP_ZIP}" | awk '{print $1}')
+        else
+          # macOS uses shasum
+          ACTUAL_SHA256=$(shasum -a 256 "${TEMP_ZIP}" | awk '{print $1}')
+        fi
+
+        if [ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]; then
+          echo "SHA256 mismatch for ${FILENAME}" >&2
+          echo "  Expected: ${EXPECTED_SHA256}" >&2
+          echo "  Actual:   ${ACTUAL_SHA256}" >&2
+          rm -f "${TEMP_ZIP}"
+          exit 1
+        fi
+        echo "SHA256 verified: ${ACTUAL_SHA256}"
+
+        unzip -q -o "${TEMP_ZIP}" -d "${INSTALL_DIR}"
+        rm -f "${TEMP_ZIP}"
+
+        # Ensure the binary is executable
+        chmod +x "${INSTALL_DIR}/bin/protoc"
+
+        # Add to PATH for subsequent steps
+        echo "${INSTALL_DIR}/bin" >> "${GITHUB_PATH}"
+
+        echo "protoc installed: ${INSTALL_DIR}/bin/protoc (${VERSION})"
+        "${INSTALL_DIR}/bin/protoc" --version
+
+    - name: Determine version and download protoc (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        # Fetch release metadata
+        if ([string]::IsNullOrEmpty($env:INPUT_VERSION)) {
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/latest"
+        } else {
+          $QueryVersion = $env:INPUT_VERSION
+          if (-not $QueryVersion.StartsWith("v")) {
+            $QueryVersion = "v$QueryVersion"
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/$QueryVersion"
+        }
+
+        $Version = $release.tag_name
+        if ([string]::IsNullOrEmpty($Version)) {
+          throw "Failed to determine protoc version from release metadata"
+        }
+
+        # Ensure version starts with 'v'
+        if (-not $Version.StartsWith("v")) {
+          $Version = "v$Version"
+        }
+
+        # Strip leading 'v' for filename
+        $FileVersion = $Version.TrimStart("v")
+
+        # Handle rc releases
+        $FileVersion = $FileVersion -replace "-?rc(\d+)$", "-rc-`$1"
+
+        # Determine architecture
+        $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLower()
+        switch ($Arch) {
+          "x64" {
+            $ArchSuffix = "64"
+          }
+          "x86" {
+            $ArchSuffix = "32"
+          }
+          "arm64" {
+            throw "Failed to install protoc for Windows architecture '${Arch}': No supported protoc release asset is configured for this architecture. Use an x64 Windows runner or update this action to map arm64 to a verified upstream asset."
+          }
+          default {
+            throw "Failed to install protoc for Windows architecture '${Arch}': Unsupported architecture. Supported Windows architectures are x64 and x86."
+          }
+        }
+
+        $Filename = "protoc-${FileVersion}-win${ArchSuffix}.zip"
+        $DownloadUrl = "https://github.com/protocolbuffers/protobuf/releases/download/${Version}/${Filename}"
+
+        # Extract expected SHA256 from release metadata
+        $asset = $release.assets | Where-Object { $_.name -eq $Filename }
+        if (-not $asset -or [string]::IsNullOrEmpty($asset.digest)) {
+          throw "Failed to find SHA256 digest for asset '${Filename}' in release metadata"
+        }
+        $ExpectedSha256 = $asset.digest -replace '^sha256:', ''
+
+        Write-Host "Downloading protoc ${Version}: ${DownloadUrl}"
+        Write-Host "Expected SHA256: ${ExpectedSha256}"
+
+        $InstallDir = "$env:USERPROFILE\.local\protoc"
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+        $TempZip = [System.IO.Path]::GetTempFileName() + ".zip"
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip
+
+        # Validate SHA256
+        $ActualSha256 = (Get-FileHash -Path $TempZip -Algorithm SHA256).Hash.ToLower()
+        if ($ActualSha256 -ne $ExpectedSha256) {
+          Remove-Item -Force $TempZip
+          throw "SHA256 mismatch for ${Filename}: expected ${ExpectedSha256}, got ${ActualSha256}"
+        }
+        Write-Host "SHA256 verified: ${ActualSha256}"
+
+        Expand-Archive -Path $TempZip -DestinationPath $InstallDir -Force
+        Remove-Item -Force $TempZip
+
+        # Add to PATH for subsequent steps
+        "$InstallDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+        Write-Host "protoc installed: $InstallDir\bin\protoc.exe ($Version)"
+        & "$InstallDir\bin\protoc.exe" --version

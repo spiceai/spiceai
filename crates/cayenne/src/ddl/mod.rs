@@ -14,22 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Single-node Cayenne DDL: handler, operations, physical execution plans,
-//! logical nodes, and local MERGE planner.
+//! Single-node Cayenne DDL plus local MERGE DML support.
 //!
 //! Usable without the runtime crate. Pair with `datafusion_ddl::DdlAnalyzerRule`
-//! and `datafusion_ddl::DdlExtensionPlanner` for full DDL support in a standalone
-//! Cayenne-backed `SessionContext`.
+//! and `datafusion_ddl::DdlExtensionPlanner` for DDL, and with
+//! `datafusion_dml::DmlExtensionPlanner` for any emitted generic DML extension
+//! nodes.
 
 pub mod handler;
-pub mod logical_nodes;
 pub mod merge_planner;
 pub mod operations;
 pub mod physical_plans;
 
 pub use handler::CayenneDdlHandler;
-pub use logical_nodes::CayenneMergeNode;
-pub use merge_planner::CayenneDmlExtensionPlanner;
+pub use merge_planner::{CayenneDmlHandler, LocalMergePlanInput, build_local_merge_plan_input};
 pub use physical_plans::CayenneMergeExec;
 
 use datafusion::catalog::CatalogProvider;

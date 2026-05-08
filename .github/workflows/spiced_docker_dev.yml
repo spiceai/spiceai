@@ -34,7 +34,7 @@ jobs:
       run_amd64: ${{ steps.set_targets.outputs.run_amd64 }}
       run_arm64: ${{ steps.set_targets.outputs.run_arm64 }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set version
         id: set_version
@@ -77,7 +77,7 @@ jobs:
       RUST_PROFILE: release
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Add dev postfix to version in Cargo.toml
         env:
@@ -113,9 +113,15 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so base image pulls (rust, debian, etc.)
+        # use authenticated rate limits instead of anonymous (per-IP) limits.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          driver-opts: |
-            image=moby/buildkit:latest
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set cargo features
         run: |
@@ -139,6 +145,11 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
 
+      - name: Validate ARM64 image
+        run: |
+          docker load -i /tmp/image-arm64.tar
+          docker run --rm localhost:5000/spiceai:dev-arm64 --version
+
       - name: Upload ARM64 artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -153,7 +164,7 @@ jobs:
       RUST_PROFILE: release
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Add dev postfix to version in Cargo.toml
         env:
@@ -170,9 +181,15 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so base image pulls (rust, debian, etc.)
+        # use authenticated rate limits instead of anonymous (per-IP) limits.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          driver-opts: |
-            image=moby/buildkit:latest
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set cargo features
         run: |
@@ -195,6 +212,11 @@ jobs:
           build-args: |
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
+
+      - name: Validate AMD64 image
+        run: |
+          docker load -i /tmp/image-amd64.tar
+          docker run --rm localhost:5000/spiceai:dev-amd64 --version
 
       - name: Upload AMD64 artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -220,6 +242,16 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before pulling so we use the authenticated
+        # rate limits instead of anonymous (per-IP) limits when pulling
+        # registry:2 below.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Start local registry
         run: |

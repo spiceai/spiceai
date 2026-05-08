@@ -16,13 +16,14 @@ limitations under the License.
 
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use governor::{
     Quota, RateLimiter,
     clock::DefaultClock,
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
 };
-use snafu::ResultExt;
 use snafu::prelude::*;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -63,6 +64,7 @@ pub struct RateControllerBuilder {
     max_concurrent_requests: Option<usize>,
     quotas: Vec<Quota>,
     weighted_quota: Option<Quota>,
+    metrics: Option<Arc<RateControllerMetrics>>,
 }
 
 impl RateControllerBuilder {
@@ -86,6 +88,12 @@ impl RateControllerBuilder {
     #[must_use]
     pub fn with_max_concurrent_requests(mut self, max_concurrent_requests: usize) -> Self {
         self.max_concurrent_requests = Some(max_concurrent_requests);
+        self
+    }
+
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<RateControllerMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -118,7 +126,63 @@ impl RateControllerBuilder {
             .max_concurrent_requests
             .map(|max_concurrent_requests| Arc::new(Semaphore::new(max_concurrent_requests)));
 
-        RateController::new(jitter, rate_limiters, weighted_rate_limiter, semaphore)
+        RateController::new(
+            jitter,
+            rate_limiters,
+            weighted_rate_limiter,
+            semaphore,
+            self.metrics.unwrap_or_default(),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RateControllerMetrics {
+    permits_acquired_total: AtomicU64,
+    acquire_errors_total: AtomicU64,
+    wait_duration_ms_total: AtomicU64,
+    inflight_permits: AtomicU64,
+}
+
+impl RateControllerMetrics {
+    #[must_use]
+    pub fn permits_acquired_total(&self) -> u64 {
+        self.permits_acquired_total.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn acquire_errors_total(&self) -> u64 {
+        self.acquire_errors_total.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn wait_duration_ms_total(&self) -> u64 {
+        self.wait_duration_ms_total.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn inflight_permits(&self) -> u64 {
+        self.inflight_permits.load(Ordering::Relaxed)
+    }
+
+    fn record_wait_duration(&self, duration: Duration) {
+        self.wait_duration_ms_total
+            .fetch_add(duration_millis_u64(duration), Ordering::Relaxed);
+    }
+
+    fn record_acquire_success(&self, duration: Duration) {
+        self.permits_acquired_total.fetch_add(1, Ordering::Relaxed);
+        self.inflight_permits.fetch_add(1, Ordering::Relaxed);
+        self.record_wait_duration(duration);
+    }
+
+    fn record_acquire_error(&self, duration: Duration) {
+        self.acquire_errors_total.fetch_add(1, Ordering::Relaxed);
+        self.record_wait_duration(duration);
+    }
+
+    fn record_permit_drop(&self) {
+        self.inflight_permits.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -129,6 +193,7 @@ pub struct RateController {
     weighted_rate_limiter:
         Option<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
     semaphore: Option<Arc<Semaphore>>,
+    metrics: Arc<RateControllerMetrics>,
 }
 
 #[derive(Debug)]
@@ -140,6 +205,7 @@ pub struct Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
+        self.rate_controller.metrics.record_permit_drop();
         if let Some(permit) = self.semaphore.take() {
             drop(permit);
         }
@@ -155,9 +221,26 @@ impl Permit {
     ///
     /// - If the weighted quota does not have sufficient capacity for the provided weight, this will return an `InsufficientCapacity` error.
     pub async fn until_ready(&self) -> Result<()> {
-        Arc::clone(&self.rate_controller)
+        let wait_start = tokio::time::Instant::now();
+        let result = Arc::clone(&self.rate_controller)
             .until_weighted_ready(self.weight)
-            .await
+            .await;
+
+        let wait_duration = wait_start.elapsed();
+        match result {
+            Ok(()) => {
+                self.rate_controller
+                    .metrics
+                    .record_wait_duration(wait_duration);
+                Ok(())
+            }
+            Err(error) => {
+                self.rate_controller
+                    .metrics
+                    .record_acquire_error(wait_duration);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -165,6 +248,18 @@ impl RateController {
     #[must_use]
     pub fn builder() -> RateControllerBuilder {
         RateControllerBuilder::new()
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> Arc<RateControllerMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    #[must_use]
+    pub fn available_permits(&self) -> Option<usize> {
+        self.semaphore
+            .as_ref()
+            .map(|semaphore| semaphore.available_permits())
     }
 
     async fn until_ready(self: Arc<Self>) -> Result<()> {
@@ -203,6 +298,7 @@ impl RateController {
             Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>,
         >,
         semaphore: Option<Arc<Semaphore>>,
+        metrics: Arc<RateControllerMetrics>,
     ) -> Arc<Self> {
         let jitter_config = jitter.unwrap_or(JitterConfig {
             min: Duration::ZERO,
@@ -214,6 +310,7 @@ impl RateController {
             rate_limiters,
             weighted_rate_limiter,
             semaphore,
+            metrics,
         })
     }
 
@@ -251,25 +348,32 @@ impl RateController {
     /// - If the weighted quota does not have sufficient capacity for the provided weight, this will return an `InsufficientCapacity` error.
     pub async fn acquire_weighted_opt(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
         let self_cloned = Arc::clone(self);
+        let wait_start = tokio::time::Instant::now();
 
         // check for concurrency first - we may end up waiting for a concurrent request long enough that the rate limits clear
         let semaphore = if let Some(semaphore) = &self.semaphore {
-            Some(
-                Arc::clone(semaphore)
-                    .acquire_owned()
-                    .await
-                    .context(SemaphoreAcquireSnafu)?,
-            )
+            match Arc::clone(semaphore).acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(source) => {
+                    self.metrics.record_acquire_error(wait_start.elapsed());
+                    return Err(Error::SemaphoreAcquireError { source });
+                }
+            }
         } else {
             None
         };
 
         // check all of the rate limiters async
-        Arc::clone(self).until_weighted_ready(weight).await?;
+        if let Err(error) = Arc::clone(self).until_weighted_ready(weight).await {
+            self.metrics.record_acquire_error(wait_start.elapsed());
+            return Err(error);
+        }
 
         // add jitter
         let jitter_wait = rand::random_range(self.jitter_config.min..=self.jitter_config.max);
         tokio::time::sleep(jitter_wait).await;
+
+        self.metrics.record_acquire_success(wait_start.elapsed());
 
         Ok(Permit {
             semaphore,
@@ -277,6 +381,10 @@ impl RateController {
             rate_controller: self_cloned,
         })
     }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -344,6 +452,31 @@ mod tests {
                 panic!("Expected to acquire a permit after dropping one, but timed out.");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_rate_controller_metrics_track_permits() {
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let rate_controller = RateControllerBuilder::new()
+            .with_max_concurrent_requests(1)
+            .with_metrics(Arc::clone(&metrics))
+            .build();
+
+        assert_eq!(rate_controller.available_permits(), Some(1));
+        let permit = rate_controller
+            .acquire()
+            .await
+            .expect("permit should be acquired");
+
+        assert_eq!(metrics.permits_acquired_total(), 1);
+        assert_eq!(metrics.acquire_errors_total(), 0);
+        assert_eq!(metrics.inflight_permits(), 1);
+        assert_eq!(rate_controller.available_permits(), Some(0));
+
+        drop(permit);
+
+        assert_eq!(metrics.inflight_permits(), 0);
+        assert_eq!(rate_controller.available_permits(), Some(1));
     }
 
     #[tokio::test]

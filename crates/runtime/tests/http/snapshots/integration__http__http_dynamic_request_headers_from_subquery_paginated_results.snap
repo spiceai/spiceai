@@ -1,0 +1,33 @@
+---
+source: crates/runtime/tests/http/mod.rs
+expression: pretty
+---
++------------------------+---------+---------+
+| request_headers        | metric  | reading |
++------------------------+---------+---------+
+| {"x-org-id":"org-001"} | cpu     | 42.0    |
+| {"x-org-id":"org-001"} | disk    | 55.0    |
+| {"x-org-id":"org-001"} | mem     | 78.5    |
+| {"x-org-id":"org-001"} | net_in  | 12.3    |
+| {"x-org-id":"org-001"} | net_out | 9.7     |
+| {"x-org-id":"org-002"} | cpu     | 42.0    |
+| {"x-org-id":"org-002"} | disk    | 55.0    |
+| {"x-org-id":"org-002"} | mem     | 78.5    |
+| {"x-org-id":"org-002"} | net_in  | 12.3    |
+| {"x-org-id":"org-002"} | net_out | 9.7     |
+| {"x-org-id":"org-003"} | cpu     | 42.0    |
+| {"x-org-id":"org-003"} | disk    | 55.0    |
+| {"x-org-id":"org-003"} | mem     | 78.5    |
+| {"x-org-id":"org-003"} | net_in  | 12.3    |
+| {"x-org-id":"org-003"} | net_out | 9.7     |
+| {"x-org-id":"org-004"} | cpu     | 42.0    |
+| {"x-org-id":"org-004"} | disk    | 55.0    |
+| {"x-org-id":"org-004"} | mem     | 78.5    |
+| {"x-org-id":"org-004"} | net_in  | 12.3    |
+| {"x-org-id":"org-004"} | net_out | 9.7     |
+| {"x-org-id":"org-005"} | cpu     | 42.0    |
+| {"x-org-id":"org-005"} | disk    | 55.0    |
+| {"x-org-id":"org-005"} | mem     | 78.5    |
+| {"x-org-id":"org-005"} | net_in  | 12.3    |
+| {"x-org-id":"org-005"} | net_out | 9.7     |
++------------------------+---------+---------+

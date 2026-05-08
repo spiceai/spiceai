@@ -41,15 +41,40 @@ pub enum MetadataMode {
     Exact(String),
 }
 
+/// A function that builds a `StorageFactory` for a given URL scheme (e.g. `s3`, `s3a`).
+///
+/// This is used by the `HadoopCatalogBuilder` to allow the storage factory to be
+/// reconstructed when scheme inference detects that the warehouse root scheme does
+/// not match the scheme used in table metadata locations.
+pub type StorageFactoryBuilderFn = Arc<dyn Fn(&str) -> Arc<dyn StorageFactory> + Send + Sync>;
+
 /// Builder for creating a new `HadoopCatalog`
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct HadoopCatalogBuilder {
     warehouse_root: Option<String>,
     file_io: Option<FileIO>,
     metadata_mode: MetadataMode,
     properties: HashMap<String, String>,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    storage_factory_builder: Option<StorageFactoryBuilderFn>,
     operator: Option<Operator>,
+}
+
+impl std::fmt::Debug for HadoopCatalogBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HadoopCatalogBuilder")
+            .field("warehouse_root", &self.warehouse_root)
+            .field("file_io", &self.file_io)
+            .field("metadata_mode", &self.metadata_mode)
+            .field("properties", &self.properties)
+            .field("storage_factory", &self.storage_factory)
+            .field(
+                "storage_factory_builder",
+                &self.storage_factory_builder.as_ref().map(|_| "<fn>"),
+            )
+            .field("operator", &self.operator)
+            .finish()
+    }
 }
 
 impl HadoopCatalogBuilder {
@@ -72,6 +97,25 @@ impl HadoopCatalogBuilder {
     #[must_use]
     pub fn with_storage_factory(mut self, factory: Arc<dyn StorageFactory>) -> Self {
         self.storage_factory = Some(factory);
+        self
+    }
+
+    /// Sets a builder function that produces a `StorageFactory` for a given URL scheme.
+    ///
+    /// When set, this function is invoked during scheme inference: if the inferred
+    /// scheme differs from the warehouse root scheme, the storage factory is rebuilt
+    /// using the new scheme so that the rebuilt `FileIO` accepts paths with that
+    /// scheme.
+    ///
+    /// If both `with_storage_factory` and `with_storage_factory_builder` are set,
+    /// the builder function takes precedence and is invoked with the warehouse root
+    /// scheme during the initial build.
+    #[must_use]
+    pub fn with_storage_factory_builder<F>(mut self, builder: F) -> Self
+    where
+        F: Fn(&str) -> Arc<dyn StorageFactory> + Send + Sync + 'static,
+    {
+        self.storage_factory_builder = Some(Arc::new(builder));
         self
     }
 
@@ -103,7 +147,7 @@ impl HadoopCatalogBuilder {
         self
     }
 
-    fn inner_build(self, infer_scheme: bool) -> BoxFuture<'static, Result<HadoopCatalog>> {
+    fn inner_build(mut self, infer_scheme: bool) -> BoxFuture<'static, Result<HadoopCatalog>> {
         async move {
             let mut cloned_self = self.clone();
             let mut warehouse_root = self.warehouse_root.ok_or_else(|| {
@@ -112,6 +156,24 @@ impl HadoopCatalogBuilder {
 
             if !warehouse_root.ends_with('/') {
                 warehouse_root.push('/');
+            }
+
+            // If a storage factory builder was provided, materialize the factory
+            // for the current warehouse root scheme. This lets scheme inference
+            // rebuild the factory when re-entering inner_build with a new scheme.
+            if let Some(factory_builder) = &self.storage_factory_builder {
+                if let Some((scheme, _)) = warehouse_root.split_once("://") {
+                    self.storage_factory = Some(factory_builder(scheme));
+                } else if self.file_io.is_none() && self.storage_factory.is_none() {
+                    // The builder needs a scheme to materialize a factory, and we
+                    // have no other source for the FileIO.
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot materialize storage factory: warehouse root '{warehouse_root}' does not contain a URL scheme. Verify the warehouse root is in the format '<scheme>://<path>'.",
+                        ),
+                    ));
+                }
             }
 
             let file_io = if let Some(file_io) = self.file_io {
@@ -123,7 +185,7 @@ impl HadoopCatalogBuilder {
             } else {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
-                    "Either file_io or storage_factory must be provided",
+                    "Either file_io, storage_factory, or storage_factory_builder must be provided",
                 ));
             };
 

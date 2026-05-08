@@ -21,6 +21,18 @@ Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and
 
 **This principle supersedes all other considerations including performance, developer experience, and feature velocity.**
 
+### Git Workflow
+
+**Never force push** — not on `trunk`, not on feature branches, not even with `--force-with-lease`. Always merge or rebase normally, then push without force.
+
+- **Why force-push is banned**: It silently destroys collaborator commits and orphans PR review history (comments lose their anchor, reviewers re-read the entire diff, CI re-runs). `--force-with-lease` only protects against the *latest fetch* — it cannot see commits a collaborator pushed since you fetched, so it does not make force-push safe on shared branches.
+- **What to do instead of force-push**:
+  - Branch out of date with `trunk`? `git pull --rebase` or `git merge trunk`, then `git push` normally.
+  - Want to fix history on a branch with open review? Add a follow-up commit and squash on merge — don't rewrite published commits.
+  - Pre-commit hook failed and the commit didn't actually land? Re-stage, fix, create a *new* commit. Never `--amend` after pushing.
+- **Never bypass hooks** (`--no-verify`, etc.). If a hook fails, fix the underlying issue — these checks exist because earlier failures escaped review. Likewise, don't bypass required commit signing (e.g. `--no-gpg-sign`) just to get a commit through.
+- **Investigate before destroying**: unfamiliar files, branches, or lock files may represent in-progress work. Don't `git reset --hard`, `checkout --`, or `clean -f` to "make it go away" — find the root cause first.
+
 ### Runtime Architecture - Separate Tokio Runtimes
 
 **Separate runtime instances for:**
@@ -63,10 +75,11 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 - **Use SNAFU**: Derive `Snafu` and `Debug` on error enums
 - **NO `.unwrap()`/`.expect()` in non-test code**: Use `?` operator or `match`
 - **In tests**: Use `.expect("descriptive message")` instead of `.unwrap()`
-- **Use `unreachable!()`**: Only for provably impossible cases
+- **`unreachable!()` / `unimplemented!()` / `todo!()`**: Only for *provably unreachable* code. Never for unfinished-but-callable code — they panic at runtime, which violates the data-correctness rule of failing safely with a structured error. For not-yet-implemented method bodies, return a typed error (`DataFusionError::NotImplemented("...")`, an `Err(NotImplementedSnafu { ... })` variant, etc.) so callers can degrade gracefully or surface a useful message
 - **Use `ensure!` macro**: Preferred over `if` + `return Err`
 - **Define `Result` type alias**: `pub type Result<T, E = Error> = std::result::Result<T, E>;`
 - **Don't use `assert!()` (or related) macros in non-test code**: Prefer proper error handling, or marking with `unreachable!()` if the assertion is truly unreachable. Alternatively, make the assertion a `debug_assert!()` assertion to only fire in debug builds instead of release builds. `assert!()` macros can have case-by-case exceptions, for example for compile-time assertions that would prevent a build from being released to begin with.
+- **Don't `#[allow(...)]` warnings in production/library/runtime code**. `#[allow(dead_code)]`, `#[allow(unused)]`, `#[allow(unused_imports)]`, `#[allow(unused_variables)]`, `#[allow(clippy::*)]` and friends paper over real issues that the project's lint denials (`-Dwarnings`, `unwrap_used`, `expect_used`, `clone_on_ref_ptr`, `pedantic`) exist to surface. Fix the underlying issue — delete unused code, drop unused imports, restructure to satisfy the lint — rather than suppressing the warning. Well-justified `#[allow(...)]` (or preferably `#[expect(...)]`, which fails when the lint stops firing) is acceptable in **tests, benches, examples, and build scripts** when the alternative is meaningfully worse (e.g., a test fixture with intentionally unused fields, or a bench that intentionally calls `.expect()`).
 
 ```rust
 // GOOD
@@ -83,12 +96,11 @@ let value = option.context(ValueMissingSnafu)?;
 fn test() { let value = option.expect("descriptive message"); }
 ```
 
-### Logging & Streams (CRITICAL)
+### Streams
 
-- **Use `tracing::`** not `log::` (tracing::info!, tracing::error!, etc.)
-- **AVOID `stream!` macro**: Breaks rust-analyzer, hard to debug. Use manual Stream implementations or `async_stream::stream` sparingly; when unavoidable, document why.
+- **AVOID `stream!` macro**: Breaks rust-analyzer, hard to debug. Use manual `Stream` implementations or `async_stream::stream` sparingly; document why when unavoidable.
 
-## Performance & Memory (CRITICAL)
+## Performance & Memory
 
 ### Zero-Copy Operations
 
@@ -321,7 +333,7 @@ let conn = pool.get().await?; // Error only here
 let conn = create_connection().await?; // Creates new connection every time
 ```
 
-#### Arc/Rc Cloning
+### Arc/Rc Cloning
 
 - **Avoid unnecessary `Arc`/`Rc` clones** (caught by `clippy::clone_on_ref_ptr`)
 - `Arc::clone()` is cheap but not free - don't clone in hot loops unnecessarily
@@ -351,30 +363,9 @@ fn process_data(data: &Arc<RecordBatch>) { ... }
 
 ## Project Structure
 
-### Binary Targets
-
-- `bin/spiced/` - Runtime daemon (Rust)
-- `bin/spice/` - CLI (Rust)
-
-### Core Crates
-
-- `runtime/` - Orchestration, component init
-- `data_components/` - TableProvider implementations
-- `app/` - Spicepod parsing
-- `datafusion/` - DataFusion extensions
-- `llms/` - LLM inference
-- `model_components/` - ML/LLM loading
-- `search/` - Search functionality
-- `test-framework/` - Testing utilities
-
-### Runtime Sub-Crates
-
-- `runtime-acceleration/` - Arrow, DuckDB, SQLite, PostgreSQL
-- `runtime-auth/`, `runtime-datafusion-udfs/`, `runtime-secrets/`, `runtime-parameters/`
-
-### Extension Points (see `docs/EXTENSIBILITY.md`)
-
-1. Data Connector, 2. Data Accelerator, 3. Catalog Connector, 4. Secret Stores, 5. Models, 6. Embeddings
+- **Binaries**: `bin/spiced/` (runtime daemon), `bin/spice/` (CLI).
+- **Crates**: source lives in `crates/`. Most-touched: `runtime/` (orchestration), `data_components/` (`TableProvider` impls), `app/` (Spicepod parsing), `datafusion/` (DataFusion extensions), `llms/`, `search/`, `model_components/`. Acceleration engines under `runtime-acceleration/`; per-concern `runtime-*` crates (`runtime-auth`, `runtime-secrets`, `runtime-parameters`, etc.). For the authoritative current map, see workspace `members` in the root `Cargo.toml`.
+- **Extension points** (see `docs/EXTENSIBILITY.md`): Data Connector, Data Accelerator, Catalog Connector, Secret Store, Model, Embedding.
 
 ## Testing
 
@@ -391,6 +382,13 @@ Examples: `s3[parquet]-federated`, `mysql-duckdb[file]-on_zero_results`
 testoperator run bench -p test.yaml -s spiced --query-set tpch --validate
 testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrency 25
 ```
+
+### Test Waits and Readiness
+
+- **Avoid fixed sleeps/waits as readiness mechanisms in tests**: Don't add `tokio::time::sleep`, `std::thread::sleep`, or arbitrary time delays to wait for containers, services, background refreshes, streams, replication, caches, or eventual data visibility.
+- **Prefer condition-driven waits**: Use `runtime_ready_check`, `runtime_ready_check_with_timeout`, `wait_until_true`, `util::retry` with `FibonacciBackoffBuilder`, protocol/application probes (`SELECT 1`, ping, health/ready endpoints, `list_tables`, metadata fetches), Docker health plus host-port checks, explicit completion signals (refresh notifiers, task handles, channels), or query/result polling that validates the actual expected state.
+- **Bound every wait**: Polling loops must have a clear timeout, short polling interval, and useful failure message that includes the last observed error or state.
+- **Fixed sleeps are acceptable only when time itself is the behavior under test**: Examples include TTL/cache expiry, cron/scheduler boundaries, backoff timing, timeout behavior, rate limiting, and cancellation/shutdown timing. Keep these sleeps as short as the test allows and make the reason obvious in the test.
 
 ### Snapshot Testing with Insta
 
@@ -451,11 +449,7 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 ### VSCode Settings
 
-```json
-"[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer", "editor.formatOnSave": true },
-"rust-analyzer.check.command": "clippy",
-"rust-analyzer.check.extraArgs": ["--", "-Dwarnings", "-Dclippy::expect_used", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr", "-Aclippy::module_name_repetitions"]
-```
+`.vscode/settings.json` is gitignored; copy `.vscode/settings.json.template` (and see `CONTRIBUTING.md`) for the canonical config. Notable: rust-analyzer runs `clippy` with `-Dclippy::pedantic`, `-Dclippy::unwrap_used`, and `-Dclippy::clone_on_ref_ptr` (and `-Aclippy::module_name_repetitions`) — i.e. clippy lints fail your local check, not just CI.
 
 ### PR Process
 
@@ -482,9 +476,10 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 ### Async Patterns
 
-- Use `tokio` runtime (see `bin/spiced/src/main.rs`)
-- Use `async_trait` for trait async methods
-- Use `CancellationToken` for shutdown (see `runtime/src/cancellable_task.rs`)
+- Use `tokio` runtime (see `bin/spiced/src/main.rs`).
+- **Trait async methods**: prefer `#[async_trait]`. Native `async fn` in traits has been stable since Rust 1.75 and is fine for traits that *don't* need to be `dyn`-compatible — but most internal traits in this codebase (`DataConnector`, `Chat`, `Embed`, `SecretStore`, `Index`, `CacheProvider`, etc.) are stored as `Arc<dyn Trait>`, and native AFIT isn't `dyn`-safe without manual workarounds. Default to `async_trait` to keep the dyn path consistent; reach for native AFIT only on non-dyn helper traits.
+- **Lazy globals**: prefer `std::sync::LazyLock` / `OnceLock` (modern stable Rust) over `lazy_static!` and `once_cell::sync::Lazy` for new code. Existing `once_cell` callsites are fine to leave.
+- Use `CancellationToken` for shutdown (see `runtime/src/cancellable_task.rs`).
 
 ## Key Files
 

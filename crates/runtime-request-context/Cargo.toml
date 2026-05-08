@@ -2,7 +2,7 @@
 description = "Request context for the Spice runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "runtime-request-context"
 repository.workspace = true
 rust-version.workspace = true
@@ -22,6 +22,7 @@ runtime-auth = { path = "../runtime-auth" }
 sha2.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]

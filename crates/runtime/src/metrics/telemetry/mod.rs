@@ -106,7 +106,7 @@ static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
 });
 
 pub fn track_query_duration(duration: Duration, dimensions: &[KeyValue]) {
-    telemetry::track_query_duration(duration, dimensions);
+    telemetry::track_query_duration(duration, &without_anonymous_excluded(dimensions));
     QUERY_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
@@ -122,8 +122,26 @@ static QUERY_EXECUTION_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
 });
 
 pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {
-    telemetry::track_query_execution_duration(duration, dimensions);
+    telemetry::track_query_execution_duration(duration, &without_anonymous_excluded(dimensions));
     QUERY_EXECUTION_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+/// Attribute keys that must never be exported via the spice.ai anonymous
+/// telemetry pipeline. They are kept on the runtime's own meter (so users
+/// who connect their own OTel/Prometheus stack still see them) but are
+/// stripped before forwarding to the anonymous exporter.
+///
+/// `datasets` is a comma-joined list of dataset names referenced by a
+/// query and is not needed for the aggregate latency shape that anonymous
+/// telemetry tracks.
+const ANONYMOUS_TELEMETRY_EXCLUDED_KEYS: &[&str] = &["datasets"];
+
+fn without_anonymous_excluded(dimensions: &[KeyValue]) -> Vec<KeyValue> {
+    dimensions
+        .iter()
+        .filter(|kv| !ANONYMOUS_TELEMETRY_EXCLUDED_KEYS.contains(&kv.key.as_str()))
+        .cloned()
+        .collect()
 }
 
 static AI_INFERENCES_WITH_SPICE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {

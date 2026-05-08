@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow_schema::DataType;
-use datafusion::{common::utils::quote_identifier, sql::TableReference};
+use datafusion::sql::TableReference;
 use itertools::Itertools;
 use std::{
     fmt::{Display, Formatter},
@@ -23,7 +23,7 @@ use std::{
 };
 use tracing::Span;
 use tracing_futures::Instrument;
-use util::security::quote_table_reference;
+use util::security::{quote_sql_identifier, quote_table_reference};
 
 use crate::datafusion::DataFusion;
 use arrow::compute::concat;
@@ -73,7 +73,7 @@ impl DistinctColumnsParams {
         // Ensure that we still get `n` rows when `len(distinct(col)) < n`, whilst
         // stilling getting all possible distinct values.
         let tbl_quoted = quote_table_reference(tbl);
-        let col = quote_identifier(column);
+        let col = quote_sql_identifier(column);
         Self::_sample_col(
             Arc::clone(&df),
             &format!(
@@ -98,6 +98,7 @@ impl DistinctColumnsParams {
         n: usize,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         let tbl_quoted = quote_table_reference(tbl);
+        let col = quote_sql_identifier(col);
         Self::_sample_col(
             Arc::clone(&df),
             &format!("SELECT {col} FROM {tbl_quoted} LIMIT {n}"),
@@ -132,7 +133,7 @@ impl SampleFrom for DistinctColumnsParams {
         &self,
         df: Arc<DataFusion>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        let tbl = TableReference::from(self.tbl.clone());
+        let tbl = TableReference::parse_str(self.tbl.as_str());
         let Some(provider) = df.get_table(&tbl).await else {
             return Err("Table not found".into());
         };
@@ -206,4 +207,49 @@ fn column_supports_distinct_sampling(column: &arrow_schema::Field) -> bool {
             | DataType::Dictionary(_, _)
             | DataType::Union(_, _)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow_schema::{Field, Schema};
+    use datafusion::datasource::MemTable;
+
+    #[tokio::test]
+    async fn samples_reserved_keyword_column_names() {
+        let runtime = crate::Runtime::builder().build().await;
+        let df = runtime.datafusion();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("interval", DataType::Int64, false),
+            Field::new("group", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b", "a"])) as ArrayRef,
+            ],
+        )
+        .expect("test batch should be valid");
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+            .expect("mem table should be valid");
+        df.ctx
+            .register_table("audiences", Arc::new(table))
+            .expect("test table should register");
+
+        let params = DistinctColumnsParams {
+            tbl: "audiences".to_string(),
+            limit: 3,
+            cols: None,
+        };
+
+        let sample = params
+            .sample(Arc::clone(&df))
+            .await
+            .expect("sampling keyword columns should succeed");
+
+        assert_eq!(sample.num_columns(), 2);
+        assert_eq!(sample.num_rows(), 3);
+    }
 }

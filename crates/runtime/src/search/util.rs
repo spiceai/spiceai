@@ -38,6 +38,8 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::SearchGenerationSnafu;
 use crate::search::full_text::as_candidate_generations;
+#[cfg(feature = "elasticsearch")]
+use crate::search::full_text::as_es_text_candidate_generations;
 
 use super::{Error, Result};
 
@@ -90,6 +92,14 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
 pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
+    // `AcceleratedTable` is a concrete TableProvider underneath `FederatedTableProviderAdaptor`.
+    if let Some(accelerated_table) = find_concrete_table_provider::<AcceleratedTable>(tbl)
+        && let Some(indexes) =
+            find_index_in_table_provider::<T>(accelerated_table.get_accelerator_ref())
+    {
+        return Some(indexes);
+    }
+
     let mut indexed_table_opt = find_concrete_table_provider::<IndexedTableProvider>(tbl);
     while let Some(indexed_table) = indexed_table_opt {
         let indexes = indexed_table.get_indexes::<T>();
@@ -244,6 +254,16 @@ pub async fn embedding_columns_from_table(
         }
     }
 
+    #[cfg(feature = "duckdb")]
+    {
+        use search::index::duckdb::DuckDBVectorIndex;
+        if let Some((indexes, _)) =
+            find_index_in_table_provider::<DuckDBVectorIndex>(&table_provider)
+        {
+            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+        }
+    }
+
     Some(embedding_columns.into_iter().collect())
 }
 
@@ -258,28 +278,42 @@ pub async fn full_text_search_candidates(
     tbl: &TableReference,
 ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
     let base_table_provider = df.get_table(tbl).await?;
-    let index_table_provider = Arc::clone(&base_table_provider);
 
     // If the table exists, but does not have full text search support, return no candidates.
     let Some(indexed_table) =
-        find_concrete_table_provider::<IndexedTableProvider>(&index_table_provider)
+        find_concrete_table_provider::<IndexedTableProvider>(&base_table_provider)
     else {
         return Some(Ok(vec![]));
     };
 
-    let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() else {
-        return Some(Ok(vec![]));
-    };
+    // Tantivy path.
+    if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
+        return Some(
+            as_candidate_generations(
+                &fts.with_new_base(Arc::clone(&base_table_provider)),
+                Arc::clone(df),
+                tbl.clone(),
+            )
+            .await
+            .context(SearchGenerationSnafu),
+        );
+    }
 
-    Some(
-        as_candidate_generations(
-            &fts.with_new_base(base_table_provider),
-            Arc::clone(df),
-            tbl.clone(),
-        )
-        .await
-        .context(SearchGenerationSnafu),
-    )
+    // Elasticsearch BM25 path.
+    #[cfg(feature = "elasticsearch")]
+    {
+        use search::index::elasticsearch::ElasticsearchTextIndex;
+        let es_indexes = indexed_table.get_indexes::<ElasticsearchTextIndex>();
+        if !es_indexes.is_empty() {
+            return Some(
+                as_es_text_candidate_generations(es_indexes, Arc::clone(df), tbl.clone())
+                    .await
+                    .context(SearchGenerationSnafu),
+            );
+        }
+    }
+
+    Some(Ok(vec![]))
 }
 
 /// There is no [`Expr`] that can parse a fully qualified table name. For UDTFs that require

@@ -182,6 +182,9 @@ pub struct JobState {
     /// distributed execution (used by internal callers like partition discovery).
     #[serde(default)]
     pub allow_accelerated_tables: bool,
+    /// Whether this job must execute only read-only SQL operations.
+    #[serde(default)]
+    pub read_only: bool,
     /// Object store version for conditional writes (e-tag tracking).
     /// This is not serialized - it's set after reading from object store.
     #[serde(skip)]
@@ -209,6 +212,7 @@ impl JobState {
             timeout_seconds: None,
             maximum_size: None,
             allow_accelerated_tables: false,
+            read_only: false,
             version: None,
         }
     }

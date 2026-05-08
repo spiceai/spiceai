@@ -48,7 +48,7 @@ pub enum Error {
 }
 
 /// Resolves a `GraphFailure` into a human-readable error message.
-fn resolve_graph_failure(e: &GraphFailure) -> String {
+pub(crate) fn resolve_graph_failure(e: &GraphFailure) -> String {
     tracing::debug!("GraphFailure occurred: {:#?}", e);
 
     match e {

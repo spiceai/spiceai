@@ -60,11 +60,16 @@ pub async fn verify_endpoint_connection(endpoint: &str) -> Result<()> {
         endpoint: endpoint.to_string(),
     })?;
 
-    let port = url.port_or_known_default().context(InvalidPortSnafu {
+    let port = port_or_known_default(&url).context(InvalidPortSnafu {
         endpoint: endpoint.to_string(),
     })?;
 
     verify_ns_lookup_and_tcp_connect(host, port).await
+}
+
+fn port_or_known_default(url: &url::Url) -> Option<u16> {
+    url.port_or_known_default()
+        .or_else(|| (url.scheme() == "grpc+tls").then_some(443))
 }
 
 /// Verify NS lookup and TCP connect of the provided `host` and `port`.
@@ -118,5 +123,26 @@ pub async fn verify_ns_lookup_and_tcp_connect(host: &str, port: u16) -> Result<(
             }
             .fail()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_port_or_known_default_uses_grpc_tls_default() {
+        let url =
+            url::Url::parse("grpc+tls://example.com").expect("grpc+tls endpoint should parse");
+
+        assert_eq!(port_or_known_default(&url), Some(443));
+    }
+
+    #[test]
+    fn test_port_or_known_default_prefers_explicit_grpc_tls_port() {
+        let url = url::Url::parse("grpc+tls://example.com:50051")
+            .expect("grpc+tls endpoint with port should parse");
+
+        assert_eq!(port_or_known_default(&url), Some(50051));
     }
 }

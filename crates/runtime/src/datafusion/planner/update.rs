@@ -16,8 +16,9 @@ limitations under the License.
 
 //! UPDATE planning for the unified planner.
 //!
-//! In distributed (scheduler) mode, produces a [`DistributedCayenneUpdateNode`]
-//! that forwards the UPDATE to executor nodes.
+//! In distributed (scheduler) mode, wraps target Cayenne UPDATE statements in a
+//! generic [`datafusion_dml::DmlExtensionNode`] with a distributed Cayenne DML
+//! handler.
 //!
 //! In local mode, UPDATE is handled by Cayenne's `TableProvider` implementation
 //! through `DataFusion`'s standard physical planning — no interception needed.
@@ -26,29 +27,32 @@ use std::sync::Arc;
 
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Extension, LogicalPlan};
+use datafusion_dml::{CatalogDmlHandler, DmlExtensionNode, DmlNodeOp, UpdateParams};
 use datafusion_expr::DmlStatement;
 
 use crate::datafusion::cayenne_ddl::dml_planner::{extract_filters, extract_update_assignments};
-use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneUpdateNode;
 
-/// Wrap a `DataFusion` `DmlStatement` (UPDATE) into a distributed Cayenne
-/// extension node for forwarding to executor nodes.
+/// Wrap a `DataFusion` `DmlStatement` (UPDATE) into a generic DML extension
+/// node for forwarding to executor nodes.
 ///
 /// This rewrite is only used for scheduler-side distributed overlay paths.
-///
-/// This is only called in distributed (scheduler) mode. In local mode,
-/// the standard `DataFusion` plan is returned unchanged by the caller.
-pub(super) fn plan_distributed_update(dml: &DmlStatement) -> DFResult<LogicalPlan> {
+pub(super) fn plan_distributed_update(
+    dml: &DmlStatement,
+    handler: Arc<dyn CatalogDmlHandler>,
+) -> DFResult<LogicalPlan> {
     let filters = extract_filters(&dml.input)?;
     let assignments = extract_update_assignments(&dml.input, &dml.table_name)?;
 
     Ok(LogicalPlan::Extension(Extension {
-        node: Arc::new(DistributedCayenneUpdateNode::new(
-            dml.table_name.clone(),
-            Arc::clone(&dml.input),
+        node: Arc::new(DmlExtensionNode::new(
+            DmlNodeOp::Update(UpdateParams {
+                table_name: dml.table_name.clone(),
+                filters,
+                assignments,
+            }),
+            handler,
+            vec![Arc::clone(&dml.input)],
             Arc::clone(&dml.output_schema),
-            filters,
-            assignments,
         )),
     }))
 }

@@ -30,6 +30,8 @@ use crate::{init_tracing, utils::test_request_context};
 
 pub mod common;
 #[cfg(feature = "postgres")]
+pub mod dml;
+#[cfg(feature = "postgres")]
 pub mod replication;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod replication_tpch;

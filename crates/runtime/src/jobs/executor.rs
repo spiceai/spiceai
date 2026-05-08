@@ -76,8 +76,8 @@ impl JobExecutor {
     /// Submits a new query job for async execution.
     ///
     /// Returns the job state immediately. The query will be executed in the background.
-    pub async fn submit(&self, request: SubmitQueryRequest) -> Result<JobState> {
-        let state = self.job_store.create_job(request).await?;
+    pub async fn submit(&self, request: SubmitQueryRequest, read_only: bool) -> Result<JobState> {
+        let state = self.job_store.create_job(request, read_only).await?;
         let job_id = state.job_id.clone();
 
         // Create cancellation token for this job
@@ -185,7 +185,8 @@ impl JobExecutor {
         }
 
         // Build and submit the query using Query::submit_distributed
-        let mut query_builder = QueryBuilder::new(&state.sql, Arc::clone(&df));
+        let mut query_builder =
+            QueryBuilder::new(&state.sql, Arc::clone(&df)).read_only(state.read_only);
 
         // Parse parameters if present
         if let Some(p) = state.parameters {

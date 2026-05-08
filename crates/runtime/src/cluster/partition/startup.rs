@@ -107,7 +107,7 @@ pub async fn initialize_partition_metadata(
 }
 
 /// Verify that all accelerated datasets and views have at least one `partition_by`
-/// key configured, which is required for cluster partition management.
+/// key configured, which is required for cluster partition assignment.
 pub fn validate_partition_keys(app: &App) -> Result<()> {
     for ds in &app.datasets {
         if ds

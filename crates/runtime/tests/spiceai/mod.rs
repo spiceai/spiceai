@@ -38,6 +38,7 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
                 "spiceai_endpoint".to_string(),
                 "https://flight.spiceai.io".to_string(),
             ),
+            ("spiceai_region".to_string(), "us-east-1".to_string()),
         ]
         .into_iter()
         .collect(),

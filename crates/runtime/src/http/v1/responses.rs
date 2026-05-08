@@ -111,6 +111,7 @@ fn extract_text(resp: &OpenAIResponse) -> String {
                 }
             })
         ))),
+        (status = 400, description = "The specified model provider does not support the Responses API or the request is invalid"),
         (status = 404, description = "The specified model was not found"),
         (status = 500, description = "An internal server error occurred while processing the response", content((
             serde_json::Value = "application/json",

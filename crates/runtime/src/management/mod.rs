@@ -206,6 +206,13 @@ impl Management {
             );
         }
 
+        if let Some(region) = self.params.get("region") {
+            params.insert(
+                "spiceai_region".to_string(),
+                region.expose_secret().to_string(),
+            );
+        }
+
         let sink = get_spiceai_table_provider(
             TASK_HISTORY_SINK_TABLE,
             TASK_HISTORY_SINK_REMOTE_TABLE,

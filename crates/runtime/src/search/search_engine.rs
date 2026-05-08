@@ -33,6 +33,8 @@ use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 #[cfg(not(feature = "models"))]
 const EMBED_UDF_NAME: &str = "embed";
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
+#[cfg(feature = "duckdb")]
+use search::index::duckdb::DuckDBVectorIndex;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 use search::pipeline::QueryEngine;
@@ -42,8 +44,8 @@ use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::ChunkedNonIndexVectorGeneration,
     util::{
-        embedding_columns_from_table, find_concrete_table_provider, full_text_search_candidates,
-        get_primary_keys_with_overrides,
+        embedding_columns_from_table, find_concrete_table_provider, find_index_in_table_provider,
+        full_text_search_candidates, get_primary_keys_with_overrides,
     },
 };
 use arrow::array::RecordBatch;
@@ -58,7 +60,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use itertools::Itertools;
-use runtime_datafusion_index::IndexedTableProvider;
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
 use search::index::native_vector::NativeVectorIndex;
@@ -97,26 +98,41 @@ impl SearchEngine {
         tbl: &Arc<dyn TableProvider>,
         embedding_column: &str,
     ) -> Option<Arc<dyn SearchIndex>> {
-        let tbl = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
-        tbl.get_all_indexes().into_iter().find_map(|idx| {
-            if let Some(chunked) = idx.as_any().downcast_ref::<ChunkedSearchIndex>()
-                && chunked.search_column() == embedding_column
-            {
-                return Some(Arc::new(chunked.clone()) as Arc<dyn SearchIndex>);
-            }
-            #[cfg(feature = "s3_vectors")]
-            if let Some(s3v) = idx.as_any().downcast_ref::<S3Vector>()
-                && s3v.search_column() == embedding_column
-            {
-                return Some(Arc::new(s3v.clone()) as Arc<dyn SearchIndex>);
-            }
-            if let Some(native) = idx.as_any().downcast_ref::<NativeVectorIndex>()
-                && native.search_column() == embedding_column
-            {
-                return Some(Arc::new(native.clone()) as Arc<dyn SearchIndex>);
-            }
-            None
-        })
+        if let Some((indexes, _)) = find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        #[cfg(feature = "s3_vectors")]
+        if let Some((indexes, _)) = find_index_in_table_provider::<S3Vector>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        #[cfg(feature = "duckdb")]
+        if let Some((indexes, _)) = find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        if let Some((indexes, _)) = find_index_in_table_provider::<NativeVectorIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        None
     }
 
     // Prepare an individual [`impl search::CandidateGeneration`] (specifically a [`VectorGeneration`]) based on the [`TableReference`].
@@ -232,7 +248,11 @@ impl SearchEngine {
                 _ => CacheKey::Search(&search_key),
             };
 
-            let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
+            let raw_cache_key = {
+                let ns = request_context.cache_namespace();
+                let (ns_tag, ns_id) = ns.hash_inputs();
+                cache_key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
+            };
 
             match (
                 cache_control,

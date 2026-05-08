@@ -14,44 +14,32 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Extension planners for Cayenne DML nodes.
+//! Distributed Cayenne DML handler plus logical-plan extraction helpers.
 //!
-//! DDL nodes are handled by `datafusion_ddl::DdlExtensionPlanner`.
-//! Local MERGE is handled by `cayenne::ddl::CayenneDmlExtensionPlanner`.
+//! The runtime emits generic `datafusion_dml::DmlExtensionNode` values for
+//! distributed Cayenne DML. This module provides:
 //!
-//! This module provides:
-//!
-//! - [`DistributedCayenneDmlExtensionPlanner`] — handles the four distributed
-//!   DML nodes (DELETE, UPDATE, INSERT, MERGE) that forward operations to
-//!   executor nodes. Only registered when an [`ExecutorRegistry`] is present.
-//!
-//! The handler layer follows the optional-overlay contract from
-//! `datafusion-dml`: handlers override only operations that need custom
-//! behavior and inherit trait defaults for standard `DataFusion` execution.
+//! - [`DistributedCayenneDmlHandler`] — the catalog-specific handler embedded in
+//!   those nodes.
+//! - [`extract_filters`] and [`extract_update_assignments`] — helpers used while
+//!   rewriting `DataFusion` DML plans into generic extension nodes.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
-use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode, dml::InsertOp};
+use datafusion::logical_expr::{Expr, LogicalPlan, dml::InsertOp};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::sql::unparser::expr_to_sql;
 use datafusion_dml::{CatalogDmlHandler, DeleteParams, InsertParams, MergeParams, UpdateParams};
 use datafusion_expr::utils::conjunction;
 
-use super::logical_nodes::{
-    DistributedCayenneDeleteNode, DistributedCayenneInsertNode, DistributedCayenneMergeNode,
-    DistributedCayenneUpdateNode,
-};
 use super::physical_plans::{
     DistributedCayenneDeleteExec, DistributedCayenneInsertExec, DistributedCayenneMergeExec,
     DistributedCayenneUpdateExec,
 };
 use crate::cluster::ExecutorRegistry;
-
-// ── DML extraction helpers ───────────────────────────────────────────────────
 
 /// Walk the input plan to find the topmost `Filter` and return predicate
 /// expressions.
@@ -87,7 +75,6 @@ pub fn extract_update_assignments(
         };
         let col_name = &alias.name;
 
-        // Skip identity projections (unchanged columns).
         if let Expr::Column(col) = alias.expr.as_ref()
             && col.name == *col_name
             && col.relation.as_ref().is_none_or(|r| *r == *table_name)
@@ -122,8 +109,6 @@ fn assignments_to_sql(assignments: &[(String, Expr)]) -> DFResult<Vec<(String, S
         })
         .collect()
 }
-
-// ── DistributedCayenneDmlHandler ──────────────────────────────────────────────
 
 /// Catalog DML handler for distributed Cayenne execution.
 #[derive(Debug)]
@@ -266,112 +251,5 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
             Arc::clone(&self.executor_registry),
             ctx,
         )))
-    }
-}
-
-// ── DistributedCayenneDmlExtensionPlanner ─────────────────────────────────────
-
-/// Extension planner for distributed Cayenne DML nodes.
-///
-/// Handles DELETE, UPDATE, INSERT, and MERGE nodes that forward operations
-/// to executor nodes. Only registered when an [`ExecutorRegistry`] is present.
-#[derive(Debug)]
-pub struct DistributedCayenneDmlExtensionPlanner {
-    handler: Arc<DistributedCayenneDmlHandler>,
-}
-
-impl DistributedCayenneDmlExtensionPlanner {
-    #[must_use]
-    pub fn new(
-        executor_registry: Arc<ExecutorRegistry>,
-        io_runtime: Option<tokio::runtime::Handle>,
-    ) -> Self {
-        Self {
-            handler: Arc::new(DistributedCayenneDmlHandler::new(
-                executor_registry,
-                io_runtime,
-            )),
-        }
-    }
-}
-
-#[async_trait]
-impl ExtensionPlanner for DistributedCayenneDmlExtensionPlanner {
-    async fn plan_extension(
-        &self,
-        _planner: &dyn PhysicalPlanner,
-        node: &dyn UserDefinedLogicalNode,
-        _logical_inputs: &[&LogicalPlan],
-        physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        if let Some(delete) = node.as_any().downcast_ref::<DistributedCayenneDeleteNode>() {
-            return self
-                .handler
-                .delete_exec(
-                    DeleteParams {
-                        table_name: delete.table_name.clone(),
-                        filters: delete.filters.clone(),
-                    },
-                    physical_inputs.to_vec(),
-                    session_state,
-                )
-                .await
-                .map(Some);
-        }
-
-        if let Some(update) = node.as_any().downcast_ref::<DistributedCayenneUpdateNode>() {
-            return self
-                .handler
-                .update_exec(
-                    UpdateParams {
-                        table_name: update.table_name.clone(),
-                        filters: update.filters.clone(),
-                        assignments: update.assignments.clone(),
-                    },
-                    physical_inputs.to_vec(),
-                    session_state,
-                )
-                .await
-                .map(Some);
-        }
-
-        if let Some(insert) = node.as_any().downcast_ref::<DistributedCayenneInsertNode>() {
-            return self
-                .handler
-                .insert_exec(
-                    InsertParams {
-                        table_name: insert.table_name.clone(),
-                        insert_op: insert.insert_op,
-                    },
-                    physical_inputs.to_vec(),
-                    session_state,
-                )
-                .await
-                .map(Some);
-        }
-
-        if let Some(merge) = node.as_any().downcast_ref::<DistributedCayenneMergeNode>() {
-            return self
-                .handler
-                .merge_exec(
-                    MergeParams {
-                        target_table: merge.target_table.clone(),
-                        source_table: merge.source_table.clone(),
-                        target_qualifier: merge.target_qualifier.clone(),
-                        source_qualifier: merge.source_qualifier.clone(),
-                        on_keys: merge.on_keys.clone(),
-                        // Distributed execution forwards original SQL directly.
-                        assignments: Vec::new(),
-                        original_sql: Some(merge.original_sql.clone()),
-                    },
-                    physical_inputs.to_vec(),
-                    session_state,
-                )
-                .await
-                .map(Some);
-        }
-
-        Ok(None)
     }
 }

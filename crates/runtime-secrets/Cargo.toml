@@ -3,7 +3,7 @@ name = "runtime-secrets"
 description = "Secrets management utilities for the Spice.ai runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -38,9 +38,9 @@ aws-sdk-sts = { workspace = true, optional = true }
 azure_core = { version = "0.31.0", optional = true }
 azure_identity = { version = "0.31.0", optional = true }
 azure_security_keyvault_secrets = { version = "0.10.0", optional = true }
-# `url` is used by `resolve_vault_url` to enforce a well-formed https URL
-# with a host (not just a matching scheme prefix). Pulled in only under the
-# `azure-keyvault` feature via the feature block below.
+# `url` is used by `resolve_vault_url` (Azure KeyVault) and `build_base_url`
+# (HashiCorp Vault) to enforce a well-formed URL with a host. Pulled in only
+# under either of those features via the feature block below.
 url = { workspace = true, optional = true }
 keyring = { version = "3.6.3", features = [
     "apple-native",
@@ -67,11 +67,14 @@ azure-keyvault = [
     "dep:azure_security_keyvault_secrets",
     "dep:url",
 ]
+# HashiCorp Vault: pure-reqwest implementation, no SDK. `url` is shared
+# with the `azure-keyvault` feature for address validation.
+hashicorp_vault = ["dep:url"]
 # `azure-keyvault` is deliberately *not* in `default`: it pulls the Azure SDK
 # (azure_core / azure_identity / azure_security_keyvault_secrets) into every
 # crate that depends on `runtime-secrets` without `default-features = false`,
 # which we don't want for crates like `runtime-acceleration` that only touch
 # the core `Secrets` type. Opted in via the matching `runtime/azure-keyvault`
 # and `spiced/azure-keyvault` features.
-default = ["keyring-secret-store", "aws-secrets-manager"]
+default = ["keyring-secret-store", "aws-secrets-manager", "hashicorp_vault"]
 keyring-secret-store = ["dep:keyring"]

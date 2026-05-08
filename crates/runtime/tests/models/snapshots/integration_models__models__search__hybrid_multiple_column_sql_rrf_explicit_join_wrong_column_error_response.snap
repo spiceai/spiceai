@@ -2,4 +2,4 @@
 source: crates/runtime/tests/models/search.rs
 expression: err.to_string()
 ---
-HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named foobar. Valid fields are "?table?".id, "?table?".question, "?table?".answer, "?table?".subject, "?table?".reference_answer, "?table?".source, "?table?".question_embedding, "?table?"._score.
+HTTP error: 400 Bad Request - Failed to execute query: Execution error: rrf: Cannot resolve column foobar when fusing results

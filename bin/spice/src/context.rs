@@ -21,6 +21,7 @@ use crate::error::{
     RuntimeNotInstalledSnafu, RuntimeVersionSnafu, WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::ResultExt;
+use spice_cloud_client::endpoints::data_endpoint as spice_cloud_data_endpoint;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -122,7 +123,7 @@ impl RuntimeContext {
         }
 
         if let Some(region) = cloud {
-            ctx.http_endpoint = format!("https://{region}-prod-aws-data.spiceai.io");
+            ctx.http_endpoint = spice_cloud_data_endpoint(region);
             ctx.cloud_region = Some(region.to_string());
         }
 
@@ -337,10 +338,9 @@ impl RuntimeContext {
         );
         cmd.arg(http_addr);
 
-        // Add API key if present
+        // Add API key if present. Use the environment so the key is not exposed in process args.
         if let Some(api_key) = &self.api_key {
-            cmd.arg("--api-key");
-            cmd.arg(api_key);
+            cmd.env("SPICE_API_KEY", api_key);
         }
 
         // Add TLS root certificate file if present
@@ -538,6 +538,13 @@ mod tests {
             .collect()
     }
 
+    fn get_cmd_env(cmd: &Command, key: &str) -> Option<String> {
+        let key = std::ffi::OsStr::new(key);
+        cmd.get_envs()
+            .find(|(env_key, _)| *env_key == key)
+            .and_then(|(_, env_value)| env_value.map(|value| value.to_string_lossy().to_string()))
+    }
+
     #[test]
     fn test_get_run_cmd_includes_pods_watcher_enabled() {
         let (ctx, _temp_dir) = create_test_context_with_runtime();
@@ -621,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_run_cmd_includes_api_key_when_set() {
+    fn test_get_run_cmd_sets_api_key_env_when_set() {
         let (mut ctx, _temp_dir) = create_test_context_with_runtime();
         ctx.api_key = Some("test-api-key-12345".to_string());
 
@@ -631,12 +638,13 @@ mod tests {
         let args = get_cmd_args(&cmd);
 
         assert!(
-            args.contains(&"--api-key".to_string()),
-            "Should include --api-key flag, got: {args:?}"
+            !args.contains(&"--api-key".to_string())
+                && !args.contains(&"test-api-key-12345".to_string()),
+            "Should not expose API key in process args, got: {args:?}"
         );
-        assert!(
-            args.contains(&"test-api-key-12345".to_string()),
-            "Should include the API key value, got: {args:?}"
+        assert_eq!(
+            get_cmd_env(&cmd, "SPICE_API_KEY").as_deref(),
+            Some("test-api-key-12345")
         );
     }
 
@@ -653,6 +661,7 @@ mod tests {
             !args.contains(&"--api-key".to_string()),
             "Should NOT include --api-key flag when not set, got: {args:?}"
         );
+        assert_eq!(get_cmd_env(&cmd, "SPICE_API_KEY"), None);
     }
 
     #[test]
@@ -777,8 +786,6 @@ mod tests {
             "-vv",
             "--http",
             "localhost:9090",
-            "--api-key",
-            "my-api-key",
             "--tls-root-certificate-file",
             "/cert.pem",
             "--user-agent",
@@ -793,6 +800,10 @@ mod tests {
                 "Should include '{expected_arg}', got: {args:?}"
             );
         }
+        assert_eq!(
+            get_cmd_env(&cmd, "SPICE_API_KEY").as_deref(),
+            Some("my-api-key")
+        );
     }
 
     #[test]

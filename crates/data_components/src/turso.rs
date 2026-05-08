@@ -1474,7 +1474,7 @@ impl TursoExec {
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("({ast})")))
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
@@ -1623,7 +1623,7 @@ impl DeletionSink for TursoDeletionSink {
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("({ast})")))
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
@@ -1881,11 +1881,21 @@ fn convert_timestamp_to_turso(
             // Convert to RFC3339 string format
             use chrono::{DateTime, Utc};
 
-            // Convert value to nanoseconds
+            // Convert value to nanoseconds (checked to prevent overflow for dates beyond ~year 2262)
             let nanos = match unit {
-                TimeUnit::Second => value * timestamp_conversion::NANOS_PER_SECOND,
-                TimeUnit::Millisecond => value * timestamp_conversion::NANOS_PER_MILLI,
-                TimeUnit::Microsecond => value * 1_000,
+                TimeUnit::Second => value
+                    .checked_mul(timestamp_conversion::NANOS_PER_SECOND)
+                    .ok_or_else(|| {
+                        format!("Timestamp value {value}s overflows nanosecond conversion")
+                    })?,
+                TimeUnit::Millisecond => value
+                    .checked_mul(timestamp_conversion::NANOS_PER_MILLI)
+                    .ok_or_else(|| {
+                    format!("Timestamp value {value}ms overflows nanosecond conversion")
+                })?,
+                TimeUnit::Microsecond => value.checked_mul(1_000).ok_or_else(|| {
+                    format!("Timestamp value {value}us overflows nanosecond conversion")
+                })?,
                 TimeUnit::Nanosecond => value,
             };
 
@@ -2439,6 +2449,27 @@ mod tests {
         assert!(
             arr.is_null(0),
             "Nanosecond-precision timestamp should be NULL for year 2300 (overflow)"
+        );
+    }
+
+    #[test]
+    fn test_convert_timestamp_to_turso_rfc3339_overflow_returns_error() {
+        let result =
+            convert_timestamp_to_turso(i64::MAX, TimeUnit::Second, None, TimestampFormat::Rfc3339);
+        assert!(
+            result.is_err(),
+            "TimestampSecond i64::MAX should overflow when converting to nanoseconds"
+        );
+
+        let result = convert_timestamp_to_turso(
+            i64::MAX,
+            TimeUnit::Millisecond,
+            None,
+            TimestampFormat::Rfc3339,
+        );
+        assert!(
+            result.is_err(),
+            "TimestampMillisecond i64::MAX should overflow when converting to nanoseconds"
         );
     }
 }

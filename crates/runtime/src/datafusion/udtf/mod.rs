@@ -14,6 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod flatten_json;
-pub mod json_properties;
-pub mod json_tree;
+pub use runtime_datafusion_udfs::flatten_json;
+pub use runtime_datafusion_udfs::json_properties;
+pub use runtime_datafusion_udfs::json_tree;

@@ -26,6 +26,7 @@ limitations under the License.
 //! nodes after calling the same `operations` functions.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -44,10 +45,13 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, execute_stream,
 };
 
+use datafusion_common::ScalarValue;
 use datafusion_datasource::memory::MemorySourceConfig;
 
 use super::operations::{CreateTableParams, create_schema, create_table, drop_table};
 use crate::ddl::get_cayenne_provider;
+use crate::provider::CayenneTableProvider;
+use runtime_table_partition::provider::PartitionTableProvider;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -600,18 +604,28 @@ async fn execute_merge(
     // per target row. We must detect this *before* any mutations — otherwise the
     // delete would commit (removing the target row) but the count verification
     // would fail, leaving permanently missing rows.
-    validate_no_duplicate_target_keys(&normalized_batches, &target_key_columns)?;
+    let matched_keys = validate_no_duplicate_target_keys(&normalized_batches, &target_key_columns)?;
 
-    // Step 3: Build deletion filter from the matched key values.
-    let delete_filter = build_delete_filter(&normalized_batches, &target_key_columns)?;
-
-    // Step 4: Delete matched rows from the target.
-    let delete_plan = target_provider
-        .delete_from(&session_state, vec![delete_filter])
-        .await?;
-    let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
-    let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
-    let delete_count = extract_dml_count(&delete_batches);
+    // Step 3+4: Delete matched rows from the target.
+    //
+    // For PositionBased Cayenne tables, use the fast path: build a HashSet of
+    // matched key tuples and probe each file's rows with O(1) lookups. This
+    // replaces the O(N) filter expression that the legacy path builds and
+    // evaluates against every chunk of every file.
+    let delete_count = if let Some(count) =
+        try_key_probe_delete(&target_provider, &target_key_columns, matched_keys).await?
+    {
+        count
+    } else {
+        // Legacy path: build filter expression and push through delete_from.
+        let delete_filter = build_delete_filter(&normalized_batches, &target_key_columns)?;
+        let delete_plan = target_provider
+            .delete_from(&session_state, vec![delete_filter])
+            .await?;
+        let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
+        let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
+        extract_dml_count(&delete_batches)
+    };
 
     // Verify the delete count matches the expected number of rows.
     if delete_count != total_rows as u64 {
@@ -671,7 +685,7 @@ fn extract_dml_count(batches: &[RecordBatch]) -> u64 {
 fn validate_no_duplicate_target_keys(
     batches: &[RecordBatch],
     key_columns: &[String],
-) -> Result<(), DataFusionError> {
+) -> Result<HashSet<Vec<ScalarValue>>, DataFusionError> {
     use std::collections::HashSet;
 
     let mut seen = HashSet::new();
@@ -690,11 +704,9 @@ fn validate_no_duplicate_target_keys(
 
         for row_idx in 0..batch.num_rows() {
             // Build a composite key as a Vec<ScalarValue> for hashing.
-            let key: Vec<datafusion::common::ScalarValue> = col_indices
+            let key: Vec<ScalarValue> = col_indices
                 .iter()
-                .map(|&idx| {
-                    datafusion::common::ScalarValue::try_from_array(batch.column(idx), row_idx)
-                })
+                .map(|&idx| ScalarValue::try_from_array(batch.column(idx), row_idx))
                 .collect::<Result<Vec<_>, _>>()?;
 
             if !seen.insert(key) {
@@ -702,11 +714,8 @@ fn validate_no_duplicate_target_keys(
                     .iter()
                     .zip(&col_indices)
                     .map(|(name, &idx)| {
-                        let val = datafusion::common::ScalarValue::try_from_array(
-                            batch.column(idx),
-                            row_idx,
-                        )
-                        .map_or_else(|_| "?".to_string(), |v| v.to_string());
+                        let val = ScalarValue::try_from_array(batch.column(idx), row_idx)
+                            .map_or_else(|_| "?".to_string(), |v| v.to_string());
                         format!("{name}={val}")
                     })
                     .collect();
@@ -719,7 +728,7 @@ fn validate_no_duplicate_target_keys(
             }
         }
     }
-    Ok(())
+    Ok(seen)
 }
 
 /// Build a deletion filter from matched key column values.
@@ -745,7 +754,7 @@ fn build_delete_filter(
             })?;
             let array = batch.column(col_idx);
             for row_idx in 0..array.len() {
-                let scalar = datafusion::common::ScalarValue::try_from_array(array, row_idx)?;
+                let scalar = ScalarValue::try_from_array(array, row_idx)?;
                 values.push(lit(scalar));
             }
         }
@@ -783,9 +792,10 @@ fn build_delete_filter(
             // Build AND of all key column equalities for this row.
             let mut row_and: Option<datafusion::prelude::Expr> = None;
             for (key_col, indices) in &col_indices {
-                let array = batch.column(indices[batch_idx]);
-                let scalar = datafusion::common::ScalarValue::try_from_array(array, row_idx)?;
-                let eq_expr = col(key_col.as_str()).eq(lit(scalar));
+                let eq_expr = col(key_col.as_str()).eq(lit(ScalarValue::try_from_array(
+                    batch.column(indices[batch_idx]),
+                    row_idx,
+                )?));
                 row_and = Some(match row_and {
                     Some(existing) => existing.and(eq_expr),
                     None => eq_expr,
@@ -805,10 +815,61 @@ fn build_delete_filter(
     }
 
     // Combine row predicates with OR using a balanced binary tree.
-    match util::expr::combine_exprs_balanced(row_predicates, datafusion::prelude::Expr::or) {
-        Some(combined) => Ok(combined),
-        None => Err(DataFusionError::Internal(
+    util::expr::combine_exprs_balanced(row_predicates, datafusion::prelude::Expr::or).ok_or(
+        DataFusionError::Internal(
             "Failed to build delete filters: no row predicates generated".to_string(),
-        )),
+        ),
+    )
+}
+
+/// Try the fast key-probe deletion path for `PositionBased` Cayenne tables.
+///
+/// Returns `Some(delete_count)` if the provider is a `PositionBased` Cayenne table
+/// (direct, adapter-wrapped, or partitioned) and the deletion succeeded.
+/// Returns `None` if the provider doesn't support the fast path, in which case
+/// the caller should fall back to the legacy filter-based deletion.
+async fn try_key_probe_delete(
+    provider: &Arc<dyn TableProvider>,
+    key_columns: &[String],
+    matched_keys: HashSet<Vec<datafusion_common::ScalarValue>>,
+) -> Result<Option<u64>, DataFusionError> {
+    // Case 1: Direct CayenneTableProvider.
+    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
+        if cayenne.is_position_based() {
+            return cayenne
+                .delete_matched_rows_by_key_probe(matched_keys, key_columns)
+                .await
+                .map(Some);
+        }
+        return Ok(None);
     }
+
+    // Case 3: PartitionTableProvider wrapping per-partition Cayenne providers.
+    // All partitions share the same table metadata and deletion strategy, so
+    // checking the first partition is sufficient to decide the fast path.
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+        let providers = partitioned.partition_table_providers().await;
+        if providers
+            .first()
+            .and_then(|p| p.as_any().downcast_ref::<CayenneTableProvider>())
+            .is_none_or(|cayenne| !cayenne.is_position_based())
+        {
+            return Ok(None);
+        }
+
+        let mut total = 0u64;
+        for pp in &providers {
+            if let Some(cayenne) = pp.as_any().downcast_ref::<CayenneTableProvider>() {
+                // Each partition's listing table only contains its own files, so
+                // the full matched_keys set is passed to each — hash probes for
+                // keys not in this partition simply find no matches.
+                total += cayenne
+                    .delete_matched_rows_by_key_probe(matched_keys.clone(), key_columns)
+                    .await?;
+            }
+        }
+        return Ok(Some(total));
+    }
+
+    Ok(None)
 }

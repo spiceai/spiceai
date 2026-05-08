@@ -42,6 +42,8 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
 use spicepod::component::runtime::CorsConfig;
+#[cfg(feature = "mcp")]
+use spicepod::component::runtime::McpConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -65,7 +67,7 @@ use axum::{
     response::IntoResponse,
     routing::{Router, get, post},
 };
-use runtime_auth::layer::http::AuthLayer;
+use runtime_auth::{AuthRequestContext, layer::http::AuthLayer};
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -99,6 +101,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::inference::get,
         v1::inference::post,
         v1::tools::list,
+        v1::tools::search,
         v1::tools::post,
         v1::iceberg::get_config,
         v1::iceberg::get_namespaces,
@@ -180,6 +183,24 @@ selected via the `Accept` header. Session continuity is carried via the `Mcp-Ses
                         .build(),
                 )
                 .response(
+                    "403",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list. \
+Configure `runtime.mcp.allowed_hosts` or set it to `[\"*\"]` to allow all hosts.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "401",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. \
+Configure an API key provider in your Spicepod and retry with credentials.",
+                        )
+                        .build(),
+                )
+                .response(
                     "413",
                     utoipa::openapi::ResponseBuilder::new()
                         .description("Payload too large. Maximum allowed size is 32 MiB.")
@@ -211,6 +232,23 @@ The `Mcp-Session-Id` header must identify an existing session created via `POST 
                         .description("Unknown or expired `Mcp-Session-Id`.")
                         .build(),
                 )
+                .response(
+                    "401",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. \
+Configure an API key provider in your Spicepod and retry with credentials.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "403",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list.",
+                        )
+                        .build(),
+                )
                 .build(),
         );
         openai.paths.add_path_operation(
@@ -234,6 +272,23 @@ The `Mcp-Session-Id` header must identify an existing session created via `POST 
                     "404",
                     utoipa::openapi::ResponseBuilder::new()
                         .description("Unknown or already-terminated `Mcp-Session-Id`.")
+                        .build(),
+                )
+                .response(
+                    "401",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. \
+Configure an API key provider in your Spicepod and retry with credentials.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "403",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list.",
+                        )
                         .build(),
                 )
                 .build(),
@@ -261,11 +316,18 @@ pub(crate) fn routes(
     search: Arc<search_engine::SearchEngine>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
+    #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+        .route("/v1/sql/active", get(v1::queries::list_active))
+        .route(
+            "/v1/sql/{query_id}/cancel",
+            post(v1::queries::cancel_active),
+        )
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
+        .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
@@ -324,13 +386,15 @@ pub(crate) fn routes(
         // relying on each tool to enforce its own safety posture. Configure
         // `runtime.auth.api_key` (or any future provider) to re-enable this surface.
         let tools_auth_required = auth_layer.is_some();
+        let tools_auth_message = "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
         let tools_router = Router::new()
             .route("/v1/tools", get(v1::tools::list))
+            .route("/v1/tools/search", get(v1::tools::search))
             .route("/v1/tools/{*name}", post(v1::tools::post))
             // Deprecated, use /v1/tools/:name instead
             .route("/v1/tool/{name}", post(v1::tools::post))
             .route_layer(middleware::from_fn(move |req, next| {
-                require_auth_configured(tools_auth_required, req, next)
+                require_auth_configured(tools_auth_required, tools_auth_message, req, next)
             }));
 
         authenticated_router = authenticated_router
@@ -389,19 +453,25 @@ pub(crate) fn routes(
         // Streamable HTTP transport endpoint per MCP 2025-11-25 spec.
         // This replaces the legacy SSE transport that was removed in rmcp 1.x.
         let runtime_arc = Arc::clone(rt);
+        let mcp_config = mcp_server_config(mcp_config);
         let mcp_service = StreamableHttpService::new(
             move || Ok(RuntimeServer::from(&runtime_arc)),
             Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
+            mcp_config,
         );
 
         tracing::debug!(
             "MCP request body size limit set to {} bytes",
             MCP_REQUEST_BODY_LIMIT
         );
+        let mcp_auth_required = auth_layer.is_some();
+        let mcp_auth_message = "MCP endpoint (/v1/mcp) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
         let mcp_router = Router::new()
             .nest_service("/v1/mcp", mcp_service)
-            .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
+            .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT))
+            .route_layer(middleware::from_fn(move |req, next| {
+                require_auth_configured(mcp_auth_required, mcp_auth_message, req, next)
+            }));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
@@ -442,7 +512,7 @@ async fn track_metrics(
     State(df): State<Arc<DataFusion>>,
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     headers: http::HeaderMap,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
     let app_lock = app.read().await;
@@ -460,6 +530,9 @@ async fn track_metrics(
             .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
             .build(),
     );
+    let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> =
+        Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>;
+    req.extensions_mut().insert(auth_request_context);
 
     let request_dimensions = request_context.to_dimensions();
 
@@ -474,7 +547,24 @@ async fn track_metrics(
     let response = Arc::clone(&request_context)
         .scope(async move {
             request_context.load_extensions().await;
-            next.run(req).await
+            // Install a drop guard on the request's cancellation token so
+            // that if the response body is dropped before the body completes
+            // (for example, the client disconnects while a streaming SQL or
+            // SSE response is being produced), the cancellation token fires
+            // and any cooperating in-flight query terminates promptly.
+            //
+            // The guard is attached to the response body via
+            // `CancelGuardBody`, which disarms the guard once the body
+            // signals end-of-stream. This means the guard's lifetime tracks
+            // the streaming response, not just the response future.
+            let cancel_guard = request_context.cancellation_token().clone().drop_guard();
+            let response = next.run(req).await;
+            let (parts, body) = response.into_parts();
+            let body = axum::body::Body::new(util::cancel_guard_body::CancelGuardBody::new(
+                body,
+                cancel_guard,
+            ));
+            axum::response::Response::from_parts(parts, body)
         })
         .await;
 
@@ -494,6 +584,23 @@ async fn track_metrics(
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
 
     response
+}
+
+/// Build the MCP [`StreamableHttpServerConfig`] from the optional `runtime.mcp` config.
+///
+/// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None`, rmcp defaults
+///   apply (`localhost`, `127.0.0.1`, `::1`).
+/// - If `runtime.mcp.allowed_hosts` contains `"*"`, host checking is disabled entirely
+///   (matches how `runtime.cors.allowed_origins: ["*"]` works).
+/// - Otherwise the provided list replaces the defaults entirely.
+#[cfg(feature = "mcp")]
+fn mcp_server_config(mcp_config: Option<&McpConfig>) -> StreamableHttpServerConfig {
+    let config = StreamableHttpServerConfig::default();
+    match mcp_config.and_then(|c| c.allowed_hosts.as_deref()) {
+        Some(hosts) if hosts.iter().any(|h| h == "*") => config.disable_allowed_hosts(),
+        Some(hosts) => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
+        None => config,
+    }
 }
 
 fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
@@ -554,6 +661,7 @@ async fn check_shutdown(
 /// `websearch` is equivalent to arbitrary query / outbound fetch).
 async fn require_auth_configured(
     auth_configured: bool,
+    message: &'static str,
     req: axum::http::Request<Body>,
     next: Next,
 ) -> axum::response::Response {
@@ -564,7 +672,7 @@ async fn require_auth_configured(
     (
         http::StatusCode::UNAUTHORIZED,
         axum::Json(serde_json::json!({
-            "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials."
+            "message": message
         })),
     )
         .into_response()

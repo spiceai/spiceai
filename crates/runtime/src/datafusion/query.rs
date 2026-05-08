@@ -58,6 +58,7 @@ mod cache;
 pub mod error_code;
 mod handle;
 mod metrics;
+pub mod registry;
 mod tracker;
 
 pub use handle::{DistributedJobStatus, QueryHandle, QueryHandleError};
@@ -153,6 +154,9 @@ pub enum Error {
         Use the synchronous query API (/v1/sql or Flight SQL) instead."
     ))]
     CayenneCatalogTableNotSupportedInDistributedQuery { table: String },
+
+    #[snafu(display("Query {query_id} was cancelled"))]
+    QueryCancelled { query_id: String },
 }
 
 impl Error {
@@ -169,6 +173,8 @@ impl Error {
 }
 
 pub enum QueryMethod {
+    /// A pre-parsed logical plan with no associated SQL. The cache key is
+    /// derived from the plan hash. Used by [`Query::from_logical_plan`].
     Plan(Box<LogicalPlan>),
     Text {
         sql: Arc<str>,
@@ -176,6 +182,11 @@ pub enum QueryMethod {
 
         /// An optional allowlist of tables that can be accessed by this query. When [`Option::is_some`], no SQL results caching is performed. [`LogicalPlan`] caching can still occur (since allowlisting is done post-plan).
         table_allowlist: Option<ResolvedTableAwareAllowlist>,
+
+        /// A pre-parsed logical plan to use instead of re-parsing `sql`.
+        /// The SQL string is still used for results-cache key computation so
+        /// cached entries are shared with equivalent plain `Text` executions.
+        pre_parsed_plan: Option<Box<LogicalPlan>>,
     },
 }
 
@@ -192,6 +203,15 @@ pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
     tracker: Option<QueryTracker>,
+    #[expect(
+        clippy::struct_field_names,
+        reason = "query_id matches the conventional naming for the query identifier"
+    )]
+    query_id: uuid::Uuid,
+    /// Cancellation token for cooperative cancellation. If unset, query
+    /// execution inherits the request-context cancellation token. Set this to
+    /// override the request-context token for this query.
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
     /// When true, the validator additionally rejects DDL, DML, COPY, or any
     /// `LogicalPlan::Statement` node (including PREPARE/EXECUTE/DEALLOCATE),
     /// regardless of per-catalog writability. Set via [`QueryBuilder::read_only`];
@@ -215,6 +235,18 @@ macro_rules! handle_error {
 }
 
 impl Query {
+    fn ensure_not_cancelled(
+        token: &tokio_util::sync::CancellationToken,
+        query_id: &str,
+    ) -> Result<()> {
+        if token.is_cancelled() {
+            return Err(Error::QueryCancelled {
+                query_id: query_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns the session state for local query execution.
     ///
     /// For Flight SQL sessions, returns the session-specific context to preserve
@@ -321,12 +353,16 @@ impl Query {
         // Get logical plan and cache key, reusing existing cache infrastructure
         let (plan, mut tracker, cache_key) = match &self.sql {
             QueryMethod::Text {
-                sql, parameters, ..
+                sql,
+                parameters,
+                pre_parsed_plan,
+                ..
             } => {
-                // Use the existing get_plan_or_cached which handles all cache control,
-                // stale-while-revalidate, and query tracking. `read_only` is
-                // threaded through so cached results cannot bypass
-                // `validate_sql_query_read_only` below.
+                // Use the existing get_plan_or_cached which handles all cache
+                // control, stale-while-revalidate, and query tracking. The
+                // cache itself is namespaced per principal and refuses to
+                // store write-capable plans, so a read-only caller cannot
+                // observe a cached entry produced by a write-capable plan.
                 match Query::get_plan_or_cached(
                     &self.df,
                     &session,
@@ -334,7 +370,7 @@ impl Query {
                     sql,
                     parameters.clone(),
                     tracker,
-                    self.read_only,
+                    pre_parsed_plan.clone(),
                 )
                 .await?
                 {
@@ -539,10 +575,39 @@ impl Query {
             crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
         }
 
+        // Resolve the cancellation token for this query. An explicit token on
+        // the `Query` takes precedence; otherwise the query inherits the
+        // request-scoped token so that cancelling the originating request
+        // cancels this query too. A child token is used so that cancelling the
+        // query (via admin cancel endpoint) does not propagate upwards to the
+        // request and abort other in-progress work.
+        let query_cancel_token = match &self.cancellation_token {
+            Some(t) => t.clone(),
+            None => request_context.child_cancellation_token(),
+        };
+
+        // Register in the DataFusion-owned active-query registry so administrative
+        // cancel endpoints can locate this query by id. The guard is captured
+        // by the returned stream so the registration is removed on completion,
+        // drop, or cancellation.
+        let sql_preview = match &self.sql {
+            QueryMethod::Text { sql, .. } => sql.as_ref(),
+            QueryMethod::Plan(_) => "<logical plan>",
+        };
+        let active_query_guard = self.df.query_cancel_registry().register(
+            self.query_id,
+            sql_preview.as_ref(),
+            request_context.protocol(),
+            query_cancel_token.clone(),
+        );
+        let query_id_str = self.query_id.to_string();
+
         let inner_span = span.clone();
 
         let query_result =
             async {
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+
                 let mut session = self.get_session_state(&request_context);
 
                 let ctx = self;
@@ -559,35 +624,42 @@ impl Query {
                         sql,
                         parameters,
                         table_allowlist: Some(allowlist),
+                        pre_parsed_plan,
                     } => {
                         let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
                             .as_raw_key(Query::plan_hasher(&ctx.df));
-                        let plan = match Self::get_plan(
-                            &ctx.df,
-                            &session,
-                            sql,
-                            &raw_cache_key,
-                            parameters.clone(),
-                        )
-                        .await
-                        {
-                            Ok(plan) => plan,
-                            Err(e) => match e {
-                                Error::UnableToExecuteQuery { source } => {
-                                    let code = ErrorCode::from(&source);
-                                    let snafu_err = Error::UnableToExecuteQuery { source };
-                                    if let Some(t) = tracker {
-                                        t.finish_with_error(
-                                            &request_context,
-                                            snafu_err.to_string(),
-                                            code,
-                                        );
+                        let plan = if let Some(plan) = pre_parsed_plan {
+                            plan.clone()
+                        } else {
+                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                            match Self::get_plan(
+                                &ctx.df,
+                                &session,
+                                sql,
+                                &raw_cache_key,
+                                parameters.clone(),
+                            )
+                            .await
+                            {
+                                Ok(plan) => Box::new(plan),
+                                Err(e) => match e {
+                                    Error::UnableToExecuteQuery { source } => {
+                                        let code = ErrorCode::from(&source);
+                                        let snafu_err = Error::UnableToExecuteQuery { source };
+                                        if let Some(t) = tracker {
+                                            t.finish_with_error(
+                                                &request_context,
+                                                snafu_err.to_string(),
+                                                code,
+                                            );
+                                        }
+                                        return Err(snafu_err);
                                     }
-                                    return Err(snafu_err);
-                                }
-                                _ => return Err(e),
-                            },
+                                    _ => return Err(e),
+                                },
+                            }
                         };
+                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                         let tables_referenced = plan.as_table_refs();
                         if let Some(disallowed_table) = tables_referenced
                             .iter()
@@ -599,7 +671,7 @@ impl Query {
                         }
 
                         (
-                            Box::new(plan),
+                            plan,
                             tracker,
                             RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
                         )
@@ -608,6 +680,7 @@ impl Query {
                         sql,
                         parameters,
                         table_allowlist: None,
+                        pre_parsed_plan,
                     } => {
                         match Self::get_plan_or_cached(
                             &ctx.df,
@@ -616,14 +689,23 @@ impl Query {
                             sql,
                             parameters.clone(),
                             tracker,
-                            ctx.read_only,
+                            pre_parsed_plan.clone(),
                         )
                         .await?
                         {
                             PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                                 (plan, tracker, cache_manager)
                             }
-                            PlanOrCached::Cached(query_result) => return Ok(query_result),
+                            PlanOrCached::Cached(query_result) => {
+                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                                return Ok(attach_cancellation_to_query_result(
+                                    query_result,
+                                    query_cancel_token.clone(),
+                                    query_id_str.clone(),
+                                    active_query_guard,
+                                ));
+                            }
                         }
                     }
                     QueryMethod::Plan(logical_plan) => {
@@ -635,6 +717,8 @@ impl Query {
                         (logical_plan.clone(), None, cache_manager)
                     }
                 };
+
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
 
                 if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
                     let e = find_datafusion_root(e);
@@ -733,6 +817,7 @@ impl Query {
                         Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
                     };
 
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     let dataframe = match session_ctx
                         .execute_logical_plan(plan.as_ref().clone())
                         .await
@@ -751,6 +836,7 @@ impl Query {
                         }
                     };
 
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     // Create a physical plan from the dataframe and execute it with our own TaskContext
                     // that includes the request context. This ensures BytesProcessedExec has access to it.
                     let df_plan = match dataframe.create_physical_plan().await {
@@ -768,6 +854,7 @@ impl Query {
                         }
                     };
 
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     let task_ctx = Arc::new(TaskContext::from(&session));
                     let stream = match execute_stream_preserving_output_order(
                         Arc::clone(&df_plan),
@@ -789,6 +876,7 @@ impl Query {
                     (stream, df_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     let physical_plan = match session.create_physical_plan(&plan).await {
                         Ok(stream) => stream,
                         Err(e) => {
@@ -804,6 +892,7 @@ impl Query {
                         }
                     };
 
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     let task_ctx = Arc::new(TaskContext::from(&session));
 
                     let stream = match execute_stream_preserving_output_order(
@@ -823,8 +912,11 @@ impl Query {
                             )
                         }
                     };
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                     (stream, physical_plan)
                 };
+
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
 
                 // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
                 // DDL plans (CREATE TABLE/DROP TABLE), DML Delete/Update plans, and Spice
@@ -892,6 +984,18 @@ impl Query {
                     inner_span.clone(),
                 );
 
+                // Wrap with cancellation observation so that cancelling the
+                // query (via HTTP `/v1/sql/{id}/cancel`, the custom Flight
+                // `CancelQuery` action, or client disconnect) terminates the
+                // stream with a clear error. The active-query registry guard is held by the
+                // wrapped stream so deregistration occurs on drop.
+                let final_stream = attach_cancellation_to_stream(
+                    final_stream,
+                    query_cancel_token.clone(),
+                    query_id_str.clone(),
+                    active_query_guard,
+                );
+
                 Ok(QueryResult::new(
                     attach_query_tracker_to_stream(
                         inner_span,
@@ -902,8 +1006,12 @@ impl Query {
                     cache_manager.cache_status,
                 ))
             }
-            .instrument(span.clone())
-            .await;
+            .instrument(span.clone());
+
+        // Keep this large async block out of callers' state machines. This
+        // preserves the concrete future type, avoiding dynamic dispatch while
+        // still moving the state machine itself to the heap.
+        let query_result = Box::pin(query_result).await;
 
         match query_result {
             Ok(result) => Ok(result),
@@ -919,6 +1027,8 @@ impl Query {
             df: Arc::clone(df),
             sql: QueryMethod::Plan(Box::new(plan.clone())),
             tracker: None,
+            query_id: uuid::Uuid::new_v4(),
+            cancellation_token: None,
             read_only: false,
             allow_accelerated: false,
         }
@@ -964,7 +1074,11 @@ impl Query {
         };
 
         let plan = match self.sql {
-            QueryMethod::Plan(ref plan) => plan.clone(),
+            QueryMethod::Plan(ref plan)
+            | QueryMethod::Text {
+                pre_parsed_plan: Some(ref plan),
+                ..
+            } => plan.clone(),
             QueryMethod::Text { ref sql, .. } => {
                 match self.df.create_logical_plan(&session, sql).await {
                     Ok(plan) => Box::new(plan),
@@ -1181,6 +1295,114 @@ fn attach_query_active_guard_to_stream(
         schema,
         Box::pin(updated_stream.instrument(span)),
     ))
+}
+
+fn attach_cancellation_to_query_result<G>(
+    query_result: QueryResult,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    query_id: String,
+    guard: G,
+) -> QueryResult
+where
+    G: Send + 'static,
+{
+    let QueryResult { data, cache_status } = query_result;
+    QueryResult::new(
+        attach_cancellation_to_stream(data, cancellation_token, query_id, guard),
+        cache_status,
+    )
+}
+
+/// Wraps a record batch stream so that cancellation via the supplied
+/// [`CancellationToken`] yields a single [`DataFusionError::External`] wrapping
+/// [`Error::QueryCancelled`] and terminates the stream.
+///
+/// Using [`Error::QueryCancelled`] lets downstream callers (HTTP status
+/// mapping, Flight status mapping, metrics) distinguish cancellation from
+/// other query failures via [`is_cancellation_error`] or an
+/// [`std::error::Error::downcast_ref`] on the external error source.
+///
+/// The wrapper also keeps ownership of any `guard` (typically an
+/// [`ActiveQueryGuard`]) so that the query's registry entry is removed when the
+/// stream is dropped, whether it completes, errors, or is cancelled.
+fn attach_cancellation_to_stream<G>(
+    stream: SendableRecordBatchStream,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    query_id: String,
+    guard: G,
+) -> SendableRecordBatchStream
+where
+    G: Send + 'static,
+{
+    struct State<G> {
+        stream: Option<SendableRecordBatchStream>,
+        token: tokio_util::sync::CancellationToken,
+        query_id: String,
+        guard: Option<G>,
+        emitted_cancel: bool,
+    }
+
+    impl<G> State<G> {
+        fn release_query_resources(&mut self) {
+            self.stream.take();
+            self.guard.take();
+        }
+    }
+
+    fn cancellation_error(query_id: &str) -> DataFusionError {
+        DataFusionError::External(Box::new(Error::QueryCancelled {
+            query_id: query_id.to_string(),
+        }))
+    }
+
+    let schema = stream.schema();
+
+    let state = State {
+        stream: Some(stream),
+        token: cancellation_token,
+        query_id,
+        guard: Some(guard),
+        emitted_cancel: false,
+    };
+
+    let wrapped = futures::stream::unfold(state, |mut state| async move {
+        if state.emitted_cancel {
+            return None;
+        }
+        if state.token.is_cancelled() {
+            state.emitted_cancel = true;
+            state.release_query_resources();
+            return Some((Err(cancellation_error(&state.query_id)), state));
+        }
+        let token = state.token.clone();
+        let mut stream = state.stream.take()?;
+        tokio::select! {
+            biased;
+            () = token.cancelled() => {
+                state.emitted_cancel = true;
+                state.release_query_resources();
+                Some((Err(cancellation_error(&state.query_id)), state))
+            }
+            next = stream.next() => {
+                state.stream = Some(stream);
+                next.map(|item| (item, state))
+            }
+        }
+    });
+
+    Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(wrapped)))
+}
+
+/// Returns true if `err` represents a query cancellation produced by
+/// [`attach_cancellation_to_stream`].
+#[must_use]
+pub fn is_cancellation_error(err: &DataFusionError) -> bool {
+    let DataFusionError::External(source) = err else {
+        return false;
+    };
+    source
+        .downcast_ref::<Error>()
+        .is_some_and(|e| matches!(e, Error::QueryCancelled { .. }))
 }
 
 #[must_use]
@@ -1760,50 +1982,23 @@ fn reconcile_stream_nullability(
 
 /// Extract the target table reference from a DML logical plan.
 ///
-/// Handles both standard `DataFusion` `LogicalPlan::Dml` nodes and
-/// distributed Cayenne DML extension nodes.
+/// Handles both standard `DataFusion` `LogicalPlan::Dml` nodes and generic
+/// `datafusion_dml::DmlExtensionNode` values.
 fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
     match plan {
         LogicalPlan::Dml(dml) => Some(dml.table_name.clone()),
-        #[cfg(not(windows))]
         LogicalPlan::Extension(ext) => {
-            use super::cayenne_ddl::logical_nodes::{
-                DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
-                DistributedCayenneMergeNode, DistributedCayenneUpdateNode,
-            };
-            use super::planner::logical_nodes::CayenneMergeNode;
-            if let Some(n) = ext
+            let dml = ext
                 .node
                 .as_any()
-                .downcast_ref::<DistributedCayenneDeleteNode>()
-            {
-                return Some(n.table_name.clone());
-            }
-            if let Some(n) = ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneUpdateNode>()
-            {
-                return Some(n.table_name.clone());
-            }
-            if let Some(n) = ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneInsertNode>()
-            {
-                return Some(n.table_name.clone());
-            }
-            if let Some(n) = ext.node.as_any().downcast_ref::<CayenneMergeNode>() {
-                return Some(n.target_table.clone());
-            }
-            if let Some(n) = ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneMergeNode>()
-            {
-                return Some(n.target_table.clone());
-            }
-            None
+                .downcast_ref::<datafusion_dml::DmlExtensionNode>()?;
+
+            Some(match &dml.op {
+                datafusion_dml::DmlNodeOp::Delete(params) => params.table_name.clone(),
+                datafusion_dml::DmlNodeOp::Update(params) => params.table_name.clone(),
+                datafusion_dml::DmlNodeOp::Insert(params) => params.table_name.clone(),
+                datafusion_dml::DmlNodeOp::Merge(params) => params.target_table.clone(),
+            })
         }
         _ => None,
     }
@@ -1814,43 +2009,15 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
 /// Used to skip schema verification for DML extension nodes, whose output
 /// schema may differ from the logical plan's schema.
 fn is_dml_extension(plan: &LogicalPlan) -> bool {
-    #[cfg(not(windows))]
-    if let LogicalPlan::Extension(ext) = plan {
-        use super::cayenne_ddl::logical_nodes::{
-            DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
-            DistributedCayenneMergeNode, DistributedCayenneUpdateNode,
-        };
-        use super::planner::logical_nodes::CayenneMergeNode;
-        if ext
-            .node
-            .as_any()
-            .downcast_ref::<DistributedCayenneDeleteNode>()
-            .is_some()
-            || ext
+    matches!(
+        plan,
+        LogicalPlan::Extension(ext)
+            if ext
                 .node
                 .as_any()
-                .downcast_ref::<DistributedCayenneUpdateNode>()
+                .downcast_ref::<datafusion_dml::DmlExtensionNode>()
                 .is_some()
-            || ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneInsertNode>()
-                .is_some()
-            || ext
-                .node
-                .as_any()
-                .downcast_ref::<CayenneMergeNode>()
-                .is_some()
-            || ext
-                .node
-                .as_any()
-                .downcast_ref::<DistributedCayenneMergeNode>()
-                .is_some()
-        {
-            return true;
-        }
-    }
-    false
+    )
 }
 
 #[cfg(test)]
@@ -1864,6 +2031,7 @@ mod tests {
         buffer::Buffer,
         datatypes::{DataType, Field, Schema, UnionMode},
     };
+    use datafusion::logical_expr::Extension;
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
@@ -1873,6 +2041,8 @@ mod tests {
     use spicepod::component::caching::SQLResultsCacheConfig;
     use std::any::Any;
     use std::fmt::{Debug, Formatter};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio_util::sync::CancellationToken;
 
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
@@ -1881,6 +2051,57 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug)]
+    struct NoopDmlHandler;
+
+    #[async_trait::async_trait]
+    impl datafusion_dml::CatalogDmlHandler for NoopDmlHandler {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn test_extract_dml_target_table_from_generic_delete_extension() {
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(datafusion_dml::DmlExtensionNode::new_with_count_output(
+                datafusion_dml::DmlNodeOp::Delete(datafusion_dml::DeleteParams {
+                    table_name: TableReference::parse_str("catalog.schema.target"),
+                    filters: vec![],
+                }),
+                Arc::new(NoopDmlHandler),
+                vec![],
+            )),
+        });
+
+        let target = extract_dml_target_table(&plan).expect("should find DML target");
+        assert_eq!(target.to_string(), "catalog.schema.target");
+        assert!(is_dml_extension(&plan));
+    }
+
+    #[test]
+    fn test_extract_dml_target_table_from_generic_merge_extension() {
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(datafusion_dml::DmlExtensionNode::new_with_count_output(
+                datafusion_dml::DmlNodeOp::Merge(Box::new(datafusion_dml::MergeParams {
+                    target_table: TableReference::parse_str("catalog.schema.target"),
+                    source_table: TableReference::parse_str("catalog.schema.source"),
+                    target_qualifier: "t".to_string(),
+                    source_qualifier: "s".to_string(),
+                    on_keys: vec![("id".to_string(), "id".to_string())],
+                    assignments: vec![],
+                    original_sql: None,
+                })),
+                Arc::new(NoopDmlHandler),
+                vec![],
+            )),
+        });
+
+        let target = extract_dml_target_table(&plan).expect("should find MERGE target");
+        assert_eq!(target.to_string(), "catalog.schema.target");
+        assert!(is_dml_extension(&plan));
+    }
 
     #[tokio::test]
     async fn parameterized_query() {
@@ -1959,6 +2180,69 @@ mod tests {
         }
 
         assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+    }
+
+    #[tokio::test]
+    async fn cached_query_result_keeps_registry_entry_until_stream_drop_and_observes_cancel() {
+        let config = SQLResultsCacheConfig::default();
+        let cache_provider = Arc::new(
+            QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("cache provider new"),
+        );
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(Caching::new().with_results_cache(cache_provider)))
+            .build(),
+        );
+
+        {
+            let mut query = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+                .build()
+                .run()
+                .await
+                .expect("initial query should run");
+            assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+            while let Some(batch_result) = query.data.next().await {
+                batch_result.expect("initial query stream should succeed");
+            }
+        }
+
+        let query_id = uuid::Uuid::new_v4();
+        let cancel_token = CancellationToken::new();
+        let mut cached_query = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .query_id(query_id)
+            .cancellation_token(cancel_token.clone())
+            .build()
+            .run()
+            .await
+            .expect("cached query should run");
+
+        assert_eq!(cached_query.cache_status, CacheStatus::CacheHit);
+        let registry = df.query_cancel_registry();
+        assert!(
+            registry.list().iter().any(|info| info.query_id == query_id),
+            "cached query should remain registered while its stream is alive"
+        );
+
+        assert!(registry.cancel(query_id));
+        assert!(cancel_token.is_cancelled());
+        let cancellation = cached_query
+            .data
+            .next()
+            .await
+            .expect("cached stream should emit cancellation");
+        assert_query_cancelled(
+            cancellation.expect_err("cached stream item should be a cancellation error"),
+            &query_id.to_string(),
+        );
+        assert!(cached_query.data.next().await.is_none());
+        assert!(
+            registry.list().iter().all(|info| info.query_id != query_id),
+            "cached query should be deregistered after the stream terminates"
+        );
     }
 
     #[tokio::test]
@@ -2447,6 +2731,118 @@ mod tests {
         Box::pin(RecordBatchStreamAdapter::new(Arc::clone(schema), {
             futures::stream::iter(batches.into_iter().map(Ok))
         }))
+    }
+
+    fn pending_stream(schema: &Arc<Schema>) -> SendableRecordBatchStream {
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(schema),
+            futures::stream::pending::<DataFusionResult<RecordBatch>>(),
+        ))
+    }
+
+    struct DropFlag {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl DropFlag {
+        fn new(dropped: Arc<AtomicBool>) -> Self {
+            Self { dropped }
+        }
+    }
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn assert_query_cancelled(error: DataFusionError, expected_query_id: &str) {
+        assert!(is_cancellation_error(&error));
+        let DataFusionError::External(source) = error else {
+            panic!("expected external cancellation error");
+        };
+        let cancellation = source
+            .downcast_ref::<Error>()
+            .expect("external error should be query cancellation");
+        let Error::QueryCancelled { query_id } = cancellation else {
+            panic!("expected query cancellation error");
+        };
+        assert_eq!(query_id, expected_query_id);
+    }
+
+    #[tokio::test]
+    async fn attach_cancellation_to_stream_emits_single_cancel_then_terminates() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42])) as ArrayRef],
+        )
+        .expect("batch");
+        let cancel_token = CancellationToken::new();
+        let guard_dropped = Arc::new(AtomicBool::new(false));
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let mut stream = attach_cancellation_to_stream(
+            stream_from_batches(&schema, vec![batch]),
+            cancel_token.clone(),
+            query_id.clone(),
+            DropFlag::new(Arc::clone(&guard_dropped)),
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("stream should emit the first batch")
+            .expect("first batch should succeed");
+        assert_eq!(first.num_rows(), 1);
+        assert!(!guard_dropped.load(Ordering::SeqCst));
+
+        cancel_token.cancel();
+        let cancellation = stream
+            .next()
+            .await
+            .expect("stream should emit one cancellation error");
+        assert_query_cancelled(
+            cancellation.expect_err("second item should be cancellation"),
+            &query_id,
+        );
+        assert!(guard_dropped.load(Ordering::SeqCst));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_cancellation_to_stream_wakes_pending_next_on_cancel() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let cancel_token = CancellationToken::new();
+        let guard_dropped = Arc::new(AtomicBool::new(false));
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let mut stream = attach_cancellation_to_stream(
+            pending_stream(&schema),
+            cancel_token.clone(),
+            query_id.clone(),
+            DropFlag::new(Arc::clone(&guard_dropped)),
+        );
+
+        let pending_next = tokio::spawn(async move { stream.next().await });
+        tokio::task::yield_now().await;
+        cancel_token.cancel();
+
+        let cancellation = pending_next
+            .await
+            .expect("pending stream task should complete")
+            .expect("pending stream should emit cancellation");
+        assert_query_cancelled(
+            cancellation.expect_err("pending item should be cancellation"),
+            &query_id,
+        );
+        assert!(guard_dropped.load(Ordering::SeqCst));
     }
 
     /// Collect all batches from a `SendableRecordBatchStream`.

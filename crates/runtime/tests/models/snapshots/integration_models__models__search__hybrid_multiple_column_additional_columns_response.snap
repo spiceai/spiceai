@@ -1,10 +1,25 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
+    {
+      "_score": "0.01",
+      "data": {
+        "question": "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
+        ]
+      },
+      "primary_key": {
+        "id": 539
+      }
+    },
     {
       "_score": "0.01",
       "data": {
@@ -18,21 +33,6 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "id": 525
-      }
-    },
-    {
-      "_score": "0.01",
-      "data": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
-      },
-      "dataset": "qs",
-      "matches": {
-        "question": [
-          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
-        ]
-      },
-      "primary_key": {
-        "id": 361
       }
     },
     {
@@ -53,16 +53,16 @@ expression: normalize_search_response(resp, round_scores)
     {
       "_score": "0.01",
       "data": {
-        "question": "How many groups of 2 are in 14?"
+        "question": "How many chirality centers does cholesterol have?"
       },
       "dataset": "qs",
       "matches": {
         "question": [
-          "How many groups of 2 are in 14?"
+          "How many chirality centers does cholesterol have?"
         ]
       },
       "primary_key": {
-        "id": 462
+        "id": 454
       }
     }
   ]

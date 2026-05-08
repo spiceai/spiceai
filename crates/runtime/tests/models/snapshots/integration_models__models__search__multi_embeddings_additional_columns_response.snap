@@ -1,68 +1,68 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.65",
+      "_score": "0.60",
       "data": {
-        "question": "<refined question>"
+        "question": "What is the `car` of the list `l` where `l` is `((a b c) x y z)`?"
       },
       "dataset": "qs",
       "matches": {
         "answer": [
-          "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+          "`(a b c)`, because `(a b c)` is the first S-expression of this non-empty list."
         ]
       },
       "primary_key": {
-        "id": 6
+        "id": 868
       }
     },
     {
-      "_score": "0.64",
+      "_score": "0.57",
       "data": {
-        "question": "Compare the fractions and write the appropriate sign ('<', '>', or '=') between them:  \n$\\frac{5}{6} \\square \\frac{5}{5}$"
+        "question": "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
       },
       "dataset": "qs",
       "matches": {
         "answer": [
-          "$\\frac{5}{6} < \\frac{5}{5}$ because $\\frac{5}{6}$ is less than 1, while $\\frac{5}{5}$ equals 1.  \n\nFinal answer: $\\boxed{<}$"
+          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
         ]
       },
       "primary_key": {
-        "id": 58
+        "id": 708
       }
     },
     {
-      "_score": "0.63",
+      "_score": "0.56",
       "data": {
-        "question": "Is $\\frac{7 \\text { erasers }}{12 \\text { pencils }}$ an example of a ratio or a rate?"
+        "question": "Evaluate the function \\( h(x) = -3x - 4 \\) at the given values:\na. \\( h(7) \\)\nb. \\( h(-4) \\)"
       },
       "dataset": "qs",
       "matches": {
         "answer": [
-          "This is an example of a $\\boxed{\\text{rate}}$ because it compares two unlike denominate numbers (erasers and pencils)."
+          "a. \\( h(7) = -3(7) - 4 = -21 - 4 = \\boxed{-25} \\)\nb. \\( h(-4) = -3(-4) - 4 = 12 - 4 = \\boxed{8} \\)"
         ]
       },
       "primary_key": {
-        "id": 543
+        "id": 255
       }
     },
     {
-      "_score": "0.63",
+      "_score": "0.55",
       "data": {
-        "question": "Write the decimal `2.3` in words and then express it as a fraction or mixed number."
+        "question": "Evaluate the function \\( G(x) = x - 1 \\) at the following values of \\( x \\):\na. \\( x = 3 \\)\nb. \\( x = -5 \\)\nc. \\( x = 0 \\)"
       },
       "dataset": "qs",
       "matches": {
         "answer": [
-          "1. In words: \"two and three tenths.\"  \n2. As a fraction: \\(\\boxed{\\dfrac{23}{10}}\\)."
+          "a. \\( G(3) = 3 - 1 = \\boxed{2} \\)\nb. \\( G(-5) = -5 - 1 = \\boxed{-6} \\)\nc. \\( G(0) = 0 - 1 = \\boxed{-1} \\)"
         ]
       },
       "primary_key": {
-        "id": 1318
+        "id": 251
       }
     }
   ]

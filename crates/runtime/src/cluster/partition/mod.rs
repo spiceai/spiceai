@@ -85,7 +85,7 @@ pub enum Error {
     NotAcceleratedTable { table: String },
 
     #[snafu(display(
-        "Accelerated {component_type} '{name}' has no partition keys configured. Add 'partition_by' to its acceleration config to participate in cluster partition management."
+        "Accelerated {component_type} '{name}' has no partition keys configured. Add 'partition_by' to its acceleration config to participate in cluster partition assignment."
     ))]
     MissingPartitionKeys {
         component_type: &'static str,

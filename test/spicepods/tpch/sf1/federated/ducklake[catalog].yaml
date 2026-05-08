@@ -6,3 +6,8 @@ catalogs:
     name: ducklake
     params:
       ducklake_connection_string: ${secrets:DUCKLAKE_CONNECTION_STRING}
+      ducklake_aws_region: us-east-1
+      ducklake_aws_access_key_id: minioadmin
+      ducklake_aws_secret_access_key: minioadmin
+      ducklake_aws_endpoint: "http://127.0.0.1:9000"
+      ducklake_aws_allow_http: "true"

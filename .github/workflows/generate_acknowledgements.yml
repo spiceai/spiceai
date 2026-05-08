@@ -12,7 +12,9 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - run: rustup toolchain install 1.94.1 --profile minimal
 
@@ -39,7 +41,7 @@ jobs:
           if [[ $(git diff --exit-code acknowledgements.md) ]]; then
             git add acknowledgements.md
             git commit -m "Update acknowledgements"
-            git push origin acknowledgements/${GITHUB_RUN_ID}
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:acknowledgements/${GITHUB_RUN_ID}
             gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
           else
             echo "No changes detected"

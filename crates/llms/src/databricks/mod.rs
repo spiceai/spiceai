@@ -108,6 +108,53 @@ impl Databricks {
         req
     }
 
+    fn alter_request_body(
+        &self,
+        req: CreateChatCompletionRequest,
+        stream: bool,
+    ) -> Result<Value, OpenAIError> {
+        let mut req = self.alter_request(req);
+        let prompt_cache_requested = req.prompt_cache_key.take().is_some();
+        req.stream = Some(stream);
+
+        let mut body =
+            serde_json::to_value(req).map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        if prompt_cache_requested {
+            Self::add_prompt_cache_control(&mut body);
+        }
+        Ok(body)
+    }
+
+    fn add_prompt_cache_control(body: &mut Value) {
+        let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for message in messages.iter_mut().rev() {
+            let Some(content) = message.get_mut("content") else {
+                continue;
+            };
+
+            match content {
+                Value::String(text) if !text.is_empty() => {
+                    let text = std::mem::take(text);
+                    *content = json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+                    return;
+                }
+                Value::Array(parts) => {
+                    if let Some(Value::Object(part)) = parts
+                        .iter_mut()
+                        .rev()
+                        .find(|part| part.get("text").is_some())
+                    {
+                        part.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     #[must_use]
     pub fn set_cache(
         mut self,
@@ -275,7 +322,7 @@ impl Chat for Databricks {
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         // Must use `create_stream_byot` with custom response type to handle Databricks-specific format.
-        let altered_req = self.alter_request(req);
+        let altered_req = self.alter_request_body(req, true)?;
         let stream: std::pin::Pin<
             Box<
                 dyn futures::Stream<
@@ -299,7 +346,7 @@ impl Chat for Databricks {
         self.client
             .chat()
             .path("")?
-            .create_byot(self.alter_request(req))
+            .create_byot(self.alter_request_body(req, false)?)
             .await
     }
 }
@@ -404,5 +451,45 @@ impl std::fmt::Debug for Databricks {
         f.debug_struct("DatabricksEmbed")
             .field("inner", &self.client)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_cache_control_is_added_to_last_text_message() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "Static instructions"},
+                {"role": "user", "content": "Reusable context"}
+            ]
+        });
+
+        Databricks::add_prompt_cache_control(&mut body);
+
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn prompt_cache_control_skips_trailing_non_text_content() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "Reusable context"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "call_123"}]}
+            ]
+        });
+
+        Databricks::add_prompt_cache_control(&mut body);
+
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(body["messages"][1]["content"][0]["cache_control"].is_null());
     }
 }

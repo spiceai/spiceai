@@ -46,7 +46,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::context::PartitionOperations;
 use crate::executor_registry::{self, ExecutorRegistry};
-use crate::scheduler_task_config::PartitionManagementConfig;
+use crate::scheduler_task_config::PartitionAssignmentConfig;
 use crate::{PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes, store};
 
 #[derive(Debug, Snafu)]
@@ -206,23 +206,18 @@ impl PartitionService {
     }
 
     fn config_from_app(app: &App) -> AssignmentConfig {
-        let Some(pm) = app
-            .runtime
-            .scheduler
-            .as_ref()
-            .and_then(|s| s.partition_management.clone())
-        else {
+        let Some(scheduler) = app.runtime.scheduler.clone() else {
             return AssignmentConfig::default();
         };
-        match PartitionManagementConfig::try_from(pm) {
-            Ok(pm_config) => AssignmentConfig {
-                max_assignments_per_cycle: pm_config.max_assignments_per_cycle,
-                max_partitions_per_executor: pm_config.max_partitions_per_executor,
-                discovery_timeout: pm_config.discovery_timeout,
+        match PartitionAssignmentConfig::try_from(scheduler) {
+            Ok(pa_config) => AssignmentConfig {
+                max_assignments_per_cycle: pa_config.max_assignments_per_interval,
+                max_partitions_per_executor: pa_config.max_partitions_per_executor,
+                discovery_timeout: pa_config.discovery_timeout,
             },
             Err(e) => {
                 tracing::warn!(
-                    "Invalid runtime.scheduler.partition_management config; using defaults: {e}"
+                    "Invalid runtime.scheduler partition assignment config; using defaults: {e}"
                 );
                 AssignmentConfig::default()
             }
@@ -253,7 +248,8 @@ impl PartitionService {
             .refresh()
             .await
             .context(PartitionStoreRefreshSnafu)?;
-        self.diff_and_apply(table, partition_by, values, ops).await?;
+        self.diff_and_apply(table, partition_by, values, ops)
+            .await?;
         Ok(())
     }
 
@@ -1710,69 +1706,6 @@ mod tests {
             &state,
             &store,
             &config,
-            AssignmentLimit::PerCycleCap,
-        );
-        assert_eq!(
-            assignments.len(),
-            2,
-            "Both new partitions should be assigned"
-        );
-
-        // Step 3: Commit assignments to the store.
-        let result = commit_assignments(&store, assignments)
-            .await
-            .expect("commit");
-        assert_eq!(result.committed.len(), 2);
-        assert!(result.failed.is_empty());
-
-        // Verify: all 4 partitions are now assigned in the store.
-        let metadata = store
-            .get_table_metadata(&table)
-            .await
-            .expect("get")
-            .expect("exists");
-        assert_eq!(metadata.partitions.len(), 4);
-        for p in &metadata.partitions {
-            assert!(
-                p.is_assigned(),
-                "Partition {:?} should be assigned",
-                p.partition_value
-            );
-        }
-    }
-
-    /// Verifies that adding partitions that already exist is a no-op (idempotent).
-    #[tokio::test]
-    async fn test_add_partitions_idempotent() {
-        let store = make_store().await;
-        setup_table(
-            &store,
-            "orders",
-            vec![assigned_partition("date", "2024-01-01", "exec1")],
-        )
-        .await;
-
-        let table = TableReference::parse_str("orders");
-
-        // Try to add the same partition again.
-        add_partitions_with_retry(&store, &table, vec![pv("date", "2024-01-01")])
-            .await
-            .expect("should succeed (idempotent)");
-
-        let metadata = store
-            .get_table_metadata(&table)
-            .await
-            .expect("get")
-            .expect("exists");
-        assert_eq!(
-            metadata.partitions.len(),
-            1,
-            "Duplicate partition should not be added"
-        );
-        assert!(metadata.partitions[0].is_assigned_to("exec1"));
-    }
-}
-     &config,
             AssignmentLimit::PerCycleCap,
         );
         assert_eq!(

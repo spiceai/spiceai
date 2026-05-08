@@ -18,6 +18,7 @@ pub mod catalogs;
 pub mod chat;
 pub mod datasets;
 pub mod embeddings;
+pub mod functions;
 pub mod iceberg;
 pub mod inference;
 pub mod responses;
@@ -41,7 +42,10 @@ use crate::{
     component::dataset::Dataset,
     datafusion::{
         DataFusion,
-        query::{QueryBuilder, write_to_json_string, write_to_json_value},
+        query::{
+            Error as QueryError, QueryBuilder, is_cancellation_error, write_to_json_string,
+            write_to_json_value,
+        },
     },
     status::ComponentStatus,
 };
@@ -65,7 +69,8 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_auth::AuthPrincipalRef;
+use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
@@ -87,6 +92,41 @@ pub enum Format {
 
     /// CSV format
     Csv,
+}
+
+pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
+    principal
+        .groups()
+        .iter()
+        .any(|group| *group == "write" || *group == "read_write")
+}
+
+pub(crate) async fn current_principal_requires_read_only() -> bool {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
+        .is_some_and(|principal| !principal_has_write_access(principal))
+}
+
+pub(crate) async fn require_write_access() -> Option<Response> {
+    if current_principal_requires_read_only().await {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({ "message": "API key does not allow write access" })),
+            )
+                .into_response(),
+        )
+    } else {
+        None
+    }
+}
+
+fn status_for_sql_error(message: &str) -> StatusCode {
+    if message.contains("read-only SQL context") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_REQUEST
+    }
 }
 
 #[cfg(feature = "openapi")]
@@ -190,7 +230,7 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     }
 
     // Fallback: if not in runtime status, check if table exists
-    if df.table_exists(ds.name.clone()) {
+    if df.table_exists(&ds.name) {
         ComponentStatus::Ready
     } else {
         ComponentStatus::error()
@@ -203,14 +243,29 @@ pub async fn sql_to_http_response(
     sql: &str,
     parameters: Option<ParamValues>,
     format: ResponseMimeType,
+    read_only: bool,
 ) -> Response {
-    let (data, results_cache_status) = match run_sql(df, sql, parameters).await {
-        Ok((data, results_cache_status)) => (data, results_cache_status),
-        Err(e) => {
-            tracing::debug!("Error executing query: {e}");
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    };
+    let (data, results_cache_status) =
+        match run_sql_with_read_only(df, sql, parameters, read_only).await {
+            Ok((data, results_cache_status)) => (data, results_cache_status),
+            Err(e) => {
+                let message = e.to_string();
+                tracing::debug!("Error executing query: {message}");
+                let status = if e
+                    .downcast_ref::<datafusion::error::DataFusionError>()
+                    .is_some_and(is_cancellation_error)
+                    || e.downcast_ref::<QueryError>()
+                        .is_some_and(|err| matches!(err, QueryError::QueryCancelled { .. }))
+                {
+                    // 499 Client Closed Request: used for cancelled queries so
+                    // clients can distinguish cancellation from a bad request.
+                    StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
+                } else {
+                    status_for_sql_error(&message)
+                };
+                return (status, message).into_response();
+            }
+        };
 
     to_http_response(
         data,
@@ -228,8 +283,19 @@ pub async fn run_sql(
     sql: &str,
     parameters: Option<ParamValues>,
 ) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
+    run_sql_with_read_only(df, sql, parameters, false).await
+}
+
+// Runs query and returns the results as a vector of `RecordBatch`, enforcing read-only mode when requested.
+pub async fn run_sql_with_read_only(
+    df: Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<ParamValues>,
+    read_only: bool,
+) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
     let query_res = QueryBuilder::new(sql, df)
         .parameters(parameters)
+        .read_only(read_only)
         .build()
         .run()
         .await?;
@@ -298,9 +364,32 @@ fn attach_cache_headers(
         headers.insert("Results-Cache-Status", val);
     }
 
+    // Surface the cache scope so callers can tell whether a MISS came
+    // from per-user isolation (a coworker's cached entry is not visible)
+    // versus a true cold cache.
+    let cache_namespace = request_context.cache_namespace();
+    headers.insert(
+        "Results-Cache-Scope",
+        HeaderValue::from_static(cache_namespace.as_header_value()),
+    );
+
     // Tell CDN entry is unique per user cache key
     if user_key_specified {
-        headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
+        append_vary(headers, "Spice-Cache-Key");
+    }
+
+    // For per-user scope, additionally vary on every header that can
+    // identify a principal so an HTTP cache between Spice and the client
+    // never collapses entries belonging to different principals.
+    // - `Authorization` covers Bearer / Basic / future U2M flows.
+    // - `X-API-Key` is the header used by the API-key auth flow today;
+    //   without it shared proxies/CDNs would happily reuse Alice's
+    //   response for Bob.
+    // - `Cookie` covers any future session-cookie based auth.
+    if matches!(cache_namespace, CacheNamespace::Principal(_)) {
+        append_vary(headers, "Authorization");
+        append_vary(headers, "X-API-Key");
+        append_vary(headers, "Cookie");
     }
 
     // Add Cache-Control response header with stale-while-revalidate if configured
@@ -329,6 +418,29 @@ fn attach_cache_headers(
             }
         }
     }
+}
+
+/// Append `field` to the `Vary` response header, preserving any prior
+/// value(s). RFC 7231 §7.1.4 allows comma-separated field lists.
+pub(super) fn append_vary(headers: &mut HeaderMap, field: &'static str) {
+    use http::header::VARY;
+    if let Some(existing) = headers.get(VARY)
+        && let Ok(existing_str) = existing.to_str()
+    {
+        // Skip if already present.
+        if existing_str
+            .split(',')
+            .any(|f| f.trim().eq_ignore_ascii_case(field))
+        {
+            return;
+        }
+        let combined = format!("{existing_str}, {field}");
+        if let Ok(v) = HeaderValue::from_str(&combined) {
+            headers.insert(VARY, v);
+        }
+        return;
+    }
+    headers.insert(VARY, HeaderValue::from_static(field));
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.

@@ -82,10 +82,13 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
                     .start()
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
-                tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
             }
-            execute_spill_to_disk_and_rehydration(Arc::clone(&running_container), engine, db_file_path)
-                .await?;
+            execute_spill_to_disk_and_rehydration(
+                Arc::clone(&running_container),
+                engine,
+                db_file_path,
+            )
+            .await?;
         }
 
         running_container
@@ -114,14 +117,8 @@ async fn execute_spill_to_disk_and_rehydration(
 ) -> Result<(), anyhow::Error> {
     // retrieve number of rows using native mysql connection
     // this also ensures that federated dataset is available
-    let pool = get_mysql_conn(MYSQL_PORT)?;
-    let res: Vec<Row> = pool
-        .get_conn()
-        .await?
-        .exec("SELECT COUNT(*) FROM lineitem", Params::Empty)
-        .await?;
-    let num_rows: u64 = res[0].get(0).context("Unable to retrieve number of rows")?;
-    assert!(num_rows > 0);
+    let num_rows = get_lineitem_count().await?;
+    anyhow::ensure!(num_rows > 0, "lineitem table should contain rows");
 
     let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path);
     tracing::debug!(
@@ -163,10 +160,8 @@ async fn execute_spill_to_disk_and_rehydration(
     // ensure data has been loaded correctly
     assert_eq!(num_rows_loaded as u64, 10);
 
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     rt.shutdown().await;
     drop(rt);
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
     retry(retry_strategy, || async {
@@ -193,10 +188,8 @@ async fn execute_spill_to_disk_and_rehydration(
     let restart1_items_pretty =
         arrow::util::pretty::pretty_format_batches(&restart1_items).expect("pretty format");
     insta::assert_snapshot!("records", restart1_items_pretty);
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     rt.shutdown().await;
     drop(rt);
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Restart the runtime with updated app definition that includes primary key and indexes
     let rt = init_spice_app(engine, db_file_path, true).await?;
@@ -205,10 +198,8 @@ async fn execute_spill_to_disk_and_rehydration(
         arrow::util::pretty::pretty_format_batches(&restart2_items).expect("pretty format");
     insta::assert_snapshot!("records", restart2_items_pretty);
 
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     rt.shutdown().await;
     drop(rt);
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
     let rt = init_spice_app(engine, db_file_path, false).await?;
@@ -218,7 +209,34 @@ async fn execute_spill_to_disk_and_rehydration(
         arrow::util::pretty::pretty_format_batches(&restart3_items).expect("pretty format");
     insta::assert_snapshot!("records", restart3_items_pretty);
 
+    rt.shutdown().await;
+    drop(rt);
+
     Ok(())
+}
+
+async fn get_lineitem_count() -> Result<u64, anyhow::Error> {
+    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+    retry(retry_strategy, || async {
+        get_lineitem_count_once()
+            .await
+            .map_err(RetryError::transient)
+    })
+    .await
+}
+
+async fn get_lineitem_count_once() -> Result<u64, anyhow::Error> {
+    let pool = get_mysql_conn(MYSQL_PORT)?;
+    let mut conn = pool
+        .get_conn()
+        .await
+        .context("Unable to connect to MySQL lineitem database")?;
+    let num_rows: Option<u64> = conn
+        .exec_first("SELECT COUNT(*) FROM lineitem", Params::Empty)
+        .await
+        .context("Unable to count rows in lineitem")?;
+
+    num_rows.context("Unable to retrieve number of rows")
 }
 
 async fn get_locally_persisted_records(

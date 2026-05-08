@@ -21,3 +21,6 @@ runtime:
       enabled: true
       max_size: 1GiB # Default 128 MiB
       item_ttl: 1m # Default 1s
+  task_history:
+    enabled: true
+    captured_context: redacted
