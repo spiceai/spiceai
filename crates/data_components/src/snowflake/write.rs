@@ -596,10 +596,12 @@ fn scalar_to_u64(value: &ScalarValue) -> Option<u64> {
         ScalarValue::UInt64(Some(value)) => Some(*value),
         ScalarValue::Int8(Some(value)) => u64::try_from(*value).ok(),
         ScalarValue::Int16(Some(value)) => u64::try_from(*value).ok(),
-        ScalarValue::Int32(Some(value)) => u64::try_from(*value).ok(),
-        ScalarValue::Int64(Some(value)) => u64::try_from(*value).ok(),
-        ScalarValue::Decimal32(Some(value), _, 0) => u64::try_from(*value).ok(),
-        ScalarValue::Decimal64(Some(value), _, 0) => u64::try_from(*value).ok(),
+        ScalarValue::Int32(Some(value)) | ScalarValue::Decimal32(Some(value), _, 0) => {
+            u64::try_from(*value).ok()
+        }
+        ScalarValue::Int64(Some(value)) | ScalarValue::Decimal64(Some(value), _, 0) => {
+            u64::try_from(*value).ok()
+        }
         ScalarValue::Decimal128(Some(value), _, 0) => u64::try_from(*value).ok(),
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
@@ -675,10 +677,10 @@ fn scalar_to_sql_literal(value: ScalarValue, column: &str) -> Result<String> {
         ScalarValue::Float16(Some(value)) => finite_float_literal(f32::from(value), column),
         ScalarValue::Float32(Some(value)) => finite_float_literal(value, column),
         ScalarValue::Float64(Some(value)) => finite_float_literal(value, column),
-        ScalarValue::Decimal32(Some(value), _, scale) => Ok(decimal_to_sql_literal(value, scale)),
-        ScalarValue::Decimal64(Some(value), _, scale) => Ok(decimal_to_sql_literal(value, scale)),
-        ScalarValue::Decimal128(Some(value), _, scale) => Ok(decimal_to_sql_literal(value, scale)),
-        ScalarValue::Decimal256(Some(value), _, scale) => Ok(decimal_to_sql_literal(value, scale)),
+        ScalarValue::Decimal32(Some(value), _, scale) => Ok(decimal_to_sql_literal(&value, scale)),
+        ScalarValue::Decimal64(Some(value), _, scale) => Ok(decimal_to_sql_literal(&value, scale)),
+        ScalarValue::Decimal128(Some(value), _, scale) => Ok(decimal_to_sql_literal(&value, scale)),
+        ScalarValue::Decimal256(Some(value), _, scale) => Ok(decimal_to_sql_literal(&value, scale)),
         ScalarValue::Int8(Some(value)) => Ok(value.to_string()),
         ScalarValue::Int16(Some(value)) => Ok(value.to_string()),
         ScalarValue::Int32(Some(value)) => Ok(value.to_string()),
@@ -769,7 +771,7 @@ fn finite_float_literal(value: impl Into<f64>, column: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn decimal_to_sql_literal(value: impl ToString, scale: i8) -> String {
+fn decimal_to_sql_literal(value: &impl ToString, scale: i8) -> String {
     let raw = value.to_string();
     let Some(unsigned_digits) = raw.strip_prefix('-') else {
         return unsigned_decimal_to_sql_literal(&raw, scale, "");
@@ -935,9 +937,9 @@ mod tests {
 
     #[test]
     fn decimal_literal_preserves_scale() {
-        assert_eq!(decimal_to_sql_literal(12345, 2), "123.45");
-        assert_eq!(decimal_to_sql_literal(-42, 4), "-0.0042");
-        assert_eq!(decimal_to_sql_literal(42, -2), "4200");
+        assert_eq!(decimal_to_sql_literal(&12345, 2), "123.45");
+        assert_eq!(decimal_to_sql_literal(&-42, 4), "-0.0042");
+        assert_eq!(decimal_to_sql_literal(&42, -2), "4200");
     }
 
     #[test]
