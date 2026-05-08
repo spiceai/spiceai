@@ -78,6 +78,15 @@ pub enum Error {
 
     #[snafu(display("Received empty batch from Kafka topic. The consumer will retry."))]
     EmptyBatch,
+
+    #[snafu(display(
+        "Received Kafka message without payload from topic '{topic}', partition {partition}, offset {offset}"
+    ))]
+    MessageMissingPayload {
+        topic: String,
+        partition: i32,
+        offset: i64,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -689,11 +698,11 @@ impl Kafka {
                 }
 
                 let change_batch =
-                    messages_to_change_batch(&messages, flatten_json.as_ref(), &schema);
+                    messages_to_change_batch(&messages, flatten_json.as_ref(), &schema)?;
 
                 let committer = MessageBatchCommitter::from_borrowed_messages(consumer, &messages);
 
-                change_batch.map(|rb| ChangeEnvelope::new(Box::new(committer), rb, true))
+                Ok(ChangeEnvelope::new(Box::new(committer), change_batch, true))
             });
 
         Box::pin(inject_ready_signal_on_caught_up(
@@ -709,10 +718,14 @@ fn messages_to_change_batch(
     flatten_json: Option<&String>,
     schema: &Arc<Schema>,
 ) -> Result<ChangeBatch, cdc::StreamError> {
+    let payloads = messages
+        .iter()
+        .map(message_payload)
+        .collect::<Result<Vec<_>, _>>()?;
+
     if let Some(delimiter) = flatten_json {
-        let values = messages
-            .iter()
-            .filter_map(Message::payload)
+        let values = payloads
+            .into_iter()
             .map(|payload| {
                 serde_json::from_slice::<Value>(payload).map_err(|e| {
                     cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
@@ -722,7 +735,17 @@ fn messages_to_change_batch(
         return values_to_change_batch(values.iter(), Some(delimiter), schema);
     }
 
-    payloads_to_change_batch(messages.iter().filter_map(Message::payload), schema)
+    payloads_to_change_batch(payloads.into_iter(), schema)
+}
+
+fn message_payload<'a>(message: &'a BorrowedMessage<'_>) -> Result<&'a [u8], cdc::StreamError> {
+    message.payload().ok_or_else(|| {
+        cdc::StreamError::Kafka(Error::MessageMissingPayload {
+            topic: message.topic().to_string(),
+            partition: message.partition(),
+            offset: message.offset(),
+        })
+    })
 }
 
 fn payloads_to_change_batch<'a>(

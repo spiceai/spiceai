@@ -913,17 +913,23 @@ async fn join_pending_commit(
     tokio::select! {
         result = &mut handle => {
             match result {
+                Err(e) if e.is_panic() => {
+                    let error_message =
+                        format!("CDC commit task for {dataset_name} panicked: {e}");
+                    tracing::error!("{error_message}");
+                    Some(error_message)
+                }
                 Err(e) if e.is_cancelled() && is_shutdown => {
                     tracing::debug!("CDC commit task for {dataset_name} was cancelled (likely shutdown)");
                     None
                 }
-                Err(e) if !is_shutdown => {
+                Err(e) => {
                     let error_message =
                         format!("CDC commit task for {dataset_name} ended unexpectedly: {e}");
                     tracing::error!("{error_message}");
                     Some(error_message)
                 }
-                Ok(()) | Err(_) => None,
+                Ok(()) => None,
             }
         }
         () = tokio::time::sleep(commit_timeout) => {
@@ -2056,6 +2062,38 @@ mod tests {
         .expect("must not hang on empty stream");
         res.expect("must return Ok on empty stream");
         assert!(log.ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_join_pending_commit_reports_panic_during_shutdown() {
+        let dataset_name = TableReference::bare("test");
+        let handle = tokio::spawn(async {
+            panic!("synthetic commit panic");
+        });
+
+        let error_message =
+            join_pending_commit(handle, &dataset_name, true, Duration::from_secs(5))
+                .await
+                .expect("panic must be reported even during shutdown");
+
+        assert!(
+            error_message.contains("CDC commit task for test panicked"),
+            "unexpected error message: {error_message}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_join_pending_commit_ignores_cancel_during_shutdown() {
+        let dataset_name = TableReference::bare("test");
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+
+        let result = join_pending_commit(handle, &dataset_name, true, Duration::from_secs(5)).await;
+
+        assert!(
+            result.is_none(),
+            "cancelled commit task should be ignored during shutdown"
+        );
     }
 
     // -- Correctness: dataset-ready signaling ---------------------------------

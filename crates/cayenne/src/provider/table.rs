@@ -1453,16 +1453,7 @@ impl CayenneTableProvider {
         let protected_snapshots =
             Self::load_protected_snapshots(Arc::clone(&catalog), &table_id, &pk_deletion_strategy)
                 .await?;
-        let inlined_row_count = match catalog.get_inlined_data_count(&table_id).await {
-            Ok(count) => count,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load inlined row count for table {}; starting cached count at 0: {e}",
-                    table_metadata.table_name,
-                );
-                0
-            }
-        };
+        let inlined_row_count = catalog.get_inlined_data_count(&table_id).await?;
 
         // Register the S3 object store in the shared RuntimeEnv once during
         // construction. Every code path that creates a SessionContext from
