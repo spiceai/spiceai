@@ -358,9 +358,11 @@ impl CayenneDataSink {
                 .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
                 .await?;
 
-            self.apply_retention_if_configured().await?;
-            self.sort_if_configured().await?;
-            self.table.refresh_listing_table()?;
+            let retention_deleted_rows = self.apply_retention_if_configured().await?;
+            let sorted = self.sort_if_configured().await?;
+            if retention_deleted_rows > 0 || sorted {
+                self.table.refresh_listing_table()?;
+            }
             self.table.persist_table_stats(&stats_acc).await;
 
             return Ok(rows);
@@ -436,18 +438,20 @@ impl CayenneDataSink {
             self.table.refresh_listing_table()?;
         }
 
-        // Apply retention filters, sort, and refresh listing table.
-        self.apply_retention_if_configured().await?;
+        let retention_deleted_rows = self.apply_retention_if_configured().await?;
 
         // Sort operates on the listing table data (the complete corpus after retention),
         // ensuring optimal zone maps with non-overlapping min/max ranges.
         // Uses DataFusion's SortExec with automatic disk spilling for large datasets,
         // streaming external merge sort, and SIMD-optimized kernels.
-        self.sort_if_configured().await?;
+        let sorted = self.sort_if_configured().await?;
 
-        // Refresh the listing table to pick up new/rewritten files and update statistics,
-        // so subsequent query plans see the latest data.
-        self.table.refresh_listing_table()?;
+        // Staged appends refresh the listing table during WAL finalization, and
+        // new-snapshot writes refresh it immediately above. Refresh again only
+        // when a post-write operation can change file visibility/statistics.
+        if retention_deleted_rows > 0 || sorted {
+            self.table.refresh_listing_table()?;
+        }
 
         // Persist table-level column statistics to the metastore (best-effort).
         self.table.persist_table_stats(&write_stats_acc).await;
@@ -458,9 +462,9 @@ impl CayenneDataSink {
     }
 
     /// Apply retention filters if configured on the table.
-    async fn apply_retention_if_configured(&self) -> super::Result<()> {
+    async fn apply_retention_if_configured(&self) -> super::Result<u64> {
         if !self.table.has_retention_filters() {
-            return Ok(());
+            return Ok(0);
         }
 
         let deleted = self.table.apply_retention_filters().await?;
@@ -476,18 +480,18 @@ impl CayenneDataSink {
                 self.table.table_name()
             );
         }
-        Ok(())
+        Ok(deleted)
     }
 
     /// Sort and rewrite data if `sort_columns` is configured.
-    async fn sort_if_configured(&self) -> super::Result<()> {
+    async fn sort_if_configured(&self) -> super::Result<bool> {
         if !self.context.has_sort_columns() {
-            return Ok(());
+            return Ok(false);
         }
 
         let target_size_bytes = self.context.target_file_size_bytes();
         self.table.sort_and_rewrite_data(target_size_bytes).await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Handles overwrite mode writes by creating a new snapshot:

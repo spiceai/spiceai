@@ -43,7 +43,7 @@ use futures::{StreamExt, stream};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -1005,7 +1005,7 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
     let mut sub_batches = Vec::new();
     let mut current_batch_indices = Vec::new();
     let mut current_op_type: Option<ChangeOperationType> = None;
-    let mut seen_primary_keys: HashSet<u64, BuildHasherDefault<twox_hash::XxHash3_64>> =
+    let mut seen_primary_keys: HashSet<Vec<u8>, BuildHasherDefault<twox_hash::XxHash3_64>> =
         HashSet::default();
     let has_pks = !pk_col_indices.is_empty();
 
@@ -1013,14 +1013,14 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
         let op = change_batch.op(row_id);
         let op_type = ChangeOperationType::from_operation(&op);
 
-        let primary_key_hash = if has_pks {
-            hash_primary_key(&data_batch, &pk_col_indices, row_id)
+        let primary_key = if has_pks {
+            encode_primary_key(&data_batch, &pk_col_indices, row_id)
         } else {
-            0
+            Vec::new()
         };
 
         let should_split = if let Some(current_type) = current_op_type {
-            current_type != op_type || (has_pks && seen_primary_keys.contains(&primary_key_hash))
+            current_type != op_type || (has_pks && seen_primary_keys.contains(&primary_key))
         } else {
             false
         };
@@ -1040,7 +1040,7 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
 
         current_batch_indices.push(row_id);
         if has_pks {
-            seen_primary_keys.insert(primary_key_hash);
+            seen_primary_keys.insert(primary_key);
         }
     }
 
@@ -1053,142 +1053,159 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
     sub_batches
 }
 
-fn hash_primary_key(data_batch: &RecordBatch, pk_col_indices: &[usize], row_id: usize) -> u64 {
-    let mut hasher = twox_hash::XxHash3_64::default();
+fn encode_primary_key(
+    data_batch: &RecordBatch,
+    pk_col_indices: &[usize],
+    row_id: usize,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(pk_col_indices.len().saturating_mul(16));
     for &col_idx in pk_col_indices {
-        col_idx.hash(&mut hasher);
-        hash_array_value(data_batch.column(col_idx).as_ref(), row_id, &mut hasher);
+        key.extend_from_slice(&col_idx.to_le_bytes());
+        encode_array_value(data_batch.column(col_idx).as_ref(), row_id, &mut key);
     }
-    hasher.finish()
+    key
 }
 
-macro_rules! hash_primitive_value {
-    ($array:expr, $row_id:expr, $array_type:ty, $hasher:expr) => {{
+macro_rules! encode_primitive_value {
+    ($array:expr, $row_id:expr, $array_type:ty, $key:expr) => {{
         if let Some(array) = $array.as_any().downcast_ref::<$array_type>() {
-            array.value($row_id).hash($hasher);
+            $key.extend_from_slice(&array.value($row_id).to_le_bytes());
             return;
         }
     }};
 }
 
-fn hash_array_value(array: &dyn Array, row_id: usize, hasher: &mut impl Hasher) {
+fn encode_bytes(bytes: &[u8], key: &mut Vec<u8>) {
+    key.extend_from_slice(&bytes.len().to_le_bytes());
+    key.extend_from_slice(bytes);
+}
+
+fn encode_array_value(array: &dyn Array, row_id: usize, key: &mut Vec<u8>) {
     if array.is_null(row_id) {
-        0u8.hash(hasher);
+        key.push(0);
         return;
     }
-    1u8.hash(hasher);
+    key.push(1);
 
     match array.data_type() {
         DataType::Boolean => {
-            hash_primitive_value!(array, row_id, arrow::array::BooleanArray, hasher);
+            if let Some(array) = array.as_any().downcast_ref::<arrow::array::BooleanArray>() {
+                key.push(u8::from(array.value(row_id)));
+                return;
+            }
         }
         DataType::Int8 => {
-            hash_primitive_value!(array, row_id, arrow::array::Int8Array, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::Int8Array, key);
         }
         DataType::Int16 => {
-            hash_primitive_value!(array, row_id, arrow::array::Int16Array, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::Int16Array, key);
         }
         DataType::Int32 => {
-            hash_primitive_value!(array, row_id, Int32Array, hasher);
+            encode_primitive_value!(array, row_id, Int32Array, key);
         }
         DataType::Int64 => {
-            hash_primitive_value!(array, row_id, Int64Array, hasher);
+            encode_primitive_value!(array, row_id, Int64Array, key);
         }
         DataType::UInt8 => {
-            hash_primitive_value!(array, row_id, arrow::array::UInt8Array, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::UInt8Array, key);
         }
         DataType::UInt16 => {
-            hash_primitive_value!(array, row_id, arrow::array::UInt16Array, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::UInt16Array, key);
         }
         DataType::UInt32 => {
-            hash_primitive_value!(array, row_id, UInt32Array, hasher);
+            encode_primitive_value!(array, row_id, UInt32Array, key);
         }
         DataType::UInt64 => {
-            hash_primitive_value!(array, row_id, arrow::array::UInt64Array, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::UInt64Array, key);
         }
         DataType::Float32 => {
             if let Some(array) = array.as_any().downcast_ref::<arrow::array::Float32Array>() {
-                array.value(row_id).to_bits().hash(hasher);
+                key.extend_from_slice(&array.value(row_id).to_bits().to_le_bytes());
                 return;
             }
         }
         DataType::Float64 => {
             if let Some(array) = array.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                array.value(row_id).to_bits().hash(hasher);
+                key.extend_from_slice(&array.value(row_id).to_bits().to_le_bytes());
                 return;
             }
         }
         DataType::Utf8 => {
-            hash_primitive_value!(array, row_id, StringArray, hasher);
+            if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+                encode_bytes(array.value(row_id).as_bytes(), key);
+                return;
+            }
         }
         DataType::LargeUtf8 => {
-            hash_primitive_value!(array, row_id, arrow::array::LargeStringArray, hasher);
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+            {
+                encode_bytes(array.value(row_id).as_bytes(), key);
+                return;
+            }
         }
         DataType::Date32 => {
-            hash_primitive_value!(array, row_id, arrow::array::Date32Array, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::Date32Array, key);
         }
         DataType::Date64 => {
-            hash_primitive_value!(array, row_id, arrow::array::Date64Array, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::Date64Array, key);
         }
         DataType::Time32(_) => {
             if let Some(array) = array
                 .as_any()
                 .downcast_ref::<arrow::array::Time32SecondArray>()
             {
-                array.value(row_id).hash(hasher);
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
                 return;
             }
-            hash_primitive_value!(array, row_id, arrow::array::Time32MillisecondArray, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::Time32MillisecondArray, key);
         }
         DataType::Time64(_) => {
             if let Some(array) = array
                 .as_any()
                 .downcast_ref::<arrow::array::Time64MicrosecondArray>()
             {
-                array.value(row_id).hash(hasher);
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
                 return;
             }
-            hash_primitive_value!(array, row_id, arrow::array::Time64NanosecondArray, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::Time64NanosecondArray, key);
         }
         DataType::Timestamp(_, _) => {
             if let Some(array) = array
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampSecondArray>()
             {
-                array.value(row_id).hash(hasher);
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
                 return;
             }
             if let Some(array) = array
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampMillisecondArray>()
             {
-                array.value(row_id).hash(hasher);
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
                 return;
             }
             if let Some(array) = array
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
             {
-                array.value(row_id).hash(hasher);
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
                 return;
             }
-            hash_primitive_value!(
-                array,
-                row_id,
-                arrow::array::TimestampNanosecondArray,
-                hasher
-            );
+            encode_primitive_value!(array, row_id, arrow::array::TimestampNanosecondArray, key);
         }
         DataType::Decimal128(_, _) => {
-            hash_primitive_value!(array, row_id, arrow::array::Decimal128Array, hasher);
+            encode_primitive_value!(array, row_id, arrow::array::Decimal128Array, key);
         }
         _ => {}
     }
 
     if let Ok(value) = arrow::util::display::array_value_to_string(array, row_id) {
-        value.hash(hasher);
+        key.push(0xfe);
+        encode_bytes(value.as_bytes(), key);
     } else {
-        0xffu8.hash(hasher);
+        key.push(0xff);
     }
 }
 

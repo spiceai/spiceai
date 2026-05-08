@@ -1737,24 +1737,16 @@ impl TursoDataSink {
 
             while let Some(batch) = data.next().await {
                 let batch = batch?;
-                total_rows += batch.num_rows() as u64;
+                total_rows += u64::try_from(batch.num_rows()).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Unable to convert batch row count to u64: {e}"
+                    ))
+                })?;
 
-                for row_idx in 0..batch.num_rows() {
-                    let mut values = Vec::with_capacity(batch.num_columns());
-                    for col_idx in 0..batch.num_columns() {
-                        let column = batch.column(col_idx);
-                        let value = ScalarValue::try_from_array(column, row_idx)?;
-                        let turso_value =
-                            scalar_value_to_turso(value, self.pool.timestamp_format())
-                                .map_err(DataFusionError::External)?;
-                        values.push(turso_value);
-                    }
-
-                    stmt.execute(values)
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                }
+                self.execute_insert_batch(&mut stmt, &batch).await?;
             }
+
+            drop(stmt);
 
             conn.execute(COMMIT_SQL, ())
                 .await
@@ -1771,43 +1763,78 @@ impl TursoDataSink {
         write_result
     }
 
-    /// Inserts a batch of records into the Turso database
-    async fn insert_batch(
+    async fn append_all(
         &self,
-        batch: &RecordBatch,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-
-        let conn = self.pool.connect().await?;
+        mut data: SendableRecordBatchStream,
+    ) -> datafusion::error::Result<u64> {
+        let conn = self
+            .pool
+            .connect()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let insert_sql = self.insert_sql();
 
-        // Use a transaction to batch all inserts
-        // BEGIN CONCURRENT improves write concurrency on Turso in MVCC mode.
-        conn.execute(BEGIN_CONCURRENT_SQL, ()).await?;
+        let write_result = async {
+            conn.execute(BEGIN_CONCURRENT_SQL, ())
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Prepare the statement once
-        let mut stmt = conn.prepare(&insert_sql).await?;
+            let mut stmt = conn
+                .prepare(&insert_sql)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Execute for each row using prepared statement (much faster than building SQL strings)
+            let mut total_rows = 0u64;
+
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                total_rows += u64::try_from(batch.num_rows()).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Unable to convert batch row count to u64: {e}"
+                    ))
+                })?;
+
+                self.execute_insert_batch(&mut stmt, &batch).await?;
+            }
+
+            drop(stmt);
+
+            conn.execute(COMMIT_SQL, ())
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            Ok(total_rows)
+        }
+        .await;
+
+        if write_result.is_err() {
+            Self::rollback_write(&conn).await;
+        }
+
+        write_result
+    }
+
+    /// Inserts a batch of records using an already-open Turso transaction.
+    async fn execute_insert_batch(
+        &self,
+        stmt: &mut turso::Statement,
+        batch: &RecordBatch,
+    ) -> datafusion::error::Result<()> {
         for row_idx in 0..batch.num_rows() {
-            let mut values = Vec::new();
+            let mut values = Vec::with_capacity(batch.num_columns());
             for col_idx in 0..batch.num_columns() {
                 let column = batch.column(col_idx);
                 let value = ScalarValue::try_from_array(column, row_idx)?;
 
-                // Convert DataFusion ScalarValue to Turso Value
-                let turso_value = scalar_value_to_turso(value, self.pool.timestamp_format())?;
+                let turso_value = scalar_value_to_turso(value, self.pool.timestamp_format())
+                    .map_err(DataFusionError::External)?;
                 values.push(turso_value);
             }
 
-            // Execute the prepared statement with parameters (fast!)
-            stmt.execute(values).await?;
+            stmt.execute(values)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
         }
-
-        // Commit the transaction
-        conn.execute(COMMIT_SQL, ()).await?;
 
         Ok(())
     }
@@ -1836,17 +1863,7 @@ impl DataSink for TursoDataSink {
             return self.overwrite_all(data).await;
         }
 
-        let mut total_rows = 0u64;
-
-        while let Some(batch) = data.next().await {
-            let batch = batch?;
-            total_rows += batch.num_rows() as u64;
-            self.insert_batch(&batch)
-                .await
-                .map_err(datafusion::error::DataFusionError::External)?;
-        }
-
-        Ok(total_rows)
+        self.append_all(data).await
     }
 }
 

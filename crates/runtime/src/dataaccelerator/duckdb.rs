@@ -20,7 +20,7 @@ use crate::{
     component::{
         dataset::{
             Dataset,
-            acceleration::{Acceleration, Engine, Mode},
+            acceleration::{Acceleration, Engine, Mode, RefreshMode},
         },
         view::View,
     },
@@ -446,6 +446,17 @@ impl DataAccelerator for DuckDBAccelerator {
             cmd.options.insert(
                 "recompute_statistics_on_write".to_string(),
                 recompute_statistics_on_write,
+            );
+        }
+
+        let is_changes_refresh = source
+            .and_then(|src| src.acceleration())
+            .and_then(|acceleration| acceleration.refresh_mode)
+            .is_some_and(|refresh_mode| refresh_mode == RefreshMode::Changes);
+        if is_changes_refresh && !cmd.options.contains_key("recompute_statistics_on_write") {
+            cmd.options.insert(
+                "recompute_statistics_on_write".to_string(),
+                "false".to_string(),
             );
         }
 
