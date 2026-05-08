@@ -25,8 +25,9 @@ use crate::error::{self, HttpRequestSnafu, Result};
 use crate::types::{
     ApiKeysResponse, App, AppsResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
     CreateAppRequest, CreateDeploymentRequest, Deployment, DeploymentsResponse, LogsResponse,
-    MetricsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse,
-    RollbackRequest, Secret, SecretsResponse, SetSecretRequest, UpdateAppRequest,
+    MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, RegenerateApiKeyRequest,
+    RegenerateApiKeyResponse, RegionsResponse, RollbackRequest, Secret, SecretsResponse,
+    SetSecretRequest, UpdateAppRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -105,7 +106,7 @@ impl CloudClient {
     pub fn get_auth_url(&self, auth_code: &str) -> String {
         format!(
             "{}/v1/auth/device?code={}",
-            self.base_url.replace("api.", ""),
+            self.oauth_base_url(),
             auth_code
         )
     }
@@ -140,6 +141,53 @@ impl CloudClient {
 
         let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;
         Ok(Some(body))
+    }
+
+    /// Returns the base URL for OAuth endpoints by stripping the API host segment.
+    /// For example, `https://api.spice.ai` → `https://spice.ai`,
+    /// `https://dev-api.spice.ai` → `https://dev.spice.ai`,
+    /// and `https://staging.api.spice.ai` → `https://staging.spice.ai`.
+    fn oauth_base_url(&self) -> String {
+        let Ok(mut url) = reqwest::Url::parse(&self.base_url) else {
+            return self.base_url.clone();
+        };
+
+        let Some(host) = url.host_str() else {
+            return self.base_url.clone();
+        };
+
+        let Some(rewritten_host) = oauth_host(host) else {
+            return self.base_url.clone();
+        };
+
+        if url.set_host(Some(&rewritten_host)).is_err() {
+            return self.base_url.clone();
+        }
+
+        url.to_string().trim_end_matches('/').to_string()
+    }
+
+    /// Exchange `OAuth2` client credentials for an access token.
+    pub async fn exchange_client_credentials(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<OAuthTokenResponse> {
+        let url = format!("{}/api/oauth/token", self.oauth_base_url());
+        let body = OAuthTokenRequest {
+            client_id,
+            client_secret,
+            grant_type: "client_credentials",
+        };
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
     }
 
     /// Get the authentication context for the current token.
@@ -584,5 +632,50 @@ fn body_or<'a>(fallback: &'a str, body: &'a str) -> &'a str {
         fallback
     } else {
         body
+    }
+}
+
+fn oauth_host(host: &str) -> Option<String> {
+    let mut labels: Vec<&str> = host.split('.').collect();
+
+    if let Some(api_index) = labels.iter().position(|label| *label == "api") {
+        labels.remove(api_index);
+    } else if let Some(label) = labels.iter_mut().find(|label| label.ends_with("-api")) {
+        *label = label.trim_end_matches("-api");
+    } else {
+        return None;
+    }
+
+    let rewritten_host = labels.join(".");
+    if rewritten_host.is_empty() || labels.iter().any(|label| label.is_empty()) {
+        return None;
+    }
+
+    Some(rewritten_host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CloudClient;
+
+    #[test]
+    fn oauth_base_url_rewrites_api_hosts() {
+        let cases = [
+            ("https://api.spice.ai", "https://spice.ai"),
+            ("https://api.spice.ai/", "https://spice.ai"),
+            ("https://dev-api.spice.ai", "https://dev.spice.ai"),
+            ("https://staging.api.spice.ai", "https://staging.spice.ai"),
+        ];
+
+        for (base_url, expected) in cases {
+            let client = CloudClient::new(base_url).expect("cloud client should build");
+            assert_eq!(client.oauth_base_url(), expected);
+        }
+    }
+
+    #[test]
+    fn oauth_base_url_leaves_non_api_hosts_unchanged() {
+        let client = CloudClient::new("https://localhost:8090").expect("cloud client should build");
+        assert_eq!(client.oauth_base_url(), "https://localhost:8090");
     }
 }

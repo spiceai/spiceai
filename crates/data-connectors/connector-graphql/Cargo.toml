@@ -34,5 +34,9 @@ snafu.workspace = true
 token_provider = { path = "../../token_provider" }
 url.workspace = true
 
+[dev-dependencies]
+app = { path = "../../app" }
+tokio.workspace = true
+
 [features]
 default = []

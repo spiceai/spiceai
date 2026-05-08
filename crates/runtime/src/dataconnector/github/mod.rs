@@ -77,7 +77,9 @@ mod stargazers;
 mod workflow_runs;
 mod workflows;
 
-static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
+type GitHubConcurrencyLimits = HashMap<String, (usize, Arc<Semaphore>)>;
+
+static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<GitHubConcurrencyLimits>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
@@ -767,6 +769,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("workflow_logs")
         .description("Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run. Defaults to 'disabled'.")
         .default("disabled"),
+    ParameterSpec::runtime("max_concurrent_requests")
+        .description("Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.params.github_max_concurrent_connections or the connector default."),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -801,7 +805,45 @@ impl DataConnectorFactory for GithubFactory {
             .ok()
             .map(ToString::to_string);
 
-        let max_concurrent_connections = params
+        let connector_component = params.component.clone();
+
+        let dataset_max_concurrent_requests = match params
+            .parameters
+            .get("max_concurrent_requests")
+            .expose()
+            .ok()
+            .map(str::trim)
+        {
+            Some("") | None => None,
+            Some(value) => match value.parse::<usize>() {
+                Ok(0) => {
+                    let error = DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component,
+                        message: format!(
+                            "The '{}' parameter must be greater than 0.",
+                            params.parameters.user_param("max_concurrent_requests")
+                        ),
+                    };
+                    return Box::pin(async move { Err(Box::new(error) as _) });
+                }
+                Ok(value) => Some(value),
+                Err(source) => {
+                    let error = DataConnectorError::InvalidConfiguration {
+                        dataconnector: "github".to_string(),
+                        message: format!(
+                            "The '{}' parameter must be a positive integer.",
+                            params.parameters.user_param("max_concurrent_requests")
+                        ),
+                        connector_component,
+                        source: source.into(),
+                    };
+                    return Box::pin(async move { Err(Box::new(error) as _) });
+                }
+            },
+        };
+
+        let app_max_concurrent_connections = params
             .app
             .and_then(|app| {
                 app.runtime
@@ -810,6 +852,10 @@ impl DataConnectorFactory for GithubFactory {
                     .cloned()
             })
             .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0);
+
+        let max_concurrent_connections = dataset_max_concurrent_requests
+            .or(app_max_concurrent_connections)
             .unwrap_or(GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS);
 
         Box::pin(async move {
@@ -839,11 +885,27 @@ impl DataConnectorFactory for GithubFactory {
 
             let semaphore = if let Some(key) = semaphore_key {
                 let mut limits = GITHUB_CONCURRENCY_LIMITS.lock().await;
-                Arc::clone(
-                    limits
-                        .entry(key)
-                        .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent_connections))),
-                )
+                match limits.get(&key) {
+                    Some((existing_limit, semaphore))
+                        if *existing_limit == max_concurrent_connections =>
+                    {
+                        Arc::clone(semaphore)
+                    }
+                    Some((existing_limit, _)) => {
+                        return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                            dataconnector: "github".to_string(),
+                            connector_component,
+                            message: format!(
+                                "Multiple GitHub datasets share the same authentication context with different concurrency limits ({existing_limit} and {max_concurrent_connections}). Use the same max_concurrent_requests value for datasets sharing a GitHub token or installation."
+                            ),
+                        }) as _);
+                    }
+                    None => {
+                        let semaphore = Arc::new(Semaphore::new(max_concurrent_connections));
+                        limits.insert(key, (max_concurrent_connections, Arc::clone(&semaphore)));
+                        semaphore
+                    }
+                }
             } else {
                 Arc::new(Semaphore::new(max_concurrent_connections))
             };
@@ -1776,7 +1838,75 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_github_path, sanitize_github_validation_body};
+    use super::{GithubFactory, PARAMETERS, parse_github_path, sanitize_github_validation_body};
+    use crate::Runtime;
+    use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataconnector::{
+        ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
+    };
+    use crate::parameters::Parameters;
+    use runtime_secrets::Secrets;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn github_connector_params(
+        dataset_name: &str,
+        token: &str,
+        extra: &[(&str, &str)],
+    ) -> ConnectorParams {
+        let mut params = vec![("github_token".to_string(), token.to_string().into())];
+        params.extend(
+            extra
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string().into())),
+        );
+
+        let parameters = Parameters::try_new(
+            "connector github",
+            params,
+            "github",
+            Arc::new(RwLock::new(Secrets::default())),
+            PARAMETERS,
+        )
+        .await
+        .expect("test GitHub parameters should be valid");
+
+        let app = app::AppBuilder::new(dataset_name.to_string()).build();
+        let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
+        let app = Arc::new(app);
+        let dataset = DatasetBuilder::try_new(
+            "github:github.com/spiceai/spiceai/issues".to_string(),
+            dataset_name,
+        )
+        .expect("test GitHub dataset should be valid")
+        .with_app(Arc::clone(&app))
+        .with_runtime(Arc::clone(&runtime))
+        .build()
+        .expect("test GitHub dataset should build");
+
+        ConnectorParams {
+            parameters,
+            unsupported_type_action: None,
+            component: ConnectorComponent::from(&dataset),
+            app: Some(app),
+            runtime: Some(runtime),
+            io_runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn expect_invalid_configuration_message(
+        error: Box<dyn std::error::Error + Send + Sync>,
+    ) -> String {
+        let error = error
+            .downcast::<DataConnectorError>()
+            .expect("error should be a DataConnectorError");
+
+        match *error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. }
+            | DataConnectorError::InvalidConfiguration { message, .. } => message,
+            other => panic!("expected GitHub invalid configuration error, got: {other}"),
+        }
+    }
 
     #[test]
     fn test_sanitize_github_validation_body_normalizes_crlf() {
@@ -1806,5 +1936,58 @@ mod tests {
         assert_eq!(parsed.repo, Some("spiceai"));
         assert_eq!(parsed.resource_type, "files");
         assert!(parsed.remaining.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_github_rejects_invalid_max_concurrent_requests() {
+        let params = github_connector_params(
+            "github_invalid_concurrency",
+            "github-invalid-concurrency-token",
+            &[("max_concurrent_requests", "0")],
+        )
+        .await;
+
+        let Err(error) = GithubFactory::new().create(params).await else {
+            panic!("zero GitHub max_concurrent_requests should be rejected");
+        };
+        let message = expect_invalid_configuration_message(error);
+
+        assert!(
+            message.contains("must be greater than 0"),
+            "expected zero-limit validation error, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_github_rejects_conflicting_shared_auth_concurrency_limits() {
+        let factory = GithubFactory::new();
+        let token = "github-conflicting-concurrency-token";
+
+        let first = github_connector_params(
+            "github_conflicting_concurrency_first",
+            token,
+            &[("max_concurrent_requests", "2")],
+        )
+        .await;
+        factory
+            .create(first)
+            .await
+            .expect("first GitHub connector should be created");
+
+        let second = github_connector_params(
+            "github_conflicting_concurrency_second",
+            token,
+            &[("max_concurrent_requests", "3")],
+        )
+        .await;
+        let Err(error) = factory.create(second).await else {
+            panic!("conflicting GitHub concurrency limits should be rejected");
+        };
+        let message = expect_invalid_configuration_message(error);
+
+        assert!(
+            message.contains("different concurrency limits"),
+            "expected shared auth concurrency conflict, got: {message}"
+        );
     }
 }

@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use std::sync::Arc;
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
-    common::tree_node::TreeNode,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::LogicalPlan,
     physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
@@ -71,10 +71,18 @@ impl SQLExecutor for FlightSQLTable {
 
     fn can_execute_plan(&self, logical_plan: &LogicalPlan) -> bool {
         // FlightSQL federation currently cannot safely unparse arbitrary custom
-        // extension nodes. If any are present in the subtree, do not federate.
-        !logical_plan
-            .exists(|p| Ok(matches!(p, LogicalPlan::Extension(_))))
-            .unwrap_or(false)
+        // extension nodes. If any are present in the subtree — including inside
+        // subquery expressions (IN, EXISTS, scalar subqueries) — do not federate.
+        let mut found = false;
+        let _ = logical_plan.apply_with_subqueries(|p| {
+            if matches!(p, LogicalPlan::Extension(_)) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        });
+        !found
     }
 
     fn execute(

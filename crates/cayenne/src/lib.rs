@@ -70,6 +70,7 @@ pub(crate) mod schema;
 pub mod stats;
 
 pub use catalog::MetadataCatalog;
+pub use catalog::{CatalogError, CatalogResult};
 pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };

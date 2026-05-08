@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+#![recursion_limit = "256"]
 
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
@@ -36,10 +37,9 @@ use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
-use crate::component::dataset::Load;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::datafusion::DataFusion;
 use crate::datafusion::error::format_datafusion_error;
-use crate::datafusion::{DataFusion, OnDemandTableLoader};
 use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
@@ -476,7 +476,7 @@ pub enum Error {
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
 const CLUSTER_SCHEDULER_REGISTRY: &str = "cluster_scheduler_registry";
-const CLUSTER_PARTITION_MANAGEMENT_TASK: &str = "cluster_partition_management_task";
+const CLUSTER_PARTITION_ASSIGNMENT_TASK: &str = "cluster_partition_assignment_task";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
@@ -500,6 +500,7 @@ pub struct Runtime {
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     /// Per-model rate controllers for AI UDF concurrency control.
     model_rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
     // LLMs that support the OpenAI Responses API
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
@@ -539,11 +540,6 @@ pub struct Runtime {
 
     config: Arc<Config>,
 
-    /// Datasets configured with `load: on_demand` that have not been loaded yet.
-    on_demand_datasets: Arc<RwLock<HashMap<TableReference, Arc<component::dataset::Dataset>>>>,
-    /// Per-dataset locks to ensure concurrent triggers only load a dataset once.
-    on_demand_load_locks: Arc<Mutex<HashMap<TableReference, Arc<Mutex<()>>>>>,
-
     /// Shared semaphore that bounds concurrent dataset schema inference
     /// (`read_provider`) calls so that startup loads and on-demand loads both
     /// honor `runtime.dataset_load_parallelism`.
@@ -577,13 +573,6 @@ impl Runtime {
     #[must_use]
     pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
-    }
-
-    #[must_use]
-    pub fn on_demand_datasets(
-        &self,
-    ) -> Arc<RwLock<HashMap<TableReference, Arc<component::dataset::Dataset>>>> {
-        Arc::clone(&self.on_demand_datasets)
     }
 
     #[must_use]
@@ -631,6 +620,13 @@ impl Runtime {
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         Arc::clone(&self.model_rate_controllers)
+    }
+
+    #[must_use]
+    pub fn http_rate_control_registry(
+        &self,
+    ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+        Arc::clone(&self.http_rate_control_registry)
     }
 
     #[must_use]
@@ -1246,12 +1242,8 @@ impl Runtime {
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
         for ds in &valid_datasets {
-            let status = if ds.load == Load::OnDemand {
-                ComponentStatus::NotLoaded
-            } else {
-                ComponentStatus::Initializing
-            };
-            self.status.update_dataset(&ds.name, status);
+            self.status
+                .update_dataset(&ds.name, ComponentStatus::Initializing);
         }
 
         if cfg!(feature = "models") {
@@ -1299,25 +1291,11 @@ impl Runtime {
         }
     }
 
-    /// Install the on-demand table loader on the embedded `DataFusion` so that
-    /// query planning and the refresh endpoint can trigger loads of
-    /// `load: on_demand` datasets. Should be called immediately after the
-    /// `Runtime` is wrapped in an `Arc`, before any servers start accepting
-    /// requests.
-    pub fn install_on_demand_loader(self: &Arc<Self>) {
-        let loader: Arc<dyn OnDemandTableLoader> = Arc::<Runtime>::clone(self);
-        self.df.set_on_demand_table_loader(Arc::downgrade(&loader));
-    }
-
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     pub async fn load_components(self: Arc<Self>) {
-        // Idempotent: ensures the loader is installed even when callers (tests,
-        // embedders) skip the `install_on_demand_loader` step.
-        self.install_on_demand_loader();
-
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
@@ -1471,16 +1449,20 @@ impl Runtime {
 
         let start_time = Instant::now();
 
-        // shutdown all running components except the HTTP and Metrics servers
+        // Shutdown running components in phases so request-serving tasks drain
+        // before query execution resources are cleaned up.
         let mut runtime_tasks = self.tasks.write().await;
 
-        // HTTP and METRICS servers must be shutdown last
+        // Query-serving tasks, including HTTP and Flight, must drain before
+        // DataFusion cleanup so in-flight queries still have access to their
+        // execution resources during graceful shutdown. Metrics can stay up
+        // until the end for health and observability during shutdown.
         let mut first_shutdown_group = Vec::new();
         let mut last_shutdown_group = Vec::new();
 
         for (name, handle) in runtime_tasks.drain() {
             match name.as_str() {
-                HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
+                METRICS_SERVER => last_shutdown_group.push((name, handle)),
                 _ => first_shutdown_group.push((name, handle)),
             }
         }
@@ -1509,11 +1491,11 @@ impl Runtime {
         document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
-        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        // group includes only Metrics endpoints.
         let elapsed = start_time.elapsed();
         let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
-        // Shutdown HTTP & Metrics servers last
+        // Shutdown Metrics server last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
@@ -1565,7 +1547,7 @@ impl Runtime {
                 .collect::<HashSet<_>>();
             for (name, tooling) in tool_lock.iter() {
                 match tooling {
-                    Tooling::Tool(tool) => {
+                    Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
                     Tooling::Catalog(catalog) => {
@@ -1592,7 +1574,8 @@ impl Runtime {
                 };
                 return catalog.get(name).await;
             } else {
-                let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
+                let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name)
+                else {
                     return None;
                 };
                 Arc::clone(tool)

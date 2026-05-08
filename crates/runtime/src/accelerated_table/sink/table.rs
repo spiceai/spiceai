@@ -41,6 +41,18 @@ impl TableSink {
         Self { table_provider }
     }
 
+    async fn providers_for_write_hooks(&self) -> Vec<Arc<dyn TableProvider>> {
+        if let Some(p) = self
+            .table_provider
+            .as_any()
+            .downcast_ref::<PartitionTableProvider>()
+        {
+            p.partition_table_providers().await
+        } else {
+            vec![Arc::clone(&self.table_provider)]
+        }
+    }
+
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
@@ -87,29 +99,41 @@ impl TableSink {
         tracing::debug!(
             "TableSink: executing insertion plan with collect() - this will read source and write to accelerator"
         );
+
+        let providers_before_write = self.providers_for_write_hooks().await;
+
+        for provider in &providers_before_write {
+            if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+                let indexes = indexed.get_all_indexes();
+                tracing::debug!(
+                    index_names = ?indexes.iter().map(|i| i.name()).collect::<Vec<_>>(),
+                    "Running on_write_start for indexes"
+                );
+                for index in indexes {
+                    if let Err(e) = index.on_write_start().await {
+                        tracing::warn!(
+                            "TableSink: on_write_start failed for index '{}': {e}. Continuing with write.",
+                            index.name()
+                        );
+                    }
+                }
+            }
+        }
+
         let collect_start = std::time::Instant::now();
         if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
             tracing::debug!(
                 "TableSink: collect() failed after {:.2}s: {e}",
                 collect_start.elapsed().as_secs_f64()
             );
+            run_on_write_failed(&providers_before_write).await;
             return Err(retry_from_df_error(e));
         }
 
         // Perform post-write index maintenance (e.g., rebuild hash indexes) if the table supports it.
         // For partitioned tables each partition holds its own IndexedMemTable, so we iterate over
-        // all partition providers and trigger maintenance on each one individually.
-        let providers_to_maintain: Vec<Arc<dyn TableProvider>> = if let Some(p) = self
-            .table_provider
-            .as_any()
-            .downcast_ref::<PartitionTableProvider>()
-        {
-            p.partition_table_providers().await
-        } else {
-            vec![Arc::clone(&self.table_provider)]
-        };
-
-        for provider in providers_to_maintain {
+        // all partition providers after the insert has created any new partitions.
+        for provider in self.providers_for_write_hooks().await {
             match perform_index_maintenance(provider.as_ref()).await {
                 Ok(true) => {
                     tracing::debug!("TableSink: index maintenance completed successfully");
@@ -129,7 +153,12 @@ impl TableSink {
             // Uses IF NOT EXISTS semantics: creates index after overwrite (new table),
             // no-op after append (index already exists). CDC skips this path entirely.
             if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
-                for index in indexed.get_all_indexes() {
+                let indexes = indexed.get_all_indexes();
+                tracing::debug!(
+                    index_names = ?indexes.iter().map(|i| i.name()).collect::<Vec<_>>(),
+                    "Running on_write_complete for indexes"
+                );
+                for index in indexes {
                     if let Err(e) = index.on_write_complete().await {
                         tracing::warn!(
                             "TableSink: on_write_complete failed for index '{}': {e}. Index may be stale until next refresh.",
@@ -146,5 +175,20 @@ impl TableSink {
             collect_start.elapsed().as_secs_f64()
         );
         Ok(())
+    }
+}
+
+async fn run_on_write_failed(providers: &[Arc<dyn TableProvider>]) {
+    for provider in providers {
+        if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+            for index in indexed.get_all_indexes() {
+                if let Err(e) = index.on_write_failed().await {
+                    tracing::warn!(
+                        "TableSink: on_write_failed failed for index '{}': {e}. Index write state may need manual cleanup.",
+                        index.name()
+                    );
+                }
+            }
+        }
     }
 }

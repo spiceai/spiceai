@@ -12,6 +12,10 @@ limitations under the License.
 */
 use crate::accelerated_table::SnapshotCreateTrigger;
 use crate::accelerated_table::refresh::Refresh;
+use crate::dataaccelerator::AccelerationSource;
+use crate::dataaccelerator::DataAccelerator;
+use crate::dataaccelerator::ReloadProviderFactory;
+use crate::dataaccelerator::swappable::SwappableTableProvider;
 use crate::status::RuntimeStatus;
 use arrow_schema::Schema;
 use datafusion::common::TableReference;
@@ -21,10 +25,69 @@ use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{ForceCreate, SnapshotManager, metrics as snapshot_metrics};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
+
+/// Per-dataset state required to drive `refresh_mode: snapshot`.
+///
+/// This bundle is built once during dataset registration and threaded down
+/// through `Refresher` -> `RefreshTaskBuilder` -> `RefreshTask`. The refresh
+/// task uses it on every tick to:
+///   1. Compare the remote `current_snapshot_id` against `current_snapshot_id`.
+///   2. Download and reload only when a strictly newer snapshot is available.
+///   3. Atomically swap the live `TableProvider` via `swappable_provider`.
+#[derive(Clone)]
+pub struct SnapshotRefreshState {
+    pub manager: Arc<SnapshotManager>,
+    pub accelerator: Arc<dyn DataAccelerator>,
+    pub source: Arc<dyn AccelerationSource>,
+    pub swappable_provider: Arc<SwappableTableProvider>,
+    /// Factory that re-runs `create_accelerator_table` for this dataset to
+    /// build a fresh provider over the on-disk snapshot file.
+    pub provider_factory: ReloadProviderFactory,
+    /// The currently-loaded snapshot id, if any. `None` means no snapshot has
+    /// been loaded yet for this dataset (e.g. fresh start with no bootstrap).
+    /// Wrapped in a sync `Mutex` because updates are infrequent (once per
+    /// successful reload) and the inner `Option<u64>` is `Copy` so reads are
+    /// trivial. Snapshot ids are not constrained: id `0` is a valid first
+    /// snapshot, so `Option<u64>` is the correct representation rather than
+    /// using a sentinel value.
+    pub current_snapshot_id: Arc<StdMutex<Option<u64>>>,
+}
+
+impl std::fmt::Debug for SnapshotRefreshState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = self.current_snapshot_id.lock().map(|g| *g).unwrap_or(None);
+        f.debug_struct("SnapshotRefreshState")
+            .field("current_snapshot_id", &id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SnapshotRefreshState {
+    /// Returns the currently-loaded snapshot id, or `None` if no snapshot has
+    /// been loaded yet.
+    #[must_use]
+    pub fn current_loaded_id(&self) -> Option<u64> {
+        self.current_snapshot_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .copied()
+    }
+
+    /// Records `snapshot_id` as the most recently loaded snapshot id.
+    pub fn set_current_loaded_id(&self, snapshot_id: u64) {
+        let mut guard = self
+            .current_snapshot_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(snapshot_id);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SnapshotCreationConfig {

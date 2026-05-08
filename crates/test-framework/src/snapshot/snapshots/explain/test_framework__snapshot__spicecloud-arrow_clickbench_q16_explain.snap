@@ -17,6 +17,6 @@ description: "Query: clickbench_q16"
 |               |           AggregateExec: mode=Partial, gby=[UserID@0 as UserID], aggr=[count(Int64(1))]                                                                         |
 |               |             SchemaCastScanExec                                                                                                                                  |
 |               |               BytesProcessedExec                                                                                                                                |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1587, 7343] |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>] |
 |               |                                                                                                                                                                 |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------+

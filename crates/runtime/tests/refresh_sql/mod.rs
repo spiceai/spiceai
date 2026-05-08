@@ -17,7 +17,7 @@ limitations under the License.
 use arrow::array::RecordBatch;
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
 
@@ -25,7 +25,7 @@ use runtime::{
     Runtime, accelerated_table::refresh::RefreshOverrides,
     component::dataset::acceleration::RefreshMode,
 };
-use spicepod::{acceleration::Acceleration, component::dataset::Dataset};
+use spicepod::{acceleration::Acceleration, component::dataset::Dataset, param::Params};
 
 use crate::{
     configure_test_datafusion, init_tracing,
@@ -41,6 +41,10 @@ fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset 
         refresh_sql: Some(refresh_sql),
         ..Default::default()
     });
+    ds.params = Some(Params::from_string_map(HashMap::from([(
+        "spiceai_region".to_string(),
+        "us-east-1".to_string(),
+    )])));
     ds
 }
 

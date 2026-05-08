@@ -15,7 +15,7 @@ The Spice open source project provides multiple distribution variants to support
 | macOS    | aarch64 (Apple Silicon) | Native (build host)                    | —                   |
 | Windows  | x86_64 (MSVC)           | —                                      | MSVC toolchain      |
 
-> **Note:** Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) is not supported on Windows natively — use WSL instead.
+> **Note:** Open source Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) is not supported on Windows natively in open source builds — use WSL instead. Native Windows runtime support is available with managed enterprise deployments.
 
 ## Distribution Availability
 
@@ -28,11 +28,14 @@ The Spice open source project provides multiple distribution variants to support
 | CUDA (Linux)            | Nightly only     | ✅           | ✅          |
 | Allocator variants      | Nightly only     | ✅           | ✅          |
 | ODBC connector          | Local build only | ✅           | ✅          |
+| Acceleration snapshots  | Local build only | ✅           | ✅          |
+| HTTP function servers   | Local build only | ✅           | ✅          |
+| WASM user functions     | Local build only | ✅           | ✅          |
 | OIDC Token Verification | ❌                | ✅           | ✅          |
 
 ## Default Distribution
 
-The default distribution includes all features including AI/ML model support. This is the recommended distribution for most users.
+The default distribution includes the standard data and AI/ML feature set. This is the recommended distribution for most users.
 
 **Included Features:**
 
@@ -40,7 +43,14 @@ The default distribution includes all features including AI/ML model support. Th
 - Embedded data accelerators (Spice Cayenne, DuckDB, SQLite)
 - AI/ML model inference (LLMs, embeddings)
 - Search capabilities (Vector and BM-25 Full-Text-Search)
+- Inline SQL user-defined scalar and table functions
 - Default memory allocator (snmalloc)
+
+**Not included by default:**
+
+- Acceleration snapshots (`snapshots` feature)
+- HTTP-backed function servers (`http-functions` feature)
+- WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
 
 > **Note:** The PostgreSQL data accelerator is only available in nightly builds. The PostgreSQL data connector is included in all distributions.
 
@@ -68,6 +78,7 @@ The data distribution excludes AI/ML model support, resulting in a smaller binar
 
 - All data connectors
 - All data accelerators
+- Acceleration snapshots in Cloud Platform and Enterprise distributions; local open source builds can enable this with the `snapshots` feature
 - Default memory allocator (snmalloc)
 
 **Excluded Features:**
@@ -229,11 +240,15 @@ These can be built locally for development and testing:
 make install-odbc
 ```
 
-## Enterprise Authentication
+## Enterprise Features
 
-The following authentication features are available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise):
+The following features are available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise). Open source builds can enable some of these features locally with the listed Cargo feature flags, but they are not included in the default open source distribution.
 
+- **Acceleration Snapshots** - Bootstrap accelerated datasets from durable snapshot storage for fast cold starts, recovery after ephemeral storage loss, and controlled rollback to a previous acceleration state. Local open source builds can enable this with `snapshots`.
+- **Function Servers** - Run HTTP-backed user-defined scalar and table functions from `functions:` declarations. The default open source distribution supports inline SQL functions only; local builds can enable HTTP-backed function servers with `http-functions`.
+- **WASM Functions** - Run sandboxed WebAssembly table functions from `functions:` declarations using Arrow IPC batches as the data ABI. Local open source builds can enable precompiled modules with `wasm-functions`; compiling Rust sources to WASM at startup additionally requires `wasm-functions-compile`.
 - **OIDC Token Verification** - Validate identity tokens from enterprise providers (Okta, Azure AD, Auth0, Google, etc.) for secure access to Spice runtime endpoints.
+- **Native Windows Runtime Support** - Run `spiced` natively on Windows in managed enterprise deployments. Open source users on Windows should use WSL.
 
 ### Linux arm64 Notes
 
@@ -252,6 +267,18 @@ You can build custom distributions with specific feature combinations:
 ```bash
 # Build with specific features
 SPICED_CUSTOM_FEATURES="duckdb,postgres,sqlite,models" make build-runtime
+
+# Build with HTTP-backed function servers
+SPICED_NON_DEFAULT_FEATURES="http-functions" make install
+
+# Build with precompiled WASM user functions
+SPICED_NON_DEFAULT_FEATURES="wasm-functions" make install
+
+# Build with Rust source-to-WASM compilation for user functions
+SPICED_NON_DEFAULT_FEATURES="wasm-functions-compile" make install
+
+# Build with acceleration snapshots
+SPICED_NON_DEFAULT_FEATURES="snapshots" make install
 
 # Build with non-default features added to defaults
 SPICED_NON_DEFAULT_FEATURES="odbc" make install

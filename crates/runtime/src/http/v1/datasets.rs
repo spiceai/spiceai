@@ -32,7 +32,6 @@ use datafusion::sql::TableReference;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use spicepod::component::dataset::Load;
 use tokio::sync::RwLock;
 
 use super::{Format, convert_entry_to_csv, dataset_status, require_write_access};
@@ -225,15 +224,13 @@ pub struct AccelerationRequest {
 
 /// Refresh Dataset
 ///
-/// Trigger an on-demand refresh for an accelerated dataset, or trigger the
-/// initial load of an on-demand (non-accelerated) dataset.
+/// Trigger an on-demand refresh for an accelerated dataset.
 ///
-/// For accelerated datasets this triggers an on-demand refresh. The refresh
-/// only applies to `full` and `append` refresh modes (not `changes` mode).
-///
-/// For datasets configured with `load: on_demand` that are *not* accelerated,
-/// this endpoint triggers dataset initialization. Subsequent calls are
-/// idempotent (no-op) once the dataset has been loaded.
+/// The refresh only applies to `full` and `append` refresh modes (not
+/// `changes` mode). Datasets without acceleration return 400 — the
+/// previous `load: on_demand` flow has been removed; deferred datasets
+/// (declared schema + `ready_state: on_registration`) are materialised
+/// automatically on first query and do not need a manual trigger.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/datasets/{name}/acceleration/refresh",
@@ -254,7 +251,7 @@ pub struct AccelerationRequest {
         ))
     ),
     responses(
-        (status = 201, description = "Dataset refresh triggered (accelerated) or dataset loaded (on-demand) successfully", content((
+        (status = 201, description = "Dataset refresh triggered successfully", content((
             MessageResponse = "application/json",
             example = json!({
                 "message": "Dataset refresh triggered for taxi_trips."
@@ -266,7 +263,7 @@ pub struct AccelerationRequest {
                 "message": "Dataset taxi_trips not found"
             })
         ))),
-        (status = 400, description = "Dataset is neither accelerated nor configured with load: on_demand; nothing to refresh or load", content((
+        (status = 400, description = "Dataset is not accelerated; nothing to refresh", content((
             MessageResponse = "application/json",
             example = json!({
                 "message": "Dataset taxi_trips does not have acceleration enabled"
@@ -323,9 +320,8 @@ pub(crate) async fn refresh(
     };
 
     let acceleration_enabled = dataset.acceleration.as_ref().is_some_and(|f| f.enabled);
-    let is_on_demand = dataset.load == Load::OnDemand;
 
-    if !acceleration_enabled && !is_on_demand {
+    if !acceleration_enabled {
         return (
             status::StatusCode::BAD_REQUEST,
             Json(MessageResponse {
@@ -336,28 +332,6 @@ pub(crate) async fn refresh(
     }
 
     let table_ref = TableReference::parse_str(dataset.name.as_str());
-
-    if is_on_demand {
-        if let Err(err) = df.load_on_demand_dataset(table_ref.clone()).await {
-            return (
-                status::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(MessageResponse {
-                    message: format!("{err}"),
-                }),
-            )
-                .into_response();
-        }
-
-        if !acceleration_enabled {
-            return (
-                status::StatusCode::CREATED,
-                Json(MessageResponse {
-                    message: format!("Dataset {dataset_name} loaded."),
-                }),
-            )
-                .into_response();
-        }
-    }
 
     match df
         .refresh_table(&table_ref, overrides_opt.map(|Json(overrides)| overrides))

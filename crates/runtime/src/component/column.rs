@@ -37,6 +37,7 @@ pub fn full_text_search_config(
                 row_ids,
                 index_store,
                 index_directory,
+                ..
             }) = &c.full_text_search
             else {
                 return None;

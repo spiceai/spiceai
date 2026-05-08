@@ -28,11 +28,11 @@ description: "Query: tpch_q4"
 |               |                 FilterExec: l_receiptdate@2 > l_commitdate@1, projection=[l_orderkey@0]                                                                                                               |
 |               |                   SchemaCastScanExec                                                                                                                                                                  |
 |               |                     BytesProcessedExec                                                                                                                                                                |
-|               |                       DataSourceExec: partitions=32, partition_sizes=[47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 46, 46, 46] |
+|               |                       DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |               RepartitionExec: partitioning=Hash([o_orderkey@0], 32), input_partitions=32                                                                                                             |
 |               |                 FilterExec: o_orderdate@1 >= 1993-07-01 AND o_orderdate@1 < 1993-10-01, projection=[o_orderkey@0, o_orderpriority@2]                                                                  |
 |               |                   SchemaCastScanExec                                                                                                                                                                  |
 |               |                     BytesProcessedExec                                                                                                                                                                |
-|               |                       DataSourceExec: partitions=32, partition_sizes=[12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11, 11, 11] |
+|               |                       DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |                                                                                                                                                                                                       |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

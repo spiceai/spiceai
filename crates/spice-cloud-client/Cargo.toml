@@ -13,3 +13,4 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
+url.workspace = true

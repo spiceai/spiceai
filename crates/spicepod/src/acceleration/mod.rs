@@ -33,6 +33,10 @@ pub enum RefreshMode {
     Append,
     Changes,
     Caching,
+    /// Refresh exclusively by reloading newer snapshots from the configured
+    /// snapshot location. The federated source is never queried for refreshes.
+    /// Requires `snapshots` to be enabled and a snapshot-supporting engine.
+    Snapshot,
 }
 
 /// Controls the write behavior for accelerated read-write datasets.
@@ -539,6 +543,33 @@ mod tests {
             let accel: Acceleration =
                 yaml::from_str(&yaml).unwrap_or_else(|_| panic!("should parse mode '{s}'"));
             assert_eq!(accel.mode, mode, "round-trip failed for mode '{s}'");
+        }
+    }
+
+    #[test]
+    fn test_deserialize_refresh_mode_snapshot() {
+        let yaml = "refresh_mode: snapshot";
+        let accel: Acceleration = yaml::from_str(yaml).expect("should parse");
+        assert_eq!(accel.refresh_mode, Some(RefreshMode::Snapshot));
+    }
+
+    #[test]
+    fn test_deserialize_all_refresh_modes() {
+        for (yaml_value, expected) in [
+            ("full", RefreshMode::Full),
+            ("append", RefreshMode::Append),
+            ("changes", RefreshMode::Changes),
+            ("caching", RefreshMode::Caching),
+            ("snapshot", RefreshMode::Snapshot),
+        ] {
+            let yaml = format!("refresh_mode: {yaml_value}");
+            let accel: Acceleration = yaml::from_str(&yaml)
+                .unwrap_or_else(|_| panic!("should parse refresh_mode '{yaml_value}'"));
+            assert_eq!(
+                accel.refresh_mode,
+                Some(expected),
+                "unexpected parse for '{yaml_value}'"
+            );
         }
     }
 }

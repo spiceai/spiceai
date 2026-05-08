@@ -78,11 +78,15 @@ mod nsql {
                         row_ids: None,
                         chunking: None,
                         vector_size: None,
+                        engine: None,
+                        params: None,
                         aggregation: None,
                         max_elements_per_row: None,
                     }],
                     description: None,
                     full_text_search: None,
+                    r#type: None,
+                    nullable: None,
                     metadata: HashMap::new(),
             }];
 
@@ -122,6 +126,7 @@ mod nsql {
                     name: "openai_basic",
                     body: json!({
                         "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                        "model": "nql",
                         "sample_data_enabled": false,
                     }),
                 },
@@ -184,11 +189,15 @@ mod search {
                             chunking: None,
                             row_ids: Some(vec!["id".to_string()]),
                             vector_size: None,
+                            engine: None,
+                            params: None,
                             aggregation: None,
                             max_elements_per_row: None,
                         }],
                         description: None,
                         full_text_search: None,
+                        r#type: None,
+                        nullable: None,
                         metadata: HashMap::new(),
                     }),
                 ))
@@ -242,11 +251,15 @@ mod search {
                 row_ids: None,
                 chunking: None,
                 vector_size: None,
+                engine: None,
+                params: None,
                 aggregation: None,
                 max_elements_per_row: None,
             }],
             description: None,
             full_text_search: None,
+            r#type: None,
+            nullable: None,
             metadata: HashMap::new(),
         }];
 
@@ -262,11 +275,15 @@ mod search {
                     trim_whitespace: false,
                 }),
                 vector_size: None,
+                engine: None,
+                params: None,
                 aggregation: None,
                 max_elements_per_row: None,
             }],
             description: None,
             full_text_search: None,
+            r#type: None,
+            nullable: None,
             metadata: HashMap::new(),
         }];
 
@@ -616,11 +633,15 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
                     row_ids: Some(vec!["i_item_sk".to_string()]),
                     chunking: None,
                     vector_size: None,
+                    engine: None,
+                    params: None,
                     aggregation: None,
                     max_elements_per_row: None,
                 }],
                 description: None,
                 full_text_search: None,
+                r#type: None,
+                nullable: None,
                 metadata: HashMap::new(),
             }];
 
@@ -683,12 +704,7 @@ async fn openai_responses_api_non_streaming() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
-
-            model.params.insert(
-                "responses_api".to_string(),
-                Value::String("enabled".to_string()),
-            );
+            let model = get_openai_model("gpt-4o-mini", "openai_model");
 
             let app = AppBuilder::new("responses_api").with_model(model).build();
 
@@ -738,11 +754,7 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
-            model.params.insert(
-                "responses_api".to_string(),
-                Value::String("enabled".to_string()),
-            );
+            let model = get_openai_model("gpt-4o-mini", "openai_model");
 
             let app = AppBuilder::new("responses_api").with_model(model).build();
 
@@ -833,11 +845,6 @@ async fn openai_responses_api_with_tools_streaming() -> Result<(), anyhow::Error
                 .params
                 .insert("tools".to_string(), Value::String("auto".to_string()));
 
-            model.params.insert(
-                "responses_api".to_string(),
-                Value::String("enabled".to_string()),
-            );
-
             let app = AppBuilder::new("responses_api")
                 .with_model(model)
                 .with_dataset(get_taxi_trips_dataset())
@@ -927,11 +934,6 @@ async fn openai_responses_api_with_tools_non_streaming() -> Result<(), anyhow::E
 
             let mut model = get_openai_model("gpt-4o-mini", "openai_model");
 
-            model.params.insert(
-                "responses_api".to_string(),
-                Value::String("enabled".to_string()),
-            );
-
             model
                 .params
                 .insert("tools".to_string(), Value::String("auto".to_string()));
@@ -990,10 +992,6 @@ fn get_responses_model_with_tools(
     model
         .params
         .insert("tools".into(), serde_json::Value::String("auto".into()));
-    model.params.insert(
-        "responses_api".into(),
-        serde_json::Value::String("enabled".into()),
-    );
     model
 }
 

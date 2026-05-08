@@ -60,6 +60,7 @@ impl Runtime {
                     .apply_view_diff(current_app, &new_app)
                     .await;
                 self.apply_model_diff(current_app, &new_app).await;
+                crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
 
                 if !cfg!(feature = "models") {
                     Arc::clone(&self)

@@ -818,6 +818,8 @@ pub(crate) mod search {
                         chunking: None,
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
+                        engine: None,
+                        params: None,
                         aggregation: None,
                         max_elements_per_row: None,
                     }])];
@@ -1020,6 +1022,8 @@ pub fn get_package_delivery_dataset(
             chunking: None,
             row_ids: Some(vec!["event.id".to_string()]),
             vector_size: None,
+            engine: None,
+            params: None,
             aggregation: None,
             max_elements_per_row: None,
         }]),

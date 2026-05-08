@@ -63,6 +63,7 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use datafusion_optimizer_rules::physical_plan::HttpParamsPushdown;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
@@ -128,6 +129,9 @@ pub struct RefreshTaskBuilder {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// State for `refresh_mode: snapshot`. Required when the refresh mode is
+    /// [`RefreshMode::Snapshot`]; ignored otherwise.
+    snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
 }
 
 impl RefreshTaskBuilder {
@@ -157,6 +161,7 @@ impl RefreshTaskBuilder {
             on_stream_batch_process_callback: None,
             last_updated_at: Arc::new(AtomicI64::new(0)),
             is_s3_express_acceleration: false,
+            snapshot_refresh_state: None,
         }
     }
 
@@ -216,6 +221,16 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Provide the snapshot-refresh state required for `RefreshMode::Snapshot`.
+    #[must_use]
+    pub fn with_snapshot_refresh_state(
+        mut self,
+        state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    ) -> RefreshTaskBuilder {
+        self.snapshot_refresh_state = state;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -266,6 +281,7 @@ impl RefreshTaskBuilder {
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
             last_updated_at: self.last_updated_at,
             is_s3_express_acceleration: self.is_s3_express_acceleration,
+            snapshot_refresh_state: self.snapshot_refresh_state,
         }
     }
 }
@@ -290,6 +306,9 @@ pub struct RefreshTask {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
+    /// other refresh modes.
+    snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -478,6 +497,7 @@ impl RefreshTask {
                 RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
                 RefreshMode::Caching => &metrics::REFRESH_DURATION_MS,
+                RefreshMode::Snapshot => &metrics::REFRESH_DURATION_MS,
             },
             &dataset_metrics_label_sets,
         );
@@ -497,6 +517,12 @@ impl RefreshTask {
             RefreshMode::Caching => {
                 // For caching mode, identify and refresh stale rows based on fetched_at and TTL
                 return self.refresh_stale_cached_rows(refresh).await;
+            }
+            RefreshMode::Snapshot => {
+                // For snapshot mode, poll the snapshot store for a newer snapshot
+                // and reload the accelerator from it. The federated source is
+                // never queried for refreshes in this mode.
+                return self.refresh_from_snapshot(refresh).await;
             }
         };
 
@@ -902,6 +928,236 @@ impl RefreshTask {
         Ok(())
     }
 
+    /// Drives `RefreshMode::Snapshot`: poll the snapshot store for a snapshot
+    /// strictly newer than what is currently loaded; if found, download it
+    /// (which writes to the accelerator's primary path) and call into the
+    /// accelerator's `reload_from_snapshot` to swap in a fresh `TableProvider`.
+    ///
+    /// The federated source is never queried by this code path. When no newer
+    /// snapshot is available the call is a no-op (Ready, no swap).
+    async fn refresh_from_snapshot(
+        &self,
+        refresh: &Refresh,
+    ) -> Result<(), RetryError<super::Error>> {
+        let _ = refresh; // refresh sql / window are intentionally unused for snapshot mode
+
+        let Some(state) = self.snapshot_refresh_state.clone() else {
+            // This is a configuration bug: the refresh mode is Snapshot but no
+            // SnapshotRefreshState was attached. Surface as a permanent error so
+            // the dataset is marked unhealthy rather than retried indefinitely.
+            tracing::error!(
+                dataset = %self.dataset_name,
+                "refresh_mode: snapshot is configured but no SnapshotRefreshState is available; \
+                 this indicates a runtime configuration bug."
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+            )
+            .await;
+            return Err(RetryError::permanent(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::Internal(
+                        "snapshot refresh state missing".to_string(),
+                    ),
+                },
+            ));
+        };
+
+        self.set_refresh_status(None, status::ComponentStatus::Refreshing)
+            .await;
+
+        let start_time = SystemTime::now();
+        let current_local_id = state.current_loaded_id();
+
+        // Take the accelerator write mutex up front so the entire refresh
+        // (download + provider rebuild + swap) is serialized with other code
+        // paths that take this mutex. `AcceleratedTable::insert_into` rejects
+        // writes outright when `refresh_mode: snapshot` is enabled, so this
+        // mutex's only remaining job here is to serialize concurrent snapshot
+        // refreshes / cache writes against the swap. The atomic rename inside
+        // `download_if_newer` independently protects against partial-file
+        // reads from in-flight queries that hold their own connection refs to
+        // the prior file inode.
+        let _write_guard = Arc::clone(&self.accelerator_write_mutex).lock_owned().await;
+
+        // Hand the snapshot manager a schema validator that runs against
+        // the snapshot metadata's recorded schema **before** the file is
+        // downloaded or renamed. This guarantees a schema-incompatible
+        // snapshot can never overwrite the accelerator's primary file.
+        let live_schema = state.swappable_provider.schema();
+        let live_schema_for_validate = Arc::clone(&live_schema);
+        let validator: Box<dyn Fn(&arrow_schema::SchemaRef) -> bool + Send + Sync> =
+            Box::new(move |candidate: &arrow_schema::SchemaRef| {
+                schemas_compatible(candidate.as_ref(), live_schema_for_validate.as_ref())
+            });
+        let download_result = state
+            .manager
+            .download_if_newer(current_local_id, Some(validator.as_ref()))
+            .await;
+
+        let info = match download_result {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                tracing::debug!(
+                    dataset = %self.dataset_name,
+                    current_snapshot_id = ?current_local_id,
+                    "refresh_mode: snapshot - no newer snapshot available; skipping reload"
+                );
+                let dataset_metrics_label_sets =
+                    self.get_dataset_label_sets(&RefreshMode::Snapshot).await;
+                for label_set in &dataset_metrics_label_sets {
+                    metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
+                }
+                self.set_refresh_status(None, status::ComponentStatus::Ready)
+                    .await;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    error = %e,
+                    "refresh_mode: snapshot - failed to check/download snapshot"
+                );
+                self.set_refresh_status(
+                    None,
+                    status::ComponentStatus::error_with_message(
+                        "snapshot refresh failure".to_string(),
+                    ),
+                )
+                .await;
+                return Err(RetryError::transient(
+                    super::Error::FailedToRefreshDataset {
+                        source: datafusion::error::DataFusionError::External(Box::new(e)),
+                    },
+                ));
+            }
+        };
+
+        // The snapshot manager already rejected schema-incompatible
+        // snapshots before download; this is a defense-in-depth check
+        // against the (rare) case where the metadata's recorded schema
+        // differed from the schema actually embedded in the downloaded
+        // file. The downloaded file may have replaced the primary path
+        // here, but `reload_from_snapshot` is gated below — and a
+        // schema-mismatch returned here is treated as permanent.
+        if !schemas_compatible(info.schema.as_ref(), live_schema.as_ref()) {
+            tracing::error!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                "refresh_mode: snapshot - downloaded snapshot schema does not match \
+                 accelerator schema; refusing to swap"
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+            )
+            .await;
+            return Err(RetryError::permanent(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::Internal(
+                        "snapshot schema mismatch".to_string(),
+                    ),
+                },
+            ));
+        }
+
+        // The accelerator write mutex was taken above, before the download,
+        // so the entire reload + swap remains serialized with concurrent
+        // accelerator writes.
+        let new_provider = match state
+            .accelerator
+            .reload_from_snapshot(
+                state.source.as_ref(),
+                state.swappable_provider.current(),
+                Arc::clone(&state.provider_factory),
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    dataset = %self.dataset_name,
+                    snapshot_id = info.snapshot_id,
+                    error = %e,
+                    "refresh_mode: snapshot - accelerator failed to reload from snapshot"
+                );
+                self.set_refresh_status(
+                    None,
+                    status::ComponentStatus::error_with_message(
+                        "snapshot refresh failure".to_string(),
+                    ),
+                )
+                .await;
+                return Err(RetryError::transient(
+                    super::Error::FailedToRefreshDataset {
+                        source: datafusion::error::DataFusionError::Internal(e.to_string()),
+                    },
+                ));
+            }
+        };
+
+        if !schemas_compatible(new_provider.schema().as_ref(), live_schema.as_ref()) {
+            tracing::error!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                "refresh_mode: snapshot - reloaded provider schema does not match accelerator \
+                 schema; refusing to swap"
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+            )
+            .await;
+            return Err(RetryError::permanent(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::Internal(
+                        "reloaded snapshot provider schema mismatch".to_string(),
+                    ),
+                },
+            ));
+        }
+
+        if let Err(swap_err) = state.swappable_provider.swap(new_provider) {
+            tracing::error!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                error = %swap_err,
+                "refresh_mode: snapshot - swap rejected by SwappableTableProvider"
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+            )
+            .await;
+            return Err(RetryError::permanent(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::Internal(format!(
+                        "snapshot swap rejected: {swap_err}"
+                    )),
+                },
+            ));
+        }
+        state.set_current_loaded_id(info.snapshot_id);
+        if let Some(updated_at) = info.last_updated_at {
+            self.last_updated_at
+                .store(updated_at, std::sync::atomic::Ordering::Release);
+        }
+
+        if let Ok(elapsed) = util::humantime_elapsed(start_time) {
+            tracing::info!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                bytes = info.bytes_downloaded,
+                "Loaded snapshot in {elapsed}"
+            );
+        }
+
+        self.set_refresh_status(None, status::ComponentStatus::Ready)
+            .await;
+        Ok(())
+    }
+
     async fn trace_load_completed(
         &self,
         start_time: SystemTime,
@@ -954,6 +1210,9 @@ impl RefreshTask {
             RefreshMode::Append => UpdateType::Append,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
             RefreshMode::Caching => UpdateType::Overwrite,
+            RefreshMode::Snapshot => {
+                unreachable!("snapshot mode is handled by refresh_from_snapshot")
+            }
         };
 
         // If a refresh SQL is explicitly provided for this `RefreshTask` (instead of provided at startup within the
@@ -1137,6 +1396,7 @@ impl RefreshTask {
             ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
             .with_optimizer_rule(Arc::new(AvoidDerivedVectorColumnOnIndexRule {}))
+            .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
@@ -1646,6 +1906,15 @@ impl RefreshTask {
     fn update_last_updated_at(&self) {
         super::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
     }
+}
+
+/// Returns true when `candidate` is structurally compatible with `expected`
+/// for swapping a `TableProvider` under a `SwappableTableProvider`. See
+/// [`crate::dataaccelerator::swappable::schemas_compatible`] for the precise
+/// rules; this is a thin re-export so callers in this module can keep using
+/// the unqualified name.
+fn schemas_compatible(candidate: &arrow_schema::Schema, expected: &arrow_schema::Schema) -> bool {
+    crate::dataaccelerator::swappable::schemas_compatible(candidate, expected)
 }
 
 #[derive(Debug)]

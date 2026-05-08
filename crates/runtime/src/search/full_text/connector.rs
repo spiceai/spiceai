@@ -20,7 +20,7 @@ use runtime_datafusion_index::IndexedTableProvider;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
@@ -139,6 +139,16 @@ impl DataConnector for FullTextConnector {
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         self.inner_connector.metrics_provider()
+    }
+
+    async fn on_accelerator_setup(
+        &self,
+        dataset: &Dataset,
+        builder: &mut accelerated_table::Builder,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner_connector
+            .on_accelerator_setup(dataset, builder)
+            .await
     }
 
     async fn on_accelerated_table_registration(
