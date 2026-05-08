@@ -31,6 +31,7 @@ use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
@@ -42,17 +43,20 @@ use futures::{StreamExt, stream};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 struct ApplyContext<'a> {
-    refresh: &'a Arc<RwLock<Refresh>>,
+    refresh_sql: Option<&'a str>,
     dataset_name: &'a TableReference,
     caching: Option<&'a Weak<Caching>>,
     ready_sender: Option<&'a Arc<Notify>>,
     initial_load_completed: &'a Arc<AtomicBool>,
     pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
+    commit_timeout: Duration,
 }
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
@@ -70,7 +74,7 @@ struct ApplyContext<'a> {
 /// }
 /// ```
 macro_rules! extract_primary_key {
-    ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr) => {{
+    ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr, $row:expr) => {{
         let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
             crate::accelerated_table::PrimaryKeyArrayDataTypeMismatchSnafu {
                 field_name: $key.to_string(),
@@ -78,23 +82,23 @@ macro_rules! extract_primary_key {
                 schema: Arc::clone(&$data_schema),
             },
         )?;
-        if key_col.is_null(0) {
+        if key_col.is_null($row) {
             return crate::accelerated_table::PrimaryKeyNullValueSnafu {
                 field_name: $key.to_string(),
             }
             .fail();
         }
-        Ok((key_col.value(0).to_string(), lit(key_col.value(0))))
+        Ok((key_col.value($row).to_string(), lit(key_col.value($row))))
     }};
 }
 
 /// Tunables for the CDC source-stream → apply pipeline.
 ///
 /// Resolved once at process start, in this priority order:
-/// 1. `runtime.params.cdc_prefetch_buffer` / `runtime.params.cdc_max_coalesced_envelopes`
-///    from the spicepod (installed via [`set_cdc_config`]).
-/// 2. `SPICE_CDC_PREFETCH_BUFFER` / `SPICE_CDC_MAX_COALESCED_ENVELOPES`
-///    environment variables (useful for tests and ad-hoc tuning).
+/// 1. `runtime.params.cdc_*` from the spicepod (installed via
+///    [`set_cdc_config`]).
+/// 2. `SPICE_CDC_*` environment variables (useful for tests and ad-hoc
+///    tuning).
 /// 3. Built-in defaults.
 ///
 /// Out-of-range or unparseable values fall back to the next source with a
@@ -109,18 +113,31 @@ pub struct CdcConfig {
     /// a single accelerator write. Coalescing amortizes per-envelope
     /// plan construction over the whole burst.
     pub max_coalesced_envelopes: usize,
+    /// Best-effort byte budget for a coalesced burst. A single envelope may
+    /// exceed this on its own; otherwise the next envelope is carried into the
+    /// next burst before we allocate a concatenated batch.
+    pub max_coalesced_bytes: usize,
+    /// Maximum time to wait for the previous source-side commit before
+    /// surfacing ingestion as stalled.
+    pub commit_timeout: Duration,
 }
 
 const CDC_PREFETCH_BUFFER_DEFAULT: usize = 32;
 const CDC_PREFETCH_BUFFER_MAX: usize = 1024;
 const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 64;
 const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 4096;
+const CDC_MAX_COALESCED_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
+const CDC_COMMIT_TIMEOUT_MS_DEFAULT: usize = 30_000;
+const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
 
 impl Default for CdcConfig {
     fn default() -> Self {
         Self {
             prefetch_buffer: CDC_PREFETCH_BUFFER_DEFAULT,
             max_coalesced_envelopes: CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+            max_coalesced_bytes: CDC_MAX_COALESCED_BYTES_DEFAULT,
+            commit_timeout: Duration::from_millis(CDC_COMMIT_TIMEOUT_MS_DEFAULT as u64),
         }
     }
 }
@@ -164,6 +181,16 @@ fn cdc_config() -> CdcConfig {
             CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
             CDC_MAX_COALESCED_ENVELOPES_MAX,
         ),
+        max_coalesced_bytes: parse_env_usize(
+            "SPICE_CDC_MAX_COALESCED_BYTES",
+            CDC_MAX_COALESCED_BYTES_DEFAULT,
+            CDC_MAX_COALESCED_BYTES_MAX,
+        ),
+        commit_timeout: Duration::from_millis(parse_env_usize(
+            "SPICE_CDC_COMMIT_TIMEOUT_MS",
+            CDC_COMMIT_TIMEOUT_MS_DEFAULT,
+            CDC_COMMIT_TIMEOUT_MS_MAX,
+        ) as u64),
     }
 }
 
@@ -196,7 +223,8 @@ fn resolve_cdc_param(
 }
 
 /// Build a [`CdcConfig`] from the spicepod `runtime.params` map, reading
-/// the `cdc_prefetch_buffer` and `cdc_max_coalesced_envelopes` keys.
+/// the `cdc_prefetch_buffer`, `cdc_max_coalesced_envelopes`,
+/// `cdc_max_coalesced_bytes`, and `cdc_commit_timeout_ms` keys.
 /// Missing/unparseable/out-of-range params fall back to the corresponding
 /// `SPICE_CDC_*` env var, then defaults.
 #[must_use]
@@ -216,6 +244,20 @@ pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>
             CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
             CDC_MAX_COALESCED_ENVELOPES_MAX,
         ),
+        max_coalesced_bytes: resolve_cdc_param(
+            params,
+            "cdc_max_coalesced_bytes",
+            "SPICE_CDC_MAX_COALESCED_BYTES",
+            CDC_MAX_COALESCED_BYTES_DEFAULT,
+            CDC_MAX_COALESCED_BYTES_MAX,
+        ),
+        commit_timeout: Duration::from_millis(resolve_cdc_param(
+            params,
+            "cdc_commit_timeout_ms",
+            "SPICE_CDC_COMMIT_TIMEOUT_MS",
+            CDC_COMMIT_TIMEOUT_MS_DEFAULT,
+            CDC_COMMIT_TIMEOUT_MS_MAX,
+        ) as u64),
     }
 }
 
@@ -312,8 +354,12 @@ impl RefreshTask {
         // monotonically), while letting commit(N) overlap with apply(N+1) —
         // the actual idle window in the original serial loop.
         let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
+        let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
 
-        while let Some(first) = rx.recv().await {
+        while let Some(first) = match carried_item.take() {
+            Some(item) => Some(item),
+            None => rx.recv().await,
+        } {
             // Drain whatever is already buffered in the prefetch channel
             // (no `await` between try_recv calls). Under low load the buffer
             // is empty after the initial recv and `burst.len() == 1` — that
@@ -324,22 +370,36 @@ impl RefreshTask {
             // planning cost over the whole burst.
             let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
                 Vec::with_capacity(8);
+            let mut burst_bytes = cdc_item_memory_size(&first);
             burst.push(first);
             let max_burst = cdc_cfg.max_coalesced_envelopes;
+            let max_burst_bytes = cdc_cfg.max_coalesced_bytes;
             while burst.len() < max_burst {
                 match rx.try_recv() {
-                    Ok(item) => burst.push(item),
+                    Ok(item) => {
+                        let item_bytes = cdc_item_memory_size(&item);
+                        if burst_bytes > 0
+                            && item_bytes > 0
+                            && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
+                        {
+                            carried_item = Some(item);
+                            break;
+                        }
+                        burst_bytes = burst_bytes.saturating_add(item_bytes);
+                        burst.push(item);
+                    }
                     Err(_) => break,
                 }
             }
 
             let mut apply_context = ApplyContext {
-                refresh: &refresh,
+                refresh_sql: sql.as_deref(),
                 dataset_name: &dataset_name,
                 caching: caching.as_ref(),
                 ready_sender: ready_sender.as_ref(),
                 initial_load_completed: &initial_load_completed,
                 pending_commit: &mut pending_commit,
+                commit_timeout: cdc_cfg.commit_timeout,
             };
             if !self.apply_burst(&mut apply_context, burst).await {
                 break;
@@ -349,11 +409,16 @@ impl RefreshTask {
         // Drain the final in-flight commit before reporting end-of-stream so
         // we don't leave the source-side offset un-acked.
         if let Some(prev) = pending_commit.take()
-            && let Some(error_message) =
-                join_pending_commit(prev, &dataset_name, self.runtime_status.is_shutdown()).await
+            && let Some(error_message) = join_pending_commit(
+                prev,
+                &dataset_name,
+                self.runtime_status.is_shutdown(),
+                cdc_cfg.commit_timeout,
+            )
+            .await
         {
             self.set_refresh_status(
-                refresh.read().await.display_sql().as_deref(),
+                sql.as_deref(),
                 status::ComponentStatus::error_with_message(error_message),
             )
             .await;
@@ -382,7 +447,7 @@ impl RefreshTask {
                 let err_msg = format!("CDC reader task ended unexpectedly: {e}");
                 tracing::error!("{err_msg} (dataset={dataset_name})");
                 self.set_refresh_status(
-                    refresh.read().await.display_sql().as_deref(),
+                    sql.as_deref(),
                     status::ComponentStatus::error_with_message(err_msg),
                 )
                 .await;
@@ -441,7 +506,7 @@ impl RefreshTask {
 
                     let error_message = format_datafusion_error(&e);
                     self.set_refresh_status(
-                        context.refresh.read().await.display_sql().as_deref(),
+                        context.refresh_sql,
                         status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
@@ -495,7 +560,7 @@ impl RefreshTask {
                     );
                     tracing::error!("{error_message}");
                     self.set_refresh_status(
-                        context.refresh.read().await.display_sql().as_deref(),
+                        context.refresh_sql,
                         status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
@@ -543,11 +608,12 @@ impl RefreshTask {
                         prev,
                         context.dataset_name,
                         self.runtime_status.is_shutdown(),
+                        context.commit_timeout,
                     )
                     .await
                 {
                     self.set_refresh_status(
-                        context.refresh.read().await.display_sql().as_deref(),
+                        context.refresh_sql,
                         status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
@@ -571,7 +637,7 @@ impl RefreshTask {
             Err(e) => {
                 let error_message = format_datafusion_error(&e);
                 self.set_refresh_status(
-                    context.refresh.read().await.display_sql().as_deref(),
+                    context.refresh_sql,
                     status::ComponentStatus::error_with_message(error_message),
                 )
                 .await;
@@ -591,6 +657,8 @@ impl RefreshTask {
         let dataset_name = self.dataset_name.clone();
 
         let sub_batches = group_into_sub_batches(&change_batch);
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
 
         tracing::trace!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
@@ -603,17 +671,17 @@ impl RefreshTask {
         for (op_type, row_indices) in sub_batches {
             match op_type {
                 ChangeOperationType::Delete => {
-                    self.process_delete_batch(&change_batch, &row_indices)
+                    self.process_delete_batch(&change_batch, &row_indices, &ctx, &session_state)
                         .await?;
                     had_change = true;
                 }
                 ChangeOperationType::Upsert => {
-                    self.process_upsert_batch(&change_batch, &row_indices)
+                    self.process_upsert_batch(&change_batch, &row_indices, &ctx, &session_state)
                         .await?;
                     had_change = true;
                 }
                 ChangeOperationType::Truncate => {
-                    self.process_truncate().await?;
+                    self.process_truncate(&ctx, &session_state).await?;
                     had_change = true;
                 }
                 ChangeOperationType::Unknown => {
@@ -639,6 +707,8 @@ impl RefreshTask {
         &self,
         change_batch: &ChangeBatch,
         row_indices: &[usize],
+        ctx: &SessionContext,
+        session_state: &SessionState,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
 
@@ -651,25 +721,7 @@ impl RefreshTask {
             );
         }
 
-        let indices_array = UInt32Array::from(
-            row_indices
-                .iter()
-                .filter_map(|&i| u32::try_from(i).ok())
-                .collect::<Vec<_>>(),
-        );
-
-        let selected_columns: Vec<ArrayRef> = data_batch
-            .columns()
-            .iter()
-            .map(|col| arrow::compute::take(col.as_ref(), &indices_array, None))
-            .collect::<Result<Vec<_>, _>>()
-            .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
-
-        let selected_batch = RecordBatch::try_new(data_batch.schema(), selected_columns)
-            .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
-
-        let ctx = SessionContext::new();
-        let session_state = ctx.state();
+        let selected_batch = select_rows(&data_batch, row_indices)?;
 
         let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
             selected_batch.schema(),
@@ -688,7 +740,7 @@ impl RefreshTask {
 
         let insert_plan = self
             .accelerator
-            .insert_into(&session_state, cast_plan, InsertOp::Append)
+            .insert_into(session_state, cast_plan, InsertOp::Append)
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
@@ -702,12 +754,14 @@ impl RefreshTask {
         Ok(())
     }
 
-    async fn process_truncate(&self) -> crate::accelerated_table::Result<()> {
+    async fn process_truncate(
+        &self,
+        ctx: &SessionContext,
+        session_state: &SessionState,
+    ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
         tracing::info!("Processing TRUNCATE for {dataset_name}");
 
-        let ctx = SessionContext::new();
-        let session_state = ctx.state();
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         // Some accelerator impls (notably DuckDB) treat an empty filter list as
         // a no-op to guard against accidental full-table deletes. To get
@@ -716,7 +770,7 @@ impl RefreshTask {
         // applied consistently across engines.
         let delete_plan = self
             .accelerator
-            .delete_from(&session_state, vec![lit(true)])
+            .delete_from(session_state, vec![lit(true)])
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
@@ -733,6 +787,8 @@ impl RefreshTask {
         &self,
         change_batch: &ChangeBatch,
         row_indices: &[usize],
+        ctx: &SessionContext,
+        session_state: &SessionState,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
 
@@ -748,13 +804,10 @@ impl RefreshTask {
         )?;
 
         if let Some(combined) = combined {
-            let ctx = SessionContext::new();
-            let session_state = ctx.state();
-
             let _lock_guard = self.accelerator_write_mutex.lock().await;
             let delete_plan = self
                 .accelerator
-                .delete_from(&session_state, vec![combined])
+                .delete_from(session_state, vec![combined])
                 .await
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
@@ -797,32 +850,112 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
     })
 }
 
+fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
+    item.as_ref()
+        .map_or(0, |env| env.change_batch.record.get_array_memory_size())
+}
+
+fn select_rows(
+    data_batch: &RecordBatch,
+    row_indices: &[usize],
+) -> crate::accelerated_table::Result<RecordBatch> {
+    if let Some((offset, length)) = contiguous_row_span(row_indices) {
+        return Ok(data_batch.slice(offset, length));
+    }
+
+    let indices = row_indices
+        .iter()
+        .map(|&i| {
+            u32::try_from(i).map_err(|e| {
+                arrow::error::ArrowError::InvalidArgumentError(format!(
+                    "CDC row index {i} exceeds UInt32 take index range: {e}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+    let indices_array = UInt32Array::from(indices);
+
+    let selected_columns: Vec<ArrayRef> = data_batch
+        .columns()
+        .iter()
+        .map(|col| arrow::compute::take(col.as_ref(), &indices_array, None))
+        .collect::<Result<Vec<_>, _>>()
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+
+    RecordBatch::try_new(data_batch.schema(), selected_columns)
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)
+}
+
+fn contiguous_row_span(row_indices: &[usize]) -> Option<(usize, usize)> {
+    let first = *row_indices.first()?;
+    if row_indices
+        .iter()
+        .enumerate()
+        .all(|(offset, &row)| row == first + offset)
+    {
+        Some((first, row_indices.len()))
+    } else {
+        None
+    }
+}
+
 /// Await an in-flight commit task spawned by `apply_envelope_run`. Surfaces
 /// panics loudly (we must never silently swallow a commit-task panic — that
 /// would leave the dataset healthy while source-side offsets stop advancing)
 /// but treats cancellation during shutdown as expected.
 async fn join_pending_commit(
-    handle: tokio::task::JoinHandle<()>,
+    mut handle: tokio::task::JoinHandle<()>,
     dataset_name: &TableReference,
     is_shutdown: bool,
+    commit_timeout: Duration,
 ) -> Option<String> {
-    match handle.await {
-        Err(e) if e.is_cancelled() && is_shutdown => {
-            tracing::debug!("CDC commit task for {dataset_name} was cancelled (likely shutdown)");
-            None
+    tokio::select! {
+        result = &mut handle => {
+            match result {
+                Err(e) if e.is_cancelled() && is_shutdown => {
+                    tracing::debug!("CDC commit task for {dataset_name} was cancelled (likely shutdown)");
+                    None
+                }
+                Err(e) if !is_shutdown => {
+                    let error_message =
+                        format!("CDC commit task for {dataset_name} ended unexpectedly: {e}");
+                    tracing::error!("{error_message}");
+                    Some(error_message)
+                }
+                Ok(()) | Err(_) => None,
+            }
         }
-        Err(e) if !is_shutdown => {
-            let error_message =
-                format!("CDC commit task for {dataset_name} ended unexpectedly: {e}");
-            tracing::error!("{error_message}");
-            Some(error_message)
+        () = tokio::time::sleep(commit_timeout) => {
+            handle.abort();
+            if is_shutdown {
+                tracing::debug!(
+                    "CDC commit task for {dataset_name} timed out during shutdown after {}ms",
+                    commit_timeout.as_millis()
+                );
+                None
+            } else {
+                let error_message = format!(
+                    "CDC commit task for {dataset_name} did not finish within {}ms",
+                    commit_timeout.as_millis()
+                );
+                tracing::error!("{error_message}");
+                Some(error_message)
+            }
         }
-        Ok(()) | Err(_) => None,
     }
 }
 
 pub(crate) fn get_primary_key_value(
     data: &RecordBatch,
+    key: &str,
+) -> crate::accelerated_table::Result<(String, Expr)> {
+    get_primary_key_value_at_row(data, 0, key)
+}
+
+pub(crate) fn get_primary_key_value_at_row(
+    data: &RecordBatch,
+    row: usize,
     key: &str,
 ) -> crate::accelerated_table::Result<(String, Expr)> {
     let data_schema = data.schema();
@@ -837,13 +970,13 @@ pub(crate) fn get_primary_key_value(
     let key_col = data.column(primary_key_idx);
     match field.data_type() {
         DataType::Int32 => {
-            extract_primary_key!(key_col, key, data_schema, Int32Array, "Int32")
+            extract_primary_key!(key_col, key, data_schema, Int32Array, "Int32", row)
         }
         DataType::Int64 => {
-            extract_primary_key!(key_col, key, data_schema, Int64Array, "Int64")
+            extract_primary_key!(key_col, key, data_schema, Int64Array, "Int64", row)
         }
         DataType::Utf8 => {
-            extract_primary_key!(key_col, key, data_schema, StringArray, "String")
+            extract_primary_key!(key_col, key, data_schema, StringArray, "String", row)
         }
         _ => crate::accelerated_table::PrimaryKeyTypeNotYetSupportedSnafu {
             data_type: field.data_type().to_string(),
@@ -872,30 +1005,22 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
     let mut sub_batches = Vec::new();
     let mut current_batch_indices = Vec::new();
     let mut current_op_type: Option<ChangeOperationType> = None;
-    let mut seen_primary_keys: HashSet<String> = HashSet::new();
+    let mut seen_primary_keys: HashSet<u64, BuildHasherDefault<twox_hash::XxHash3_64>> =
+        HashSet::default();
+    let has_pks = !pk_col_indices.is_empty();
 
     for row_id in 0..num_rows {
         let op = change_batch.op(row_id);
         let op_type = ChangeOperationType::from_operation(&op);
 
-        // Build PK string directly from column arrays — no per-row RecordBatch allocation.
-        // If there are no PK columns (e.g., Kafka append-only), skip dedup tracking entirely.
-        let has_pks = !pk_col_indices.is_empty();
-        let primary_keys = if has_pks {
-            pk_col_indices
-                .iter()
-                .filter_map(|&col_idx| {
-                    arrow::util::display::array_value_to_string(data_batch.column(col_idx), row_id)
-                        .ok()
-                })
-                .collect::<Vec<_>>()
-                .join(",")
+        let primary_key_hash = if has_pks {
+            hash_primary_key(&data_batch, &pk_col_indices, row_id)
         } else {
-            String::new()
+            0
         };
 
         let should_split = if let Some(current_type) = current_op_type {
-            current_type != op_type || (has_pks && seen_primary_keys.contains(&primary_keys))
+            current_type != op_type || (has_pks && seen_primary_keys.contains(&primary_key_hash))
         } else {
             false
         };
@@ -904,10 +1029,9 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
             if !current_batch_indices.is_empty()
                 && let Some(op_type) = current_op_type
             {
-                sub_batches.push((op_type, current_batch_indices.clone()));
+                sub_batches.push((op_type, std::mem::take(&mut current_batch_indices)));
             }
 
-            current_batch_indices.clear();
             seen_primary_keys.clear();
             current_op_type = Some(op_type);
         } else if current_op_type.is_none() {
@@ -916,7 +1040,7 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
 
         current_batch_indices.push(row_id);
         if has_pks {
-            seen_primary_keys.insert(primary_keys);
+            seen_primary_keys.insert(primary_key_hash);
         }
     }
 
@@ -927,6 +1051,145 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
     }
 
     sub_batches
+}
+
+fn hash_primary_key(data_batch: &RecordBatch, pk_col_indices: &[usize], row_id: usize) -> u64 {
+    let mut hasher = twox_hash::XxHash3_64::default();
+    for &col_idx in pk_col_indices {
+        col_idx.hash(&mut hasher);
+        hash_array_value(data_batch.column(col_idx).as_ref(), row_id, &mut hasher);
+    }
+    hasher.finish()
+}
+
+macro_rules! hash_primitive_value {
+    ($array:expr, $row_id:expr, $array_type:ty, $hasher:expr) => {{
+        if let Some(array) = $array.as_any().downcast_ref::<$array_type>() {
+            array.value($row_id).hash($hasher);
+            return;
+        }
+    }};
+}
+
+fn hash_array_value(array: &dyn Array, row_id: usize, hasher: &mut impl Hasher) {
+    if array.is_null(row_id) {
+        0u8.hash(hasher);
+        return;
+    }
+    1u8.hash(hasher);
+
+    match array.data_type() {
+        DataType::Boolean => {
+            hash_primitive_value!(array, row_id, arrow::array::BooleanArray, hasher);
+        }
+        DataType::Int8 => {
+            hash_primitive_value!(array, row_id, arrow::array::Int8Array, hasher);
+        }
+        DataType::Int16 => {
+            hash_primitive_value!(array, row_id, arrow::array::Int16Array, hasher);
+        }
+        DataType::Int32 => {
+            hash_primitive_value!(array, row_id, Int32Array, hasher);
+        }
+        DataType::Int64 => {
+            hash_primitive_value!(array, row_id, Int64Array, hasher);
+        }
+        DataType::UInt8 => {
+            hash_primitive_value!(array, row_id, arrow::array::UInt8Array, hasher);
+        }
+        DataType::UInt16 => {
+            hash_primitive_value!(array, row_id, arrow::array::UInt16Array, hasher);
+        }
+        DataType::UInt32 => {
+            hash_primitive_value!(array, row_id, UInt32Array, hasher);
+        }
+        DataType::UInt64 => {
+            hash_primitive_value!(array, row_id, arrow::array::UInt64Array, hasher);
+        }
+        DataType::Float32 => {
+            if let Some(array) = array.as_any().downcast_ref::<arrow::array::Float32Array>() {
+                array.value(row_id).to_bits().hash(hasher);
+                return;
+            }
+        }
+        DataType::Float64 => {
+            if let Some(array) = array.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                array.value(row_id).to_bits().hash(hasher);
+                return;
+            }
+        }
+        DataType::Utf8 => {
+            hash_primitive_value!(array, row_id, StringArray, hasher);
+        }
+        DataType::LargeUtf8 => {
+            hash_primitive_value!(array, row_id, arrow::array::LargeStringArray, hasher);
+        }
+        DataType::Date32 => {
+            hash_primitive_value!(array, row_id, arrow::array::Date32Array, hasher);
+        }
+        DataType::Date64 => {
+            hash_primitive_value!(array, row_id, arrow::array::Date64Array, hasher);
+        }
+        DataType::Time32(_) => {
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::Time32SecondArray>()
+            {
+                array.value(row_id).hash(hasher);
+                return;
+            }
+            hash_primitive_value!(array, row_id, arrow::array::Time32MillisecondArray, hasher);
+        }
+        DataType::Time64(_) => {
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::Time64MicrosecondArray>()
+            {
+                array.value(row_id).hash(hasher);
+                return;
+            }
+            hash_primitive_value!(array, row_id, arrow::array::Time64NanosecondArray, hasher);
+        }
+        DataType::Timestamp(_, _) => {
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampSecondArray>()
+            {
+                array.value(row_id).hash(hasher);
+                return;
+            }
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            {
+                array.value(row_id).hash(hasher);
+                return;
+            }
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            {
+                array.value(row_id).hash(hasher);
+                return;
+            }
+            hash_primitive_value!(
+                array,
+                row_id,
+                arrow::array::TimestampNanosecondArray,
+                hasher
+            );
+        }
+        DataType::Decimal128(_, _) => {
+            hash_primitive_value!(array, row_id, arrow::array::Decimal128Array, hasher);
+        }
+        _ => {}
+    }
+
+    if let Ok(value) = arrow::util::display::array_value_to_string(array, row_id) {
+        value.hash(hasher);
+    } else {
+        0xffu8.hash(hasher);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

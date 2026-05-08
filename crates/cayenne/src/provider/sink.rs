@@ -286,31 +286,16 @@ impl CayenneDataSink {
             }
 
             if !exceeded && total_rows > 0 {
-                // Concatenate into a single batch for efficient storage
-                let single_batch = arrow::compute::concat_batches(&schema, &batches)?;
-
-                if self.table.try_inline_batch(&single_batch).await? {
-                    // Persist stats from the inlined batch
+                if self.table.try_inline_batches(&batches).await? {
+                    // Persist stats from the inlined batches
                     let stats_acc = super::table::ColumnStatsAccumulator::new(&schema);
-                    stats_acc.update(&single_batch);
+                    for batch in &batches {
+                        stats_acc.update(batch);
+                    }
                     self.table.persist_table_stats(&stats_acc).await;
 
                     // Auto-checkpoint when accumulated inline data reaches 10K rows
-                    let inlined_count = match self
-                        .table
-                        .catalog()
-                        .get_inlined_data_count(self.table.table_id())
-                        .await
-                    {
-                        Ok(count) => count,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to get inlined data count for table {}, triggering checkpoint conservatively: {e}",
-                                self.table.table_name(),
-                            );
-                            i64::MAX
-                        }
-                    };
+                    let inlined_count = self.table.cached_inlined_row_count();
                     if inlined_count >= 10_000
                         && let Err(e) = self.table.checkpoint_inlined_data().await
                     {

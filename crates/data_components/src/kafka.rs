@@ -582,6 +582,32 @@ impl MessageBatchCommitter {
 
         Self { consumer, offsets }
     }
+
+    pub fn from_borrowed_messages(
+        consumer: &'static KafkaConsumer,
+        messages: &[BorrowedMessage<'_>],
+    ) -> Self {
+        let mut max_offsets: HashMap<(String, i32), i64> = HashMap::new();
+
+        for msg in messages {
+            let key = (msg.topic().to_string(), msg.partition());
+            max_offsets
+                .entry(key)
+                .and_modify(|existing| {
+                    if msg.offset() > *existing {
+                        *existing = msg.offset();
+                    }
+                })
+                .or_insert(msg.offset());
+        }
+
+        let offsets = max_offsets
+            .into_iter()
+            .map(|((topic, partition), offset)| (topic, partition, offset))
+            .collect();
+
+        Self { consumer, offsets }
+    }
 }
 
 #[async_trait]
@@ -645,7 +671,8 @@ impl Kafka {
         let metrics = Arc::clone(self.consumer.metrics());
         let inner = self
             .consumer
-            .stream_json::<serde_json::Value, serde_json::Value>()
+            .consumer
+            .stream()
             .chunks_timeout(self.batching.0, self.batching.1)
             .map(move |msgs| {
                 let schema = Arc::clone(&schema);
@@ -653,20 +680,18 @@ impl Kafka {
                 // Collect all successful messages, fail on first error
                 let messages: Vec<_> = msgs
                     .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
+                    .map(|msg| msg.context(UnableToReceiveMessageSnafu))
+                    .collect::<Result<Vec<_>>>()
                     .map_err(cdc::StreamError::Kafka)?;
 
                 if messages.is_empty() {
                     return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
                 }
 
-                let change_batch = values_to_change_batch(
-                    messages.iter().map(KafkaMessage::value),
-                    flatten_json.as_ref(),
-                    &schema,
-                );
+                let change_batch =
+                    messages_to_change_batch(&messages, flatten_json.as_ref(), &schema);
 
-                let committer = MessageBatchCommitter::from_messages(consumer, &messages);
+                let committer = MessageBatchCommitter::from_borrowed_messages(consumer, &messages);
 
                 change_batch.map(|rb| ChangeEnvelope::new(Box::new(committer), rb, true))
             });
@@ -679,25 +704,76 @@ impl Kafka {
     }
 }
 
+fn messages_to_change_batch(
+    messages: &[BorrowedMessage<'_>],
+    flatten_json: Option<&String>,
+    schema: &Arc<Schema>,
+) -> Result<ChangeBatch, cdc::StreamError> {
+    if let Some(delimiter) = flatten_json {
+        let values = messages
+            .iter()
+            .filter_map(Message::payload)
+            .map(|payload| {
+                serde_json::from_slice::<Value>(payload).map_err(|e| {
+                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return values_to_change_batch(values.iter(), Some(delimiter), schema);
+    }
+
+    payloads_to_change_batch(messages.iter().filter_map(Message::payload), schema)
+}
+
+fn payloads_to_change_batch<'a>(
+    payloads: impl Iterator<Item = &'a [u8]>,
+    schema: &Arc<Schema>,
+) -> Result<ChangeBatch, cdc::StreamError> {
+    let mut json = Vec::new();
+    let mut rows = 0usize;
+    for payload in payloads {
+        if !json.is_empty() {
+            json.push(b'\n');
+        }
+        json.extend_from_slice(payload);
+        rows += 1;
+    }
+
+    if rows == 0 {
+        return Err(cdc::StreamError::Arrow(
+            "No Kafka message payload found in batch".to_string(),
+        ));
+    }
+
+    json_bytes_to_change_batch(json.as_slice(), schema)
+}
+
 fn values_to_change_batch<'a>(
     values: impl Iterator<Item = &'a Value>,
     flatten_json: Option<&String>,
     schema: &Arc<Schema>,
 ) -> Result<ChangeBatch, cdc::StreamError> {
     // Build newline-delimited JSON from all values
-    let json_str: String = values
+    let json_values = values
         .map(|value| match flatten_json {
             Some(delimiter) => dataformat_json::flatten_json_obj(value, delimiter).to_string(),
             None => value.to_string(),
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    let json_str = json_values.join("\n");
 
+    json_bytes_to_change_batch(json_str.as_bytes(), schema)
+}
+
+fn json_bytes_to_change_batch(
+    json: &[u8],
+    schema: &Arc<Schema>,
+) -> Result<ChangeBatch, cdc::StreamError> {
     // Convert JSON string to Arrow record batches (ReaderBuilder handles NDJSON).
     // The reader produces batches of up to batch_size rows. Collect all and concatenate
     // to avoid silently dropping rows beyond the first batch.
     let reader = ReaderBuilder::new(Arc::clone(schema))
-        .build(std::io::Cursor::new(json_str.as_bytes()))
+        .build(std::io::Cursor::new(json))
         .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
 
     let batches: Vec<_> = reader

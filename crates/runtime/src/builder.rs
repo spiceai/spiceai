@@ -240,10 +240,9 @@ impl RuntimeBuilder {
 
         // Resolve CDC tunables once at startup so the per-envelope hot path
         // doesn't pay map lookup or spicepod-traversal cost. Reads
-        // `cdc_prefetch_buffer` and `cdc_max_coalesced_envelopes` from
-        // `runtime.params`; missing or rejected values fall back to the
-        // matching `SPICE_CDC_*` env var, then to defaults, with a warning
-        // for rejected explicit values.
+        // `cdc_*` knobs from `runtime.params`; missing or rejected values
+        // fall back to the matching `SPICE_CDC_*` env var, then to defaults,
+        // with a warning for rejected explicit values.
         crate::accelerated_table::refresh_task::changes::set_cdc_config(
             crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
                 &spicepod_rt.params,
