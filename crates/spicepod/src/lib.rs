@@ -654,8 +654,8 @@ mod version_tests {
         let cases = ["v0", "v3", "v3.0.0", "v100", "v4.5.6-rc.1"];
         for case in cases {
             let result: Result<SpicepodVersion, _> = yaml::from_str(case);
-            let err = result
-                .expect_err(&format!("'{case}' should be rejected as unsupported major"));
+            let err =
+                result.expect_err(&format!("'{case}' should be rejected as unsupported major"));
             let msg = err.to_string();
             assert!(
                 msg.contains("unsupported spicepod version") && msg.contains(case),

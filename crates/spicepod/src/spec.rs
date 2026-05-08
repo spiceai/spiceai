@@ -169,7 +169,8 @@ const SUPPORTED_MAJORS: &[u64] = &[1, 2];
 /// so external schema validators reject unsupported majors up-front.
 /// Keep in sync with [`SUPPORTED_MAJORS`].
 #[cfg(feature = "schemars")]
-const VERSION_SCHEMA_PATTERN: &str = r"^v(1|2)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)?)?$";
+const VERSION_SCHEMA_PATTERN: &str =
+    r"^v(1|2)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)?)?$";
 
 #[expect(clippy::expect_used)]
 static VERSION_REGEX: LazyLock<Regex> =
