@@ -222,9 +222,10 @@ impl Runtime {
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 
-        let connector = match dataconnector::create_new_connector(&source, params).await {
-            Some(result) => result.context(UnableToInitializeDataConnectorSnafu)?,
-            None => {
+        let connector =
+            if let Some(result) = dataconnector::create_new_connector(&source, params).await {
+                result.context(UnableToInitializeDataConnectorSnafu)?
+            } else {
                 let suggestion = suggest_connector(&source).await;
                 let available = registered_connector_names().await;
                 return Err(UnknownDataConnectorSnafu {
@@ -233,8 +234,7 @@ impl Runtime {
                     available,
                 }
                 .build());
-            }
-        };
+            };
 
         let provider = connector
             .read_write_provider(&dataset)
