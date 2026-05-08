@@ -140,6 +140,7 @@ impl std::error::Error for SpicepodVersionParseError {}
 /// A pre-release identifier is only valid alongside a full `major.minor.patch`.
 const VERSION_PATTERN: &str = r"^v(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)?)?$";
 
+#[expect(clippy::expect_used)]
 static VERSION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(VERSION_PATTERN).expect("spicepod version regex must compile"));
 
