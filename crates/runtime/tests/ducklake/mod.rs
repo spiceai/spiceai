@@ -440,10 +440,8 @@ async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new(
-                "ducklake:main.orders".to_string(),
-                "my_orders".to_string(),
-            );
+            let mut dataset =
+                Dataset::new("ducklake:main.orders".to_string(), "my_orders".to_string());
             dataset.params = Some(Params::from_string_map(HashMap::from([(
                 "ducklake_connection_string".to_string(),
                 metadata_path.clone(),
@@ -476,13 +474,7 @@ async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
                 .await?;
             let results: Vec<RecordBatch> = result.data.try_collect().await?;
             assert_batches_eq!(
-                &[
-                    "+-----+",
-                    "| cnt |",
-                    "+-----+",
-                    "| 3   |",
-                    "+-----+",
-                ],
+                &["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+",],
                 &results
             );
 
@@ -501,9 +493,7 @@ async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
             // Verify the row was inserted
             let result = rt
                 .datafusion()
-                .query_builder(
-                    "SELECT id, customer_id, total FROM my_orders ORDER BY id",
-                )
+                .query_builder("SELECT id, customer_id, total FROM my_orders ORDER BY id")
                 .build()
                 .run()
                 .await?;

@@ -233,91 +233,130 @@ impl DataSink for DuckDbFederatedDataSink {
                 let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let tx = duckdb_conn
+                let stream = FFI_ArrowArrayStream::new(Box::new(SyncRecordBatchReceiver::new(
+                    batch_rx,
+                    Arc::clone(&schema),
+                )));
+
+                let current_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    .as_millis();
+
+                // `register_arrow_scan_view` creates a view in the connection's
+                // default catalog (does not support qualified names). The INSERT might
+                // target different attached database (e.g. `ducklake`). DuckDB
+                // does not allow writes to multiple databases in a single transaction:
+                //
+                //   "TransactionContext Error: Attempting to write to database
+                //    'ducklake' in a transaction that has already modified database
+                //    'memory' - a single transaction can only write to a single attached database."
+                //
+                // Approach:
+                //  1. Register the view outside our explicit transaction (auto-commits to the default catalog).
+                //  2. Open a transaction for the INSERT (writes only to the target).
+                //  3. Commit or roll back.
+                //  4. Drop the view (best-effort).
+                let view_name = format!("__scan_{current_ts}");
+                duckdb_conn
                     .conn
-                    .transaction()
+                    .register_arrow_scan_view(&view_name, &stream)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let result = (|| {
-                    // Overwrite: delete existing rows before inserting new ones.
-                    // Both operations share the same transaction for atomicity.
-                    if insert_op == InsertOp::Overwrite {
-                        let delete_sql = format!("DELETE FROM {table_ref_quoted}");
-                        tracing::debug!("{delete_sql}");
-                        tx.execute(&delete_sql, [])
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    }
-
-                    let stream = FFI_ArrowArrayStream::new(Box::new(SyncRecordBatchReceiver::new(
-                        batch_rx,
-                        Arc::clone(&schema),
-                    )));
-
-                    let current_ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?
-                        .as_millis();
-
-                    // Use a temporary view to let DuckDB pull directly from Arrow buffers
-                    // without serialization, rather than row-by-row parameter binding.
-                    let view_name = format!("__scan_{current_ts}");
-                    tx.register_arrow_scan_view(&view_name, &stream)
+                // Transaction scoped in a block — see explanation above.
+                let result = {
+                    let tx = duckdb_conn
+                        .conn
+                        .transaction()
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                    let insert_sql = format!(
-                        r#"INSERT INTO {table_ref} SELECT * FROM "{view_name}""#,
-                        table_ref = table_ref_quoted,
-                    );
-                    tracing::debug!("{insert_sql}");
+                    let inner_result = (|| {
+                        if insert_op == InsertOp::Overwrite {
+                            let delete_sql = format!("DELETE FROM {table_ref_quoted}");
+                            tracing::debug!("{delete_sql}");
+                            tx.execute(&delete_sql, [])
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        }
 
-                    let rows = tx
-                        .execute(&insert_sql, [])
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        let insert_sql = format!(
+                            r#"INSERT INTO {table_ref} SELECT * FROM "{view_name}""#,
+                            table_ref = table_ref_quoted,
+                        );
+                        tracing::debug!("{insert_sql}");
 
-                    // Clean up temporary view
-                    let _ = tx.execute(&format!(r#"DROP VIEW IF EXISTS "{view_name}""#), []);
-
-                    Ok::<usize, DataFusionError>(rows)
-                })();
-
-                match result {
-                    Ok(rows) => {
-                        // Only commit if the async side confirmed the stream completed
-                        // successfully. If it was dropped or errored, commit_rx will
-                        // return an error and we roll back instead of persisting
-                        // partial data.
-                        commit_rx.blocking_recv().map_err(|_| {
-                            DataFusionError::Execution(format!(
-                                "Stream terminated before all data was sent to {table_ref_quoted}; rolling back"
-                            ))
-                        })?;
-                        tx.commit()
+                        let rows = tx
+                            .execute(&insert_sql, [])
                             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                        Ok(rows as u64)
+
+                        Ok::<usize, DataFusionError>(rows)
+                    })();
+
+                    match inner_result {
+                        Ok(rows) => {
+                            // Only commit if the async side confirmed the stream completed
+                            // successfully.
+                            commit_rx.blocking_recv().map_err(|_| {
+                                DataFusionError::Execution(format!(
+                                    "Stream terminated before all data was sent to {table_ref_quoted}; rolling back"
+                                ))
+                            })?;
+                            tx.commit()
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            Ok(rows as u64)
+                        }
+                        Err(e) => {
+                            // Transaction automatically rolls back on drop.
+                            Err(e)
+                        }
                     }
-                    Err(e) => {
-                        // Transaction automatically rolls back on drop if not committed.
-                        Err(e)
-                    }
-                }
+                };
+
+                // Best-effort cleanup: drop the temporary view after the transaction is resolved.
+                let _ = duckdb_conn
+                    .conn
+                    .execute(&format!(r#"DROP VIEW IF EXISTS "{view_name}""#), []);
+
+                result
             },
         );
 
-        // Feed batches from the async stream into the sync channel
+        // Feed batches from the async stream into the sync channel.
+        // If the stream yields an error, we must still await the blocking task
+        // so it can roll back the transaction and clean up the temporary view.
+        let mut stream_error: Option<DataFusionError> = None;
         while let Some(batch) = data.next().await {
-            let batch = batch?;
-            if batch_tx.send(batch).await.is_err() {
-                break; // Receiver dropped, write task failed
+            match batch {
+                Ok(batch) => {
+                    if batch_tx.send(batch).await.is_err() {
+                        break; // Receiver dropped, write task failed
+                    }
+                }
+                Err(e) => {
+                    stream_error = Some(e);
+                    break;
+                }
             }
         }
-        drop(batch_tx); // Signal end of stream to blocking_recv
+        drop(batch_tx); // Signal end of stream to the blocking side
 
-        // All batches sent successfully — tell the blocking side it is safe to commit.
-        let _ = commit_tx.send(());
+        if stream_error.is_none() {
+            // All batches sent successfully — tell the blocking side it is safe to commit.
+            let _ = commit_tx.send(());
+        }
+        // else: commit_tx is dropped without sending, so blocking_recv returns
+        // Err and the transaction rolls back.
 
-        write_handle
+        // Always await the blocking task to ensure cleanup completes before
+        // releasing the write lock.
+        let write_result = write_handle
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        if let Some(e) = stream_error {
+            return Err(e);
+        }
+
+        write_result
     }
 }
 
