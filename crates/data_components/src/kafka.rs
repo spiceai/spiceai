@@ -592,6 +592,7 @@ impl MessageBatchCommitter {
         Self { consumer, offsets }
     }
 
+    #[must_use]
     pub fn from_borrowed_messages(
         consumer: &'static KafkaConsumer,
         messages: &[BorrowedMessage<'_>],
