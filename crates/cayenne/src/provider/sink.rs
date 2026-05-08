@@ -360,7 +360,7 @@ impl CayenneDataSink {
 
             let retention_deleted_rows = self.apply_retention_if_configured().await?;
             let sorted = self.sort_if_configured().await?;
-            if retention_deleted_rows > 0 || sorted {
+            if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted) {
                 self.table.refresh_listing_table()?;
             }
             self.table.persist_table_stats(&stats_acc).await;
@@ -449,7 +449,7 @@ impl CayenneDataSink {
         // Staged appends refresh the listing table during WAL finalization, and
         // new-snapshot writes refresh it immediately above. Refresh again only
         // when a post-write operation can change file visibility/statistics.
-        if retention_deleted_rows > 0 || sorted {
+        if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted) {
             self.table.refresh_listing_table()?;
         }
 
@@ -597,5 +597,31 @@ impl CayenneDataSink {
         self.table.persist_table_stats(&write_stats_acc).await;
 
         Ok(total_rows)
+    }
+}
+
+fn should_refresh_listing_table_after_post_write(
+    retention_deleted_rows: u64,
+    sorted: bool,
+) -> bool {
+    retention_deleted_rows > 0 || sorted
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn refresh_listing_table_only_when_post_write_steps_changed_files() {
+        assert!(!super::should_refresh_listing_table_after_post_write(
+            0, false
+        ));
+        assert!(super::should_refresh_listing_table_after_post_write(
+            1, false
+        ));
+        assert!(super::should_refresh_listing_table_after_post_write(
+            0, true
+        ));
+        assert!(super::should_refresh_listing_table_after_post_write(
+            1, true
+        ));
     }
 }

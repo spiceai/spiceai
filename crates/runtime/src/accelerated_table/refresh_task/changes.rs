@@ -1589,6 +1589,30 @@ mod tests {
     }
 
     #[test]
+    fn test_primary_key_encoding_distinguishes_composite_string_boundaries() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("left", DataType::Utf8, false),
+            Field::new("right", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["ab", "a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["c", "bc"])) as ArrayRef,
+            ],
+        )
+        .expect("record batch should be created");
+
+        let first_key = encode_primary_key(&batch, &[0, 1], 0);
+        let second_key = encode_primary_key(&batch, &[0, 1], 1);
+
+        assert_ne!(
+            first_key, second_key,
+            "composite keys ('ab', 'c') and ('a', 'bc') must not collapse to the same grouping key"
+        );
+    }
+
+    #[test]
     fn test_alternating_operations() {
         let change_batch = create_test_change_batch(
             vec!["c", "d", "c", "d"],

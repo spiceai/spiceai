@@ -453,12 +453,7 @@ impl DataAccelerator for DuckDBAccelerator {
             .and_then(|src| src.acceleration())
             .and_then(|acceleration| acceleration.refresh_mode)
             .is_some_and(|refresh_mode| refresh_mode == RefreshMode::Changes);
-        if is_changes_refresh && !cmd.options.contains_key("recompute_statistics_on_write") {
-            cmd.options.insert(
-                "recompute_statistics_on_write".to_string(),
-                "false".to_string(),
-            );
-        }
+        apply_changes_refresh_write_defaults(&mut cmd, is_changes_refresh);
 
         // Modify the `cmd` by adding options to attach other databases
         if let Some(source) = source {
@@ -680,6 +675,15 @@ impl DataAccelerator for DuckDBAccelerator {
         )
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+    }
+}
+
+fn apply_changes_refresh_write_defaults(cmd: &mut CreateExternalTable, is_changes_refresh: bool) {
+    if is_changes_refresh && !cmd.options.contains_key("recompute_statistics_on_write") {
+        cmd.options.insert(
+            "recompute_statistics_on_write".to_string(),
+            "false".to_string(),
+        );
     }
 }
 
@@ -931,6 +935,75 @@ mod tests {
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
     use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
+
+    fn external_table_with_options(options: HashMap<String, String>) -> CreateExternalTable {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let df_schema = ToDFSchema::to_dfschema_ref(schema)
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("write_settings_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        }
+    }
+
+    #[test]
+    fn changes_refresh_disables_duckdb_recompute_statistics_by_default() {
+        let mut external_table = external_table_with_options(HashMap::new());
+
+        super::apply_changes_refresh_write_defaults(&mut external_table, true);
+
+        assert_eq!(
+            external_table.options.get("recompute_statistics_on_write"),
+            Some(&"false".to_string())
+        );
+    }
+
+    #[test]
+    fn changes_refresh_preserves_explicit_duckdb_recompute_statistics_setting() {
+        let mut options = HashMap::new();
+        options.insert(
+            "recompute_statistics_on_write".to_string(),
+            "true".to_string(),
+        );
+        let mut external_table = external_table_with_options(options);
+
+        super::apply_changes_refresh_write_defaults(&mut external_table, true);
+
+        assert_eq!(
+            external_table.options.get("recompute_statistics_on_write"),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn non_changes_refresh_keeps_duckdb_write_settings_unset() {
+        let mut external_table = external_table_with_options(HashMap::new());
+
+        super::apply_changes_refresh_write_defaults(&mut external_table, false);
+
+        assert!(
+            !external_table
+                .options
+                .contains_key("recompute_statistics_on_write")
+        );
+    }
 
     #[tokio::test]
     async fn retention_sql_applies_before_commit() {

@@ -2298,7 +2298,92 @@ impl VisitorMut for TursoBetweenVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::sink::DataSink;
+    use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::sql::sqlparser::parser::Parser;
+
+    async fn create_turso_sink(table_name: &str) -> (Arc<TursoConnectionPool>, TursoDataSink) {
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        conn.execute(
+            format!(
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY, name TEXT)",
+                quote_identifier(table_name)
+            ),
+            (),
+        )
+        .await
+        .expect("test table should be created");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let sink = TursoDataSink::new(
+            Arc::clone(&pool),
+            table_name.to_string(),
+            schema,
+            InsertOp::Append,
+        );
+
+        (pool, sink)
+    }
+
+    fn batch(schema: SchemaRef, ids: Vec<i64>, names: Vec<&str>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+            ],
+        )
+        .expect("record batch should be created")
+    }
+
+    fn stream(schema: SchemaRef, batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        Box::pin(MemoryStream::try_new(batches, schema, None).expect("stream should be created"))
+    }
+
+    async fn query_rows(pool: &TursoConnectionPool, table_name: &str) -> Vec<(i64, String)> {
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        let mut rows = conn
+            .query(
+                format!(
+                    "SELECT id, name FROM {} ORDER BY id",
+                    quote_identifier(table_name)
+                ),
+                (),
+            )
+            .await
+            .expect("query should execute");
+
+        let mut values = Vec::new();
+        while let Some(row) = rows.next().await.expect("row should be read") {
+            let id = match row.get_value(0).expect("id should be present") {
+                TursoValue::Integer(id) => id,
+                other => panic!("expected integer id, got {other:?}"),
+            };
+            let name = match row.get_value(1).expect("name should be present") {
+                TursoValue::Text(name) => name,
+                other => panic!("expected text name, got {other:?}"),
+            };
+            values.push((id, name));
+        }
+
+        values
+    }
 
     fn rewrite_between(sql: &str) -> String {
         let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
@@ -2308,6 +2393,60 @@ mod tests {
             let _ = stmt.visit(&mut visitor);
         }
         stmts[0].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_turso_append_writes_multiple_stream_batches() {
+        let table_name = "append_multi_batch";
+        let (pool, sink) = create_turso_sink(table_name).await;
+        let schema = Arc::clone(sink.schema());
+        let data = stream(
+            Arc::clone(&schema),
+            vec![
+                batch(Arc::clone(&schema), vec![1, 2], vec!["one", "two"]),
+                batch(Arc::clone(&schema), vec![3], vec!["three"]),
+            ],
+        );
+
+        let written = sink
+            .write_all(data, &Arc::new(TaskContext::default()))
+            .await
+            .expect("append should succeed");
+
+        assert_eq!(written, 3);
+        assert_eq!(
+            query_rows(&pool, table_name).await,
+            vec![
+                (1, "one".to_string()),
+                (2, "two".to_string()),
+                (3, "three".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_turso_append_rolls_back_all_batches_on_later_error() {
+        let table_name = "append_atomic_error";
+        let (pool, sink) = create_turso_sink(table_name).await;
+        let schema = Arc::clone(sink.schema());
+        let data = stream(
+            Arc::clone(&schema),
+            vec![
+                batch(Arc::clone(&schema), vec![1], vec!["first"]),
+                batch(Arc::clone(&schema), vec![1], vec!["duplicate"]),
+            ],
+        );
+
+        let result = sink
+            .write_all(data, &Arc::new(TaskContext::default()))
+            .await;
+
+        assert!(result.is_err(), "duplicate primary key should fail");
+        assert_eq!(
+            query_rows(&pool, table_name).await,
+            Vec::<(i64, String)>::new(),
+            "the first batch must roll back when a later batch in the same stream fails"
+        );
     }
 
     #[test]
