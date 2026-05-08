@@ -93,6 +93,7 @@ mod metadata;
 mod mongo;
 #[cfg(feature = "mssql")]
 mod mssql;
+mod mtls_public;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "odbc")]

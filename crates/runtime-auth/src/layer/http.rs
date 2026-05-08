@@ -73,6 +73,21 @@ where
         Box::pin(async move {
             let (parts, body) = req.into_parts();
 
+            // Short-circuit when an upstream layer (e.g. the mTLS
+            // layer in mTLS-as-identity mode) has already established
+            // the auth principal. Without this check the API-key /
+            // bearer-token verifier would still run and a request
+            // with a verified client cert but no API key would be
+            // rejected.
+            if let Some(ctx) = parts
+                .extensions
+                .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+                && ctx.auth_principal().is_some()
+            {
+                let req = Request::from_parts(parts, body);
+                return inner.call(req).await;
+            }
+
             match auth_verifier.http_verify(&parts) {
                 Ok(AuthVerdict::Allow(principal)) => {
                     let mut request = Request::from_parts(parts, body);

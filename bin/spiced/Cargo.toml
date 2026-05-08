@@ -48,6 +48,7 @@ otel-arrow = { path = "../../crates/otel-arrow" }
 prometheus.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
+runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
@@ -149,6 +150,7 @@ sftp = ["connector-sftp", "runtime/sftp"]
 sharepoint = ["connector-sharepoint", "runtime/sharepoint"]
 smb = ["connector-smb"]
 snapshots = ["runtime/snapshots"]
+client_tls = ["runtime/client_tls"]
 snowflake = ["connector-snowflake", "runtime/snowflake"]
 spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 sqlite = ["runtime/sqlite"]

@@ -1148,6 +1148,7 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
         let auth = endpoint_auth.http_auth.clone();
+        let identity_source = endpoint_auth.identity_source;
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
@@ -1161,6 +1162,7 @@ impl Runtime {
                     cloned_config.into(),
                     cloned_tls_config,
                     auth,
+                    identity_source,
                     Some(http_shutdown),
                 )
                 .map_err(Error::from),

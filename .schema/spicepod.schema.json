@@ -475,6 +475,16 @@
             }
           ]
         },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "temp_directory": {
           "description": "Configures where the runtime will store temporary files needed for operations like\nspilling to disk for queries & accelerations that are larger than memory.",
           "type": [
@@ -814,11 +824,45 @@
             "string",
             "null"
           ]
+        },
+        "client_auth_ca_file": {
+          "description": "Filesystem path to a PEM-encoded CA bundle used to verify client\ncertificates when `client_auth_mode` is `request` or `required`.\nEligible for hot-reload via the same watcher that picks up server\ncert / key rotations.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_auth_ca": {
+          "description": "Inline PEM (or `${ secrets:... }`) form of the client CA bundle.\nMutually exclusive with `client_auth_ca_file`. Inline material is\nnot hot-reloaded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_auth_mode": {
+          "description": "How the runtime treats client certificates on the public TLS\nendpoints. Defaults to `none`, which preserves today's behavior\n(the server does not request a client cert during the TLS\nhandshake). See [`ClientAuthMode`] for the full mode table.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientAuthMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
         "enabled"
+      ]
+    },
+    "ClientAuthMode": {
+      "description": "How the runtime treats client certificates on the public TLS\nendpoints (HTTP, Flight, Metrics).\n\n`None` is the out-of-the-box default and disables client-cert\nauthentication entirely — the server runs `with_no_client_auth()`\nat the rustls layer and does not send a `CertificateRequest`. A\nnon-conforming client that nonetheless presents a cert is rejected\nby rustls as a protocol violation.\n\n`Request` opts in to *optional* mTLS: the server sends\n`CertificateRequest` and accepts both no-cert and cert-bearing\nhandshakes. Presented certs must be signed by\n`client_auth_ca` / `client_auth_ca_file` (an invalid cert is still\nrejected at the handshake). When a cert is presented it is\npromoted to the request's auth principal under\n`IdentitySource::Channel`; when absent the request runs as the\nanonymous principal. Useful for migration windows and for\naudit-only deployments where every cert seen should be recorded\nbut not enforced.\n\n`Required` enables strict mTLS: the server demands a valid client\ncert (verified against `client_auth_ca` / `client_auth_ca_file`)\nfor every connection on the Flight listener; on the HTTP and\nmetrics listeners the TLS handshake admits no-cert connections so\nKubernetes liveness / readiness probes and Prometheus scrapes work\nwithout a client cert, but the HTTP route layer 401s any\nnon-probe request whose connection has no verified client cert.\n\nWhether a presented cert *also* becomes the request's auth\nprincipal is determined separately by whether `runtime.auth` is\nconfigured — see the `IdentitySource` enum at the binary\nentrypoint. Briefly:\n\n- `client_auth_mode: required` and no `runtime.auth`\n  → mTLS-as-identity (the cert is the principal).\n- `client_auth_mode: required` plus `runtime.auth`\n  → mTLS-as-channel (the cert protects the channel; the\n  API key / OIDC token is the principal).",
+      "type": "string",
+      "enum": [
+        "none",
+        "request",
+        "required"
       ]
     },
     "TracingConfig": {
@@ -1115,6 +1159,23 @@
           "default": true
         }
       }
+    },
+    "McpConfig": {
+      "description": "Configuration for the MCP (Model Context Protocol) HTTP endpoint.",
+      "type": "object",
+      "properties": {
+        "allowed_hosts": {
+          "description": "Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.\nUsed to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),\nhost-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).\nSet to `[\"*\"]` to disable host checking entirely.\nDefaults to rmcp defaults (`[\"localhost\", \"127.0.0.1\", \"::1\"]`).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "RuntimeReadyState": {
       "description": "Controls when the runtime readiness probe reports the runtime as ready.",
@@ -1731,9 +1792,6 @@
             },
             "check_availability": {
               "$ref": "#/$defs/CheckAvailability"
-            },
-            "load": {
-              "$ref": "#/$defs/Load"
             },
             "mode": {
               "$ref": "#/$defs/AccessMode"
@@ -2951,21 +3009,6 @@
           "description": "The dataset is not checked for availability.",
           "type": "string",
           "const": "disabled"
-        }
-      ]
-    },
-    "Load": {
-      "description": "Controls when a dataset is loaded by the runtime.",
-      "oneOf": [
-        {
-          "description": "Load the dataset during runtime startup.",
-          "type": "string",
-          "const": "on_startup"
-        },
-        {
-          "description": "Load the dataset when it is first queried or explicitly refreshed.",
-          "type": "string",
-          "const": "on_demand"
         }
       ]
     },
@@ -7379,7 +7422,7 @@
           "default": ""
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
         },
         "tool_embedding_model": {
@@ -7624,7 +7667,7 @@
           ]
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
         },
         "tool_embedding_model": {
@@ -7842,7 +7885,7 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
         },
         "tool_embedding_model": {
@@ -8072,7 +8115,7 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
         },
         "tool_embedding_model": {
@@ -8298,7 +8341,7 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
         },
         "tool_embedding_model": {
@@ -8528,7 +8571,7 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
         },
         "tool_embedding_model": {
@@ -8750,7 +8793,7 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
         },
         "tool_embedding_model": {
@@ -9009,7 +9052,7 @@
           ]
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
         },
         "tool_embedding_model": {
@@ -9227,7 +9270,7 @@
           "type": "string"
         },
         "tools": {
-          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
         },
         "tool_embedding_model": {
@@ -9604,9 +9647,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -9784,9 +9824,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9966,9 +10003,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10146,9 +10180,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10328,9 +10359,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10508,9 +10536,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10690,9 +10715,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10870,9 +10892,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11052,9 +11071,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11232,9 +11248,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11414,9 +11427,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11594,9 +11604,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11776,9 +11783,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11956,9 +11960,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12138,9 +12139,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12318,9 +12316,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12500,9 +12495,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12680,9 +12672,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12862,9 +12851,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13043,9 +13029,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13223,9 +13206,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -13414,9 +13394,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13603,9 +13580,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -13794,9 +13768,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13983,9 +13954,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -14174,9 +14142,6 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
-        "load": {
-          "$ref": "#/$defs/Load"
-        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -14363,9 +14328,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -15454,9 +15416,6 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
-        },
-        "load": {
-          "$ref": "#/$defs/Load"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
