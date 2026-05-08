@@ -34,7 +34,7 @@ use globset::GlobSet;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 
-use crate::{Read, RefreshableCatalogProvider};
+use crate::{Read, ReadWrite, RefreshableCatalogProvider};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -48,6 +48,24 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Clone)]
+enum SnowflakeTableCreator {
+    Read(Arc<dyn Read>),
+    ReadWrite(Arc<dyn ReadWrite>),
+}
+
+impl SnowflakeTableCreator {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+    ) -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Self::Read(table_creator) => table_creator.table_provider(table_reference).await,
+            Self::ReadWrite(table_creator) => table_creator.table_provider(table_reference).await,
+        }
+    }
+}
 
 fn quote_sql_identifier(value: &str) -> Result<String> {
     ensure!(
@@ -82,7 +100,7 @@ pub struct SnowflakeCatalogProvider {
     /// The Snowflake database name to catalog
     database: String,
     /// Table factory for creating table providers from discovered tables
-    table_creator: Arc<dyn Read>,
+    table_creator: SnowflakeTableCreator,
     /// Cached schemas (`schema_name` -> `SchemaProvider`)
     schemas: RwLock<HashMap<String, Arc<SnowflakeSchemaProvider>>>,
     /// Optional glob filter for `schema.table` patterns
@@ -103,6 +121,35 @@ impl SnowflakeCatalogProvider {
         api: Arc<SnowflakeApi>,
         database: String,
         table_creator: Arc<dyn Read>,
+        include: Option<GlobSet>,
+    ) -> Self {
+        Self::new_with_table_creator(
+            api,
+            database,
+            SnowflakeTableCreator::Read(table_creator),
+            include,
+        )
+    }
+
+    #[must_use]
+    pub fn new_read_write(
+        api: Arc<SnowflakeApi>,
+        database: String,
+        table_creator: Arc<dyn ReadWrite>,
+        include: Option<GlobSet>,
+    ) -> Self {
+        Self::new_with_table_creator(
+            api,
+            database,
+            SnowflakeTableCreator::ReadWrite(table_creator),
+            include,
+        )
+    }
+
+    fn new_with_table_creator(
+        api: Arc<SnowflakeApi>,
+        database: String,
+        table_creator: SnowflakeTableCreator,
         include: Option<GlobSet>,
     ) -> Self {
         Self {
@@ -128,7 +175,7 @@ impl SnowflakeCatalogProvider {
             stream::iter(schema_names.into_iter().map(|schema_name| {
                 let api = Arc::clone(&self.api);
                 let database = self.database.clone();
-                let table_creator = Arc::clone(&self.table_creator);
+                let table_creator = self.table_creator.clone();
                 let include = self.include.clone();
                 async move {
                     let provider = SnowflakeSchemaProvider::new(
@@ -255,7 +302,7 @@ pub struct SnowflakeSchemaProvider {
     /// The schema name
     schema_name: String,
     /// Table factory for creating table providers
-    table_creator: Arc<dyn Read>,
+    table_creator: SnowflakeTableCreator,
     /// Cached tables (`table_name` -> `TableProvider`)
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
     /// Optional glob filter for `schema.table` patterns
@@ -272,12 +319,11 @@ impl std::fmt::Debug for SnowflakeSchemaProvider {
 }
 
 impl SnowflakeSchemaProvider {
-    #[must_use]
-    pub fn new(
+    fn new(
         api: Arc<SnowflakeApi>,
         database: String,
         schema_name: String,
-        table_creator: Arc<dyn Read>,
+        table_creator: SnowflakeTableCreator,
         include: Option<Arc<GlobSet>>,
     ) -> Self {
         Self {
@@ -319,7 +365,7 @@ impl SnowflakeSchemaProvider {
         let mut stream = stream::iter(filtered_tables.into_iter().map(|table_name| {
             let database = self.database.clone();
             let schema_name = self.schema_name.clone();
-            let table_creator = Arc::clone(&self.table_creator);
+            let table_creator = self.table_creator.clone();
             async move {
                 // Quote each part with double quotes for Snowflake SQL, matching the
                 // pattern used by the Snowflake data connector.
@@ -449,7 +495,51 @@ impl SchemaProvider for SnowflakeSchemaProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{quote_sql_identifier, quote_sql_string_literal};
+    use super::{SnowflakeTableCreator, quote_sql_identifier, quote_sql_string_literal};
+    use crate::{Read, ReadWrite};
+    use async_trait::async_trait;
+    use datafusion::datasource::{MemTable, TableProvider};
+    use datafusion::sql::TableReference;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug, Default)]
+    struct RecordingTableCreator {
+        read_calls: AtomicUsize,
+        read_write_calls: AtomicUsize,
+    }
+
+    fn empty_table_provider()
+    -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?))
+    }
+
+    #[async_trait]
+    impl Read for RecordingTableCreator {
+        async fn table_provider(
+            &self,
+            _table_reference: TableReference,
+        ) -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            empty_table_provider()
+        }
+    }
+
+    #[async_trait]
+    impl ReadWrite for RecordingTableCreator {
+        async fn table_provider(
+            &self,
+            _table_reference: TableReference,
+        ) -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.read_write_calls.fetch_add(1, Ordering::Relaxed);
+            empty_table_provider()
+        }
+    }
 
     #[test]
     fn test_quote_sql_identifier_no_quotes() {
@@ -501,5 +591,35 @@ mod tests {
             quote_sql_string_literal("schema\0name").is_err(),
             "string literal containing NUL should be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn table_creator_uses_read_provider_by_default() {
+        let creator = Arc::new(RecordingTableCreator::default());
+        let read_creator: Arc<dyn Read> = creator.clone();
+        let table_creator = SnowflakeTableCreator::Read(read_creator);
+
+        table_creator
+            .table_provider(TableReference::bare("items"))
+            .await
+            .expect("table provider should be created");
+
+        assert_eq!(creator.read_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(creator.read_write_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn table_creator_uses_read_write_provider_when_configured() {
+        let creator = Arc::new(RecordingTableCreator::default());
+        let read_write_creator: Arc<dyn ReadWrite> = creator.clone();
+        let table_creator = SnowflakeTableCreator::ReadWrite(read_write_creator);
+
+        table_creator
+            .table_provider(TableReference::bare("items"))
+            .await
+            .expect("table provider should be created");
+
+        assert_eq!(creator.read_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(creator.read_write_calls.load(Ordering::Relaxed), 1);
     }
 }

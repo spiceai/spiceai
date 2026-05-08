@@ -24,8 +24,8 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
-use data_components::Read;
 use data_components::snowflake::SnowflakeTableFactory;
+use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
@@ -151,6 +151,13 @@ enum ReadProviderError {
         connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Unable to get read-write provider for {dataconnector}: {source}"))]
+    UnableToGetReadWriteProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl From<ReadProviderError> for DataConnectorError {
@@ -165,8 +172,31 @@ impl From<ReadProviderError> for DataConnectorError {
                 connector_component,
                 source,
             },
+            ReadProviderError::UnableToGetReadWriteProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadWriteProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
         }
     }
+}
+
+fn snowflake_table_path(dataset: &Dataset) -> String {
+    dataset
+        .path()
+        .split('.')
+        .map(|part| {
+            if part.starts_with('"') && part.ends_with('"') {
+                return part.into();
+            }
+
+            format!("\"{part}\"")
+        })
+        .join(".")
 }
 
 #[async_trait]
@@ -179,17 +209,7 @@ impl DataConnector for Snowflake {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let path = dataset
-            .path()
-            .split('.')
-            .map(|x| {
-                if x.starts_with('"') && x.ends_with('"') {
-                    return x.into();
-                }
-
-                format!("\"{x}\"")
-            })
-            .join(".");
+        let path = snowflake_table_path(dataset);
 
         Ok(Read::table_provider(&self.table_factory, path.into())
             .await
@@ -197,6 +217,23 @@ impl DataConnector for Snowflake {
                 dataconnector: "snowflake",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
+    }
+
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
+        let path = snowflake_table_path(dataset);
+
+        Some(
+            ReadWrite::table_provider(&self.table_factory, path.into())
+                .await
+                .context(UnableToGetReadWriteProviderSnafu {
+                    dataconnector: "snowflake",
+                    connector_component: ConnectorComponent::from(dataset),
+                })
+                .map_err(Into::into),
+        )
     }
 }
 
