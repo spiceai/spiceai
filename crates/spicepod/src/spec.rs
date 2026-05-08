@@ -47,6 +47,9 @@ use crate::extension::Extension;
 /// - `v2.0.0` — major.minor.patch
 /// - `v2.0.0-rc.1` — major.minor.patch with a pre-release identifier
 ///
+/// Currently only `v1` and `v2` majors are supported. Other shapes (`v3`, `v0`, etc.)
+/// fail to parse with an "unsupported major" error.
+///
 /// Equality is structural: `v1` and `v1.0.0` are not equal.
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct SpicepodVersion {
@@ -116,29 +119,57 @@ impl Display for SpicepodVersion {
     }
 }
 
-/// Error returned when a spicepod version string is not in the expected format.
+/// Error returned when a spicepod version string cannot be accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpicepodVersionParseError {
     input: String,
+    kind: SpicepodVersionParseErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpicepodVersionParseErrorKind {
+    /// The input does not match the expected `vMAJOR[.MINOR[.PATCH[-PRERELEASE]]]` format.
+    InvalidFormat,
+    /// The format is valid but the major version is not one of [`SUPPORTED_MAJORS`].
+    UnsupportedMajor(u64),
 }
 
 impl Display for SpicepodVersionParseError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(
-            f,
-            "invalid spicepod version '{}': expected a version string like 'v1', 'v2', 'v2.0', 'v2.0.0', or 'v2.0.0-rc.1'",
-            self.input
-        )
+        match self.kind {
+            SpicepodVersionParseErrorKind::InvalidFormat => write!(
+                f,
+                "invalid spicepod version '{}': expected a version string like 'v1', 'v2', 'v2.0', 'v2.0.0', or 'v2.0.0-rc.1'",
+                self.input
+            ),
+            SpicepodVersionParseErrorKind::UnsupportedMajor(major) => write!(
+                f,
+                "unsupported spicepod version '{}': major version v{major} is not supported (supported majors: v1, v2)",
+                self.input
+            ),
+        }
     }
 }
 
 impl std::error::Error for SpicepodVersionParseError {}
 
-/// Pattern accepted by [`SpicepodVersion::from_str`].
+/// Pattern accepted by [`SpicepodVersion::from_str`] as a well-formed version string.
 ///
 /// Numeric components disallow leading zeros (`v01`, `v2.01.0` are invalid).
 /// A pre-release identifier is only valid alongside a full `major.minor.patch`.
+///
+/// Note that this regex accepts any major version; [`FromStr::from_str`] additionally
+/// validates that the parsed major is in [`SUPPORTED_MAJORS`].
 const VERSION_PATTERN: &str = r"^v(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)?)?$";
+
+/// Currently supported major versions. Keep [`VERSION_SCHEMA_PATTERN`] in sync.
+const SUPPORTED_MAJORS: &[u64] = &[1, 2];
+
+/// JSON Schema pattern — restricted to currently supported major versions
+/// so external schema validators reject unsupported majors up-front.
+/// Keep in sync with [`SUPPORTED_MAJORS`].
+#[cfg(feature = "schemars")]
+const VERSION_SCHEMA_PATTERN: &str = r"^v(1|2)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)?)?$";
 
 #[expect(clippy::expect_used)]
 static VERSION_REGEX: LazyLock<Regex> =
@@ -148,22 +179,30 @@ impl FromStr for SpicepodVersion {
     type Err = SpicepodVersionParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let err = || SpicepodVersionParseError {
+        let invalid_format = || SpicepodVersionParseError {
             input: s.to_string(),
+            kind: SpicepodVersionParseErrorKind::InvalidFormat,
         };
-        let captures = VERSION_REGEX.captures(s).ok_or_else(err)?;
+        let captures = VERSION_REGEX.captures(s).ok_or_else(invalid_format)?;
 
         let parse_num = |idx: usize| -> Result<Option<u64>, SpicepodVersionParseError> {
             captures
                 .get(idx)
-                .map(|m| m.as_str().parse::<u64>().map_err(|_| err()))
+                .map(|m| m.as_str().parse::<u64>().map_err(|_| invalid_format()))
                 .transpose()
         };
 
-        let major = parse_num(1)?.ok_or_else(err)?;
+        let major = parse_num(1)?.ok_or_else(invalid_format)?;
         let minor = parse_num(2)?;
         let patch = parse_num(3)?;
         let pre_release = captures.get(4).map(|m| m.as_str().to_string());
+
+        if !SUPPORTED_MAJORS.contains(&major) {
+            return Err(SpicepodVersionParseError {
+                input: s.to_string(),
+                kind: SpicepodVersionParseErrorKind::UnsupportedMajor(major),
+            });
+        }
 
         Ok(Self {
             major,
@@ -200,8 +239,8 @@ impl JsonSchema for SpicepodVersion {
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         json_schema!({
             "type": "string",
-            "pattern": VERSION_PATTERN,
-            "description": "Spicepod schema version. Examples: 'v1', 'v2', 'v2.0', 'v2.0.0', 'v2.0.0-rc.1'."
+            "pattern": VERSION_SCHEMA_PATTERN,
+            "description": "Spicepod schema version. Supported majors: v1, v2. Examples: 'v1', 'v2', 'v2.0', 'v2.0.0', 'v2.0.0-rc.1'."
         })
     }
 }

@@ -623,10 +623,19 @@ mod version_tests {
         );
     }
 
-    /// Free-form versions like v3, v2.0, v2.0.0, v2.0.0-rc.1 are accepted.
+    /// Partial and full version strings are accepted for supported majors (v1, v2).
     #[test]
     fn test_free_form_versions_accepted() {
-        let cases = ["v3", "v2.0", "v2.0.0", "v2.0.0-rc.1", "v10.20.30-beta-2"];
+        let cases = [
+            "v1",
+            "v2",
+            "v1.0",
+            "v2.0",
+            "v1.0.0",
+            "v2.0.0",
+            "v2.0.0-rc.1",
+            "v1.10.20-beta-2",
+        ];
         for case in cases {
             let parsed: SpicepodVersion =
                 yaml::from_str(case).unwrap_or_else(|e| panic!("Should parse '{case}': {e}"));
@@ -634,6 +643,23 @@ mod version_tests {
                 parsed.to_string(),
                 case,
                 "Parsed version should round-trip to the same string"
+            );
+        }
+    }
+
+    /// Unsupported major versions (anything other than v1 or v2) are rejected
+    /// with an "unsupported spicepod version" error that names the major.
+    #[test]
+    fn test_unsupported_major_rejected() {
+        let cases = ["v0", "v3", "v3.0.0", "v100", "v4.5.6-rc.1"];
+        for case in cases {
+            let result: Result<SpicepodVersion, _> = yaml::from_str(case);
+            let err = result
+                .expect_err(&format!("'{case}' should be rejected as unsupported major"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unsupported spicepod version") && msg.contains(case),
+                "Error for '{case}' should mention unsupported version, got: {msg}"
             );
         }
     }
