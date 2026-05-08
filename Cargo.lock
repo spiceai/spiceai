@@ -3449,6 +3449,7 @@ dependencies = [
  "datafusion",
  "datafusion-ddl",
  "datafusion-flightsql",
+ "runtime-datafusion",
  "snafu",
  "tokio",
  "tonic",

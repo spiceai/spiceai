@@ -18,19 +18,17 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use async_trait::async_trait;
-
 use cayenne::{CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider};
 use clap::Parser;
 use data_components::RefreshableCatalogProvider as _;
 use datafusion::{
     catalog::{CatalogProvider as _, SchemaProvider},
     execution::SessionStateBuilder,
-    physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner},
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_ddl::{DdlAnalyzerRule, DdlExtensionPlanner, new_shared_store};
 use datafusion_flightsql::FlightSqlService;
+use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 use snafu::prelude::*;
 use tonic::transport::Server;
 
