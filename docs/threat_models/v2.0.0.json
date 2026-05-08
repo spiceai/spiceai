@@ -121,7 +121,7 @@
             "data": {
               "type": "tm.Process",
               "name": "Spice Runtime",
-              "description": "Rust daemon exposing SQL, Flight, OpenAI-compatible, MCP, and Iceberg APIs with embedded accelerators. v2.0 adds DDL support (CREATE/DROP TABLE) for Iceberg and Cayenne catalogs, async query materialization to object storage, distributed ingestion, URL Tables (opt-in SSRF surface), SMB/NFS data connectors, and acceleration snapshot management API.",
+              "description": "Rust daemon exposing SQL, Flight, OpenAI-compatible, MCP, and Iceberg APIs with embedded accelerators. Enterprise v2.0 adds external authentication via API key and OIDC/JWT bearer tokens (with OpenID discovery, JWKS retrieval and refresh, claim mapping, and per-protocol auth middleware) and identity-aware SQL functions (`current_user_id()`, `current_org_id()`, `current_role()`, `session_property()`). v2.0 also adds DDL support (CREATE/DROP TABLE) for Iceberg and Cayenne catalogs, async query materialization to object storage, distributed ingestion, URL Tables (opt-in SSRF surface), SMB/NFS data connectors, and acceleration snapshot management API.",
               "outOfScope": false,
               "reasonOutOfScope": "",
               "hasOpenThreats": true,
@@ -149,7 +149,7 @@
                   "status": "Open",
                   "severity": "Medium",
                   "type": "Repudiation",
-                  "description": "Spice does not provide audit logging of actions taken that could repudiate that a certain action was taken.\nAll access to Spice assumes the caller is trusted, so no identity information could be gathered even if audit logs were maintained",
+                  "description": "Spice does not provide persistent audit logging of actions taken that could repudiate that a certain action was taken. In Enterprise v2.0, callers may be authenticated via API key or OIDC/JWT, so identity context (mapped user_id, org_id, claims) is available for logging — but task history records are not persisted across restarts, so they cannot be relied on as durable audit evidence.",
                   "mitigation": "Implement a proper audit/task history log tracking both changes to the runtime operation (i.e. modifying Spicepod, runtime settings) as well as data operations (queries, refreshes) that is persistent across restarts.",
                   "modelType": "STRIDE",
                   "new": false,
@@ -304,7 +304,7 @@
                   "title": "GCS credential exposure via data connector",
                   "status": "Open",
                   "severity": "Medium",
-                  "type": "Information Disclosure",
+                  "type": "Information disclosure",
                   "description": "The GCS data connector (Alpha) requires Google Cloud credentials for bucket access. Service account keys or application default credentials could be leaked through error messages, verbose logging, or Spicepod configuration stored in version control.",
                   "mitigation": "Use Workload Identity Federation instead of long-lived service account keys. Store credentials in runtime-secrets, not in Spicepod YAML. Review error handling to ensure credential material is not logged. Apply least-privilege IAM roles scoped to specific buckets/prefixes.",
                   "modelType": "STRIDE",
@@ -751,7 +751,7 @@
               "reasonOutOfScope": "",
               "hasOpenThreats": true,
               "isBidirectional": true,
-              "isEncrypted": false,
+              "isEncrypted": true,
               "isPublicNetwork": true,
               "protocol": "HTTPS",
               "threats": [
@@ -804,7 +804,7 @@
               "reasonOutOfScope": "",
               "hasOpenThreats": true,
               "isBidirectional": false,
-              "isEncrypted": false,
+              "isEncrypted": true,
               "isPublicNetwork": true,
               "protocol": "HTTPS/S3",
               "threats": []
@@ -1246,7 +1246,7 @@
                   "title": "Secret forwarding interception via ExpandSecret RPC",
                   "status": "Open",
                   "severity": "High",
-                  "type": "Information Disclosure",
+                  "type": "Information disclosure",
                   "description": "The scheduler serves secret values to executors via the ExpandSecret gRPC RPC on the internal port (50052). Secrets are transmitted in cleartext within the gRPC payload. Without mTLS, an attacker with network access could intercept ExpandSecret responses to capture data source credentials, API keys, and other secrets held in the scheduler's secret store.",
                   "mitigation": "Enable built-in mTLS for cluster communication (required by default; opt-out only via --allow-insecure-connections). Restrict network access to port 50052. Apply least-privilege secret scoping so executors only receive secrets required for their assigned partitions. Rotate secrets regularly. Monitor ExpandSecret call patterns for anomalies.",
                   "modelType": "STRIDE",
@@ -1297,7 +1297,7 @@
                   "title": "Executor data exfiltration via distributed ingestion",
                   "status": "Open",
                   "severity": "High",
-                  "type": "Information Disclosure",
+                  "type": "Information disclosure",
                   "description": "v2.0 executors now perform distributed ingestion, reading from data sources and writing to accelerated tables. A compromised executor could exfiltrate source data during ingestion, or redirect writes to an attacker-controlled destination.",
                   "mitigation": "Restrict executor network egress to only required data sources and object storage. Use IAM roles/instance profiles scoped to specific resources. Audit executor activity via cluster observability metrics. Run executors in isolated network segments.",
                   "modelType": "STRIDE",
@@ -1310,7 +1310,7 @@
                   "title": "Shuffle data exposure in executor memory or storage",
                   "status": "Open",
                   "severity": "Medium",
-                  "type": "Information Disclosure",
+                  "type": "Information disclosure",
                   "description": "During distributed query execution, intermediate shuffle data (partial query results exchanged between executors) is held in executor memory, local disk, or object storage in Arrow IPC or Vortex format. A compromised executor or an attacker with access to the executor's filesystem or object storage prefix could read sensitive intermediate results that would not otherwise be accessible.",
                   "mitigation": "Enable mTLS for all inter-executor data exchange (Flight shuffle). Use encrypted local storage for shuffle spill files. Apply short TTLs and automatic cleanup for shuffle artifacts in object storage. Restrict executor filesystem access and object storage prefixes with least-privilege IAM.",
                   "modelType": "STRIDE",
@@ -1505,7 +1505,7 @@
               "reasonOutOfScope": "",
               "hasOpenThreats": true,
               "isBidirectional": true,
-              "isEncrypted": false,
+              "isEncrypted": true,
               "isPublicNetwork": true,
               "protocol": "HTTPS/S3",
               "threats": []
@@ -1524,6 +1524,6 @@
     ],
     "diagramTop": 2,
     "reviewer": "Spice AI Engineering Team",
-    "threatTop": 49
+    "threatTop": 74
   }
 }
