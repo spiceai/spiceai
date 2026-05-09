@@ -485,7 +485,7 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
     builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
     builder.append(SqlInfo::FlightSqlServerReadOnly, true);
     builder.append(SqlInfoFlightSqlServerSql, true);
-    builder.append(SqlInfoFlightSqlServerSubstrait, false);
+    builder.append(SqlInfoFlightSqlServerSubstrait, true);
     builder.append(
         SqlInfoFlightSqlServerTransaction,
         SqlSupportedTransactions::SqlTransactionUnspecified as i32,

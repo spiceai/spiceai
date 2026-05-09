@@ -24,4 +24,5 @@ pub(crate) mod get_xdbc_type_info;
 pub(crate) mod prepared_statement_query;
 pub(crate) mod prepared_statement_update;
 pub(crate) mod statement_query;
+pub(crate) mod statement_substrait_plan;
 pub(crate) mod statement_update;
