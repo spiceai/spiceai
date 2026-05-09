@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn snowflake_table_path_rejects_invalid_identifier_paths() {
-        assert!(quote_snowflake_table_path(r#""unterminated.table"#).is_err());
-        assert!(quote_snowflake_table_path("a.b.c.d").is_err());
+        quote_snowflake_table_path(r#""unterminated.table"#).unwrap_err();
+        quote_snowflake_table_path("a.b.c.d").unwrap_err();
     }
 }
