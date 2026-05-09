@@ -1946,6 +1946,60 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailFirstWriteProvider {
+        inner: Arc<dyn TableProvider>,
+        failures_remaining: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TableProvider for FailFirstWriteProvider {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if self
+                .failures_remaining
+                .fetch_update(
+                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "synthetic write failure".to_string(),
+                ));
+            }
+
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
     /// Records "commit" into a shared log when its `commit()` runs, so we
     /// can assert the interleaved write/commit sequence in
     /// `test_start_changes_stream_commits_after_write`.
@@ -2041,6 +2095,91 @@ mod tests {
             log.ids().await,
             vec![1, 2],
             "both pre- and post-error envelopes must be committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_envelope_run_skips_commits_after_coalesced_write_failure_and_recovers() {
+        let failures_remaining = Arc::new(AtomicUsize::new(1));
+        let provider = Arc::new(FailFirstWriteProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            failures_remaining: Arc::clone(&failures_remaining),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+        let dataset_name = TableReference::bare("test");
+        let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let mut pending_commit = None;
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            dataset_name: &dataset_name,
+            caching: None,
+            ready_sender: None,
+            initial_load_completed: &initial_load_completed,
+            pending_commit: &mut pending_commit,
+            commit_timeout: Duration::from_secs(5),
+        };
+
+        assert!(
+            task.apply_envelope_run(
+                &mut context,
+                vec![
+                    make_tracked_envelope(1, Arc::clone(&log), false),
+                    make_tracked_envelope(2, Arc::clone(&log), false),
+                ],
+            )
+            .await,
+            "write failures should be handled and the stream loop should continue"
+        );
+        assert!(
+            context.pending_commit.is_none(),
+            "failed writes must not spawn commit tasks"
+        );
+        assert_eq!(
+            log.ids().await,
+            Vec::<i32>::new(),
+            "failed coalesced writes must not commit any envelope in the run"
+        );
+        assert!(
+            task.runtime_status
+                .get_component_status("dataset:test")
+                .expect("failure should set dataset status")
+                .is_error(),
+            "write failure should mark dataset refresh status as error"
+        );
+
+        assert!(
+            task.apply_envelope_run(
+                &mut context,
+                vec![make_tracked_envelope(3, Arc::clone(&log), true)],
+            )
+            .await,
+            "subsequent envelopes should still be processed after a write failure"
+        );
+
+        let pending = context
+            .pending_commit
+            .take()
+            .expect("successful write should spawn a commit task");
+        assert!(
+            join_pending_commit(pending, &dataset_name, false, Duration::from_secs(5))
+                .await
+                .is_none(),
+            "commit task should finish cleanly"
+        );
+        assert_eq!(
+            log.ids().await,
+            vec![3],
+            "only the envelope after the failed coalesced run should commit"
+        );
+        assert!(
+            initial_load_completed.load(Ordering::Relaxed),
+            "ready envelope after the failure should still mark initial load complete"
+        );
+        assert_eq!(
+            task.runtime_status.get_component_status("dataset:test"),
+            Some(status::ComponentStatus::Ready),
+            "ready envelope after the failure should restore dataset status"
         );
     }
 

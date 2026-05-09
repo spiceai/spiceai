@@ -753,23 +753,21 @@ fn payloads_to_change_batch<'a>(
     payloads: impl Iterator<Item = &'a [u8]>,
     schema: &Arc<Schema>,
 ) -> Result<ChangeBatch, cdc::StreamError> {
-    let mut json = Vec::new();
-    let mut rows = 0usize;
-    for payload in payloads {
-        if !json.is_empty() {
-            json.push(b'\n');
-        }
-        json.extend_from_slice(payload);
-        rows += 1;
-    }
+    let values = payloads
+        .map(|payload| {
+            serde_json::from_slice::<Value>(payload).map_err(|e| {
+                cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    if rows == 0 {
+    if values.is_empty() {
         return Err(cdc::StreamError::Arrow(
             "No Kafka message payload found in batch".to_string(),
         ));
     }
 
-    json_bytes_to_change_batch(json.as_slice(), schema)
+    values_to_change_batch(values.iter(), None, schema)
 }
 
 fn values_to_change_batch<'a>(
@@ -971,6 +969,26 @@ mod tests {
         assert!(result.is_ok());
         let batch = result.expect("batch");
         assert_eq!(batch.record.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_payloads_to_change_batch_accepts_pretty_json_messages() {
+        let schema = test_schema();
+        let first = br#"{
+            "id": 1,
+            "name": "alice"
+        }"#;
+        let second = br#"{
+            "id": 2,
+            "name": "bob"
+        }"#;
+
+        let result =
+            payloads_to_change_batch([first.as_slice(), second.as_slice()].into_iter(), &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(batch.record.num_rows(), 2);
     }
 
     #[test]
