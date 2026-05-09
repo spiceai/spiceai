@@ -118,8 +118,8 @@ impl std::fmt::Debug for SnowflakeTableProvider {
 
 impl SnowflakeTableProvider {
     #[must_use]
-    pub fn new(
-        read_provider: Arc<dyn TableProvider>,
+    pub fn create(
+        read_provider: &Arc<dyn TableProvider>,
         pool: Arc<SnowflakeConnectionPool>,
         table_reference: TableReference,
         schema: SchemaRef,
@@ -127,7 +127,7 @@ impl SnowflakeTableProvider {
         write_lock: Arc<Mutex<()>>,
     ) -> Arc<dyn TableProvider> {
         let write_provider = Arc::new(Self {
-            read_provider: Arc::clone(&read_provider),
+            read_provider: Arc::clone(read_provider),
             pool,
             table_reference,
             schema,

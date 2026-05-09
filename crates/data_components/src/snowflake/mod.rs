@@ -493,8 +493,8 @@ impl SnowflakeTableFactory {
         );
 
         if writable {
-            return Ok(write::SnowflakeTableProvider::new(
-                table_provider,
+            return Ok(write::SnowflakeTableProvider::create(
+                &table_provider,
                 pool,
                 table_reference,
                 schema,
