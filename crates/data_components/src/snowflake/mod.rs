@@ -493,6 +493,7 @@ impl SnowflakeTableFactory {
         );
 
         if writable {
+            let table_provider: Arc<dyn TableProvider> = table_provider;
             return Ok(write::SnowflakeTableProvider::create(
                 &table_provider,
                 pool,
