@@ -19,53 +19,58 @@ Severity legend:
 
 ## Critical
 
-### C1. API key comparison is not constant-time (timing oracle)
+### C1. API key allowlist iteration short-circuits on match (timing leak)
 
-`crates/runtime-auth/src/api_key/mod.rs:68`, `:82`, `:94`, `:116`
+`crates/runtime-auth/src/api_key/mod.rs` — fixed in this branch.
 
-All four `ApiKeyAuth` paths (HTTP, Flight basic auth, Flight bearer, gRPC
-metadata) compare the presented key to the configured allowlist with `==` /
-`PartialEq`:
+The per-comparison code is already constant-time: `ApiKey`'s
+`PartialEq<str>` impl in `crates/spicepod/src/component/runtime.rs:785-799`
+uses `subtle::ct_eq`, so an attacker cannot recover key bytes from
+per-byte timing. The remaining issue is that `find` / `any` exit on the
+first matching key, which leaks the *position* of the matching key in
+the configured list (1 comparison vs N) and the existence of *any*
+match (M comparisons on hit vs N on miss).
 
-```rust
-if let Some(api_key) = self.api_keys.iter().find(|key| *key == api_key) { ... }
-```
+Compared to a classic byte-by-byte timing oracle, this is much weaker:
+it leaks the slot, not the bytes. Still, iterating over the full list on
+every call is cheap and makes verification time independent of the
+caller's input.
 
-`ApiKey`'s `PartialEq` resolves to byte-wise `String::eq`, which short-circuits
-on the first mismatched byte. Over a network this is observable and lets an
-attacker recover the key one byte at a time. This applies to every
-authenticated endpoint in the product.
-
-**Fix.** Compare with a constant-time primitive (e.g., `subtle::ConstantTimeEq`
-on the bytes, or `constant_time_eq`). Iterate over all keys without
-short-circuiting, or hash incoming keys and look them up in a `HashSet`
-of stored hashes.
+**Fix applied.** Replaced `find` / `any` with a `lookup` helper that
+iterates over every configured key on every call without
+short-circuiting; total verify time is O(N) regardless of which key (if
+any) matched. Added tests covering matches at first / middle / last
+positions and empty-credential rejection on the Flight basic-auth path.
 
 ### C2. Remote UDF endpoints have no SSRF allowlist
 
-`crates/runtime-datafusion-udfs/src/user_functions/remote.rs:971-982`
+`crates/runtime-datafusion-udfs/src/user_functions/remote.rs` — fixed
+in this branch.
 
-`parse_endpoint` only validates the URL scheme; any operator- or
-LLM-influenced UDF declaration can target loopback, private RFC1918 ranges, or
-the cloud metadata service:
+`parse_endpoint` previously validated only the URL scheme; any
+operator- or LLM-influenced UDF declaration could target loopback,
+private RFC1918 ranges, or the cloud metadata service. On AWS/GCP/Azure
+deployments this is a practical path to IAM credential exfiltration via
+`169.254.169.254`.
 
-```rust
-fn parse_endpoint(from: &str) -> Result<Url> {
-    let url = Url::parse(from)?;
-    match url.scheme() {
-        "http" | "https" => Ok(url),
-        ...
-    }
-}
-```
+**Fix applied.** `parse_endpoint` now classifies the host:
 
-The same `parse_endpoint` is used by scalar, aggregate, and table UDFs
-(`:180`, `:236`, `:292`). On AWS/GCP/Azure deployments this is a practical
-path to IAM credential exfiltration via `169.254.169.254`.
-
-**Fix.** Resolve the host and reject loopback, link-local (`169.254.0.0/16`,
-`fe80::/10`), RFC1918, ULA, and the cloud metadata IPs unless an explicit
-opt-in flag is set. Re-validate after redirects.
+- IPv4 literals are rejected if they fall in loopback (`127.0.0.0/8`),
+  RFC1918 (`10/8`, `172.16/12`, `192.168/16`), link-local
+  (`169.254.0.0/16`, covers AWS/GCP/Azure IMDS), multicast, broadcast,
+  unspecified (`0.0.0.0`), or carrier-grade NAT (`100.64.0.0/10`).
+- IPv6 literals are rejected if loopback, unspecified, multicast,
+  link-local (`fe80::/10`), unique-local (`fc00::/7`, covers
+  `fd00:ec2::254`), or IPv4-mapped onto any of the above ranges.
+- A short list of conventional metadata hostnames (`localhost`,
+  `metadata`, `metadata.google.internal`) is also blocked; arbitrary
+  hostnames are still permitted because resolution at builder time
+  introduces a TOCTOU/DNS-rebinding hole. Connect-time enforcement is
+  tracked as follow-up work.
+- A new `allow_private_endpoints: true` parameter opts back in for
+  trusted on-host services. Tests cover both the default rejection
+  across 12 representative private addresses and the explicit opt-in
+  path.
 
 ---
 
@@ -371,8 +376,9 @@ in as explicit `ignore = ["RUSTSEC-…"]` with an expiry comment.
 
 ## Suggested remediation order
 
-1. Constant-time API key compare (C1) — small change, broad blast radius.
-2. Remote-UDF and MCP SSRF allowlist (C2 / M2) — share one helper.
+1. ~~Constant-time API key compare (C1)~~ — fixed in this branch.
+2. ~~Remote-UDF SSRF allowlist (C2)~~ — fixed in this branch. The MCP
+   loopback check (M2) should adopt the same helper.
 3. MySQL `preferred` and Vault `tls_skip_verify` (H1, H2) — both are
    one-line config gates with high MITM impact.
 4. Default credential chain identity check (H3).

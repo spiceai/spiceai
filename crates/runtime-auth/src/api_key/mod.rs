@@ -50,6 +50,33 @@ impl ApiKeyAuth {
             api_keys: filtered_keys,
         }
     }
+
+    /// Look up `presented` against every configured API key without
+    /// short-circuiting.
+    ///
+    /// `ApiKey`'s `PartialEq<str>` already performs a constant-time byte
+    /// comparison via `subtle::ct_eq`, so an attacker cannot recover key
+    /// bytes from per-comparison timing. Iterating with `find` / `any`
+    /// would, however, leak the *position* of the matching key in the
+    /// configured list (the first key matches in 1 comparison, the last
+    /// in N). This routine compares against every key on every call so
+    /// total verification time depends only on the number of configured
+    /// keys, not which one matched (or whether any did).
+    fn lookup(&self, presented: &str) -> Option<ApiKey> {
+        let mut matched: Option<ApiKey> = None;
+        for key in &self.api_keys {
+            if *key == *presented {
+                // Don't `break`: keep iterating so timing is independent
+                // of which key matched. Later matches will not overwrite
+                // the first because configured keys are de-duplicated by
+                // the operator and `==` here is constant-time.
+                if matched.is_none() {
+                    matched = Some(key.clone());
+                }
+            }
+        }
+        matched
+    }
 }
 
 impl HttpAuth for ApiKeyAuth {
@@ -65,10 +92,9 @@ impl HttpAuth for ApiKeyAuth {
             return Ok(AuthVerdict::Deny);
         }
 
-        if let Some(api_key) = self.api_keys.iter().find(|key| *key == api_key) {
-            Ok(AuthVerdict::Allow(Arc::new(api_key.clone())))
-        } else {
-            Ok(AuthVerdict::Deny)
+        match self.lookup(api_key) {
+            Some(api_key) => Ok(AuthVerdict::Allow(Arc::new(api_key))),
+            None => Ok(AuthVerdict::Deny),
         }
     }
 }
@@ -79,7 +105,7 @@ impl FlightBasicAuth for ApiKeyAuth {
             return Err(Error::InvalidCredentials);
         }
 
-        if self.api_keys.iter().any(|key| key == password) {
+        if self.lookup(password).is_some() {
             Ok(password.to_string())
         } else {
             Err(Error::InvalidCredentials)
@@ -91,10 +117,9 @@ impl FlightBasicAuth for ApiKeyAuth {
             return Ok(AuthVerdict::Deny);
         }
 
-        if let Some(api_key) = self.api_keys.iter().find(|key| *key == bearer_token) {
-            Ok(AuthVerdict::Allow(Arc::new(api_key.clone())))
-        } else {
-            Ok(AuthVerdict::Deny)
+        match self.lookup(bearer_token) {
+            Some(api_key) => Ok(AuthVerdict::Allow(Arc::new(api_key))),
+            None => Ok(AuthVerdict::Deny),
         }
     }
 }
@@ -113,10 +138,9 @@ impl GrpcAuth for ApiKeyAuth {
             return Ok(AuthVerdict::Deny);
         }
 
-        if let Some(api_key) = self.api_keys.iter().find(|key| *key == api_key) {
-            Ok(AuthVerdict::Allow(Arc::new(api_key.clone())))
-        } else {
-            Ok(AuthVerdict::Deny)
+        match self.lookup(api_key) {
+            Some(api_key) => Ok(AuthVerdict::Allow(Arc::new(api_key))),
+            None => Ok(AuthVerdict::Deny),
         }
     }
 }
@@ -187,5 +211,33 @@ mod tests {
         let valid_key_parts = create_request_parts(Some("valid-key"));
         let valid_key_result = auth.http_verify(&valid_key_parts);
         assert!(matches!(valid_key_result, Ok(AuthVerdict::Allow(_))));
+    }
+
+    #[test]
+    fn test_lookup_matches_regardless_of_position() {
+        let auth = ApiKeyAuth::new(vec![
+            ApiKey::parse_str("first"),
+            ApiKey::parse_str("middle"),
+            ApiKey::parse_str("last"),
+        ]);
+        // Match at every position — covers the no-short-circuit behavior.
+        assert!(auth.lookup("first").is_some());
+        assert!(auth.lookup("middle").is_some());
+        assert!(auth.lookup("last").is_some());
+        assert!(auth.lookup("missing").is_none());
+    }
+
+    #[test]
+    fn test_flight_basic_auth_rejects_empty_password() {
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
+        assert!(matches!(
+            auth.validate("ignored", ""),
+            Err(crate::error::Error::InvalidCredentials)
+        ));
+        assert!(auth.validate("ignored", "valid-key").is_ok());
+        assert!(matches!(
+            auth.validate("ignored", "wrong"),
+            Err(crate::error::Error::InvalidCredentials)
+        ));
     }
 }

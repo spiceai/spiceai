@@ -37,6 +37,11 @@ limitations under the License.
 //!   * `max_response_bytes` — maximum response body size decoded from the function server, default `10MiB`.
 //!   * `max_rows` — maximum table-function response rows without a query `LIMIT`, default `100000`.
 //!   * `auth_bearer` — optional `Authorization: Bearer <value>` header value (already secret-resolved by the caller).
+//!   * `allow_private_endpoints` — boolean opt-in to allow `from:` URLs that
+//!     resolve to loopback / RFC1918 / link-local / metadata IPs. Default
+//!     `false`; only set to `true` for trusted on-host services. Endpoints
+//!     are otherwise rejected at build time to prevent SSRF (e.g. AWS/GCP
+//!     IMDS via `169.254.169.254`, internal RFC1918 hosts).
 //!
 //! Remote beta functions use Arrow's JSON reader/writer, supporting scalar and
 //! complex Arrow types that have a JSON representation.
@@ -147,6 +152,16 @@ pub enum RemoteBuildError {
     #[snafu(display("endpoint scheme '{scheme}' is not supported; use `http://` or `https://`"))]
     UnsupportedScheme { scheme: String },
 
+    #[snafu(display(
+        "endpoint host '{host}' resolves to a loopback / private / link-local / metadata \
+         address and is rejected to prevent SSRF; set `allow_private_endpoints: true` in `params` \
+         to opt in (only safe for trusted on-host services)"
+    ))]
+    PrivateEndpoint { host: String },
+
+    #[snafu(display("endpoint URL '{from}' is missing a host"))]
+    MissingHost { from: String },
+
     #[snafu(display("param '{key}' is expected to be a {expected}, got {got}"))]
     InvalidParam {
         key: String,
@@ -177,7 +192,11 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
         return build_scalar_table_arg_udf(decl);
     }
 
-    let endpoint = parse_endpoint(&decl.from)?;
+    let allow_private = parse_bool_param(
+        "allow_private_endpoints",
+        decl.params.get("allow_private_endpoints"),
+    )?;
+    let endpoint = parse_endpoint(&decl.from, allow_private)?;
 
     let arg_names: Vec<String> = decl.signature.args.iter().map(|a| a.name.clone()).collect();
     let arg_types: Vec<DataType> = decl
@@ -233,7 +252,11 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
 }
 
 fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
-    let endpoint = parse_endpoint(&decl.from)?;
+    let allow_private = parse_bool_param(
+        "allow_private_endpoints",
+        decl.params.get("allow_private_endpoints"),
+    )?;
+    let endpoint = parse_endpoint(&decl.from, allow_private)?;
     let arg_schema = function_arg_schema(&decl.signature.args)?;
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let (return_type, output_schema) = scalar_return_schema(decl)?;
@@ -289,7 +312,11 @@ fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
 /// Returns [`RemoteBuildError`] when the endpoint, signature, params, or HTTP
 /// client cannot be constructed.
 pub fn build_table_udtf(decl: &Function) -> Result<Arc<dyn TableFunctionImpl>> {
-    let endpoint = parse_endpoint(&decl.from)?;
+    let allow_private = parse_bool_param(
+        "allow_private_endpoints",
+        decl.params.get("allow_private_endpoints"),
+    )?;
+    let endpoint = parse_endpoint(&decl.from, allow_private)?;
     let arg_schema = function_arg_schema(&decl.signature.args)?;
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let output_schema = table_return_schema(decl)?;
@@ -968,15 +995,129 @@ fn sanitize_body_for_error(body: &str, already_truncated: bool) -> String {
     }
 }
 
-fn parse_endpoint(from: &str) -> Result<Url> {
+fn parse_endpoint(from: &str, allow_private: bool) -> Result<Url> {
     let url = Url::parse(from).map_err(|source| RemoteBuildError::InvalidEndpoint {
         from: from.to_string(),
         source,
     })?;
     match url.scheme() {
-        "http" | "https" => Ok(url),
-        other => Err(RemoteBuildError::UnsupportedScheme {
-            scheme: other.to_string(),
+        "http" | "https" => {}
+        other => {
+            return Err(RemoteBuildError::UnsupportedScheme {
+                scheme: other.to_string(),
+            });
+        }
+    }
+    if !allow_private {
+        let host = url
+            .host()
+            .ok_or_else(|| RemoteBuildError::MissingHost {
+                from: from.to_string(),
+            })?;
+        if let Some(reason) = ip_literal_is_disallowed(&host) {
+            tracing::warn!(
+                endpoint = %from,
+                reason,
+                "rejecting remote UDF endpoint that targets a non-public address"
+            );
+            return Err(RemoteBuildError::PrivateEndpoint {
+                host: host.to_string(),
+            });
+        }
+        // For domain hosts we deliberately do not resolve DNS here:
+        // doing so would couple builder time to DNS availability and
+        // is still vulnerable to TOCTOU/DNS rebinding. Connect-time
+        // enforcement against private ranges is tracked separately.
+    }
+    Ok(url)
+}
+
+/// Returns `Some(reason)` if `host` is an IP literal that points at a
+/// loopback, private, link-local, multicast, or unspecified address —
+/// the address families typically targeted by SSRF (cloud IMDS, internal
+/// services, container metadata). Domain hosts return `None` here; the
+/// caller is responsible for handling them (we currently allow them).
+fn ip_literal_is_disallowed(host: &url::Host<&str>) -> Option<&'static str> {
+    match host {
+        url::Host::Domain(d) => {
+            // Treat the literal "localhost" label and metadata-style
+            // names that some platforms hand out as if they were the
+            // IPs they conventionally resolve to. This is best-effort:
+            // an attacker controlling DNS can still point an arbitrary
+            // name at a private IP.
+            let lower = d.to_ascii_lowercase();
+            if lower == "localhost"
+                || lower.ends_with(".localhost")
+                || lower == "metadata"
+                || lower == "metadata.google.internal"
+            {
+                Some("hostname resolves to a loopback or metadata service")
+            } else {
+                None
+            }
+        }
+        url::Host::Ipv4(ip) => {
+            if ip.is_loopback() {
+                Some("IPv4 loopback")
+            } else if ip.is_private() {
+                Some("IPv4 RFC1918 private range")
+            } else if ip.is_link_local() {
+                // 169.254.0.0/16 — covers AWS / GCP / Azure IMDS.
+                Some("IPv4 link-local (covers cloud metadata services)")
+            } else if ip.is_multicast() {
+                Some("IPv4 multicast")
+            } else if ip.is_broadcast() {
+                Some("IPv4 broadcast")
+            } else if ip.is_unspecified() {
+                Some("IPv4 unspecified (0.0.0.0)")
+            } else if ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 0x40 {
+                // 100.64.0.0/10 — carrier-grade NAT / shared address space.
+                Some("IPv4 carrier-grade NAT shared space")
+            } else {
+                None
+            }
+        }
+        url::Host::Ipv6(ip) => {
+            if ip.is_loopback() {
+                Some("IPv6 loopback")
+            } else if ip.is_unspecified() {
+                Some("IPv6 unspecified (::)")
+            } else if ip.is_multicast() {
+                Some("IPv6 multicast")
+            } else if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+                // fe80::/10 link-local — covers AWS IMDSv2 over IPv6
+                // (fd00:ec2::254 is unique-local; fe80::a9fe:a9fe is
+                // commonly used by Azure IMDS).
+                Some("IPv6 link-local")
+            } else if (ip.segments()[0] & 0xfe00) == 0xfc00 {
+                // fc00::/7 unique local addresses (covers fd00:ec2::254).
+                Some("IPv6 unique-local (ULA)")
+            } else if matches!(ip.to_ipv4_mapped(), Some(v4) if v4.is_loopback() || v4.is_private() || v4.is_link_local()) {
+                Some("IPv4-mapped IPv6 targeting a non-public address")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn parse_bool_param(key: &str, v: Option<&Value>) -> Result<bool> {
+    match v {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" => Ok(true),
+            "false" | "no" | "0" => Ok(false),
+            _ => Err(RemoteBuildError::InvalidParam {
+                key: key.to_string(),
+                expected: "boolean".into(),
+                got: s.clone(),
+            }),
+        },
+        Some(other) => Err(RemoteBuildError::InvalidParam {
+            key: key.to_string(),
+            expected: "boolean".into(),
+            got: format!("{other}"),
         }),
     }
 }
@@ -1671,6 +1812,17 @@ mod tests {
         decl
     }
 
+    /// Round-trip tests bind a mock HTTP server on `127.0.0.1:0`. The SSRF
+    /// guard would normally reject loopback endpoints, so opt the test
+    /// decl into the explicit allow flag.
+    fn with_loopback_optin(mut decl: Function) -> Function {
+        decl.params.insert(
+            "allow_private_endpoints".into(),
+            serde_json::Value::Bool(true),
+        );
+        decl
+    }
+
     fn register_numbers(ctx: &SessionContext) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -1718,6 +1870,78 @@ mod tests {
         let d = sample_decl("not-a-url");
         let err = build_scalar_udf(&d).expect_err("invalid URL rejected");
         assert!(matches!(err, RemoteBuildError::InvalidEndpoint { .. }));
+    }
+
+    #[test]
+    fn endpoint_parse_rejects_private_addresses_by_default() {
+        // Cloud metadata IPs (AWS / GCP / Azure all use 169.254.169.254).
+        for from in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/udf",
+            "http://10.0.0.1/udf",
+            "http://192.168.1.1/udf",
+            "http://172.16.0.1/udf",
+            "http://0.0.0.0/udf",
+            "http://localhost/udf",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://[::1]/udf",
+            "http://[fe80::1]/udf",
+            "http://[fc00::1]/udf",
+            "http://[::ffff:127.0.0.1]/udf",
+        ] {
+            let d = sample_decl(from);
+            let err = build_scalar_udf(&d)
+                .err()
+                .unwrap_or_else(|| panic!("expected rejection of private endpoint {from}"));
+            assert!(
+                matches!(err, RemoteBuildError::PrivateEndpoint { .. }),
+                "expected PrivateEndpoint for {from}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_parse_rejects_private_address_with_typed_error() {
+        let d = sample_decl("http://169.254.169.254/latest/meta-data/");
+        let err = build_scalar_udf(&d).expect_err("metadata IP rejected");
+        assert!(
+            matches!(err, RemoteBuildError::PrivateEndpoint { .. }),
+            "expected PrivateEndpoint, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_parse_allows_public_addresses() {
+        // 8.8.8.8 is public; should be accepted.
+        let d = sample_decl("http://8.8.8.8/udf");
+        build_scalar_udf(&d).expect("public IP accepted");
+
+        let d = sample_decl("https://example.com/udf");
+        build_scalar_udf(&d).expect("public domain accepted");
+    }
+
+    #[test]
+    fn endpoint_parse_allows_private_with_opt_in() {
+        let mut d = sample_decl("http://127.0.0.1:9000/udf");
+        d.params.insert(
+            "allow_private_endpoints".into(),
+            serde_json::Value::Bool(true),
+        );
+        build_scalar_udf(&d).expect("private endpoint allowed when opted in");
+    }
+
+    #[test]
+    fn endpoint_parse_rejects_invalid_opt_in_value() {
+        let mut d = sample_decl("http://127.0.0.1:9000/udf");
+        d.params.insert(
+            "allow_private_endpoints".into(),
+            serde_json::Value::String("definitely".into()),
+        );
+        let err = build_scalar_udf(&d).expect_err("non-boolean opt-in rejected");
+        assert!(
+            matches!(err, RemoteBuildError::InvalidParam { ref key, .. } if key == "allow_private_endpoints"),
+            "expected InvalidParam, got {err:?}"
+        );
     }
 
     #[test]
@@ -1854,7 +2078,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let decl = sample_table_decl(&format!("http://{addr}/rows"));
+        let decl = with_loopback_optin(sample_table_decl(&format!("http://{addr}/rows")));
         let udtf = build_table_udtf(&decl).expect("builds");
         let ctx = SessionContext::new();
         ctx.register_udtf(&decl.name, udtf);
@@ -1924,7 +2148,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let decl = sample_table_decl(&format!("http://{addr}/rows"));
+        let decl = with_loopback_optin(sample_table_decl(&format!("http://{addr}/rows")));
         let udtf = build_table_udtf(&decl).expect("builds");
         let ctx = SessionContext::new();
         ctx.register_udtf(&decl.name, udtf);
@@ -2030,7 +2254,8 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let decl = sample_dynamic_scalar_decl(&format!("http://{addr}/scalar"));
+        let decl =
+            with_loopback_optin(sample_dynamic_scalar_decl(&format!("http://{addr}/scalar")));
         let udf = build_scalar_udf(&decl).expect("builds");
         let ctx = SessionContext::new();
         register_numbers(&ctx);
@@ -2088,7 +2313,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let decl = sample_dynamic_table_decl(&format!("http://{addr}/rows"));
+        let decl = with_loopback_optin(sample_dynamic_table_decl(&format!("http://{addr}/rows")));
         let udtf = build_table_udtf(&decl).expect("builds");
         let ctx = SessionContext::new();
         register_numbers(&ctx);
