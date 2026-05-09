@@ -24,6 +24,8 @@ mod caching_mode;
 #[cfg(feature = "duckdb")]
 mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
+mod caching_mode_post_filter;
+#[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
 #[cfg(feature = "postgres-accel")]
 mod checkpoint_postgres;

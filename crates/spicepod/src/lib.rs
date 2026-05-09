@@ -975,6 +975,32 @@ mod version_tests {
         assert_eq!(scheduler.partition_discovery_timeout, "60s");
     }
 
+    #[test]
+    fn test_runtime_source_rate_control_deserializes() {
+        let yaml = r"
+            source_rate_control:
+              state_location: file:///tmp/spice-source-rate-control
+              refresh_interval: 15s
+              github_concurrent_connections_limit: 5
+              params:
+                allow_http: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let source_rate_control = runtime
+            .source_rate_control
+            .expect("source_rate_control section should exist");
+        assert_eq!(
+            source_rate_control.state_location.as_deref(),
+            Some("file:///tmp/spice-source-rate-control")
+        );
+        assert_eq!(source_rate_control.refresh_interval, "15s");
+        assert_eq!(
+            source_rate_control.github_concurrent_connections_limit,
+            Some(5)
+        );
+        assert!(source_rate_control.params.is_some());
+    }
+
     /// `read_write_create` access mode deserializes.
     #[test]
     fn test_access_mode_read_write_create() {

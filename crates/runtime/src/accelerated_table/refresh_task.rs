@@ -110,6 +110,63 @@ struct RefreshStat {
     pub memory_size: usize,
 }
 
+/// Synchronous traversal: walks a provider chain and collects indexes from every
+/// [`IndexedTableProvider`] layer. Kept as a plain fn (not async) so that the
+/// `HashSet<*const ()>` used for dedup never appears inside an async fn and cannot
+/// make the enclosing future non-`Send`.
+fn collect_indexes_from_provider(
+    root: Arc<dyn datafusion::catalog::TableProvider>,
+) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+    use crate::embeddings::table::EmbeddingTable;
+    use runtime_datafusion_index::IndexedTableProvider;
+
+    let mut indexes: Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut current = Some(root);
+
+    while let Some(provider) = current.take() {
+        if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+            for index in indexed.get_all_indexes() {
+                let ptr = Arc::as_ptr(&index).cast::<()>();
+                if seen.insert(ptr) {
+                    indexes.push(index);
+                }
+            }
+        }
+
+        current = if let Some(adaptor) = provider
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+        {
+            adaptor.table_provider.as_ref().map(Arc::clone)
+        } else if let Some(embedding_table) = provider.as_any().downcast_ref::<EmbeddingTable>() {
+            Some(Arc::clone(embedding_table.get_underlying_ref()))
+        } else if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+            Some(indexed.get_underlying())
+        } else {
+            None
+        };
+    }
+
+    indexes
+}
+
+/// Walks the federated provider chain and collects indexes from **every** [`IndexedTableProvider`]
+/// layer encountered. Known wrapper types (`FederatedTableProviderAdaptor`, `EmbeddingTable`) are
+/// unwrapped so that indexes nested inside them are not silently missed. These indexes receive
+/// write lifecycle hooks alongside accelerator refreshes.
+///
+/// Uses `try_table_provider_sync` to avoid blocking when the federated provider is deferred
+/// (e.g. during schema evolution). If the provider is not yet available, returns an empty list.
+fn indexes_from_federated(
+    federated: &FederatedTable,
+) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+    let Some(root) = federated.try_table_provider_sync() else {
+        return Vec::new();
+    };
+    collect_indexes_from_provider(root)
+}
+
 pub struct RefreshTaskBuilder {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
@@ -252,9 +309,13 @@ impl RefreshTaskBuilder {
         // if the task is never executed, but simplifies the builder API and ownership model.
         // The alternative of lazy initialization would add complexity without meaningful benefit
         // given the typical usage pattern.
-        let sink = Arc::new(RwLock::new(AccelerationSink::new(Arc::clone(
-            &self.accelerator,
-        ))));
+        // Extract indexes from the federated provider chain so they receive write
+        // lifecycle hooks without needing to be manually plumbed through as sink_indexes.
+        let federated_indexes = indexes_from_federated(&self.federated);
+        let sink = Arc::new(RwLock::new(
+            AccelerationSink::new(Arc::clone(&self.accelerator))
+                .with_sink_indexes(federated_indexes),
+        ));
 
         RefreshTask {
             runtime_status: self.runtime_status,

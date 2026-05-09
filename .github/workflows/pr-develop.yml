@@ -85,7 +85,7 @@ jobs:
       - name: Run cargo check
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-        run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp,snapshots --workspace --exclude libnfs --locked
+        run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp,snapshots,rate-control --workspace --exclude libnfs --locked
 
       - name: Validate datafusion-table-providers commit
         run: bash .github/scripts/validate_table_providers_commit.sh

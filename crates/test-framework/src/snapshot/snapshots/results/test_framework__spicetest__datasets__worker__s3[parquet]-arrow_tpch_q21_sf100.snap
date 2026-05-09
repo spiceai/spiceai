@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q21"
+---
++--------------------+---------+
+| s_name             | numwait |
++--------------------+---------+
+| Supplier#000121921 | 10      |
+| Supplier#000847579 | 10      |
+| Supplier#000302054 | 9       |
+| Supplier#000418032 | 9       |
+| Supplier#000568689 | 9       |
+| Supplier#000607988 | 9       |
+| Supplier#000647295 | 9       |
+| Supplier#000717204 | 9       |
+| Supplier#000813682 | 9       |
+| Supplier#000895284 | 9       |
++--------------------+---------+
