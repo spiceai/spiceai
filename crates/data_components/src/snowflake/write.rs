@@ -664,7 +664,13 @@ fn filters_to_sql(
         .map(|filter| unparser.expr_to_sql(filter).map(|sql| sql.to_string()))
         .collect::<DataFusionResult<Vec<_>>>()?;
 
-    Ok(Some(parts.join(" AND ")))
+    Ok(Some(
+        parts
+            .iter()
+            .map(|p| format!("({p})"))
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    ))
 }
 
 fn assignments_to_sql(
