@@ -683,63 +683,331 @@ impl Index for ElasticsearchTextIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        // The FTS IndexedTableProvider lives on the federated/source side and is never
-        // seen by TableSink. The on_write_start/on_write_complete lifecycle hooks are
-        // therefore not called externally — we drive them here instead.
-        //
-        // NOTE: compute_index is called once *per batch* by IndexerExec (one stream
-        // element at a time) and by index_change_envelope (one CDC envelope at a time).
-        // on_write_start/on_write_complete are deliberately idempotent via AtomicBool so
-        // that the first batch in a write cycle opens the window and the last one closes
-        // it. This means bulk_load_refresh_interval, _refresh, and _forcemerge fire once
-        // per write cycle, not once per batch.
-        //
-        // TODO: the per-batch granularity means write_cycle_active resets after each
-        // batch, so on_write_complete actually fires after every batch rather than once
-        // at the true end of the full write. Fixing this requires the FTS
-        // IndexedTableProvider to be visible to TableSink (the same path used by the
-        // vector index), which is a larger architectural change.
-        self.write_maintenance
-            .on_write_start(self.client.as_ref(), &self.es_index)
-            .await?;
-
         let futs = batches
             .into_iter()
             .map(|rb| async move { self.write(rb).await.map_err(DataFusionError::External) });
-        let result = try_join_all(futs).await;
+        try_join_all(futs).await
+    }
 
-        match result {
-            Ok(batches) => {
-                // Restores refresh_interval, calls _refresh and _forcemerge.
-                // Warn-only: a maintenance failure must not abort the stream mid-write,
-                // as subsequent batches still need to be indexed.
-                if let Err(e) = self
-                    .write_maintenance
-                    .on_write_complete(self.client.as_ref(), &self.es_index)
-                    .await
-                {
-                    tracing::warn!(
-                        index = %self.es_index,
-                        "Elasticsearch FTS on_write_complete failed: {e}. Index may not be fully optimized."
-                    );
-                }
-                Ok(batches)
-            }
-            Err(write_err) => {
-                // Best-effort: restore refresh_interval. Log but don't mask the original
-                // write error if maintenance cleanup itself fails.
-                if let Err(e) = self
-                    .write_maintenance
-                    .on_write_failed(self.client.as_ref(), &self.es_index)
-                    .await
-                {
-                    tracing::warn!(
-                        index = %self.es_index,
-                        "Elasticsearch FTS on_write_failed failed: {e}. Index refresh_interval may need manual cleanup."
-                    );
-                }
-                Err(write_err)
-            }
+    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+        self.write_maintenance
+            .on_write_start(self.client.as_ref(), &self.es_index)
+            .await
+    }
+
+    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+        self.write_maintenance
+            .on_write_failed(self.client.as_ref(), &self.es_index)
+            .await
+    }
+
+    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+        self.write_maintenance
+            .on_write_complete(self.client.as_ref(), &self.es_index)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod write_maintenance_tests {
+    use super::*;
+
+    use std::sync::atomic::AtomicU32;
+
+    use elasticsearch::{
+        Elasticsearch as ElasticsearchTrait, MappingResponse, SearchRequest, SearchResponse,
+    };
+
+    /// Minimal mock that records calls to the maintenance-related Elasticsearch methods.
+    /// All other methods are unused by `ElasticsearchIndexWriteMaintenance` and will panic.
+    #[derive(Debug, Default)]
+    struct MockElasticsearch {
+        refresh_interval: std::sync::Mutex<Option<String>>,
+        get_refresh_interval_calls: AtomicU32,
+        put_settings_calls: AtomicU32,
+        refresh_index_calls: AtomicU32,
+        force_merge_calls: AtomicU32,
+        last_force_merge_segments: std::sync::Mutex<Option<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ElasticsearchTrait for MockElasticsearch {
+        async fn get_index_refresh_interval(
+            &self,
+            _index: &str,
+        ) -> elasticsearch::Result<Option<String>> {
+            self.get_refresh_interval_calls
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(self.refresh_interval.lock().expect("lock poisoned").clone())
         }
+
+        async fn put_index_settings(
+            &self,
+            _index: &str,
+            _body: &serde_json::Value,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            self.put_settings_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(serde_json::json!({}))
+        }
+
+        async fn refresh_index(&self, _index: &str) -> elasticsearch::Result<serde_json::Value> {
+            self.refresh_index_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(serde_json::json!({}))
+        }
+
+        async fn force_merge(
+            &self,
+            _index: &str,
+            max_num_segments: u32,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            self.force_merge_calls.fetch_add(1, Ordering::Relaxed);
+            *self
+                .last_force_merge_segments
+                .lock()
+                .expect("lock poisoned") = Some(max_num_segments);
+            Ok(serde_json::json!({}))
+        }
+
+        // Remaining methods are unused by ElasticsearchIndexWriteMaintenance.
+        async fn get_mapping(&self, _: &str) -> elasticsearch::Result<MappingResponse> {
+            unimplemented!()
+        }
+        async fn search(
+            &self,
+            _: &str,
+            _: &SearchRequest,
+        ) -> elasticsearch::Result<SearchResponse> {
+            unimplemented!()
+        }
+        async fn search_raw(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> elasticsearch::Result<SearchResponse> {
+            unimplemented!()
+        }
+        async fn open_point_in_time(&self, _: &str, _: &str) -> elasticsearch::Result<String> {
+            unimplemented!()
+        }
+        async fn search_point_in_time(
+            &self,
+            _: &serde_json::Value,
+        ) -> elasticsearch::Result<SearchResponse> {
+            unimplemented!()
+        }
+        async fn close_point_in_time(&self, _: &str) -> elasticsearch::Result<()> {
+            unimplemented!()
+        }
+        async fn index_exists(&self, _: &str) -> elasticsearch::Result<bool> {
+            unimplemented!()
+        }
+        async fn create_index(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn put_mapping(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn index_document(
+            &self,
+            _: &str,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn bulk_index(
+            &self,
+            _: &str,
+            _: &[(Option<String>, serde_json::Value)],
+        ) -> elasticsearch::Result<serde_json::Value> {
+            unimplemented!()
+        }
+    }
+
+    fn make_maintenance(
+        opts: ElasticsearchIndexWriteOptions,
+    ) -> ElasticsearchIndexWriteMaintenance {
+        ElasticsearchIndexWriteMaintenance::new(opts)
+    }
+
+    /// `on_write_start` with no options configured is a pure no-op: no ES calls.
+    #[tokio::test]
+    async fn write_start_no_options_is_noop() {
+        let client = MockElasticsearch::default();
+        let m = make_maintenance(ElasticsearchIndexWriteOptions::default());
+
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("on_write_start should succeed");
+
+        assert_eq!(client.get_refresh_interval_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(client.put_settings_calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// Calling `on_write_start` multiple times — simulating multiple batches arriving in one
+    /// refresh cycle — must only apply the `refresh_interval` override once.
+    /// The second and subsequent calls must be no-ops due to `write_cycle_active`.
+    /// This is the core correctness guarantee of the fix for issue #3.
+    #[tokio::test]
+    async fn write_start_fires_once_per_cycle_not_per_batch() {
+        let client = MockElasticsearch::default();
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: Some("-1".to_string()),
+            force_merge_segments: None,
+        });
+
+        // Simulate three batches before on_write_complete.
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("first start");
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("second start — must be no-op");
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("third start — must be no-op");
+
+        assert_eq!(
+            client.get_refresh_interval_calls.load(Ordering::Relaxed),
+            1,
+            "refresh_interval must be fetched exactly once per write cycle, not once per batch"
+        );
+        assert_eq!(
+            client.put_settings_calls.load(Ordering::Relaxed),
+            1,
+            "refresh_interval must be overridden exactly once per write cycle, not once per batch"
+        );
+    }
+
+    /// `on_write_complete` restores the refresh_interval and calls `_refresh`.
+    /// `force_merge` must NOT be called when `force_merge_segments` is `None`.
+    #[tokio::test]
+    async fn write_complete_restores_interval_and_refreshes() {
+        let client = MockElasticsearch {
+            refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
+            ..Default::default()
+        };
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: Some("-1".to_string()),
+            force_merge_segments: None,
+        });
+
+        m.on_write_start(&client, "my-index").await.expect("start");
+        m.on_write_complete(&client, "my-index")
+            .await
+            .expect("complete");
+
+        // put_settings: once to override (set -1), once to restore (set 30s).
+        assert_eq!(
+            client.put_settings_calls.load(Ordering::Relaxed),
+            2,
+            "settings should be applied on start and restored on complete"
+        );
+        assert_eq!(
+            client.refresh_index_calls.load(Ordering::Relaxed),
+            1,
+            "index should be refreshed once after write completes"
+        );
+        assert_eq!(
+            client.force_merge_calls.load(Ordering::Relaxed),
+            0,
+            "force_merge must not be called when force_merge_segments is None"
+        );
+    }
+
+    /// `on_write_complete` calls `force_merge` with the configured segment count.
+    #[tokio::test]
+    async fn write_complete_calls_force_merge_when_configured() {
+        let client = MockElasticsearch::default();
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: None,
+            force_merge_segments: Some(1),
+        });
+
+        m.on_write_start(&client, "my-index").await.expect("start");
+        m.on_write_complete(&client, "my-index")
+            .await
+            .expect("complete");
+
+        assert_eq!(
+            client.force_merge_calls.load(Ordering::Relaxed),
+            1,
+            "force_merge must be called once after write completes"
+        );
+        assert_eq!(
+            *client
+                .last_force_merge_segments
+                .lock()
+                .expect("lock poisoned"),
+            Some(1),
+            "force_merge must use the configured segment count"
+        );
+    }
+
+    /// `on_write_failed` resets the write cycle so the next `on_write_start`
+    /// correctly re-applies the refresh_interval override for a subsequent cycle.
+    #[tokio::test]
+    async fn write_failed_resets_cycle_so_next_start_reapplies_override() {
+        let client = MockElasticsearch {
+            refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
+            ..Default::default()
+        };
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: Some("-1".to_string()),
+            force_merge_segments: None,
+        });
+
+        // First write cycle fails.
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("start cycle 1");
+        m.on_write_failed(&client, "my-index")
+            .await
+            .expect("failed cycle 1");
+
+        // Second write cycle — must re-apply the override.
+        m.on_write_start(&client, "my-index")
+            .await
+            .expect("start cycle 2");
+
+        // get_interval: once per cycle start → 2 total.
+        assert_eq!(
+            client.get_refresh_interval_calls.load(Ordering::Relaxed),
+            2,
+            "each write cycle must independently fetch the current refresh_interval"
+        );
+        // put_settings: set -1 (cycle 1) + restore on failure + set -1 (cycle 2) = 3.
+        assert_eq!(
+            client.put_settings_calls.load(Ordering::Relaxed),
+            3,
+            "settings must be applied on each start and restored on each failure"
+        );
+    }
+
+    /// `on_write_complete` called without a preceding `on_write_start` must be a no-op.
+    /// The `write_cycle_active` guard prevents spurious maintenance calls.
+    #[tokio::test]
+    async fn write_complete_without_start_is_noop() {
+        let client = MockElasticsearch::default();
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: Some("-1".to_string()),
+            force_merge_segments: Some(1),
+        });
+
+        m.on_write_complete(&client, "my-index")
+            .await
+            .expect("complete without start must be no-op");
+
+        assert_eq!(client.refresh_index_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(client.force_merge_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(client.put_settings_calls.load(Ordering::Relaxed), 0);
     }
 }
