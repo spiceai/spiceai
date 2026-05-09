@@ -29,8 +29,9 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion_catalog::Session;
@@ -55,8 +56,8 @@ pub struct DeletionFilteringVortexFormat {
     /// The underlying Vortex file format.
     inner: Arc<VortexFormat>,
     /// Per-file deletion cache. Key is the file path, value is the bitmap of deleted row indices.
-    /// Uses `Arc<RwLock<...>>` to allow shared access across clones.
-    deletion_cache: Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>,
+    /// Uses `Arc<ArcSwap<...>>` so readers always see a wait-free immutable snapshot.
+    deletion_cache: Arc<ArcSwap<HashMap<String, RoaringBitmap>>>,
 }
 
 impl std::fmt::Debug for DeletionFilteringVortexFormat {
@@ -90,16 +91,10 @@ impl std::fmt::Debug for DeletionFilteringVortexFormat {
 #[expect(clippy::implicit_hasher)]
 pub fn attach_deletion_vectors_to_config(
     mut config: FileScanConfig,
-    deletion_cache: &RwLock<Arc<HashMap<String, RoaringBitmap>>>,
+    deletion_cache: &ArcSwap<HashMap<String, RoaringBitmap>>,
 ) -> DFResult<(FileScanConfig, bool)> {
-    let deletion_map = {
-        let guard = deletion_cache.read().map_err(|_| {
-            datafusion_common::DataFusionError::Execution(
-                "Failed to acquire deletion cache lock".to_string(),
-            )
-        })?;
-        Arc::clone(&guard)
-    };
+    // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `deletion_map`.
+    let deletion_map = deletion_cache.load_full();
 
     // If no deletions, return config unchanged
     if deletion_map.is_empty() {
@@ -187,7 +182,7 @@ impl DeletionFilteringVortexFormat {
     /// * `deletion_cache` - Shared cache of per-file deletion vectors.
     pub fn new(
         inner: Arc<VortexFormat>,
-        deletion_cache: Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>,
+        deletion_cache: Arc<ArcSwap<HashMap<String, RoaringBitmap>>>,
     ) -> Self {
         Self {
             inner,
@@ -250,13 +245,11 @@ impl FileFormat for DeletionFilteringVortexFormat {
         // optimization which would skip the actual scan and return wrong row counts.
         let file_path = object.location.to_string();
         let has_deletions = {
-            let guard = self.deletion_cache.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    "Failed to acquire deletion cache lock".to_string(),
-                )
-            })?;
-            guard.contains_key(&file_path)
-                && !guard.get(&file_path).is_some_and(RoaringBitmap::is_empty)
+            // Wait-free read of the current snapshot.
+            let snapshot = self.deletion_cache.load();
+            snapshot
+                .get(&file_path)
+                .is_some_and(|bitmap| !bitmap.is_empty())
         };
 
         if has_deletions {
