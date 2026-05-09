@@ -402,6 +402,8 @@ impl RefreshTask {
                 commit_timeout: cdc_cfg.commit_timeout,
             };
             if !self.apply_burst(&mut apply_context, burst).await {
+                rx.close();
+                reader_handle.abort();
                 break;
             }
         }
@@ -644,7 +646,9 @@ impl RefreshTask {
                 if !self.runtime_status.is_shutdown() {
                     tracing::error!("Error writing change for {}: {e}", context.dataset_name);
                 }
-                // Drop committers without acking — see comment above.
+                // Drop committers without acking, and stop this stream before
+                // any later envelope can commit past the uncommitted gap.
+                return false;
             }
         }
         true
@@ -2099,7 +2103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_apply_envelope_run_skips_commits_after_coalesced_write_failure_and_recovers() {
+    async fn test_apply_envelope_run_skips_commits_after_coalesced_write_failure() {
         let failures_remaining = Arc::new(AtomicUsize::new(1));
         let provider = Arc::new(FailFirstWriteProvider {
             inner: make_mem_table() as Arc<dyn TableProvider>,
@@ -2121,15 +2125,16 @@ mod tests {
         };
 
         assert!(
-            task.apply_envelope_run(
-                &mut context,
-                vec![
-                    make_tracked_envelope(1, Arc::clone(&log), false),
-                    make_tracked_envelope(2, Arc::clone(&log), false),
-                ],
-            )
-            .await,
-            "write failures should be handled and the stream loop should continue"
+            !task
+                .apply_envelope_run(
+                    &mut context,
+                    vec![
+                        make_tracked_envelope(1, Arc::clone(&log), false),
+                        make_tracked_envelope(2, Arc::clone(&log), false),
+                    ],
+                )
+                .await,
+            "write failures should stop the stream so later commits cannot skip an uncommitted gap"
         );
         assert!(
             context.pending_commit.is_none(),
@@ -2147,39 +2152,9 @@ mod tests {
                 .is_error(),
             "write failure should mark dataset refresh status as error"
         );
-
         assert!(
-            task.apply_envelope_run(
-                &mut context,
-                vec![make_tracked_envelope(3, Arc::clone(&log), true)],
-            )
-            .await,
-            "subsequent envelopes should still be processed after a write failure"
-        );
-
-        let pending = context
-            .pending_commit
-            .take()
-            .expect("successful write should spawn a commit task");
-        assert!(
-            join_pending_commit(pending, &dataset_name, false, Duration::from_secs(5))
-                .await
-                .is_none(),
-            "commit task should finish cleanly"
-        );
-        assert_eq!(
-            log.ids().await,
-            vec![3],
-            "only the envelope after the failed coalesced run should commit"
-        );
-        assert!(
-            initial_load_completed.load(Ordering::Relaxed),
-            "ready envelope after the failure should still mark initial load complete"
-        );
-        assert_eq!(
-            task.runtime_status.get_component_status("dataset:test"),
-            Some(status::ComponentStatus::Ready),
-            "ready envelope after the failure should restore dataset status"
+            !initial_load_completed.load(Ordering::Relaxed),
+            "failed writes must not mark initial load complete"
         );
     }
 
