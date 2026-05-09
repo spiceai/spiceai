@@ -24,6 +24,10 @@ use datafusion::{
     datasource::TableProvider,
     sql::{
         TableReference,
+        sqlparser::{
+            dialect::GenericDialect,
+            parser::{Parser, ParserError},
+        },
         unparser::dialect::{self, Dialect},
     },
 };
@@ -59,6 +63,56 @@ impl SnowflakeTableFactory {
             pool,
             write_lock: Arc::new(Mutex::new(())),
         }
+    }
+}
+
+/// Parses a Snowflake table path string (e.g. `db.schema.table` or `"my.schema".table`)
+/// using SQL parser rules and returns a fully-quoted identifier string safe to embed in
+/// Snowflake SQL statements.
+///
+/// Each identifier part is unquoted by the parser (handling embedded `""` escapes and
+/// dot-in-quoted-identifier cases), then re-quoted with proper `""` escaping.
+///
+/// # Errors
+/// Returns a `ParserError` if `path` is not a valid 1-, 2-, or 3-part Snowflake identifier
+/// or contains NUL bytes.
+pub fn quote_snowflake_table_path(path: &str) -> std::result::Result<String, ParserError> {
+    let table_reference = parse_snowflake_table_reference(path)?;
+    let identifier_parts = table_reference.to_vec();
+
+    if identifier_parts.iter().any(|part| part.contains('\0')) {
+        return Err(ParserError::ParserError(
+            "Snowflake identifiers cannot contain NUL bytes".to_string(),
+        ));
+    }
+
+    Ok(identifier_parts
+        .iter()
+        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join("."))
+}
+
+fn parse_snowflake_table_reference(path: &str) -> std::result::Result<TableReference, ParserError> {
+    let dialect = GenericDialect {};
+    let identifier_parts = Parser::new(&dialect)
+        .try_with_sql(path)?
+        .parse_multipart_identifier()?
+        .into_iter()
+        .map(|identifier| identifier.value)
+        .collect::<Vec<_>>();
+
+    match identifier_parts.as_slice() {
+        [table] => Ok(TableReference::bare(table.clone())),
+        [schema, table] => Ok(TableReference::partial(schema.clone(), table.clone())),
+        [catalog, schema, table] => Ok(TableReference::full(
+            catalog.clone(),
+            schema.clone(),
+            table.clone(),
+        )),
+        _ => Err(ParserError::ParserError(format!(
+            "Invalid Snowflake table path: expected 1-3 identifier parts, got: {path}"
+        ))),
     }
 }
 

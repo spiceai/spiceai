@@ -24,19 +24,11 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
-use data_components::snowflake::SnowflakeTableFactory;
+use data_components::snowflake::{SnowflakeTableFactory, quote_snowflake_table_path};
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        dialect::GenericDialect,
-        parser::{Parser, ParserError},
-    },
-};
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
-use itertools::Itertools;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -204,49 +196,6 @@ fn snowflake_table_path(dataset: &Dataset) -> DataConnectorResult<String> {
             source: Box::new(source),
         }
     })
-}
-
-fn quote_snowflake_table_path(path: &str) -> std::result::Result<String, ParserError> {
-    let table_reference = parse_snowflake_table_reference(path)?;
-    let identifier_parts = table_reference.to_vec();
-
-    if identifier_parts.iter().any(|part| part.contains('\0')) {
-        return Err(ParserError::ParserError(
-            "Snowflake identifiers cannot contain NUL bytes".to_string(),
-        ));
-    }
-
-    Ok(identifier_parts
-        .iter()
-        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
-        .join("."))
-}
-
-fn parse_snowflake_table_reference(path: &str) -> std::result::Result<TableReference, ParserError> {
-    let dialect = GenericDialect {};
-    let identifier_parts = Parser::new(&dialect)
-        .try_with_sql(path)?
-        .parse_multipart_identifier()?
-        .into_iter()
-        .map(|identifier| identifier.value)
-        .collect::<Vec<_>>();
-
-    match identifier_parts.as_slice() {
-        [table] => Ok(TableReference::bare(table.clone())),
-        [schema, table] => Ok(TableReference::partial(schema.clone(), table.clone())),
-        [catalog, schema, table] => Ok(TableReference::full(
-            catalog.clone(),
-            schema.clone(),
-            table.clone(),
-        )),
-        [] => Err(ParserError::ParserError(
-            "Snowflake table path is empty".to_string(),
-        )),
-        _ => Err(ParserError::ParserError(format!(
-            "Snowflake table path has {} parts; expected 1 to 3",
-            identifier_parts.len()
-        ))),
-    }
 }
 
 #[async_trait]

@@ -20,14 +20,13 @@ use super::DataConnector;
 use super::DataConnectorFactory;
 use super::ParameterSpec;
 use async_trait::async_trait;
+use data_components::snowflake::{SnowflakeTableFactory, quote_snowflake_table_path};
 use data_components::{Read, ReadWrite};
-use data_components::snowflake::SnowflakeTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
 use crate::component::dataset::Dataset;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
-use itertools::Itertools;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;
@@ -169,17 +168,17 @@ impl DataConnector for Snowflake {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let path = dataset
-            .path()
-            .split('.')
-            .map(|x| {
-                if x.starts_with('"') && x.ends_with('"') {
-                    return x.into();
-                }
-
-                format!("\"{x}\"")
-            })
-            .join(".");
+        let path = quote_snowflake_table_path(dataset.path()).map_err(|source| {
+            super::DataConnectorError::InvalidConfiguration {
+                dataconnector: "snowflake".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: format!(
+                    "The specified table name in dataset path is invalid '{}'. Ensure the table name uses valid Snowflake identifier syntax and try again.",
+                    dataset.path()
+                ),
+                source: Box::new(source),
+            }
+        })?;
 
         Ok(Read::table_provider(&self.table_factory, path.into())
             .await
@@ -193,17 +192,20 @@ impl DataConnector for Snowflake {
         &self,
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        let path = dataset
-            .path()
-            .split('.')
-            .map(|x| {
-                if x.starts_with('"') && x.ends_with('"') {
-                    return x.into();
-                }
-
-                format!("\"{x}\"")
-            })
-            .join(".");
+        let path = match quote_snowflake_table_path(dataset.path()) {
+            Ok(path) => path,
+            Err(source) => {
+                return Some(Err(super::DataConnectorError::InvalidConfiguration {
+                    dataconnector: "snowflake".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "The specified table name in dataset path is invalid '{}'. Ensure the table name uses valid Snowflake identifier syntax and try again.",
+                        dataset.path()
+                    ),
+                    source: Box::new(source),
+                }));
+            }
+        };
 
         Some(
             ReadWrite::table_provider(&self.table_factory, path.into())
