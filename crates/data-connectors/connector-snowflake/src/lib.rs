@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn snowflake_table_path_rejects_invalid_identifier_paths() {
-        quote_snowflake_table_path(r#""unterminated.table"#).unwrap_err();
-        quote_snowflake_table_path("a.b.c.d").unwrap_err();
+        quote_snowflake_table_path(r#""unterminated.table"#).expect_err("should reject unterminated quoted identifier");
+        quote_snowflake_table_path("a.b.c.d").expect_err("should reject 4-part identifier");
     }
 }
