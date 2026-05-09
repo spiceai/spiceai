@@ -240,7 +240,6 @@ impl TableProvider for SnowflakeTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        tracing::info!(table_reference = ?self.table_reference, "SnowflakeTableProvider::insert_into");
         if matches!(insert_op, InsertOp::Replace) {
             return Err(DataFusionError::Plan(
                 "Snowflake tables do not support INSERT REPLACE semantics".to_string(),
@@ -353,7 +352,6 @@ impl DataSink for SnowflakeDataSink {
     ) -> DataFusionResult<u64> {
         let _write_guard = self.write_lock.lock().await;
         let table_name = self.table_reference.to_quoted_string();
-        tracing::info!(table_reference = ?self.table_reference, table_name = %table_name, "SnowflakeDataSink::write_all");
         let api = snowflake_api_from_pool(&self.pool, &table_name).await?;
 
         let mut transaction_started = false;
