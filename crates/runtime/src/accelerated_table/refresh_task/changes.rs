@@ -952,6 +952,7 @@ async fn join_pending_commit(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn get_primary_key_value(
     data: &RecordBatch,
     key: &str,
