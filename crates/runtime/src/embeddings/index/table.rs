@@ -444,7 +444,6 @@ async fn wrap_table_as_index_elasticsearch(
         } else {
             let idx = Arc::new(es_index);
             let vector_index = Arc::clone(&idx) as Arc<dyn search::index::VectorIndex>;
-
             provider.underlying = Arc::new(
                 VectorScanTableProvider::try_new(provider.underlying, &vector_index)
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,

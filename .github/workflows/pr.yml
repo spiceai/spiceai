@@ -294,7 +294,7 @@ jobs:
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
-  # Release-profile installs (make install, install-cli, install-runtime)
+  # Release-profile installs (make install, install-cli, install-spiced)
   build-install-release:
     name: Build (release profile)
     runs-on: spiceai-macos
@@ -360,14 +360,14 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install-cli
 
-      - name: make install-runtime
+      - name: make install-spiced
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: release
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-        run: make install-runtime
+        run: make install-spiced
 
       - name: Cancel workflow on failure
         if: failure()
