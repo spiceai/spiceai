@@ -694,12 +694,12 @@ impl Runtime {
                     {
                         tracing::warn!(
                             dataset = %ds.name,
-                            "hash_index is automatically enabled for Arrow engine acceleration because primary_key is configured. Note: hash_index is experimental and may have breaking changes in future releases."
+                            "hash_index is automatically enabled for Arrow acceleration because primary_key is configured. Note: hash_index is experimental and may have breaking changes in future releases."
                         );
                     } else {
                         tracing::warn!(
                             dataset = %ds.name,
-                            "hash_index is enabled for Arrow engine acceleration. Note: hash_index is experimental and may have breaking changes in future releases."
+                            "hash_index is enabled for Arrow acceleration. Note: hash_index is experimental and may have breaking changes in future releases."
                         );
                     }
                 }

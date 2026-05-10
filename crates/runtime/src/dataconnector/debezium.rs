@@ -367,7 +367,7 @@ impl DataConnector for Debezium {
                 || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector requires Kafka message keys for accelerators other than Arrow. Configure a primary key or message.key.columns in Debezium, or use the Arrow acceleration engine for full-row CDC matching. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                message: "The Debezium data connector requires Kafka message keys for accelerators other than Arrow. Configure a primary key or message.key.columns in Debezium, or use the Arrow acceleration engine for full-row CDC matching with full before images for keyless updates and deletes. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -375,7 +375,7 @@ impl DataConnector for Debezium {
         if metadata.primary_keys.is_empty() {
             tracing::warn!(
                 dataset = %dataset_name,
-                "Debezium messages do not include primary keys; Arrow acceleration will apply deletes and updates by matching full row values"
+                "Debezium messages do not include primary keys; Arrow acceleration will apply deletes and updates by matching full row values, which requires Debezium full before images for keyless updates and deletes"
             );
         }
 

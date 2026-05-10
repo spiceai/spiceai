@@ -131,7 +131,7 @@ impl Default for PartitionedArrowAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::runtime("hash_index")
-        .description("Enable hash index for fast primary key lookups and upserts. Automatically enabled when primary_key is supplied."),
+        .description("Enable hash index for fast primary key lookups and upserts. Automatically enabled when primary_key is supplied, except in caching refresh mode."),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];

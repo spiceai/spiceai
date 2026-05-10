@@ -812,6 +812,7 @@ impl RefreshTask {
             .is_some_and(|row| change_batch.primary_keys(*row).is_empty())
         {
             let selected_batch = select_rows(&change_batch.data_batch(), row_indices)?;
+            let _lock_guard = self.accelerator_write_mutex.lock().await;
             if delete_matching_rows_from_arrow_provider(&self.accelerator, &selected_batch)
                 .await?
                 .is_some()
