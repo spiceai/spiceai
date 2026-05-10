@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn quote_identifier_rejects_nul() {
-        quote_sql_identifier("bad\0name").unwrap_err();
+        quote_sql_identifier("bad\0name").expect_err("should reject NUL byte in identifier");
     }
 
     #[test]
@@ -1025,7 +1025,7 @@ mod tests {
 
     #[test]
     fn scalar_literal_rejects_non_finite_float() {
-        scalar_to_sql_literal(ScalarValue::Float64(Some(f64::NAN)), "value").unwrap_err();
+        scalar_to_sql_literal(ScalarValue::Float64(Some(f64::NAN)), "value").expect_err("should reject NaN float");
     }
 
     #[test]
