@@ -22,7 +22,6 @@ use datafusion::{
     catalog::{Session, TableProvider},
     datasource::TableType,
     error::Result as DataFusionResult,
-    execution::SendableRecordBatchStream,
     logical_expr::TableProviderFilterPushDown,
     physical_expr::{EquivalenceProperties, Partitioning},
     physical_plan::{

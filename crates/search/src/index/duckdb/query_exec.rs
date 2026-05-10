@@ -21,10 +21,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    physical_expr::{EquivalenceProperties, Partitioning},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-        execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
     prelude::Expr,
@@ -292,6 +290,10 @@ mod tests {
         let batch = empty_projected_batch(schema, 3).expect("batch should build");
 
         assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 3);
+    }
+}
+t_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), 3);
     }
 }
