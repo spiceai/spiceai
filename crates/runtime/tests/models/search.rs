@@ -304,7 +304,7 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value) {
         // across a two-decimal rounding boundary. Use structural validation instead of
         // exact snapshot comparison for these tests.
         name if use_structural_search_response_validation(name) => {
-            assert_search_response_structure(name, resp, round_scores);
+            assert_search_response_structure(name, &resp);
         }
         _ => {
             insta::assert_snapshot!(
@@ -403,7 +403,7 @@ fn assert_search_response_structure(test_name: &str, resp: &Value) {
 fn structural_search_response_accepts_additional_columns_in_data() {
     assert_search_response_structure(
         "s3vectors_chunking_additional_columns",
-        json!({
+        &json!({
             "duration_ms": 1,
             "results": [
                 {"_score": 0.4, "data": {"question": "q1"}, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1}},
@@ -412,7 +412,6 @@ fn structural_search_response_accepts_additional_columns_in_data() {
                 {"_score": 0.1, "data": {"question": "q4"}, "dataset": "qs", "matches": {"answer": ["a4"]}, "primary_key": {"id": 4}}
             ]
         }),
-        true,
     );
 }
 
@@ -420,7 +419,7 @@ fn structural_search_response_accepts_additional_columns_in_data() {
 fn structural_search_response_accepts_additional_columns_in_primary_key() {
     assert_search_response_structure(
         "s3vectors_composite_additional_columns",
-        json!({
+        &json!({
             "duration_ms": 1,
             "results": [
                 {"_score": 0.4, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1, "question": "q1"}},
@@ -429,7 +428,6 @@ fn structural_search_response_accepts_additional_columns_in_primary_key() {
                 {"_score": 0.1, "dataset": "qs", "matches": {"answer": ["a4"]}, "primary_key": {"id": 4, "question": "q4"}}
             ]
         }),
-        true,
     );
 }
 
@@ -502,7 +500,8 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
 }
 
 fn normalize_search_response(json: Value) -> String {
-    serde_json::to_string_pretty(&normalize_search_response_json(json, false)).unwrap_or_default()
+    serde_json::to_string_pretty(&normalize_search_response_json(json, false))
+        .expect("search response snapshot serialization should succeed")
 }
 
 /// Normalize a `/v1/sql` HTTP response for stable snapshotting.
@@ -550,7 +549,7 @@ fn normalize_sql_response_json(mut json: Value) -> Value {
 
 fn row_tiebreak_key(row: &Value) -> String {
     let Some(obj) = row.as_object() else {
-        return serde_json::to_string(row).unwrap_or_default();
+        return serde_json::to_string(row).expect("row tiebreak key serialization should succeed");
     };
     let mut sanitized: BTreeMap<String, Value> = BTreeMap::new();
     for (k, v) in obj {
@@ -559,7 +558,7 @@ fn row_tiebreak_key(row: &Value) -> String {
         }
         sanitized.insert(k.clone(), v.clone());
     }
-    serde_json::to_string(&sanitized).unwrap_or_default()
+    serde_json::to_string(&sanitized).expect("row tiebreak key serialization should succeed")
 }
 
 fn quote_sql_identifier(identifier: &str) -> String {
