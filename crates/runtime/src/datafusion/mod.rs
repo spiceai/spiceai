@@ -3720,14 +3720,13 @@ async fn wait_until_dependent_tables_are_ready(
         let catalog_statuses = runtime_status.get_catalog_statuses();
 
         if let Some(not_ready_table) = dependent_tables.iter().find(|dependent_table| {
-            match statuses.get(dependent_table) {
-                Some(s) => s != &status::ComponentStatus::Ready,
-                None => {
-                    // Table not tracked as a dataset or view (e.g. a catalog table).
-                    // Consider it ready if its catalog is registered and ready.
-                    let catalog = dependent_table.catalog.as_ref();
-                    catalog_statuses.get(catalog) != Some(&status::ComponentStatus::Ready)
-                }
+            if let Some(s) = statuses.get(dependent_table) {
+                s != &status::ComponentStatus::Ready
+            } else {
+                // Table not tracked as a dataset or view (e.g. a catalog table).
+                // Consider it ready if its catalog is registered and ready.
+                let catalog = dependent_table.catalog.as_ref();
+                catalog_statuses.get(catalog) != Some(&status::ComponentStatus::Ready)
             }
         }) {
             tracing::debug!(
