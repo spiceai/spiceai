@@ -42,6 +42,7 @@ fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static st
         (VORTEX_RANGE_FILTER_PATTERN.to_string(), VORTEX_RANGE_FILTER_REPLACEMENT),
         (r"required_guarantees=\[[^\]]*\]".to_string(), "required_guarantees=[N]"),
         (r"partition_sizes=\[[^\]]*\]".to_string(), "partition_sizes=[<redacted>]"),
+        (r"file_groups=\{(\d+ groups?): [^}]+\}".to_string(), "file_groups={$1: [<redacted>]}"),
         (
             r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#.to_string(),
             "<GROUPING_PAIR>",
@@ -411,5 +412,51 @@ mod tests {
 
         let result = super::sort_partitioned_union_children(input);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_file_groups_filter() -> Result<(), String> {
+        let regex = regex::Regex::new(r"file_groups=\{(\d+ groups?): [^}]+\}")
+            .map_err(|e| format!("{e}"))?;
+        let replacement = "file_groups={$1: [<redacted>]}";
+
+        // Multiple groups with vortex ranges and trailing `...`
+        let input = "DataSourceExec: file_groups={16 groups: [[/data/orders/<CAYENNE_PATH>.vortex:<RANGE>, /data/orders/<CAYENNE_PATH>.vortex:<RANGE>], [/data/orders/<CAYENNE_PATH>.vortex:<RANGE>], ...]}, projection=[o_orderkey]";
+        let expected =
+            "DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[o_orderkey]";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Single group (singular "group") with single vortex file
+        let input = "DataSourceExec: file_groups={1 group: [[/data/nation/<CAYENNE_PATH>.vortex]]}, projection=[n_nationkey]";
+        let expected =
+            "DataSourceExec: file_groups={1 group: [<redacted>]}, projection=[n_nationkey]";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Single group with parquet file
+        let input = "DataSourceExec: file_groups={1 group: [[tpcds_sf1/item.parquet]]}, projection=[i_manufact], file_type=parquet";
+        let expected = "DataSourceExec: file_groups={1 group: [<redacted>]}, projection=[i_manufact], file_type=parquet";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Multiple groups with parquet byte ranges and trailing `...`
+        let input = "ParquetExec: file_groups={24 groups: [[/data/orders.parquet:0..2311466], [/data/orders.parquet:2311466..4622932], [/data/orders.parquet:4622932..6934398], ...]}, projection=[o_orderkey], limit=10";
+        let expected =
+            "ParquetExec: file_groups={24 groups: [<redacted>]}, projection=[o_orderkey], limit=10";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Single group with temp path
+        let input = "DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name], file_type=vortex";
+        let expected = "DataSourceExec: file_groups={1 group: [<redacted>]}, projection=[id, name], file_type=vortex";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Multiple file_groups on one line (two DataSourceExec nodes in plan output)
+        let input = "DataSourceExec: file_groups={4 groups: [[a], [b], [c], [d]]}, x=1 ... DataSourceExec: file_groups={2 groups: [[e], [f]]}, y=2";
+        let expected = "DataSourceExec: file_groups={4 groups: [<redacted>]}, x=1 ... DataSourceExec: file_groups={2 groups: [<redacted>]}, y=2";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // No file_groups — input unchanged
+        let input = "SortExec: expr=[revenue@1 DESC]";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
     }
 }
