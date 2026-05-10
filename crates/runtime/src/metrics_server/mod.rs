@@ -28,9 +28,8 @@ use governor::{
 use http::{HeaderValue, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::{
-    body::{self, Incoming},
+    body::Incoming,
     header::{CONTENT_TYPE, RETRY_AFTER},
-    server::conn::http1::Builder,
 };
 use hyper_util::{rt::TokioIo, server::conn::auto::Builder as AutoBuilder};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
