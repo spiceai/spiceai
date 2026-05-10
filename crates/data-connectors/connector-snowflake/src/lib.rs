@@ -24,12 +24,11 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
-use data_components::Read;
-use data_components::snowflake::SnowflakeTableFactory;
+use data_components::snowflake::{SnowflakeTableFactory, quote_snowflake_table_path};
+use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
-use itertools::Itertools;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -151,6 +150,13 @@ enum ReadProviderError {
         connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Unable to get read-write provider for {dataconnector}: {source}"))]
+    UnableToGetReadWriteProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl From<ReadProviderError> for DataConnectorError {
@@ -165,8 +171,31 @@ impl From<ReadProviderError> for DataConnectorError {
                 connector_component,
                 source,
             },
+            ReadProviderError::UnableToGetReadWriteProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadWriteProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
         }
     }
+}
+
+fn snowflake_table_path(dataset: &Dataset) -> DataConnectorResult<String> {
+    quote_snowflake_table_path(dataset.path()).map_err(|source| {
+        DataConnectorError::InvalidConfiguration {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "The specified table name in dataset path is invalid '{}'. Ensure the table name uses valid Snowflake identifier syntax and try again.",
+                dataset.path()
+            ),
+            source: Box::new(source),
+        }
+    })
 }
 
 #[async_trait]
@@ -179,17 +208,7 @@ impl DataConnector for Snowflake {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let path = dataset
-            .path()
-            .split('.')
-            .map(|x| {
-                if x.starts_with('"') && x.ends_with('"') {
-                    return x.into();
-                }
-
-                format!("\"{x}\"")
-            })
-            .join(".");
+        let path = snowflake_table_path(dataset)?;
 
         Ok(Read::table_provider(&self.table_factory, path.into())
             .await
@@ -197,6 +216,26 @@ impl DataConnector for Snowflake {
                 dataconnector: "snowflake",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
+    }
+
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
+        let path = match snowflake_table_path(dataset) {
+            Ok(path) => path,
+            Err(error) => return Some(Err(error)),
+        };
+
+        Some(
+            ReadWrite::table_provider(&self.table_factory, path.into())
+                .await
+                .context(UnableToGetReadWriteProviderSnafu {
+                    dataconnector: "snowflake",
+                    connector_component: ConnectorComponent::from(dataset),
+                })
+                .map_err(Into::into),
+        )
     }
 }
 
@@ -250,5 +289,36 @@ mod tests {
             private_key.secret,
             "private_key holds PEM key material and must be marked secret"
         );
+    }
+
+    #[test]
+    fn snowflake_table_path_quotes_each_identifier() {
+        assert_eq!(
+            quote_snowflake_table_path("database.schema.table").expect("path should be quoted"),
+            "\"database\".\"schema\".\"table\""
+        );
+    }
+
+    #[test]
+    fn snowflake_table_path_preserves_quoted_dots() {
+        assert_eq!(
+            quote_snowflake_table_path(r#""my.schema".table"#).expect("path should be quoted"),
+            "\"my.schema\".\"table\""
+        );
+    }
+
+    #[test]
+    fn snowflake_table_path_escapes_embedded_double_quotes() {
+        assert_eq!(
+            quote_snowflake_table_path(r#"schema."a""b""#).expect("path should be quoted"),
+            "\"schema\".\"a\"\"b\""
+        );
+    }
+
+    #[test]
+    fn snowflake_table_path_rejects_invalid_identifier_paths() {
+        quote_snowflake_table_path(r#""unterminated.table"#)
+            .expect_err("should reject unterminated quoted identifier");
+        quote_snowflake_table_path("a.b.c.d").expect_err("should reject 4-part identifier");
     }
 }

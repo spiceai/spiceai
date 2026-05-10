@@ -1010,6 +1010,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_only_validator_rejects_update_on_writable_dataset() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("UPDATE tbl_writable SET name = 'bar' WHERE id = 1")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("UPDATE must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_insert_on_writable_catalog() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(
+                "INSERT INTO writable_catalog.public.test_table VALUES (1, 'foo', 42.0)",
+            )
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("INSERT into a writable catalog must be rejected in read-only context");
+    }
+
+    #[tokio::test]
     async fn test_read_only_validator_rejects_ddl() {
         let df = create_test_datafusion();
 
