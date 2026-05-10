@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -79,13 +79,15 @@ async fn decode_plan(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
+    let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+        // `write!` formats directly into the preallocated `String` without
+        // an intermediate allocation per byte.
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }
