@@ -179,11 +179,22 @@ impl Runtime {
     /// Resolves the configured `task_history.persistence` block into a
     /// writable `TableProvider` that the accelerated table will write back to.
     /// The connector name is the prefix of `from:` (e.g. `postgres` in
-    /// `postgres:public.task_history`), and must support DDL/DML.
+    /// `postgres:public.task_history`), and must expose a writable provider
+    /// (DML — INSERT, plus DELETE for retention).
     async fn build_task_history_persistence_source(
         self: &Arc<Self>,
         persistence: TaskHistoryPersistence,
     ) -> Result<Arc<dyn TableProvider>> {
+        if persistence.from.trim().is_empty() {
+            return Err(Error::UnableToTrackTaskHistory {
+                source: task_history::Error::InvalidConfiguration {
+                    source: "task_history.persistence.from must be a non-empty \
+                             `<connector>:<path>` reference (e.g. \
+                             `postgres:public.task_history`)"
+                        .into(),
+                },
+            });
+        }
         let app = self.app();
         let app_guard = app.read().await;
         let app_ref =

@@ -145,8 +145,8 @@ pub async fn create_internal_accelerated_table(
 /// Like [`create_internal_accelerated_table`], but persists writes to a
 /// caller-provided federated source via the accelerated table's write-back
 /// mode. The local accelerator continues to serve as the synchronous buffer;
-/// the source provider must support `insert_into` (i.e. expose a
-/// `read_write_provider`).
+/// the source provider must expose a `read_write_provider` and support DML
+/// (INSERT, plus DELETE if the caller configures retention).
 #[expect(clippy::too_many_arguments)]
 pub async fn create_internal_accelerated_table_with_persistence(
     runtime_status: Arc<status::RuntimeStatus>,
