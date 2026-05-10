@@ -1008,27 +1008,28 @@ fn parse_endpoint(from: &str, allow_private: bool) -> Result<Url> {
             });
         }
     }
-    if !allow_private {
-        let host = url
-            .host()
-            .ok_or_else(|| RemoteBuildError::MissingHost {
-                from: from.to_string(),
-            })?;
-        if let Some(reason) = ip_literal_is_disallowed(&host) {
-            tracing::warn!(
-                endpoint = %from,
-                reason,
-                "rejecting remote UDF endpoint that targets a non-public address"
-            );
-            return Err(RemoteBuildError::PrivateEndpoint {
-                host: host.to_string(),
-            });
-        }
-        // For domain hosts we deliberately do not resolve DNS here:
-        // doing so would couple builder time to DNS availability and
-        // is still vulnerable to TOCTOU/DNS rebinding. Connect-time
-        // enforcement against private ranges is tracked separately.
+    let host = url.host().ok_or_else(|| RemoteBuildError::MissingHost {
+        from: from.to_string(),
+    })?;
+
+    if allow_private {
+        return Ok(url);
     }
+
+    if let Some(reason) = ip_literal_is_disallowed(&host) {
+        tracing::warn!(
+            endpoint = %from,
+            reason,
+            "rejecting remote UDF endpoint that targets a non-public address"
+        );
+        return Err(RemoteBuildError::PrivateEndpoint {
+            host: host.to_string(),
+        });
+    }
+    // For domain hosts we deliberately do not resolve DNS here:
+    // doing so would couple builder time to DNS availability and
+    // is still vulnerable to TOCTOU/DNS rebinding. Connect-time
+    // enforcement against private ranges is tracked separately.
     Ok(url)
 }
 
@@ -1092,7 +1093,8 @@ fn ip_literal_is_disallowed(host: &url::Host<&str>) -> Option<&'static str> {
             } else if (ip.segments()[0] & 0xfe00) == 0xfc00 {
                 // fc00::/7 unique local addresses (covers fd00:ec2::254).
                 Some("IPv6 unique-local (ULA)")
-            } else if matches!(ip.to_ipv4_mapped(), Some(v4) if v4.is_loopback() || v4.is_private() || v4.is_link_local()) {
+            } else if matches!(ip.to_ipv4_mapped(), Some(v4) if v4.is_loopback() || v4.is_private() || v4.is_link_local())
+            {
                 Some("IPv4-mapped IPv6 targeting a non-public address")
             } else {
                 None
@@ -1869,6 +1871,17 @@ mod tests {
     fn endpoint_parse_rejects_invalid_url() {
         let d = sample_decl("not-a-url");
         let err = build_scalar_udf(&d).expect_err("invalid URL rejected");
+        assert!(matches!(err, RemoteBuildError::InvalidEndpoint { .. }));
+    }
+
+    #[test]
+    fn endpoint_parse_rejects_malformed_url_with_private_opt_in() {
+        let mut d = sample_decl("http://");
+        d.params.insert(
+            "allow_private_endpoints".into(),
+            serde_json::Value::Bool(true),
+        );
+        let err = build_scalar_udf(&d).expect_err("malformed endpoint rejected");
         assert!(matches!(err, RemoteBuildError::InvalidEndpoint { .. }));
     }
 

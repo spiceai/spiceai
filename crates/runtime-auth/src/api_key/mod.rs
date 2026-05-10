@@ -65,7 +65,7 @@ impl ApiKeyAuth {
     fn lookup(&self, presented: &str) -> Option<ApiKey> {
         let mut matched: Option<ApiKey> = None;
         for key in &self.api_keys {
-            if *key == *presented {
+            if key == presented {
                 // Don't `break`: keep iterating so timing is independent
                 // of which key matched. Later matches will not overwrite
                 // the first because configured keys are de-duplicated by
@@ -234,7 +234,8 @@ mod tests {
             auth.validate("ignored", ""),
             Err(crate::error::Error::InvalidCredentials)
         ));
-        assert!(auth.validate("ignored", "valid-key").is_ok());
+        auth.validate("ignored", "valid-key")
+            .expect("valid key should be accepted");
         assert!(matches!(
             auth.validate("ignored", "wrong"),
             Err(crate::error::Error::InvalidCredentials)
