@@ -36,6 +36,8 @@ limitations under the License.
 //!
 //! [`AcceleratedTable`]: super::AcceleratedTable
 
+#[cfg(feature = "duckdb")]
+pub(crate) mod wal;
 pub(crate) mod write_back;
 pub(crate) mod write_through;
 

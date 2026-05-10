@@ -257,6 +257,8 @@ pub struct AcceleratedTable {
     disable_federation: bool,
     /// Controls where writes (INSERT INTO) are directed.
     write_mode: WriteMode,
+    /// WAL context for durable `write_back`. `None` falls back to fire-and-forget.
+    wal_context: Option<Arc<write::wal::WalContext>>,
     synchronized_with: Option<SynchronizedTable>,
     /// Child accelerators that should receive cached data when this parent stores new cache entries (caching mode only)
     synchronized_children: Arc<RwLock<Vec<Arc<dyn TableProvider>>>>,
@@ -284,8 +286,8 @@ pub struct AcceleratedTable {
 
 impl std::fmt::Debug for AcceleratedTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AcceleratedTable")
-            .field("dataset_name", &self.dataset_name)
+        let mut dbg = f.debug_struct("AcceleratedTable");
+        dbg.field("dataset_name", &self.dataset_name)
             .field("accelerator", &self.accelerator)
             .field("federated", &self.federated)
             .field("zero_results_action", &self.zero_results_action)
@@ -293,8 +295,9 @@ impl std::fmt::Debug for AcceleratedTable {
             .field("refresh_params", &self.refresh_params)
             .field("disable_federation", &self.disable_federation)
             .field("write_mode", &self.write_mode)
-            .field("synchronized_with", &self.synchronized_with)
-            .finish_non_exhaustive()
+            .field("wal_context", &self.wal_context.is_some())
+            .field("synchronized_with", &self.synchronized_with);
+        dbg.finish_non_exhaustive()
     }
 }
 
@@ -344,6 +347,8 @@ pub struct Builder {
     write_to_accelerator_only: bool,
     write_through: bool,
     write_back: bool,
+    /// Pre-built WAL backend, set by the caller via [`Builder::with_wal_backend`].
+    wal_backend: Option<Arc<dyn write::wal::WalBackend>>,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
@@ -398,6 +403,7 @@ impl Builder {
             write_to_accelerator_only: false,
             write_through: false,
             write_back: false,
+            wal_backend: None,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
@@ -501,6 +507,11 @@ impl Builder {
     /// then asynchronously persist to the federated source.
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
+        self
+    }
+
+    pub fn with_wal_backend(&mut self, backend: Arc<dyn write::wal::WalBackend>) -> &mut Self {
+        self.wal_backend = Some(backend);
         self
     }
 
@@ -661,7 +672,7 @@ impl Builder {
     }
 
     /// Build the accelerated table
-    pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
+    pub async fn build(mut self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
             return ExpectedChangesModeForChangesStreamSnafu.fail();
         }
@@ -1057,6 +1068,38 @@ impl Builder {
             WriteMode::FederatedOnly
         };
 
+        // Initialize WAL for write_back on DuckDB file mode.
+        let wal_context: Option<Arc<write::wal::WalContext>> = if self.write_back {
+            let (notify_tx, notify_rx) = mpsc::channel(32);
+            if let Some(backend) = self.wal_backend.take() {
+                if let Err(e) = backend.initialize().await {
+                    tracing::warn!(
+                        dataset = %self.dataset_name,
+                        "Failed to initialize WAL schema, falling back to fire-and-forget write_back: {e}"
+                    );
+                    None
+                } else {
+                    let ctx_arc = Arc::new(write::wal::WalContext {
+                        backend,
+                        dataset_name: self.dataset_name.to_string(),
+                        notify_tx,
+                    });
+                    write::wal::log_pending_on_startup(&ctx_arc).await;
+                    let worker = write::wal::start_wal_worker(
+                        Arc::clone(&ctx_arc),
+                        Arc::clone(&self.federated),
+                        notify_rx,
+                    );
+                    handlers.push(worker);
+                    Some(ctx_arc)
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(AcceleratedTable {
             dataset_name: self.dataset_name,
             accelerator: self.accelerator,
@@ -1070,6 +1113,7 @@ impl Builder {
             refresher,
             disable_federation: self.disable_federation,
             write_mode,
+            wal_context,
             synchronized_with: self.synchronize_with,
             synchronized_children: Arc::new(RwLock::new(Vec::new())),
             cache_ttl: self.caching_ttl,
@@ -1649,6 +1693,14 @@ impl TableProvider for AcceleratedTable {
             }
             WriteMode::WriteBack => {
                 write::write_back::validate_insert_op(overwrite)?;
+                if let Some(wal) = &self.wal_context {
+                    return Ok(write::wal::insert_wal_write_back(
+                        input,
+                        Arc::clone(wal),
+                        Arc::clone(&self.refresher),
+                        self.schema(),
+                    ));
+                }
                 write::write_back::insert_write_back(
                     state,
                     input,
@@ -1694,6 +1746,9 @@ impl TableProvider for AcceleratedTable {
                 federated_table.delete_from(state, filters).await
             }
             WriteMode::WriteBack => {
+                if let Some(wal) = &self.wal_context {
+                    return Ok(write::wal::delete_wal_write_back(filters, Arc::clone(wal)));
+                }
                 write::write_back::delete_write_back(
                     state,
                     filters,
@@ -1741,6 +1796,13 @@ impl TableProvider for AcceleratedTable {
                 federated_table.update(state, assignments, filters).await
             }
             WriteMode::WriteBack => {
+                if let Some(wal) = &self.wal_context {
+                    return Ok(write::wal::update_wal_write_back(
+                        assignments,
+                        filters,
+                        Arc::clone(wal),
+                    ));
+                }
                 write::write_back::update_write_back(
                     state,
                     assignments,

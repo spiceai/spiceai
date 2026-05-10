@@ -2428,6 +2428,14 @@ impl DataFusion {
             match acceleration_settings.write_mode {
                 spicepod::acceleration::WriteMode::WriteBack => {
                     accelerated_table_builder.write_back();
+                    if let Some(engine) = self
+                        .accelerator_engine_registry
+                        .get_accelerator_engine(acceleration_settings.engine)
+                        .await
+                        && let Some(backend) = engine.wal_backend(&accelerated_table_provider)
+                    {
+                        accelerated_table_builder.with_wal_backend(backend);
+                    }
                 }
                 spicepod::acceleration::WriteMode::WriteThrough
                     if acceleration_settings.engine == Engine::Cayenne =>

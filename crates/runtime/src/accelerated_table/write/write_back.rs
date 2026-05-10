@@ -368,7 +368,7 @@ pub(super) fn extract_dml_count(batches: &[RecordBatch]) -> u64 {
 /// cast to the target provider's schema so differences between the
 /// accelerator and federated source schemas (extra columns, differing
 /// types) don't cause incorrect writes.
-async fn execute_insert(
+pub(super) async fn execute_insert(
     table: Arc<dyn TableProvider>,
     input_schema: SchemaRef,
     batches: Vec<RecordBatch>,

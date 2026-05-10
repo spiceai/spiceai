@@ -78,6 +78,7 @@ use std::{
 };
 
 pub(crate) mod settings;
+pub(crate) mod wal_backend;
 
 pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -329,6 +330,14 @@ impl DataAccelerator for DuckDBAccelerator {
 
     fn name(&self) -> &'static str {
         "duckdb"
+    }
+
+    fn wal_backend(
+        &self,
+        accelerator: &Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Option<Arc<dyn crate::accelerated_table::write::wal::WalBackend>> {
+        wal_backend::DuckDBWalBackend::try_from_provider(accelerator)
+            .map(|b| Arc::new(b) as Arc<dyn crate::accelerated_table::write::wal::WalBackend>)
     }
 
     fn valid_file_extensions(&self) -> Vec<&'static str> {

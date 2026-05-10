@@ -4666,7 +4666,7 @@ impl TableProvider for CayenneTableProvider {
             })?
             .clone();
 
-        Ok(Arc::new(data_components::update::UpdateExec::new(
+        Ok(Arc::new(data_components::update::LocalUpdateExec::new(
             source_plan,
             Arc::new(self.clone_for_write()),
             session_state,

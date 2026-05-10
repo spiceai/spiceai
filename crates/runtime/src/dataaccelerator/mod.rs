@@ -391,6 +391,20 @@ impl AcceleratorEngineRegistry {
 pub trait DataAccelerator: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
+    /// Return a WAL backend for durable `write_back` on this accelerator, or `None`
+    /// if this engine does not support WAL (e.g. Arrow, in-memory `DuckDB`).
+    ///
+    /// The backend is constructed from the already-created `accelerator` table provider,
+    /// which gives access to the underlying connection pool and table definition.
+    /// Returns `None` if the engine does not support WAL, or if the table has no primary
+    /// keys (required for idempotent WAL replay).
+    fn wal_backend(
+        &self,
+        _accelerator: &Arc<dyn TableProvider>,
+    ) -> Option<Arc<dyn crate::accelerated_table::write::wal::WalBackend>> {
+        None
+    }
+
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     ///
     /// Also returns the behaviors of the table provider created by the accelerator engine.
