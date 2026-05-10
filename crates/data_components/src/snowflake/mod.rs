@@ -15,28 +15,38 @@ limitations under the License.
 */
 
 pub mod provider;
+mod write;
 
 use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider,
-    sql::{TableReference, unparser::dialect},
+    sql::{
+        TableReference,
+        sqlparser::{
+            dialect::GenericDialect,
+            parser::{Parser, ParserError},
+        },
+        unparser::dialect::{self, Dialect},
+    },
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
 use snowflake_api::SnowflakeApi;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
-use crate::Read;
 use crate::schema_discovery::{NoPermissionsCheck, SchemaProbeResult, discover_schema};
+use crate::{Read, ReadWrite};
 
 pub type SnowflakeConnectionPool =
     dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync;
 
 pub struct SnowflakeTableFactory {
     pool: Arc<SnowflakeConnectionPool>,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for SnowflakeTableFactory {
@@ -49,7 +59,60 @@ impl std::fmt::Debug for SnowflakeTableFactory {
 impl SnowflakeTableFactory {
     #[must_use]
     pub fn new(pool: Arc<SnowflakeConnectionPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            write_lock: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+/// Parses a Snowflake table path string (e.g. `db.schema.table` or `"my.schema".table`)
+/// using SQL parser rules and returns a fully-quoted identifier string safe to embed in
+/// Snowflake SQL statements.
+///
+/// Each identifier part is unquoted by the parser (handling embedded `""` escapes and
+/// dot-in-quoted-identifier cases), then re-quoted with proper `""` escaping.
+///
+/// # Errors
+/// Returns a `ParserError` if `path` is not a valid 1-, 2-, or 3-part Snowflake identifier
+/// or contains NUL bytes.
+pub fn quote_snowflake_table_path(path: &str) -> std::result::Result<String, ParserError> {
+    let table_reference = parse_snowflake_table_reference(path)?;
+    let identifier_parts = table_reference.to_vec();
+
+    if identifier_parts.iter().any(|part| part.contains('\0')) {
+        return Err(ParserError::ParserError(
+            "Snowflake identifiers cannot contain NUL bytes".to_string(),
+        ));
+    }
+
+    Ok(identifier_parts
+        .iter()
+        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join("."))
+}
+
+fn parse_snowflake_table_reference(path: &str) -> std::result::Result<TableReference, ParserError> {
+    let dialect = GenericDialect {};
+    let identifier_parts = Parser::new(&dialect)
+        .try_with_sql(path)?
+        .parse_multipart_identifier()?
+        .into_iter()
+        .map(|identifier| identifier.value)
+        .collect::<Vec<_>>();
+
+    match identifier_parts.as_slice() {
+        [table] => Ok(TableReference::bare(table.clone())),
+        [schema, table] => Ok(TableReference::partial(schema.clone(), table.clone())),
+        [catalog, schema, table] => Ok(TableReference::full(
+            catalog.clone(),
+            schema.clone(),
+            table.clone(),
+        )),
+        _ => Err(ParserError::ParserError(format!(
+            "Invalid Snowflake table path: expected 1-3 identifier parts, got: {path}"
+        ))),
     }
 }
 
@@ -361,7 +424,33 @@ impl Read for SnowflakeTableFactory {
         Arc<dyn TableProvider + 'static>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let dialect = Arc::new(snowflake_dialect());
+        self.table_provider(table_reference, false).await
+    }
+}
+
+#[async_trait]
+impl ReadWrite for SnowflakeTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+    ) -> std::result::Result<
+        Arc<dyn TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.table_provider(table_reference, true).await
+    }
+}
+
+impl SnowflakeTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+        writable: bool,
+    ) -> std::result::Result<
+        Arc<dyn TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let dialect: Arc<dyn Dialect + Send + Sync> = Arc::new(snowflake_dialect());
         let pool = Arc::clone(&self.pool);
 
         // Get a connection only long enough to extract the API handle.
@@ -383,10 +472,18 @@ impl Read for SnowflakeTableFactory {
         .await?;
 
         result.log_warnings(table_reference.to_string());
+        let schema = Arc::clone(&result.schema);
+        let table_reference_for_provider = table_reference.clone();
 
         let table_provider = Arc::new(
-            SqlTable::new_with_schema("snowflake", &pool, result.schema, table_reference, None)
-                .with_dialect(dialect),
+            SqlTable::new_with_schema(
+                "snowflake",
+                &pool,
+                Arc::clone(&schema),
+                table_reference_for_provider,
+                None,
+            )
+            .with_dialect(Arc::clone(&dialect)),
         );
 
         let table_provider = Arc::new(
@@ -394,6 +491,18 @@ impl Read for SnowflakeTableFactory {
                 .create_federated_table_provider()
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
         );
+
+        if writable {
+            let table_provider: Arc<dyn TableProvider> = table_provider;
+            return Ok(write::SnowflakeTableProvider::create(
+                &table_provider,
+                pool,
+                table_reference,
+                schema,
+                dialect,
+                Arc::clone(&self.write_lock),
+            ));
+        }
 
         Ok(table_provider)
     }
