@@ -12,6 +12,6 @@ description: "Query: tpch_simple_q1"
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)] |
 |               |       SchemaCastScanExec                                                 |
 |               |         BytesProcessedExec                                               |
-|               |           DataSourceExec: partitions=16, partition_sizes=[<redacted>]    |
+|               |           DataSourceExec: partitions=32, partition_sizes=[<redacted>]    |
 |               |                                                                          |
 +---------------+--------------------------------------------------------------------------+

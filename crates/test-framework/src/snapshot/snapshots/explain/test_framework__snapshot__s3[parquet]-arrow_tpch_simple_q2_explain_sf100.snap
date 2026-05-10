@@ -17,9 +17,9 @@ description: "Query: tpch_simple_q2"
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_linenumber)]                                                                                         |
 |               |         SchemaCastScanExec                                                                                                                                           |
 |               |           BytesProcessedExec                                                                                                                                         |
-|               |             DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                                              |
+|               |             DataSourceExec: partitions=32, partition_sizes=[<redacted>]                                                                                              |
 |               |   SchemaCastScanExec                                                                                                                                                 |
 |               |     BytesProcessedExec                                                                                                                                               |
-|               |       DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                                                    |
+|               |       DataSourceExec: partitions=32, partition_sizes=[<redacted>]                                                                                                    |
 |               |                                                                                                                                                                      |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+

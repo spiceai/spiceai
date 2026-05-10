@@ -13,6 +13,6 @@ description: "Query: tpch_simple_q7"
 |               |   CoalescePartitionsExec: fetch=10                                            |
 |               |     SchemaCastScanExec                                                        |
 |               |       BytesProcessedExec                                                      |
-|               |         DataSourceExec: partitions=16, partition_sizes=[<redacted>], fetch=10 |
+|               |         DataSourceExec: partitions=32, partition_sizes=[<redacted>], fetch=10 |
 |               |                                                                               |
 +---------------+-------------------------------------------------------------------------------+

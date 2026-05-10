@@ -15,6 +15,6 @@ description: "Query: tpch_simple_q3"
 |               |       ProjectionExec: expr=[l_comment@2 as l_comment, l_partkey@0 as l_partkey, l_linenumber@1 as l_linenumber] |
 |               |         SchemaCastScanExec                                                                                      |
 |               |           BytesProcessedExec                                                                                    |
-|               |             DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                         |
+|               |             DataSourceExec: partitions=32, partition_sizes=[<redacted>]                                         |
 |               |                                                                                                                 |
 +---------------+-----------------------------------------------------------------------------------------------------------------+
