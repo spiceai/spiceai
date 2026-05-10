@@ -274,7 +274,25 @@ impl FlightClient {
         metadata: Option<tonic::metadata::MetadataMap>,
         ca_certificate_path: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let flight_channel = tls::new_tls_flight_channel(&url, ca_certificate_path)
+        let opts =
+            tls::ClientTlsOptions::ca_only(ca_certificate_path.map(std::path::PathBuf::from));
+        Self::try_new_with_tls_options(url, credentials, metadata, &opts).await
+    }
+
+    /// Creates a new instance of `FlightClient` with full TLS options,
+    /// including an optional client certificate + key for mutual TLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unable to create the `FlightClient` (TLS
+    /// material could not be loaded or the upstream connection failed).
+    pub async fn try_new_with_tls_options(
+        url: Arc<str>,
+        credentials: Credentials,
+        metadata: Option<tonic::metadata::MetadataMap>,
+        tls_options: &tls::ClientTlsOptions,
+    ) -> Result<Self> {
+        let flight_channel = tls::new_tls_flight_channel_with_options(&url, tls_options)
             .await
             .context(UnableToConnectToServerSnafu)?;
 
