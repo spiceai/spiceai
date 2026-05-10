@@ -25,11 +25,11 @@ pub enum BackendMode {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Run spidapter as a newline-delimited JSON-RPC server over stdio
-    Stdio(StdioArgs),
+    Stdio(Box<StdioArgs>),
     /// Run spidapter backed by a local spiced cluster (scheduler + executors)
-    LocalSpiced(LocalSpicedArgs),
+    LocalSpiced(Box<LocalSpicedArgs>),
     /// Run spidapter backed by a local cayenne-flightsql instance
-    CayenneFlightsql(CayenneFlightsqlArgs),
+    CayenneFlightsql(Box<CayenneFlightsqlArgs>),
 }
 
 #[derive(Parser, Debug, Clone)]
