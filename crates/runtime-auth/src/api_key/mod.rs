@@ -67,9 +67,8 @@ impl ApiKeyAuth {
         for key in &self.api_keys {
             if key == presented {
                 // Don't `break`: keep iterating so timing is independent
-                // of which key matched. Later matches will not overwrite
-                // the first because configured keys are de-duplicated by
-                // the operator and `==` here is constant-time.
+                // of which key matched. Preserve the first match if the
+                // same key was configured more than once.
                 if matched.is_none() {
                     matched = Some(key.clone());
                 }

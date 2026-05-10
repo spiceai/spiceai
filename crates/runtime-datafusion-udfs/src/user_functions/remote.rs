@@ -1018,7 +1018,8 @@ fn parse_endpoint(from: &str, allow_private: bool) -> Result<Url> {
 
     if let Some(reason) = ip_literal_is_disallowed(&host) {
         tracing::warn!(
-            endpoint = %from,
+            endpoint_host = %host,
+            endpoint_port = ?url.port_or_known_default(),
             reason,
             "rejecting remote UDF endpoint that targets a non-public address"
         );
@@ -1057,27 +1058,7 @@ fn ip_literal_is_disallowed(host: &url::Host<&str>) -> Option<&'static str> {
                 None
             }
         }
-        url::Host::Ipv4(ip) => {
-            if ip.is_loopback() {
-                Some("IPv4 loopback")
-            } else if ip.is_private() {
-                Some("IPv4 RFC1918 private range")
-            } else if ip.is_link_local() {
-                // 169.254.0.0/16 — covers AWS / GCP / Azure IMDS.
-                Some("IPv4 link-local (covers cloud metadata services)")
-            } else if ip.is_multicast() {
-                Some("IPv4 multicast")
-            } else if ip.is_broadcast() {
-                Some("IPv4 broadcast")
-            } else if ip.is_unspecified() {
-                Some("IPv4 unspecified (0.0.0.0)")
-            } else if ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 0x40 {
-                // 100.64.0.0/10 — carrier-grade NAT / shared address space.
-                Some("IPv4 carrier-grade NAT shared space")
-            } else {
-                None
-            }
-        }
+        url::Host::Ipv4(ip) => ipv4_literal_is_disallowed(ip),
         url::Host::Ipv6(ip) => {
             if ip.is_loopback() {
                 Some("IPv6 loopback")
@@ -1093,13 +1074,38 @@ fn ip_literal_is_disallowed(host: &url::Host<&str>) -> Option<&'static str> {
             } else if (ip.segments()[0] & 0xfe00) == 0xfc00 {
                 // fc00::/7 unique local addresses (covers fd00:ec2::254).
                 Some("IPv6 unique-local (ULA)")
-            } else if matches!(ip.to_ipv4_mapped(), Some(v4) if v4.is_loopback() || v4.is_private() || v4.is_link_local())
+            } else if ip
+                .to_ipv4_mapped()
+                .and_then(|v4| ipv4_literal_is_disallowed(&v4))
+                .is_some()
             {
-                Some("IPv4-mapped IPv6 targeting a non-public address")
+                Some("IPv4-mapped IPv6 targeting a disallowed IPv4 address")
             } else {
                 None
             }
         }
+    }
+}
+
+fn ipv4_literal_is_disallowed(ip: &std::net::Ipv4Addr) -> Option<&'static str> {
+    if ip.is_loopback() {
+        Some("IPv4 loopback")
+    } else if ip.is_private() {
+        Some("IPv4 RFC1918 private range")
+    } else if ip.is_link_local() {
+        // 169.254.0.0/16 — covers AWS / GCP / Azure IMDS.
+        Some("IPv4 link-local (covers cloud metadata services)")
+    } else if ip.is_multicast() {
+        Some("IPv4 multicast")
+    } else if ip.is_broadcast() {
+        Some("IPv4 broadcast")
+    } else if ip.is_unspecified() {
+        Some("IPv4 unspecified (0.0.0.0)")
+    } else if ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 0x40 {
+        // 100.64.0.0/10 — carrier-grade NAT / shared address space.
+        Some("IPv4 carrier-grade NAT shared space")
+    } else {
+        None
     }
 }
 
@@ -1901,6 +1907,10 @@ mod tests {
             "http://[fe80::1]/udf",
             "http://[fc00::1]/udf",
             "http://[::ffff:127.0.0.1]/udf",
+            "http://[::ffff:0.0.0.0]/udf",
+            "http://[::ffff:100.64.0.1]/udf",
+            "http://[::ffff:224.0.0.1]/udf",
+            "http://[::ffff:255.255.255.255]/udf",
         ] {
             let d = sample_decl(from);
             let err = build_scalar_udf(&d)
