@@ -1025,7 +1025,8 @@ mod tests {
 
     #[test]
     fn scalar_literal_rejects_non_finite_float() {
-        scalar_to_sql_literal(ScalarValue::Float64(Some(f64::NAN)), "value").expect_err("should reject NaN float");
+        scalar_to_sql_literal(ScalarValue::Float64(Some(f64::NAN)), "value")
+            .expect_err("should reject NaN float");
     }
 
     #[test]
