@@ -351,14 +351,9 @@ impl Spicepod {
     ) -> Result<Spicepod> {
         let path = path.into();
 
-        let file_stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
         let is_file = path.is_file() || path.extension().is_some();
 
-        let (spicepod_rdr, base_path) = if file_stem == "spicepod" && is_file {
+        let (spicepod_rdr, base_path) = if is_file {
             let spicepod_rdr = fs
                 .open_exact_yaml(path.clone())
                 .await
@@ -1150,6 +1145,29 @@ mod version_tests {
                 .unwrap_or_else(|e| panic!("Failed to load v1 fixture {file}: {e}"));
             assert_eq!(pod.version, SpicepodVersion::V1, "Expected V1 for {file}");
         }
+    }
+
+    /// `load_from` accepts any YAML file path, not just files named "spicepod".
+    #[tokio::test]
+    async fn test_load_from_accepts_arbitrary_filename() {
+        let pod = Spicepod::load_from(&reader::StdFileSystem, "./tests/basic_spicepod.yaml")
+            .await
+            .expect("load_from should accept a file path with a non-spicepod stem");
+        assert_eq!(pod.name, "basic_spicepod");
+    }
+
+    /// `load_from` with a directory still finds spicepod.yaml inside it.
+    #[tokio::test]
+    async fn test_load_from_directory_finds_spicepod_yaml() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let spicepod_content = "version: v1\nkind: Spicepod\nname: test_pod\n";
+        std::fs::write(dir.path().join("spicepod.yaml"), spicepod_content)
+            .expect("write spicepod.yaml");
+
+        let pod = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .expect("load_from should find spicepod.yaml in a directory");
+        assert_eq!(pod.name, "test_pod");
     }
 
     /// All v2-versioned test spicepods load successfully.
