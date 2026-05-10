@@ -596,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn table_creator_uses_read_provider_by_default() {
         let creator = Arc::new(RecordingTableCreator::default());
-        let read_creator: Arc<dyn Read> = creator.clone();
+        let read_creator: Arc<dyn Read> = Arc::clone(&creator) as Arc<dyn Read>;
         let table_creator = SnowflakeTableCreator::Read(read_creator);
 
         table_creator
@@ -611,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn table_creator_uses_read_write_provider_when_configured() {
         let creator = Arc::new(RecordingTableCreator::default());
-        let read_write_creator: Arc<dyn ReadWrite> = creator.clone();
+        let read_write_creator: Arc<dyn ReadWrite> = Arc::clone(&creator) as Arc<dyn ReadWrite>;
         let table_creator = SnowflakeTableCreator::ReadWrite(read_write_creator);
 
         table_creator

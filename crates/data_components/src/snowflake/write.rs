@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn quote_identifier_rejects_nul() {
-        assert!(quote_sql_identifier("bad\0name").is_err());
+        quote_sql_identifier("bad\0name").unwrap_err();
     }
 
     #[test]
@@ -1025,7 +1025,7 @@ mod tests {
 
     #[test]
     fn scalar_literal_rejects_non_finite_float() {
-        assert!(scalar_to_sql_literal(ScalarValue::Float64(Some(f64::NAN)), "value").is_err());
+        scalar_to_sql_literal(ScalarValue::Float64(Some(f64::NAN)), "value").unwrap_err();
     }
 
     #[test]
