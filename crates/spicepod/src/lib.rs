@@ -111,7 +111,7 @@ pub enum Error {
 
     #[snafu(display(
         "Unsupported Spicepod version in {}: '{version}'\n\n\
-        Supported versions are: v1, v2",
+        Supported versions are: v1, v2 (or full semver: v1.0.0, v2.0.0-rc.1, etc.)",
         path.display()
     ))]
     InvalidSpicepodVersion { version: String, path: PathBuf },
