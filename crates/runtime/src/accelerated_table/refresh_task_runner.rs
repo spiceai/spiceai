@@ -59,6 +59,7 @@ pub struct RefreshTaskRunnerBuilder {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -90,6 +91,7 @@ impl RefreshTaskRunnerBuilder {
             accelerator_write_mutex,
             last_updated_at: Arc::new(AtomicI64::new(0)),
             is_s3_express_acceleration: false,
+            snapshot_refresh_state: None,
         }
     }
 
@@ -140,6 +142,16 @@ impl RefreshTaskRunnerBuilder {
         self
     }
 
+    /// Provide the snapshot-refresh state required for `RefreshMode::Snapshot`.
+    #[must_use]
+    pub fn with_snapshot_refresh_state(
+        mut self,
+        state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    ) -> Self {
+        self.snapshot_refresh_state = state;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
@@ -167,6 +179,9 @@ impl RefreshTaskRunnerBuilder {
 
         refresh_task_builder =
             refresh_task_builder.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
+        refresh_task_builder =
+            refresh_task_builder.with_snapshot_refresh_state(self.snapshot_refresh_state);
 
         let refresh_task = Arc::new(refresh_task_builder.build());
 

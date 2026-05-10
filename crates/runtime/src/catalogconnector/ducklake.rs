@@ -27,6 +27,8 @@ use crate::{
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::ducklake::provider::DuckLakeCatalogProvider;
+use data_components::ducklake::{DuckLakeS3Params, configure_duckdb_httpfs};
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use snafu::prelude::*;
@@ -53,6 +55,20 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'."),
     ParameterSpec::component("open")
         .description("Optional path to an existing `DuckDB` file. If not provided, an in-memory `DuckDB` is used."),
+    ParameterSpec::component("aws_region")
+        .description("The AWS region for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_access_key_id")
+        .description("The AWS access key ID for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_secret_access_key")
+        .description("The AWS secret access key for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_endpoint")
+        .description("Custom S3-compatible endpoint URL (e.g. for MinIO).")
+        .secret(),
+    ParameterSpec::component("aws_allow_http")
+        .description("Allow HTTP (non-TLS) connections to S3."),
 ];
 
 /// A catalog connector for `DuckLake`, providing access to schemas and tables via `DuckDB`.
@@ -137,6 +153,44 @@ impl CatalogConnector for DuckLakeCatalog {
             AccessMode::ReadOnly
         };
 
+        let s3_params = DuckLakeS3Params {
+            region: self
+                .params
+                .parameters
+                .get("aws_region")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            access_key_id: self
+                .params
+                .parameters
+                .get("aws_access_key_id")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            secret_access_key: self
+                .params
+                .parameters
+                .get("aws_secret_access_key")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            endpoint: self
+                .params
+                .parameters
+                .get("aws_endpoint")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            allow_http: self
+                .params
+                .parameters
+                .get("aws_allow_http")
+                .expose()
+                .ok()
+                .is_some_and(|v| v == "true"),
+        };
+
         let connection_string_for_pool = connection_string;
         let catalog_name_for_pool = catalog_name.clone();
         let connector_component_for_pool = connector_component.clone();
@@ -172,16 +226,17 @@ impl CatalogConnector for DuckLakeCatalog {
                     }
                 })?;
 
-                let duckdb_conn = conn
+                let duckdb_wrapper = conn
                     .as_any()
-                    .downcast_ref::<duckdb::Connection>()
+                    .downcast_ref::<DuckDbConnection>()
                     .ok_or_else(|| super::Error::InvalidConfigurationNoSource {
                         connector: PREFIX.to_string(),
                         connector_component: connector_component_for_pool.clone(),
                         message: "Failed to get underlying DuckDB connection".to_string(),
                     })?;
 
-                duckdb_conn
+                duckdb_wrapper
+                    .conn
                     .execute("INSTALL ducklake", [])
                     .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
                     .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -190,8 +245,17 @@ impl CatalogConnector for DuckLakeCatalog {
                         source: Box::new(e),
                     })?;
 
-                duckdb_conn
+                duckdb_wrapper
+                    .conn
                     .execute("LOAD ducklake", [])
+                    .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
+                    .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                        connector: PREFIX.to_string(),
+                        connector_component: connector_component_for_pool.clone(),
+                        source: Box::new(e),
+                    })?;
+
+                configure_duckdb_httpfs(&duckdb_wrapper.conn, &s3_params)
                     .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
                     .map_err(|e| super::Error::UnableToGetCatalogProvider {
                         connector: PREFIX.to_string(),
@@ -204,7 +268,8 @@ impl CatalogConnector for DuckLakeCatalog {
                 let attach_sql = format!(
                     "ATTACH 'ducklake:{escaped_connection_string}' AS \"{escaped_catalog_name}\""
                 );
-                duckdb_conn
+                duckdb_wrapper
+                    .conn
                     .execute(&attach_sql, [])
                     .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
                     .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -228,6 +293,7 @@ impl CatalogConnector for DuckLakeCatalog {
             catalog_name,
             writable,
             ddl_enabled,
+            catalog.include.clone(),
         ));
 
         // Initial refresh to populate schemas and tables

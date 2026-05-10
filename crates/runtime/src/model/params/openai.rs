@@ -43,7 +43,8 @@ pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
         .one_of(&["free", "tier1", "tier2", "tier3", "tier4", "tier5"])
         .default("tier1"),
     ParameterSpec::runtime("responses_api")
-        .description("Whether to enable use of this model via the Responses API. `disabled` by default.")
+        .description("Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.")
+        .one_of(&["enabled", "disabled"])
         .default("disabled"),
     ParameterSpec::component("responses_tools")
         .description("The OpenAI Responses tools to use when calling the model from the Responses API")

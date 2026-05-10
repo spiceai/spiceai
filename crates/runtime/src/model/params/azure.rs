@@ -46,8 +46,7 @@ pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
         )
         .default(""),
     ParameterSpec::runtime("responses_api")
-        .description(
-            "Whether to enable use of this model via the Responses API. `disabled` by default.",
-        )
+        .description("Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.")
+        .one_of(&["enabled", "disabled"])
         .default("disabled"),
 ];

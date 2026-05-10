@@ -213,12 +213,21 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
         run: echo "Skipping AMD64 image build per workflow configuration."
 
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
+        # use authenticated rate limits instead of anonymous (per-IP) limits.
+        if: ${{ needs.setup.outputs.run_amd64 == 'true' && github.repository == 'spiceai/spiceai' }}
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: default
         run: |
@@ -243,6 +252,12 @@ jobs:
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
+      - name: Validate AMD64 image
+        run: |
+          docker load -i /tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
+          docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64 --version
+        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
+
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -257,7 +272,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 != 'true' }}
         run: echo "Skipping ARM64 image build per workflow configuration."
 
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Install docker
@@ -286,6 +301,15 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
+        # use authenticated rate limits instead of anonymous (per-IP) limits.
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' && github.repository == 'spiceai/spiceai' }}
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: default
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
@@ -309,6 +333,12 @@ jobs:
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
+      - name: Validate ARM64 image
+        run: |
+          docker load -i /tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
+          docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64 --version
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
+
       - name: Upload ARM64 artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -326,12 +356,21 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda != 'true' }}
         run: echo "Skipping CUDA image build per workflow configuration."
 
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so base image pulls (nvidia/cuda, etc.)
+        # use authenticated rate limits instead of anonymous (per-IP) limits.
+        if: ${{ needs.setup.outputs.run_cuda == 'true' && github.repository == 'spiceai/spiceai' }}
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Configure CUDA build
         run: |
@@ -354,6 +393,12 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             CUDA_COMPUTE_CAP=${{ env.CUDA_COMPUTE_CAP }}
             GITHUB_REPOSITORY=${{ github.repository }}
+        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
+
+      - name: Validate CUDA image
+        run: |
+          docker load -i /tmp/images-amd64-cuda.tar
+          docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64 --version
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Upload CUDA artifacts
@@ -394,6 +439,16 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before pulling so we use the authenticated
+        # rate limits instead of anonymous (per-IP) limits when pulling
+        # registry:2 below.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Start local registry
         run: |
@@ -500,6 +555,16 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before pulling so we use the authenticated
+        # rate limits instead of anonymous (per-IP) limits when pulling
+        # registry:2 below.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Start local registry
         run: |

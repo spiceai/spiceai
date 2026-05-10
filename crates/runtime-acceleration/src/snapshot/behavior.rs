@@ -18,12 +18,12 @@ use std::sync::{Arc, Weak};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
-/// Message shown when a user has configured snapshots but the feature is not
-/// compiled into this build of Spice.
+/// Message shown when snapshots are configured or requested but the feature is
+/// not compiled into this build of Spice.
 ///
 /// In OSS default builds the `snapshots` cargo feature is disabled and snapshot
 /// support is shipped only in the Spice.ai enterprise build.
-const SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE: &str = "Acceleration Snapshots are included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise";
+pub const SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE: &str = "Acceleration Snapshots are included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise";
 
 #[cfg(feature = "snapshots")]
 const SNAPSHOTS_ENABLED: bool = true;
@@ -88,13 +88,13 @@ impl SnapshotBehavior {
         io_runtime: Handle,
         compaction: spicepod_acceleration::SnapshotsCompaction,
     ) -> Self {
-        // Snapshot support must be compiled in for bootstrapping to be possible.
-        if !SNAPSHOTS_ENABLED {
-            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
+        if !snapshots.enabled {
             return SnapshotBehavior::Disabled;
         }
 
-        if !snapshots.enabled {
+        // Snapshot support must be compiled in for bootstrapping to be possible.
+        if !SNAPSHOTS_ENABLED {
+            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
             return SnapshotBehavior::Disabled;
         }
 
@@ -107,13 +107,13 @@ impl SnapshotBehavior {
         secrets: Weak<RwLock<Secrets>>,
         io_runtime: Handle,
     ) -> Self {
-        // Snapshot support must be compiled in for bootstrapping to be possible.
-        if !SNAPSHOTS_ENABLED {
-            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
+        if !snapshots.enabled {
             return SnapshotBehavior::Disabled;
         }
 
-        if !snapshots.enabled {
+        // Snapshot support must be compiled in for bootstrapping to be possible.
+        if !SNAPSHOTS_ENABLED {
+            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
             return SnapshotBehavior::Disabled;
         }
 
@@ -127,13 +127,13 @@ impl SnapshotBehavior {
         io_runtime: Handle,
         compaction: spicepod_acceleration::SnapshotsCompaction,
     ) -> Self {
-        // Snapshot support must be compiled in for snapshot creation to be possible.
-        if !SNAPSHOTS_ENABLED {
-            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
+        if !snapshots.enabled {
             return SnapshotBehavior::Disabled;
         }
 
-        if !snapshots.enabled {
+        // Snapshot support must be compiled in for snapshot creation to be possible.
+        if !SNAPSHOTS_ENABLED {
+            tracing::warn!("{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}");
             return SnapshotBehavior::Disabled;
         }
 

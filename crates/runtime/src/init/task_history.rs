@@ -141,7 +141,7 @@ impl Runtime {
                     local_table_provider,
                     Arc::clone(peers),
                     executor_registry.flight_sql_clients_handle(),
-                    self.df.cluster_config.client_tls_config().cloned(),
+                    self.df.cluster_config.client_tls_config(),
                     node_id,
                 );
                 Arc::new(federated)

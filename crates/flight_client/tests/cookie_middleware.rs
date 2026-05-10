@@ -21,6 +21,8 @@ use arrow_flight::{
     PollInfo, SchemaResult, Ticket,
 };
 use flight_client::cookie::{CookieService, CookieStore};
+use flight_client::{Credentials, FlightClient};
+use secrecy::SecretString;
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
@@ -106,7 +108,7 @@ impl FlightService for CookieFlightService {
         &self,
         _request: Request<tonic::Streaming<arrow_flight::HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        Err(Status::unimplemented("handshake"))
+        Ok(Response::new(tokio_stream::empty()))
     }
 
     async fn list_flights(
@@ -176,7 +178,7 @@ impl FlightService for CookieFlightService {
         &self,
         _request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        Err(Status::unimplemented("do_get"))
+        Ok(Response::new(tokio_stream::empty()))
     }
 
     async fn do_put(
@@ -234,5 +236,56 @@ async fn cookie_middleware_persists_cookie_across_requests() {
         .expect("second request should include cookie");
 
     assert!(cookie_seen.load(Ordering::SeqCst));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn anonymous_flight_client_query_does_not_require_authorization() {
+    let cookie_seen = Arc::new(AtomicBool::new(false));
+    let service = CookieFlightService::new(cookie_seen);
+    let server = TestServer::start(service).await;
+
+    let client = FlightClient::try_new(
+        format!("http://{}", server.addr).into(),
+        Credentials::anonymous(),
+        None,
+        None,
+    )
+    .await
+    .expect("client should connect");
+
+    client
+        .query("SELECT 1")
+        .await
+        .expect("anonymous query should reach the server");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn username_password_without_handshake_token_returns_unauthorized() {
+    let cookie_seen = Arc::new(AtomicBool::new(false));
+    let service = CookieFlightService::new(cookie_seen);
+    let server = TestServer::start(service).await;
+
+    let client = FlightClient::try_new(
+        format!("http://{}", server.addr).into(),
+        Credentials::new("user", SecretString::new("password".into())),
+        None,
+        None,
+    )
+    .await
+    .expect("client should connect");
+
+    let err = client
+        .query("SELECT 1")
+        .await
+        .expect_err("username/password auth without a handshake token should fail");
+
+    assert!(
+        matches!(err, flight_client::Error::Unauthorized {}),
+        "expected Unauthorized, got {err}"
+    );
+
     server.shutdown().await;
 }

@@ -50,6 +50,7 @@ pub struct DuckDBSnapshotEngine {
 }
 
 impl DuckDBSnapshotEngine {
+    #[must_use]
     pub fn new(compaction_enabled: bool) -> Self {
         Self { compaction_enabled }
     }

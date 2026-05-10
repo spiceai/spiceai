@@ -6,6 +6,7 @@ datasets:
     name: cookbook
     params:
       spiceai_api_key: ${ secrets:SPICEAI_API_KEY }
+      spiceai_region: us-east-1
     acceleration:
       enabled: true
     columns:
@@ -16,6 +17,7 @@ datasets:
     name: docs
     params:
       spiceai_api_key: ${ secrets:SPICEAI_API_KEY }
+      spiceai_region: us-east-1
     acceleration:
       enabled: true
     columns:

@@ -18,6 +18,6 @@ description: "Query: clickbench_q26"
 |               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                  |
 |               |                 CooperativeExec                                                                                      |
 |               |                   BytesProcessedExec                                                                                 |
-|               |                     DuckSqlExec sql= SELECT "SearchPhrase" FROM "hits"                                               |
+|               |                     DuckSqlExec sql= SELECT "SearchPhrase" FROM "hits" WHERE (CAST("SearchPhrase" AS VARCHAR) <> '') |
 |               |                                                                                                                      |
 +---------------+----------------------------------------------------------------------------------------------------------------------+

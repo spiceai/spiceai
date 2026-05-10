@@ -226,8 +226,11 @@ pub struct AccelerationRequest {
 ///
 /// Trigger an on-demand refresh for an accelerated dataset.
 ///
-/// This endpoint triggers an on-demand refresh for an accelerated dataset.
-/// The refresh only applies to `full` and `append` refresh modes (not `changes` mode).
+/// The refresh only applies to `full` and `append` refresh modes (not
+/// `changes` mode). Datasets without acceleration return 400 — the
+/// previous `load: on_demand` flow has been removed; deferred datasets
+/// (declared schema + `ready_state: on_registration`) are materialised
+/// automatically on first query and do not need a manual trigger.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/datasets/{name}/acceleration/refresh",
@@ -260,7 +263,7 @@ pub struct AccelerationRequest {
                 "message": "Dataset taxi_trips not found"
             })
         ))),
-        (status = 400, description = "Acceleration not enabled for the dataset", content((
+        (status = 400, description = "Dataset is not accelerated; nothing to refresh", content((
             MessageResponse = "application/json",
             example = json!({
                 "message": "Dataset taxi_trips does not have acceleration enabled"
@@ -328,11 +331,10 @@ pub(crate) async fn refresh(
             .into_response();
     }
 
+    let table_ref = TableReference::parse_str(dataset.name.as_str());
+
     match df
-        .refresh_table(
-            &TableReference::parse_str(dataset.name.as_str()),
-            overrides_opt.map(|Json(overrides)| overrides),
-        )
+        .refresh_table(&table_ref, overrides_opt.map(|Json(overrides)| overrides))
         .await
     {
         Ok(_) => (

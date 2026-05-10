@@ -30,6 +30,8 @@ use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{
     ApiKey, ApiKeyAuth, Auth, Flight, Query, Runtime, Scheduler, TelemetryConfig,
+    default_max_partition_assignments_per_interval, default_max_partitions_per_executor,
+    default_partition_assignment_interval, default_partition_discovery_timeout,
 };
 use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
@@ -1652,7 +1654,11 @@ fn generate_initial_spicepod(
                     "s3_auth".to_string(),
                     "key".to_string(),
                 )]))),
-                partition_management: None,
+                partition_assignment_interval: default_partition_assignment_interval(),
+                max_partition_assignments_per_interval:
+                    default_max_partition_assignments_per_interval(),
+                max_partitions_per_executor: default_max_partitions_per_executor(),
+                partition_discovery_timeout: default_partition_discovery_timeout(),
             };
 
             if let Some(region) = aws_region {

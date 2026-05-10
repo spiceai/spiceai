@@ -25,7 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http::{HeaderMap, HeaderValue};
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 use tracing::Instrument;
@@ -167,9 +167,29 @@ pub(crate) async fn post(
                     headers.insert("Search-Results-Cache-Status", val);
                 }
 
+                // Surface the cache scope so callers can tell whether a MISS
+                // came from per-user isolation versus a true cold cache.
+                let cache_namespace = request_context.cache_namespace();
+                headers.insert(
+                    "Search-Results-Cache-Scope",
+                    HeaderValue::from_static(cache_namespace.as_header_value()),
+                );
+
                 // Tell CDN entry is unique per user cache key
                 if request_context.client_supplied_cache_key().is_some() {
-                    headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
+                    super::append_vary(&mut headers, "Spice-Cache-Key");
+                }
+
+                // For per-user scope, additionally vary on every header
+                // that can identify a principal so an HTTP cache between
+                // Spice and the client never collapses entries belonging
+                // to different principals. See the matching block in
+                // `http/v1/mod.rs::add_cache_response_headers` for the
+                // rationale on each header.
+                if matches!(cache_namespace, CacheNamespace::Principal(_)) {
+                    super::append_vary(&mut headers, "Authorization");
+                    super::append_vary(&mut headers, "X-API-Key");
+                    super::append_vary(&mut headers, "Cookie");
                 }
 
                 (

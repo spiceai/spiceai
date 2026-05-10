@@ -19,7 +19,7 @@ name = "connector-postgres"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "PostgreSQL data connector for Spice.ai runtime"
 
 [dependencies]
@@ -39,4 +39,3 @@ tokio-postgres.workspace = true
 
 [features]
 default = []
-postgres-write = []

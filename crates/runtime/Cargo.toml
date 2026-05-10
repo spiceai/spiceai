@@ -2,7 +2,7 @@
 description = "The spiced runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "runtime"
 repository.workspace = true
 rust-version.workspace = true
@@ -73,6 +73,7 @@ governor.workspace = true
 graphql-parser.workspace = true
 headers-accept = "0.3.0"
 http.workspace = true
+http-body = "1.0.1"
 http-body-util = "0.1.3"
 humantime = { workspace = true, optional = true }
 hyper = "1.7.0"
@@ -84,6 +85,7 @@ iceberg-datafusion.workspace = true
 iceberg-storage-opendal.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
+logos.workspace = true
 opendal.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
@@ -93,6 +95,8 @@ model_components = { path = "../model_components" }
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
+arc-swap = "1.7"
+sha2 = { workspace = true }
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
 object_store_occ = { path = "../object_store_occ" }
@@ -158,9 +162,9 @@ secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 blake3 = { workspace = true, optional = true }
 serde_json.workspace = true
-sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
+spice-cloud-client.workspace = true
 spicepod = { path = "../spicepod" }
 sysinfo.workspace = true
 telemetry = { path = "../telemetry" }
@@ -183,7 +187,7 @@ tracing-subscriber.workspace = true
 turso = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
-util = { path = "../util", features = ["datafusion"] }
+util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = "9", features = [
     "axum",
@@ -202,6 +206,7 @@ yaml = { path = "../yaml" }
 anyhow.workspace = true
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 aws-credential-types = { workspace = true, features = [
     "hardcoded-credentials",
 ] }
@@ -262,7 +267,7 @@ tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 
 [features]
-adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "dep:sha2", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 azure-keyvault = ["runtime-secrets/azure-keyvault"]
 hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
@@ -294,6 +299,7 @@ duckdb = [
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
+    "search/duckdb",
 ]
 dynamodb = [
     "dep:aws-sdk-dynamodb",
@@ -304,6 +310,10 @@ dynamodb = [
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
+http-functions = ["runtime-datafusion-udfs/http-functions"]
+rate-control = []
+wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
+wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []
 imap = ["data_components/imap"]
 kafka = ["data_components/kafka"]
@@ -337,7 +347,7 @@ postgres = [
     "datafusion-table-providers/postgres",
 ]
 postgres-accel = ["postgres"]
-postgres-write = []
+
 s3_vectors = [
     "data_components/s3_vectors",
     "dep:s3_vectors",

@@ -2,7 +2,7 @@
 description = "Spice OSS Flight cookie test server"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "flight-cookie-server"
 repository.workspace = true
 rust-version.workspace = true

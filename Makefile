@@ -103,7 +103,7 @@ lint: lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch --workspace --exclude libnfs -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -118,7 +118,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -137,7 +137,7 @@ lint-rust:
 
 ## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
 ## Optional: FEATURES="feat1,feat2" to override features
-## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch for workspace (unless PACKAGES is set, then uses package defaults)
+## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control for workspace (unless PACKAGES is set, then uses package defaults)
 ## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
 PACKAGES ?=
 FEATURES ?=
@@ -155,7 +155,7 @@ _FEATURES_FLAGS := --features $(FEATURES)
 else ifdef PACKAGES
 _FEATURES_FLAGS :=
 else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch
+_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control
 endif
 
 lint-rust-fix:
@@ -202,6 +202,9 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
 	cargo check $(CARGO_PROFILE) --no-default-features --features keyring-secret-store
 	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
+	cargo check $(CARGO_PROFILE) --no-default-features --features http-functions
+	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions
+	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions-compile
 	cargo check $(CARGO_PROFILE) --no-default-features --features aws-secrets-manager
 	cargo check $(CARGO_PROFILE) --no-default-features --features databricks
 	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake

@@ -383,6 +383,13 @@ testoperator run bench -p test.yaml -s spiced --query-set tpch --validate
 testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrency 25
 ```
 
+### Test Waits and Readiness
+
+- **Avoid fixed sleeps/waits as readiness mechanisms in tests**: Don't add `tokio::time::sleep`, `std::thread::sleep`, or arbitrary time delays to wait for containers, services, background refreshes, streams, replication, caches, or eventual data visibility.
+- **Prefer condition-driven waits**: Use `runtime_ready_check`, `runtime_ready_check_with_timeout`, `wait_until_true`, `util::retry` with `FibonacciBackoffBuilder`, protocol/application probes (`SELECT 1`, ping, health/ready endpoints, `list_tables`, metadata fetches), Docker health plus host-port checks, explicit completion signals (refresh notifiers, task handles, channels), or query/result polling that validates the actual expected state.
+- **Bound every wait**: Polling loops must have a clear timeout, short polling interval, and useful failure message that includes the last observed error or state.
+- **Fixed sleeps are acceptable only when time itself is the behavior under test**: Examples include TTL/cache expiry, cron/scheduler boundaries, backoff timing, timeout behavior, rate limiting, and cancellation/shutdown timing. Keep these sleeps as short as the test allows and make the reason obvious in the test.
+
 ### Snapshot Testing with Insta
 
 - **ALWAYS use named `.snap` files** for snapshot assertions — never inline snapshots (`@r"..."` syntax)

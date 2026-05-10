@@ -66,6 +66,8 @@ mod delta_lake;
 mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
+#[cfg(feature = "duckdb")]
+mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 mod endpoint_auth;
@@ -76,11 +78,14 @@ mod git;
 mod github;
 mod glue;
 mod graphql;
+#[cfg(all(feature = "postgres", feature = "hashicorp_vault"))]
+mod hashicorp_vault;
 mod http;
 mod iceberg;
 mod iceberg_api;
 mod json;
 
+mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
 mod metadata;
@@ -97,6 +102,8 @@ mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
+#[cfg(feature = "rate-control")]
+mod rate_control;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
@@ -113,6 +120,8 @@ mod s3_location_pruning;
     feature = "turso"
 ))]
 mod schema_evolution;
+#[cfg(feature = "sharepoint")]
+mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
 #[cfg(feature = "snowflake")]
@@ -125,6 +134,7 @@ mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;
+mod tls_reload;
 #[cfg(feature = "postgres-accel")]
 mod tpcds_postgres;
 mod utils;
@@ -153,7 +163,6 @@ fn configure_test_datafusion() {
         _ => panic!("Must obtain write lock to defaults"),
     }
 }
-
 fn configure_test_datafusion_request_context() {
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),
@@ -224,7 +233,11 @@ where
     if snapshot_plan {
         insta::with_settings!({
             description => format!("Query: {query}"),
-            omit_expression => true
+            omit_expression => true,
+            filters => vec![
+                // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
+                (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+            ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);
         });
@@ -327,9 +340,4 @@ where
     }
 
     Ok(())
-}
-
-fn container_registry() -> String {
-    std::env::var("CONTAINER_REGISTRY")
-        .unwrap_or_else(|_| "public.ecr.aws/docker/library/".to_string())
 }

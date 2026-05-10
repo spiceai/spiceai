@@ -2,7 +2,7 @@
 description = "Acceleration support for the Spice runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "runtime-acceleration"
 repository.workspace = true
 rust-version.workspace = true
@@ -30,6 +30,7 @@ telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
+rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -47,8 +48,8 @@ uuid = { version = "1", features = ["v7"] }
 default = []
 duckdb = ["dep:duckdb"]
 snapshots = []
-sqlite = []
-turso = []
+sqlite = ["dep:rusqlite"]
+turso = ["dep:rusqlite"]
 
 [dev-dependencies]
 anyhow = { workspace = true }

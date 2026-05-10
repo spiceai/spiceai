@@ -23,6 +23,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::component::catalog::Catalog;
 use crate::component::embeddings::Embeddings;
+use crate::component::function::Function;
 use crate::component::is_default;
 use crate::component::management::Management;
 use crate::component::rerankers::Reranker;
@@ -127,6 +128,10 @@ pub struct SpicepodDefinition {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub workers: Vec<ComponentOrReference<Worker>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub functions: Vec<ComponentOrReference<Function>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
