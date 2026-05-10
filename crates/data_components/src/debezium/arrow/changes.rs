@@ -121,6 +121,7 @@ fn append_change_row(
     change_data: serde_json::Value,
 ) -> super::Result<()> {
     struct_builder.append(true);
+    let mut change_data = Some(change_data);
 
     for (idx, field) in schema.fields().iter().enumerate() {
         let field_builder = struct_builder.field_builder_array(idx);
@@ -144,11 +145,24 @@ fn append_change_row(
             }
             "data" => {
                 let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)?;
+                let change_data =
+                    change_data
+                        .take()
+                        .context(super::InvalidChangeEventSchemaSnafu {
+                            reason: "data field appears more than once",
+                        })?;
                 super::append_value_to_struct_builder(change_data, data_struct_builder)?;
             }
             _ => unreachable!("Unexpected field in changes schema {}", field.name()),
         }
     }
+
+    ensure!(
+        change_data.is_none(),
+        super::InvalidChangeEventSchemaSnafu {
+            reason: "data field is missing"
+        }
+    );
 
     Ok(())
 }

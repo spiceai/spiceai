@@ -79,6 +79,9 @@ pub enum Error {
     #[snafu(display("Failed to process Debezium data: internal type conversion error"))]
     DowncastBuilder,
 
+    #[snafu(display("Invalid Debezium change event schema: {reason}"))]
+    InvalidChangeEventSchema { reason: &'static str },
+
     #[snafu(display("Failed to decode base64-encoded column value: {source}"))]
     UnableToDecodeBase64 { source: base64::DecodeError },
 
