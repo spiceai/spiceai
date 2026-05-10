@@ -293,7 +293,3 @@ mod tests {
         assert_eq!(batch.num_rows(), 3);
     }
 }
-t_eq!(batch.num_columns(), 0);
-        assert_eq!(batch.num_rows(), 3);
-    }
-}
