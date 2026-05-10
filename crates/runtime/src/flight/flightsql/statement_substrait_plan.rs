@@ -48,13 +48,11 @@ use crate::flight::{
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
 
-/// Lowers the wire representation of a Substrait plan to a DataFusion
-/// [`LogicalPlan`]. Returns a synthetic cache key derived from the plan bytes
-/// so that identical Substrait plans share results-cache entries.
-async fn decode_plan(
-    cmd: &sql::CommandStatementSubstraitPlan,
-    datafusion: &Arc<DataFusion>,
-) -> Result<(LogicalPlan, String), Status> {
+/// Decodes the Substrait protobuf payload out of a
+/// [`sql::CommandStatementSubstraitPlan`] and computes a stable cache key for
+/// the plan bytes. Split from [`decode_plan`] so the validation/decoding
+/// rules can be unit-tested without spinning up a `DataFusion` session.
+fn decode_plan_proto(cmd: &sql::CommandStatementSubstraitPlan) -> Result<(Plan, String), Status> {
     let substrait = cmd.plan.as_ref().ok_or_else(|| {
         Status::invalid_argument("CommandStatementSubstraitPlan.plan is required")
     })?;
@@ -68,13 +66,25 @@ async fn decode_plan(
     let proto = Plan::decode(substrait.plan.as_ref())
         .map_err(|e| Status::invalid_argument(format!("Failed to decode Substrait plan: {e}")))?;
 
+    // Cache key namespaced so it cannot collide with a SQL query string.
+    let cache_key = format!("substrait:{}", sha256_hex(substrait.plan.as_ref()));
+    Ok((proto, cache_key))
+}
+
+/// Lowers the wire representation of a Substrait plan to a DataFusion
+/// [`LogicalPlan`]. Returns a synthetic cache key derived from the plan bytes
+/// so that identical Substrait plans share results-cache entries.
+async fn decode_plan(
+    cmd: &sql::CommandStatementSubstraitPlan,
+    datafusion: &Arc<DataFusion>,
+) -> Result<(LogicalPlan, String), Status> {
+    let (proto, cache_key) = decode_plan_proto(cmd)?;
+
     let session = datafusion.ctx.state();
     let plan = from_substrait_plan(&session, &proto)
         .await
         .map_err(map_substrait_error)?;
 
-    // Cache key namespaced so it cannot collide with a SQL query string.
-    let cache_key = format!("substrait:{}", sha256_hex(substrait.plan.as_ref()));
     Ok((plan, cache_key))
 }
 
@@ -168,4 +178,80 @@ pub(crate) async fn do_get(
         Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
     attach_cache_metadata(&mut response, from_cache, &context);
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_flight::sql::SubstraitPlan;
+    use bytes::Bytes;
+    use tonic::Code;
+
+    fn cmd(plan: Option<SubstraitPlan>) -> sql::CommandStatementSubstraitPlan {
+        sql::CommandStatementSubstraitPlan {
+            plan,
+            transaction_id: None,
+        }
+    }
+
+    #[test]
+    fn decode_plan_proto_missing_plan_returns_invalid_argument() {
+        let err = decode_plan_proto(&cmd(None)).expect_err("missing plan must error");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("plan is required"), "{err}");
+    }
+
+    #[test]
+    fn decode_plan_proto_empty_bytes_returns_invalid_argument() {
+        let err = decode_plan_proto(&cmd(Some(SubstraitPlan {
+            plan: Bytes::new(),
+            version: String::new(),
+        })))
+        .expect_err("empty plan must error");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn decode_plan_proto_invalid_bytes_returns_invalid_argument() {
+        // Random bytes that are not a valid substrait Plan protobuf encoding.
+        let err = decode_plan_proto(&cmd(Some(SubstraitPlan {
+            plan: Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]),
+            version: String::new(),
+        })))
+        .expect_err("invalid bytes must error");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message().contains("Failed to decode Substrait plan"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn decode_plan_proto_returns_namespaced_cache_key() {
+        let bytes = Bytes::from_static(b"\x08\x00"); // valid empty Plan (version absent)
+        let (_proto, key) = decode_plan_proto(&cmd(Some(SubstraitPlan {
+            plan: bytes.clone(),
+            version: String::new(),
+        })))
+        .expect("valid empty Plan should decode");
+        assert!(key.starts_with("substrait:"));
+        // Same bytes yield the same key.
+        let (_proto2, key2) = decode_plan_proto(&cmd(Some(SubstraitPlan {
+            plan: bytes,
+            version: String::new(),
+        })))
+        .expect("decode");
+        assert_eq!(key, key2);
+    }
+
+    #[test]
+    fn sha256_hex_is_lowercase_64_chars() {
+        let out = sha256_hex(b"");
+        assert_eq!(out.len(), 64);
+        assert!(
+            out.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+    }
 }
