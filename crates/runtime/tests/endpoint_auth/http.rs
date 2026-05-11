@@ -116,7 +116,7 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
             tracing::info!("HTTP health check passed");
 
             // Metrics API is not authenticated
-            let metrics_url = format!("http://127.0.0.1:{metrics_port}/");
+            let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
             let response = http_client
                 .get(&metrics_url)
                 .send()

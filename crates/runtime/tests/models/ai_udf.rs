@@ -172,7 +172,7 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
             // Verify models are available before starting the test
             ModelVerificationBuilder::new()
                 .openai("gpt-4o-mini")
-                .xai("grok-4-1-fast-non-reasoning")
+                .xai("grok-4.20-non-reasoning")
                 .anthropic("claude-haiku-4-5-20251001")
                 .verify()
                 .await
@@ -181,7 +181,7 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
             let app = AppBuilder::new("ai_udf_test")
                 .with_dataset(get_mega_science_dataset(None, None, None))
                 .with_model(get_openai_model("gpt-4o-mini", "gpt-4o-mini"))
-                .with_model(get_xai_model("grok-4-1-fast-non-reasoning", "grok-4"))
+                .with_model(get_xai_model("grok-4.20-non-reasoning", "grok-4"))
                 .with_model(get_anthropic_model("claude-haiku-4-5-20251001", "claude-haiku"))
                 .build();
 
@@ -249,7 +249,7 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
             // Verify models are available before starting the test
             ModelVerificationBuilder::new()
                 .openai("gpt-4o-mini")
-                .xai("grok-4-1-fast-non-reasoning")
+                .xai("grok-4.20-non-reasoning")
                 .anthropic("claude-haiku-4-5-20251001")
                 .verify()
                 .await
@@ -257,7 +257,7 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
 
             let app = AppBuilder::new("ai_udf_test")
                 .with_model(get_openai_model("gpt-4o-mini", "gpt-4o-mini"))
-                .with_model(get_xai_model("grok-4-1-fast-non-reasoning", "grok-4"))
+                .with_model(get_xai_model("grok-4.20-non-reasoning", "grok-4"))
                 .with_model(get_anthropic_model("claude-haiku-4-5-20251001", "claude-haiku"))
                 .build();
 
