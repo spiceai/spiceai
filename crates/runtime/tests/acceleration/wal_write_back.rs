@@ -430,12 +430,17 @@ async fn test_wal_write_back_multiple_ops_queued() -> Result<(), anyhow::Error> 
             // Wait until all WAL entries are delivered: 5 rows with the exact final values.
             // We cannot rely on wait_for_pg_row_count(5) alone because the count passes through 5
             // after only 2 of the 3 INSERTs are delivered (3→4→5), before UPDATEs and DELETE land.
+            // We also must not use two separate queries per iteration — WAL can deliver between
+            // them, causing the SELECT snapshot and the COUNT check to disagree. We check the
+            // expected state directly on the single fetched `batches` to avoid that race.
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             let batches = loop {
                 let conn = pool.connect().await.map_err(|e| anyhow::anyhow!("{e}"))?;
                 let async_conn = conn
                     .as_async()
                     .ok_or_else(|| anyhow::anyhow!("async conn"))?;
+                // Single query: fetch id + value in one round-trip so the check and the
+                // snapshot data are always consistent.
                 let batches: Vec<RecordBatch> = async_conn
                     .query_arrow("SELECT id, value FROM wal_test ORDER BY id", &[], None)
                     .await
@@ -443,27 +448,35 @@ async fn test_wal_write_back_multiple_ops_queued() -> Result<(), anyhow::Error> 
                     .try_collect()
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let n_matching: i64 = async_conn
-                    .query_arrow(
-                        "SELECT COUNT(*) AS n FROM wal_test \
-                         WHERE (id = 1 AND value = 11) OR (id = 2 AND value = 22) \
-                            OR id IN (4, 5, 6)",
-                        &[],
-                        None,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .try_collect::<Vec<RecordBatch>>()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .first()
-                    .and_then(|b| {
-                        b.column(0)
-                            .as_any()
-                            .downcast_ref::<arrow::array::Int64Array>()
-                            .map(|a| a.value(0))
+                // Count rows that have the expected final state.
+                // Use a helper that handles both Int32 (Postgres INTEGER → Arrow) and Int64.
+                fn col_as_i64(arr: &dyn arrow::array::Array, row: usize) -> Option<i64> {
+                    use arrow::array::{Int32Array, Int64Array};
+                    if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
+                        return Some(i64::from(a.value(row)));
+                    }
+                    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                        return Some(a.value(row));
+                    }
+                    None
+                }
+                let n_matching: usize = batches
+                    .iter()
+                    .flat_map(|b| {
+                        let id_col = b.column(0);
+                        let val_col = b.column(1);
+                        (0..b.num_rows()).filter_map(move |i| {
+                            Some((col_as_i64(id_col, i)?, col_as_i64(val_col, i)?))
+                        })
                     })
-                    .unwrap_or(0);
+                    .filter(|&(id, val)| {
+                        (id == 1 && val == 11)
+                            || (id == 2 && val == 22)
+                            || id == 4
+                            || id == 5
+                            || id == 6
+                    })
+                    .count();
                 if n_matching == 5 {
                     break batches;
                 }

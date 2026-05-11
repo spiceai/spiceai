@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! WAL backend implementation for `DuckDB` (file mode).
+//! WAL backend implementation for `DuckDB`.
 //!
 //! `DuckDB` uses optimistic concurrency: conflicting transactions are aborted at
 //! commit time. All three write operations (`atomic_insert`, `atomic_delete`,
@@ -27,6 +27,8 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use futures::stream::BoxStream;
+use tokio::sync::mpsc;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -42,13 +44,12 @@ use crate::accelerated_table::write::wal::{
     WalBackend, WalEntry, WalOp, arrow_ipc_to_batches, batches_to_arrow_ipc, extract_pks_ipc,
     sanitize_name,
 };
-use crate::dataaccelerator::spice_sys::{AccelerationConnection, OpenOption, acceleration_connection};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// WAL backend for `DuckDB` (file mode).
+/// WAL backend for `DuckDB`.
 ///
-/// The WAL tables and checkpoint are stored in the same `DuckDB` file as the
+/// The WAL tables and checkpoint are stored in the same `DuckDB` instance as the
 /// accelerator data, so WAL writes and data writes are covered by the same
 /// transaction. On conflict (`DuckDB` optimistic concurrency), the full
 /// transaction is retried from scratch.
@@ -62,25 +63,18 @@ pub(crate) struct DuckDBWalBackend {
 }
 
 impl DuckDBWalBackend {
-    /// Build a `DuckDBWalBackend` from an acceleration source and its table provider.
+    /// Build a `DuckDBWalBackend` from a pool and its table provider.
     ///
-    /// The pool is obtained via [`acceleration_connection`], which naturally rejects
-    /// memory-mode DuckDB (no durability) by failing the file-existence check.
+    /// The pool is supplied by the caller (`DuckDBAccelerator::wal_backend`) via
+    /// `get_shared_pool`, which works for both file-mode and memory-mode DuckDB.
     /// Schema and constraints are read directly from the `accelerator` table provider
     /// without downcasting to engine-internal types.
-    /// Returns `None` when WAL is not applicable (memory mode, no primary keys).
+    /// Returns `None` when WAL is not applicable (no primary keys).
     pub(crate) async fn try_new(
+        pool: Arc<DuckDbConnectionPool>,
         source: &dyn crate::dataaccelerator::AccelerationSource,
         accelerator: &Arc<dyn TableProvider>,
     ) -> Option<Self> {
-        let pool = match acceleration_connection(source, OpenOption::OpenExisting)
-            .await
-            .ok()?
-        {
-            AccelerationConnection::DuckDB(pool) => pool,
-            _ => return None,
-        };
-
         let schema = accelerator.schema();
         let constraints: &Constraints = accelerator.constraints()?;
 
@@ -129,6 +123,10 @@ impl DuckDBWalBackend {
 
     fn wal_seq(&self) -> String {
         format!("__spice_wal_seq_{}", sanitize_name(&self.table_name))
+    }
+
+    fn wal_txn_seq(&self) -> String {
+        format!("__spice_wal_txn_seq_{}", sanitize_name(&self.table_name))
     }
 }
 
@@ -345,6 +343,7 @@ impl WalBackend for DuckDBWalBackend {
 
     async fn initialize(&self) -> Result<(), BoxError> {
         let seq = self.wal_seq();
+        let txn_seq = self.wal_txn_seq();
         let wal = self.wal_table();
         let cp = self.wal_cp_table();
         let pool = Arc::clone(&self.pool);
@@ -358,13 +357,16 @@ impl WalBackend for DuckDBWalBackend {
             tx.execute_batch(&format!(
                 r#"
                 CREATE SEQUENCE IF NOT EXISTS "{seq}";
+                CREATE SEQUENCE IF NOT EXISTS "{txn_seq}";
                 CREATE TABLE IF NOT EXISTS "{wal}" (
                     seq        BIGINT PRIMARY KEY DEFAULT nextval('"{seq}"'),
+                    txn_id     BIGINT NOT NULL DEFAULT -1,
                     op         VARCHAR NOT NULL,
                     pks        BLOB NOT NULL,
                     new_values BLOB,
                     written_at TIMESTAMPTZ DEFAULT now()
                 );
+                ALTER TABLE "{wal}" ADD COLUMN IF NOT EXISTS txn_id BIGINT DEFAULT -1;
                 CREATE TABLE IF NOT EXISTS "{cp}" (
                     last_delivered_seq BIGINT NOT NULL
                 );
@@ -418,6 +420,7 @@ impl WalBackend for DuckDBWalBackend {
 
     async fn atomic_insert(&self, batches: Vec<RecordBatch>) -> Result<(), BoxError> {
         let wal_table = self.wal_table();
+        let txn_seq = self.wal_txn_seq();
         let table_definition = Arc::clone(&self.table_definition);
         let on_conflict = self.on_conflict.clone();
         let schema = Arc::clone(&self.schema);
@@ -427,6 +430,7 @@ impl WalBackend for DuckDBWalBackend {
         let mut attempt: u32 = 0;
         loop {
             let wal_table = wal_table.clone();
+            let txn_seq = txn_seq.clone();
             let table_definition = Arc::clone(&table_definition);
             let on_conflict = on_conflict.clone();
             let schema = Arc::clone(&schema);
@@ -435,25 +439,40 @@ impl WalBackend for DuckDBWalBackend {
             let pool = Arc::clone(&pool);
 
             let res = tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
-                let pks_ipc = extract_pks_ipc(&batches, &primary_keys)?;
-                let ipc_bytes = batches_to_arrow_ipc(&batches)?;
-
                 let mut conn = pool.connect_sync()?;
                 let duckdb_conn =
                     DuckDB::duckdb_conn(&mut conn).map_err(|e| Box::new(e) as BoxError)?;
                 let tx = duckdb_conn.conn.transaction()?;
 
-                tx.execute(
-                    &format!(r#"INSERT INTO "{wal_table}" (op, pks, new_values) VALUES (?, ?, ?)"#),
-                    duckdb::params![WalOp::Insert.as_str(), pks_ipc, ipc_bytes],
-                )?;
+                // Allocate one txn_id for this entire DML operation.
+                let txn_id: i64 = {
+                    let mut stmt =
+                        tx.prepare(&format!(r#"SELECT nextval('"{txn_seq}"')"#))?;
+                    let mut rows = stmt.query([])?;
+                    rows.next()?
+                        .map(|r| r.get::<usize, i64>(0))
+                        .transpose()?
+                        .unwrap_or(0)
+                };
+
+                // Write each batch as a separate WAL row, all sharing the same txn_id.
+                for batch in &batches {
+                    let pks_ipc = extract_pks_ipc(&[batch.clone()], &primary_keys)?;
+                    let ipc_bytes = batches_to_arrow_ipc(&[batch.clone()])?;
+                    tx.execute(
+                        &format!(
+                            r#"INSERT INTO "{wal_table}" (txn_id, op, pks, new_values) VALUES (?, ?, ?, ?)"#
+                        ),
+                        duckdb::params![txn_id, WalOp::Insert.as_str(), pks_ipc, ipc_bytes],
+                    )?;
+                }
 
                 let append_table = resolve_append_table(&table_definition, &tx)
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
                 write_batches_to_table(&append_table, &tx, schema, batches, on_conflict.as_ref())
                     .map_err(|e: datafusion::error::DataFusionError| {
-                    Box::new(std::io::Error::other(e.to_string())) as BoxError
-                })?;
+                        Box::new(std::io::Error::other(e.to_string())) as BoxError
+                    })?;
 
                 tx.commit()?;
                 Ok(())
@@ -479,6 +498,7 @@ impl WalBackend for DuckDBWalBackend {
         let filter_sql = filters_to_sql_string(filters)
             .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
         let wal_table = self.wal_table();
+        let txn_seq = self.wal_txn_seq();
         let table_name = self.table_name.clone();
         let primary_keys = self.primary_keys.clone();
         let pool = Arc::clone(&self.pool);
@@ -487,6 +507,7 @@ impl WalBackend for DuckDBWalBackend {
         let mut attempt: u32 = 0;
         loop {
             let wal_table = wal_table.clone();
+            let txn_seq = txn_seq.clone();
             let table_name = table_name.clone();
             let primary_keys = primary_keys.clone();
             let filter_sql = filter_sql.clone();
@@ -510,11 +531,21 @@ impl WalBackend for DuckDBWalBackend {
                     return Ok(0);
                 };
 
+                let txn_id: i64 = {
+                    let mut stmt =
+                        tx.prepare(&format!(r#"SELECT nextval('"{txn_seq}"')"#))?;
+                    let mut rows = stmt.query([])?;
+                    rows.next()?
+                        .map(|r| r.get::<usize, i64>(0))
+                        .transpose()?
+                        .unwrap_or(0)
+                };
+
                 tx.execute(
                     &format!(
-                        r#"INSERT INTO "{wal_table}" (op, pks, new_values) VALUES (?, ?, NULL)"#
+                        r#"INSERT INTO "{wal_table}" (txn_id, op, pks, new_values) VALUES (?, ?, ?, NULL)"#
                     ),
-                    duckdb::params![WalOp::Delete.as_str(), pks_ipc],
+                    duckdb::params![txn_id, WalOp::Delete.as_str(), pks_ipc],
                 )?;
 
                 // DELETE must target base tables; the main table name may be a VIEW when
@@ -561,6 +592,7 @@ impl WalBackend for DuckDBWalBackend {
             datafusion_table_providers::util::dml::assignments_to_sql(assignments, None)
                 .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
         let wal_table = self.wal_table();
+        let txn_seq = self.wal_txn_seq();
         let table_name = self.table_name.clone();
         let primary_keys = self.primary_keys.clone();
         let pool = Arc::clone(&self.pool);
@@ -569,6 +601,7 @@ impl WalBackend for DuckDBWalBackend {
         let mut attempt: u32 = 0;
         loop {
             let wal_table = wal_table.clone();
+            let txn_seq = txn_seq.clone();
             let table_name = table_name.clone();
             let primary_keys = primary_keys.clone();
             let filter_sql = filter_sql.clone();
@@ -611,10 +644,22 @@ impl WalBackend for DuckDBWalBackend {
                 let new_values_ipc =
                     read_rows_by_pks_arrow(&tx, &table_name, &primary_keys, &pks_ipc)?;
 
-                // 4. Write WAL entry with final row state
+                // 4. Allocate txn_id and write WAL entry with final row state
+                let txn_id: i64 = {
+                    let mut stmt =
+                        tx.prepare(&format!(r#"SELECT nextval('"{txn_seq}"')"#))?;
+                    let mut rows = stmt.query([])?;
+                    rows.next()?
+                        .map(|r| r.get::<usize, i64>(0))
+                        .transpose()?
+                        .unwrap_or(0)
+                };
+
                 tx.execute(
-                    &format!(r#"INSERT INTO "{wal_table}" (op, pks, new_values) VALUES (?, ?, ?)"#),
-                    duckdb::params![WalOp::Update.as_str(), pks_ipc, new_values_ipc],
+                    &format!(
+                        r#"INSERT INTO "{wal_table}" (txn_id, op, pks, new_values) VALUES (?, ?, ?, ?)"#
+                    ),
+                    duckdb::params![txn_id, WalOp::Update.as_str(), pks_ipc, new_values_ipc],
                 )?;
 
                 tx.commit()?;
@@ -637,54 +682,83 @@ impl WalBackend for DuckDBWalBackend {
         }
     }
 
-    async fn pending_entries(&self, after_seq: i64) -> Result<Vec<WalEntry>, BoxError> {
+    fn next_pending_group(&self) -> BoxStream<'static, Result<WalEntry, BoxError>> {
+        let pool = Arc::clone(&self.pool);
         let wal_table = self.wal_table();
         let cp_table = self.wal_cp_table();
-        let pool = Arc::clone(&self.pool);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<WalEntry>, BoxError> {
-            let mut conn = pool.connect_sync()?;
-            let duckdb_conn =
-                DuckDB::duckdb_conn(&mut conn).map_err(|e| Box::new(e) as BoxError)?;
-            let tx = duckdb_conn.conn.transaction()?;
+        let (sender, receiver) = mpsc::channel::<Result<WalEntry, BoxError>>(32);
 
-            // i64::MIN is the sentinel meaning "start from the last delivered checkpoint"
-            let last_seq = if after_seq == i64::MIN {
-                let mut stmt =
-                    tx.prepare(&format!(r#"SELECT last_delivered_seq FROM "{cp_table}""#))?;
-                let mut rows = stmt.query([])?;
-                rows.next()?
-                    .map(|r| r.get::<usize, i64>(0))
-                    .transpose()?
-                    .unwrap_or(-1)
-            } else {
-                after_seq
-            };
+        tokio::task::spawn_blocking(move || {
+            let res: Result<(), BoxError> = (|| {
+                let mut conn = pool.connect_sync()?;
+                let duckdb_conn =
+                    DuckDB::duckdb_conn(&mut conn).map_err(|e| Box::new(e) as BoxError)?;
+                let tx = duckdb_conn.conn.transaction()?;
 
-            let sql = format!(
-                r#"SELECT seq, op, pks, new_values FROM "{wal_table}"
-                   WHERE seq > {last_seq} ORDER BY seq ASC"#
-            );
-            let mut stmt = tx.prepare(&sql)?;
-            let mut rows = stmt.query([])?;
-            let mut entries = Vec::new();
-            while let Some(row) = rows.next()? {
-                let op_str: String = row.get(1)?;
-                let Some(op) = WalOp::from_str(&op_str) else {
-                    tracing::warn!("Unknown WAL op '{op_str}' at seq {}, skipping", row.get::<usize, i64>(0)?);
-                    continue;
+                let last_seq: i64 = {
+                    let mut stmt =
+                        tx.prepare(&format!(r#"SELECT last_delivered_seq FROM "{cp_table}""#))?;
+                    let mut rows = stmt.query([])?;
+                    rows.next()?
+                        .map(|r| r.get::<usize, i64>(0))
+                        .transpose()?
+                        .unwrap_or(-1)
                 };
-                entries.push(WalEntry {
-                    seq: row.get(0)?,
-                    op,
-                    pks_ipc: row.get(2)?,
-                    new_values: row.get(3)?,
-                });
+
+                // Fetch rows belonging to the next undelivered txn_id group.
+                // Chosen as the group with the smallest min(seq) among pending txn_ids.
+                let sql = format!(
+                    r#"SELECT seq, txn_id, op, pks, new_values
+                       FROM "{wal_table}"
+                       WHERE seq > {last_seq}
+                         AND txn_id = (
+                           SELECT txn_id FROM "{wal_table}"
+                           WHERE seq > {last_seq}
+                           GROUP BY txn_id
+                           ORDER BY min(seq)
+                           LIMIT 1
+                         )
+                       ORDER BY seq ASC"#
+                );
+
+                let mut stmt = tx.prepare(&sql)?;
+                let mut rows = stmt.query([])?;
+
+                while let Some(row) = rows.next()? {
+                    let op_str: String = row.get(2)?;
+                    let Some(op) = WalOp::from_str(&op_str) else {
+                        tracing::warn!(
+                            "Unknown WAL op '{}' at seq {}, skipping",
+                            op_str,
+                            row.get::<usize, i64>(0).unwrap_or(0)
+                        );
+                        continue;
+                    };
+                    let entry = WalEntry {
+                        seq: row.get(0)?,
+                        txn_id: row.get(1)?,
+                        op,
+                        pks_ipc: row.get(3)?,
+                        new_values: row.get(4)?,
+                    };
+                    if sender.blocking_send(Ok(entry)).is_err() {
+                        break; // receiver dropped
+                    }
+                }
+
+                tx.rollback()?;
+                Ok(())
+            })();
+
+            if let Err(e) = res {
+                let _ = sender.blocking_send(Err(e));
             }
-            tx.rollback()?;
-            Ok(entries)
-        })
-        .await?
+        });
+
+        Box::pin(futures::stream::unfold(receiver, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
     }
 
     async fn advance_checkpoint(&self, seq: i64) -> Result<(), BoxError> {

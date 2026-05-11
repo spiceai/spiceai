@@ -46,9 +46,9 @@ use datafusion::prelude::{SessionContext, lit};
 use datafusion::scalar::ScalarValue;
 
 use arrow::compute::concat_batches;
-use datafusion::execution::SessionState;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -90,6 +90,8 @@ impl WalOp {
 /// A single WAL entry read from the backend's pending queue.
 pub struct WalEntry {
     pub seq: i64,
+    /// Groups all chunks of one client DML operation — used for atomic delivery.
+    pub txn_id: i64,
     pub op: WalOp,
     pub pks_ipc: Vec<u8>,
     pub new_values: Option<Vec<u8>>,
@@ -136,8 +138,12 @@ pub trait WalBackend: Send + Sync {
         filters: &[Expr],
     ) -> Result<u64, BoxError>;
 
-    /// Read all WAL entries with `seq > after_seq`, ascending by seq.
-    async fn pending_entries(&self, after_seq: i64) -> Result<Vec<WalEntry>, BoxError>;
+    /// Stream all WAL entries belonging to the next undelivered `txn_id` group, ordered
+    /// by `seq` ascending.  The group is the one with the smallest `min(seq)` among
+    /// all entries that have `seq > last_delivered_checkpoint`.
+    ///
+    /// Returns an empty stream when there are no undelivered entries.
+    fn next_pending_group(&self) -> BoxStream<'static, Result<WalEntry, BoxError>>;
 
     /// Advance the checkpoint to `seq` and delete delivered entries with seq ≤ seq.
     async fn advance_checkpoint(&self, seq: i64) -> Result<(), BoxError>;
@@ -446,84 +452,49 @@ pub(crate) fn start_wal_worker(
     })
 }
 
-/// Apply each row in `batches` as a targeted UPDATE to the federated table.
+/// Deliver all undelivered WAL entries to the federated source, one `txn_id` group at a time.
 ///
-/// Uses `TableProvider::update()` (native SQL UPDATE) rather than INSERT, so
-/// rows that already exist in the federated source are updated in-place instead
-/// of causing a duplicate-key error.
-async fn deliver_update_to_federated(
-    table: Arc<dyn datafusion::datasource::TableProvider>,
-    batches: Vec<RecordBatch>,
-    primary_keys: &[String],
-    session_state: &SessionState,
-) -> DataFusionResult<()> {
-    let schema = batches[0].schema();
-    let combined = concat_batches(&schema, &batches)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-    for row_idx in 0..combined.num_rows() {
-        let filters: Vec<Expr> = primary_keys
-            .iter()
-            .map(|pk| {
-                let col_idx = schema.index_of(pk).map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "WAL UPDATE delivery: PK column '{pk}' not found in new_values schema: {e}"
-                    ))
-                })?;
-                let scalar = ScalarValue::try_from_array(combined.column(col_idx), row_idx)?;
-                Ok::<Expr, DataFusionError>(col(pk).eq(lit(scalar)))
-            })
-            .collect::<DataFusionResult<_>>()?;
-
-        let assignments: Vec<(String, Expr)> = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| !primary_keys.contains(f.name()))
-            .map(|(col_idx, f)| {
-                let scalar = ScalarValue::try_from_array(combined.column(col_idx), row_idx)?;
-                Ok::<(String, Expr), DataFusionError>((f.name().clone(), lit(scalar)))
-            })
-            .collect::<DataFusionResult<_>>()?;
-
-        if assignments.is_empty() {
-            continue;
-        }
-
-        let plan = table.update(session_state, assignments, filters).await?;
-        datafusion::physical_plan::collect(plan, session_state.task_ctx()).await?;
-    }
-
-    Ok(())
-}
-
-/// Read and deliver all undelivered WAL entries for this table.
+/// Each group represents one client DML operation (potentially spanning multiple chunks).
+/// INSERT and UPDATE are delivered as a single upsert (one SQL statement = one implicit
+/// federated transaction). DELETE accumulates all PK batches and issues one `delete_from`
+/// call. The checkpoint advances only after the entire group is delivered.
 pub(crate) async fn deliver_pending(
     wal: &Arc<WalContext>,
     federated: &Arc<FederatedTable>,
 ) -> Result<(), BoxError> {
-    // i64::MIN is the sentinel meaning "from last delivered checkpoint".
-    let entries = wal.backend.pending_entries(i64::MIN).await?;
-
-    if entries.is_empty() {
-        return Ok(());
-    }
-
     let session_state = SessionContext::new().state();
     let primary_keys = wal.backend.primary_keys().to_vec();
 
-    for entry in entries {
+    loop {
+        let mut stream = wal.backend.next_pending_group();
+
+        let first = match stream.next().await {
+            None => break,
+            Some(Err(e)) => return Err(e),
+            Some(Ok(entry)) => entry,
+        };
+
+        let op = first.op;
+        let mut max_seq = first.seq;
         let federated_provider = federated.table_provider().await;
-        match entry.op {
-            WalOp::Insert => {
-                let ipc = entry.new_values.unwrap_or_default();
-                let batches = arrow_ipc_to_batches(&ipc)?;
-                if !batches.is_empty() {
-                    let schema = batches[0].schema();
+
+        match op {
+            WalOp::Insert | WalOp::Update => {
+                // Both use upsert so that the entire group is one implicit federated transaction.
+                let mut all_batches =
+                    arrow_ipc_to_batches(&first.new_values.unwrap_or_default())?;
+                while let Some(result) = stream.next().await {
+                    let entry = result?;
+                    max_seq = max_seq.max(entry.seq);
+                    all_batches
+                        .extend(arrow_ipc_to_batches(&entry.new_values.unwrap_or_default())?);
+                }
+                if !all_batches.is_empty() {
+                    let schema = all_batches[0].schema();
                     execute_insert(
                         Arc::clone(&federated_provider),
                         schema,
-                        batches,
+                        all_batches,
                         InsertOp::Replace,
                         &session_state,
                         None,
@@ -532,34 +503,33 @@ pub(crate) async fn deliver_pending(
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
                 }
             }
-            WalOp::Update => {
-                let ipc = entry.new_values.unwrap_or_default();
-                let batches = arrow_ipc_to_batches(&ipc)?;
-                if !batches.is_empty() {
-                    deliver_update_to_federated(
-                        Arc::clone(&federated_provider),
-                        batches,
-                        &primary_keys,
-                        &session_state,
-                    )
-                    .await
-                    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
-                }
-            }
             WalOp::Delete => {
-                let filters = build_pk_filters_from_ipc(&entry.pks_ipc, &primary_keys)
-                    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
-                let plan = federated_provider
-                    .delete_from(&session_state, filters)
-                    .await
-                    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
-                datafusion::physical_plan::collect(plan, session_state.task_ctx())
-                    .await
-                    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                // Combine all PK batches into one filter set so the entire group is one
+                // delete_from call (one implicit federated transaction).
+                let mut pk_batches = arrow_ipc_to_batches(&first.pks_ipc)?;
+                while let Some(result) = stream.next().await {
+                    let entry = result?;
+                    max_seq = max_seq.max(entry.seq);
+                    pk_batches.extend(arrow_ipc_to_batches(&entry.pks_ipc)?);
+                }
+                if !pk_batches.is_empty() {
+                    let combined = concat_batches(&pk_batches[0].schema(), &pk_batches)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    let all_pks_ipc = batches_to_arrow_ipc(&[combined])?;
+                    let filters = build_pk_filters_from_ipc(&all_pks_ipc, &primary_keys)
+                        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                    let plan = federated_provider
+                        .delete_from(&session_state, filters)
+                        .await
+                        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                    datafusion::physical_plan::collect(plan, session_state.task_ctx())
+                        .await
+                        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                }
             }
         }
 
-        wal.backend.advance_checkpoint(entry.seq).await?;
+        wal.backend.advance_checkpoint(max_seq).await?;
     }
 
     Ok(())

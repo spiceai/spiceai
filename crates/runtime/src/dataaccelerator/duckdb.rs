@@ -337,7 +337,8 @@ impl DataAccelerator for DuckDBAccelerator {
         source: &dyn super::AccelerationSource,
         accelerator: &Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Option<Arc<dyn crate::accelerated_table::write::wal::WalBackend>> {
-        wal_backend::DuckDBWalBackend::try_new(source, accelerator)
+        let pool = std::sync::Arc::new(self.get_shared_pool(source).await.ok()?);
+        wal_backend::DuckDBWalBackend::try_new(pool, source, accelerator)
             .await
             .map(|b| Arc::new(b) as Arc<dyn crate::accelerated_table::write::wal::WalBackend>)
     }
