@@ -35,7 +35,7 @@ use super::{
     DuckDBVectorQueryContext,
     hnsw::DuckDBHnswOptions,
     resolve_current_table_name,
-    sql::{EMPTY_PROJECTION_ROW_COLUMN, duckdb_vector_sql},
+    sql::duckdb_vector_sql,
     to_execution_error, validate_vector, vector_literal,
 };
 
@@ -202,6 +202,15 @@ fn run_duckdb_vector_query(
         .map_err(to_execution_error)?;
     let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_execution_error)?;
     let conn = &duckdb_conn.conn;
+
+    // VSS must be loaded on every connection — it is not auto-loaded on pooled
+    // connections even after the extension has been installed.
+    conn.execute("LOAD vss", []).map_err(to_execution_error)?;
+
+    if let Some(ef_search) = exec.hnsw.hnsw_ef_search {
+        conn.execute(&format!("SET hnsw_ef_search = {ef_search}"), [])
+            .map_err(to_execution_error)?;
+    }
 
     let table_name = resolve_current_table_name(context.table_definition.name(), conn)?;
     let sql = exec.sql(&table_name, query_vector)?;
