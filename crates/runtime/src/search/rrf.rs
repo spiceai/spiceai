@@ -1252,6 +1252,7 @@ mod tests {
     #[cfg(feature = "models")]
     use async_graphql::futures_util::TryStreamExt;
     use datafusion::arrow::datatypes::DataType;
+    #[cfg(feature = "models")]
     use datafusion::catalog::TableProvider;
     #[cfg(feature = "models")]
     use datafusion::common::Result;
@@ -1266,7 +1267,6 @@ mod tests {
     #[cfg(feature = "models")]
     use datafusion::prelude::{DataFrame, named_struct, now, to_unixtime};
     use datafusion::scalar::ScalarValue;
-    #[cfg(feature = "models")]
     use datafusion_expr::ExprFunctionExt;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::lit;

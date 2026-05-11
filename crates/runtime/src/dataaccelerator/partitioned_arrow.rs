@@ -168,9 +168,9 @@ impl DataAccelerator for PartitionedArrowAccelerator {
                 cmd.options
                     .insert("sort_columns".to_string(), sort_cols_str.clone());
             }
-            // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
-            // which overwrites the entire table. Primary key constraints cause uniqueness validation
-            // errors during inserts because Arrow doesn't support upsert operations.
+            // Caching mode uses InsertOp::Replace to overwrite the entire table. Strip primary
+            // key constraints so repeated cache refreshes do not fail uniqueness validation while
+            // replacing existing rows.
             if is_caching_mode {
                 cmd.constraints = Constraints::new_unverified(vec![]);
             }

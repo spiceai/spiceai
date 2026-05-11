@@ -1247,11 +1247,9 @@ impl DeletionSink for MemDeletionSink {
         let batches = self.batches.clone();
 
         let ctx = SessionContext::new();
-        let mut tmp_batches = vec![vec![]; batches.len()];
-
-        for (i, partition) in batches.iter().enumerate() {
-            let mut partition_vec = partition.write().await;
-            tmp_batches[i].append(&mut *partition_vec);
+        let mut tmp_batches = Vec::with_capacity(batches.len());
+        for partition in &batches {
+            tmp_batches.push(partition.read().await.clone());
         }
 
         let provider = MemTable::try_new(Arc::clone(&self.schema), tmp_batches)?;
@@ -1279,8 +1277,10 @@ impl DeletionSink for MemDeletionSink {
             i = (i + 1) % batches.len();
         }
 
-        for (target, mut batches) in batches.iter().zip(new_batches.into_iter()) {
-            target.write().await.append(&mut batches);
+        let writable_targets =
+            futures::future::join_all(batches.iter().map(|target| target.write())).await;
+        for (mut target, batches) in writable_targets.into_iter().zip(new_batches.into_iter()) {
+            *target = batches;
         }
 
         Ok(count as u64)
@@ -1926,6 +1926,42 @@ mod tests {
             .expect("result should be UInt64Array");
         let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_error_preserves_existing_batches() {
+        let (rb, schema) = create_batch_with_string_columns(&[("id", vec!["1", "2", "3"])]);
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![rb]])
+            .expect("mem table should be created");
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let plan = TableProvider::delete_from(&table, &state, vec![col("missing").eq(lit("x"))])
+            .await
+            .expect("deletion plan should be created");
+        let result = collect(plan, ctx.task_ctx()).await;
+        assert!(result.is_err(), "delete should fail for missing column");
+
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("scan plan can be constructed");
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("query successful");
+        let remaining_ids: Vec<_> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("id column should be StringArray")
+                    .iter()
+            })
+            .collect();
+
+        assert_eq!(remaining_ids, vec![Some("1"), Some("2"), Some("3")]);
     }
 
     #[tokio::test]
