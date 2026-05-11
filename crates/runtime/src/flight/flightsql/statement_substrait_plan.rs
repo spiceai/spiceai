@@ -185,6 +185,8 @@ mod tests {
     use super::*;
     use arrow_flight::sql::SubstraitPlan;
     use bytes::Bytes;
+    use datafusion_substrait::substrait::proto::Version;
+    use prost::Message;
     use tonic::Code;
 
     fn cmd(plan: Option<SubstraitPlan>) -> sql::CommandStatementSubstraitPlan {
@@ -231,7 +233,14 @@ mod tests {
 
     #[test]
     fn decode_plan_proto_returns_namespaced_cache_key() {
-        let bytes = Bytes::from_static(b"\x08\x00"); // valid empty Plan (version absent)
+        let plan = Plan {
+            version: Some(Version {
+                minor_number: 62,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = Bytes::from(plan.encode_to_vec());
         let (_proto, key) = decode_plan_proto(&cmd(Some(SubstraitPlan {
             plan: bytes.clone(),
             version: String::new(),
