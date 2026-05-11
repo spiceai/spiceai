@@ -52,9 +52,8 @@ fn data_source_exec(fetch: Option<usize>) -> Arc<dyn ExecutionPlan> {
         vec![Arc::new(Int64Array::from_iter_values(0i64..10))],
     )
     .expect("batch");
-    let source: Arc<dyn DataSource> = Arc::new(
-        MemorySourceConfig::try_new(&[vec![batch]], schema, None).expect("memory source"),
-    );
+    let source: Arc<dyn DataSource> =
+        Arc::new(MemorySourceConfig::try_new(&[vec![batch]], schema, None).expect("memory source"));
     let source = if let Some(limit) = fetch {
         source.with_fetch(Some(limit)).expect("with_fetch")
     } else {

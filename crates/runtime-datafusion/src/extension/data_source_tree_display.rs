@@ -101,7 +101,11 @@ impl DataSource for LimitDisplayDataSource {
     ) -> Result<Option<Arc<dyn DataSource>>> {
         Ok(self
             .inner
-            .repartitioned(target_partitions, repartition_file_min_size, output_ordering)?
+            .repartitioned(
+                target_partitions,
+                repartition_file_min_size,
+                output_ordering,
+            )?
             .map(Self::wrap))
     }
 

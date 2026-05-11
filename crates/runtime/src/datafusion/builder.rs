@@ -349,9 +349,9 @@ impl DataFusionBuilder {
         state = state
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
-                Arc::new(Box::new(track_bytes_processed)),
-            )))
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
+                Box::new(track_bytes_processed),
+            ))))
             .with_physical_optimizer_rule(Arc::new(DataSourceTreeDisplayOptimizer::new()));
 
         if matches!(
