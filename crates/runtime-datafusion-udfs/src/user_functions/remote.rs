@@ -1058,7 +1058,7 @@ fn ip_literal_is_disallowed(host: &url::Host<&str>) -> Option<&'static str> {
                 None
             }
         }
-        url::Host::Ipv4(ip) => ipv4_literal_is_disallowed(ip),
+        url::Host::Ipv4(ip) => ipv4_literal_is_disallowed(*ip),
         url::Host::Ipv6(ip) => {
             if ip.is_loopback() {
                 Some("IPv6 loopback")
@@ -1076,7 +1076,7 @@ fn ip_literal_is_disallowed(host: &url::Host<&str>) -> Option<&'static str> {
                 Some("IPv6 unique-local (ULA)")
             } else if ip
                 .to_ipv4_mapped()
-                .and_then(|v4| ipv4_literal_is_disallowed(&v4))
+                .and_then(ipv4_literal_is_disallowed)
                 .is_some()
             {
                 Some("IPv4-mapped IPv6 targeting a disallowed IPv4 address")
@@ -1087,7 +1087,7 @@ fn ip_literal_is_disallowed(host: &url::Host<&str>) -> Option<&'static str> {
     }
 }
 
-fn ipv4_literal_is_disallowed(ip: &std::net::Ipv4Addr) -> Option<&'static str> {
+fn ipv4_literal_is_disallowed(ip: std::net::Ipv4Addr) -> Option<&'static str> {
     if ip.is_loopback() {
         Some("IPv4 loopback")
     } else if ip.is_private() {
