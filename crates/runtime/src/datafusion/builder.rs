@@ -72,7 +72,10 @@ use datafusion_optimizer_rules::{
     },
 };
 use runtime_datafusion::{
-    extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
+    extension::{
+        ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
+        data_source_tree_display::DataSourceTreeDisplayOptimizer,
+    },
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
@@ -348,7 +351,8 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
                 Arc::new(Box::new(track_bytes_processed)),
-            )));
+            )))
+            .with_physical_optimizer_rule(Arc::new(DataSourceTreeDisplayOptimizer::new()));
 
         if matches!(
             self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
