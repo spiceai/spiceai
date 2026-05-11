@@ -336,7 +336,7 @@ fn attach_list_column(
     if values.is_empty() {
         return Ok(());
     }
-    let value_refs: Vec<&dyn Array> = values.iter().map(|a| a.as_ref()).collect();
+    let value_refs: Vec<&dyn Array> = values.iter().map(AsRef::as_ref).collect();
     let concatenated = concat(&value_refs).boxed()?;
     let item_field = Arc::new(Field::new("item", concatenated.data_type().clone(), true));
     let list_arr = Arc::new(
