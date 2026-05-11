@@ -57,6 +57,16 @@ async fn start_spice_test_app(
     rate_limits: Option<RateLimits>,
     test_dataset: Option<Dataset>,
 ) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
+    let (channel, df, _metrics_port) =
+        start_spice_test_app_with_metrics_port(flight_auth, rate_limits, test_dataset).await?;
+    Ok((channel, df))
+}
+
+async fn start_spice_test_app_with_metrics_port(
+    flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    rate_limits: Option<RateLimits>,
+    test_dataset: Option<Dataset>,
+) -> Result<(Channel, Arc<DataFusion>, u16), anyhow::Error> {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
@@ -155,7 +165,7 @@ async fn start_spice_test_app(
         }
     };
 
-    Ok((channel, df))
+    Ok((channel, df, metrics_port))
 }
 
 fn test_record_batch() -> Result<RecordBatch, anyhow::Error> {
