@@ -15560,6 +15560,7 @@ dependencies = [
  "datafusion-optimizer-rules",
  "datafusion-proto",
  "datafusion-spark",
+ "datafusion-substrait",
  "datafusion-table-providers",
  "db_connection_pool",
  "document_parse",
