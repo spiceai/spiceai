@@ -93,7 +93,7 @@ mod tests {
 
         assert_eq!(
             options.create_index_sql("docs", "body_embedding", "idx_docs_embedding"),
-            "CREATE INDEX IF NOT EXISTS idx_docs_embedding ON docs USING HNSW (body_embedding) WITH (metric = 'l2sq', m = 24, ef_construction = 96)"
+            "CREATE INDEX IF NOT EXISTS idx_docs_embedding ON docs USING HNSW (body_embedding) WITH (metric = 'l2sq', m = 24, ef_construction = 96, ef_search = 40)"
         );
     }
 }
