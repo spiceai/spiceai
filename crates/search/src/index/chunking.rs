@@ -1152,8 +1152,12 @@ mod tests {
     }
 
     /// Concatenated value arrays across multiple inner.write calls must preserve order, so the
-    /// per-document list slices come out aligned. We use the synthetic embedding values (row
-    /// index encoded as the first f32) to verify ordering is preserved end-to-end.
+    /// per-document list slices come out aligned. `RecordingInner` writes a synthetic embedding
+    /// where the first f32 is the row's position within that single `inner.write` call.
+    /// Row-atomic grouping puts a whole input row into exactly one `inner.write`, so after the
+    /// per-group outputs are concatenated and wrapped with `OffsetBuffer::from_lengths(repeats)`
+    /// each output row's embedding list must contain values whose first f32 runs 0..C_i in order.
+    /// If the concat order or the offset buffer were wrong, this sequence would skip or repeat.
     #[tokio::test]
     async fn write_preserves_chunk_order_across_groups() {
         let inner = Arc::new(RecordingInner::new("content"));
@@ -1163,7 +1167,8 @@ mod tests {
             chunker as Arc<dyn Chunker>,
         );
 
-        // 3 rows of 5000 chunks each → 15,000 chunks total, budget 8192 → 3 groups.
+        // 3 rows of 5000 chunks each → 15,000 chunks total, budget 8192 → 3 groups (one row
+        // per group, since two rows would exceed the budget).
         let big_doc: String = (0..5000).map(|i| format!("w{i} ")).collect::<String>();
         let rows: Vec<(String, i64)> = (0..3)
             .map(|i| (big_doc.trim_end().to_string(), i as i64))
@@ -1174,29 +1179,45 @@ mod tests {
         let out = idx.write(input).await.expect("write ok");
         assert_eq!(out.num_rows(), 3);
 
-        // Grouping is row-atomic, so a single row's chunks are always emitted by exactly one
-        // inner.write call and never straddle a concat seam. We check the invariant that every
-        // output list has length 5000 (chunks per row), which exercises the per-group →
-        // concatenation → list-wrap path without depending on inter-group seam behavior.
         let emb_list = out
             .column_by_name(&embedding_col("content"))
             .expect("embed")
             .as_any()
             .downcast_ref::<ListArray>()
             .expect("list");
-        for i in 0..emb_list.len() {
-            assert_eq!(emb_list.value_length(i), 5000);
+
+        // Every output list has length 5000 (chunks per row) and its values appear in 0..5000
+        // order — proves the concat seam between groups doesn't misalign chunks within a row.
+        for row_idx in 0..emb_list.len() {
+            assert_eq!(emb_list.value_length(row_idx), 5000);
+            let row_emb = emb_list.value(row_idx);
+            let fsl = row_emb
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("fsl");
+            assert_eq!(fsl.len(), 5000);
+            for chunk_idx in 0..fsl.len() {
+                let vec = fsl.value(chunk_idx);
+                let arr = vec
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("f32");
+                assert_eq!(
+                    arr.value(0),
+                    chunk_idx as f32,
+                    "row {row_idx} chunk {chunk_idx} embedding[0] mismatch — chunks reordered across the concat seam",
+                );
+            }
         }
 
-        // And the total length of the flat value array equals sum(per-row chunks).
+        // Total flat-value length equals sum(per-row chunks).
         let off_list = out
             .column_by_name(&ChunkedSearchIndex::chunking_offset_col("content"))
             .expect("offset col")
             .as_any()
             .downcast_ref::<ListArray>()
             .expect("list");
-        let total_offset_values = off_list.values().len();
-        assert_eq!(total_offset_values, 3 * 5000);
+        assert_eq!(off_list.values().len(), 3 * 5000);
     }
 
     /// Per-row offset entries must point at the correct character spans of the source document.
