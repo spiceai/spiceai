@@ -14,396 +14,215 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! High-performance deletion tracking using SIMD-optimized hash index.
+//! Immutable deletion index with bloom-filter prefilter.
 //!
-//! This module provides `DeletionIndex`, a drop-in replacement for `HashMap<i64, i64>`
-//! that's optimized for the common case where most rows are NOT deleted.
+//! [`DeletionIndex`] (Int64 PK) and [`KeyDeletionIndex`] (composite-key PK) are the
+//! frozen, share-by-`Arc` snapshots that scans probe at query time. They hold a plain
+//! [`HashMap`] plus a [`BloomFilter`] sized for the deletion set, and expose only
+//! read-only methods: a probe goes through the bloom filter first, and falls through to
+//! the hash map only on a possible hit.
 //!
-//! # Performance Benefits
+//! # Build then publish
 //!
-//! 1. **Bloom Filter**: O(1) rejection of definitely-not-deleted keys before probing
-//! 2. **SIMD Probing**: Swiss table-style parallel slot checking (16 at a time on x86)
-//! 3. **Cache-Friendly**: Control bytes separate from data for better prefetching
-//!
-//! # Typical Use Case
-//!
-//! In a table with 1 million rows and 1000 deletions:
-//! - Without bloom filter: 1M hash table probes
-//! - With bloom filter: ~1000 hash table probes + 1M bit tests (much faster)
+//! All mutation happens before the index is wrapped in an `Arc`/`ArcSwap`. Construct
+//! via [`DeletionIndex::from_map`] / [`DeletionIndex::empty`] (and the matching
+//! [`KeyDeletionIndex`] constructors), publish through `ArcSwap`, and treat the
+//! published index as immutable. To apply a write, build a new index with
+//! [`DeletionIndex::extend_max`] (or [`KeyDeletionIndex::extend_max`]) and store the
+//! `Arc<DeletionIndex>` back into the swap cell. Readers always see a fully-built
+//! snapshot and never block.
 
 use hash_index::{BloomFilter, hash_key};
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// A high-performance deletion index using SIMD hash index with bloom filter.
-///
-/// This is optimized for the common case where most rows are NOT deleted.
-/// The bloom filter provides fast O(1) rejection before probing the hash table.
-#[derive(Debug)]
+/// Bloom filter capacity floor: keep some signal even for empty / tiny sets so that the
+/// "probably-not-present" path stays useful when a fresh index is constructed.
+const MIN_BLOOM_CAPACITY: usize = 64;
+
+/// Frozen deletion index for tables with a single-column Int64 primary key.
+#[derive(Debug, Clone)]
 pub struct DeletionIndex {
-    /// Map of deleted PK -> delete sequence number.
-    /// Using `HashMap` internally but with bloom filter for fast negative lookups.
-    entries: RwLock<HashMap<i64, i64>>,
-    /// Bloom filter for fast negative lookups.
-    bloom: RwLock<BloomFilter>,
-    /// Whether bloom filter is enabled.
-    use_bloom: bool,
+    entries: HashMap<i64, i64>,
+    bloom: BloomFilter,
 }
 
 impl Default for DeletionIndex {
     fn default() -> Self {
-        Self::new()
+        Self::empty()
     }
 }
 
 impl DeletionIndex {
-    /// Creates a new empty deletion index with bloom filter enabled.
+    /// An empty deletion index. Probes always miss; bloom filter still allocated at the
+    /// minimum capacity so size-0 indexes don't degrade once `extend_max` is called.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn empty() -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
-            bloom: RwLock::new(BloomFilter::new(1024)), // Start with reasonable capacity
-            use_bloom: true,
+            entries: HashMap::new(),
+            bloom: BloomFilter::new(MIN_BLOOM_CAPACITY),
         }
     }
 
-    /// Creates a new deletion index with the expected number of deletions.
+    /// Build a frozen index from an owned `HashMap` of `pk -> delete_sequence`.
     #[must_use]
-    pub fn with_capacity(expected_deletions: usize) -> Self {
-        let capacity = expected_deletions.max(64);
-        Self {
-            entries: RwLock::new(HashMap::with_capacity(capacity)),
-            bloom: RwLock::new(BloomFilter::new(capacity)),
-            use_bloom: true,
-        }
-    }
-
-    /// Creates a deletion index from an existing `HashMap`.
-    #[must_use]
-    pub fn from_map(map: HashMap<i64, i64>) -> Self {
-        let capacity = map.len().max(64);
+    pub fn from_map(entries: HashMap<i64, i64>) -> Self {
+        let capacity = entries.len().max(MIN_BLOOM_CAPACITY);
         let mut bloom = BloomFilter::new(capacity);
-
-        // Build bloom filter from existing entries
-        for &pk in map.keys() {
+        for &pk in entries.keys() {
             bloom.insert(hash_key(&pk));
         }
-
-        Self {
-            entries: RwLock::new(map),
-            bloom: RwLock::new(bloom),
-            use_bloom: true,
-        }
+        Self { entries, bloom }
     }
 
-    /// Creates a deletion index from an Arc<HashMap>.
-    ///
-    /// This clones the `HashMap` to enable mutable operations.
+    /// Build a frozen index from an `Arc<HashMap>` (clones the map).
     #[must_use]
     pub fn from_arc_map(map: &Arc<HashMap<i64, i64>>) -> Self {
         Self::from_map((**map).clone())
     }
 
-    /// Returns the number of entries in the index.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Number of deletion entries in the index.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.read().len()
+        self.entries.len()
     }
 
-    /// Returns true if the index is empty.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Whether the index has any deletions.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.read().is_empty()
+        self.entries.is_empty()
     }
 
-    /// Checks if a key might be deleted (bloom filter check only).
-    ///
-    /// Returns `false` if the key is definitely NOT deleted.
-    /// Returns `true` if the key might be deleted (requires full lookup).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Bloom-filter check. Returns `false` if the key is definitely not in the index;
+    /// `true` if it might be (and a [`get`](Self::get) is required to confirm).
     #[inline]
+    #[must_use]
     pub fn might_contain(&self, pk: i64) -> bool {
-        if !self.use_bloom {
-            return true;
-        }
-        self.bloom.read().might_contain(hash_key(&pk))
+        self.bloom.might_contain(hash_key(&pk))
     }
 
-    /// Gets the delete sequence for a key, if deleted.
-    ///
-    /// Uses bloom filter for fast negative lookups.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Bloom-prefiltered lookup. Returns the delete sequence number if `pk` is in the
+    /// index, `None` otherwise.
     #[inline]
+    #[must_use]
     pub fn get(&self, pk: i64) -> Option<i64> {
-        // Fast path: bloom filter check
-        if self.use_bloom && !self.bloom.read().might_contain(hash_key(&pk)) {
+        if !self.bloom.might_contain(hash_key(&pk)) {
             return None;
         }
-        // Slow path: hash table lookup
-        self.entries.read().get(&pk).copied()
+        self.entries.get(&pk).copied()
     }
 
-    /// Checks if a key is deleted.
-    ///
-    /// Uses bloom filter for fast negative lookups.
-    #[inline]
-    pub fn contains(&self, pk: i64) -> bool {
-        self.get(pk).is_some()
-    }
-
-    /// Inserts a deletion entry.
-    ///
-    /// Returns the previous delete sequence if the key was already deleted.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
-    pub fn insert(&self, pk: i64, delete_sequence: i64) -> Option<i64> {
-        if self.use_bloom {
-            self.bloom.write().insert(hash_key(&pk));
-        }
-        self.entries.write().insert(pk, delete_sequence)
-    }
-
-    /// Inserts or updates a deletion entry with the maximum sequence number.
-    ///
-    /// If the key already exists, updates to the max of existing and new sequence.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
-    pub fn insert_max(&self, pk: i64, delete_sequence: i64) {
-        if self.use_bloom {
-            self.bloom.write().insert(hash_key(&pk));
-        }
-        self.entries
-            .write()
-            .entry(pk)
-            .and_modify(|seq| *seq = (*seq).max(delete_sequence))
-            .or_insert(delete_sequence);
-    }
-
-    /// Inserts multiple deletion entries.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
-    pub fn insert_batch(&self, entries: impl IntoIterator<Item = (i64, i64)>) {
-        let entries_vec: Vec<_> = entries.into_iter().collect();
-        if entries_vec.is_empty() {
-            return;
-        }
-
-        if self.use_bloom {
-            let mut bloom = self.bloom.write();
-            for (pk, _) in &entries_vec {
-                bloom.insert(hash_key(pk));
-            }
-        }
-
-        let mut map = self.entries.write();
-        for (pk, seq) in entries_vec {
-            map.insert(pk, seq);
-        }
-    }
-
-    /// Clears all entries.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
-    pub fn clear(&self) {
-        self.entries.write().clear();
-        self.bloom.write().clear();
-    }
-
-    /// Returns a snapshot of the entries as an Arc<HashMap>.
-    ///
-    /// This is useful for passing to filter executors that expect Arc<HashMap>.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Direct read-only access to the underlying entries (for callers that need to
+    /// rebuild a filtered index, e.g. partial-deletion filters).
     #[must_use]
-    pub fn snapshot(&self) -> Arc<HashMap<i64, i64>> {
-        Arc::new(self.entries.read().clone())
+    pub fn entries(&self) -> &HashMap<i64, i64> {
+        &self.entries
     }
 
-    /// Provides iteration over keys (for compatibility).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
-    pub fn keys(&self) -> Vec<i64> {
-        self.entries.read().keys().copied().collect()
-    }
-
-    /// Returns all entries as a vector of (key, value) pairs.
-    pub fn to_vec(&self) -> Vec<(i64, i64)> {
-        self.entries.read().iter().map(|(&k, &v)| (k, v)).collect()
+    /// Build a new index from `self`'s entries plus `additions`, taking the max sequence
+    /// number on conflict. Used by writers to publish a new snapshot via `ArcSwap::store`.
+    #[must_use]
+    pub fn extend_max(&self, additions: impl IntoIterator<Item = (i64, i64)>) -> Self {
+        let mut entries = self.entries.clone();
+        for (pk, seq) in additions {
+            entries
+                .entry(pk)
+                .and_modify(|existing| *existing = (*existing).max(seq))
+                .or_insert(seq);
+        }
+        Self::from_map(entries)
     }
 }
 
-/// A byte-key based deletion index for composite/non-integer primary keys.
-///
-/// Similar to `DeletionIndex` but for `Box<[u8]>` keys created by `RowConverter`.
-#[derive(Debug)]
+/// Frozen deletion index for tables with a composite or non-integer primary key. Keys
+/// are the byte-encoded form produced by `arrow_row::RowConverter`.
+#[derive(Debug, Clone)]
 pub struct KeyDeletionIndex {
-    /// Map of deleted PK bytes -> delete sequence number.
-    entries: RwLock<HashMap<Box<[u8]>, i64>>,
-    /// Bloom filter for fast negative lookups.
-    bloom: RwLock<BloomFilter>,
-    /// Whether bloom filter is enabled.
-    use_bloom: bool,
+    entries: HashMap<Box<[u8]>, i64>,
+    bloom: BloomFilter,
 }
 
 impl Default for KeyDeletionIndex {
     fn default() -> Self {
-        Self::new()
+        Self::empty()
     }
 }
 
 impl KeyDeletionIndex {
-    /// Creates a new empty deletion index.
+    /// An empty index.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn empty() -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
-            bloom: RwLock::new(BloomFilter::new(1024)),
-            use_bloom: true,
+            entries: HashMap::new(),
+            bloom: BloomFilter::new(MIN_BLOOM_CAPACITY),
         }
     }
 
-    /// Creates a deletion index from an existing `HashMap`.
+    /// Build a frozen index from an owned `HashMap` of `pk_bytes -> delete_sequence`.
     #[must_use]
-    pub fn from_map(map: HashMap<Box<[u8]>, i64>) -> Self {
-        let capacity = map.len().max(64);
+    pub fn from_map(entries: HashMap<Box<[u8]>, i64>) -> Self {
+        let capacity = entries.len().max(MIN_BLOOM_CAPACITY);
         let mut bloom = BloomFilter::new(capacity);
-
-        for key in map.keys() {
+        for key in entries.keys() {
             bloom.insert(hash_key(&key.as_ref()));
         }
-
-        Self {
-            entries: RwLock::new(map),
-            bloom: RwLock::new(bloom),
-            use_bloom: true,
-        }
+        Self { entries, bloom }
     }
 
-    /// Creates a deletion index from an Arc<HashMap>.
+    /// Build a frozen index from an `Arc<HashMap>` (clones the map).
     #[must_use]
     pub fn from_arc_map(map: &Arc<HashMap<Box<[u8]>, i64>>) -> Self {
         Self::from_map((**map).clone())
     }
 
-    /// Returns the number of entries.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Number of deletion entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.read().len()
+        self.entries.len()
     }
 
-    /// Returns true if empty.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Whether the index has any deletions.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.read().is_empty()
+        self.entries.is_empty()
     }
 
-    /// Checks if a key might be deleted (bloom filter check only).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Bloom-filter check; see [`DeletionIndex::might_contain`].
     #[inline]
+    #[must_use]
     pub fn might_contain(&self, key: &[u8]) -> bool {
-        if !self.use_bloom {
-            return true;
-        }
-        self.bloom.read().might_contain(hash_key(&key))
+        self.bloom.might_contain(hash_key(&key))
     }
 
-    /// Gets the delete sequence for a key.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Bloom-prefiltered lookup. Returns the delete sequence number if `key` is in the
+    /// index, `None` otherwise.
     #[inline]
+    #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<i64> {
-        if self.use_bloom && !self.bloom.read().might_contain(hash_key(&key)) {
+        if !self.bloom.might_contain(hash_key(&key)) {
             return None;
         }
-        self.entries.read().get(key).copied()
+        self.entries.get(key).copied()
     }
 
-    /// Inserts a deletion entry.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
-    pub fn insert(&self, key: Box<[u8]>, delete_sequence: i64) -> Option<i64> {
-        if self.use_bloom {
-            self.bloom.write().insert(hash_key(&key.as_ref()));
-        }
-        self.entries.write().insert(key, delete_sequence)
-    }
-
-    /// Inserts or updates with max sequence.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
-    pub fn insert_max(&self, key: Box<[u8]>, delete_sequence: i64) {
-        if self.use_bloom {
-            self.bloom.write().insert(hash_key(&key.as_ref()));
-        }
-        self.entries
-            .write()
-            .entry(key)
-            .and_modify(|seq| *seq = (*seq).max(delete_sequence))
-            .or_insert(delete_sequence);
-    }
-
-    /// Returns a snapshot of the entries.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
+    /// Direct read-only access to the underlying entries.
     #[must_use]
-    pub fn snapshot(&self) -> Arc<HashMap<Box<[u8]>, i64>> {
-        Arc::new(self.entries.read().clone())
+    pub fn entries(&self) -> &HashMap<Box<[u8]>, i64> {
+        &self.entries
     }
 
-    /// Clears all entries.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
-    pub fn clear(&self) {
-        self.entries.write().clear();
-        self.bloom.write().clear();
+    /// Build a new index from `self`'s entries plus `additions`, taking the max sequence
+    /// number on conflict.
+    #[must_use]
+    pub fn extend_max(&self, additions: impl IntoIterator<Item = (Box<[u8]>, i64)>) -> Self {
+        let mut entries = self.entries.clone();
+        for (key, seq) in additions {
+            entries
+                .entry(key)
+                .and_modify(|existing| *existing = (*existing).max(seq))
+                .or_insert(seq);
+        }
+        Self::from_map(entries)
     }
 }
 
@@ -412,106 +231,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_deletion_index_basic() {
-        let index = DeletionIndex::new();
-
-        // Insert some deletions
-        index.insert(100, 1);
-        index.insert(200, 2);
-        index.insert(300, 3);
-
-        // Check lookups
-        assert_eq!(index.get(100), Some(1));
-        assert_eq!(index.get(200), Some(2));
-        assert_eq!(index.get(300), Some(3));
-        assert_eq!(index.get(400), None); // Not deleted
-
-        // Bloom filter should reject definitely-not-deleted
-        assert!(index.might_contain(100));
-        // Note: 400 might still pass bloom filter (false positive possible)
-    }
-
-    #[test]
-    fn test_deletion_index_insert_max() {
-        let index = DeletionIndex::new();
-
-        index.insert_max(100, 1);
-        assert_eq!(index.get(100), Some(1));
-
-        // Insert with higher sequence
-        index.insert_max(100, 5);
-        assert_eq!(index.get(100), Some(5));
-
-        // Insert with lower sequence - should keep higher
-        index.insert_max(100, 3);
-        assert_eq!(index.get(100), Some(5));
-    }
-
-    #[test]
-    fn test_deletion_index_batch() {
-        let index = DeletionIndex::new();
-
-        let entries = vec![(1, 10), (2, 20), (3, 30)];
-        index.insert_batch(entries);
-
-        assert_eq!(index.len(), 3);
-        assert_eq!(index.get(1), Some(10));
-        assert_eq!(index.get(2), Some(20));
-        assert_eq!(index.get(3), Some(30));
-    }
-
-    #[test]
-    fn test_deletion_index_from_map() {
+    fn from_map_then_get() {
         let mut map = HashMap::new();
-        map.insert(1, 100);
-        map.insert(2, 200);
+        map.insert(100, 1);
+        map.insert(200, 2);
+        map.insert(300, 3);
+        let idx = DeletionIndex::from_map(map);
 
-        let index = DeletionIndex::from_map(map);
-
-        assert_eq!(index.len(), 2);
-        assert_eq!(index.get(1), Some(100));
-        assert_eq!(index.get(2), Some(200));
+        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.get(100), Some(1));
+        assert_eq!(idx.get(200), Some(2));
+        assert_eq!(idx.get(300), Some(3));
+        assert_eq!(idx.get(400), None);
     }
 
     #[test]
-    fn test_key_deletion_index() {
-        let index = KeyDeletionIndex::new();
-
-        let key1: Box<[u8]> = vec![1, 2, 3].into_boxed_slice();
-        let key2: Box<[u8]> = vec![4, 5, 6].into_boxed_slice();
-
-        index.insert(key1.clone(), 1);
-        index.insert(key2.clone(), 2);
-
-        assert_eq!(index.get(&key1), Some(1));
-        assert_eq!(index.get(&key2), Some(2));
-        assert_eq!(index.get(&[7, 8, 9]), None);
+    fn empty_index_probes_to_none() {
+        let idx = DeletionIndex::empty();
+        assert!(idx.is_empty());
+        assert_eq!(idx.get(42), None);
     }
 
     #[test]
-    fn test_bloom_filter_effectiveness() {
-        let index = DeletionIndex::with_capacity(100);
+    fn extend_max_takes_higher_sequence() {
+        let mut map = HashMap::new();
+        map.insert(100, 5);
+        let idx = DeletionIndex::from_map(map);
 
-        // Insert 100 deletions
-        for i in 0..100 {
-            index.insert(i * 2, i); // Even numbers only
+        let next = idx.extend_max([(100, 3), (200, 7)]);
+        assert_eq!(next.get(100), Some(5));
+        assert_eq!(next.get(200), Some(7));
+
+        let after = next.extend_max([(100, 10)]);
+        assert_eq!(after.get(100), Some(10));
+    }
+
+    #[test]
+    fn bloom_rejects_most_misses() {
+        let mut map = HashMap::new();
+        for i in 0..100_i64 {
+            map.insert(i * 2, i);
         }
+        let idx = DeletionIndex::from_map(map);
 
-        // Check that odd numbers are quickly rejected
-        // (bloom filter should catch most of them)
-        let mut bloom_rejects = 0;
+        let mut rejects = 0;
         for i in 0..100 {
             let odd = i * 2 + 1;
-            if !index.might_contain(odd) {
-                bloom_rejects += 1;
+            if !idx.might_contain(odd) {
+                rejects += 1;
             }
         }
-
-        // With good bloom filter, most odd numbers should be rejected
-        // Allow for some false positives
         assert!(
-            bloom_rejects > 80,
-            "Bloom filter should reject most non-deleted keys, got {bloom_rejects}"
+            rejects > 80,
+            "expected bloom to reject most non-deleted keys, got {rejects}"
         );
+    }
+
+    #[test]
+    fn key_index_basic() {
+        let mut map: HashMap<Box<[u8]>, i64> = HashMap::new();
+        let key1: Box<[u8]> = vec![1, 2, 3].into_boxed_slice();
+        let key2: Box<[u8]> = vec![4, 5, 6].into_boxed_slice();
+        map.insert(key1.clone(), 1);
+        map.insert(key2.clone(), 2);
+
+        let idx = KeyDeletionIndex::from_map(map);
+        assert_eq!(idx.get(&key1), Some(1));
+        assert_eq!(idx.get(&key2), Some(2));
+        assert_eq!(idx.get(&[7, 8, 9]), None);
+    }
+
+    #[test]
+    fn key_index_extend_max() {
+        let key1: Box<[u8]> = vec![1, 2].into_boxed_slice();
+        let mut map: HashMap<Box<[u8]>, i64> = HashMap::new();
+        map.insert(key1.clone(), 5);
+        let idx = KeyDeletionIndex::from_map(map);
+
+        let next = idx.extend_max([(key1.clone(), 3)]);
+        assert_eq!(next.get(&key1), Some(5));
+
+        let after = next.extend_max([(key1.clone(), 10)]);
+        assert_eq!(after.get(&key1), Some(10));
     }
 }

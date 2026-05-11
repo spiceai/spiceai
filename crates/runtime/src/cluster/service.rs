@@ -240,7 +240,6 @@ impl ClusterServiceImpl {
             executor_registry,
             metrics_reader,
             allow_secret_expansion,
-
             executor_streams,
         }
     }
@@ -994,6 +993,140 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use runtime_proto::{
+        cluster_service_client::ClusterServiceClient, cluster_service_server::ClusterServiceServer,
+    };
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::{Channel, Server};
+
+    async fn make_test_service() -> ClusterServiceImpl {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = Arc::new(
+            DataFusion::builder(
+                crate::status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let task_history_schema = Arc::new(Schema::new(vec![Field::new(
+            "trace_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let task_history_table = Arc::new(
+            MemTable::try_new(Arc::clone(&task_history_schema), vec![vec![]])
+                .expect("empty task history table should be created"),
+        );
+        datafusion
+            .ctx
+            .register_table(
+                TableReference::partial(SPICE_RUNTIME_SCHEMA, LOCAL_TASK_HISTORY_TABLE),
+                task_history_table,
+            )
+            .expect("local task history table should be registered");
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let cluster_state = Arc::new(runtime_cluster::ClusterStateStore::new(store, ""));
+        cluster_state
+            .bootstrap()
+            .await
+            .expect("cluster state should bootstrap");
+        let executor_registry = Arc::new(ExecutorRegistry::new(
+            Arc::new(runtime_cluster::PartitionStore::accelerations(Arc::clone(
+                &cluster_state,
+            ))),
+            Arc::new(runtime_cluster::PartitionStore::catalog(Arc::clone(
+                &cluster_state,
+            ))),
+        ));
+
+        ClusterServiceImpl::new(
+            Arc::new(TokioRwLock::new(None)),
+            Arc::new(TokioRwLock::new(Secrets::default())),
+            "127.0.0.1:0".to_string(),
+            Arc::new(TokioRwLock::new(HashMap::new())),
+            datafusion,
+            executor_registry,
+            None,
+            true,
+        )
+    }
+
+    async fn make_test_client() -> (ClusterServiceClient<Channel>, CancellationToken) {
+        let service = make_test_service().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test cluster service listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test cluster service listener should have a local address");
+        let shutdown = CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(ClusterServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    shutdown_signal.cancelled().await;
+                })
+                .await
+                .expect("test cluster service server should run");
+        });
+
+        let client = ClusterServiceClient::connect(format!("http://{address}"))
+            .await
+            .expect("test cluster service client should connect");
+
+        (client, shutdown)
+    }
+
+    #[tokio::test]
+    async fn test_internal_get_metrics_transport_allows_repeated_requests() {
+        let (mut client, shutdown) = make_test_client().await;
+
+        // Internal cluster RPCs are intentionally not rate-limited; the Prometheus HTTP
+        // metrics endpoint applies the external scrape limit.
+        client
+            .get_metrics(Request::new(GetMetricsRequest {}))
+            .await
+            .expect("first metrics request should succeed");
+
+        client
+            .get_metrics(Request::new(GetMetricsRequest {}))
+            .await
+            .expect("second metrics request should also succeed");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_internal_get_task_history_transport_allows_repeated_requests() {
+        let (mut client, shutdown) = make_test_client().await;
+        let request = || {
+            Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            })
+        };
+
+        client
+            .get_task_history(request())
+            .await
+            .expect("first task history request should succeed");
+
+        client
+            .get_task_history(request())
+            .await
+            .expect("second task history request should also succeed");
+
+        shutdown.cancel();
+    }
 
     #[test]
     fn test_rewrite_task_history_sql_simple() {

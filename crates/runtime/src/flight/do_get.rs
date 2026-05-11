@@ -75,12 +75,7 @@ pub(crate) async fn handle(
             ))
         }
         Command::CommandStatementSubstraitPlan(cmd) => {
-            let _start =
-                metrics::track_flight_request("do_get", Some("statement_substrait_plan")).await;
-            tracing::debug!("CommandStatementSubstraitPlan not yet implemented: {cmd:?}");
-            Err(Status::unimplemented(
-                "CommandStatementSubstraitPlan is not yet implemented",
-            ))
+            Box::pin(flightsql::statement_substrait_plan::do_get(cmd)).await
         }
         Command::CommandGetCrossReference(cmd) => {
             let _start = metrics::track_flight_request("do_get", Some("get_cross_reference")).await;

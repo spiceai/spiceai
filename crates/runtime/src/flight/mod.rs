@@ -37,7 +37,7 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use async_stream::try_stream;
 use bytes::Bytes;
-use cache::result::CacheStatus;
+use cache::result::{CacheStatus, query::QueryResult};
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
@@ -266,6 +266,35 @@ impl Service {
                 .map_err(handle_query_error)?
         };
 
+        Ok(Self::query_result_to_flight_stream(query_result))
+    }
+
+    /// Run a pre-built [`LogicalPlan`] and stream results as Flight data.
+    ///
+    /// Used by surfaces that produce a logical plan outside the SQL parser
+    /// (e.g. `FlightSQL` `CommandStatementSubstraitPlan`). The `cache_key`
+    /// identifies the plan in the results cache; callers should derive it
+    /// from the plan source so that semantically identical inputs hit the
+    /// same cache entry.
+    pub(crate) async fn plan_to_flight_stream(
+        datafusion: Arc<DataFusion>,
+        plan: LogicalPlan,
+        cache_key: impl Into<Arc<str>>,
+    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+        let query_result = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
+            .read_only(read_only)
+            .build()
+            .run()
+            .await
+            .map_err(handle_query_error)?;
+
+        Ok(Self::query_result_to_flight_stream(query_result))
+    }
+
+    fn query_result_to_flight_stream(
+        query_result: QueryResult,
+    ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema = query_result.data.schema();
@@ -319,7 +348,7 @@ impl Service {
             }
         };
 
-        Ok((flights_stream.boxed(), cache_status))
+        (flights_stream.boxed(), cache_status)
     }
 
     async fn wrap_response_stream_with_scope<S>(
@@ -422,7 +451,7 @@ fn handle_query_error(e: query::Error) -> Status {
     }
 }
 
-fn handle_datafusion_error(e: DataFusionError) -> Status {
+pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
     if query::is_cancellation_error(&e) {
         return Status::cancelled(e.to_string());
     }
@@ -707,6 +736,13 @@ pub struct RateLimits {
     /// Whether write rate limiting is enabled. When `false`, the rate limiter
     /// layer is still present but the check function always succeeds.
     flight_write_enabled: AtomicBool,
+    /// Rate limit applied to every request served by the `/metrics` HTTP endpoint
+    /// (both local scrapes and `?scope=cluster` fan-out). It is independent of the
+    /// data-path write limit so that clients can still retrieve observability data
+    /// even when their data requests are rate-limited. Because this throttles all
+    /// `/metrics` callers, lowering it to protect the expensive cluster fan-out
+    /// will also throttle ordinary local Prometheus scrapes.
+    pub metrics_endpoint_limit: Quota,
 }
 
 impl RateLimits {
@@ -728,6 +764,12 @@ impl RateLimits {
     }
 
     #[must_use]
+    pub fn with_metrics_endpoint_limit(mut self, rate_limit: Quota) -> Self {
+        self.metrics_endpoint_limit = rate_limit;
+        self
+    }
+
+    #[must_use]
     pub fn flight_write_enabled(&self) -> bool {
         self.flight_write_enabled.load(Ordering::Acquire)
     }
@@ -745,6 +787,13 @@ impl Default for RateLimits {
                 NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
             ),
             flight_write_enabled: AtomicBool::new(true),
+            // Allow 100 /metrics HTTP requests every 60 seconds by default.
+            // This is a separate limiter from the data-path write limit so that
+            // clients can still retrieve observability data even when data
+            // requests are rate-limited.
+            metrics_endpoint_limit: Quota::per_minute(
+                NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
+            ),
         }
     }
 }
