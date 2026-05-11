@@ -45,6 +45,8 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::{SessionContext, lit};
 use datafusion::scalar::ScalarValue;
 
+use arrow::compute::concat_batches;
+use datafusion::execution::SessionState;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -416,6 +418,57 @@ pub(crate) fn start_wal_worker(
     })
 }
 
+/// Apply each row in `batches` as a targeted UPDATE to the federated table.
+///
+/// Uses `TableProvider::update()` (native SQL UPDATE) rather than INSERT, so
+/// rows that already exist in the federated source are updated in-place instead
+/// of causing a duplicate-key error.
+async fn deliver_update_to_federated(
+    table: Arc<dyn datafusion::datasource::TableProvider>,
+    batches: Vec<RecordBatch>,
+    primary_keys: &[String],
+    session_state: &SessionState,
+) -> DataFusionResult<()> {
+    let schema = batches[0].schema();
+    let combined = concat_batches(&schema, &batches)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    for row_idx in 0..combined.num_rows() {
+        let filters: Vec<Expr> = primary_keys
+            .iter()
+            .map(|pk| {
+                let col_idx = schema.index_of(pk).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "WAL UPDATE delivery: PK column '{pk}' not found in new_values schema: {e}"
+                    ))
+                })?;
+                let scalar = ScalarValue::try_from_array(combined.column(col_idx), row_idx)?;
+                Ok::<Expr, DataFusionError>(col(pk).eq(lit(scalar)))
+            })
+            .collect::<DataFusionResult<_>>()?;
+
+        let assignments: Vec<(String, Expr)> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !primary_keys.contains(f.name()))
+            .map(|(col_idx, f)| {
+                let scalar = ScalarValue::try_from_array(combined.column(col_idx), row_idx)?;
+                Ok::<(String, Expr), DataFusionError>((f.name().clone(), lit(scalar)))
+            })
+            .collect::<DataFusionResult<_>>()?;
+
+        if assignments.is_empty() {
+            continue;
+        }
+
+        let plan = table.update(session_state, assignments, filters).await?;
+        datafusion::physical_plan::collect(plan, session_state.task_ctx()).await?;
+    }
+
+    Ok(())
+}
+
 /// Read and deliver all undelivered WAL entries for this table.
 pub(crate) async fn deliver_pending(
     wal: &Arc<WalContext>,
@@ -434,7 +487,7 @@ pub(crate) async fn deliver_pending(
     for entry in entries {
         let federated_provider = federated.table_provider().await;
         match entry.op.as_str() {
-            "INSERT" | "UPDATE" => {
+            "INSERT" => {
                 let ipc = entry.new_values.unwrap_or_default();
                 let batches = arrow_ipc_to_batches(&ipc)?;
                 if !batches.is_empty() {
@@ -446,6 +499,20 @@ pub(crate) async fn deliver_pending(
                         InsertOp::Replace,
                         &session_state,
                         None,
+                    )
+                    .await
+                    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                }
+            }
+            "UPDATE" => {
+                let ipc = entry.new_values.unwrap_or_default();
+                let batches = arrow_ipc_to_batches(&ipc)?;
+                if !batches.is_empty() {
+                    deliver_update_to_federated(
+                        Arc::clone(&federated_provider),
+                        batches,
+                        &primary_keys,
+                        &session_state,
                     )
                     .await
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;

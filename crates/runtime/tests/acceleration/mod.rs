@@ -56,6 +56,8 @@ mod single_instance_duckdb;
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
 mod snapshot_mutex;
+#[cfg(all(feature = "duckdb", feature = "postgres-accel"))]
+mod wal_write_back;
 
 pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file",);

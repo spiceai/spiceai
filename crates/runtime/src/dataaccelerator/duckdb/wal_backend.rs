@@ -152,6 +152,29 @@ fn filters_to_sql_string(filters: &[Expr]) -> DataFusionResult<Option<String>> {
         .map_err(|e| DataFusionError::Execution(format!("WAL: failed to build filter SQL: {e}")))
 }
 
+/// Return the names of all base tables that hold data for `table_definition`.
+///
+/// When DuckDB table providers use partition tables the main table name becomes a VIEW;
+/// DELETE/UPDATE must target the underlying base tables directly.  If no internal
+/// partition tables exist the main table itself is a base table.
+fn writable_base_tables(
+    table_definition: &Arc<TableDefinition>,
+    tx: &duckdb::Transaction<'_>,
+    fallback: &str,
+) -> Result<Vec<String>, BoxError> {
+    let internal = table_definition
+        .list_internal_tables(tx)
+        .map_err(|e| Box::new(e) as BoxError)?;
+    if internal.is_empty() {
+        Ok(vec![fallback.to_string()])
+    } else {
+        Ok(internal
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect())
+    }
+}
+
 fn resolve_append_table(
     table_definition: &Arc<TableDefinition>,
     tx: &duckdb::Transaction<'_>,
@@ -430,7 +453,9 @@ impl WalBackend for DuckDBWalBackend {
                 let append_table = resolve_append_table(&table_definition, &tx)
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
                 write_batches_to_table(&append_table, &tx, schema, batches, on_conflict.as_ref())
-                    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                    .map_err(|e: datafusion::error::DataFusionError| {
+                    Box::new(std::io::Error::other(e.to_string())) as BoxError
+                })?;
 
                 tx.commit()?;
                 Ok(())
@@ -459,6 +484,7 @@ impl WalBackend for DuckDBWalBackend {
         let table_name = self.table_name.clone();
         let primary_keys = self.primary_keys.clone();
         let pool = Arc::clone(&self.pool);
+        let table_definition = Arc::clone(&self.table_definition);
 
         let mut attempt: u32 = 0;
         loop {
@@ -467,6 +493,7 @@ impl WalBackend for DuckDBWalBackend {
             let primary_keys = primary_keys.clone();
             let filter_sql = filter_sql.clone();
             let pool = Arc::clone(&pool);
+            let table_definition = Arc::clone(&table_definition);
 
             let res = tokio::task::spawn_blocking(move || -> Result<u64, BoxError> {
                 let mut conn = pool.connect_sync()?;
@@ -492,12 +519,18 @@ impl WalBackend for DuckDBWalBackend {
                     duckdb::params!["DELETE", pks_ipc],
                 )?;
 
-                let delete_sql = if let Some(ref wh) = filter_sql {
-                    format!(r#"DELETE FROM "{table_name}" WHERE {wh}"#)
-                } else {
-                    format!(r#"DELETE FROM "{table_name}""#)
-                };
-                let count = tx.execute(&delete_sql, [])?;
+                // DELETE must target base tables; the main table name may be a VIEW when
+                // DuckDB uses internal partition tables after a Full refresh.
+                let base_tables = writable_base_tables(&table_definition, &tx, &table_name)?;
+                let mut count: usize = 0;
+                for bt in &base_tables {
+                    let sql = if let Some(ref wh) = filter_sql {
+                        format!(r#"DELETE FROM "{bt}" WHERE {wh}"#)
+                    } else {
+                        format!(r#"DELETE FROM "{bt}""#)
+                    };
+                    count += tx.execute(&sql, [])?;
+                }
 
                 tx.commit()?;
                 Ok(count as u64)
@@ -533,6 +566,7 @@ impl WalBackend for DuckDBWalBackend {
         let table_name = self.table_name.clone();
         let primary_keys = self.primary_keys.clone();
         let pool = Arc::clone(&self.pool);
+        let table_definition = Arc::clone(&self.table_definition);
 
         let mut attempt: u32 = 0;
         loop {
@@ -542,6 +576,7 @@ impl WalBackend for DuckDBWalBackend {
             let filter_sql = filter_sql.clone();
             let set_clause = set_clause.clone();
             let pool = Arc::clone(&pool);
+            let table_definition = Arc::clone(&table_definition);
 
             let res = tokio::task::spawn_blocking(move || -> Result<u64, BoxError> {
                 let mut conn = pool.connect_sync()?;
@@ -561,15 +596,20 @@ impl WalBackend for DuckDBWalBackend {
                     return Ok(0);
                 };
 
-                // 2. Apply the UPDATE
-                let update_sql = if let Some(ref wh) = filter_sql {
-                    format!(r#"UPDATE "{table_name}" SET {set_clause} WHERE {wh}"#)
-                } else {
-                    format!(r#"UPDATE "{table_name}" SET {set_clause}"#)
-                };
-                let count = tx.execute(&update_sql, [])?;
+                // 2. Apply the UPDATE across all base tables (the main table name may be a VIEW
+                //    when DuckDB uses internal partition tables after a Full refresh).
+                let base_tables = writable_base_tables(&table_definition, &tx, &table_name)?;
+                let mut count: usize = 0;
+                for bt in &base_tables {
+                    let sql = if let Some(ref wh) = filter_sql {
+                        format!(r#"UPDATE "{bt}" SET {set_clause} WHERE {wh}"#)
+                    } else {
+                        format!(r#"UPDATE "{bt}" SET {set_clause}"#)
+                    };
+                    count += tx.execute(&sql, [])?;
+                }
 
-                // 3. Read new row state for WAL replay
+                // 3. Read new row state for WAL replay (from the view, which reflects all partitions)
                 let new_values_ipc =
                     read_rows_by_pks_arrow(&tx, &table_name, &primary_keys, &pks_ipc)?;
 

@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/acceleration/wal_write_back.rs
+expression: pretty
+---
++----+-------+
+| id | value |
++----+-------+
+| 1  | 11    |
+| 2  | 22    |
+| 4  | 40    |
+| 5  | 50    |
+| 6  | 60    |
++----+-------+
