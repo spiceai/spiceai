@@ -8,6 +8,7 @@ repository = "https://github.com/spiceai/spiceai"
 version.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 arrow = { workspace = true }
 arrow_tools = { path = "../arrow_tools" }
 datafusion-ddl = { path = "../datafusion-ddl" }
@@ -87,3 +88,7 @@ name = "metastore_operations"
 [[bench]]
 harness = false
 name = "deletion_strategies"
+
+[[bench]]
+harness = false
+name = "deletion_index_probe"

@@ -3379,6 +3379,7 @@ name = "cayenne"
 version = "2.0.0-unstable"
 dependencies = [
  "aegis",
+ "arc-swap",
  "arrow",
  "arrow-flight",
  "arrow-ipc",
@@ -6203,7 +6204,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=8df061143d7f5ce7640f531e74dddb471877642a#8df061143d7f5ce7640f531e74dddb471877642a"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be#81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -15561,6 +15562,7 @@ dependencies = [
  "datafusion-optimizer-rules",
  "datafusion-proto",
  "datafusion-spark",
+ "datafusion-substrait",
  "datafusion-table-providers",
  "db_connection_pool",
  "document_parse",

@@ -87,13 +87,7 @@ pub(crate) async fn handle(
             Ok(Response::new(info))
         }
         Command::CommandStatementSubstraitPlan(cmd) => {
-            let _start =
-                metrics::track_flight_request("get_flight_info", Some("statement_substrait_plan"))
-                    .await;
-            tracing::debug!("CommandStatementSubstraitPlan not yet implemented: {cmd:?}");
-            Err(Status::unimplemented(
-                "CommandStatementSubstraitPlan is not yet implemented",
-            ))
+            flightsql::statement_substrait_plan::get_flight_info(cmd, request).await
         }
         Command::CommandGetCrossReference(cmd) => {
             let _start =
