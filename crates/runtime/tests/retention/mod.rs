@@ -177,7 +177,10 @@ async fn refresh_table(rt: Arc<Runtime>, table_name: &str) -> Result<(), anyhow:
 /// Polls `sql` until it returns `expected_rows` (the retention task runs on a
 /// background interval, so the row count may not drop immediately after
 /// `refresh_table` returns). Returns the matching batches once observed, or
-/// errors after `timeout`.
+/// errors after `timeout`. The entire poll loop — including any in-flight
+/// query and the inter-attempt sleep — is bounded by `timeout` via
+/// `tokio::time::timeout_at`, so a slow query cannot extend the total runtime
+/// past the deadline.
 async fn wait_for_retention_applied(
     rt: &Runtime,
     sql: &str,
@@ -185,20 +188,25 @@ async fn wait_for_retention_applied(
     timeout: std::time::Duration,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let query = rt.datafusion().query_builder(sql).build().run().await?;
-        let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
-        let count: usize = results.iter().map(RecordBatch::num_rows).sum();
-        if count == expected_rows {
-            return Ok(results);
+
+    let polled = tokio::time::timeout_at(deadline, async {
+        loop {
+            let query = rt.datafusion().query_builder(sql).build().run().await?;
+            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+            let count: usize = results.iter().map(RecordBatch::num_rows).sum();
+            if count == expected_rows {
+                return Ok::<_, anyhow::Error>(results);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(anyhow::anyhow!(
-                "retention did not apply within {timeout:?} for `{sql}` (got {count} rows, expected {expected_rows})",
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    })
+    .await;
+
+    polled.unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "retention did not apply within {timeout:?} for `{sql}` (expected {expected_rows} rows)"
+        ))
+    })
 }
 
 #[tokio::test]
