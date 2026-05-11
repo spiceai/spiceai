@@ -3,9 +3,14 @@
 all-features = true
 
 [advisories]
+# cargo-deny v2 schema: vulnerability, unmaintained, unsound, and notice
+# advisories all fail the check by default. Yanked crates also fail.
+# To bypass a specific advisory, add its RUSTSEC ID to `ignore` with a
+# comment explaining why and an owner.
+version = 2
+yanked = "deny"
 ignore = [
 ]
-yanked = "deny"
 
 [bans]
 allow-wildcard-paths = false

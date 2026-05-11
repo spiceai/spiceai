@@ -56,3 +56,6 @@ jobs:
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
+
+      - name: Check Rust Advisories
+        run: cargo deny check advisories
