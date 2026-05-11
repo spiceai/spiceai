@@ -24,9 +24,8 @@ use secrecy::SecretString;
 use snafu::ResultExt;
 use snafu::Snafu;
 use spicepod::component::model::ModelSource;
-#[cfg(feature = "local_llm")]
 use std::path::Path;
-#[cfg(feature = "local_llm")]
+#[cfg(any(feature = "local_llm", test))]
 use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(feature = "local_llm")]
