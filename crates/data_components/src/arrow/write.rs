@@ -1376,7 +1376,7 @@ fn delete_primary_keys_from_snapshot(
                 continue;
             }
 
-            let keys = extract_primary_keys_str(&batch, primary_key)?;
+            let keys = extract_primary_keys_str(batch, primary_key)?;
             let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
             let mut removed_from_batch = false;
 
@@ -1390,7 +1390,7 @@ fn delete_primary_keys_from_snapshot(
             }
 
             if removed_from_batch {
-                let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
+                let filtered_batch = filter_record_batch(batch, &keep_row_builder.finish())?;
                 if filtered_batch.num_rows() > 0 {
                     filtered_batches.push(filtered_batch);
                 }
