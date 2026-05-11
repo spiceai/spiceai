@@ -484,8 +484,13 @@ impl ExecutionPlan for IndexerExec {
                     let mut b = batch;
 
                     // Verify the incoming batch fields match the advertised schema.
-                    // Uses fields-only comparison to tolerate metadata differences.
-                    if b.schema().fields() != advertised_schema.fields() {
+                    // Use a metadata-ignoring comparison: Arrow's `Field` PartialEq includes
+                    // field-level metadata, so two schemas that are identical in name, type, and
+                    // nullability can still compare unequal if FTS (or another index) attaches
+                    // metadata to fields in the advertised schema but not in the incoming batch
+                    // (or vice versa). That would produce a confusing error where "Expected" and
+                    // "Got" look identical in the log. We only care about structural compatibility.
+                    if !fields_structurally_equal(b.schema().fields(), advertised_schema.fields()) {
                         let exp = schema_signature(advertised_schema.as_ref());
                         let got = schema_signature(b.schema().as_ref());
                         return Err(DataFusionError::Execution(format!(
@@ -511,7 +516,10 @@ impl ExecutionPlan for IndexerExec {
                                 b = out
                                     .pop()
                                     .unwrap_or_else(|| unreachable!("length is checked"));
-                                if b.schema().fields() != schema_before.fields() {
+                                if !fields_structurally_equal(
+                                    b.schema().fields(),
+                                    schema_before.fields(),
+                                ) {
                                     let exp = schema_signature(schema_before.as_ref());
                                     let got = schema_signature(b.schema().as_ref());
                                     return Err(DataFusionError::Execution(format!(
@@ -604,6 +612,22 @@ impl ExecutionPlan for IndexerExec {
 }
 
 /// Helper for better diagnostics when schema is mismatched.
+/// Returns `true` if two field lists are structurally compatible: same length, and every
+/// corresponding pair has the same name, data type, and nullability.
+///
+/// Arrow's [`Field`] `PartialEq` includes field-level metadata, which means two schemas that are
+/// visually identical can compare as unequal when one side carries index-attached metadata (e.g.
+/// FTS column markers) and the other does not. This function intentionally ignores metadata so
+/// that schema validation catches real structural mismatches without false positives.
+fn fields_structurally_equal(a: &arrow::datatypes::Fields, b: &arrow::datatypes::Fields) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(fa, fb)| {
+            fa.name() == fb.name()
+                && fa.data_type() == fb.data_type()
+                && fa.is_nullable() == fb.is_nullable()
+        })
+}
+
 fn schema_signature(s: &Schema) -> String {
     use std::fmt::Write;
     let mut buf = String::new();
