@@ -565,16 +565,11 @@ async fn file(
     }
 
     let trust_pickle = parse_trust_pickle(params)?;
-    llms::chat::reject_unsafe_weight_formats(
-        &model_weights
-            .iter()
-            .map(std::path::Path::new)
-            .collect::<Vec<_>>(),
-        trust_pickle,
-    )
-    .map_err(|source| LlmError::FailedToLoadModel {
-        source: Box::new(source),
-    })?;
+    llms::chat::reject_unsafe_weight_formats(model_weights.as_slice(), trust_pickle).map_err(
+        |source| LlmError::FailedToLoadModel {
+            source: Box::new(source),
+        },
+    )?;
 
     let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
     let tokenizer_config_path = component.find_any_file_path(ModelFileType::TokenizerConfig);
@@ -608,7 +603,9 @@ fn parse_trust_pickle(params: &Parameters) -> Result<bool, LlmError> {
         "false" | "no" | "0" | "" => Ok(false),
         other => Err(LlmError::InvalidParamValueError {
             param: "trust_pickle".to_string(),
-            message: format!("Must be 'true' or 'false', got '{other}'"),
+            message: format!(
+                "Must be one of 'true', 'false', 'yes', 'no', '1', or '0', got '{other}'"
+            ),
         }),
     }
 }

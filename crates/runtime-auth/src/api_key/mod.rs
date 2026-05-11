@@ -67,7 +67,7 @@ impl ApiKeyAuth {
         presented: &str,
         mut on_compare: impl FnMut(),
     ) -> Option<ApiKey> {
-        let mut matched: Option<ApiKey> = None;
+        let mut matched: Option<&ApiKey> = None;
         for key in &self.api_keys {
             on_compare();
             if key == presented {
@@ -75,11 +75,11 @@ impl ApiKeyAuth {
                 // of which key matched. Preserve the first match if the
                 // same key was configured more than once.
                 if matched.is_none() {
-                    matched = Some(key.clone());
+                    matched = Some(key);
                 }
             }
         }
-        matched
+        matched.cloned()
     }
 
     fn lookup(&self, presented: &str) -> Option<ApiKey> {
