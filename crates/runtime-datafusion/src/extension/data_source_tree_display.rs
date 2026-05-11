@@ -273,6 +273,19 @@ mod tests {
             "expected wrapped tree to contain `limit`, got:\n{rendered}"
         );
 
+        // The TreeRender contract is one `key=value` per line. `MemorySourceConfig`
+        // already terminates each of its fields (`format=…`, `rows=…`, `bytes=…`)
+        // with `writeln!`, so our `writeln!(f, "limit=…")` must produce a clean
+        // `\nlimit=2\n` segment rather than concatenating to a previous field.
+        assert!(
+            rendered.contains("\nlimit=2"),
+            "`limit=` should appear on its own line, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("]limit=") && !rendered.contains("=2limit="),
+            "`limit=` must not be glued to a sibling field, got:\n{rendered}"
+        );
+
         Ok(())
     }
 
