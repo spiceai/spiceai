@@ -516,7 +516,7 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     let pk_slice = pk_array.values();
                     let mut keep_mask: Vec<bool> = Vec::with_capacity(batch_size);
                     let mut keep_count: usize = 0;
-                    for &pk_value in pk_slice.iter() {
+                    for &pk_value in pk_slice {
                         let visible = is_pk_visible_i64(
                             pk_value,
                             &self.deleted_pk_values,

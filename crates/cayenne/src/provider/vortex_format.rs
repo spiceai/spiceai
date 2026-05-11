@@ -85,20 +85,17 @@ impl std::fmt::Debug for DeletionFilteringVortexFormat {
 /// - The modified `FileScanConfig` with `VortexAccessPlan` extensions attached to files with deletions
 /// - A boolean indicating if any deletions were attached
 ///
-/// # Errors
-///
-/// Returns an error if the deletion cache lock cannot be acquired.
 #[expect(clippy::implicit_hasher)]
 pub fn attach_deletion_vectors_to_config(
     mut config: FileScanConfig,
     deletion_cache: &ArcSwap<HashMap<String, RoaringBitmap>>,
-) -> DFResult<(FileScanConfig, bool)> {
+) -> (FileScanConfig, bool) {
     // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `deletion_map`.
     let deletion_map = deletion_cache.load_full();
 
     // If no deletions, return config unchanged
     if deletion_map.is_empty() {
-        return Ok((config, false));
+        return (config, false);
     }
 
     // Track if any files had deletions attached
@@ -125,7 +122,7 @@ pub fn attach_deletion_vectors_to_config(
         })
         .collect();
 
-    Ok((config, has_any_deletions))
+    (config, has_any_deletions)
 }
 
 /// Attach a `VortexAccessPlan` to a single file if it has deletions.
@@ -193,7 +190,7 @@ impl DeletionFilteringVortexFormat {
     /// Attach `VortexAccessPlan` extensions to files with deletion vectors.
     ///
     /// This is a convenience method that delegates to [`attach_deletion_vectors_to_config`].
-    fn attach_deletion_vectors(&self, config: FileScanConfig) -> DFResult<(FileScanConfig, bool)> {
+    fn attach_deletion_vectors(&self, config: FileScanConfig) -> (FileScanConfig, bool) {
         attach_deletion_vectors_to_config(config, &self.deletion_cache)
     }
 }
@@ -270,8 +267,7 @@ impl FileFormat for DeletionFilteringVortexFormat {
         file_scan_config: FileScanConfig,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Attach deletion vectors to files before creating the plan
-        let (modified_config, has_any_deletions) =
-            self.attach_deletion_vectors(file_scan_config)?;
+        let (modified_config, has_any_deletions) = self.attach_deletion_vectors(file_scan_config);
 
         // Delegate to the underlying VortexFormat
         let plan = self

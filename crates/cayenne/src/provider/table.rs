@@ -1579,7 +1579,7 @@ impl CayenneTableProvider {
 
         // Get the maximum delete sequence from current deletions.
         // This snapshot is protected from deletions with seq <= max_delete_seq.
-        let max_delete_seq = self.get_max_delete_sequence()?;
+        let max_delete_seq = self.get_max_delete_sequence();
 
         // Add to protected snapshots so scan applies only NEWER deletions (seq > max_delete_seq)
         // We do NOT clear old protected snapshots because they may contain data that's still valid.
@@ -1602,28 +1602,28 @@ impl CayenneTableProvider {
     }
 
     /// Get the maximum delete sequence number from the cached deletions.
-    fn get_max_delete_sequence(&self) -> Result<i64> {
+    fn get_max_delete_sequence(&self) -> i64 {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 cached_deleted_pk, ..
-            } => Ok(cached_deleted_pk
+            } => cached_deleted_pk
                 .load()
                 .entries()
                 .values()
                 .max()
                 .copied()
-                .unwrap_or(0)),
+                .unwrap_or(0),
             PkDeletionStrategyWithCache::RowConverterBased {
                 cached_deleted_row_keys,
                 ..
-            } => Ok(cached_deleted_row_keys
+            } => cached_deleted_row_keys
                 .load()
                 .entries()
                 .values()
                 .max()
                 .copied()
-                .unwrap_or(0)),
-            PkDeletionStrategyWithCache::PositionBased { .. } => Ok(0),
+                .unwrap_or(0),
+            PkDeletionStrategyWithCache::PositionBased { .. } => 0,
         }
     }
 
@@ -2963,21 +2963,18 @@ impl CayenneTableProvider {
     /// - Position-based deletions use per-file deletion vectors (no special handling needed)
     /// - PK-based deletions use anti-deletions (write to new snapshot with higher sequence)
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the deletion cache lock is poisoned.
-    pub(crate) fn has_pending_deletions(&self) -> Result<bool> {
+    pub(crate) fn has_pending_deletions(&self) -> bool {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::PositionBased {
                 cached_deleted_row_ids,
-            } => Ok(!cached_deleted_row_ids.load().is_empty()),
+            } => !cached_deleted_row_ids.load().is_empty(),
             PkDeletionStrategyWithCache::Int64Pk {
                 cached_deleted_pk, ..
-            } => Ok(!cached_deleted_pk.load().is_empty()),
+            } => !cached_deleted_pk.load().is_empty(),
             PkDeletionStrategyWithCache::RowConverterBased {
                 cached_deleted_row_keys,
                 ..
-            } => Ok(!cached_deleted_row_keys.load().is_empty()),
+            } => !cached_deleted_row_keys.load().is_empty(),
         }
     }
 
@@ -2994,7 +2991,7 @@ impl CayenneTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if any cache lock is poisoned.
+    /// Returns an error if the protected snapshots lock is poisoned.
     pub(crate) fn clear_all_deletion_caches(&self) -> Result<()> {
         // Clear caches based on the current strategy.
         // ArcSwap stores publish a fresh empty snapshot atomically; readers see either
@@ -4988,8 +4985,7 @@ mod tests {
         let (batch, converter) = make_int64_pk_batch(&[1, 2, 3]);
 
         // Delete pk=2 with del_seq=1
-        let deleted_index =
-            DeletionIndex::from_map(HashMap::from([(2_i64, 1_i64)]));
+        let deleted_index = DeletionIndex::from_map(HashMap::from([(2_i64, 1_i64)]));
         let strategy = PkDeletionStrategyWithCache::Int64Pk {
             cached_deleted_pk: Arc::new(ArcSwap::from_pointee(deleted_index.clone())),
             cached_insert_records: Arc::new(ArcSwap::from_pointee(DeletionIndex::empty())),
