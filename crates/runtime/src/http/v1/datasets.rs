@@ -17,8 +17,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
-    LogErrors, Runtime, accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
-    datafusion::request_context_extension::get_current_datafusion,
+    LogErrors, Runtime,
+    accelerated_table::refresh::RefreshOverrides,
+    component::dataset::Dataset,
+    datafusion::{
+        SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
+        request_context_extension::get_current_datafusion,
+    },
 };
 use app::App;
 use axum::{
@@ -305,11 +310,23 @@ pub(crate) async fn refresh(
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
 
-    let Some(dataset) = readable_app
-        .datasets
-        .iter()
-        .find(|d| d.name.to_lowercase() == dataset_name.to_lowercase())
-    else {
+    // Resolve the requested name to a full table reference so that both
+    // bare names (e.g. "wiki") and fully-qualified names (e.g. "spice.public.wiki") match.
+    let requested_ref = TableReference::parse_str(&dataset_name)
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+
+    // Search both datasets and accelerated views for the given name.
+    let (name, acceleration) = if let Some(dataset) = readable_app.datasets.iter().find(|d| {
+        TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+            == requested_ref
+    }) {
+        (dataset.name.as_str(), &dataset.acceleration)
+    } else if let Some(view) = readable_app.views.iter().find(|v| {
+        TableReference::parse_str(&v.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+            == requested_ref
+    }) {
+        (view.name.as_str(), &view.acceleration)
+    } else {
         return (
             status::StatusCode::NOT_FOUND,
             Json(MessageResponse {
@@ -319,7 +336,7 @@ pub(crate) async fn refresh(
             .into_response();
     };
 
-    let acceleration_enabled = dataset.acceleration.as_ref().is_some_and(|f| f.enabled);
+    let acceleration_enabled = acceleration.as_ref().is_some_and(|f| f.enabled);
 
     if !acceleration_enabled {
         return (
@@ -331,7 +348,7 @@ pub(crate) async fn refresh(
             .into_response();
     }
 
-    let table_ref = TableReference::parse_str(dataset.name.as_str());
+    let table_ref = TableReference::parse_str(name);
 
     match df
         .refresh_table(&table_ref, overrides_opt.map(|Json(overrides)| overrides))
