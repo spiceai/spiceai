@@ -32,11 +32,8 @@ use futures::TryStreamExt;
 use llms::embeddings::{Embed, EmbeddingInput};
 
 use super::{
-    DuckDBVectorQueryContext,
-    hnsw::DuckDBHnswOptions,
-    resolve_current_table_name,
-    sql::duckdb_vector_sql,
-    to_execution_error, validate_vector, vector_literal,
+    DuckDBVectorQueryContext, hnsw::DuckDBHnswOptions, resolve_current_table_name,
+    sql::duckdb_vector_sql, to_execution_error, validate_vector, vector_literal,
 };
 
 #[derive(Debug, Clone)]
