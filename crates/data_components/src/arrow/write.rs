@@ -1108,6 +1108,8 @@ impl DataSink for MemSink {
             .transpose()
             .map_err(check_and_mark_retriable_error)?
         {
+            let batch = arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&self.schema))
+                .map_err(DataFusionError::from)?;
             row_count += batch.num_rows();
             new_batches[i].push(batch);
             i = (i + 1) % num_partitions;
@@ -1291,8 +1293,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{
-        array::{RecordBatch, StringArray, UInt64Array},
-        datatypes::{DataType, Schema, SchemaRef},
+        array::{Int32Array, RecordBatch, StringArray, UInt64Array},
+        datatypes::{DataType, Field, Schema, SchemaRef},
     };
     use arrow_array::Array;
     use arrow_buffer::ArrowNativeType;
@@ -1428,6 +1430,57 @@ mod tests {
             ],
             results
         );
+    }
+
+    #[tokio::test]
+    async fn test_insert_normalizes_nullable_input_to_table_schema() {
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let table = MemTable::try_new(Arc::clone(&table_schema), vec![vec![]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]))
+            .await
+            .expect("satisfy primary key constraints")
+            .with_on_conflict(OnConflict::try_from("upsert:id").expect("create on_conflict"));
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let input_batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")])),
+            ],
+        )
+        .expect("input batch should be created");
+        let exec = Arc::new(MockExec::new(vec![Ok(input_batch)], input_schema));
+        let insertion = table
+            .insert_into(&state, exec, datafusion::logical_expr::dml::InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("scan plan can be constructed after insert");
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("query successful");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].schema(), table_schema);
     }
 
     #[tokio::test]
