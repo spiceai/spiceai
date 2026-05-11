@@ -20,7 +20,7 @@ use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::{Builder, Connection};
 use hyper_util::service::TowerToHyperService;
-use runtime_auth::{HttpAuth, layer::http::AuthLayer};
+use runtime_auth::{HttpAuth, IdentitySource, layer::http::AuthLayer};
 use snafu::prelude::*;
 use spicepod::component::runtime::CorsConfig;
 use tokio::net::TcpStream;
@@ -38,6 +38,7 @@ use crate::{
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
 mod metrics;
+mod mtls;
 mod routes;
 pub mod traceparent;
 
@@ -118,6 +119,7 @@ pub(crate) async fn start<A>(
     config: Arc<config::Config>,
     tls_config: Option<Arc<TlsConfig>>,
     auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
+    identity_source: IdentitySource,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()>
 where
@@ -179,8 +181,15 @@ where
 
                 match tls_config {
                     Some(ref config) => {
-                        let acceptor = TlsAcceptor::from(Arc::clone(&config.server_config));
-                        process_tls_tcp_stream(stream, acceptor, routes.clone(), shutdown_notify.subscribe());
+                        let acceptor = TlsAcceptor::from(Arc::clone(&config.http_server_config));
+                        process_tls_tcp_stream(
+                            stream,
+                            acceptor,
+                            routes.clone(),
+                            identity_source,
+                            config.client_auth,
+                            shutdown_notify.subscribe(),
+                        );
                     }
                     None => {
                         process_tcp_stream(stream, routes.clone(), shutdown_notify.subscribe());
@@ -213,11 +222,25 @@ fn process_tls_tcp_stream(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     routes: Router,
+    identity_source: IdentitySource,
+    client_auth: crate::tls::ClientAuthEnforcement,
     on_shutdown: Receiver<()>,
 ) {
     tokio::spawn(async move {
         match acceptor.accept(stream).await {
             Ok(tls_stream) => {
+                // Pre-compute the per-connection mTLS identities
+                // (`ChannelIdentity` always; `MtlsPrincipal` only in
+                // `Channel` mode) once at accept-time so per-request
+                // middleware does no X.509 parsing on the hot path.
+                // Every request served on this TLS connection then
+                // sees the same `Arc<PerConnTls>` in its extensions.
+                let per_conn = mtls::PerConnTls::build(
+                    tls_stream.get_ref().1.peer_certificates(),
+                    identity_source,
+                    client_auth,
+                );
+                let routes = mtls::install_per_conn_extension(routes, per_conn);
                 let conn = serve_connection(tls_stream, routes);
                 handle_connection(conn, on_shutdown).await;
             }

@@ -16,10 +16,8 @@ limitations under the License.
 
 //! On-disk certificate hot-reload for TLS endpoints.
 //!
-//! This module is the foundation for [milestone 1 of the mTLS plan]
-//! (`plans/mtls-public-endpoints.md`). It adds the ability to swap
-//! TLS certificates and (in a follow-up milestone) client-cert trust roots
-//! without restarting `spiced`.
+//! Lets `spiced` swap TLS certificates (and the client-cert trust
+//! roots used for mTLS) at runtime without a restart.
 //!
 //! ## Pieces
 //!
@@ -65,8 +63,13 @@ use opentelemetry::{
     metrics::{Counter, Meter},
 };
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
-    server::{ClientHello, ResolvesServerCert},
+    DistinguishedName, RootCertStore, SignatureScheme,
+    client::danger::HandshakeSignatureValid,
+    pki_types::{CertificateDer, PrivateKeyDer, UnixTime},
+    server::{
+        ClientHello, ResolvesServerCert, WebPkiClientVerifier,
+        danger::{ClientCertVerified, ClientCertVerifier},
+    },
     sign::CertifiedKey,
 };
 use rustls_pemfile::{certs, private_key};
@@ -97,12 +100,40 @@ impl ReloadScope {
 /// A `ResolvesServerCert` implementation backed by an [`ArcSwap`] so the
 /// certificate can be hot-swapped without rebuilding the parent
 /// [`rustls::ServerConfig`].
+///
+/// This type can also optionally own swappable
+/// [`WebPkiClientVerifier`]s for client-cert authentication. When the
+/// caller configures a client CA path, both the server cert/key and
+/// the CA file are watched together; on rotation, the reload callback
+/// rebuilds whichever materials changed and stores them on the
+/// respective swap. Cert+key and verifier each have their own swap so
+/// rustls can read them independently per handshake without locking;
+/// the reload callback is the only writer.
+///
+/// Two verifiers are built off the same CA bundle: a *strict* one
+/// (no-cert handshake fails) used by the Flight listener, and a *lax*
+/// one (`allow_unauthenticated()`, no-cert handshake succeeds and
+/// `peer_certificates()` is empty) used by the HTTP and metrics
+/// listeners. The HTTP route layer enforces presence on non-probe
+/// routes; `/health` and `/v1/ready` are reachable without a client
+/// cert by design so Kubernetes liveness/readiness probes work over
+/// TLS without mounting a probe certificate.
 #[derive(Debug)]
 pub struct ReloadableServerCerts {
     inner: ArcSwap<CertifiedKey>,
+    /// Strict verifier — used by the Flight server. `None` when
+    /// the caller never configured client-cert authentication.
+    verifier_swap: Option<Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>>,
+    /// Lax (`allow_unauthenticated`) verifier — used by the HTTP
+    /// and metrics servers. `None` mirrors `verifier_swap`.
+    verifier_swap_lax: Option<Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>>,
     scope: ReloadScope,
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
+    /// Path to the client CA bundle when CA hot-reload is enabled.
+    /// `None` when the verifier was built from inline bytes (or when
+    /// no client auth is configured).
+    client_ca_path: Option<PathBuf>,
 }
 
 impl ReloadableServerCerts {
@@ -113,12 +144,40 @@ impl ReloadableServerCerts {
         key_pem: &[u8],
         scope: ReloadScope,
     ) -> Result<Arc<Self>, ReloadError> {
+        Self::from_pem_with_client_auth(cert_pem, key_pem, None, scope)
+    }
+
+    /// Like [`Self::from_pem`] but additionally builds a static
+    /// [`WebPkiClientVerifier`] from `client_ca_pem` when supplied.
+    /// The verifier is held under the same `ArcSwap` machinery as the
+    /// hot-reload path uses, but — since this constructor takes inline
+    /// bytes — it never gets rebuilt for the lifetime of the process.
+    pub fn from_pem_with_client_auth(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        client_ca_pem: Option<&[u8]>,
+        scope: ReloadScope,
+    ) -> Result<Arc<Self>, ReloadError> {
         let certified = build_certified_key(cert_pem, key_pem)?;
+        let (verifier_swap, verifier_swap_lax) = match client_ca_pem {
+            Some(ca) => {
+                let strict = build_client_verifier(ca, ClientVerifierKind::Strict)?;
+                let lax = build_client_verifier(ca, ClientVerifierKind::Lax)?;
+                (
+                    Some(Arc::new(ArcSwap::from_pointee(strict))),
+                    Some(Arc::new(ArcSwap::from_pointee(lax))),
+                )
+            }
+            None => (None, None),
+        };
         Ok(Arc::new(Self {
             inner: ArcSwap::from_pointee(certified),
+            verifier_swap,
+            verifier_swap_lax,
             scope,
             cert_path: None,
             key_path: None,
+            client_ca_path: None,
         }))
     }
 
@@ -131,6 +190,24 @@ impl ReloadableServerCerts {
         scope: ReloadScope,
         watcher: &CertWatcher,
     ) -> Result<Arc<Self>, ReloadError> {
+        Self::from_paths_with_client_auth(cert_path, key_path, None, scope, watcher)
+    }
+
+    /// Like [`Self::from_paths`] but additionally registers an optional
+    /// client CA path for client-cert authentication. When `client_ca_path`
+    /// is `Some`, the watcher monitors all three files; on any change the
+    /// reload callback re-reads and re-validates *all* materials in
+    /// scope and atomically stores the new server cert/key and
+    /// (separately) the new client verifier. Cert+key and verifier are
+    /// independent swaps so reads on one cannot block reads on the
+    /// other; the dispatcher thread is the only writer.
+    pub fn from_paths_with_client_auth(
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        client_ca_path: Option<PathBuf>,
+        scope: ReloadScope,
+        watcher: &CertWatcher,
+    ) -> Result<Arc<Self>, ReloadError> {
         let cert_pem = fs::read(&cert_path).map_err(|source| ReloadError::Io {
             path: cert_path.clone(),
             source,
@@ -140,15 +217,39 @@ impl ReloadableServerCerts {
             source,
         })?;
         let certified = build_certified_key(&cert_pem, &key_pem)?;
+        let (verifier_swap, verifier_swap_lax) = if let Some(ca_path) = &client_ca_path {
+            let ca_pem = fs::read(ca_path).map_err(|source| ReloadError::Io {
+                path: ca_path.clone(),
+                source,
+            })?;
+            let strict = build_client_verifier(&ca_pem, ClientVerifierKind::Strict)?;
+            let lax = build_client_verifier(&ca_pem, ClientVerifierKind::Lax)?;
+            (
+                Some(Arc::new(ArcSwap::from_pointee(strict))),
+                Some(Arc::new(ArcSwap::from_pointee(lax))),
+            )
+        } else {
+            (None, None)
+        };
         let this = Arc::new(Self {
             inner: ArcSwap::from_pointee(certified),
+            verifier_swap,
+            verifier_swap_lax,
             scope,
             cert_path: Some(cert_path.clone()),
             key_path: Some(key_path.clone()),
+            client_ca_path: client_ca_path.clone(),
         });
 
         let weak = Arc::downgrade(&this);
-        let cb_paths = vec![cert_path, key_path];
+        // Single registration covering every path that should trigger a
+        // reload. The callback re-reads its own paths from `self`, so a
+        // change to any one of them produces one consistent re-read of
+        // the whole bundle (cert+key and, when applicable, CA).
+        let mut cb_paths = vec![cert_path, key_path];
+        if let Some(ca_path) = client_ca_path {
+            cb_paths.push(ca_path);
+        }
         watcher.register(cb_paths, move |_changed| {
             let Some(this) = weak.upgrade() else {
                 return;
@@ -159,52 +260,100 @@ impl ReloadableServerCerts {
         Ok(this)
     }
 
-    /// Re-read the configured cert + key files and swap atomically. Errors
-    /// keep the old material in place.
+    /// Re-read the configured cert + key files (and client CA, when
+    /// configured) and swap atomically. Each material is independent;
+    /// a parse failure on one keeps the previous version in place
+    /// without affecting the others. Errors keep the old material in
+    /// place rather than taking the server down on a bad rotation.
     pub fn reload_now(&self) {
-        let (Some(cert_path), Some(key_path)) = (&self.cert_path, &self.key_path) else {
-            return;
-        };
-        let cert_pem = match fs::read(cert_path) {
-            Ok(b) => b,
-            Err(err) => {
-                tracing::warn!(
-                    path = %cert_path.display(),
-                    "TLS reload: failed to read cert file: {err}"
-                );
-                metrics().reload(self.scope, "io_error");
-                return;
+        // ---- server cert + key ----
+        if let (Some(cert_path), Some(key_path)) = (&self.cert_path, &self.key_path) {
+            let cert_pem = match fs::read(cert_path) {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %cert_path.display(),
+                        "TLS reload: failed to read cert file: {err}"
+                    );
+                    metrics().reload(self.scope, "io_error");
+                    return;
+                }
+            };
+            let key_pem = match fs::read(key_path) {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %key_path.display(),
+                        "TLS reload: failed to read key file: {err}"
+                    );
+                    metrics().reload(self.scope, "io_error");
+                    return;
+                }
+            };
+            match build_certified_key(&cert_pem, &key_pem) {
+                Ok(new_ck) => {
+                    let fp = cert_fingerprint_short(&new_ck);
+                    self.inner.store(Arc::new(new_ck));
+                    tracing::info!(
+                        cert_path = %cert_path.display(),
+                        fingerprint = %fp,
+                        scope = self.scope.as_str(),
+                        "TLS reload: swapped server certificate"
+                    );
+                    metrics().reload(self.scope, "ok");
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        cert_path = %cert_path.display(),
+                        "TLS reload: rejected new material, keeping old: {err}"
+                    );
+                    metrics().reload(self.scope, "parse_error");
+                }
             }
-        };
-        let key_pem = match fs::read(key_path) {
-            Ok(b) => b,
-            Err(err) => {
-                tracing::warn!(
-                    path = %key_path.display(),
-                    "TLS reload: failed to read key file: {err}"
-                );
-                metrics().reload(self.scope, "io_error");
-                return;
-            }
-        };
-        match build_certified_key(&cert_pem, &key_pem) {
-            Ok(new_ck) => {
-                let fp = cert_fingerprint_short(&new_ck);
-                self.inner.store(Arc::new(new_ck));
-                tracing::info!(
-                    cert_path = %cert_path.display(),
-                    fingerprint = %fp,
-                    scope = self.scope.as_str(),
-                    "TLS reload: swapped server certificate"
-                );
-                metrics().reload(self.scope, "ok");
-            }
-            Err(err) => {
-                tracing::warn!(
-                    cert_path = %cert_path.display(),
-                    "TLS reload: rejected new material, keeping old: {err}"
-                );
-                metrics().reload(self.scope, "parse_error");
+        }
+
+        // ---- client CA (mTLS verifiers) ----
+        // Independent from the cert+key swap: a bad CA rotation must
+        // not affect the server cert, and vice versa. The strict and
+        // lax verifiers are rebuilt from the same CA bytes and stored
+        // back-to-back; rustls reads each independently per handshake,
+        // so a connection only ever sees one consistent verifier.
+        if let (Some(ca_path), Some(strict_swap), Some(lax_swap)) = (
+            &self.client_ca_path,
+            &self.verifier_swap,
+            &self.verifier_swap_lax,
+        ) {
+            let ca_pem = match fs::read(ca_path) {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %ca_path.display(),
+                        "TLS reload: failed to read client CA file: {err}"
+                    );
+                    metrics().reload(self.scope, "io_error");
+                    return;
+                }
+            };
+            let strict = build_client_verifier(&ca_pem, ClientVerifierKind::Strict);
+            let lax = build_client_verifier(&ca_pem, ClientVerifierKind::Lax);
+            match (strict, lax) {
+                (Ok(new_strict), Ok(new_lax)) => {
+                    strict_swap.store(Arc::new(new_strict));
+                    lax_swap.store(Arc::new(new_lax));
+                    tracing::info!(
+                        ca_path = %ca_path.display(),
+                        scope = self.scope.as_str(),
+                        "TLS reload: swapped client CA bundle"
+                    );
+                    metrics().reload(self.scope, "ok");
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    tracing::warn!(
+                        ca_path = %ca_path.display(),
+                        "TLS reload: rejected new client CA bundle, keeping old: {err}"
+                    );
+                    metrics().reload(self.scope, "parse_error");
+                }
             }
         }
     }
@@ -213,6 +362,149 @@ impl ReloadableServerCerts {
 impl ResolvesServerCert for ReloadableServerCerts {
     fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(self.inner.load_full())
+    }
+}
+
+impl ReloadableServerCerts {
+    /// Returns the *strict* [`ClientCertVerifier`] suitable for
+    /// [`ServerConfig::with_client_cert_verifier`] when this resolver was
+    /// built with a client CA configured. "Strict" means the rustls
+    /// handshake fails if the client does not present a cert. Used by
+    /// the Flight listener.
+    ///
+    /// The returned verifier is a thin shim that reads `verifier_swap`
+    /// on every handshake — so a CA rotation lands on the next
+    /// handshake without rebuilding the `ServerConfig`.
+    ///
+    /// `None` when the resolver was built without client-cert auth
+    /// (the caller should wire `with_no_client_auth()` instead).
+    #[must_use]
+    pub fn client_verifier(&self) -> Option<Arc<dyn ClientCertVerifier>> {
+        Some(shim_for(self.verifier_swap.as_ref()?))
+    }
+
+    /// Returns the *lax* [`ClientCertVerifier`] for the HTTP and
+    /// metrics listeners. "Lax" means a client that presents no cert
+    /// completes the handshake (and `peer_certificates()` is empty);
+    /// a client that presents an invalid / wrong-CA cert is still
+    /// rejected at the handshake. Per-route HTTP middleware enforces
+    /// presence for non-probe routes; `/health` and `/v1/ready` are
+    /// reachable without a cert by design for Kubernetes probes.
+    ///
+    /// `None` mirrors [`Self::client_verifier`].
+    #[must_use]
+    pub fn client_verifier_lax(&self) -> Option<Arc<dyn ClientCertVerifier>> {
+        Some(shim_for(self.verifier_swap_lax.as_ref()?))
+    }
+}
+
+fn shim_for(swap: &Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>) -> Arc<dyn ClientCertVerifier> {
+    // Capture `root_hint_subjects` from the live verifier once,
+    // here, because `ClientCertVerifier::root_hint_subjects`
+    // returns `&[DistinguishedName]` — a borrow that cannot point
+    // into an `ArcSwap::load` result. This matches the design
+    // choice in `crate::cluster::pki::ClusterPkiBundle`: the set
+    // of advertised CA subjects is pinned at startup and a
+    // rotated CA file does **not** change the
+    // `CertificateRequest` hint list. Operators rotating a CA in
+    // a way that adds or removes subject DNs need to restart the
+    // process to re-advertise; in practice CA rotations swap the
+    // signing key under the same Subject, so the hint list stays
+    // valid.
+    let hint_subjects = swap.load_full().root_hint_subjects().to_vec();
+    Arc::new(ReloadableClientVerifier {
+        inner: Arc::clone(swap),
+        hint_subjects,
+    })
+}
+
+/// Thin shim that delegates every [`ClientCertVerifier`] call to the
+/// live verifier inside an [`ArcSwap`]. Reads happen on the rustls
+/// handshake hot path and are wait-free (`ArcSwap::load_full` is a
+/// single atomic read + clone of the inner `Arc`). The dispatcher
+/// thread is the only writer and only stores fully-validated
+/// verifiers, so no handshake can ever observe a torn / partially
+/// rebuilt verifier.
+///
+/// Methods other than `verify_client_cert` (TLS 1.2 / 1.3 signature
+/// verification, supported schemes) also delegate to the live verifier
+/// so a CA rotation that, for example, narrows the supported
+/// signature schemes is reflected immediately. `root_hint_subjects`
+/// is the exception — see the doc comment in
+/// [`ReloadableServerCerts::client_verifier`] for why it's pinned at
+/// startup.
+#[derive(Debug)]
+struct ReloadableClientVerifier {
+    inner: Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>,
+    /// Subject DN list captured at construction time and returned
+    /// from every `root_hint_subjects` call. See the constructor for
+    /// the rotation trade-off.
+    hint_subjects: Vec<DistinguishedName>,
+}
+
+impl ReloadableClientVerifier {
+    fn live(&self) -> Arc<dyn ClientCertVerifier> {
+        // `inner` is an `Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>`,
+        // so `load_full()` returns `Arc<Arc<dyn ClientCertVerifier>>`
+        // (the outer `Arc` is the snapshot guard, the inner is the
+        // verifier itself). Deref one layer and clone the inner Arc
+        // explicitly so the return type isn't relying on a subtle
+        // `Deref` coercion.
+        let snapshot = self.inner.load_full();
+        Arc::clone(&*snapshot)
+    }
+}
+
+impl ClientCertVerifier for ReloadableClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.live().offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        // Forwarded from the live verifier so the
+        // strict-vs-`allow_unauthenticated` distinction baked into
+        // each underlying `WebPkiClientVerifier` actually reaches
+        // rustls. The default trait impl returns `true`, which would
+        // override `allow_unauthenticated()` on the lax verifier and
+        // make the handshake reject no-cert clients — not what we
+        // want for the HTTP listener that serves `/health`.
+        self.live().client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.hint_subjects
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        self.live()
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.live().verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.live().verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.live().supported_verify_schemes()
     }
 }
 
@@ -466,6 +758,50 @@ fn build_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, 
     Ok(CertifiedKey::new(cert_chain, signing_key))
 }
 
+/// Whether to build the strict (rejects no-cert at handshake) or lax
+/// (`allow_unauthenticated`) variant of the `WebPkiClientVerifier`.
+/// Both variants share the same trust roots; only the no-cert
+/// behavior differs.
+#[derive(Debug, Clone, Copy)]
+enum ClientVerifierKind {
+    Strict,
+    Lax,
+}
+
+/// Build a [`WebPkiClientVerifier`] from one or more PEM-encoded CA
+/// certificates. Used both at startup and on every CA-file rotation.
+///
+/// Treats an empty CA bundle as an error — a verifier with no roots
+/// would silently reject every client cert and operators would have a
+/// hard time figuring out why mTLS "stopped working".
+fn build_client_verifier(
+    ca_pem: &[u8],
+    kind: ClientVerifierKind,
+) -> Result<Arc<dyn ClientCertVerifier>, ReloadError> {
+    let mut roots = RootCertStore::empty();
+    let ca_certs = certs(&mut Cursor::new(ca_pem))
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(|source| ReloadError::ParseCert { source })?;
+    if ca_certs.is_empty() {
+        return Err(ReloadError::EmptyClientCa);
+    }
+    for ca in ca_certs {
+        roots
+            .add(ca)
+            .map_err(|source| ReloadError::Rustls { source })?;
+    }
+    let builder = WebPkiClientVerifier::builder(Arc::new(roots));
+    let builder = match kind {
+        ClientVerifierKind::Strict => builder,
+        ClientVerifierKind::Lax => builder.allow_unauthenticated(),
+    };
+    builder
+        .build()
+        .map_err(|err| ReloadError::ClientVerifierBuild {
+            message: err.to_string(),
+        })
+}
+
 fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, ReloadError> {
     let mut cursor = Cursor::new(pem);
     certs(&mut cursor)
@@ -511,6 +847,10 @@ pub enum ReloadError {
     MissingKey,
     #[snafu(display("TLS PEM contained no certificates"))]
     EmptyCertChain,
+    #[snafu(display("client CA bundle contained no certificates"))]
+    EmptyClientCa,
+    #[snafu(display("failed to build rustls client cert verifier: {message}"))]
+    ClientVerifierBuild { message: String },
     #[snafu(display("rustls signing key error: {source}"))]
     Sign { source: rustls::Error },
     #[snafu(display("rustls error: {source}"))]
