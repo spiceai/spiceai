@@ -98,14 +98,14 @@ impl DuckDBVectorIndex {
     #[must_use]
     pub fn with_query_context(
         mut self,
-        pool: Arc<DuckDbConnectionPool>,
+        pool: &Arc<DuckDbConnectionPool>,
         table_definition: Arc<TableDefinition>,
     ) -> Self {
         // Clone the pool struct (cheap: the underlying r2d2 pool is Arc-shared) and inject
         // "LOAD vss" as a connection setup query so it runs exactly once per connection
         // acquisition rather than once per query.
         let pool_with_vss = Arc::new(
-            (*pool)
+            (**pool)
                 .clone()
                 .with_connection_setup_queries(vec![Arc::from("LOAD vss")]),
         );

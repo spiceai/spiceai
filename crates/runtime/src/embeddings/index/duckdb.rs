@@ -238,7 +238,7 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
             Arc::clone(&secrets),
         )
         .await?
-        .with_query_context(Arc::clone(&pool), Arc::clone(&table_definition));
+        .with_query_context(&pool, Arc::clone(&table_definition));
 
         // For CDC/append datasets the HNSW index is created here at init time so it exists
         // before any CDC writes arrive. DuckDB VSS then auto-maintains it on each insert.
