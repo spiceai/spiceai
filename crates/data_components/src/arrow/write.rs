@@ -1549,6 +1549,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use super::{PartitionData, replace_partitions_if_unchanged, snapshot_partitions};
     use arrow::{
         array::{Int32Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Field, Schema, SchemaRef},
