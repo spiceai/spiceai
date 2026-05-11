@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for WAL-backed write-back acceleration (DuckDB accelerator + Postgres source).
+//! Integration tests for WAL-backed write-back acceleration (`DuckDB` accelerator + Postgres source).
 //!
 //! Test scenarios:
 //! - Happy path: INSERT/UPDATE/DELETE propagate to Postgres.
-//! - Postgres down before write: commits to DuckDB immediately, delivers on reconnect.
+//! - Postgres down before write: commits to `DuckDB` immediately, delivers on reconnect.
 //! - Postgres goes down mid-batch: surviving writes are queued and eventually delivered.
 //! - Multiple operations queued: ordering and completeness preserved across outage.
 //! - DELETE while Postgres is down: tracked in WAL and replayed on reconnect.
@@ -26,7 +26,7 @@ limitations under the License.
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    postgres::common::{self, PG_PASSWORD, get_pg_params, get_random_port},
+    postgres::common::{self, PG_PASSWORD, get_random_port},
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
@@ -40,7 +40,15 @@ use spicepod::{
     },
     param::Params,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
+use tokio::sync::Mutex;
+
+/// Serializes WAL tests because `Runtime::shutdown()` calls `unregister_all()`,
+/// which clears the global connector registry and breaks parallel tests.
+static WAL_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::{
@@ -85,9 +93,9 @@ async fn setup_source_table(pool: &PostgresConnectionPool) -> Result<(), anyhow:
 
 /// Build a DuckDB-memory–accelerated dataset backed by a Postgres source in WAL write-back mode.
 ///
-/// Memory mode avoids partition/view tables that DuckDB file mode creates after a full refresh
+/// Memory mode avoids partition/view tables that `DuckDB` file mode creates after a full refresh
 /// (which would reject DELETE/UPDATE with "Can only delete from base table!"). The WAL itself
-/// lives inside the in-memory DuckDB, which is sufficient for testing network-outage scenarios.
+/// lives inside the in-memory `DuckDB`, which is sufficient for testing network-outage scenarios.
 fn make_wal_dataset(port: usize) -> Dataset {
     let mut dataset = Dataset::new("postgres:wal_test", "wal_test");
     dataset.params = Some(pg_params(port));
@@ -205,6 +213,7 @@ async fn wait_for_local_row_count(
 #[cfg(all(feature = "duckdb", feature = "postgres-accel"))]
 #[tokio::test]
 async fn test_wal_write_back_happy_path() -> Result<(), anyhow::Error> {
+    let _test_lock = WAL_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -294,11 +303,12 @@ async fn test_wal_write_back_happy_path() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Postgres is completely down when writes arrive; they commit to DuckDB immediately
+/// Postgres is completely down when writes arrive; they commit to `DuckDB` immediately
 /// and are delivered once Postgres comes back up.
 #[cfg(all(feature = "duckdb", feature = "postgres-accel"))]
 #[tokio::test]
 async fn test_wal_write_back_postgres_down_then_recover() -> Result<(), anyhow::Error> {
+    let _test_lock = WAL_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -366,6 +376,7 @@ async fn test_wal_write_back_postgres_down_then_recover() -> Result<(), anyhow::
 #[cfg(all(feature = "duckdb", feature = "postgres-accel"))]
 #[tokio::test]
 async fn test_wal_write_back_multiple_ops_queued() -> Result<(), anyhow::Error> {
+    let _test_lock = WAL_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -502,6 +513,7 @@ async fn test_wal_write_back_multiple_ops_queued() -> Result<(), anyhow::Error> 
 #[cfg(all(feature = "duckdb", feature = "postgres-accel"))]
 #[tokio::test]
 async fn test_wal_write_back_deletes_while_down() -> Result<(), anyhow::Error> {
+    let _test_lock = WAL_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -559,6 +571,7 @@ async fn test_wal_write_back_deletes_while_down() -> Result<(), anyhow::Error> {
 #[cfg(all(feature = "duckdb", feature = "postgres-accel"))]
 #[tokio::test]
 async fn test_wal_write_back_updates_while_down() -> Result<(), anyhow::Error> {
+    let _test_lock = WAL_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -673,6 +686,7 @@ async fn test_wal_write_back_updates_while_down() -> Result<(), anyhow::Error> {
 #[cfg(all(feature = "duckdb", feature = "postgres-accel"))]
 #[tokio::test]
 async fn test_wal_write_back_postgres_fails_mid_batch() -> Result<(), anyhow::Error> {
+    let _test_lock = WAL_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 

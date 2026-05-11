@@ -129,6 +129,7 @@ pub struct StreamingExec {
 }
 
 impl StreamingExec {
+    #[must_use]
     pub fn new(schema: &SchemaRef, stream: SendableRecordBatchStream) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(schema)),

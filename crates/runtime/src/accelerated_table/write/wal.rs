@@ -483,7 +483,7 @@ pub(crate) async fn deliver_pending(
         let federated_provider = federated.table_provider().await;
 
         match op {
-            WalOp::Insert | WalOp::Update => {
+            WalOp::Insert => {
                 // max_seq is updated inside the stream closure; share it via an atomic.
                 let max_seq_atom = Arc::new(AtomicI64::new(first.seq));
                 let max_seq_clone = Arc::clone(&max_seq_atom);
@@ -525,7 +525,7 @@ pub(crate) async fn deliver_pending(
                 let adapted = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
                 let plan_input = Arc::new(StreamingExec::new(&schema, Box::pin(adapted)));
                 let insert_plan = federated_provider
-                    .insert_into(&session_state, plan_input, InsertOp::Replace)
+                    .insert_into(&session_state, plan_input, InsertOp::Append)
                     .await
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
                 datafusion::physical_plan::collect(insert_plan, session_state.task_ctx())
@@ -533,6 +533,55 @@ pub(crate) async fn deliver_pending(
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
 
                 max_seq = max_seq_atom.load(Ordering::SeqCst);
+            }
+            WalOp::Update => {
+                // UPDATE delivery: delete the old rows by PK, then insert the new row state.
+                // This avoids requiring upsert support on the target connector and is idempotent:
+                // if delivery fails after delete but before insert, the retry deletes 0 rows
+                // (already gone) and inserts the new values successfully.
+                let mut new_value_batches =
+                    arrow_ipc_to_batches(&first.new_values.unwrap_or_default())?;
+                let mut pk_batches = arrow_ipc_to_batches(&first.pks_ipc)?;
+                while let Some(result) = stream.next().await {
+                    let entry = result?;
+                    max_seq = max_seq.max(entry.seq);
+                    new_value_batches
+                        .extend(arrow_ipc_to_batches(&entry.new_values.unwrap_or_default())?);
+                    pk_batches.extend(arrow_ipc_to_batches(&entry.pks_ipc)?);
+                }
+
+                if !pk_batches.is_empty() {
+                    let combined_pks = concat_batches(&pk_batches[0].schema(), &pk_batches)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    let all_pks_ipc = batches_to_arrow_ipc(&[combined_pks])?;
+                    let filters = build_pk_filters_from_ipc(&all_pks_ipc, &primary_keys)
+                        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                    let delete_plan = federated_provider
+                        .delete_from(&session_state, filters)
+                        .await
+                        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                    datafusion::physical_plan::collect(delete_plan, session_state.task_ctx())
+                        .await
+                        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                }
+
+                if !new_value_batches.is_empty() {
+                    let schema = federated_provider.schema();
+                    let combined =
+                        concat_batches(&new_value_batches[0].schema(), &new_value_batches)
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    let batch_stream: BoxStream<'static, DataFusionResult<RecordBatch>> =
+                        Box::pin(futures::stream::once(futures::future::ready(Ok(combined))));
+                    let adapted = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
+                    let plan_input = Arc::new(StreamingExec::new(&schema, Box::pin(adapted)));
+                    let insert_plan = federated_provider
+                        .insert_into(&session_state, plan_input, InsertOp::Append)
+                        .await
+                        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                    datafusion::physical_plan::collect(insert_plan, session_state.task_ctx())
+                        .await
+                        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+                }
             }
             WalOp::Delete => {
                 // Accumulate only PK bytes from all entries, then issue one delete_from call.

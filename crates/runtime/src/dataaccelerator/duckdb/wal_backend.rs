@@ -66,7 +66,7 @@ impl DuckDBWalBackend {
     /// Build a `DuckDBWalBackend` from a pool and its table provider.
     ///
     /// The pool is supplied by the caller (`DuckDBAccelerator::wal_backend`) via
-    /// `get_shared_pool`, which works for both file-mode and memory-mode DuckDB.
+    /// `get_shared_pool`, which works for both file-mode and memory-mode `DuckDB`.
     /// Schema and constraints are read directly from the `accelerator` table provider
     /// without downcasting to engine-internal types.
     /// Returns `None` when WAL is not applicable (no primary keys).
@@ -150,7 +150,7 @@ fn filters_to_sql_string(filters: &[Expr]) -> DataFusionResult<Option<String>> {
 
 /// Return the names of all base tables that hold data for `table_definition`.
 ///
-/// When DuckDB table providers use partition tables the main table name becomes a VIEW;
+/// When `DuckDB` table providers use partition tables the main table name becomes a VIEW;
 /// DELETE/UPDATE must target the underlying base tables directly.  If no internal
 /// partition tables exist the main table itself is a base table.
 fn writable_base_tables(
