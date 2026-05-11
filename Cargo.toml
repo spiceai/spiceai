@@ -100,6 +100,7 @@ adbc_core = "0.23.0"
 adbc_driver_manager = "0.23.0"
 ahash = "0.8.12"
 anyhow = "1.0.102"
+arc-swap = "1.7"
 arrow = { version = "57.0.0", features = ["prettyprint"] }
 arrow-array = "57.0.0"
 arrow-buffer = "57.0.0"
@@ -181,6 +182,7 @@ datafusion-physical-plan = "52.0.0"
 datafusion-proto = { version = "52.0.0", features = ["json"] }
 datafusion-pruning = "52.0.0"
 datafusion-spark = "52.0.0"
+datafusion-substrait = "52.0.0"
 datafusion-table-providers = "0.1.0"  # Placeholder version; actual crate is provided via [patch.crates-io] from spiceai fork with DF52 support
 
 delta_kernel = { version = "0.18.2", features = [
@@ -442,7 +444,7 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "8df061143d7f5ce7640f531e74dddb471877642a" } # spiceai-52
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be" } # spiceai-52
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "383e165a080d648c313a2530a3a53eae6077fdba" }      # spiceai-52.5
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "383e165a080d648c313a2530a3a53eae6077fdba" } # spiceai-52.5

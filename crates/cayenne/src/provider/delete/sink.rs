@@ -46,7 +46,7 @@ limitations under the License.
 //! 6. Update in-memory caches for immediate query consistency
 
 use super::super::Error;
-use super::super::constants::{DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
+use super::super::constants::LISTING_TABLE_LOCK_POISONED;
 use super::super::deletion_strategy::PkDeletionStrategyWithCache;
 use super::super::utils::convert_to_u64_box;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
@@ -560,18 +560,12 @@ impl CayenneDeletionSink {
 
         // Count how many keys are NEW deletions (not already in the cache).
         // This gives an accurate count of newly deleted rows for the return value.
-        let new_deletion_count = {
-            let guard = cached_deleted_row_keys
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-            row_keys
-                .iter()
-                .filter(|key| !guard.contains_key(key.as_ref()))
-                .count()
-        };
+        // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
+        let current = cached_deleted_row_keys.load_full();
+        let new_deletion_count = row_keys
+            .iter()
+            .filter(|key| current.get(key.as_ref()).is_none())
+            .count();
 
         // Create a temporary metadata with the delete sequence number
         let mut temp_metadata = self.table_metadata.clone();
@@ -599,26 +593,15 @@ impl CayenneDeletionSink {
             }
         };
 
-        // Update the cached deletion keys with sequence number
-        {
-            let mut guard = cached_deleted_row_keys
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-
-            let mut updated_map = (**guard).clone();
-            for key in written_row_keys {
-                // Update with max sequence if key already exists
-                updated_map
-                    .entry(key.clone())
-                    .and_modify(|seq| *seq = (*seq).max(delete_sequence))
-                    .or_insert(delete_sequence);
-            }
-
-            *guard = Arc::new(updated_map);
-        }
+        // Build a fresh snapshot with the new deletions and publish via ArcSwap.
+        // Writes are serialised by the per-table write lock so the load+rebuild+store
+        // sequence is race-free.
+        let updated = cached_deleted_row_keys.load().extend_max(
+            written_row_keys
+                .iter()
+                .map(|key| (key.clone(), delete_sequence)),
+        );
+        cached_deleted_row_keys.store(Arc::new(updated));
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
@@ -677,19 +660,12 @@ impl CayenneDeletionSink {
         }
 
         // Count how many PKs are NEW deletions (not already in the cache).
-        // This gives an accurate count of newly deleted rows for the return value.
-        let new_deletion_count = {
-            let guard = cached_deleted_pk_i64
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-            pk_values
-                .iter()
-                .filter(|pk| !guard.contains_key(*pk))
-                .count()
-        };
+        // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
+        let current = cached_deleted_pk_i64.load_full();
+        let new_deletion_count = pk_values
+            .iter()
+            .filter(|pk| current.get(**pk).is_none())
+            .count();
 
         // For Int64 PK deletions, we store them as key-based deletions
         // where each key is the 8-byte big-endian representation of the i64 value.
@@ -714,26 +690,13 @@ impl CayenneDeletionSink {
 
         self.catalog.add_delete_file(result.delete_file).await?;
 
-        // Update the cached Int64 PK deletion map with sequence number
-        {
-            let mut guard = cached_deleted_pk_i64
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-
-            let mut updated_map = (**guard).clone();
-            for &pk_value in &pk_values {
-                // Update with max sequence if key already exists
-                updated_map
-                    .entry(pk_value)
-                    .and_modify(|seq| *seq = (*seq).max(delete_sequence))
-                    .or_insert(delete_sequence);
-            }
-
-            *guard = Arc::new(updated_map);
-        }
+        // Build a fresh snapshot with the new deletions and publish via ArcSwap.
+        // Writes are serialised by the per-table write lock so the load+rebuild+store
+        // sequence is race-free.
+        let updated = cached_deleted_pk_i64
+            .load()
+            .extend_max(pk_values.iter().map(|&pk| (pk, delete_sequence)));
+        cached_deleted_pk_i64.store(Arc::new(updated));
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
