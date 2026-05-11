@@ -225,35 +225,24 @@ fn wal_stream(
                                     "schema mismatch for {dataset_name}: {e}"
                                 )))?;
                             }
+                            decoder.apply_declared_primary_keys(rel.relation_id, &primary_keys);
                         }
                         DecodedMessage::Insert { relation_id, tuple } => {
-                            let rel = resolve_relation_with_declared_pks(
-                                &decoder,
-                                relation_id,
-                                &primary_keys,
-                            )?;
+                            let rel = resolve_relation(&decoder, relation_id)?;
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
-                                .push_insert(&rel, tuple);
+                                .push_insert(rel, tuple);
                             metrics.inc_insert();
                         }
                         DecodedMessage::Update { relation_id, new, .. } => {
-                            let rel = resolve_relation_with_declared_pks(
-                                &decoder,
-                                relation_id,
-                                &primary_keys,
-                            )?;
+                            let rel = resolve_relation(&decoder, relation_id)?;
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
-                                .push_update(&rel, new);
+                                .push_update(rel, new);
                             metrics.inc_update();
                         }
                         DecodedMessage::Delete { relation_id, old } => {
-                            let rel = resolve_relation_with_declared_pks(
-                                &decoder,
-                                relation_id,
-                                &primary_keys,
-                            )?;
+                            let rel = resolve_relation(&decoder, relation_id)?;
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
-                                .push_delete(&rel, old);
+                                .push_delete(rel, old);
                             metrics.inc_delete();
                         }
                         DecodedMessage::Truncate { relation_ids } => {
@@ -281,11 +270,7 @@ fn wal_stream(
                                     unreachable!();
                                 }
                             };
-                            let rel = match resolve_relation_with_declared_pks(
-                                &decoder,
-                                relation_id,
-                                &primary_keys,
-                            ) {
+                            let rel = match resolve_relation(&decoder, relation_id) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     Err(StreamError::External(format!(
@@ -296,7 +281,7 @@ fn wal_stream(
                                 }
                             };
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
-                                .push_truncate(&rel);
+                                .push_truncate(rel);
                             tracing::info!(
                                 dataset = %dataset_name,
                                 relation_id,
@@ -409,31 +394,22 @@ fn pg_epoch_to_system_time(pg_micros: i64) -> std::time::SystemTime {
     }
 }
 
-/// Clone the cached pgoutput `Relation` and rewrite `is_key` so that *only*
-/// the dataset's declared primary-key columns are treated as keys.
+/// Borrow the cached pgoutput `Relation`. The relation cache has already had
+/// its key flags rewritten so that *only* the dataset's declared primary-key
+/// columns are treated as keys.
 ///
 /// Why: with `REPLICA IDENTITY FULL`, Postgres flags every column as key
 /// (used to match the old tuple during DELETE/UPDATE). That would explode
 /// `ChangeBatch.primary_keys` and include types the delete path can't handle
 /// (floats, dates). The dataset config already tells us which columns are the
 /// real PK — use that.
-fn resolve_relation_with_declared_pks(
+fn resolve_relation(
     decoder: &Decoder,
     relation_id: u32,
-    declared_pks: &[String],
-) -> std::result::Result<super::pgoutput::Relation, StreamError> {
-    let mut rel = decoder
-        .relation(relation_id)
-        .ok_or_else(|| {
-            StreamError::External(format!("change event before Relation for id {relation_id}"))
-        })?
-        .clone();
-    if !declared_pks.is_empty() {
-        for col in &mut rel.columns {
-            col.is_key = declared_pks.iter().any(|pk| pk == &col.name);
-        }
-    }
-    Ok(rel)
+) -> std::result::Result<&super::pgoutput::Relation, StreamError> {
+    decoder.relation(relation_id).ok_or_else(|| {
+        StreamError::External(format!("change event before Relation for id {relation_id}"))
+    })
 }
 
 fn advance(flush: &AtomicU64, to: u64) {

@@ -18,6 +18,7 @@ use datafusion::{
     catalog::TableProvider, logical_expr::dml::InsertOp, physical_plan::RecordBatchStream,
 };
 use multi::MultiSink;
+use runtime_datafusion_index::Index;
 use std::{pin::Pin, sync::Arc};
 use table::TableSink;
 use util::RetryError;
@@ -38,12 +39,25 @@ impl AccelerationSink {
         Self::Table(TableSink::new(table_provider))
     }
 
+    pub fn with_sink_indexes(self, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
+        match self {
+            AccelerationSink::Table(sink) => {
+                AccelerationSink::Table(sink.with_sink_indexes(indexes))
+            }
+            AccelerationSink::Multi(sink) => {
+                AccelerationSink::Multi(sink.with_sink_indexes(indexes))
+            }
+        }
+    }
+
     // Adds a table provider to the AccelerationSink, converting a TableSink to a MultiSink if necessary
     pub fn add_synchronized_table(&mut self, synchronized_table: SynchronizedTable) {
         match self {
             AccelerationSink::Table(table_sink) => {
                 let table_provider = Arc::clone(&table_sink.table_provider);
-                let multi_sink = MultiSink::new(table_provider, vec![synchronized_table]);
+                let sink_indexes = std::mem::take(&mut table_sink.sink_indexes);
+                let multi_sink = MultiSink::new(table_provider, vec![synchronized_table])
+                    .with_sink_indexes(sink_indexes);
                 *self = AccelerationSink::Multi(multi_sink);
             }
             AccelerationSink::Multi(sink) => sink.add_synchronized_table(synchronized_table),

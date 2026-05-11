@@ -16,6 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use arrow::array::RecordBatch;
+use arrow::compute::cast;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow_flight::{
     FlightData, PutResult,
     decode::{DecodedPayload, FlightDataDecoder},
@@ -24,6 +27,7 @@ use arrow_flight::{
     sql::{Any, Command},
 };
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
@@ -165,6 +169,51 @@ async fn decode_flight_batches(
     Ok((schema, batches))
 }
 
+/// Cast columns in `batches` to match `target_schema` where the types differ
+/// but are compatible (e.g. `Timestamp(µs)` → `Timestamp(ns)`).
+fn coerce_batches_to_schema(
+    src_schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    target_schema: &Schema,
+) -> DFResult<(SchemaRef, Vec<RecordBatch>)> {
+    if src_schema.fields().len() == target_schema.fields().len()
+        && src_schema
+            .fields()
+            .iter()
+            .zip(target_schema.fields().iter())
+            .all(|(s, t)| s.data_type() == t.data_type())
+    {
+        return Ok((src_schema, batches));
+    }
+
+    let target_fields = target_schema.fields();
+    let coerced_batches = batches
+        .into_iter()
+        .map(|batch| {
+            if batch.num_columns() != target_fields.len() {
+                return Ok(batch);
+            }
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(target_fields.iter())
+                .map(|(col, target_field)| {
+                    if col.data_type() == target_field.data_type() {
+                        Ok(Arc::clone(col))
+                    } else {
+                        cast(col, target_field.data_type())
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                    }
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            RecordBatch::try_new(Arc::new(target_schema.clone()), columns)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+
+    Ok((Arc::new(target_schema.clone()), coerced_batches))
+}
+
 async fn do_put_raw(
     ctx: Arc<SessionContext>,
     mut streaming: Peekable<Streaming<FlightData>>,
@@ -188,6 +237,12 @@ async fn do_put_raw(
         .map_err(handle_datafusion_error)?;
 
     let (schema, batches) = decode_flight_batches(streaming).await?;
+
+    // Cast batches to the table's schema for compatible type differences
+    // (e.g. Timestamp(µs) incoming vs Timestamp(ns) in the table).
+    let table_schema = table_provider.schema();
+    let (schema, batches) = coerce_batches_to_schema(schema, batches, &table_schema)
+        .map_err(handle_datafusion_error)?;
 
     let insert_plan = table_provider
         .insert_into(

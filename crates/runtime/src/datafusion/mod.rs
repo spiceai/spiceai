@@ -2398,15 +2398,15 @@ impl DataFusion {
             }
         }
 
-        // For append mode without time_column, check if source provides append_stream
-        // Skip this check for Cayenne which has its own validation (supports primary_key or time_column)
-        if refresh_mode == RefreshMode::Append
-            && dataset.time_column.is_none()
-            && acceleration_settings.engine != Engine::Cayenne
-        {
+        // For append mode without time_column, attach the source's append_stream
+        // when available (e.g. Kafka). This enables streaming append into any
+        // accelerator engine, including Cayenne. When the source does not
+        // provide an append_stream, Cayenne falls back to its own validation
+        // (supports primary_key); other engines require time_column.
+        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
             if let Some(append_stream) = source.append_stream(source_table_provider) {
                 accelerated_table_builder.append_stream(append_stream);
-            } else {
+            } else if acceleration_settings.engine != Engine::Cayenne {
                 return Err(Error::AppendRequiresTimeColumn {
                     from: dataset.from.clone(),
                 });
@@ -2907,7 +2907,7 @@ impl DataFusion {
 
         let federated_table_provider = federated_read_table.table_provider().await;
 
-        let source_table_provider = match dataset.access() {
+        let source_table_provider: Arc<dyn TableProvider> = match dataset.access() {
             AccessMode::Read => federated_table_provider,
             AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
                 .read_write_provider(dataset)
@@ -3717,9 +3717,17 @@ async fn wait_until_dependent_tables_are_ready(
             .into_iter()
             .map(|(key, value)| (resolve_table_reference(key), value))
             .collect::<std::collections::HashMap<_, _>>();
+        let catalog_statuses = runtime_status.get_catalog_statuses();
 
         if let Some(not_ready_table) = dependent_tables.iter().find(|dependent_table| {
-            statuses.get(dependent_table) != Some(&status::ComponentStatus::Ready)
+            if let Some(s) = statuses.get(dependent_table) {
+                s != &status::ComponentStatus::Ready
+            } else {
+                // Table not tracked as a dataset or view (e.g. a catalog table).
+                // Consider it ready if its catalog is registered and ready.
+                let catalog = dependent_table.catalog.as_ref();
+                catalog_statuses.get(catalog) != Some(&status::ComponentStatus::Ready)
+            }
         }) {
             tracing::debug!(
                 "Dependent table {not_ready_table} is not ready for {table}. Retrying..."
