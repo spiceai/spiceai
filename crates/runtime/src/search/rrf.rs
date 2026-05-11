@@ -1266,7 +1266,8 @@ mod tests {
     #[cfg(feature = "models")]
     use datafusion::prelude::{DataFrame, named_struct, now, to_unixtime};
     use datafusion::scalar::ScalarValue;
-    use datafusion_expr::ExprFunctionExt as _;
+    #[cfg(feature = "models")]
+    use datafusion_expr::ExprFunctionExt;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::lit;
     #[cfg(feature = "models")]
