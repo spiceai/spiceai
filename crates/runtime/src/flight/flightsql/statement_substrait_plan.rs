@@ -214,9 +214,11 @@ mod tests {
 
     #[test]
     fn decode_plan_proto_invalid_bytes_returns_invalid_argument() {
-        // Random bytes that are not a valid substrait Plan protobuf encoding.
+        // 0x0a = field 1, wire-type 2 (length-delimited); 0x10 = "length 16
+        // bytes follow" — but no further bytes are supplied, forcing prost
+        // into a buffer-underflow decode error.
         let err = decode_plan_proto(&cmd(Some(SubstraitPlan {
-            plan: Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]),
+            plan: Bytes::from_static(&[0x0a, 0x10]),
             version: String::new(),
         })))
         .expect_err("invalid bytes must error");
