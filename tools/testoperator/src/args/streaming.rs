@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::Parser;
+use std::fmt;
+
+use clap::{Parser, ValueEnum};
 
 use super::CommonArgs;
 use crate::commands::streaming::querysets::QuerySetType;
@@ -127,4 +129,97 @@ pub struct StreamingDynamodbCorrectnessArgs {
     /// (for schema inference). These records are consumed during startup.
     #[arg(long, default_value = "10")]
     pub initial_records: usize,
+}
+
+/// Stream source mode for the ingestion benchmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum StreamMode {
+    /// Debezium CDC (PostgreSQL → Debezium → Kafka → Spice, `refresh_mode: changes`)
+    Debezium,
+    /// Plain Kafka append (`refresh_mode: append`)
+    Kafka,
+}
+
+impl fmt::Display for StreamMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Debezium => write!(f, "debezium"),
+            Self::Kafka => write!(f, "kafka"),
+        }
+    }
+}
+
+/// Arguments for the one-time stream preparation step.
+///
+/// Creates a fixed Kafka topic or Debezium-tracked PostgreSQL table, produces
+/// `--rows` data rows, and appends a permanent `benchmark-ready` marker.
+/// Run this once before any `streaming-ingestion` benchmark runs.
+///
+/// ## Environment Variables (Kafka mode)
+/// - `KAFKA_BOOTSTRAP_SERVERS`: Kafka bootstrap servers (default: localhost:9092)
+/// - `KAFKA_SECURITY_PROTOCOL`: Security protocol (default: PLAINTEXT)
+///
+/// ## Environment Variables (Debezium mode)
+/// - `KAFKA_BOOTSTRAP_SERVERS`: Kafka bootstrap servers
+/// - `KAFKA_CONNECT_URL`: Kafka Connect REST URL (default: http://localhost:8083)
+/// - `PG_HOST`, `PG_PORT`, `PG_DB`, `PG_USER`, `PG_PASSWORD`: PostgreSQL connection
+#[derive(Parser, Debug, Clone)]
+pub struct PrepareIngestionStreamArgs {
+    /// Common arguments (spicepod path, spiced path, metrics, etc.)
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Stream source mode: debezium (CDC) or kafka (append)
+    #[arg(long, value_enum)]
+    pub stream_mode: StreamMode,
+
+    /// Kafka topic name (Kafka mode) or Debezium topic prefix (Debezium mode).
+    /// The same value must be passed to `streaming-ingestion --topic`.
+    #[arg(long)]
+    pub topic: String,
+
+    /// Number of data rows to produce (not counting the permanent marker)
+    #[arg(long, default_value = "1000000")]
+    pub rows: u64,
+
+    /// Number of messages per batch (Kafka mode only)
+    #[arg(long, default_value = "5000")]
+    pub batch_size: usize,
+}
+
+/// Arguments for the streaming ingestion benchmark.
+///
+/// Assumes the stream was already prepared with `prepare-ingestion-stream`.
+/// Starts Spice with a unique consumer group (replays from offset 0), waits
+/// for the permanent `benchmark-ready` marker, and emits throughput telemetry.
+///
+/// ## Environment Variables (Kafka mode)
+/// - `KAFKA_BOOTSTRAP_SERVERS`: Kafka bootstrap servers (default: localhost:9092)
+/// - `KAFKA_SECURITY_PROTOCOL`: Security protocol (default: PLAINTEXT)
+///
+/// ## Environment Variables (Debezium mode)
+/// - `KAFKA_BOOTSTRAP_SERVERS`: Kafka bootstrap servers
+#[derive(Parser, Debug, Clone)]
+pub struct StreamingIngestionArgs {
+    /// Common arguments (spicepod path, spiced path, metrics, etc.)
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Stream source mode: debezium (CDC) or kafka (append)
+    #[arg(long, value_enum)]
+    pub stream_mode: StreamMode,
+
+    /// Kafka topic name (Kafka mode) or Debezium topic prefix (Debezium mode).
+    /// Must match the value used in `prepare-ingestion-stream --topic`.
+    #[arg(long)]
+    pub topic: String,
+
+    /// Number of data rows in the pre-ingested stream (used for throughput calculation).
+    /// Must match the `--rows` value used in `prepare-ingestion-stream`.
+    #[arg(long, default_value = "1000000")]
+    pub rows: u64,
+
+    /// Enable health monitoring during ingestion (tracks latency and failures)
+    #[arg(long)]
+    pub enable_liveness: bool,
 }

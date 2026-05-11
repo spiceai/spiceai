@@ -18831,6 +18831,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "rand 0.10.1",
+ "rdkafka",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
@@ -18838,6 +18839,7 @@ dependencies = [
  "spicepod",
  "test-framework",
  "tokio",
+ "tokio-postgres",
  "tokio-util",
  "yaml",
 ]

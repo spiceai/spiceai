@@ -25,7 +25,7 @@ mod spiced_metrics;
 
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SchemaTestArgs, TestCommands,
-    TextToSqlArgs,
+    TextToSqlArgs, PrepareIngestionStreamArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -107,6 +107,22 @@ async fn main() -> anyhow::Result<()> {
         Commands::Export(TestCommands::StreamingDynamodbCorrectness(_)) => {
             return Err(anyhow::anyhow!(
                 "Export is not supported for streaming-dynamodb-correctness (spicepods are transformed at runtime)"
+            ));
+        }
+        Commands::Run(TestCommands::PrepareIngestionStream(args)) => {
+            commands::streaming::run_prepare_stream(&args).await?;
+        }
+        Commands::Export(TestCommands::PrepareIngestionStream(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for prepare-ingestion-stream"
+            ));
+        }
+        Commands::Run(TestCommands::StreamingIngestion(args)) => {
+            commands::streaming::run_ingestion(&args).await?;
+        }
+        Commands::Export(TestCommands::StreamingIngestion(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for streaming-ingestion (spicepods are transformed at runtime)"
             ));
         }
         _ => {

@@ -1,0 +1,140 @@
+name: testoperator streaming ingestion benchmark
+run-name: streaming-ingestion - ${{ github.event.inputs.spicepod_path }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'Spicepod file path (relative to repo root, e.g., test/spicepods/streaming/ingestion/debezium-duckdb-memory.yaml)'
+        required: true
+        type: string
+      stream_mode:
+        description: 'Stream source mode'
+        required: true
+        default: 'debezium'
+        type: choice
+        options:
+          - 'debezium'
+          - 'kafka'
+      rows:
+        description: 'Total rows to produce to the stream'
+        required: true
+        default: '100000'
+        type: string
+      initial_rows:
+        description: 'Rows to produce before starting Spice (schema inference seed)'
+        required: true
+        default: '10'
+        type: string
+      ready_wait:
+        description: 'Seconds to wait for spiced to start and markers to be ingested'
+        required: true
+        default: '120'
+        type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-dev-runners'
+        type: choice
+        options:
+          - 'spiceai-dev-runners'
+          - 'spiceai-dev-large-runners'
+      enable_liveness:
+        description: 'Enable health monitoring during ingestion'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  run-streaming-ingestion-benchmark:
+    name: Run streaming ingestion benchmark
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 120
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Load secrets from AWS
+        uses: ./.github/actions/load-aws-secrets
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          INPUT_PATH="${{ github.event.inputs.spicepod_path }}"
+          if [[ "${INPUT_PATH}" == ./* ]]; then
+            SPICEPOD_PATH="${INPUT_PATH}"
+          else
+            SPICEPOD_PATH="./${INPUT_PATH}"
+          fi
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Run streaming ingestion benchmark
+        run: |
+          LIVENESS_FLAG=""
+          if [ "${{ github.event.inputs.enable_liveness }}" = "true" ]; then
+            LIVENESS_FLAG="--enable-liveness"
+          fi
+
+          testoperator run streaming-ingestion \
+            -s /usr/local/bin/spiced \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            --stream-mode ${{ github.event.inputs.stream_mode }} \
+            --rows ${{ github.event.inputs.rows }} \
+            --initial-rows ${{ github.event.inputs.initial_rows }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --metrics \
+            ${LIVENESS_FLAG}
+        env:
+          # Kafka / Redpanda
+          KAFKA_BOOTSTRAP_SERVERS: ${{ env.KAFKA_BOOTSTRAP_SERVERS }}
+          KAFKA_SECURITY_PROTOCOL: PLAINTEXT
+          # Kafka Connect / Debezium (used for debezium stream mode)
+          KAFKA_CONNECT_URL: ${{ env.KAFKA_CONNECT_URL }}
+          # PostgreSQL source (used for debezium stream mode)
+          PG_HOST: ${{ env.CDC_PG_HOST }}
+          PG_PORT: ${{ env.CDC_PG_PORT }}
+          PG_DB: ${{ env.CDC_PG_DB }}
+          PG_USER: ${{ env.CDC_PG_USER }}
+          PG_PASSWORD: ${{ env.CDC_PG_PASSWORD }}
+          DEBEZIUM_TOPIC_PREFIX: ${{ env.DEBEZIUM_TOPIC_PREFIX }}
+          # Acceleration PostgreSQL (used for postgres engine spicepods)
+          ACCEL_PG_HOST: ${{ env.ACCEL_PG_HOST }}
+          ACCEL_PG_PORT: ${{ env.ACCEL_PG_PORT }}
+          ACCEL_PG_DB: ${{ env.ACCEL_PG_DB }}
+          ACCEL_PG_USER: ${{ env.ACCEL_PG_USER }}
+          ACCEL_PG_PASSWORD: ${{ env.ACCEL_PG_PASSWORD }}
+          # Metrics
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

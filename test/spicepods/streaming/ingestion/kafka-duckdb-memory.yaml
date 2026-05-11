@@ -1,0 +1,19 @@
+version: v1
+kind: Spicepod
+name: streaming-ingestion-kafka-duckdb-memory
+
+datasets:
+  - from: kafka:events
+    name: events
+    params:
+      kafka_bootstrap_servers: localhost:9092
+      kafka_security_protocol: PLAINTEXT
+      kafka_consumer_group_id: spice-ingestion-placeholder-2
+      kafka_message_format: json
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_mode: append
+    metrics:
+      - name: records_consumed_total

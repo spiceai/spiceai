@@ -25,7 +25,9 @@ limitations under the License.
 
 pub mod correctness;
 pub mod datasets;
+pub mod ingestion_runner;
 pub mod mutations;
+pub mod prepare_runner;
 pub mod query_liveness;
 pub mod querysets;
 pub mod runner;
@@ -35,4 +37,6 @@ mod utils;
 pub mod verification;
 
 pub use correctness::run_correctness;
+pub use ingestion_runner::run_ingestion;
+pub use prepare_runner::run_prepare_stream;
 pub use runner::run_benchmark;

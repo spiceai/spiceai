@@ -1,0 +1,20 @@
+version: v1
+kind: Spicepod
+name: streaming-ingestion-debezium-arrow-memory
+
+datasets:
+  - from: debezium:dbserver1.public.events
+    name: events
+    params:
+      debezium_transport: kafka
+      debezium_message_format: json
+      kafka_bootstrap_servers: localhost:9092
+      kafka_security_protocol: PLAINTEXT
+      kafka_consumer_group_id: spice-ingestion-placeholder
+    acceleration:
+      enabled: true
+      engine: arrow
+      mode: memory
+      refresh_mode: changes
+    metrics:
+      - name: records_consumed_total

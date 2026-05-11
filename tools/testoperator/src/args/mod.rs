@@ -38,8 +38,8 @@ pub use text_to_sql::TextToSqlArgs;
 mod schema;
 pub use schema::SchemaTestArgs;
 
-mod streaming;
-pub use streaming::{StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs};
+pub mod streaming;
+pub use streaming::{PrepareIngestionStreamArgs, StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs, StreamingIngestionArgs};
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -74,6 +74,10 @@ pub enum TestCommands {
     StreamingDynamodb(StreamingDynamodbArgs),
     /// Run a streaming `DynamoDB` data correctness test (multi-round CDC verification)
     StreamingDynamodbCorrectness(StreamingDynamodbCorrectnessArgs),
+    /// Prepare a persistent Kafka topic or Debezium stream for ingestion benchmarks (run once)
+    PrepareIngestionStream(PrepareIngestionStreamArgs),
+    /// Run a streaming ingestion benchmark using a precreated Kafka or Debezium stream
+    StreamingIngestion(StreamingIngestionArgs),
     /// Validate catalog connector schema discovery via `information_schema`
     Schema(SchemaTestArgs),
 }

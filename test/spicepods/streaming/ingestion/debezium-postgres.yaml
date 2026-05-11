@@ -1,0 +1,25 @@
+version: v1
+kind: Spicepod
+name: streaming-ingestion-debezium-postgres
+
+datasets:
+  - from: debezium:dbserver1.public.events
+    name: events
+    params:
+      debezium_transport: kafka
+      debezium_message_format: json
+      kafka_bootstrap_servers: localhost:9092
+      kafka_security_protocol: PLAINTEXT
+      kafka_consumer_group_id: spice-ingestion-placeholder
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_mode: changes
+      params:
+        pg_host: ${env:ACCEL_PG_HOST}
+        pg_port: ${env:ACCEL_PG_PORT}
+        pg_db: ${env:ACCEL_PG_DB}
+        pg_user: ${env:ACCEL_PG_USER}
+        pg_pass: ${env:ACCEL_PG_PASSWORD}
+    metrics:
+      - name: records_consumed_total
