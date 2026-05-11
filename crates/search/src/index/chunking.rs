@@ -1198,10 +1198,7 @@ mod tests {
             assert_eq!(fsl.len(), 5000);
             for chunk_idx in 0..fsl.len() {
                 let vec = fsl.value(chunk_idx);
-                let arr = vec
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .expect("f32");
+                let arr = vec.as_any().downcast_ref::<Float32Array>().expect("f32");
                 assert_eq!(
                     arr.value(0),
                     chunk_idx as f32,
