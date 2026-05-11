@@ -833,6 +833,10 @@ pub struct Query {
     /// Specifies the compression codec used when spilling data to disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spill_compression: Option<SpillCompression>,
+
+    /// Overrides DataFusion's local query target partition count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_partitions: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1255,7 +1259,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: None,
-                memory_limit: Some("100MiB".to_string())
+                memory_limit: Some("100MiB".to_string()),
+                target_partitions: None,
             })
         );
 
@@ -1270,7 +1275,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: None,
-                memory_limit: Some("200MiB".to_string())
+                memory_limit: Some("200MiB".to_string()),
+                target_partitions: None,
             })
         );
 
@@ -1286,7 +1292,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: None,
-                memory_limit: Some("200MiB".to_string())
+                memory_limit: Some("200MiB".to_string()),
+                target_partitions: None,
             })
         );
 
@@ -1309,7 +1316,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: Some("/foo".to_string()),
-                memory_limit: None
+                memory_limit: None,
+                target_partitions: None,
             })
         );
 
@@ -1324,7 +1332,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None
+                memory_limit: None,
+                target_partitions: None,
             })
         );
 
@@ -1340,7 +1349,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None
+                memory_limit: None,
+                target_partitions: None,
             })
         );
 
@@ -1349,6 +1359,19 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
+    }
+
+    #[test]
+    fn test_query_target_partitions() {
+        let yaml = r"
+            query:
+                target_partitions: 64
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.query.unwrap_or_default().target_partitions,
+            Some(64)
+        );
     }
 
     #[test]

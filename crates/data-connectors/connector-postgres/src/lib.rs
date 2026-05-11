@@ -166,6 +166,19 @@ const PARAMETERS: &[ParameterSpec] = &[
              Default: 10s.",
         )
         .default("10s"),
+    ParameterSpec::component("replication_bootstrap_batch_size")
+        .description(
+            "Rows per emitted batch during the initial replication snapshot. \
+             Default: 8192. Maximum: 1048576.",
+        )
+        .default("8192"),
+    ParameterSpec::component("replication_ack_filtered_lsn")
+        .description(
+            "Whether to acknowledge keepalive WAL positions when no decoded transaction \
+             is pending, allowing filtered publications to release retained WAL. \
+             Default: true.",
+        )
+        .default("true"),
 ];
 
 impl DataConnectorFactory for PostgresFactory {

@@ -120,8 +120,35 @@ All replication-specific parameters live under `params:` on the dataset and star
 | `pg_replication_initial_snapshot`      | `true`                              | If `true`, take an initial snapshot of the table's existing rows before streaming. Set to `false` if you are pre-seeding the accelerator yourself. |
 | `pg_replication_temporary_slot`        | `false`                             | If `true`, the slot is dropped when Spice disconnects. Every restart re-bootstraps. |
 | `pg_replication_status_interval`       | `10s`                               | How often `StandbyStatusUpdate` (LSN acknowledgement) is sent back to Postgres. Lower values free WAL faster; higher values reduce network chatter. Accepts any [fundu](https://docs.rs/fundu) duration string (`500ms`, `30s`, `2m`). |
+| `pg_replication_bootstrap_batch_size`  | `8192`                              | Rows per batch emitted by the initial snapshot stream. Increase for large tables to reduce per-batch write/planning overhead; decrease to reduce peak memory. Maximum: `1048576`. |
+| `pg_replication_ack_filtered_lsn`      | `true`                              | If `true`, Spice advances slot acknowledgement on keepalives when no decoded transaction is pending. This lets quiet or filtered publications release retained WAL even when no table changes are emitted. |
 
 All existing `pg_host`, `pg_port`, `pg_user`, `pg_pass`, `pg_db`, `pg_sslmode`, `pg_connection_string`, etc. parameters continue to apply.
+
+### Runtime CDC apply tuning
+
+For high-throughput catch-up workloads, the runtime CDC apply loop can be tuned under `runtime.params`:
+
+```yaml
+runtime:
+  params:
+    cdc_prefetch_buffer: '128'
+    cdc_max_coalesced_envelopes: '256'
+    cdc_max_coalesced_bytes: '134217728'
+    cdc_commit_timeout_ms: '30000'
+```
+
+`cdc_prefetch_buffer` controls decoded envelope buffering between the source reader and accelerator writer. `cdc_max_coalesced_envelopes` and `cdc_max_coalesced_bytes` control how many envelopes are merged into one accelerator write. Larger values improve catch-up throughput by amortizing planning and write overhead, but increase peak memory.
+
+For standalone analytical query benchmarks, `runtime.query.target_partitions` can be set to control DataFusion's local query parallelism:
+
+```yaml
+runtime:
+  query:
+    target_partitions: 64
+```
+
+Set this near the number of CPU cores or expected scan partitions, then verify with `EXPLAIN ANALYZE`. In cluster mode, Spice sets target partitions dynamically from executor slots.
 
 #### `pg_sslmode` for WAL streaming
 
