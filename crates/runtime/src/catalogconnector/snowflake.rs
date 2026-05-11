@@ -128,12 +128,21 @@ impl CatalogConnector for SnowflakeCatalog {
 
         let table_factory = Arc::new(SnowflakeTableFactory::new(pool));
 
-        let catalog_provider = Arc::new(SnowflakeCatalogProvider::new(
-            api,
-            database,
-            table_factory,
-            catalog.include.clone(),
-        ));
+        let catalog_provider = if catalog.access.allows_write() {
+            Arc::new(SnowflakeCatalogProvider::new_read_write(
+                api,
+                database,
+                table_factory,
+                catalog.include.clone(),
+            ))
+        } else {
+            Arc::new(SnowflakeCatalogProvider::new(
+                api,
+                database,
+                table_factory,
+                catalog.include.clone(),
+            ))
+        };
 
         // Initial refresh to populate schemas and tables
         catalog_provider

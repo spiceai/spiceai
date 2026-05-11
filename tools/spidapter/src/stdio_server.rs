@@ -505,7 +505,7 @@ async fn execute_sql_statement(
     }
 }
 
-fn generate_adbc_create_table_statements(
+pub(crate) fn generate_adbc_create_table_statements(
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<Vec<String>> {
     let mut dataset_names = datasets.keys().cloned().collect::<Vec<_>>();
@@ -522,7 +522,7 @@ fn generate_adbc_create_table_statements(
         .collect()
 }
 
-fn generate_adbc_create_table_statement(
+pub(crate) fn generate_adbc_create_table_statement(
     dataset_name: &str,
     dataset: &DatasetConfig,
 ) -> anyhow::Result<String> {
@@ -594,7 +594,7 @@ fn generate_adbc_create_table_statement(
     ))
 }
 
-fn adbc_sql_type_for_arrow(data_type: &DataType) -> anyhow::Result<String> {
+pub(crate) fn adbc_sql_type_for_arrow(data_type: &DataType) -> anyhow::Result<String> {
     let sql_type = match data_type {
         DataType::Boolean => "BOOLEAN".to_string(),
         DataType::Int8 => "TINYINT".to_string(),
@@ -629,7 +629,7 @@ fn adbc_sql_type_for_arrow(data_type: &DataType) -> anyhow::Result<String> {
     Ok(sql_type)
 }
 
-fn quote_identifier(identifier: &str) -> String {
+pub(crate) fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 

@@ -14,15 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use cayenne::{CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider};
 use clap::Parser;
 use data_components::RefreshableCatalogProvider as _;
-use datafusion::catalog::{CatalogProvider as _, SchemaProvider};
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::{
+    catalog::{CatalogProvider as _, SchemaProvider},
+    execution::SessionStateBuilder,
+    prelude::{SessionConfig, SessionContext},
+};
+use datafusion_ddl::{DdlAnalyzerRule, DdlExtensionPlanner, new_shared_store};
 use datafusion_flightsql::FlightSqlService;
+use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 use snafu::prelude::*;
 use tonic::transport::Server;
 
@@ -133,22 +139,32 @@ async fn main() -> Result<()> {
             .clone_from(&args.default_schema);
     }
 
-    let ctx = Arc::new(SessionContext::new_with_config(session_config));
-
-    let provider_config = CayenneCatalogProviderConfig {
-        data_dir: args.cayenne_data_dir.clone(),
-        metadata_dir: args.cayenne_metadata_dir.clone(),
-        spice_data_base_path: args.spice_data_base_path.clone(),
-        footer_cache_mb: args.cayenne_footer_cache_mb,
-        segment_cache_mb: args.cayenne_segment_cache_mb,
-        target_file_size_mb: args.cayenne_target_file_size_mb,
-        compression_strategy: None,
-    };
+    // Register DdlExtensionPlanner so that CREATE TABLE / DROP TABLE / CREATE SCHEMA
+    // executed via Flight SQL create real Cayenne (Vortex) tables, not in-memory ones.
+    let state = SessionStateBuilder::new()
+        .with_config(session_config)
+        .with_default_features()
+        .with_query_planner(Arc::new(
+            ExtensionPlanQueryPlanner::from_extension_planners(vec![Arc::new(DdlExtensionPlanner)]),
+        ))
+        .build();
+    let ctx = Arc::new(SessionContext::new_with_state(state));
 
     let provider = Arc::new(
-        CayenneCatalogProvider::try_new(provider_config, ctx.runtime_env())
-            .await
-            .context(CayenneCatalogInitSnafu)?,
+        CayenneCatalogProvider::try_new(
+            CayenneCatalogProviderConfig {
+                data_dir: args.cayenne_data_dir.clone(),
+                metadata_dir: args.cayenne_metadata_dir.clone(),
+                spice_data_base_path: args.spice_data_base_path.clone(),
+                footer_cache_mb: args.cayenne_footer_cache_mb,
+                segment_cache_mb: args.cayenne_segment_cache_mb,
+                target_file_size_mb: args.cayenne_target_file_size_mb,
+                compression_strategy: None,
+            },
+            ctx.runtime_env(),
+        )
+        .await
+        .context(CayenneCatalogInitSnafu)?,
     );
 
     provider
@@ -162,6 +178,24 @@ async fn main() -> Result<()> {
         &args.catalog,
         Arc::clone(&provider) as Arc<dyn datafusion::catalog::CatalogProvider>,
     );
+
+    // Register CayenneDdlHandler so that CREATE TABLE / DROP TABLE / CREATE SCHEMA
+    // executed via Flight SQL create real Cayenne (Vortex) tables, not in-memory ones.
+    {
+        let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::from([args.catalog.clone()])));
+        let ddl_store = new_shared_store(&args.catalog, &args.default_schema);
+        let ddl_handler =
+            Arc::new(cayenne::CayenneDdlHandler {}) as Arc<dyn datafusion_ddl::CatalogDdlHandler>;
+
+        ctx.add_analyzer_rule(Arc::new(DdlAnalyzerRule::new(
+            ctx.state().catalog_list(),
+            &ddl_enabled_catalogs,
+            ddl_store,
+            ddl_handler,
+            &args.default_schema,
+            &args.catalog,
+        )));
+    }
 
     let schema_names = provider.schema_names();
     tracing::info!(
@@ -196,7 +230,11 @@ async fn main() -> Result<()> {
     tracing::info!(addr = %args.addr, "Starting Flight SQL service");
 
     let server_result = Server::builder()
-        .add_service(FlightSqlService::new(Arc::clone(&ctx)).into_server())
+        .add_service(
+            FlightSqlService::new(Arc::clone(&ctx))
+                .into_server()
+                .max_decoding_message_size(256 * 1024 * 1024),
+        )
         .serve_with_shutdown(args.addr, util::shutdown_signal())
         .await;
 
