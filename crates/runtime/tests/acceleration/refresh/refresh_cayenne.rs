@@ -23,7 +23,7 @@ use crate::postgres::common;
 use crate::postgres::common::get_random_port;
 use crate::{
     configure_test_datafusion, configure_test_datafusion_request_context, init_tracing,
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 use arrow::array::Array;
 use spicepod::acceleration::Mode;
@@ -306,7 +306,6 @@ async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow
 }
 
 #[tokio::test]
-#[ignore = "https://github.com/spiceai/spiceai/issues/7860"] // https://github.com/spiceai/spiceai/issues/7860
 async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -332,12 +331,16 @@ async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Er
                 get_acceleration_config_append("cayenne", Some(Params::from_string_map(params)));
             acceleration_config.mode = Mode::File;
 
-            // Remove both primary_key and time_column - this should cause dataset initialization to fail
+            // Remove primary_key (combined with no time_column from the dataset)
+            // so that append mode has neither constraint - this should cause
+            // dataset initialization to fail.
             acceleration_config.primary_key = None;
 
-            // Create the dataset with invalid configuration
+            // Create the dataset with invalid configuration (no time_column)
             let mut dataset = get_dataset_no_time_column(port);
             dataset.acceleration = Some(acceleration_config);
+
+            register_test_connectors().await;
 
             let app = app::AppBuilder::new("test_acceleration_refresh")
                 .with_dataset(dataset)
@@ -348,14 +351,13 @@ async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Er
 
             let rt = Arc::new(runtime::Runtime::builder().with_app(app).build().await);
 
-            // Spawn load_components in background (it will keep retrying)
-            let rt_clone = Arc::clone(&rt);
-            tokio::spawn(async move {
-                rt_clone.load_components().await;
-            });
-
-            // Wait a bit for the first initialization attempt
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // load_components retries failed dataset initialization indefinitely, so
+            // it won't complete here. Bound the wait with a timeout so the test
+            // proceeds to verify the dataset never became queryable.
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+                () = Arc::clone(&rt).load_components() => {}
+            }
 
             // Verify that the dataset is not available (failed to initialize)
             let result = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await;
