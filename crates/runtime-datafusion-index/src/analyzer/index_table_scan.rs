@@ -1140,7 +1140,7 @@ mod test {
 
     /// Regression test for #10223: a field-level metadata difference (e.g. FTS attaching
     /// metadata to indexed fields) must not trigger a false "unexpected schema" error.
-    /// Arrow's `Field` PartialEq includes field-level metadata, so the old `fields() != fields()`
+    /// Arrow's `Field` `PartialEq` includes field-level metadata, so the old `fields() != fields()`
     /// check would fail even when names, types, and nullability are identical.
     #[tokio::test]
     async fn pipeline_tolerates_field_level_metadata_difference() {
