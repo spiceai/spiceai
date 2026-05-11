@@ -10,8 +10,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow.workspace = true
+anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 dirs = "6"
@@ -23,6 +24,7 @@ spice-cloud-client.workspace = true
 spicepod = { path = "../../crates/spicepod", default-features = false }
 system-adapter-protocol.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 url.workspace = true
 uuid.workspace = true
 yaml = { path = "../../crates/yaml" }

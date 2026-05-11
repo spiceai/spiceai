@@ -3478,11 +3478,14 @@ dependencies = [
 name = "cayenne-flightsql"
 version = "2.0.0-enterprise-beta"
 dependencies = [
+ "async-trait",
  "cayenne",
  "clap",
  "data_components",
  "datafusion",
+ "datafusion-ddl",
  "datafusion-flightsql",
+ "runtime-datafusion",
  "snafu",
  "tokio",
  "tonic",
@@ -6286,7 +6289,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=f4f864d22cc92ee65e33b76afbd128a2ffc50d48#f4f864d22cc92ee65e33b76afbd128a2ffc50d48"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=8df061143d7f5ce7640f531e74dddb471877642a#8df061143d7f5ce7640f531e74dddb471877642a"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -18288,6 +18291,7 @@ version = "2.0.0-enterprise-beta"
 dependencies = [
  "anyhow",
  "arrow",
+ "arrow-flight",
  "async-trait",
  "clap",
  "dirs",
@@ -18299,6 +18303,7 @@ dependencies = [
  "spicepod",
  "system-adapter-protocol",
  "tokio",
+ "tonic",
  "url",
  "uuid 1.23.1",
  "yaml",

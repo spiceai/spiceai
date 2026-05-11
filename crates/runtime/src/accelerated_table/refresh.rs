@@ -1194,24 +1194,21 @@ impl Refresher {
         changes_stream: ChangesStream,
         on_batch_process_callback: Option<SnapshotCallback>,
     ) -> tokio::task::JoinHandle<()> {
-        let refresh_task = Arc::new(
-            RefreshTask::builder(
-                Arc::clone(&self.runtime_status),
-                self.dataset_name.clone(),
-                Arc::clone(&self.federated),
-                self.federated_source.clone(),
-                Arc::clone(&self.accelerator),
-                self.io_runtime.clone(),
-                Arc::clone(&self.accelerator_write_mutex),
-            )
-            .with_disable_federation(self.disable_federation)
-            .with_cpu_runtime(self.cpu_runtime.clone())
-            .with_metrics(self.metrics.clone())
-            .with_on_stream_batch_process_callback(on_batch_process_callback)
-            .with_last_updated_at(Arc::clone(&self.last_updated_at))
-            .with_s3_express_acceleration(self.is_s3_express_acceleration)
-            .build(),
-        );
+        let refresh_task_builder = RefreshTask::builder(
+            Arc::clone(&self.runtime_status),
+            self.dataset_name.clone(),
+            Arc::clone(&self.federated),
+            self.federated_source.clone(),
+            Arc::clone(&self.accelerator),
+            self.io_runtime.clone(),
+            Arc::clone(&self.accelerator_write_mutex),
+        )
+        .with_disable_federation(self.disable_federation)
+        .with_cpu_runtime(self.cpu_runtime.clone())
+        .with_metrics(self.metrics.clone())
+        .with_on_stream_batch_process_callback(on_batch_process_callback)
+        .with_last_updated_at(Arc::clone(&self.last_updated_at))
+        .with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
@@ -1219,6 +1216,7 @@ impl Refresher {
 
         let notifier = self.on_complete_notification.clone();
         tokio::spawn(async move {
+            let refresh_task = refresh_task_builder.build();
             if let Err(err) = refresh_task
                 .start_changes_stream(
                     refresh,

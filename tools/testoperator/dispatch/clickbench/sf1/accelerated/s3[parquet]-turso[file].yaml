@@ -2,5 +2,6 @@ tests:
   bench:
     spicepod_path: accelerated/s3[parquet]-turso[file].yaml
     query_set: clickbench
+    query_overrides: turso
     runner_type: spicehq-dev-large-runners
     ready_wait: 1800

@@ -10,11 +10,14 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-cayenne = { path = "../../crates/cayenne" }
+async-trait = { workspace = true }
+cayenne = { path = "../../crates/cayenne", features = ["partition-table-provider"] }
 clap = { workspace = true, features = ["derive", "env"] }
 data_components = { path = "../../crates/data_components" }
 datafusion = { workspace = true }
+datafusion-ddl = { path = "../../crates/datafusion-ddl" }
 datafusion-flightsql = { path = "../../crates/datafusion-flightsql" }
+runtime-datafusion = { path = "../../crates/runtime-datafusion" }
 snafu = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
