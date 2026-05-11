@@ -28,6 +28,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
@@ -41,6 +42,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, col};
 use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::{SessionContext, lit};
 use datafusion::scalar::ScalarValue;
@@ -51,9 +53,9 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use util::stream_utils::StreamingExec;
 
 use crate::accelerated_table::refresh::Refresher;
-use crate::accelerated_table::write::write_back::execute_insert;
 use crate::federated_table::FederatedTable;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -452,12 +454,14 @@ pub(crate) fn start_wal_worker(
     })
 }
 
+// ── WAL delivery ──────────────────────────────────────────────────────────────
+
 /// Deliver all undelivered WAL entries to the federated source, one `txn_id` group at a time.
 ///
-/// Each group represents one client DML operation (potentially spanning multiple chunks).
-/// INSERT and UPDATE are delivered as a single upsert (one SQL statement = one implicit
-/// federated transaction). DELETE accumulates all PK batches and issues one `delete_from`
-/// call. The checkpoint advances only after the entire group is delivered.
+/// INSERT and UPDATE are streamed directly into `insert_into` — no full-group buffering.
+/// DELETE accumulates only PK bytes (much smaller than full rows) to build the filter,
+/// then issues a single `delete_from` call.
+/// The checkpoint advances only after the entire group is delivered.
 pub(crate) async fn deliver_pending(
     wal: &Arc<WalContext>,
     federated: &Arc<FederatedTable>,
@@ -480,32 +484,59 @@ pub(crate) async fn deliver_pending(
 
         match op {
             WalOp::Insert | WalOp::Update => {
-                // Both use upsert so that the entire group is one implicit federated transaction.
-                let mut all_batches =
-                    arrow_ipc_to_batches(&first.new_values.unwrap_or_default())?;
-                while let Some(result) = stream.next().await {
-                    let entry = result?;
-                    max_seq = max_seq.max(entry.seq);
-                    all_batches
-                        .extend(arrow_ipc_to_batches(&entry.new_values.unwrap_or_default())?);
-                }
-                if !all_batches.is_empty() {
-                    let schema = all_batches[0].schema();
-                    execute_insert(
-                        Arc::clone(&federated_provider),
-                        schema,
-                        all_batches,
-                        InsertOp::Replace,
-                        &session_state,
-                        None,
-                    )
+                // max_seq is updated inside the stream closure; share it via an atomic.
+                let max_seq_atom = Arc::new(AtomicI64::new(first.seq));
+                let max_seq_clone = Arc::clone(&max_seq_atom);
+
+                let first_ipc = first.new_values.unwrap_or_default();
+                let first_batches = arrow_ipc_to_batches(&first_ipc)?;
+                let schema = federated_provider.schema();
+
+                // Build a lazy RecordBatch stream from the WAL entry stream.
+                // Each entry's IPC bytes are decoded on demand; the full group is never buffered.
+                let batch_stream: BoxStream<'static, DataFusionResult<RecordBatch>> = Box::pin(
+                    futures::stream::iter(first_batches.into_iter().map(Ok::<_, DataFusionError>))
+                        .chain(stream.flat_map(
+                            move |result| -> BoxStream<'static, DataFusionResult<RecordBatch>> {
+                                match result {
+                                    Err(e) => Box::pin(futures::stream::once(
+                                        futures::future::ready(Err(DataFusionError::External(e))),
+                                    )),
+                                    Ok(entry) => {
+                                        max_seq_clone.fetch_max(entry.seq, Ordering::SeqCst);
+                                        match arrow_ipc_to_batches(
+                                            &entry.new_values.unwrap_or_default(),
+                                        ) {
+                                            Err(e) => Box::pin(futures::stream::once(
+                                                futures::future::ready(Err(
+                                                    DataFusionError::External(e),
+                                                )),
+                                            )),
+                                            Ok(batches) => Box::pin(futures::stream::iter(
+                                                batches.into_iter().map(Ok::<_, DataFusionError>),
+                                            )),
+                                        }
+                                    }
+                                }
+                            },
+                        )),
+                );
+
+                let adapted = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
+                let plan_input = Arc::new(StreamingExec::new(&schema, Box::pin(adapted)));
+                let insert_plan = federated_provider
+                    .insert_into(&session_state, plan_input, InsertOp::Replace)
                     .await
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
-                }
+                datafusion::physical_plan::collect(insert_plan, session_state.task_ctx())
+                    .await
+                    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
+
+                max_seq = max_seq_atom.load(Ordering::SeqCst);
             }
             WalOp::Delete => {
-                // Combine all PK batches into one filter set so the entire group is one
-                // delete_from call (one implicit federated transaction).
+                // Accumulate only PK bytes from all entries, then issue one delete_from call.
+                // PK data is orders of magnitude smaller than full row data so buffering is OK.
                 let mut pk_batches = arrow_ipc_to_batches(&first.pks_ipc)?;
                 while let Some(result) = stream.next().await {
                     let entry = result?;

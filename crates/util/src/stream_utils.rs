@@ -123,13 +123,13 @@ pub fn sort_stream(
 ///
 /// This is a simple wrapper that allows integrating an existing stream
 /// into `DataFusion`'s `ExecutionPlan` framework for operations like sorting.
-struct StreamingExec {
+pub struct StreamingExec {
     stream: Mutex<Option<SendableRecordBatchStream>>,
     properties: PlanProperties,
 }
 
 impl StreamingExec {
-    fn new(schema: &SchemaRef, stream: SendableRecordBatchStream) -> Self {
+    pub fn new(schema: &SchemaRef, stream: SendableRecordBatchStream) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(schema)),
             Partitioning::UnknownPartitioning(1),

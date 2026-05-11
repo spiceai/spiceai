@@ -27,8 +27,6 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use futures::stream::BoxStream;
-use tokio::sync::mpsc;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -39,6 +37,8 @@ use datafusion_table_providers::duckdb::{RelationName, TableDefinition, TableMan
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use futures::stream::BoxStream;
+use tokio::sync::mpsc;
 
 use crate::accelerated_table::write::wal::{
     WalBackend, WalEntry, WalOp, arrow_ipc_to_batches, batches_to_arrow_ipc, extract_pks_ipc,
