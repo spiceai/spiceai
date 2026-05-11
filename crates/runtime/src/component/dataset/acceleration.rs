@@ -358,6 +358,7 @@ impl Acceleration {
     #[must_use]
     pub fn is_hash_index_enabled(&self) -> bool {
         matches!(self.engine, Engine::Arrow | Engine::PartitionedArrow)
+            && self.enabled
             && (!self.indexes.is_empty()
                 || (self.primary_key.is_some()
                     && !matches!(self.refresh_mode, Some(RefreshMode::Caching))))

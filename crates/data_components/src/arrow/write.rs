@@ -17,7 +17,7 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
-use arrow::array::{Array, BooleanBuilder};
+use arrow::array::{Array, ArrayRef, BooleanBuilder};
 use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
@@ -371,16 +371,9 @@ impl MemTable {
             return Ok(0);
         }
 
-        self.schema
-            .logically_equivalent_names_and_types(&rows.schema())
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Deleting rows by full-row match requires the same schema as the table. {e}"
-                ))
-            })?;
-
+        let rows = reorder_record_batch_to_schema(rows, &self.schema)?;
         let converter = row_converter_for_schema(&self.schema)?;
-        let mut delete_counts = row_key_counts(rows, &converter)?;
+        let mut delete_counts = row_key_counts(&rows, &converter)?;
         let mut deleted = 0_u64;
 
         for partition in &self.batches {
@@ -443,6 +436,63 @@ fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {
         .collect();
 
     RowConverter::new(sort_fields)
+        .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))
+}
+
+fn reorder_record_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    let batch_schema = batch.schema();
+    if schema.fields().len() != batch_schema.fields().len() {
+        return Err(DataFusionError::Execution(format!(
+            "Deleting rows by full-row match requires the same number of columns as the table. Expected {}, got {}.",
+            schema.fields().len(),
+            batch_schema.fields().len()
+        )));
+    }
+
+    for field in schema.fields() {
+        let index = batch_schema.index_of(field.name()).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Deleting rows by full-row match requires table column '{}' in the delete batch. {e}",
+                field.name()
+            ))
+        })?;
+        let batch_field = batch_schema.field(index);
+        if field.data_type() != batch_field.data_type() {
+            return Err(DataFusionError::Execution(format!(
+                "Deleting rows by full-row match requires table column '{}' to have type {}, got {}.",
+                field.name(),
+                field.data_type(),
+                batch_field.data_type()
+            )));
+        }
+    }
+
+    if schema
+        .fields()
+        .iter()
+        .zip(batch_schema.fields().iter())
+        .all(|(field, batch_field)| {
+            field.name() == batch_field.name() && field.data_type() == batch_field.data_type()
+        })
+    {
+        return Ok(batch.clone());
+    }
+
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let index = batch_schema.index_of(field.name()).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Deleting rows by full-row match requires table column '{}' in the delete batch. {e}",
+                    field.name()
+                ))
+            })?;
+            Ok(Arc::clone(batch.column(index)) as ArrayRef)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    RecordBatch::try_new(Arc::clone(schema), columns)
         .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))
 }
 
@@ -1819,6 +1869,45 @@ mod tests {
             .expect("result should be UInt64Array");
         let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
+    }
+
+    #[tokio::test]
+    async fn test_delete_matching_rows_reorders_columns() {
+        let (rb, schema) = create_batch_with_string_columns(&[
+            ("id", vec!["1", "2", "3"]),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![rb]])
+            .expect("mem table should be created");
+        let (delete_rows, _) =
+            create_batch_with_string_columns(&[("value", vec!["b"]), ("id", vec!["2"])]);
+
+        let deleted = table
+            .delete_matching_rows(&delete_rows)
+            .await
+            .expect("delete by reordered full-row batch should succeed");
+        assert_eq!(deleted, 1);
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+        let remaining_ids: Vec<_> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("id column should be StringArray")
+                    .iter()
+            })
+            .collect();
+        assert_eq!(remaining_ids, vec![Some("1"), Some("3")]);
     }
 
     #[tokio::test]
