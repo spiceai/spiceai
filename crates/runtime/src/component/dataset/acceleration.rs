@@ -437,7 +437,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             && params.data.remove("hash_index").is_some()
         {
             tracing::warn!(
-                "The hash_index acceleration parameter is ignored for Arrow acceleration; hash indexes are automatically enabled when primary_key or indexes are configured."
+                "The hash_index acceleration parameter is ignored for Arrow acceleration; hash_index alone no longer enables indexing. Hash indexes are automatically enabled only when primary_key or indexes are configured."
             );
         }
         // Note: The warning for hash_index being experimental is logged once
@@ -739,5 +739,20 @@ mod tests {
         // Test missing parameter (default)
         let result = parse_caching_stale_if_error(&mut None).expect("to parse");
         assert_eq!(result, StaleIfError::Disabled);
+    }
+
+    #[test]
+    fn test_hash_index_param_is_ignored() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            params: Some(Params::from_string_map(HashMap::from([(
+                "hash_index".to_string(),
+                "enabled".to_string(),
+            )]))),
+            ..Default::default()
+        };
+
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+        assert!(!parsed.params.contains_key("hash_index"));
+        assert!(!parsed.is_hash_index_enabled());
     }
 }
