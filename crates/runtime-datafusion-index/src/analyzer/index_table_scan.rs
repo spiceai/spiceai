@@ -514,7 +514,7 @@ impl ExecutionPlan for IndexerExec {
                                 b = out
                                     .pop()
                                     .unwrap_or_else(|| unreachable!("length is checked"));
-                                if let Err(e) = arrow_tools::verify_schema(
+                                if let Err(e) = arrow_tools::schema::verify_schema(
                                     schema_before.fields(),
                                     b.schema().fields(),
                                 ) {
