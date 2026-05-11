@@ -484,16 +484,11 @@ impl ExecutionPlan for IndexerExec {
                     let mut b = batch;
 
                     // Verify the incoming batch fields match the advertised schema.
-                    // Use arrow_tools::verify_schema which compares fields by name and data type
-                    // only, ignoring field-level metadata. Arrow's `Field` PartialEq includes
-                    // field-level metadata, so two schemas that are identical in name, type, and
-                    // nullability can still compare unequal if FTS (or another index) attaches
-                    // metadata to fields in the advertised schema but not in the incoming batch
-                    // (or vice versa). That would produce a confusing error where "Expected" and
-                    // "Got" look identical in the log. We only care about structural compatibility.
-                    if let Err(e) =
-                        arrow_tools::verify_schema(advertised_schema.fields(), b.schema().fields())
-                    {
+                    // Ignore field and schema-level metadata.
+                    if let Err(e) = arrow_tools::schema::verify_schema(
+                        advertised_schema.fields(),
+                        b.schema().fields(),
+                    ) {
                         let exp = schema_signature(advertised_schema.as_ref());
                         let got = schema_signature(b.schema().as_ref());
                         return Err(DataFusionError::Execution(format!(
