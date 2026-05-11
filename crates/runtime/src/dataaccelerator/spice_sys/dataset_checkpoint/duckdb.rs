@@ -399,44 +399,39 @@ mod tests {
         assert_eq!(&schema2, retrieved_schema.as_ref());
 
         // Verify that the updated_at timestamp has changed
-        if let AccelerationConnection::DuckDB(pool) = &checkpoint.acceleration_connection {
-            let mut db_conn = Arc::clone(pool)
-                .connect_sync()
-                .expect("Failed to connect to DuckDB");
-            let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-                .expect("Failed to get DuckDB connection")
-                .get_underlying_conn_mut();
+        let AccelerationConnection::DuckDB(pool) = &checkpoint.acceleration_connection;
+        let mut db_conn = Arc::clone(pool)
+            .connect_sync()
+            .expect("Failed to connect to DuckDB");
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .expect("Failed to get DuckDB connection")
+            .get_underlying_conn_mut();
 
-            let query = format!(
-                "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
+        let query = format!(
+            "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
+        );
+        let mut stmt = duckdb_conn
+            .prepare(&query)
+            .expect("Failed to prepare SQL statement");
+        let mut rows = stmt
+            .query([&checkpoint.dataset_name])
+            .expect("Failed to execute query");
+
+        if let Some(row) = rows.next().expect("Failed to fetch row") {
+            let created_at: duckdb::types::Value = row.get(0).expect("Failed to get created_at");
+            let duckdb::types::Value::Timestamp(_, created_at) = created_at else {
+                panic!("created_at is not a timestamp");
+            };
+            let updated_at: duckdb::types::Value = row.get(1).expect("Failed to get updated_at");
+            let duckdb::types::Value::Timestamp(_, updated_at) = updated_at else {
+                panic!("updated_at is not a timestamp");
+            };
+            assert_ne!(
+                created_at, updated_at,
+                "created_at and updated_at should be different"
             );
-            let mut stmt = duckdb_conn
-                .prepare(&query)
-                .expect("Failed to prepare SQL statement");
-            let mut rows = stmt
-                .query([&checkpoint.dataset_name])
-                .expect("Failed to execute query");
-
-            if let Some(row) = rows.next().expect("Failed to fetch row") {
-                let created_at: duckdb::types::Value =
-                    row.get(0).expect("Failed to get created_at");
-                let duckdb::types::Value::Timestamp(_, created_at) = created_at else {
-                    panic!("created_at is not a timestamp");
-                };
-                let updated_at: duckdb::types::Value =
-                    row.get(1).expect("Failed to get updated_at");
-                let duckdb::types::Value::Timestamp(_, updated_at) = updated_at else {
-                    panic!("updated_at is not a timestamp");
-                };
-                assert_ne!(
-                    created_at, updated_at,
-                    "created_at and updated_at should be different"
-                );
-            } else {
-                panic!("No checkpoint found");
-            }
         } else {
-            panic!("Unexpected acceleration connection type");
+            panic!("No checkpoint found");
         }
     }
 

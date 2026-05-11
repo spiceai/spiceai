@@ -164,7 +164,7 @@ impl IndexedMemTable {
                 .sum();
 
             // Always build the hash index when primary key is specified.
-            // IndexedMemTable is only created when hash_index is explicitly enabled,
+            // IndexedMemTable is only created when the runtime requests hash indexing,
             // so we should always create the index even if empty (it will be rebuilt
             // after data is inserted).
             Some(Arc::new(
@@ -1140,7 +1140,7 @@ mod tests {
 
     /// Test that an index is always created when primary key is specified,
     /// regardless of row count. This is by design since `IndexedMemTable` is only
-    /// used when `hash_index=enabled` is explicitly specified by the user.
+    /// used when the runtime requests hash indexing.
     #[tokio::test]
     async fn test_always_creates_index_with_primary_key() {
         // Create a small table (only 100 rows)

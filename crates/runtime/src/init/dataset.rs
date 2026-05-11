@@ -684,24 +684,15 @@ impl Runtime {
         {
             Ok(()) => {
                 // Log experimental hash_index warning once per dataset at registration
-                if let Some(acceleration) = ds
+                if ds
                     .acceleration
                     .as_ref()
-                    .filter(|acceleration| acceleration.is_hash_index_enabled())
+                    .is_some_and(|acceleration| acceleration.is_hash_index_enabled())
                 {
-                    if acceleration.is_hash_index_auto_enabled_by_primary_key()
-                        && !acceleration.is_hash_index_explicitly_enabled()
-                    {
-                        tracing::warn!(
-                            dataset = %ds.name,
-                            "hash_index is automatically enabled for Arrow acceleration because primary_key is configured. Note: hash_index is experimental and may have breaking changes in future releases."
-                        );
-                    } else {
-                        tracing::warn!(
-                            dataset = %ds.name,
-                            "hash_index is enabled for Arrow acceleration. Note: hash_index is experimental and may have breaking changes in future releases."
-                        );
-                    }
+                    tracing::warn!(
+                        dataset = %ds.name,
+                        "hash_index is automatically enabled for Arrow acceleration because primary_key or indexes are configured. Note: hash_index is experimental and may have breaking changes in future releases."
+                    );
                 }
                 tracing::info!(
                     duration_ms = register_start.elapsed().as_millis(),

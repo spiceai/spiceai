@@ -130,8 +130,6 @@ impl Default for PartitionedArrowAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
-    ParameterSpec::runtime("hash_index")
-        .description("Enable hash index for fast primary key lookups and upserts. Automatically enabled when primary_key is supplied, except in caching refresh mode."),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
@@ -170,10 +168,6 @@ impl DataAccelerator for PartitionedArrowAccelerator {
                 cmd.options
                     .insert("sort_columns".to_string(), sort_cols_str.clone());
             }
-            if let Some(hash_index_str) = acceleration.params.get("hash_index") {
-                cmd.options
-                    .insert("hash_index".to_string(), hash_index_str.clone());
-            }
             // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
             // which overwrites the entire table. Primary key constraints cause uniqueness validation
             // errors during inserts because Arrow doesn't support upsert operations.
@@ -182,9 +176,7 @@ impl DataAccelerator for PartitionedArrowAccelerator {
             }
         }
 
-        if !is_caching_mode {
-            super::arrow::enable_hash_index_for_primary_key(&mut cmd);
-        }
+        super::arrow::enable_hash_index_for_primary_key_or_indexes(&mut cmd);
 
         let schema = Arc::new(cmd.schema.as_arrow().clone());
         let creator = Arc::new(ArrowPartitionCreator::new(cmd, partition_by.clone()));

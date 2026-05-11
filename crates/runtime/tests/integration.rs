@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::{array::RecordBatch, util::display::FormatOptions};
+#[cfg(feature = "mysql")]
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
+#[cfg(feature = "postgres-accel")]
 use std::sync::Arc;
 
+#[cfg(feature = "postgres-accel")]
 use crate::utils::TEST_REQUEST_CONTEXT;
 use runtime::Runtime;
 use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
@@ -163,6 +166,7 @@ fn configure_test_datafusion() {
         _ => panic!("Must obtain write lock to defaults"),
     }
 }
+#[cfg(feature = "postgres-accel")]
 fn configure_test_datafusion_request_context() {
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),
@@ -184,6 +188,7 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     tracing::subscriber::set_default(subscriber)
 }
 
+#[cfg(feature = "mysql")]
 async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
     let lineitem_parquet_bytes =
         reqwest::get("https://public-data.spiceai.org/tpch_lineitem.parquet")

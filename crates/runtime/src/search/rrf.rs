@@ -1232,37 +1232,58 @@ impl TableProvider for ReciprocalRankFusion {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "models")]
     use crate::Runtime;
+    #[cfg(feature = "models")]
     use crate::builder::RuntimeBuilder;
+    #[cfg(feature = "models")]
     use crate::datafusion::query::QueryBuilder;
+    #[cfg(feature = "models")]
     use crate::datafusion::udf::register_udfs;
+    #[cfg(feature = "models")]
     use crate::embeddings::table::EmbeddingColumnConfig;
+    #[cfg(feature = "models")]
     use crate::embeddings::table::EmbeddingTable;
     use crate::search::rrf::ReciprocalRankFusionArgs;
+    #[cfg(feature = "models")]
     use arrow::array::as_string_array;
+    #[cfg(feature = "models")]
     use arrow::record_batch::RecordBatch;
+    #[cfg(feature = "models")]
     use async_graphql::futures_util::TryStreamExt;
     use datafusion::arrow::datatypes::DataType;
     use datafusion::catalog::TableProvider;
+    #[cfg(feature = "models")]
     use datafusion::common::Result;
+    #[cfg(feature = "models")]
     use datafusion::common::cast::{as_float64_array, as_uint64_array};
+    #[cfg(feature = "models")]
     use datafusion::functions_window::expr_fn::row_number;
     use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    #[cfg(feature = "models")]
     use datafusion::prelude::{DataFrame, named_struct, now, to_unixtime};
     use datafusion::scalar::ScalarValue;
+    #[cfg(feature = "models")]
+    use datafusion_expr::ExprFunctionExt;
     use datafusion_expr::expr::ScalarFunction;
-    use datafusion_expr::{ExprFunctionExt, lit};
+    use datafusion_expr::lit;
     #[cfg(feature = "models")]
     use llms::model2vec::Model2Vec;
+    #[cfg(feature = "models")]
     use runtime_request_context::{Protocol, RequestContext};
     use std::collections::BTreeMap;
+    #[cfg(feature = "models")]
     use std::collections::HashMap;
+    #[cfg(feature = "models")]
     use std::process::ExitCode;
-    use std::sync::{Arc, LazyLock};
+    use std::sync::Arc;
+    #[cfg(feature = "models")]
+    use std::sync::LazyLock;
 
+    #[cfg(feature = "models")]
     pub static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
@@ -1296,6 +1317,7 @@ mod tests {
         }};
     }
 
+    #[cfg(feature = "models")]
     macro_rules! extract_column {
         ($batches:expr, $column_name:expr, $array_cast_fn:ident, $nth:expr) => {
             $array_cast_fn(
@@ -1310,6 +1332,7 @@ mod tests {
         };
     }
 
+    #[cfg(feature = "models")]
     macro_rules! test_query {
         ($runtime:ident, $query:expr) => {{
             let query = QueryBuilder::new($query, $runtime.datafusion()).build();

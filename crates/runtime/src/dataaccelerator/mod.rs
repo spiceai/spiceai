@@ -1121,6 +1121,51 @@ mod test {
         let expected = ["+------+", "| name |", "+------+", "| new  |", "+------+"];
         assert_batches_eq!(&expected, &result);
     }
+
+    #[tokio::test]
+    async fn test_arrow_indexes_enable_hash_index() {
+        use crate::builder::RuntimeBuilder;
+        use data_components::arrow::IndexedMemTable;
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let acceleration_settings = Acceleration {
+            enabled: true,
+            mode: Mode::Memory,
+            engine: Engine::Arrow,
+            indexes: HashMap::from([(
+                ColumnReference::new(vec!["name".to_string()]),
+                IndexType::Unique,
+            )]),
+            ..Acceleration::default()
+        };
+
+        let table = runtime
+            .accelerator_engine_registry
+            .create_accelerator_table(
+                "arrow_secondary_index".into(),
+                schema,
+                None,
+                &acceleration_settings,
+                Arc::new(RwLock::new(Secrets::new())),
+                None,
+                ctx,
+            )
+            .await
+            .expect("accelerator table should be created");
+
+        let indexed = table
+            .as_any()
+            .downcast_ref::<IndexedMemTable>()
+            .expect("indexes should create an IndexedMemTable");
+        assert!(!indexed.has_index());
+        assert!(indexed.has_secondary_indexes());
+    }
 }
 
 #[cfg(test)]
