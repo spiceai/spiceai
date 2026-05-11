@@ -97,6 +97,7 @@ adbc_core = "0.23"
 adbc_driver_manager = "0.23"
 ahash = "0.8.12"
 anyhow = "1.0.102"
+arc-swap = "1.7"
 arrow = { version = "57.0.0", features = ["prettyprint"] }
 arrow-array = "57.0.0"
 arrow-buffer = "57.0.0"

@@ -3379,6 +3379,7 @@ name = "cayenne"
 version = "2.0.0-unstable"
 dependencies = [
  "aegis",
+ "arc-swap",
  "arrow",
  "arrow-flight",
  "arrow-ipc",
