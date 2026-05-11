@@ -98,28 +98,25 @@ fn bench_int64_probe(c: &mut Criterion) {
     group.finish();
 }
 
-/// Build a `KeyDeletionIndex` of `total * ratio` 16-byte keys.
+fn build_row_key(row_index: usize) -> Box<[u8]> {
+    let mut buf = [0_u8; 16];
+    buf[..8].copy_from_slice(&((row_index as i64) * 2).to_be_bytes());
+    buf[8..].copy_from_slice(&(row_index as i64).to_be_bytes());
+    Box::from(buf)
+}
+
+/// Build a `KeyDeletionIndex` of `total * ratio` 16-byte keys from the probe keyspace.
 fn build_key_index(total: usize, ratio: f64) -> KeyDeletionIndex {
     let count = ((total as f64) * ratio) as usize;
     let mut map: HashMap<Box<[u8]>, i64> = HashMap::with_capacity(count);
-    for i in 0..count {
-        let mut buf = [0_u8; 16];
-        buf[..8].copy_from_slice(&((i as i64) * 2).to_be_bytes());
-        buf[8..].copy_from_slice(&(i as i64).to_be_bytes());
-        map.insert(buf.into(), i as i64);
+    for row_index in 0..count {
+        map.insert(build_row_key(row_index), row_index as i64);
     }
     KeyDeletionIndex::from_map(map)
 }
 
 fn build_row_keys(total: usize) -> Vec<Box<[u8]>> {
-    (0..total)
-        .map(|i| {
-            let mut buf = [0_u8; 16];
-            buf[..8].copy_from_slice(&(i as i64).to_be_bytes());
-            buf[8..].copy_from_slice(&(i as i64).to_be_bytes());
-            Box::from(buf)
-        })
-        .collect()
+    (0..total).map(build_row_key).collect()
 }
 
 fn bench_row_keys_probe(c: &mut Criterion) {
