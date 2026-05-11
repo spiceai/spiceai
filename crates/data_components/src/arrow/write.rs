@@ -1417,56 +1417,53 @@ impl DeletionSink for MemDeletionSink {
                 .await?);
         }
 
-        let batches = self.batches.clone();
-
         let ctx = SessionContext::new();
-        let mut tmp_batches = Vec::with_capacity(batches.len());
-        for partition in &batches {
-            tmp_batches.push(partition.read().await.clone());
-        }
 
-        let rows_before_delete: usize = tmp_batches
-            .iter()
-            .flatten()
-            .map(RecordBatch::num_rows)
-            .sum();
-        let provider = MemTable::try_new(Arc::clone(&self.schema), tmp_batches)?;
+        for _ in 0..DELETE_REPLACE_MAX_RETRIES {
+            let batches = self.batches.clone();
+            let tmp_batches = snapshot_partitions(&batches).await;
 
-        let mut df = DataFrame::new(
-            ctx.state(),
-            LogicalPlanBuilder::scan("?table?", provider_as_source(Arc::new(provider)), None)?
-                .build()?,
-        );
+            let rows_before_delete: usize = tmp_batches
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum();
+            let provider = MemTable::try_new(Arc::clone(&self.schema), tmp_batches.clone())?;
 
-        for filter in self.filters.clone() {
-            df = df.filter(is_not_true(filter))?;
-        }
+            let mut df = DataFrame::new(
+                ctx.state(),
+                LogicalPlanBuilder::scan("?table?", provider_as_source(Arc::new(provider)), None)?
+                    .build()?,
+            );
 
-        let mut new_batches = vec![vec![]; batches.len()];
-        let mut rows_after_delete = 0_usize;
-        let mut i = 0;
-        for vec in df.collect_partitioned().await? {
-            for batch in vec {
-                rows_after_delete += batch.num_rows();
-                new_batches[i].push(batch);
+            for filter in self.filters.clone() {
+                df = df.filter(is_not_true(filter))?;
             }
 
-            i = (i + 1) % batches.len();
+            let mut new_batches = vec![vec![]; batches.len()];
+            let mut rows_after_delete = 0_usize;
+            let mut i = 0;
+            for vec in df.collect_partitioned().await? {
+                for batch in vec {
+                    rows_after_delete += batch.num_rows();
+                    new_batches[i].push(batch);
+                }
+
+                i = (i + 1) % batches.len();
+            }
+
+            let count = rows_before_delete.checked_sub(rows_after_delete).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Delete output row count ({rows_after_delete}) exceeds input row count ({rows_before_delete})"
+                ))
+            })?;
+
+            if replace_partitions_if_unchanged(&batches, &tmp_batches, new_batches).await {
+                return Ok(count as u64);
+            }
         }
 
-        let count = rows_before_delete.checked_sub(rows_after_delete).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "Delete output row count ({rows_after_delete}) exceeds input row count ({rows_before_delete})"
-            ))
-        })?;
-
-        let writable_targets =
-            futures::future::join_all(batches.iter().map(|target| target.write())).await;
-        for (mut target, batches) in writable_targets.into_iter().zip(new_batches.into_iter()) {
-            *target = batches;
-        }
-
-        Ok(count as u64)
+        Err(Box::new(concurrent_delete_error()))
     }
 }
 
@@ -1567,6 +1564,7 @@ mod tests {
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::{on_conflict::OnConflict, test::MockExec};
+    use tokio::sync::RwLock;
 
     use crate::arrow::write::MemTable;
 
@@ -2222,6 +2220,23 @@ mod tests {
             .collect();
 
         assert_eq!(remaining_ids, vec![Some("1"), Some("2"), Some("3")]);
+    }
+
+    #[tokio::test]
+    async fn test_conditional_partition_replace_preserves_concurrent_append() {
+        let (first_batch, _) = create_batch_with_string_columns(&[("id", vec!["1"])]);
+        let (second_batch, _) = create_batch_with_string_columns(&[("id", vec!["2"])]);
+        let partition: PartitionData = Arc::new(RwLock::new(vec![first_batch]));
+        let batches = vec![Arc::clone(&partition)];
+        let snapshot = snapshot_partitions(&batches).await;
+
+        partition.write().await.push(second_batch);
+
+        let replaced = replace_partitions_if_unchanged(&batches, &snapshot, vec![vec![]]).await;
+        assert!(!replaced, "replacement should detect concurrent writes");
+
+        let current = partition.read().await;
+        assert_eq!(current.len(), 2, "concurrent append should be preserved");
     }
 
     #[tokio::test]
