@@ -305,6 +305,7 @@ impl DataConnector for EmbeddingConnector {
                 )
                 .await?;
             builder.set_accelerator(indexed_accelerator);
+            return Ok(());
         }
 
         Ok(())

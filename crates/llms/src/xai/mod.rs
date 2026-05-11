@@ -48,7 +48,7 @@ use crate::chat::{
 use crate::openai::default_rate_controller;
 
 static DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
-static DEFAULT_MODEL: &str = "grok-3";
+static DEFAULT_MODEL: &str = "grok-4.3";
 
 /// [`Xai`] is a chat model for xAI models. xAI is nearly `OpenAI` compatible.
 pub struct Xai {

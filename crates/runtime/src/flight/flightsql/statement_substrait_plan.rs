@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! FlightSQL `CommandStatementSubstraitPlan` handlers.
+//! `FlightSQL` `CommandStatementSubstraitPlan` handlers.
 //!
-//! Per the FlightSQL spec, clients submit a serialized [`substrait::proto::Plan`]
+//! Per the `FlightSQL` spec, clients submit a serialized [`substrait::proto::Plan`]
 //! wrapped in a [`SubstraitPlan`] message. The runtime decodes the plan, lowers
-//! it to a DataFusion [`LogicalPlan`] via `datafusion-substrait`, and then runs
+//! it to a `DataFusion` [`LogicalPlan`] via `datafusion-substrait`, and then runs
 //! it through the same execution path as a SQL statement.
 
 use std::sync::Arc;
@@ -71,7 +71,7 @@ fn decode_plan_proto(cmd: &sql::CommandStatementSubstraitPlan) -> Result<(Plan, 
     Ok((proto, cache_key))
 }
 
-/// Lowers the wire representation of a Substrait plan to a DataFusion
+/// Lowers the wire representation of a Substrait plan to a `DataFusion`
 /// [`LogicalPlan`]. Returns a synthetic cache key derived from the plan bytes
 /// so that identical Substrait plans share results-cache entries.
 async fn decode_plan(

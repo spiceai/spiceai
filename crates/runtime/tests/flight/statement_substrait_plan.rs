@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for FlightSQL `CommandStatementSubstraitPlan`.
+//! Integration tests for `FlightSQL` `CommandStatementSubstraitPlan`.
 
 use arrow::array::RecordBatch;
 use arrow_flight::{
@@ -44,7 +44,7 @@ use crate::{
     utils::test_request_context,
 };
 
-/// Build a Substrait `Plan` from `sql` using a standalone DataFusion
+/// Build a Substrait `Plan` from `sql` using a standalone `DataFusion`
 /// `SessionContext` and return it encoded as protobuf bytes. The server
 /// rebuilds the `LogicalPlan` from these bytes, so the producer's context
 /// does not need to match the server's catalog as long as the SQL is

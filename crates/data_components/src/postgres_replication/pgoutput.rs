@@ -126,6 +126,22 @@ impl Decoder {
         self.relations.values()
     }
 
+    /// Rewrite the cached relation's key flags to the dataset-declared primary
+    /// keys after the original relation message has been validated against the
+    /// source replica identity. This keeps the per-change hot path borrowed and
+    /// avoids cloning the whole relation for every row.
+    pub fn apply_declared_primary_keys(&mut self, id: RelationId, declared_pks: &[String]) {
+        if declared_pks.is_empty() {
+            return;
+        }
+
+        if let Some(rel) = self.relations.get_mut(&id) {
+            for col in &mut rel.columns {
+                col.is_key = declared_pks.iter().any(|pk| pk == &col.name);
+            }
+        }
+    }
+
     /// Decode a single pgoutput message. If it's a `Relation`, the decoder
     /// caches it internally so later Insert/Update/Delete messages can refer
     /// to it.
