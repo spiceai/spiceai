@@ -1448,7 +1448,7 @@ fn equality_literal_for_column(left: &Expr, right: &Expr, column_name: &str) -> 
 
 fn literal_key_value(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Literal(ScalarValue::Null, _) => None,
+        Expr::Literal(value, _) if value.is_null() => None,
         Expr::Literal(value, _) => Some(value.to_string()),
         _ => None,
     }
