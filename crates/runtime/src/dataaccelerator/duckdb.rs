@@ -332,11 +332,13 @@ impl DataAccelerator for DuckDBAccelerator {
         "duckdb"
     }
 
-    fn wal_backend(
+    async fn wal_backend(
         &self,
+        source: &dyn super::AccelerationSource,
         accelerator: &Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Option<Arc<dyn crate::accelerated_table::write::wal::WalBackend>> {
-        wal_backend::DuckDBWalBackend::try_from_provider(accelerator)
+        wal_backend::DuckDBWalBackend::try_new(source, accelerator)
+            .await
             .map(|b| Arc::new(b) as Arc<dyn crate::accelerated_table::write::wal::WalBackend>)
     }
 

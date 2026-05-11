@@ -60,10 +60,37 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ── WAL entry ────────────────────────────────────────────────────────────────
 
+/// The operation kind stored in a WAL entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalOp {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl WalOp {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+        }
+    }
+
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "INSERT" => Some(Self::Insert),
+            "UPDATE" => Some(Self::Update),
+            "DELETE" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
 /// A single WAL entry read from the backend's pending queue.
 pub struct WalEntry {
     pub seq: i64,
-    pub op: String,
+    pub op: WalOp,
     pub pks_ipc: Vec<u8>,
     pub new_values: Option<Vec<u8>>,
 }
@@ -319,6 +346,7 @@ impl DataSink for WalInsertSink {
             .await
             .map_err(|e| DataFusionError::Execution(format!("WAL insert failed: {e}")))?;
 
+        // TODO: What is it?
         self.refresher.set_initial_load_completed(true);
         let _ = self.wal.notify_tx.try_send(());
         Ok(row_count)
@@ -486,8 +514,8 @@ pub(crate) async fn deliver_pending(
 
     for entry in entries {
         let federated_provider = federated.table_provider().await;
-        match entry.op.as_str() {
-            "INSERT" => {
+        match entry.op {
+            WalOp::Insert => {
                 let ipc = entry.new_values.unwrap_or_default();
                 let batches = arrow_ipc_to_batches(&ipc)?;
                 if !batches.is_empty() {
@@ -504,7 +532,7 @@ pub(crate) async fn deliver_pending(
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
                 }
             }
-            "UPDATE" => {
+            WalOp::Update => {
                 let ipc = entry.new_values.unwrap_or_default();
                 let batches = arrow_ipc_to_batches(&ipc)?;
                 if !batches.is_empty() {
@@ -518,7 +546,7 @@ pub(crate) async fn deliver_pending(
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
                 }
             }
-            "DELETE" => {
+            WalOp::Delete => {
                 let filters = build_pk_filters_from_ipc(&entry.pks_ipc, &primary_keys)
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
                 let plan = federated_provider
@@ -528,12 +556,6 @@ pub(crate) async fn deliver_pending(
                 datafusion::physical_plan::collect(plan, session_state.task_ctx())
                     .await
                     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as BoxError)?;
-            }
-            other => {
-                tracing::warn!(
-                    table = %wal.backend.table_name(),
-                    "Unknown WAL op '{other}' at seq {}, skipping", entry.seq
-                );
             }
         }
 

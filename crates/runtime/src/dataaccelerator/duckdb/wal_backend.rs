@@ -27,22 +27,22 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::poly::PolyTableProvider;
-use datafusion::common::Constraint;
+use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::Expr;
 use datafusion_table_providers::duckdb::DuckDB;
-use datafusion_table_providers::duckdb::write::{DuckDBTableWriter, write_batches_to_table};
-use datafusion_table_providers::duckdb::{TableDefinition, TableManager};
+use datafusion_table_providers::duckdb::write::write_batches_to_table;
+use datafusion_table_providers::duckdb::{RelationName, TableDefinition, TableManager};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 
 use crate::accelerated_table::write::wal::{
-    WalBackend, WalEntry, arrow_ipc_to_batches, batches_to_arrow_ipc, extract_pks_ipc,
+    WalBackend, WalEntry, WalOp, arrow_ipc_to_batches, batches_to_arrow_ipc, extract_pks_ipc,
     sanitize_name,
 };
-use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
+use crate::dataaccelerator::spice_sys::{AccelerationConnection, OpenOption, acceleration_connection};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -62,17 +62,28 @@ pub(crate) struct DuckDBWalBackend {
 }
 
 impl DuckDBWalBackend {
-    /// Try to build a `DuckDBWalBackend` from an accelerator `TableProvider`.
+    /// Build a `DuckDBWalBackend` from an acceleration source and its table provider.
     ///
-    /// Returns `None` if the provider is not a `DuckDB` instance or the table
-    /// has no primary keys (WAL replay requires PKs for idempotent delivery).
-    pub(crate) fn try_from_provider(accelerator: &Arc<dyn TableProvider>) -> Option<Self> {
-        let writer = try_extract_duckdb_writer(accelerator)?;
-        let pool = writer.pool();
-        let table_definition = writer.table_definition();
-        let schema = table_definition.schema();
+    /// The pool is obtained via [`acceleration_connection`], which naturally rejects
+    /// memory-mode DuckDB (no durability) by failing the file-existence check.
+    /// Schema and constraints are read directly from the `accelerator` table provider
+    /// without downcasting to engine-internal types.
+    /// Returns `None` when WAL is not applicable (memory mode, no primary keys).
+    pub(crate) async fn try_new(
+        source: &dyn crate::dataaccelerator::AccelerationSource,
+        accelerator: &Arc<dyn TableProvider>,
+    ) -> Option<Self> {
+        let pool = match acceleration_connection(source, OpenOption::OpenExisting)
+            .await
+            .ok()?
+        {
+            AccelerationConnection::DuckDB(pool) => pool,
+            _ => return None,
+        };
 
-        let constraints = table_definition.constraints()?;
+        let schema = accelerator.schema();
+        let constraints: &Constraints = accelerator.constraints()?;
+
         let primary_keys: Vec<String> = constraints
             .iter()
             .filter_map(|c| {
@@ -89,8 +100,14 @@ impl DuckDBWalBackend {
             return None;
         }
 
-        let table_name = table_definition.name().to_string();
-        let on_conflict = writer.on_conflict().cloned();
+        let table_name = source.name().table().to_string();
+        let on_conflict = Some(OnConflict::Upsert(ColumnReference::new(
+            primary_keys.clone(),
+        )));
+        let table_definition = Arc::new(
+            TableDefinition::new(RelationName::new(&table_name), Arc::clone(&schema))
+                .with_constraints(constraints.clone()),
+        );
 
         Some(Self {
             pool,
@@ -113,25 +130,6 @@ impl DuckDBWalBackend {
     fn wal_seq(&self) -> String {
         format!("__spice_wal_seq_{}", sanitize_name(&self.table_name))
     }
-}
-
-fn try_extract_duckdb_writer(
-    accelerator: &Arc<dyn TableProvider>,
-) -> Option<Arc<DuckDBTableWriter>> {
-    let poly = accelerator.as_any().downcast_ref::<PolyTableProvider>()?;
-    let writer = poly.writer();
-
-    if let Some(w) = writer.as_any().downcast_ref::<DuckDBTableWriter>() {
-        return Some(Arc::new(w.clone()));
-    }
-
-    if let Some(dedup) = writer.as_any().downcast_ref::<UpsertDedupTableProvider>()
-        && let Some(w) = dedup.inner().as_any().downcast_ref::<DuckDBTableWriter>()
-    {
-        return Some(Arc::new(w.clone()));
-    }
-
-    None
 }
 
 fn is_duckdb_conflict(e: &dyn std::error::Error) -> bool {
@@ -447,7 +445,7 @@ impl WalBackend for DuckDBWalBackend {
 
                 tx.execute(
                     &format!(r#"INSERT INTO "{wal_table}" (op, pks, new_values) VALUES (?, ?, ?)"#),
-                    duckdb::params!["INSERT", pks_ipc, ipc_bytes],
+                    duckdb::params![WalOp::Insert.as_str(), pks_ipc, ipc_bytes],
                 )?;
 
                 let append_table = resolve_append_table(&table_definition, &tx)
@@ -516,7 +514,7 @@ impl WalBackend for DuckDBWalBackend {
                     &format!(
                         r#"INSERT INTO "{wal_table}" (op, pks, new_values) VALUES (?, ?, NULL)"#
                     ),
-                    duckdb::params!["DELETE", pks_ipc],
+                    duckdb::params![WalOp::Delete.as_str(), pks_ipc],
                 )?;
 
                 // DELETE must target base tables; the main table name may be a VIEW when
@@ -616,7 +614,7 @@ impl WalBackend for DuckDBWalBackend {
                 // 4. Write WAL entry with final row state
                 tx.execute(
                     &format!(r#"INSERT INTO "{wal_table}" (op, pks, new_values) VALUES (?, ?, ?)"#),
-                    duckdb::params!["UPDATE", pks_ipc, new_values_ipc],
+                    duckdb::params![WalOp::Update.as_str(), pks_ipc, new_values_ipc],
                 )?;
 
                 tx.commit()?;
@@ -671,9 +669,14 @@ impl WalBackend for DuckDBWalBackend {
             let mut rows = stmt.query([])?;
             let mut entries = Vec::new();
             while let Some(row) = rows.next()? {
+                let op_str: String = row.get(1)?;
+                let Some(op) = WalOp::from_str(&op_str) else {
+                    tracing::warn!("Unknown WAL op '{op_str}' at seq {}, skipping", row.get::<usize, i64>(0)?);
+                    continue;
+                };
                 entries.push(WalEntry {
                     seq: row.get(0)?,
-                    op: row.get(1)?,
+                    op,
                     pks_ipc: row.get(2)?,
                     new_values: row.get(3)?,
                 });

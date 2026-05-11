@@ -394,12 +394,13 @@ pub trait DataAccelerator: Send + Sync {
     /// Return a WAL backend for durable `write_back` on this accelerator, or `None`
     /// if this engine does not support WAL (e.g. Arrow, in-memory `DuckDB`).
     ///
-    /// The backend is constructed from the already-created `accelerator` table provider,
-    /// which gives access to the underlying connection pool and table definition.
-    /// Returns `None` if the engine does not support WAL, or if the table has no primary
-    /// keys (required for idempotent WAL replay).
-    fn wal_backend(
+    /// The pool is obtained via `spice_sys::acceleration_connection`; schema and
+    /// constraints are read from the already-created `accelerator` table provider.
+    /// Returns `None` if the engine does not support WAL, or if the table has no
+    /// primary keys (required for idempotent WAL replay).
+    async fn wal_backend(
         &self,
+        _source: &dyn AccelerationSource,
         _accelerator: &Arc<dyn TableProvider>,
     ) -> Option<Arc<dyn crate::accelerated_table::write::wal::WalBackend>> {
         None

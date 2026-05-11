@@ -2432,7 +2432,9 @@ impl DataFusion {
                         .accelerator_engine_registry
                         .get_accelerator_engine(acceleration_settings.engine)
                         .await
-                        && let Some(backend) = engine.wal_backend(&accelerated_table_provider)
+                        && let Some(backend) = engine
+                            .wal_backend(dataset, &accelerated_table_provider)
+                            .await
                     {
                         accelerated_table_builder.with_wal_backend(backend);
                     }

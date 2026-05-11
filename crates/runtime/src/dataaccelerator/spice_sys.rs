@@ -83,7 +83,7 @@ pub mod dynamodb;
 
 pub mod caching_engine;
 
-enum AccelerationConnection {
+pub(crate) enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),
     #[cfg(feature = "postgres-accel")]
@@ -216,7 +216,7 @@ pub enum OpenOption {
     OpenExisting,
 }
 
-async fn acceleration_connection(
+pub(crate) async fn acceleration_connection(
     source: &dyn AccelerationSource,
     #[cfg_attr(
         not(any(feature = "duckdb", feature = "sqlite", feature = "turso")),
