@@ -21,6 +21,13 @@ limitations under the License.
 //! the inner index's `write` method is called with strictly-bounded batches even when the input
 //! row count would otherwise produce a multi-million-row intermediate.
 
+#![expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    reason = "test uses small fixed counts (well under f32 precision and i64::MAX) as ids and \
+              synthetic embedding values to verify chunk ordering"
+)]
+
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,8 +78,8 @@ impl Chunker for FixedCountChunker {
             } else {
                 (i + 1) * stride
             };
-            let start_byte = chars.get(start_idx).map(|(b, _)| *b).unwrap_or(text.len());
-            let end_byte = chars.get(end_idx).map(|(b, _)| *b).unwrap_or(text.len());
+            let start_byte = chars.get(start_idx).map_or(text.len(), |(b, _)| *b);
+            let end_byte = chars.get(end_idx).map_or(text.len(), |(b, _)| *b);
             (start_byte, &text[start_byte..end_byte])
         }))
     }

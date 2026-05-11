@@ -816,11 +816,28 @@ impl SearchIndex for ChunkedVectorIndex {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::float_cmp,
+    reason = "test data uses small integer values encoded in f32 to verify ordering; \
+              precision and exact equality are both fine in this synthetic setup"
+)]
 mod tests {
     use super::*;
     use arrow::array::{Float32Array, Int32Array, Int64Array, StringArray};
     use chunking::Chunker;
+    use std::fmt::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Build a repeating space-separated token string deterministically — used by the multi-
+    /// group write tests to produce inputs with known chunk counts. Written as an explicit fold
+    /// to avoid the `format!`-in-`collect` allocation pattern.
+    fn repeated_tokens(n: usize) -> String {
+        (0..n).fold(String::with_capacity(n * 8), |mut s, i| {
+            write!(&mut s, "w{i} ").expect("writing to a String never fails");
+            s
+        })
+    }
 
     #[test]
     fn group_rows_by_chunk_budget_empty() {
@@ -945,7 +962,9 @@ mod tests {
                 .expect("mutex")
                 .push(record.num_rows());
 
-            // Build a synthetic embedding column matching the row count.
+            // Build a synthetic embedding column matching the row count. The first element
+            // encodes the row's position within this call so tests can verify ordering
+            // end-to-end after concat across multiple inner.write calls.
             let n = record.num_rows();
             let mut emb_values: Vec<f32> = Vec::with_capacity(n * 4);
             for i in 0..n {
@@ -1079,9 +1098,9 @@ mod tests {
 
         // Build N rows of ~K chunks each, total chunks well above the 8192 budget.
         // K=200 chunks/row * 50 rows = 10,000 chunks > 8192 budget.
-        let big_doc: String = (0..200).map(|i| format!("w{i} ")).collect::<String>();
-        let rows: Vec<(String, i64)> = (0..50)
-            .map(|i| (big_doc.trim_end().to_string(), i as i64))
+        let big_doc = repeated_tokens(200);
+        let rows: Vec<(String, i64)> = (0i64..50)
+            .map(|i| (big_doc.trim_end().to_string(), i))
             .collect();
         let row_refs: Vec<(&str, i64)> = rows.iter().map(|(s, i)| (s.as_str(), *i)).collect();
         let input = build_input(&row_refs);
@@ -1135,9 +1154,7 @@ mod tests {
 
         // Row 0: budget + 100 chunks (single oversized row).
         // Row 1: 3 chunks.
-        let big = (0..INNER_WRITE_TARGET_CHUNKS + 100)
-            .map(|i| format!("w{i} "))
-            .collect::<String>();
+        let big = repeated_tokens(INNER_WRITE_TARGET_CHUNKS + 100);
         let big_trimmed = big.trim_end();
         let input = build_input(&[(big_trimmed, 1), ("a b c", 2)]);
 
@@ -1169,9 +1186,9 @@ mod tests {
 
         // 3 rows of 5000 chunks each → 15,000 chunks total, budget 8192 → 3 groups (one row
         // per group, since two rows would exceed the budget).
-        let big_doc: String = (0..5000).map(|i| format!("w{i} ")).collect::<String>();
-        let rows: Vec<(String, i64)> = (0..3)
-            .map(|i| (big_doc.trim_end().to_string(), i as i64))
+        let big_doc = repeated_tokens(5000);
+        let rows: Vec<(String, i64)> = (0i64..3)
+            .map(|i| (big_doc.trim_end().to_string(), i))
             .collect();
         let row_refs: Vec<(&str, i64)> = rows.iter().map(|(s, i)| (s.as_str(), *i)).collect();
         let input = build_input(&row_refs);
