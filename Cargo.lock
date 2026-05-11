@@ -3442,11 +3442,14 @@ dependencies = [
 name = "cayenne-flightsql"
 version = "2.0.0-unstable"
 dependencies = [
+ "async-trait",
  "cayenne",
  "clap",
  "data_components",
  "datafusion",
+ "datafusion-ddl",
  "datafusion-flightsql",
+ "runtime-datafusion",
  "snafu",
  "tokio",
  "tonic",
@@ -17850,6 +17853,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "anyhow",
  "arrow",
+ "arrow-flight",
  "async-trait",
  "clap",
  "dirs",
@@ -17861,6 +17865,7 @@ dependencies = [
  "spicepod",
  "system-adapter-protocol",
  "tokio",
+ "tonic",
  "url",
  "uuid 1.21.0",
  "yaml",
