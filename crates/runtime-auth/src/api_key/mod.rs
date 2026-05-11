@@ -62,9 +62,14 @@ impl ApiKeyAuth {
     /// in N). This routine compares against every key on every call so
     /// total verification time depends only on the number of configured
     /// keys, not which one matched (or whether any did).
-    fn lookup(&self, presented: &str) -> Option<ApiKey> {
+    fn lookup_with_comparison_observer(
+        &self,
+        presented: &str,
+        mut on_compare: impl FnMut(),
+    ) -> Option<ApiKey> {
         let mut matched: Option<ApiKey> = None;
         for key in &self.api_keys {
+            on_compare();
             if key == presented {
                 // Don't `break`: keep iterating so timing is independent
                 // of which key matched. Preserve the first match if the
@@ -75,6 +80,10 @@ impl ApiKeyAuth {
             }
         }
         matched
+    }
+
+    fn lookup(&self, presented: &str) -> Option<ApiKey> {
+        self.lookup_with_comparison_observer(presented, || {})
     }
 }
 
@@ -213,17 +222,22 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_matches_regardless_of_position() {
+    fn test_lookup_compares_every_key_regardless_of_position() {
         let auth = ApiKeyAuth::new(vec![
             ApiKey::parse_str("first"),
             ApiKey::parse_str("middle"),
             ApiKey::parse_str("last"),
         ]);
-        // Match at every position — covers the no-short-circuit behavior.
-        assert!(auth.lookup("first").is_some());
-        assert!(auth.lookup("middle").is_some());
-        assert!(auth.lookup("last").is_some());
-        assert!(auth.lookup("missing").is_none());
+
+        for presented in ["first", "middle", "last", "missing"] {
+            let mut comparison_count = 0;
+            let matched = auth.lookup_with_comparison_observer(presented, || {
+                comparison_count += 1;
+            });
+
+            assert_eq!(comparison_count, 3);
+            assert_eq!(matched.is_some(), presented != "missing");
+        }
     }
 
     #[test]

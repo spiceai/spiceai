@@ -1040,7 +1040,7 @@ fn host_endpoint_rejection(
             // IPs they conventionally resolve to. This is best-effort:
             // an attacker controlling DNS can still point an arbitrary
             // name at a private IP.
-            let lower = d.to_ascii_lowercase();
+            let lower = d.trim_end_matches('.').to_ascii_lowercase();
             if !endpoint_policy.allow_all
                 && (lower == "localhost"
                     || lower.ends_with(".localhost")
@@ -2083,7 +2083,10 @@ mod tests {
             "http://172.16.0.1/udf",
             "http://0.0.0.0/udf",
             "http://localhost/udf",
+            "http://localhost./udf",
+            "http://service.localhost./udf",
             "http://metadata.google.internal/computeMetadata/v1/",
+            "http://metadata.google.internal./computeMetadata/v1/",
             "http://[::1]/udf",
             "http://[fe80::1]/udf",
             "http://[fc00::1]/udf",
