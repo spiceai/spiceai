@@ -51,6 +51,7 @@ use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
     schema_cast::SchemaCastScanExec, wrap_with_filter,
 };
+
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
@@ -1356,8 +1357,7 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Check if we're in caching mode
-        let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+        let is_caching_mode = self.refresh_mode == RefreshMode::Caching;
 
         if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
             // Accelerated tables aren't accelerated on scheduler. Just scan the federated source.

@@ -393,3 +393,7 @@ name = "prepared_statement"
 [[bench]]
 harness = false
 name = "flatten_json_properties"
+
+[[bench]]
+harness = false
+name = "cdc_cayenne_inline"

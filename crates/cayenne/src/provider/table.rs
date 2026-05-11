@@ -69,6 +69,7 @@ use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
@@ -295,14 +296,16 @@ const INLINE_MAX_BYTES: usize = 1_048_576; // 1 MB
 /// overhead vs. the compact IPC representation.
 pub(crate) const INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576; // 4 MB
 
-/// Serialize a `RecordBatch` to Arrow IPC bytes (stream format, single batch).
-fn serialize_batch_to_ipc(
-    batch: &RecordBatch,
+/// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
+fn serialize_batches_to_ipc(
+    batches: &[RecordBatch],
 ) -> std::result::Result<Vec<u8>, arrow::error::ArrowError> {
     let mut buf = Vec::new();
-    {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())?;
-        writer.write(batch)?;
+    if let Some(first) = batches.first() {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, first.schema_ref())?;
+        for batch in batches {
+            writer.write(batch)?;
+        }
         writer.finish()?;
     }
     Ok(buf)
@@ -400,6 +403,10 @@ pub struct CayenneTableProvider {
     /// Maps `snapshot_id` -> `minimum_sequence` (all deletes with seq <= `min_seq` don't apply).
     /// At scan time, data from these snapshots is scanned without deletion filtering.
     protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
+    /// Cached inlined row count. Maintained while the process is running so
+    /// append-heavy inline CDC writes don't query the metastore after every
+    /// burst just to decide whether to checkpoint.
+    inlined_row_count: Arc<AtomicI64>,
 }
 
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
@@ -1445,6 +1452,7 @@ impl CayenneTableProvider {
         let protected_snapshots =
             Self::load_protected_snapshots(Arc::clone(&catalog), &table_id, &pk_deletion_strategy)
                 .await?;
+        let inlined_row_count = catalog.get_inlined_data_count(&table_id).await?;
 
         // Register the S3 object store in the shared RuntimeEnv once during
         // construction. Every code path that creates a SessionContext from
@@ -1468,6 +1476,7 @@ impl CayenneTableProvider {
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
+            inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
         };
 
         // Fail construction if a staging WAL exists — the table may contain
@@ -1796,6 +1805,7 @@ impl CayenneTableProvider {
             object_store_config: self.object_store_config.clone(),
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
+            inlined_row_count: Arc::clone(&self.inlined_row_count),
         }
     }
 
@@ -3325,18 +3335,18 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Write a small batch directly to the metastore as inlined data (Arrow IPC blob).
-    ///
-    /// Returns `true` if the batch was inlined, `false` if it's too large and should
-    /// go through the normal Vortex write path.
-    pub(crate) async fn try_inline_batch(&self, batch: &RecordBatch) -> Result<bool> {
-        if batch.num_rows() == 0 {
+    /// Write small batches directly to the metastore as a single Arrow IPC
+    /// stream without concatenating them first.
+    pub(crate) async fn try_inline_batches(&self, batches: &[RecordBatch]) -> Result<bool> {
+        let total_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        if total_rows == 0 {
             return Ok(true); // nothing to write
         }
-        if batch.num_rows() > INLINE_MAX_ROWS {
+        if total_rows > INLINE_MAX_ROWS {
             return Ok(false);
         }
-        let ipc_bytes = serialize_batch_to_ipc(batch).map_err(|e| Error::Arrow { source: e })?;
+        let ipc_bytes =
+            serialize_batches_to_ipc(batches).map_err(|e| Error::Arrow { source: e })?;
         if ipc_bytes.len() > INLINE_MAX_BYTES {
             return Ok(false);
         }
@@ -3352,20 +3362,32 @@ impl CayenneTableProvider {
                 table_id: self.table_metadata.table_id.clone(),
                 partition_key: None,
                 data_ipc: ipc_bytes,
-                record_count: i64::try_from(batch.num_rows()).unwrap_or(i64::MAX),
+                record_count: i64::try_from(total_rows).unwrap_or(i64::MAX),
                 sequence_number,
                 created_at: String::new(), // default in DDL
             })
             .await?;
 
+        let delta = i64::try_from(total_rows).unwrap_or(i64::MAX);
+        let _ =
+            self.inlined_row_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(delta))
+                });
+
         tracing::debug!(
             "Inlined {} rows for table {} (seq={})",
-            batch.num_rows(),
+            total_rows,
             self.table_metadata.table_name,
             sequence_number,
         );
 
         Ok(true)
+    }
+
+    #[must_use]
+    pub(crate) fn cached_inlined_row_count(&self) -> i64 {
+        self.inlined_row_count.load(Ordering::Relaxed)
     }
 
     /// Read all inlined data for this table and return as `RecordBatch`es.
@@ -3434,6 +3456,7 @@ impl CayenneTableProvider {
         self.catalog
             .clear_inlined_data(&self.table_metadata.table_id)
             .await?;
+        self.inlined_row_count.store(0, Ordering::Relaxed);
 
         self.refresh_listing_table()?;
 
@@ -3444,16 +3467,7 @@ impl CayenneTableProvider {
     ///
     /// Callers must hold `write_lock` while calling this helper.
     async fn checkpoint_inlined_data_if_present_for_delete(&self) -> datafusion_common::Result<()> {
-        let inlined_count = self
-            .catalog
-            .get_inlined_data_count(&self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to get inlined data count for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
+        let inlined_count = self.cached_inlined_row_count();
 
         if inlined_count > 0 {
             self.checkpoint_inlined_data().await.map_err(|e| {
