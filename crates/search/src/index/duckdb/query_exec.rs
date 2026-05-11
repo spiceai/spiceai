@@ -213,20 +213,9 @@ fn run_duckdb_vector_query(
     );
     tracing::trace!("DuckDB vector query SQL: {sql}");
 
-    // hnsw_ef_search is a per-connection setting. Set it before the query and reset
-    // immediately after so the value doesn't leak to other users of the same pooled
-    // connection.
-    if let Some(ef_search) = exec.hnsw.hnsw_ef_search {
-        conn.execute(&format!("SET hnsw_ef_search = {ef_search}"), [])
-            .map_err(to_execution_error)?;
-    }
     let mut stmt = conn.prepare(&sql).map_err(to_execution_error)?;
     let result = stmt.query_arrow([]).map_err(to_execution_error)?;
     let batches = result.collect::<Vec<_>>();
-    if exec.hnsw.hnsw_ef_search.is_some() {
-        conn.execute("RESET hnsw_ef_search", [])
-            .map_err(to_execution_error)?;
-    }
     if exec.projected_columns.is_empty() {
         batches
             .into_iter()
