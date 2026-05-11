@@ -40,7 +40,12 @@ util = { path = "../util", features = ["datafusion"] }
 
 [dev-dependencies]
 chrono.workspace = true
+criterion = { version = "0.7", features = ["html_reports"] }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 insta.workspace = true
 object_store.workspace = true
 tokio.workspace = true
+
+[[bench]]
+harness = false
+name = "data_source_tree_display"
