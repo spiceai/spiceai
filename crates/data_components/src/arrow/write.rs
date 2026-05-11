@@ -471,8 +471,8 @@ async fn replace_partitions_if_unchanged(
     expected: &[Vec<RecordBatch>],
     replacement: Vec<Vec<RecordBatch>>,
 ) -> bool {
-    let writable_targets = futures::future::join_all(batches.iter().map(|target| target.write()))
-        .await;
+    let writable_targets =
+        futures::future::join_all(batches.iter().map(|target| target.write())).await;
 
     if writable_targets
         .iter()
@@ -1366,43 +1366,43 @@ fn delete_primary_keys_from_snapshot(
     primary_key: &[usize],
 ) -> Result<(Vec<Vec<RecordBatch>>, u64)> {
     let mut new_batches = Vec::with_capacity(snapshot.len());
-        let mut deleted = 0_u64;
+    let mut deleted = 0_u64;
 
-        for partition_batches in snapshot {
-            let mut filtered_batches = Vec::with_capacity(partition_batches.len());
+    for partition_batches in snapshot {
+        let mut filtered_batches = Vec::with_capacity(partition_batches.len());
 
-            for batch in partition_batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-
-                let keys = extract_primary_keys_str(&batch, primary_key)?;
-                let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
-                let mut removed_from_batch = false;
-
-                for key in keys {
-                    let should_delete = key.is_some_and(|key| primary_key_values.contains(&key));
-                    if should_delete {
-                        deleted += 1;
-                        removed_from_batch = true;
-                    }
-                    keep_row_builder.append_value(!should_delete);
-                }
-
-                if removed_from_batch {
-                    let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
-                    if filtered_batch.num_rows() > 0 {
-                        filtered_batches.push(filtered_batch);
-                    }
-                } else {
-                    filtered_batches.push(batch.clone());
-                }
+        for batch in partition_batches {
+            if batch.num_rows() == 0 {
+                continue;
             }
 
-            new_batches.push(filtered_batches);
+            let keys = extract_primary_keys_str(&batch, primary_key)?;
+            let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
+            let mut removed_from_batch = false;
+
+            for key in keys {
+                let should_delete = key.is_some_and(|key| primary_key_values.contains(&key));
+                if should_delete {
+                    deleted += 1;
+                    removed_from_batch = true;
+                }
+                keep_row_builder.append_value(!should_delete);
+            }
+
+            if removed_from_batch {
+                let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
+                if filtered_batch.num_rows() > 0 {
+                    filtered_batches.push(filtered_batch);
+                }
+            } else {
+                filtered_batches.push(batch.clone());
+            }
         }
 
-        Ok((new_batches, deleted))
+        new_batches.push(filtered_batches);
+    }
+
+    Ok((new_batches, deleted))
 }
 
 #[async_trait]
