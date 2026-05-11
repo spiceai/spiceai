@@ -1463,7 +1463,11 @@ mod tests {
         .expect("input batch should be created");
         let exec = Arc::new(MockExec::new(vec![Ok(input_batch)], input_schema));
         let insertion = table
-            .insert_into(&state, exec, datafusion::logical_expr::dml::InsertOp::Append)
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
             .await
             .expect("insertion should be successful");
 
