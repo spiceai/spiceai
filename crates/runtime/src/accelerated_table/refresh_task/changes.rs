@@ -44,6 +44,7 @@ use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_datafusion_index::IndexedTableProvider;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
@@ -807,30 +808,35 @@ impl RefreshTask {
             row_indices.len()
         );
 
-        if row_indices
-            .first()
-            .is_some_and(|row| change_batch.primary_keys(*row).is_empty())
-        {
-            let selected_batch = select_rows(&change_batch.data_batch(), row_indices)?;
-            let _lock_guard = self.accelerator_write_mutex.lock().await;
+        let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
+            .iter()
+            .copied()
+            .partition(|row| change_batch.primary_keys(*row).is_empty());
+
+        let mut wrote = false;
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
+
+        if !keyless_rows.is_empty() {
+            let selected_batch = select_rows(&change_batch.data_batch(), &keyless_rows)?;
             if delete_matching_rows_from_arrow_provider(&self.accelerator, &selected_batch)
                 .await?
                 .is_some()
             {
-                perform_change_write_maintenance(&self.accelerator).await?;
-                self.update_last_updated_at();
-                return Ok(());
+                wrote = true;
+            } else {
+                return Err(crate::accelerated_table::Error::NoPrimaryKeysDefined {
+                    dataset_name: dataset_name.to_string(),
+                });
             }
         }
 
         let combined = build_batch_delete_expr_from_change_batch(
             change_batch,
-            row_indices,
+            &keyed_rows,
             dataset_name.to_string().as_str(),
         )?;
 
         if let Some(combined) = combined {
-            let _lock_guard = self.accelerator_write_mutex.lock().await;
             let delete_plan = self
                 .accelerator
                 .delete_from(session_state, vec![combined])
@@ -841,10 +847,13 @@ impl RefreshTask {
                 .await
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-            perform_change_write_maintenance(&self.accelerator).await?;
+            wrote = true;
         }
 
-        self.update_last_updated_at();
+        if wrote {
+            perform_change_write_maintenance(&self.accelerator).await?;
+            self.update_last_updated_at();
+        }
 
         Ok(())
     }
@@ -918,6 +927,25 @@ async fn delete_matching_rows_from_arrow_provider(
     provider: &Arc<dyn TableProvider>,
     rows: &RecordBatch,
 ) -> crate::accelerated_table::Result<Option<u64>> {
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        return Box::pin(delete_matching_rows_from_arrow_provider(
+            indexed.get_underlying_ref(),
+            rows,
+        ))
+        .await;
+    }
+
+    if let Some(embedding_table) = provider
+        .as_any()
+        .downcast_ref::<crate::embeddings::table::EmbeddingTable>()
+    {
+        return Box::pin(delete_matching_rows_from_arrow_provider(
+            embedding_table.get_underlying_ref(),
+            rows,
+        ))
+        .await;
+    }
+
     if let Some(table) = provider.as_any().downcast_ref::<MemTable>() {
         return table
             .delete_matching_rows(rows)
@@ -960,6 +988,23 @@ async fn delete_matching_rows_from_arrow_provider(
 async fn perform_change_write_maintenance(
     provider: &Arc<dyn TableProvider>,
 ) -> crate::accelerated_table::Result<()> {
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        return Box::pin(perform_change_write_maintenance(
+            indexed.get_underlying_ref(),
+        ))
+        .await;
+    }
+
+    if let Some(embedding_table) = provider
+        .as_any()
+        .downcast_ref::<crate::embeddings::table::EmbeddingTable>()
+    {
+        return Box::pin(perform_change_write_maintenance(
+            embedding_table.get_underlying_ref(),
+        ))
+        .await;
+    }
+
     if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
         for partition_provider in partitioned.partition_table_providers().await {
             Box::pin(perform_change_write_maintenance(&partition_provider)).await?;
@@ -1797,6 +1842,85 @@ mod tests {
                 .expect("write_change should succeed"),
             WriteChangeResult::NoChange
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_change_mixed_keyed_and_keyless_deletes() {
+        let schema = Arc::new(create_test_data_schema());
+        let initial = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("keyed"), Some("keyless")])) as ArrayRef,
+            ],
+        )
+        .expect("initial batch should be created");
+        let table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![initial]])
+                .expect("mem table should be created"),
+        );
+        let task = make_refresh_task(Arc::clone(&table) as Arc<dyn TableProvider>);
+
+        let change_batch = create_test_change_batch(
+            vec!["d", "d"],
+            &[vec![], vec!["id"]],
+            vec![2, 1],
+            vec![Some("keyless"), Some("changed")],
+        );
+
+        assert_eq!(
+            task.write_change(change_batch)
+                .await
+                .expect("mixed delete should succeed"),
+            WriteChangeResult::DataWritten
+        );
+
+        let ctx = SessionContext::new();
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let remaining = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+        let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(remaining_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_keyless_delete_unwraps_indexed_provider() {
+        let schema = Arc::new(create_test_data_schema());
+        let initial = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("row")])) as ArrayRef,
+            ],
+        )
+        .expect("initial batch should be created");
+        let table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![initial.clone()]])
+                .expect("mem table should be created"),
+        );
+        let wrapped = Arc::new(IndexedTableProvider::new(
+            Arc::clone(&table) as Arc<dyn TableProvider>
+        )) as Arc<dyn TableProvider>;
+
+        let deleted = delete_matching_rows_from_arrow_provider(&wrapped, &initial)
+            .await
+            .expect("delete should succeed through wrapper");
+        assert_eq!(deleted, Some(1));
+
+        let ctx = SessionContext::new();
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let remaining = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+        let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(remaining_rows, 0);
     }
 
     #[test]
