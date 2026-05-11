@@ -15856,6 +15856,7 @@ dependencies = [
 name = "runtime-datafusion-index"
 version = "2.0.0-unstable"
 dependencies = [
+ "arrow_tools",
  "async-trait",
  "datafusion",
  "futures",
