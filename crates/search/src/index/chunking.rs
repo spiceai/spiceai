@@ -226,13 +226,23 @@ impl ChunkedSearchIndex {
 
         let search_field_array = group_record.column(search_field_idx);
 
+        // Names of columns that may be present on the input but must NOT survive into the
+        // intermediate chunked batch — they are recomputed by the inner index and re-attached
+        // as list columns on the final output. Filtering them out *before* `repeat()` avoids
+        // expensive `take()` work on nested list columns that would be discarded immediately.
+        let embedding_col_name = embedding_col(self.search_column().as_str());
+        let offset_col_name = Self::chunking_offset_col(self.search_column().as_str());
+
         let (mut fields, mut arrays): (Vec<Field>, Vec<ArrayRef>) = group_record
             .columns()
             .iter()
             .enumerate()
-            .map(|(i, arr)| {
+            .filter_map(|(i, arr)| {
                 let field = schema.field(i).clone();
-                if i == search_field_idx {
+                if field.name() == &embedding_col_name || field.name() == &offset_col_name {
+                    return None;
+                }
+                let result = if i == search_field_idx {
                     let chunked_array: ArrayRef = match field.data_type() {
                         DataType::LargeUtf8 => {
                             let values: Vec<String> = group_flatten_chunks
@@ -257,20 +267,19 @@ impl ChunkedSearchIndex {
                     .column_with_name(CHUNKED_INDEX_FULL_SEARCH_FIELD)
                     .is_some_and(|(idx, _)| i == idx)
                 {
-                    // If self.search_field is in self.inner.metadata_columns, we must add additional column. This colum will have full content.
-                    // During list/search, we shall ask for this column instead of the chunked version.
-                    // The chunked version must be provided to `self.inner` so that it can be indexed appropriately (e.g. embedded).
-                    Ok((field, repeat(search_field_array, group_repeats)?))
+                    // If self.search_field is in self.inner.metadata_columns, we must add an
+                    // additional column. This column will have the full content. During
+                    // list/search we shall ask for this column instead of the chunked version.
+                    // The chunked version must be provided to `self.inner` so that it can be
+                    // indexed appropriately (e.g. embedded).
+                    repeat(search_field_array, group_repeats).map(|a| (field, a))
                 } else {
-                    Ok((field, repeat(arr, group_repeats)?))
-                }
+                    repeat(arr, group_repeats).map(|a| (field, a))
+                };
+                Some(result)
             })
             .collect::<Result<Vec<_>, ArrowError>>()?
             .into_iter()
-            .filter(|(f, _)| {
-                *f.name() != embedding_col(self.search_column().as_str())
-                    && *f.name() != Self::chunking_offset_col(self.search_column().as_str())
-            })
             .unzip();
 
         fields.push(Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false));
@@ -1165,11 +1174,10 @@ mod tests {
         let out = idx.write(input).await.expect("write ok");
         assert_eq!(out.num_rows(), 3);
 
-        // The flat embedding values inside each row's list should be `[0,1,2,...]` because each
-        // inner.write call regenerates indices starting at 0. After concat + list-wrap, each
-        // row's slice independently should start at 0 and run to 4999 — but the values inside
-        // the list span the concatenation seam if a row straddles two inner calls.
-        // We check the simpler invariant: every output list has length 5000 (chunks per row).
+        // Grouping is row-atomic, so a single row's chunks are always emitted by exactly one
+        // inner.write call and never straddle a concat seam. We check the invariant that every
+        // output list has length 5000 (chunks per row), which exercises the per-group →
+        // concatenation → list-wrap path without depending on inter-group seam behavior.
         let emb_list = out
             .column_by_name(&embedding_col("content"))
             .expect("embed")
