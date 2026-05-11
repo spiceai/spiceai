@@ -100,7 +100,15 @@ async fn test_substrait_plan_round_trip() -> Result<(), anyhow::Error> {
             let data: Vec<RecordBatch> = stream.try_collect().await?;
             let result_str = arrow::util::pretty::pretty_format_batches(&data)?.to_string();
 
-            insta::assert_snapshot!("substrait_round_trip", result_str);
+            // Direct string comparison rather than a snapshot so this test is
+            // self-contained — no separate `.snap` file to keep in sync.
+            let expected = "\
++---+-------+
+| x | name  |
++---+-------+
+| 1 | spice |
++---+-------+";
+            assert_eq!(result_str, expected);
 
             Ok(())
         })
