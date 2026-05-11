@@ -1042,6 +1042,7 @@ fn host_endpoint_rejection(
             // name at a private IP.
             let lower = d.trim_end_matches('.').to_ascii_lowercase();
             if !endpoint_policy.allow_all
+                && endpoint_policy.allowed_ranges.is_empty()
                 && (lower == "localhost"
                     || lower.ends_with(".localhost")
                     || lower == "metadata"
@@ -1135,8 +1136,25 @@ fn mask_ipv6(ip: Ipv6Addr, prefix: u8) -> Ipv6Addr {
 
 fn normalize_ipv4_mapped(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .or_else(|| ipv4_compatible_addr(ip))
+            .map_or(IpAddr::V6(ip), IpAddr::V4),
         IpAddr::V4(ip) => IpAddr::V4(ip),
+    }
+}
+
+fn ipv4_compatible_addr(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    let octets = ip.octets();
+    if octets[..12].iter().all(|&octet| octet == 0) {
+        Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
     }
 }
 
@@ -2095,6 +2113,10 @@ mod tests {
             "http://[::ffff:100.64.0.1]/udf",
             "http://[::ffff:224.0.0.1]/udf",
             "http://[::ffff:255.255.255.255]/udf",
+            "http://[::127.0.0.1]/udf",
+            "http://[::10.0.0.1]/udf",
+            "http://[::169.254.169.254]/udf",
+            "http://[::100.64.0.1]/udf",
         ] {
             let d = sample_decl(from);
             let err = build_scalar_udf(&d)
@@ -2135,6 +2157,16 @@ mod tests {
             serde_json::Value::Array(vec![serde_json::Value::String("127.0.0.1/32".into())]),
         );
         build_scalar_udf(&d).expect("private endpoint allowed by explicit CIDR");
+    }
+
+    #[test]
+    fn endpoint_parse_allows_localhost_domain_with_allowed_range() {
+        let mut d = sample_decl("http://localhost:9000/udf");
+        d.params.insert(
+            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("127.0.0.1/32".into())]),
+        );
+        build_scalar_udf(&d).expect("localhost endpoint allowed by explicit CIDR");
     }
 
     #[test]
