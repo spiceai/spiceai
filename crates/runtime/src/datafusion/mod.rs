@@ -2398,15 +2398,15 @@ impl DataFusion {
             }
         }
 
-        // For append mode without time_column, check if source provides append_stream
-        // Skip this check for Cayenne which has its own validation (supports primary_key or time_column)
-        if refresh_mode == RefreshMode::Append
-            && dataset.time_column.is_none()
-            && acceleration_settings.engine != Engine::Cayenne
-        {
+        // For append mode without time_column, attach the source's append_stream
+        // when available (e.g. Kafka). This enables streaming append into any
+        // accelerator engine, including Cayenne. When the source does not
+        // provide an append_stream, Cayenne falls back to its own validation
+        // (supports primary_key); other engines require time_column.
+        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
             if let Some(append_stream) = source.append_stream(source_table_provider) {
                 accelerated_table_builder.append_stream(append_stream);
-            } else {
+            } else if acceleration_settings.engine != Engine::Cayenne {
                 return Err(Error::AppendRequiresTimeColumn {
                     from: dataset.from.clone(),
                 });
