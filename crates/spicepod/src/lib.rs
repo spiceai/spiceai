@@ -648,16 +648,139 @@ mod version_tests {
         assert_eq!(def.name, "test_pod");
     }
 
-    /// Unknown version strings produce a deserialization error.
+    /// Malformed version strings produce a deserialization error.
     #[test]
     fn test_invalid_version_rejected() {
         let yaml = r"
-            version: v3
+            version: not-a-version
             kind: Spicepod
             name: invalid
         ";
         let result: Result<SpicepodDefinition, _> = yaml::from_str(yaml);
-        assert!(result.is_err(), "Unknown version 'v3' should be rejected");
+        assert!(
+            result.is_err(),
+            "Malformed version 'not-a-version' should be rejected"
+        );
+    }
+
+    /// Partial and full version strings are accepted for supported majors (v1, v2).
+    #[test]
+    fn test_free_form_versions_accepted() {
+        let cases = [
+            "v1",
+            "v2",
+            "v1.0",
+            "v2.0",
+            "v1.0.0",
+            "v2.0.0",
+            "v2.0.0-rc.1",
+            "v1.10.20-beta-2",
+        ];
+        for case in cases {
+            let parsed: SpicepodVersion =
+                yaml::from_str(case).unwrap_or_else(|e| panic!("Should parse '{case}': {e}"));
+            assert_eq!(
+                parsed.to_string(),
+                case,
+                "Parsed version should round-trip to the same string"
+            );
+        }
+    }
+
+    /// Unsupported major versions (anything other than v1 or v2) are rejected
+    /// with an "unsupported spicepod version" error that names the major.
+    #[test]
+    fn test_unsupported_major_rejected() {
+        let cases = ["v0", "v3", "v3.0.0", "v100", "v4.5.6-rc.1"];
+        for case in cases {
+            let result: Result<SpicepodVersion, _> = yaml::from_str(case);
+            let err =
+                result.expect_err(&format!("'{case}' should be rejected as unsupported major"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unsupported spicepod version") && msg.contains(case),
+                "Error for '{case}' should mention unsupported version, got: {msg}"
+            );
+        }
+    }
+
+    /// Malformed version strings produce errors with a friendly message.
+    #[test]
+    fn test_malformed_version_error_message() {
+        let cases = [
+            "v1beta1",
+            "1.0.0",
+            "vfoo",
+            "v",
+            "v1.",
+            "v1.0.0-",
+            "v1-rc.1",
+            "v1.0-rc.1",
+            "v1.0.0.0",
+            "v01",
+            "v2.01",
+            "v2.0.01",
+            "v02.0.0",
+        ];
+        for case in cases {
+            let result: Result<SpicepodVersion, _> = yaml::from_str(case);
+            let err = result.expect_err(&format!("'{case}' should be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("invalid spicepod version") && msg.contains(case),
+                "Error for '{case}' should be user-friendly, got: {msg}"
+            );
+        }
+    }
+
+    /// Partial and full version strings are structurally distinct.
+    #[test]
+    fn test_partial_versions_are_distinct() {
+        let v2: SpicepodVersion = yaml::from_str("v2").expect("v2");
+        let v2_0: SpicepodVersion = yaml::from_str("v2.0").expect("v2.0");
+        let v2_0_0: SpicepodVersion = yaml::from_str("v2.0.0").expect("v2.0.0");
+        assert_ne!(v2, v2_0);
+        assert_ne!(v2_0, v2_0_0);
+        assert_eq!(v2, SpicepodVersion::V2);
+    }
+
+    /// A full version string with pre-release roundtrips through YAML.
+    #[test]
+    fn test_prerelease_version_roundtrip() {
+        let original: SpicepodVersion = yaml::from_str("v2.0.0-rc.1").expect("Should parse");
+        let yaml_str = yaml::to_string(&original).expect("Should serialize");
+        let roundtripped: SpicepodVersion = yaml::from_str(&yaml_str).expect("Should deserialize");
+        assert_eq!(original, roundtripped);
+        assert_eq!(original.to_string(), "v2.0.0-rc.1");
+    }
+
+    /// End-to-end: a full `vMAJOR.MINOR.PATCH-PRERELEASE` tag in a complete
+    /// `SpicepodDefinition` YAML deserializes and round-trips through serialization.
+    #[test]
+    fn test_full_version_tag_in_spicepod_definition() {
+        let yaml = r"
+            version: v2.0.0-rc.1
+            kind: Spicepod
+            name: prerelease_pod
+        ";
+        let def: SpicepodDefinition =
+            yaml::from_str(yaml).expect("Should parse SpicepodDefinition with v2.0.0-rc.1");
+        assert_eq!(def.version.to_string(), "v2.0.0-rc.1");
+        assert_eq!(def.version.major(), 2);
+        assert_eq!(def.version.minor(), Some(0));
+        assert_eq!(def.version.patch(), Some(0));
+        assert_eq!(def.version.pre_release(), Some("rc.1"));
+        assert_eq!(def.name, "prerelease_pod");
+
+        // Round-trip through serialize → deserialize preserves the version tag exactly.
+        let serialized = yaml::to_string(&def).expect("Should serialize");
+        assert!(
+            serialized.contains("version: v2.0.0-rc.1"),
+            "Serialized YAML should preserve full version tag, got:\n{serialized}"
+        );
+        let reparsed: SpicepodDefinition =
+            yaml::from_str(&serialized).expect("Should re-parse round-tripped YAML");
+        assert_eq!(reparsed.version, def.version);
     }
 
     // ========================================================================
