@@ -768,7 +768,7 @@ pub async fn create_local_model(
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
-/// File extensions that are conventionally Python pickle by PyTorch's
+/// File extensions that are conventionally Python pickle by `PyTorch`'s
 /// ecosystem and that are unsafe to load from any source the operator
 /// does not fully trust. Pickle deserialization is RCE by design.
 const PICKLE_WEIGHT_EXTENSIONS: &[&str] = &["bin", "pt", "pth", "ckpt"];
