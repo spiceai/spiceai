@@ -23,13 +23,16 @@ use crate::postgres::common;
 use crate::postgres::common::get_random_port;
 use crate::{
     configure_test_datafusion, configure_test_datafusion_request_context, init_tracing,
-    utils::{register_test_connectors, test_request_context},
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 use arrow::array::Array;
+use datafusion::common::TableReference;
+use runtime::status::ComponentStatus;
 use spicepod::acceleration::Mode;
 use spicepod::param::Params;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::test]
 async fn test_acceleration_refresh_cayenne_append() -> Result<(), anyhow::Error> {
@@ -351,13 +354,35 @@ async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Er
 
             let rt = Arc::new(runtime::Runtime::builder().with_app(app).build().await);
 
-            // load_components retries failed dataset initialization indefinitely, so
-            // it won't complete here. Bound the wait with a timeout so the test
-            // proceeds to verify the dataset never became queryable.
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
-                () = Arc::clone(&rt).load_components() => {}
-            }
+            // Drive load_components on a spawned task so initialization actually
+            // runs to completion of the first attempt. It retries indefinitely on
+            // failure, so the task won't exit on its own — we abort it after
+            // shutdown below.
+            let load_handle = tokio::spawn({
+                let rt = Arc::clone(&rt);
+                async move {
+                    rt.load_components().await;
+                }
+            });
+
+            // Wait for the dataset to reach the Error state, signaling that the
+            // first initialization attempt has failed (as expected).
+            let ds_name = TableReference::from("test_table");
+            let entered_error = wait_until_true(Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                let ds_name = ds_name.clone();
+                async move {
+                    rt.status()
+                        .get_dataset_statuses()
+                        .get(&ds_name)
+                        .is_some_and(|s| matches!(s, ComponentStatus::Error(_)))
+                }
+            })
+            .await;
+            assert!(
+                entered_error,
+                "Dataset never entered Error state; validation may not have fired"
+            );
 
             // Verify that the dataset is not available (failed to initialize)
             let result = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await;
@@ -373,7 +398,12 @@ async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Er
                     || err_msg.contains("'datafusion.catalog.spice.public.test_table' not found"),
                 "Error message should indicate table not found, got: {err_msg}"
             );
-            tracing::info!("✓ Validation correctly rejects append mode without constraints");
+            tracing::info!("Validation correctly rejects append mode without constraints");
+
+            // Stop the infinite-retry loop and release runtime resources before
+            // dropping the docker container, then drop the load_components task.
+            rt.shutdown().await;
+            load_handle.abort();
 
             running_container.remove().await?;
             Ok(())
