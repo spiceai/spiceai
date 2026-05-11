@@ -180,13 +180,14 @@ fn validate_spicepod_header(raw: &yaml::Value, path: &Path) -> Result<()> {
     }
 
     if let Some(version_val) = raw.get("version")
-        && yaml::from_value::<SpicepodVersion>(version_val.clone()).is_err() {
-            return InvalidSpicepodVersionSnafu {
-                version: version_val.as_str().unwrap_or("unknown").to_string(),
-                path: path.to_path_buf(),
-            }
-            .fail();
+        && yaml::from_value::<SpicepodVersion>(version_val.clone()).is_err()
+    {
+        return InvalidSpicepodVersionSnafu {
+            version: version_val.as_str().unwrap_or("unknown").to_string(),
+            path: path.to_path_buf(),
         }
+        .fail();
+    }
 
     Ok(())
 }
