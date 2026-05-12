@@ -1860,12 +1860,14 @@ mod tests {
         let name_array: ArrayRef = Arc::new(StringArray::from(names));
         let data_array: ArrayRef = Arc::new(StructArray::from(vec![
             (Arc::new(Field::new("id", DataType::Int32, true)), id_array),
-            (Arc::new(Field::new("name", DataType::Utf8, true)), name_array),
+            (
+                Arc::new(Field::new("name", DataType::Utf8, true)),
+                name_array,
+            ),
         ]));
 
-        let record =
-            RecordBatch::try_new(Arc::new(schema), vec![op_array, pk_array, data_array])
-                .expect("record batch");
+        let record = RecordBatch::try_new(Arc::new(schema), vec![op_array, pk_array, data_array])
+            .expect("record batch");
         ChangeBatch::try_new(record).expect("change batch")
     }
 
@@ -1894,15 +1896,22 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        let coerced =
-            coerce_batch_nullability(batch, &target_schema).expect("coerce");
+        let coerced = coerce_batch_nullability(batch, &target_schema).expect("coerce");
 
         assert!(
-            !coerced.schema().field_with_name("id").unwrap().is_nullable(),
+            !coerced
+                .schema()
+                .field_with_name("id")
+                .unwrap()
+                .is_nullable(),
             "id should be promoted to non-nullable"
         );
         assert!(
-            coerced.schema().field_with_name("name").unwrap().is_nullable(),
+            coerced
+                .schema()
+                .field_with_name("name")
+                .unwrap()
+                .is_nullable(),
             "name should remain nullable"
         );
         assert_eq!(coerced.num_rows(), 2, "row count unchanged");
@@ -1922,8 +1931,7 @@ mod tests {
         )
         .expect("batch");
 
-        let coerced =
-            coerce_batch_nullability(batch.clone(), &schema).expect("coerce");
+        let coerced = coerce_batch_nullability(batch.clone(), &schema).expect("coerce");
         assert_eq!(
             coerced.schema(),
             batch.schema(),
