@@ -1041,10 +1041,10 @@ mod accelerator_compat_tests {
         logical_expr::{CreateExternalTable, col, dml::InsertOp, lit},
         physical_plan::collect,
     };
+    use datafusion_table_providers::util::test::MockExec;
     use datafusion_table_providers::util::{
         column_reference::ColumnReference, on_conflict::OnConflict,
     };
-    use datafusion_table_providers::util::test::MockExec;
     use std::{collections::HashMap, sync::Arc};
     use tempfile::TempDir;
 
