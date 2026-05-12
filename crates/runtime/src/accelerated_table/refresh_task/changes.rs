@@ -21,7 +21,7 @@ use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 #[cfg(feature = "dynamodb")]
@@ -725,7 +725,15 @@ impl RefreshTask {
             );
         }
 
+        let target_schema = self.accelerator.schema();
+
         let selected_batch = select_rows(&data_batch, row_indices)?;
+        // CDC sources may produce a nullable schema even for fields declared NOT NULL in the
+        // accelerator (e.g. Postgres DELETE rows where non-PK columns are absent from the WAL
+        // old-tuple). Promote those fields to non-nullable so the batch dtype matches
+        // acceleration schema. SchemaCastScanExec handles type coercion;
+        // this step only adjusts nullability metadata.
+        let selected_batch = coerce_batch_nullability(selected_batch, &target_schema)?;
 
         let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
             selected_batch.schema(),
@@ -736,7 +744,6 @@ impl RefreshTask {
 
         // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
         // (e.g., timestamp precision conversion from Millisecond to Microsecond for Cayenne)
-        let target_schema = self.accelerator.schema();
         let streaming_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream));
         let cast_plan: Arc<dyn ExecutionPlan> =
@@ -857,6 +864,44 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
 fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
     item.as_ref()
         .map_or(0, |env| env.change_batch.record.get_array_memory_size())
+}
+
+/// Rebuild `batch` with nullability flags promoted to match `target_schema`.
+///
+/// Fields that are nullable in the batch but non-nullable in the target are
+/// declared non-nullable in the returned batch. The underlying `ArrayRef`s are
+/// shared unchanged — Arrow arrays hold null values independently of the
+/// schema's nullability declaration. `SchemaCastScanExec` handles data-type
+/// differences; this function only adjusts nullability metadata.
+fn coerce_batch_nullability(
+    batch: RecordBatch,
+    target_schema: &SchemaRef,
+) -> crate::accelerated_table::Result<RecordBatch> {
+    let needs_coercion = batch.schema().fields().iter().any(|f| {
+        target_schema
+            .field_with_name(f.name())
+            .is_ok_and(|tf| f.is_nullable() && !tf.is_nullable())
+    });
+
+    if !needs_coercion {
+        return Ok(batch);
+    }
+
+    let new_fields: Vec<Arc<Field>> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| match target_schema.field_with_name(f.name()) {
+            Ok(tf) if f.is_nullable() && !tf.is_nullable() => {
+                Arc::new(Field::new(f.name(), f.data_type().clone(), false))
+            }
+            _ => Arc::clone(f),
+        })
+        .collect();
+
+    let new_schema = Arc::new(Schema::new(new_fields));
+    RecordBatch::try_new(new_schema, batch.columns().to_vec())
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)
 }
 
 fn select_rows(
@@ -1760,6 +1805,158 @@ mod tests {
         assert_eq!(result[1].1.len(), 2);
         assert_eq!(result[2].0, ChangeOperationType::Upsert);
         assert_eq!(result[2].1.len(), 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // Tests for nullable-schema ChangeBatch handling.
+    //
+    // Postgres CDC produces ChangeBatches whose `data` struct has all fields
+    // promoted to nullable (so DELETE rows with absent non-PK columns can be
+    // written without Arrow rejecting nulls in non-nullable fields).
+    // `coerce_batch_nullability` in `process_upsert_batch` restores the
+    // accelerator's original nullability before the write.
+    // ---------------------------------------------------------------------
+
+    /// Build a `ChangeBatch` where every field in the `data` struct is
+    /// nullable — matching what `build_change_batch` now produces for
+    /// Postgres native CDC.
+    fn create_nullable_change_batch(
+        ops: Vec<&str>,
+        primary_keys: &[Vec<&str>],
+        ids: Vec<i32>,
+        names: Vec<Option<&str>>,
+    ) -> ChangeBatch {
+        let nullable_data_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let schema = changes_schema(&nullable_data_schema);
+
+        let op_array: ArrayRef = Arc::new(StringArray::from(ops));
+
+        let mut pk_offsets = vec![0i32];
+        let mut pk_values: Vec<&str> = vec![];
+        for pk_vec in primary_keys {
+            for &pk in pk_vec {
+                pk_values.push(pk);
+            }
+            pk_offsets.push(
+                pk_offsets.last().copied().unwrap_or(0)
+                    + i32::try_from(pk_vec.len()).expect("fits in i32"),
+            );
+        }
+        let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
+        let pk_array: ArrayRef = Arc::new(
+            ListArray::try_new(
+                pk_field,
+                arrow::buffer::OffsetBuffer::new(pk_offsets.into()),
+                Arc::new(StringArray::from(pk_values)),
+                None,
+            )
+            .expect("pk list"),
+        );
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(ids));
+        let name_array: ArrayRef = Arc::new(StringArray::from(names));
+        let data_array: ArrayRef = Arc::new(StructArray::from(vec![
+            (Arc::new(Field::new("id", DataType::Int32, true)), id_array),
+            (Arc::new(Field::new("name", DataType::Utf8, true)), name_array),
+        ]));
+
+        let record =
+            RecordBatch::try_new(Arc::new(schema), vec![op_array, pk_array, data_array])
+                .expect("record batch");
+        ChangeBatch::try_new(record).expect("change batch")
+    }
+
+    /// `coerce_batch_nullability` promotes nullable fields to non-nullable
+    /// when the target schema declares them as such, and leaves already-
+    /// matching fields untouched.
+    #[test]
+    fn test_coerce_batch_nullability_promotes_fields() {
+        // All-nullable source batch (Postgres CDC output style).
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&src_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("Alice"), None])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        // Target: `id` is NOT NULL, `name` is nullable.
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let coerced =
+            coerce_batch_nullability(batch, &target_schema).expect("coerce");
+
+        assert!(
+            !coerced.schema().field_with_name("id").unwrap().is_nullable(),
+            "id should be promoted to non-nullable"
+        );
+        assert!(
+            coerced.schema().field_with_name("name").unwrap().is_nullable(),
+            "name should remain nullable"
+        );
+        assert_eq!(coerced.num_rows(), 2, "row count unchanged");
+    }
+
+    /// `coerce_batch_nullability` is a no-op when the batch schema already
+    /// matches the target nullability.
+    #[test]
+    fn test_coerce_batch_nullability_no_op_when_already_matches() {
+        let schema = Arc::new(create_test_data_schema());
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("Alice")])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        let coerced =
+            coerce_batch_nullability(batch.clone(), &schema).expect("coerce");
+        assert_eq!(
+            coerced.schema(),
+            batch.schema(),
+            "schema should be identical when already matching"
+        );
+    }
+
+    /// A `ChangeBatch` whose `data` struct uses all-nullable fields (as
+    /// Postgres native CDC produces) must be successfully written to an
+    /// accelerator whose schema declares `id` as NOT NULL.
+    ///
+    /// Before the fix this would have caused a Vortex dtype mismatch that
+    /// silently killed the write task. The `coerce_batch_nullability` step in
+    /// `process_upsert_batch` makes the write succeed.
+    #[tokio::test]
+    async fn test_write_change_nullable_batch_against_non_nullable_accelerator() {
+        // Accelerator schema: `id` is NOT NULL (create_test_data_schema).
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+
+        // ChangeBatch schema: all fields nullable (Postgres CDC style).
+        let change_batch = create_nullable_change_batch(
+            vec!["c", "c"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 2],
+            vec![Some("Alice"), Some("Bob")],
+        );
+
+        assert_eq!(
+            task.write_change(change_batch)
+                .await
+                .expect("write must succeed with nullable batch against non-nullable accelerator"),
+            WriteChangeResult::DataWritten,
+        );
     }
 
     // ---------------------------------------------------------------------
