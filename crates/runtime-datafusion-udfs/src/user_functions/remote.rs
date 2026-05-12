@@ -1292,30 +1292,41 @@ impl Resolve for EndpointFilteringResolver {
         let policy = self.policy.clone();
         Box::pin(async move {
             let addrs: Vec<SocketAddr> = inner.resolve(name).await?.collect();
-            ensure_resolved_addrs_allowed(&policy, &host, &addrs)
+            let addrs = filter_resolved_addrs(&policy, &host, addrs)
                 .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
 }
 
-fn ensure_resolved_addrs_allowed(
+fn filter_resolved_addrs(
     policy: &EndpointAccessPolicy,
     host: &str,
-    addrs: &[SocketAddr],
-) -> std::result::Result<(), std::io::Error> {
+    addrs: Vec<SocketAddr>,
+) -> std::result::Result<Vec<SocketAddr>, std::io::Error> {
+    let mut allowed = Vec::with_capacity(addrs.len());
+    let mut first_rejected = None;
+
     for addr in addrs {
         if let Some(reason) = policy.rejection_reason(addr.ip()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "remote UDF endpoint host '{host}' resolved to disallowed address {} ({reason}); add a specific CIDR to `{ALLOWED_ENDPOINT_RANGES_PARAM}` or set it to [\"*\"] only for trusted endpoints",
-                    addr.ip()
-                ),
-            ));
+            first_rejected.get_or_insert((addr.ip(), reason));
+        } else {
+            allowed.push(addr);
         }
     }
-    Ok(())
+
+    if allowed.is_empty()
+        && let Some((ip, reason)) = first_rejected
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "remote UDF endpoint host '{host}' resolved only to disallowed addresses, including {ip} ({reason}); add a specific CIDR to `{ALLOWED_ENDPOINT_RANGES_PARAM}` or set it to [\"*\"] only for trusted endpoints"
+            ),
+        ));
+    }
+
+    Ok(allowed)
 }
 
 fn parse_timeout(v: Option<&Value>) -> Result<Duration> {
@@ -2208,6 +2219,33 @@ mod tests {
         {
             Ok(_) => panic!("private resolved address should be rejected"),
             Err(err) => assert!(err.to_string().contains("10.20.5.42")),
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_filtering_resolver_filters_disallowed_dns_results() {
+        let resolver = EndpointFilteringResolver::with_inner(
+            EndpointAccessPolicy::default(),
+            Arc::new(StaticResolver {
+                addrs: vec![
+                    "10.20.5.42:0".parse().expect("valid socket address"),
+                    "8.8.8.8:0".parse().expect("valid socket address"),
+                ],
+            }),
+        );
+
+        match resolver
+            .resolve("udf.internal.svc".parse().expect("valid dns name"))
+            .await
+        {
+            Ok(mut addrs) => {
+                assert_eq!(
+                    addrs.next().expect("one allowed resolved address").ip(),
+                    "8.8.8.8".parse::<IpAddr>().expect("valid IP")
+                );
+                assert!(addrs.next().is_none(), "disallowed address was filtered");
+            }
+            Err(err) => panic!("mixed DNS results should keep allowed addresses: {err}"),
         }
     }
 
