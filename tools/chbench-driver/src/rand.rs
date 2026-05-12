@@ -97,3 +97,11 @@ pub fn rand_c_last(rng: &mut impl Rng, c_load: usize) -> String {
     let x = rng.gen_range(0..1000);
     c_last_syllables(((a | x) + c_load) % 1000)
 }
+
+/// Generate a random customer ID using NURand(1023, 1, 3000) (spec §2.1.6).
+pub fn rand_customer_id(rng: &mut impl Rng) -> i32 {
+    let a = rng.gen_range(0..1024);
+    let x = rng.gen_range(1..=3000);
+    let c = rng.gen_range(0..1024);
+    ((a | x) + c) % 3000 + 1
+}

@@ -37,6 +37,16 @@ pub struct ChBenchConfig {
 
     /// PostgreSQL password.
     pub pg_pass: String,
+
+    /// Number of concurrent OLTP terminals for the HTAP workload.
+    pub terminals: usize,
+
+    /// Duration of the OLTP workload.
+    pub duration: std::time::Duration,
+
+    /// Transaction mix weights: [NewOrder, Payment, Delivery, OrderStatus, StockLevel].
+    /// Must sum to 100.
+    pub mix: [u32; 5],
 }
 
 /// Default RNG seed for deterministic data generation.
@@ -52,6 +62,9 @@ impl Default for ChBenchConfig {
             pg_db: "chbench".into(),
             pg_user: "bench".into(),
             pg_pass: "bench".into(),
+            terminals: 10,
+            duration: std::time::Duration::from_secs(60),
+            mix: crate::txn::DEFAULT_MIX,
         }
     }
 }

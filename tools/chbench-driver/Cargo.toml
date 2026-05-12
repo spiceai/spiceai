@@ -10,3 +10,4 @@ rand = "0.8"
 snafu = "0.8"
 tokio = { workspace = true, features = ["macros", "rt"] }
 tokio-postgres = { workspace = true }
+tokio-util = { workspace = true }
