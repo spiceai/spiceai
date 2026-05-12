@@ -5310,6 +5310,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-flight",
+ "arrow-row",
  "arrow_tools",
  "async-stream",
  "async-trait",

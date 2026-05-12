@@ -19,7 +19,7 @@ limitations under the License.
 //!
 //! These tests verify:
 //! - Basic bucket partitioning correctness (data integrity, filtered queries)
-//! - `hash_index` parameter is propagated to each partition (bug fix)
+//! - primary-key hash indexing is propagated to each partition
 //! - `sort_columns` parameter is propagated to each partition (bug fix)
 
 use app::AppBuilder;
@@ -166,7 +166,7 @@ async fn test_arrow_partition_by_bucket() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test that `hash_index: enabled` is correctly propagated to every Arrow partition.
+/// Test that primary-key hash indexing is correctly propagated to every Arrow partition.
 ///
 /// Prior to the fix, `_source` was ignored in `PartitionedArrowAccelerator::create_external_table`,
 /// so `hash_index` was silently dropped and each partition's `IndexedMemTable` was created without
@@ -176,7 +176,7 @@ async fn test_arrow_partition_by_bucket() -> Result<(), anyhow::Error> {
 /// `PartitionTableProvider` — missing all the inner `IndexedMemTable`s).
 ///
 /// We verify correctness by confirming:
-/// 1. The dataset loads successfully with `hash_index: enabled` + `primary_key` set.
+/// 1. The dataset loads successfully with `primary_key` set.
 /// 2. Primary-key point lookups on the partition table return the correct single row (exercises
 ///    the rebuilt per-partition hash index).
 /// 3. A lookup for a non-existent key returns zero rows.
@@ -192,8 +192,7 @@ async fn test_arrow_partition_hash_index() -> Result<(), anyhow::Error> {
 
             crate::configure_test_datafusion();
 
-            let mut params = HashMap::new();
-            params.insert("hash_index".to_string(), "enabled".to_string());
+            let params = HashMap::new();
 
             let dataset = make_dataset(
                 "arrow_partition_hash_test",
@@ -335,10 +334,10 @@ async fn test_arrow_partition_sort_columns() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test that `hash_index` and `sort_columns` can be used together with partitioned Arrow.
+/// Test that primary-key hash indexing and `sort_columns` can be used together with partitioned Arrow.
 ///
-/// This is the combined scenario: a dataset with both options set, partitioned by bucket.
-/// Verifies that both options are propagated without conflict and the table is queryable.
+/// This is the combined scenario: a dataset with primary-key indexing and sort columns,
+/// partitioned by bucket. Verifies that both behaviors work together and the table is queryable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_arrow_partition_hash_index_and_sort_columns() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
@@ -352,7 +351,6 @@ async fn test_arrow_partition_hash_index_and_sort_columns() -> Result<(), anyhow
             crate::configure_test_datafusion();
 
             let mut params = HashMap::new();
-            params.insert("hash_index".to_string(), "enabled".to_string());
             params.insert("sort_columns".to_string(), "score".to_string());
 
             let dataset = make_dataset(
