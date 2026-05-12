@@ -135,6 +135,7 @@ fn wal_stream(
         let mut first_emitted = !mark_ready_on_first;
         let mut client_slot: Option<ReplicationClient> = initial_client;
         let mut backoff = super::resilience::Backoff::default_for_stream();
+        let mut last_emitted_commit_lsn = confirmed_flush.load(Ordering::Relaxed);
 
         // Outer reconnect loop: runs until we hit a fatal error or the stream
         // reaches a natural end (rare — Postgres replication slots are
@@ -340,6 +341,7 @@ fn wal_stream(
                             end_lsn.0,
                             is_ready,
                         );
+                        last_emitted_commit_lsn = end_lsn.0;
                         yield envelope;
                     } else {
                         // Empty transaction — still advance the LSN.
@@ -365,6 +367,7 @@ fn wal_stream(
                         &confirmed_flush,
                         ack_filtered_lsn,
                         txn.is_some(),
+                        last_emitted_commit_lsn,
                         wal_end.0,
                     );
                     metrics.set_confirmed_flush_lsn(applied);
@@ -423,9 +426,11 @@ fn keepalive_applied_lsn(
     confirmed_flush: &AtomicU64,
     ack_filtered_lsn: bool,
     transaction_pending: bool,
+    last_emitted_commit_lsn: u64,
     wal_end: u64,
 ) -> u64 {
-    if ack_filtered_lsn && !transaction_pending {
+    let applied = confirmed_flush.load(Ordering::Acquire);
+    if ack_filtered_lsn && !transaction_pending && applied >= last_emitted_commit_lsn {
         advance(confirmed_flush, wal_end);
     }
     confirmed_flush.load(Ordering::Relaxed)
@@ -493,17 +498,27 @@ mod tests {
     fn keepalive_advances_filtered_lsn_when_idle() {
         let confirmed = AtomicU64::new(100);
 
-        let applied = keepalive_applied_lsn(&confirmed, true, false, 250);
+        let applied = keepalive_applied_lsn(&confirmed, true, false, 100, 250);
 
         assert_eq!(applied, 250);
         assert_eq!(confirmed.load(Ordering::Relaxed), 250);
     }
 
     #[test]
+    fn keepalive_does_not_advance_past_uncommitted_emitted_envelope() {
+        let confirmed = AtomicU64::new(100);
+
+        let applied = keepalive_applied_lsn(&confirmed, true, false, 200, 250);
+
+        assert_eq!(applied, 100);
+        assert_eq!(confirmed.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
     fn keepalive_does_not_advance_past_pending_transaction() {
         let confirmed = AtomicU64::new(100);
 
-        let applied = keepalive_applied_lsn(&confirmed, true, true, 250);
+        let applied = keepalive_applied_lsn(&confirmed, true, true, 100, 250);
 
         assert_eq!(applied, 100);
         assert_eq!(confirmed.load(Ordering::Relaxed), 100);
@@ -513,7 +528,7 @@ mod tests {
     fn keepalive_respects_filtered_lsn_disable_switch() {
         let confirmed = AtomicU64::new(100);
 
-        let applied = keepalive_applied_lsn(&confirmed, false, false, 250);
+        let applied = keepalive_applied_lsn(&confirmed, false, false, 100, 250);
 
         assert_eq!(applied, 100);
         assert_eq!(confirmed.load(Ordering::Relaxed), 100);

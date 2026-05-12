@@ -834,7 +834,7 @@ pub struct Query {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spill_compression: Option<SpillCompression>,
 
-    /// Overrides DataFusion's local query target partition count.
+    /// Overrides `DataFusion`'s local query target partition count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_partitions: Option<usize>,
 }
