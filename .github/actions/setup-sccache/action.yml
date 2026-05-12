@@ -23,10 +23,12 @@ runs:
         echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
         echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-        SCCACHE_CONF_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sccache.XXXXXX")"
-        echo "SCCACHE_CONF=${SCCACHE_CONF_DIR}/config" >> $GITHUB_ENV
         if [ -n "${{ inputs.server_port }}" ]; then
+          SCCACHE_CONF_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sccache.XXXXXX")"
+          echo "SCCACHE_CONF=${SCCACHE_CONF_DIR}/config" >> $GITHUB_ENV
           echo "SCCACHE_SERVER_PORT=${{ inputs.server_port }}" >> $GITHUB_ENV
+        else
+          echo "SCCACHE_CONF=${HOME}/.config/sccache/config" >> $GITHUB_ENV
         fi
 
     - name: Configure apt mirrors (Linux)

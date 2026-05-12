@@ -180,6 +180,13 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
+      - name: Stop sccache
+        if: always() && needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          if [ -n "${SCCACHE_SERVER_PORT:-}" ]; then
+            sccache --stop-server || true
+          fi
+
       - name: Kill spiceio
         if: always() && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
