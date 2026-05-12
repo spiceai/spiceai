@@ -47,6 +47,7 @@ use tokio::task::JoinHandle;
 
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_request_context::CacheNamespace;
 use util::expr::combine_exprs_balanced;
 
 /// Type alias for tracking in-flight revalidation requests.
@@ -56,6 +57,104 @@ use util::expr::combine_exprs_balanced;
 pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
 
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "fetched_at";
+
+/// Reserved column name added to caching-mode accelerator storage to scope
+/// cached rows by [`runtime_request_context::CacheNamespace`]. The column is
+/// hidden from the user-facing schema and may not be referenced in user
+/// projections, filters, or dataset definitions.
+///
+/// Stored value is the namespace's stable string id (e.g. `"public"`,
+/// `"system"`, or `"apikey:<sha256[..16]>"`). Comparing rows by this column
+/// is what enforces cross-principal isolation inside the caching
+/// accelerator.
+pub const CACHE_NAMESPACE_COLUMN: &str = "__spice_cache_namespace";
+
+/// Returns true if `name` collides with a column reserved by the caching
+/// accelerator. Used by dataset configuration validation so a user-defined
+/// column never silently overwrites internal cache state.
+#[must_use]
+pub fn is_reserved_caching_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case(CACHE_NAMESPACE_COLUMN)
+}
+
+/// Returns a copy of `batch` with [`CACHE_NAMESPACE_COLUMN`] appended,
+/// populated with `namespace_id` for every row. Idempotent: if the column
+/// is already present the batch is returned unchanged.
+///
+/// Called immediately before a [`CacheWriteRequest`] is enqueued so that
+/// every persisted row carries its originating namespace tag, which is
+/// what `__spice_cache_namespace = $current_ns` filtering keys off of on
+/// read.
+pub fn stamp_namespace_column(
+    batch: RecordBatch,
+    namespace_id: &str,
+) -> DataFusionResult<RecordBatch> {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = batch.schema();
+    if schema.column_with_name(CACHE_NAMESPACE_COLUMN).is_some() {
+        return Ok(batch);
+    }
+    let n = batch.num_rows();
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
+    fields.push(Field::new(CACHE_NAMESPACE_COLUMN, DataType::Utf8, false));
+    let new_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    let ns_array: ArrayRef = Arc::new(StringArray::from(vec![namespace_id; n]));
+    let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+    cols.push(ns_array);
+    RecordBatch::try_new(new_schema, cols).map_err(|e| {
+        DataFusionError::Execution(format!("failed to stamp {CACHE_NAMESPACE_COLUMN}: {e}"))
+    })
+}
+
+/// Returns a filter expression scoping a scan to a single namespace.
+/// Pushed into the accelerator alongside user filters so cached rows
+/// belonging to other principals are not visible to this request.
+#[must_use]
+pub fn namespace_filter_expr(namespace_id: &str) -> Expr {
+    col(CACHE_NAMESPACE_COLUMN).eq(lit(namespace_id))
+}
+
+/// Extends a federated/source schema with [`CACHE_NAMESPACE_COLUMN`] so the
+/// caching accelerator can store the per-namespace tag alongside cached
+/// rows. This is only applied to storage; the user-facing
+/// [`crate::accelerated_table::AcceleratedTable`] schema continues to
+/// expose the original column set.
+///
+/// Returns an error if the source schema already defines a column whose
+/// name collides with [`CACHE_NAMESPACE_COLUMN`] — that name is reserved
+/// for the runtime and a collision would silently corrupt cached rows.
+pub fn extend_schema_with_cache_namespace(
+    dataset_name: &str,
+    schema: &arrow::datatypes::Schema,
+) -> DataFusionResult<arrow::datatypes::Schema> {
+    use arrow::datatypes::Field;
+    // Check case-insensitively. Arrow `column_with_name` is case-sensitive,
+    // so a source field named `__SPICE_CACHE_NAMESPACE` would otherwise
+    // slip past this guard, after which we would append our own lowercase
+    // internal column and the schema would end up with two fields whose
+    // names only differ by case — bad regardless of whether downstream
+    // engines treat them as equal or distinct.
+    if schema
+        .fields()
+        .iter()
+        .any(|f| f.name().eq_ignore_ascii_case(CACHE_NAMESPACE_COLUMN))
+    {
+        return Err(DataFusionError::Plan(format!(
+            "dataset `{dataset_name}` declares a column named `{CACHE_NAMESPACE_COLUMN}` (case-insensitive match), which is reserved by the caching accelerator for per-user cache scoping. Rename the source column to avoid this name.",
+        )));
+    }
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
+    fields.push(Field::new(
+        CACHE_NAMESPACE_COLUMN,
+        arrow::datatypes::DataType::Utf8,
+        false,
+    ));
+    Ok(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
 
 /// Maximum number of concurrent refresh requests
 const MAX_CONCURRENT_REFRESHES: usize = 10;
@@ -82,6 +181,13 @@ pub struct CacheWriteRequest {
     pub is_upsert: bool,
     /// Cache key computed from filters, used to track in-flight writes
     pub cache_key: String,
+    /// Stable storage id of the originating namespace (see
+    /// [`runtime_request_context::CacheNamespace::storage_id`]). Stamped into
+    /// `__spice_cache_namespace` on every row at flush time and added to the
+    /// upsert filter set so concurrent writers in different namespaces never
+    /// overwrite each other's rows for the same `(request_path, query, body)`
+    /// key.
+    pub namespace_id: Arc<str>,
 }
 
 /// Sender half of the cache write channel
@@ -198,17 +304,48 @@ async fn flush_cache_writes(
         "Flushing {request_count} cache write requests ({total_rows} total rows) for dataset={dataset_name}"
     );
 
-    // Separate inserts from upserts
+    // Separate inserts from upserts. Stamp the namespace column on every
+    // batch and add a `__spice_cache_namespace = $ns_id` predicate to each
+    // upsert filter set so concurrent writers from different namespaces
+    // never overwrite each other's rows for the same logical key. We do
+    // this here (not at the send-site) so unit-test mocks with a non-
+    // extended schema can opt out by simply not adding the column.
+    let needs_namespace_stamp = accelerator
+        .schema()
+        .column_with_name(CACHE_NAMESPACE_COLUMN)
+        .is_some();
+
     let mut insert_batches: Vec<RecordBatch> = Vec::new();
     let mut upsert_batches: Vec<RecordBatch> = Vec::new();
     let mut upsert_filters: Vec<Vec<Expr>> = Vec::new();
 
     for req in buffer.drain(..) {
+        let mut batches = req.batches;
+        let mut filters = req.filters;
+        if needs_namespace_stamp {
+            let ns_id: &str = &req.namespace_id;
+            batches = match batches
+                .into_iter()
+                .map(|b| stamp_namespace_column(b, ns_id))
+                .collect::<DataFusionResult<Vec<_>>>()
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to stamp {CACHE_NAMESPACE_COLUMN} for dataset={dataset_name}: {e}; dropping write"
+                    );
+                    continue;
+                }
+            };
+            if req.is_upsert {
+                filters.push(namespace_filter_expr(ns_id));
+            }
+        }
         if req.is_upsert {
-            upsert_batches.extend(req.batches);
-            upsert_filters.push(req.filters);
+            upsert_batches.extend(batches);
+            upsert_filters.push(filters);
         } else {
-            insert_batches.extend(req.batches);
+            insert_batches.extend(batches);
         }
     }
 
@@ -401,13 +538,31 @@ fn check_cache_freshness(
     Ok(worst_freshness)
 }
 
-/// Compute a cache key from filter expressions.
-/// The cache key is a string representation of the filter values for `request_path`, `request_query`, and `request_body`.
+/// Compute a cache key from filter expressions only.
+///
+/// Use this only when the resulting key is compared against other keys
+/// computed from the *same* call site (i.e. intra-call deduplication
+/// where the namespace is constant). For any cross-request keying
+/// (in-flight revalidation, batched-write dedup, etc.) use
+/// [`compute_cache_key_from_filters_and_namespace`] so two principals
+/// running the same SQL do not collide.
 fn compute_cache_key_from_filters(filters: &[Expr]) -> String {
-    // Sort and join filter expressions to create a consistent cache key
     let mut parts: Vec<String> = filters.iter().map(ToString::to_string).collect();
     parts.sort();
     parts.join("|")
+}
+
+/// Compute an in-flight / cache-write key from filter expressions plus
+/// the originating cache namespace. The namespace tag is mixed in so that
+/// two principals running the same query do not share an in-flight
+/// revalidation slot or a write-batch dedup slot — if alice and bob both
+/// trigger SWR for the same SQL, both must actually fetch and write
+/// independently into their own namespaces.
+fn compute_cache_key_from_filters_and_namespace(filters: &[Expr], namespace_id: &str) -> String {
+    let mut key = compute_cache_key_from_filters(filters);
+    key.push_str("|__ns=");
+    key.push_str(namespace_id);
+    key
 }
 
 /// Convert a timestamp array to nanosecond precision, returning the original if already nanoseconds.
@@ -552,10 +707,12 @@ impl CacheRefreshHelper {
         federated: Arc<dyn TableProvider>,
         dataset_name: &str,
         filters: &[Expr],
+        namespace: CacheNamespace,
         batch_write_tx: CacheWriteSender,
         in_flight_revalidations: InFlightRevalidations,
     ) -> DataFusionResult<usize> {
-        let cache_key = compute_cache_key_from_filters(filters);
+        let cache_key =
+            compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
 
         tracing::trace!(
             "Refreshing single cache entry for dataset {dataset_name} with {} filters",
@@ -583,6 +740,9 @@ impl CacheRefreshHelper {
             return Ok(0);
         }
 
+        // Stamping and namespace-scoped upsert filters are applied by the
+        // flush task based on the accelerator's actual schema.
+
         let refreshed_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
         // Queue write through batched channel
@@ -591,6 +751,7 @@ impl CacheRefreshHelper {
             filters: filters.to_vec(),
             is_upsert: true,
             cache_key: cache_key.clone(),
+            namespace_id: namespace.storage_id().into(),
         };
 
         batch_write_tx
@@ -1042,12 +1203,22 @@ impl CacheRefreshHelper {
 
     /// Propagate cached data to synchronized child accelerators (for localpod caching).
     /// This is called after successfully storing data in the parent accelerator.
+    ///
+    /// Each child accelerator may have its own storage schema. If the
+    /// child's schema includes the `__spice_cache_namespace` column
+    /// (i.e. the child is itself a caching accelerator extended by m4b),
+    /// stamp the batches with the originating namespace before insert so
+    /// the non-null `__spice_cache_namespace` constraint is satisfied and
+    /// the per-principal isolation contract holds end-to-end through the
+    /// localpod chain. Children whose schema does not have the column
+    /// (non-caching accelerators) receive the batches unchanged.
     async fn propagate_to_synchronized_children(
         synchronized_children: &SynchronizedChildren,
         dataset_name: &str,
         filters: &[Expr],
         batches: &[RecordBatch],
         is_expired: bool,
+        namespace_id: &str,
     ) {
         let children = synchronized_children.read().await;
         if children.is_empty() {
@@ -1063,10 +1234,40 @@ impl CacheRefreshHelper {
         );
 
         for (idx, child) in children.iter().enumerate() {
-            let result = if is_expired {
-                Self::upsert_into_accelerator(child, dataset_name, filters, batches.to_vec()).await
+            let stamped: Vec<RecordBatch> = if child
+                .schema()
+                .column_with_name(CACHE_NAMESPACE_COLUMN)
+                .is_some()
+            {
+                let mut out = Vec::with_capacity(batches.len());
+                let mut stamp_err = None;
+                for b in batches {
+                    match stamp_namespace_column(b.clone(), namespace_id) {
+                        Ok(b) => out.push(b),
+                        Err(e) => {
+                            stamp_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = stamp_err {
+                    tracing::warn!(
+                        "Failed to stamp namespace on synchronized child {} for dataset {}: {}",
+                        idx,
+                        dataset_name,
+                        e
+                    );
+                    continue;
+                }
+                out
             } else {
-                Self::insert_into_accelerator(child, dataset_name, batches.to_vec()).await
+                batches.to_vec()
+            };
+
+            let result = if is_expired {
+                Self::upsert_into_accelerator(child, dataset_name, filters, stamped).await
+            } else {
+                Self::insert_into_accelerator(child, dataset_name, stamped).await
             };
 
             if let Err(e) = result {
@@ -1203,6 +1404,7 @@ impl CacheRefreshHelper {
         io_runtime: &Handle,
         synchronized_children: SynchronizedChildren,
         batch_write_tx: CacheWriteSender,
+        namespace: CacheNamespace,
     ) -> SendableRecordBatchStream {
         match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
             Ok(batches) if !batches.is_empty() => {
@@ -1226,7 +1428,8 @@ impl CacheRefreshHelper {
                 // RecordBatch::clone() is cheap - only clones Arc pointers, not the underlying data.
                 let batches_for_propagate = batches_for_cache.clone().unwrap_or_default();
                 let filters_clone: Vec<Expr> = filters.to_vec();
-                let cache_key = compute_cache_key_from_filters(filters);
+                let cache_key =
+                    compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
 
                 if let Some(batches_for_cache) = batches_for_cache {
                     if batches_for_cache.is_empty() {
@@ -1237,12 +1440,18 @@ impl CacheRefreshHelper {
                         let cache_rows: usize =
                             batches_for_cache.iter().map(RecordBatch::num_rows).sum();
 
-                        // Send write request to batched consumer
+                        // Send write request to batched consumer. The flush
+                        // task is the one that stamps `__spice_cache_namespace`
+                        // and adds the namespace filter to upsert keys, so it
+                        // can do the right thing based on the accelerator's
+                        // actual storage schema (extended in real deployments,
+                        // unextended in unit-test mocks).
                         let write_request = CacheWriteRequest {
                             batches: batches_for_cache,
                             filters: filters.to_vec(),
                             is_upsert: is_expired,
                             cache_key,
+                            namespace_id: namespace.storage_id().into(),
                         };
                         if let Err(e) = batch_write_tx.send(write_request).await {
                             tracing::warn!(
@@ -1257,6 +1466,7 @@ impl CacheRefreshHelper {
                         // Propagate cacheable data to children.
                         let synchronized_children_clone = Arc::clone(&synchronized_children);
                         let dataset_name_clone = dataset_name.to_string();
+                        let namespace_id_clone: Arc<str> = namespace.storage_id().into();
                         io_runtime.spawn(async move {
                             Self::propagate_to_synchronized_children(
                                 &synchronized_children_clone,
@@ -1264,6 +1474,7 @@ impl CacheRefreshHelper {
                                 &filters_clone,
                                 &batches_for_propagate,
                                 is_expired,
+                                &namespace_id_clone,
                             )
                             .await;
                         });
@@ -1343,6 +1554,7 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         in_flight_revalidations: &InFlightRevalidations,
         batch_write_tx: CacheWriteSender,
+        namespace: CacheNamespace,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -1368,7 +1580,10 @@ impl CacheRefreshHelper {
                 }
                 CacheFreshness::Stale => {
                     // Compute cache key to check for in-flight revalidation
-                    let cache_key = compute_cache_key_from_filters(filters);
+                    let cache_key = compute_cache_key_from_filters_and_namespace(
+                        filters,
+                        namespace.storage_id(),
+                    );
 
                     // Try to acquire the revalidation slot for this cache key
                     // Use async lock since we're in an async context
@@ -1404,6 +1619,7 @@ impl CacheRefreshHelper {
                         let filters_for_refresh: Vec<Expr> = filters.to_vec();
                         let batch_write_tx_clone = batch_write_tx.clone();
                         let cache_key_clone = cache_key.clone();
+                        let namespace_clone = namespace.clone();
 
                         io_runtime.spawn(async move {
                             tracing::debug!(
@@ -1413,6 +1629,7 @@ impl CacheRefreshHelper {
                                 federated_clone,
                                 &dataset_name_clone,
                                 &filters_for_refresh,
+                                namespace_clone,
                                 batch_write_tx_clone,
                                 Arc::clone(&in_flight_clone),
                             )
@@ -1608,6 +1825,18 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.dataset_name
         );
 
+        // The originating request context is attached to the session as
+        // an extension by `Query::run_internal`. We read it from the
+        // `TaskContext` here and NOT from `RequestContext::current()`,
+        // because DataFusion does not propagate Tokio task-locals through
+        // `execute()`. The task-local lookup would silently fall back to
+        // the global `INTERNAL_REQUEST_CONTEXT` (Protocol::Internal, no
+        // principal), collapsing every caller to `CacheNamespace::System`
+        // and defeating isolation.
+        let request_context = context
+            .session_config()
+            .get_extension::<runtime_request_context::RequestContext>();
+
         // Execute the accelerator scan
         let accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
 
@@ -1643,6 +1872,14 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
         // Use stream::once pattern to handle cache miss like FallbackOnZeroResultsScanExec
         let cache_miss_or_stale_stream = futures::stream::once(async move {
+            // Capture the originating request's cache namespace once. Every
+            // subsequent cache lookup, write, and SWR refresh inherits this
+            // value so the entire scan stays inside one principal's scope.
+            let namespace = request_context.as_deref().map_or(
+                runtime_request_context::CacheNamespace::System,
+                runtime_request_context::RequestContext::cache_namespace,
+            );
+
             tracing::debug!(
                 "CacheAccelerationScanExec cache check STARTED for dataset={}",
                 dataset_name
@@ -1705,6 +1942,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             &io_runtime,
                             Arc::clone(&synchronized_children),
                             batch_write_tx.clone(),
+                            namespace,
                         )
                         .await;
                     }
@@ -1722,6 +1960,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &filters,
                     &in_flight_revalidations,
                     batch_write_tx.clone(),
+                    namespace,
                 )
                 .await
             } else {
@@ -1741,6 +1980,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &io_runtime,
                     synchronized_children,
                     batch_write_tx,
+                    namespace,
                 )
                 .await
             }
@@ -1749,6 +1989,127 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
         let adapter = RecordBatchStreamAdapter::new(schema, cache_miss_or_stale_stream);
         Ok(Box::pin(adapter))
+    }
+}
+
+#[cfg(test)]
+mod cache_namespace_column_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn reserved_column_name_is_case_insensitive() {
+        assert!(is_reserved_caching_column(CACHE_NAMESPACE_COLUMN));
+        assert!(is_reserved_caching_column("__SPICE_CACHE_NAMESPACE"));
+        assert!(!is_reserved_caching_column("fetched_at"));
+        assert!(!is_reserved_caching_column("request_path"));
+    }
+
+    #[test]
+    fn extend_schema_appends_namespace_column() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, true),
+        ]);
+        let extended = extend_schema_with_cache_namespace("ds", &schema).expect("ok");
+        assert_eq!(extended.fields().len(), 3);
+        assert_eq!(extended.field(2).name(), CACHE_NAMESPACE_COLUMN);
+        assert_eq!(extended.field(2).data_type(), &DataType::Utf8);
+        assert!(
+            !extended.field(2).is_nullable(),
+            "namespace column is required so missing-on-read indicates a corrupt table"
+        );
+    }
+
+    #[test]
+    fn extend_schema_rejects_collision_with_clear_error() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new(CACHE_NAMESPACE_COLUMN, DataType::Utf8, true),
+        ]);
+        let err = extend_schema_with_cache_namespace("http_cache", &schema)
+            .expect_err("collision must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("http_cache") && msg.contains(CACHE_NAMESPACE_COLUMN),
+            "error must name the dataset and the reserved column: {msg}"
+        );
+    }
+
+    #[test]
+    fn extend_schema_rejects_case_insensitive_collision() {
+        // The reserved-name guard must be case-insensitive: a source
+        // field named `__SPICE_CACHE_NAMESPACE` (or any other casing)
+        // collides with the lowercase internal column we would append,
+        // and must be rejected with the same error.
+        for variant in [
+            "__SPICE_CACHE_NAMESPACE",
+            "__Spice_Cache_Namespace",
+            "__spice_CACHE_namespace",
+        ] {
+            let schema = Schema::new(vec![
+                Field::new("request_path", DataType::Utf8, false),
+                Field::new(variant, DataType::Utf8, true),
+            ]);
+            let err = extend_schema_with_cache_namespace("ds", &schema)
+                .err()
+                .unwrap_or_else(|| panic!("variant `{variant}` should be rejected as a collision"));
+            assert!(
+                err.to_string().contains("reserved"),
+                "variant `{variant}` should produce a clear collision error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn stamp_namespace_column_appends_constant_string_array() {
+        use arrow::array::{Int32Array, StringArray};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
+        )
+        .expect("batch");
+
+        let stamped = stamp_namespace_column(batch, "apikey:abc").expect("ok");
+        assert_eq!(stamped.num_columns(), 2);
+        assert_eq!(stamped.schema().field(1).name(), CACHE_NAMESPACE_COLUMN);
+        let ns_col = stamped
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        assert_eq!(ns_col.len(), 3);
+        for i in 0..ns_col.len() {
+            assert_eq!(ns_col.value(i), "apikey:abc");
+        }
+    }
+
+    #[test]
+    fn stamp_namespace_column_is_idempotent_when_already_present() {
+        use arrow::array::{Int32Array, StringArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(CACHE_NAMESPACE_COLUMN, DataType::Utf8, false),
+        ]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["system"])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        let stamped = stamp_namespace_column(batch, "public").expect("ok");
+        // Existing column wins; we must not silently rewrite a row's tag
+        // because doing so could mask a bug in upstream stamping.
+        let ns_col = stamped
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        assert_eq!(ns_col.value(0), "system");
     }
 }
 
@@ -2804,6 +3165,7 @@ mod tests {
             &access_filters,
             &in_flight_revalidations,
             batch_write_tx,
+            CacheNamespace::Public,
         )
         .await;
 
@@ -2917,6 +3279,7 @@ mod tests {
                 filters: vec![],
                 is_upsert: false,
                 cache_key: format!("key_{i}"),
+                namespace_id: "public".into(),
             })
             .await
             .expect("to send write request");
@@ -2971,6 +3334,7 @@ mod tests {
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx.clone(),
+            CacheNamespace::Public,
         )
         .await;
 
@@ -3008,6 +3372,7 @@ mod tests {
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx,
+            CacheNamespace::Public,
         )
         .await;
 
@@ -3077,6 +3442,7 @@ mod tests {
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()), // synchronized_children
             batch_write_tx,
+            CacheNamespace::Public,
         )
         .await;
 

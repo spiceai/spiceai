@@ -86,7 +86,7 @@ impl TableSchemaTool {
             name: name.unwrap_or("table_schema").to_string(),
             description: Some(
                 description
-                    .unwrap_or("Retrieve the schema of all available SQL tables")
+                    .unwrap_or("Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).")
                     .to_string(),
             ),
             rt,

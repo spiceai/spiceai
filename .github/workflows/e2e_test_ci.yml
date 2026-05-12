@@ -1900,6 +1900,19 @@ jobs:
           ./simulate_append_data.sh &
           echo $! > /tmp/simulate_pid
 
+      - name: Wait for append data snapshot
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+        run: |
+          for attempt in {1..60}; do
+            if duckdb -c "SELECT COUNT(*) FROM read_parquet('.spice/service_data.parquet');" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Timed out waiting for append data snapshot"
+          exit 1
+
       - name: Configure Spicepod
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |

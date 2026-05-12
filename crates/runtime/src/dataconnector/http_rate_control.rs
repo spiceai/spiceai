@@ -17,7 +17,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::Duration;
 
@@ -28,6 +28,7 @@ use crate::dataconnector::{ConnectorComponent, DataConnectorError, DataConnector
 use crate::parameters::{ParameterSpec, Parameters};
 use data_components::rate_limit::{HttpRateLimiter, HttpRateLimiterMetrics};
 use governor::Quota;
+use object_store::ObjectStore;
 use opentelemetry::KeyValue;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerMetrics};
 use tokio::sync::RwLock;
@@ -40,6 +41,8 @@ const RUNTIME_REQUESTS_PER_SECOND_LIMIT: &str = "http_requests_per_second_limit"
 const RUNTIME_REQUESTS_PER_MINUTE_LIMIT: &str = "http_requests_per_minute_limit";
 const RUNTIME_RATE_CONTROL_JITTER_MIN: &str = "http_rate_control_jitter_min";
 const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
+#[cfg(feature = "rate-control")]
+const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
 
 // Fallback for direct connector construction without a Runtime. Factory-created
 // connectors use Runtime's per-instance registry so reloads/tests do not reuse
@@ -47,12 +50,59 @@ const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
 static GLOBAL_HTTP_RATE_CONTROL_REGISTRY: LazyLock<Arc<HttpRateControlRegistry>> =
     LazyLock::new(|| Arc::new(HttpRateControlRegistry::default()));
 
-#[derive(Debug, Default)]
 pub struct HttpRateControlRegistry {
     rate_limiters: RwLock<HashMap<String, Arc<HttpRateLimiter>>>,
     rate_controllers: RwLock<HashMap<String, SharedRateControllerEntry>>,
     metrics_by_origin: StdRwLock<HashMap<String, Arc<HttpRateControlMetrics>>>,
     metric_owners: StdRwLock<HashMap<String, String>>,
+    persisted_governor_state: Option<HttpRateControlPersistedState>,
+    persistence_task_started: AtomicBool,
+}
+
+impl std::fmt::Debug for HttpRateControlRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpRateControlRegistry")
+            .field("persisted_governor_state", &self.persisted_governor_state)
+            .field(
+                "persistence_task_started",
+                &self.persistence_task_started.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for HttpRateControlRegistry {
+    fn default() -> Self {
+        Self {
+            rate_limiters: RwLock::new(HashMap::new()),
+            rate_controllers: RwLock::new(HashMap::new()),
+            metrics_by_origin: StdRwLock::new(HashMap::new()),
+            metric_owners: StdRwLock::new(HashMap::new()),
+            persisted_governor_state: None,
+            persistence_task_started: AtomicBool::new(false),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HttpRateControlPersistedState {
+    store: Arc<dyn ObjectStore>,
+    base_prefix: String,
+    refresh_interval: Duration,
+    instance_id: String,
+    instance_ttl: Duration,
+}
+
+impl std::fmt::Debug for HttpRateControlPersistedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRateControlPersistedState")
+            .field("base_prefix", &self.base_prefix)
+            .field("refresh_interval", &self.refresh_interval)
+            .field("instance_id", &self.instance_id)
+            .field("instance_ttl", &self.instance_ttl)
+            .finish_non_exhaustive()
+    }
 }
 
 #[must_use]
@@ -346,6 +396,7 @@ pub struct HttpRateControlMetricsProvider {
     connector_name: &'static str,
     metrics: Arc<HttpRateControlMetrics>,
     metric_source: Option<HttpRateControlMetricSource>,
+    origin: Option<String>,
 }
 
 impl HttpRateControlMetricsProvider {
@@ -355,10 +406,14 @@ impl HttpRateControlMetricsProvider {
         metrics: Arc<HttpRateControlMetrics>,
         metric_source: Option<HttpRateControlMetricSource>,
     ) -> Self {
+        let origin = metric_source
+            .as_ref()
+            .map(|source| rate_control_key(&source.base_url));
         Self {
             connector_name,
             metrics,
             metric_source,
+            origin,
         }
     }
 }
@@ -383,6 +438,18 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
     ) -> Option<ObserveMetricCallback> {
         let metrics = Arc::clone(&self.metrics);
         let metric_source = self.metric_source.clone();
+
+        // Use `origin` (upstream URL) instead of `name` (dataset name) as the
+        // metric label. Multiple datasets sharing the same origin share one
+        // rate controller, and only one dataset emits metrics via `claim_owner`.
+        let mut attributes = attributes;
+        if let Some(origin) = &self.origin {
+            if let Some(pos) = attributes.iter().position(|kv| kv.key.as_str() == "name") {
+                attributes[pos] = KeyValue::new("origin", origin.clone());
+            } else {
+                attributes.push(KeyValue::new("origin", origin.clone()));
+            }
+        }
 
         macro_rules! observe_metric {
             ($value:expr) => {{
@@ -468,11 +535,25 @@ pub fn resolve_config<S: BuildHasher>(
     dataset: &Dataset,
     dataconnector: &'static str,
 ) -> DataConnectorResult<HttpRateControlConfig> {
+    resolve_config_for_component(
+        params,
+        runtime_params,
+        &ConnectorComponent::from(dataset),
+        dataconnector,
+    )
+}
+
+pub fn resolve_config_for_component<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<HttpRateControlConfig> {
     let config = HttpRateControlConfig {
         max_concurrent_requests: parse_optional_nonzero_usize_param(
             params,
             runtime_params,
-            dataset,
+            connector_component,
             dataconnector,
             "max_concurrent_requests",
             RUNTIME_MAX_CONCURRENT_REQUESTS,
@@ -480,7 +561,7 @@ pub fn resolve_config<S: BuildHasher>(
         requests_per_second: parse_optional_nonzero_u32_param(
             params,
             runtime_params,
-            dataset,
+            connector_component,
             dataconnector,
             "requests_per_second_limit",
             RUNTIME_REQUESTS_PER_SECOND_LIMIT,
@@ -488,7 +569,7 @@ pub fn resolve_config<S: BuildHasher>(
         requests_per_minute: parse_optional_nonzero_u32_param(
             params,
             runtime_params,
-            dataset,
+            connector_component,
             dataconnector,
             "requests_per_minute_limit",
             RUNTIME_REQUESTS_PER_MINUTE_LIMIT,
@@ -497,10 +578,98 @@ pub fn resolve_config<S: BuildHasher>(
         jitter_max: Duration::ZERO,
     };
 
-    with_jitter(params, runtime_params, dataset, dataconnector, config)
+    with_jitter(
+        params,
+        runtime_params,
+        connector_component,
+        dataconnector,
+        config,
+    )
 }
 
 impl HttpRateControlRegistry {
+    #[cfg(feature = "rate-control")]
+    #[must_use]
+    pub fn with_persisted_governor_state(
+        store: Arc<dyn ObjectStore>,
+        base_prefix: impl Into<String>,
+        refresh_interval: Duration,
+    ) -> Self {
+        Self {
+            persisted_governor_state: Some(HttpRateControlPersistedState {
+                store,
+                base_prefix: base_prefix.into(),
+                refresh_interval,
+                instance_id: uuid::Uuid::new_v4().to_string(),
+                instance_ttl: persisted_instance_ttl(refresh_interval),
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub fn start_persistence_task(self: &Arc<Self>) {
+        let Some(persisted_state) = &self.persisted_governor_state else {
+            return;
+        };
+
+        if self.persistence_task_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let weak_registry = Arc::downgrade(self);
+        let refresh_interval = persisted_state.refresh_interval;
+        // Tick faster than `refresh_interval` so a fresh lease is acquired
+        // shortly after each window rolls. With this cadence the worst-case
+        // dead-zone at a window boundary is `tick_interval` (≈1/4 of the
+        // window) rather than a full `refresh_interval`. Each tick is cheap
+        // when nothing has changed (no OCC write).
+        let tick_interval = (refresh_interval / 4).max(std::time::Duration::from_millis(100));
+        let persistence_task = tokio::spawn(async move {
+            if let Some(registry) = weak_registry.upgrade() {
+                registry.refresh_and_persist_governor_states().await;
+            }
+
+            let first_tick = tokio::time::Instant::now() + tick_interval;
+            let mut tick = tokio::time::interval_at(first_tick, tick_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tick.tick().await;
+                let Some(registry) = weak_registry.upgrade() else {
+                    break;
+                };
+                registry.refresh_and_persist_governor_states().await;
+            }
+        });
+        drop(persistence_task);
+    }
+
+    async fn persisted_rate_controllers(&self) -> Vec<(String, Arc<RateController>)> {
+        self.rate_controllers
+            .read()
+            .await
+            .iter()
+            .filter_map(|(origin, entry)| {
+                entry
+                    .shared
+                    .controller
+                    .as_ref()
+                    .map(|controller| (origin.clone(), Arc::clone(controller)))
+            })
+            .collect()
+    }
+
+    async fn refresh_and_persist_governor_states(&self) {
+        for (origin, controller) in self.persisted_rate_controllers().await {
+            if let Err(error) = controller.refresh_and_persist_state_snapshot().await {
+                tracing::warn!(
+                    origin = origin.as_str(),
+                    "Failed to persist rate-control state: {error}"
+                );
+            }
+        }
+    }
+
     pub async fn shared_rate_limiter(&self, base_url: &Url) -> Arc<HttpRateLimiter> {
         let key = rate_control_key(base_url);
         let rate_limiters = self.rate_limiters.read().await;
@@ -552,7 +721,7 @@ impl HttpRateControlRegistry {
                     upstream_origin = %key,
                     metrics_owner = existing_owner.as_str(),
                     skipped_dataset = owner,
-                    "HTTP rate-control metrics are shared per upstream origin and already emitted by another dataset. Skipping duplicate metric registration for this dataset."
+                    "HTTP rate-control metrics are shared per upstream origin. Metrics are emitted with origin={key} by dataset '{existing_owner}'. Skipping duplicate metric registration for dataset '{owner}'.",
                 );
             }
             existing_owner == owner
@@ -578,12 +747,30 @@ impl HttpRateControlRegistry {
         dataset: &Dataset,
         dataconnector: &'static str,
     ) -> DataConnectorResult<SharedRateControllerReservation> {
+        self.reserve_shared_rate_controller_for_component(
+            base_url,
+            config,
+            dataset.app.name.as_str(),
+            &ConnectorComponent::from(dataset),
+            dataconnector,
+        )
+        .await
+    }
+
+    pub async fn reserve_shared_rate_controller_for_component(
+        self: Arc<Self>,
+        base_url: &Url,
+        config: &HttpRateControlConfig,
+        spicepod_name: &str,
+        connector_component: &ConnectorComponent,
+        dataconnector: &'static str,
+    ) -> DataConnectorResult<SharedRateControllerReservation> {
         let key = rate_control_key(base_url);
         let mut rate_controllers = self.rate_controllers.write().await;
 
         if let Some(existing) = rate_controllers.get_mut(&key) {
             if existing.shared.config != *config {
-                return conflicting_config_error(dataset, dataconnector, &key);
+                return conflicting_config_error(connector_component, dataconnector, &key);
             }
             existing.pending_registrations = existing.pending_registrations.saturating_add(1);
             let shared = existing.shared.clone();
@@ -595,7 +782,12 @@ impl HttpRateControlRegistry {
             });
         }
 
-        let shared = build_shared_rate_controller(config);
+        let shared = build_shared_rate_controller(
+            &key,
+            spicepod_name,
+            config,
+            self.persisted_governor_state.as_ref(),
+        );
         rate_controllers.insert(
             key.clone(),
             SharedRateControllerEntry {
@@ -638,13 +830,31 @@ impl HttpRateControlRegistry {
         dataset: &Dataset,
         dataconnector: &'static str,
     ) -> DataConnectorResult<SharedRateController> {
+        self.shared_rate_controller_for_component(
+            base_url,
+            config,
+            dataset.app.name.as_str(),
+            &ConnectorComponent::from(dataset),
+            dataconnector,
+        )
+        .await
+    }
+
+    pub async fn shared_rate_controller_for_component(
+        &self,
+        base_url: &Url,
+        config: &HttpRateControlConfig,
+        spicepod_name: &str,
+        connector_component: &ConnectorComponent,
+        dataconnector: &'static str,
+    ) -> DataConnectorResult<SharedRateController> {
         let key = rate_control_key(base_url);
         let rate_controllers = self.rate_controllers.read().await;
         if let Some(existing) = rate_controllers.get(&key) {
             return resolve_existing_controller(
                 &existing.shared,
                 config,
-                dataset,
+                connector_component,
                 dataconnector,
                 &key,
             );
@@ -656,15 +866,20 @@ impl HttpRateControlRegistry {
             return resolve_existing_controller(
                 &existing.shared,
                 config,
-                dataset,
+                connector_component,
                 dataconnector,
                 &key,
             );
         }
 
-        let shared = build_shared_rate_controller(config);
+        let shared = build_shared_rate_controller(
+            &key,
+            spicepod_name,
+            config,
+            self.persisted_governor_state.as_ref(),
+        );
         rate_controllers.insert(
-            key,
+            key.clone(),
             SharedRateControllerEntry {
                 shared: shared.clone(),
                 pending_registrations: 0,
@@ -672,6 +887,7 @@ impl HttpRateControlRegistry {
             },
         );
 
+        drop(rate_controllers);
         Ok(shared)
     }
 }
@@ -702,7 +918,12 @@ pub async fn shared_rate_controller(
         .await
 }
 
-fn build_shared_rate_controller(config: &HttpRateControlConfig) -> SharedRateController {
+fn build_shared_rate_controller(
+    origin_key: &str,
+    spicepod_name: &str,
+    config: &HttpRateControlConfig,
+    persisted_state: Option<&HttpRateControlPersistedState>,
+) -> SharedRateController {
     if !config.is_enabled() {
         return SharedRateController {
             config: config.clone(),
@@ -712,14 +933,30 @@ fn build_shared_rate_controller(config: &HttpRateControlConfig) -> SharedRateCon
 
     let mut builder = RateController::builder()
         .with_jitter(JitterConfig::new(config.jitter_min, config.jitter_max));
+    if let Some(persisted_state) = persisted_state {
+        builder = builder.with_object_store_persistence_for_instance(
+            Arc::clone(&persisted_state.store),
+            persisted_state.base_prefix.clone(),
+            rate_control_state_object_key(spicepod_name, origin_key),
+            origin_key.to_string(),
+            persisted_state.instance_id.clone(),
+            persisted_state.refresh_interval,
+        );
+    }
     if let Some(max_concurrent_requests) = config.max_concurrent_requests {
         builder = builder.with_max_concurrent_requests(max_concurrent_requests);
     }
     if let Some(requests_per_second) = config.requests_per_second {
-        builder = builder.add_quota(Quota::per_second(requests_per_second));
+        builder = builder.add_quota_with_name(
+            "requests_per_second",
+            Quota::per_second(requests_per_second),
+        );
     }
     if let Some(requests_per_minute) = config.requests_per_minute {
-        builder = builder.add_quota(Quota::per_minute(requests_per_minute));
+        builder = builder.add_quota_with_name(
+            "requests_per_minute",
+            Quota::per_minute(requests_per_minute),
+        );
     }
 
     SharedRateController {
@@ -731,7 +968,7 @@ fn build_shared_rate_controller(config: &HttpRateControlConfig) -> SharedRateCon
 fn resolve_existing_controller(
     existing: &SharedRateController,
     config: &HttpRateControlConfig,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     key: &str,
 ) -> DataConnectorResult<SharedRateController> {
@@ -739,13 +976,13 @@ fn resolve_existing_controller(
         return Ok(existing.clone());
     }
 
-    conflicting_config_error(dataset, dataconnector, key)
+    conflicting_config_error(connector_component, dataconnector, key)
 }
 
 fn parse_optional_nonzero_u32_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     parameter_name: &str,
     runtime_parameter_name: &'static str,
@@ -776,14 +1013,14 @@ fn parse_optional_nonzero_u32_param<S: BuildHasher>(
             .map_err(|source| DataConnectorError::InvalidConfiguration {
                 dataconnector: dataconnector.to_string(),
                 message: format!("The '{display_name}' parameter must be a positive integer."),
-                connector_component: ConnectorComponent::from(dataset),
+                connector_component: connector_component.clone(),
                 source: source.into(),
             })?;
 
     NonZeroU32::new(value).map(Some).ok_or_else(|| {
         DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.to_string(),
-            connector_component: ConnectorComponent::from(dataset),
+            connector_component: connector_component.clone(),
             message: format!("The '{display_name}' parameter must be greater than 0."),
         }
     })
@@ -792,7 +1029,7 @@ fn parse_optional_nonzero_u32_param<S: BuildHasher>(
 fn parse_optional_nonzero_usize_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     parameter_name: &str,
     runtime_parameter_name: &'static str,
@@ -823,14 +1060,14 @@ fn parse_optional_nonzero_usize_param<S: BuildHasher>(
             .map_err(|source| DataConnectorError::InvalidConfiguration {
                 dataconnector: dataconnector.to_string(),
                 message: format!("The '{display_name}' parameter must be a positive integer."),
-                connector_component: ConnectorComponent::from(dataset),
+                connector_component: connector_component.clone(),
                 source: source.into(),
             })?;
 
     if value == 0 {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.to_string(),
-            connector_component: ConnectorComponent::from(dataset),
+            connector_component: connector_component.clone(),
             message: format!("The '{display_name}' parameter must be greater than 0."),
         });
     }
@@ -841,7 +1078,7 @@ fn parse_optional_nonzero_usize_param<S: BuildHasher>(
 fn parse_optional_duration_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     parameter_name: &str,
     runtime_parameter_name: &'static str,
@@ -872,7 +1109,7 @@ fn parse_optional_duration_param<S: BuildHasher>(
             message: format!(
                 "The '{display_name}' parameter must be a valid duration such as '10ms', '1s', or '0ms'."
             ),
-            connector_component: ConnectorComponent::from(dataset),
+            connector_component: connector_component.clone(),
             source: source.into(),
         }
     })
@@ -881,14 +1118,14 @@ fn parse_optional_duration_param<S: BuildHasher>(
 fn with_jitter<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     mut config: HttpRateControlConfig,
 ) -> DataConnectorResult<HttpRateControlConfig> {
     let jitter_min = parse_optional_duration_param(
         params,
         runtime_params,
-        dataset,
+        connector_component,
         dataconnector,
         "rate_control_jitter_min",
         RUNTIME_RATE_CONTROL_JITTER_MIN,
@@ -896,7 +1133,7 @@ fn with_jitter<S: BuildHasher>(
     let jitter_max = parse_optional_duration_param(
         params,
         runtime_params,
-        dataset,
+        connector_component,
         dataconnector,
         "rate_control_jitter_max",
         RUNTIME_RATE_CONTROL_JITTER_MAX,
@@ -919,7 +1156,7 @@ fn with_jitter<S: BuildHasher>(
     if resolved_min > resolved_max {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.to_string(),
-            connector_component: ConnectorComponent::from(dataset),
+            connector_component: connector_component.clone(),
             message: format!(
                 "The '{}' parameter must be less than or equal to '{}'.",
                 runtime_or_dataset_param_name(
@@ -970,16 +1207,59 @@ pub fn rate_control_key(base_url: &Url) -> String {
     }
 }
 
+fn rate_control_state_object_key(spicepod_name: &str, origin_key: &str) -> String {
+    let origin_without_scheme = origin_key
+        .split_once("://")
+        .map_or(origin_key, |(_, origin)| origin);
+    format!(
+        "{}/{}-{:016x}",
+        friendly_state_key_component(spicepod_name),
+        friendly_state_key_component(origin_without_scheme),
+        stable_state_key_hash(origin_key)
+    )
+}
+
+fn friendly_state_key_component(value: &str) -> String {
+    let mut component = String::with_capacity(value.len());
+    let mut previous_was_separator = false;
+
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_') {
+            component.push(character);
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            component.push('_');
+            previous_was_separator = true;
+        }
+    }
+
+    let component = component.trim_matches('_');
+    if component.is_empty() {
+        "default".to_string()
+    } else {
+        component.to_string()
+    }
+}
+
+fn stable_state_key_hash(value: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 14_695_981_039_346_656_037;
+    const FNV_PRIME: u64 = 1_099_511_628_211;
+
+    value.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
 fn conflicting_config_error<T>(
-    dataset: &Dataset,
+    connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     key: &str,
 ) -> DataConnectorResult<T> {
     Err(DataConnectorError::InvalidConfigurationNoSource {
         dataconnector: dataconnector.to_string(),
-        connector_component: ConnectorComponent::from(dataset),
+        connector_component: connector_component.clone(),
         message: format!(
-            "Multiple HTTP-based datasets target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, and rate_control_jitter_max values for datasets sharing an origin."
+            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, and rate_control_jitter_max values for components sharing an origin."
         ),
     })
 }
@@ -990,6 +1270,13 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "rate-control")]
+fn persisted_instance_ttl(refresh_interval: Duration) -> Duration {
+    refresh_interval
+        .saturating_mul(3)
+        .max(MIN_PERSISTED_INSTANCE_TTL)
 }
 
 #[cfg(test)]
@@ -1020,6 +1307,117 @@ mod tests {
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
         }
+    }
+
+    #[cfg(feature = "rate-control")]
+    fn persisted_test_config() -> HttpRateControlConfig {
+        HttpRateControlConfig {
+            max_concurrent_requests: None,
+            requests_per_second: Some(
+                NonZeroU32::new(10).expect("test rate limit should be non-zero"),
+            ),
+            requests_per_minute: None,
+            jitter_min: Duration::ZERO,
+            jitter_max: Duration::ZERO,
+        }
+    }
+
+    #[cfg(feature = "rate-control")]
+    async fn wait_for_object(store: &Arc<dyn ObjectStore>, object_key: &str) {
+        let path = object_store::path::Path::from(format!("{object_key}.json"));
+        let start = tokio::time::Instant::now();
+
+        loop {
+            match store.head(&path).await {
+                Ok(_) => return,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => {
+                    panic!("failed to check persisted state object {object_key}: {error}")
+                }
+            }
+
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "persisted state object {object_key} was not written"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[test]
+    fn rate_control_state_object_key_uses_spicepod_and_origin_without_scheme() {
+        let object_key = rate_control_state_object_key(
+            "rate control registry test",
+            "https://api.example.com:443",
+        );
+
+        let hash = object_key
+            .strip_prefix("rate_control_registry_test/api.example.com_443-")
+            .expect("object key should start with spicepod name and origin without scheme");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!object_key.contains("https"));
+    }
+
+    #[cfg(feature = "rate-control")]
+    #[tokio::test]
+    async fn registry_persistence_task_persists_all_registered_origins() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let registry = Arc::new(HttpRateControlRegistry::with_persisted_governor_state(
+            Arc::clone(&store),
+            "",
+            Duration::from_millis(20),
+        ));
+        registry.start_persistence_task();
+        registry.start_persistence_task();
+
+        let dataset = test_dataset().await;
+        let config = persisted_test_config();
+        let first_url = Url::parse("https://first.example.com/data").expect("first URL parses");
+        let second_url = Url::parse("https://second.example.com/data").expect("second URL parses");
+
+        let first = registry
+            .shared_rate_controller(&first_url, &config, &dataset, "https")
+            .await
+            .expect("first controller should build");
+        let second = registry
+            .shared_rate_controller(&second_url, &config, &dataset, "https")
+            .await
+            .expect("second controller should build");
+
+        let first_permit = first
+            .controller
+            .as_ref()
+            .expect("first controller should exist")
+            .acquire()
+            .await
+            .expect("first permit should acquire");
+        drop(first_permit);
+        let second_permit = second
+            .controller
+            .as_ref()
+            .expect("second controller should exist")
+            .acquire()
+            .await
+            .expect("second permit should acquire");
+        drop(second_permit);
+
+        wait_for_object(
+            &store,
+            &rate_control_state_object_key(
+                dataset.app.name.as_str(),
+                &rate_control_key(&first_url),
+            ),
+        )
+        .await;
+        wait_for_object(
+            &store,
+            &rate_control_state_object_key(
+                dataset.app.name.as_str(),
+                &rate_control_key(&second_url),
+            ),
+        )
+        .await;
     }
 
     #[tokio::test]

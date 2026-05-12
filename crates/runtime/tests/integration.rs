@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::{array::RecordBatch, util::display::FormatOptions};
+#[cfg(feature = "mysql")]
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
+#[cfg(feature = "postgres-accel")]
 use std::sync::Arc;
 
+#[cfg(feature = "postgres-accel")]
 use crate::utils::TEST_REQUEST_CONTEXT;
 use runtime::Runtime;
 use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
@@ -66,6 +69,8 @@ mod delta_lake;
 mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
+#[cfg(feature = "duckdb")]
+mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 mod endpoint_auth;
@@ -83,6 +88,7 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
+mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
 mod metadata;
@@ -90,6 +96,7 @@ mod metadata;
 mod mongo;
 #[cfg(feature = "mssql")]
 mod mssql;
+mod mtls_public;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "odbc")]
@@ -99,6 +106,8 @@ mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
+#[cfg(feature = "rate-control")]
+mod rate_control;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
@@ -129,6 +138,7 @@ mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;
+mod tls_reload;
 #[cfg(feature = "postgres-accel")]
 mod tpcds_postgres;
 mod utils;
@@ -157,7 +167,7 @@ fn configure_test_datafusion() {
         _ => panic!("Must obtain write lock to defaults"),
     }
 }
-
+#[cfg(feature = "postgres-accel")]
 fn configure_test_datafusion_request_context() {
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),
@@ -179,6 +189,7 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     tracing::subscriber::set_default(subscriber)
 }
 
+#[cfg(feature = "mysql")]
 async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
     let lineitem_parquet_bytes =
         reqwest::get("https://public-data.spiceai.org/tpch_lineitem.parquet")
@@ -335,9 +346,4 @@ where
     }
 
     Ok(())
-}
-
-fn container_registry() -> String {
-    std::env::var("CONTAINER_REGISTRY")
-        .unwrap_or_else(|_| "public.ecr.aws/docker/library/".to_string())
 }

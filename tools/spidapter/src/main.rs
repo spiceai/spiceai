@@ -17,7 +17,9 @@ limitations under the License.
 use clap::Parser;
 
 mod args;
+mod cayenne_server;
 mod commands;
+mod local_spiced_server;
 mod stdio_server;
 
 use args::{Commands, StdioArgs};
@@ -38,10 +40,22 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.subcommand {
         Commands::Stdio(args) => run_stdio_mode(&args).await,
+        Commands::LocalSpiced(args) => run_local_spiced_mode(&args).await,
+        Commands::CayenneFlightsql(args) => run_cayenne_flightsql_mode(&args).await,
     }
 }
 
 async fn run_stdio_mode(args: &StdioArgs) -> anyhow::Result<()> {
     eprintln!("Starting spidapter stdio JSON-RPC server");
     stdio_server::run_stdio_server(args).await
+}
+
+async fn run_local_spiced_mode(args: &args::LocalSpicedArgs) -> anyhow::Result<()> {
+    eprintln!("Starting spidapter local-spiced stdio JSON-RPC server");
+    local_spiced_server::run_local_spiced_server(args).await
+}
+
+async fn run_cayenne_flightsql_mode(args: &args::CayenneFlightsqlArgs) -> anyhow::Result<()> {
+    eprintln!("Starting spidapter cayenne-flightsql stdio JSON-RPC server");
+    cayenne_server::run_cayenne_flightsql_server(args).await
 }

@@ -40,7 +40,6 @@ use crate::cdc::{ChangeBatch, ChangeEnvelope, CommitChange, CommitError, changes
 #[derive(Debug, Clone)]
 pub struct DecodedChange {
     pub op: ChangeOp,
-    pub primary_keys: Vec<String>,
     pub row: TupleData,
 }
 
@@ -79,56 +78,32 @@ impl TransactionBuffer {
         }
     }
 
-    pub fn push_insert(&mut self, relation: &Relation, tuple: TupleData) {
+    pub fn push_insert(&mut self, _relation: &Relation, tuple: TupleData) {
         self.changes.push(DecodedChange {
             op: ChangeOp::Create,
-            primary_keys: relation
-                .columns
-                .iter()
-                .filter(|c| c.is_key)
-                .map(|c| c.name.clone())
-                .collect(),
             row: tuple,
         });
     }
 
-    pub fn push_update(&mut self, relation: &Relation, new: TupleData) {
+    pub fn push_update(&mut self, _relation: &Relation, new: TupleData) {
         self.changes.push(DecodedChange {
             op: ChangeOp::Update,
-            primary_keys: relation
-                .columns
-                .iter()
-                .filter(|c| c.is_key)
-                .map(|c| c.name.clone())
-                .collect(),
             row: new,
         });
     }
 
-    pub fn push_delete(&mut self, relation: &Relation, old: TupleData) {
+    pub fn push_delete(&mut self, _relation: &Relation, old: TupleData) {
         self.changes.push(DecodedChange {
             op: ChangeOp::Delete,
-            primary_keys: relation
-                .columns
-                .iter()
-                .filter(|c| c.is_key)
-                .map(|c| c.name.clone())
-                .collect(),
             row: old,
         });
     }
 
     /// Record a TRUNCATE for the relation. Row payload is empty — the
     /// accelerator path applies it as an unconditional delete-all.
-    pub fn push_truncate(&mut self, relation: &Relation) {
+    pub fn push_truncate(&mut self, _relation: &Relation) {
         self.changes.push(DecodedChange {
             op: ChangeOp::Truncate,
-            primary_keys: relation
-                .columns
-                .iter()
-                .filter(|c| c.is_key)
-                .map(|c| c.name.clone())
-                .collect(),
             row: TupleData { columns: vec![] },
         });
     }
@@ -162,9 +137,15 @@ pub fn build_change_batch(
     let wrapper_schema = changes_schema(&nullable_schema);
 
     let mut op_builder = StringBuilder::with_capacity(num_rows, num_rows * 2);
+    let primary_keys: Vec<&str> = relation
+        .columns
+        .iter()
+        .filter(|c| c.is_key)
+        .map(|c| c.name.as_str())
+        .collect();
     let mut pk_offsets = Vec::<i32>::with_capacity(num_rows + 1);
     pk_offsets.push(0);
-    let mut pk_values: Vec<String> = Vec::new();
+    let mut pk_values: Vec<&str> = Vec::with_capacity(num_rows.saturating_mul(primary_keys.len()));
 
     // One builder per output field, typed from dataset schema.
     let mut data_builders: Vec<FieldBuilder> = dataset_schema
@@ -196,9 +177,7 @@ pub fn build_change_batch(
 
     for change in changes {
         op_builder.append_value(change.op.as_str());
-        for pk in &change.primary_keys {
-            pk_values.push(pk.clone());
-        }
+        pk_values.extend(primary_keys.iter().copied());
         pk_offsets.push(i32::try_from(pk_values.len()).map_err(|e| {
             super::Error::PgOutputDecode {
                 message: format!("too many primary keys: {e}"),
@@ -869,12 +848,10 @@ mod tests {
         let changes = vec![
             DecodedChange {
                 op: ChangeOp::Create,
-                primary_keys: vec!["id".into()],
                 row: tuple_for("1", Some("Alice")),
             },
             DecodedChange {
                 op: ChangeOp::Delete,
-                primary_keys: vec!["id".into()],
                 row: tuple_for("2", None),
             },
         ];
@@ -948,7 +925,6 @@ mod tests {
     fn insert_change(id: &str, name: Option<&str>) -> DecodedChange {
         DecodedChange {
             op: ChangeOp::Create,
-            primary_keys: vec!["id".into()],
             row: tuple_for(id, name),
         }
     }
@@ -956,7 +932,6 @@ mod tests {
     fn update_change(id: &str, name: Option<&str>) -> DecodedChange {
         DecodedChange {
             op: ChangeOp::Update,
-            primary_keys: vec!["id".into()],
             row: tuple_for(id, name),
         }
     }
@@ -966,7 +941,6 @@ mod tests {
         // only PKs are populated; non-PK columns are explicitly null.
         DecodedChange {
             op: ChangeOp::Delete,
-            primary_keys: vec!["id".into()],
             row: tuple_for(id, None),
         }
     }
@@ -975,7 +949,6 @@ mod tests {
         // REPLICA IDENTITY FULL — O tuple has all columns populated.
         DecodedChange {
             op: ChangeOp::Delete,
-            primary_keys: vec!["id".into()],
             row: tuple_for(id, name),
         }
     }
@@ -983,7 +956,6 @@ mod tests {
     fn truncate_change() -> DecodedChange {
         DecodedChange {
             op: ChangeOp::Truncate,
-            primary_keys: vec!["id".into()],
             row: TupleData { columns: vec![] },
         }
     }
@@ -1168,7 +1140,6 @@ mod tests {
         // DELETE sends tenant+id populated, label null.
         let delete = DecodedChange {
             op: ChangeOp::Delete,
-            primary_keys: vec!["tenant".into(), "id".into()],
             row: TupleData {
                 columns: vec![
                     Some(PgValue::Text("5".into())),
@@ -1209,10 +1180,9 @@ mod tests {
         }
     }
 
-    fn single_col_change(op: ChangeOp, name: &str, text: &str) -> DecodedChange {
+    fn single_col_change(op: ChangeOp, _name: &str, text: &str) -> DecodedChange {
         DecodedChange {
             op,
-            primary_keys: vec![name.to_string()],
             row: TupleData {
                 columns: vec![Some(PgValue::Text(text.to_string()))],
             },
@@ -1379,7 +1349,6 @@ mod tests {
         let schema = non_nullable_users_schema();
         let unchanged_update = DecodedChange {
             op: ChangeOp::Update,
-            primary_keys: vec!["id".into()],
             row: TupleData {
                 columns: vec![Some(PgValue::Text("1".into())), Some(PgValue::Unchanged)],
             },

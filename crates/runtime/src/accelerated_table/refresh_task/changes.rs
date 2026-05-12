@@ -18,17 +18,23 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
-use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
+};
 use arrow::datatypes::DataType;
 use cache::Caching;
+use data_components::arrow::{IndexedMemTable, write::MemTable};
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 #[cfg(feature = "dynamodb")]
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
+use data_components::index_maintenance::perform_index_maintenance;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+use datafusion::datasource::TableProvider;
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
@@ -38,11 +44,25 @@ use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_datafusion_index::IndexedTableProvider;
+use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
+
+struct ApplyContext<'a> {
+    refresh_sql: Option<&'a str>,
+    dataset_name: &'a TableReference,
+    caching: Option<&'a Weak<Caching>>,
+    ready_sender: Option<&'a Arc<Notify>>,
+    initial_load_completed: &'a Arc<AtomicBool>,
+    pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
+    commit_timeout: Duration,
+}
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
 ///
@@ -59,7 +79,7 @@ use tokio::sync::{Notify, RwLock};
 /// }
 /// ```
 macro_rules! extract_primary_key {
-    ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr) => {{
+    ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr, $row:expr) => {{
         let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
             crate::accelerated_table::PrimaryKeyArrayDataTypeMismatchSnafu {
                 field_name: $key.to_string(),
@@ -67,16 +87,206 @@ macro_rules! extract_primary_key {
                 schema: Arc::clone(&$data_schema),
             },
         )?;
-        Ok((key_col.value(0).to_string(), lit(key_col.value(0))))
+        if key_col.is_null($row) {
+            return crate::accelerated_table::PrimaryKeyNullValueSnafu {
+                field_name: $key.to_string(),
+            }
+            .fail();
+        }
+        Ok((key_col.value($row).to_string(), lit(key_col.value($row))))
     }};
 }
 
-/// Channel depth between the CDC source-stream reader and the apply loop.
-/// Each slot can hold one decoded `ChangeEnvelope`, so peak prefetch memory
-/// is `CDC_PREFETCH_BUFFER * max_batch_bytes`. Tuned small to keep memory
-/// bounded for sources that emit large per-transaction batches (e.g.,
-/// Postgres logical replication during bulk inserts).
-const CDC_PREFETCH_BUFFER: usize = 4;
+/// Tunables for the CDC source-stream → apply pipeline.
+///
+/// Resolved once at process start, in this priority order:
+/// 1. `runtime.params.cdc_*` from the spicepod (installed via
+///    [`set_cdc_config`]).
+/// 2. `SPICE_CDC_*` environment variables (useful for tests and ad-hoc
+///    tuning).
+/// 3. Built-in defaults.
+///
+/// Out-of-range or unparseable values fall back to the next source with a
+/// `tracing::warn!` so misconfiguration is visible rather than silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdcConfig {
+    /// Channel depth between the CDC source-stream reader and the apply
+    /// loop. Each slot holds one decoded `ChangeEnvelope`, so peak
+    /// prefetch memory is `prefetch_buffer * max_batch_bytes`.
+    pub prefetch_buffer: usize,
+    /// Hard upper bound on the number of `ChangeEnvelope`s coalesced into
+    /// a single accelerator write. Coalescing amortizes per-envelope
+    /// plan construction over the whole burst.
+    pub max_coalesced_envelopes: usize,
+    /// Best-effort byte budget for a coalesced burst. A single envelope may
+    /// exceed this on its own; otherwise the next envelope is carried into the
+    /// next burst before we allocate a concatenated batch.
+    pub max_coalesced_bytes: usize,
+    /// Maximum time to wait for the previous source-side commit before
+    /// surfacing ingestion as stalled.
+    pub commit_timeout: Duration,
+}
+
+const CDC_PREFETCH_BUFFER_DEFAULT: usize = 32;
+const CDC_PREFETCH_BUFFER_MAX: usize = 1024;
+const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 64;
+const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 4096;
+const CDC_MAX_COALESCED_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
+const CDC_COMMIT_TIMEOUT_MS_DEFAULT: usize = 30_000;
+const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
+
+impl Default for CdcConfig {
+    fn default() -> Self {
+        Self {
+            prefetch_buffer: CDC_PREFETCH_BUFFER_DEFAULT,
+            max_coalesced_envelopes: CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+            max_coalesced_bytes: CDC_MAX_COALESCED_BYTES_DEFAULT,
+            commit_timeout: Duration::from_millis(CDC_COMMIT_TIMEOUT_MS_DEFAULT as u64),
+        }
+    }
+}
+
+/// Process-wide CDC tunables. Set once at runtime startup from spicepod
+/// config; repeated calls with the same value are ignored quietly so tests
+/// and multi-runtime processes don't emit noise. A different later value is
+/// ignored with a warning because active CDC streams may already be using the
+/// first config.
+static CDC_CONFIG: std::sync::OnceLock<CdcConfig> = std::sync::OnceLock::new();
+
+/// Install the CDC configuration resolved from spicepod
+/// `runtime.params.cdc_*`. Should be called exactly once during runtime
+/// startup, before any CDC stream is started. Subsequent calls are ignored.
+pub fn set_cdc_config(config: CdcConfig) {
+    if let Err(new_config) = CDC_CONFIG.set(config)
+        && let Some(existing) = CDC_CONFIG.get()
+        && *existing != new_config
+    {
+        tracing::warn!(
+            "CDC config already initialized with {existing:?}; ignoring different config {new_config:?}"
+        );
+    }
+}
+
+/// Returns the active CDC tunables, computing them on first access from
+/// (in order) the spicepod-installed config, env-var overrides, then
+/// built-in defaults.
+fn cdc_config() -> CdcConfig {
+    if let Some(cfg) = CDC_CONFIG.get() {
+        return *cfg;
+    }
+    CdcConfig {
+        prefetch_buffer: parse_env_usize(
+            "SPICE_CDC_PREFETCH_BUFFER",
+            CDC_PREFETCH_BUFFER_DEFAULT,
+            CDC_PREFETCH_BUFFER_MAX,
+        ),
+        max_coalesced_envelopes: parse_env_usize(
+            "SPICE_CDC_MAX_COALESCED_ENVELOPES",
+            CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+            CDC_MAX_COALESCED_ENVELOPES_MAX,
+        ),
+        max_coalesced_bytes: parse_env_usize(
+            "SPICE_CDC_MAX_COALESCED_BYTES",
+            CDC_MAX_COALESCED_BYTES_DEFAULT,
+            CDC_MAX_COALESCED_BYTES_MAX,
+        ),
+        commit_timeout: Duration::from_millis(parse_env_usize(
+            "SPICE_CDC_COMMIT_TIMEOUT_MS",
+            CDC_COMMIT_TIMEOUT_MS_DEFAULT,
+            CDC_COMMIT_TIMEOUT_MS_MAX,
+        ) as u64),
+    }
+}
+
+/// Resolve a single CDC tunable from `runtime.params`, falling back to the
+/// matching env var and then `default` when the param is missing,
+/// unparseable, or out of range.
+fn resolve_cdc_param(
+    params: &std::collections::HashMap<String, String>,
+    key: &'static str,
+    env_var: &'static str,
+    default: usize,
+    max: usize,
+) -> usize {
+    if let Some(raw) = params.get(key) {
+        match raw.trim().parse::<usize>() {
+            Ok(n) if (1..=max).contains(&n) => return n,
+            Ok(n) => {
+                tracing::warn!(
+                    "runtime.params.{key}={n} is out of range [1, {max}]; falling back to {env_var}/default"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "runtime.params.{key}={raw:?} is not a valid usize ({e}); falling back to {env_var}/default"
+                );
+            }
+        }
+    }
+    parse_env_usize(env_var, default, max)
+}
+
+/// Build a [`CdcConfig`] from the spicepod `runtime.params` map, reading
+/// the `cdc_prefetch_buffer`, `cdc_max_coalesced_envelopes`,
+/// `cdc_max_coalesced_bytes`, and `cdc_commit_timeout_ms` keys.
+/// Missing/unparseable/out-of-range params fall back to the corresponding
+/// `SPICE_CDC_*` env var, then defaults.
+#[must_use]
+pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>) -> CdcConfig {
+    CdcConfig {
+        prefetch_buffer: resolve_cdc_param(
+            params,
+            "cdc_prefetch_buffer",
+            "SPICE_CDC_PREFETCH_BUFFER",
+            CDC_PREFETCH_BUFFER_DEFAULT,
+            CDC_PREFETCH_BUFFER_MAX,
+        ),
+        max_coalesced_envelopes: resolve_cdc_param(
+            params,
+            "cdc_max_coalesced_envelopes",
+            "SPICE_CDC_MAX_COALESCED_ENVELOPES",
+            CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+            CDC_MAX_COALESCED_ENVELOPES_MAX,
+        ),
+        max_coalesced_bytes: resolve_cdc_param(
+            params,
+            "cdc_max_coalesced_bytes",
+            "SPICE_CDC_MAX_COALESCED_BYTES",
+            CDC_MAX_COALESCED_BYTES_DEFAULT,
+            CDC_MAX_COALESCED_BYTES_MAX,
+        ),
+        commit_timeout: Duration::from_millis(resolve_cdc_param(
+            params,
+            "cdc_commit_timeout_ms",
+            "SPICE_CDC_COMMIT_TIMEOUT_MS",
+            CDC_COMMIT_TIMEOUT_MS_DEFAULT,
+            CDC_COMMIT_TIMEOUT_MS_MAX,
+        ) as u64),
+    }
+}
+
+/// Parse a positive `usize` from `var`, falling back to `default` on missing,
+/// unparseable, or out-of-range (`<1` or `> max`) values. Logs a warning
+/// when an explicit value is rejected so misconfiguration is visible.
+fn parse_env_usize(var: &'static str, default: usize, max: usize) -> usize {
+    match std::env::var(var) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if (1..=max).contains(&n) => n,
+            Ok(n) => {
+                tracing::warn!("{var}={n} is out of range [1, {max}]; using default {default}");
+                default
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "{var}={raw:?} failed to parse as usize ({e}); using default {default}"
+                );
+                default
+            }
+        },
+    }
+}
 
 impl RefreshTask {
     pub async fn start_changes_stream(
@@ -93,6 +303,8 @@ impl RefreshTask {
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
+        let cdc_cfg = cdc_config();
+
         // Pipeline source-stream reads with apply+commit by running the source
         // in its own task on the refresh runtime and feeding a bounded channel.
         // While the apply loop writes batch N to the accelerator and commits
@@ -103,7 +315,7 @@ impl RefreshTask {
         // pulling, so we never accumulate unbounded memory.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<
             Result<cdc::ChangeEnvelope, cdc::StreamError>,
-        >(CDC_PREFETCH_BUFFER);
+        >(cdc_cfg.prefetch_buffer);
 
         let reader_dataset = dataset_name.clone();
         let reader_handle = tokio::spawn(async move {
@@ -138,71 +350,85 @@ impl RefreshTask {
             }
         });
 
-        while let Some(update) = rx.recv().await {
-            match update {
-                Ok(change_envelope) => {
-                    match self
-                        .write_change(change_envelope.change_batch.clone())
-                        .await
-                    {
-                        Ok(write_result) => {
-                            // Mark the dataset as ready if possible
-                            if change_envelope.is_dataset_ready() {
-                                initial_load_completed.store(true, Ordering::Relaxed);
-                                if let Some(ready_sender) = ready_sender.as_ref() {
-                                    ready_sender.notify_waiters();
-                                }
-                                self.update_component_status(status::ComponentStatus::Ready)
-                                    .await;
-                            }
+        // The previous burst's commit task. Commits are network round-trips
+        // to the source (PG `Standby Status Update`, Kafka offset commit,
+        // DynamoDB shard checkpoint) that don't need to gate the next apply.
+        // We keep at most one commit task in flight: by waiting on the
+        // previous commit before *spawning* the next one, we preserve
+        // strict commit ordering across bursts (LSN/offsets advance
+        // monotonically), while letting commit(N) overlap with apply(N+1) —
+        // the actual idle window in the original serial loop.
+        let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
+        let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
 
-                            if let Err(e) = change_envelope.commit().await
-                                && !self.runtime_status.is_shutdown()
-                            {
-                                tracing::error!("Failed to commit CDC change envelope: {e}");
-                            }
-
-                            if write_result == WriteChangeResult::DataWritten
-                                && let Some(cache_provider_ref) = caching.as_ref()
-                                && let Some(cache_provider) = cache_provider_ref.upgrade()
-                                && let Err(e) =
-                                    cache_provider.invalidate_for_table(dataset_name.clone())
-                                && !self.runtime_status.is_shutdown()
-                            {
-                                // No cache provider means runtime is shutting down and cache is already cleaned up
-                                tracing::error!(
-                                    "Failed to invalidate cached results for dataset {}: {e}",
-                                    &dataset_name.to_string()
-                                );
-                            }
+        while let Some(first) = match carried_item.take() {
+            Some(item) => Some(item),
+            None => rx.recv().await,
+        } {
+            // Drain whatever is already buffered in the prefetch channel
+            // (no `await` between try_recv calls). Under low load the buffer
+            // is empty after the initial recv and `burst.len() == 1` — that
+            // path matches the pre-pipelining serial cost exactly. Under
+            // high load (PG WAL bulk insert, Debezium catch-up, Kafka
+            // backlog) we collect a contiguous run and apply it in one shot,
+            // amortizing the per-envelope `SessionContext` + `insert_into`
+            // planning cost over the whole burst.
+            let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
+                Vec::with_capacity(8);
+            let mut burst_bytes = cdc_item_memory_size(&first);
+            burst.push(first);
+            let max_burst = cdc_cfg.max_coalesced_envelopes;
+            let max_burst_bytes = cdc_cfg.max_coalesced_bytes;
+            while burst.len() < max_burst {
+                match rx.try_recv() {
+                    Ok(item) => {
+                        let item_bytes = cdc_item_memory_size(&item);
+                        if burst_bytes > 0
+                            && item_bytes > 0
+                            && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
+                        {
+                            carried_item = Some(item);
+                            break;
                         }
-                        Err(e) => {
-                            let error_message = format_datafusion_error(&e);
-                            self.set_refresh_status(
-                                refresh.read().await.display_sql().as_deref(),
-                                status::ComponentStatus::error_with_message(error_message),
-                            )
-                            .await;
-                            if !self.runtime_status.is_shutdown() {
-                                tracing::error!("Error writing change for {dataset_name}: {e}");
-                            }
-                        }
+                        burst_bytes = burst_bytes.saturating_add(item_bytes);
+                        burst.push(item);
                     }
-                }
-                Err(e) => {
-                    // If the error is transient (e.g., Kafka poll timeout), continue without changing the refresh status to Error
-                    if handle_stream_error(&e, &self.dataset_name) == StreamErrorType::Transient {
-                        continue;
-                    }
-
-                    let error_message = format_datafusion_error(&e);
-                    self.set_refresh_status(
-                        refresh.read().await.display_sql().as_deref(),
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
+                    Err(_) => break,
                 }
             }
+
+            let mut apply_context = ApplyContext {
+                refresh_sql: sql.as_deref(),
+                dataset_name: &dataset_name,
+                caching: caching.as_ref(),
+                ready_sender: ready_sender.as_ref(),
+                initial_load_completed: &initial_load_completed,
+                pending_commit: &mut pending_commit,
+                commit_timeout: cdc_cfg.commit_timeout,
+            };
+            if !self.apply_burst(&mut apply_context, burst).await {
+                rx.close();
+                reader_handle.abort();
+                break;
+            }
+        }
+
+        // Drain the final in-flight commit before reporting end-of-stream so
+        // we don't leave the source-side offset un-acked.
+        if let Some(prev) = pending_commit.take()
+            && let Some(error_message) = join_pending_commit(
+                prev,
+                &dataset_name,
+                self.runtime_status.is_shutdown(),
+                cdc_cfg.commit_timeout,
+            )
+            .await
+        {
+            self.set_refresh_status(
+                sql.as_deref(),
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
         }
 
         // rx returned None: the reader dropped its sender. Three causes:
@@ -228,7 +454,7 @@ impl RefreshTask {
                 let err_msg = format!("CDC reader task ended unexpectedly: {e}");
                 tracing::error!("{err_msg} (dataset={dataset_name})");
                 self.set_refresh_status(
-                    refresh.read().await.display_sql().as_deref(),
+                    sql.as_deref(),
                     status::ComponentStatus::error_with_message(err_msg),
                 )
                 .await;
@@ -242,6 +468,197 @@ impl RefreshTask {
         Ok(())
     }
 
+    /// Apply a single coalesced burst of CDC items drained from the prefetch
+    /// channel. Splits the burst into contiguous runs of `Ok` envelopes
+    /// (which can be coalesced into one accelerator write) and `Err` items
+    /// (handled one-by-one as today). Within an `Ok` run we concatenate the
+    /// underlying `RecordBatch`es into a single `ChangeBatch` and call
+    /// `write_change` once — turning N small writes into one larger write
+    /// and amortizing the per-envelope `SessionContext` + `insert_into`
+    /// planning cost. After a successful write we hand the run's committers
+    /// to a background commit task so that commit(N) overlaps with apply(N+1).
+    async fn apply_burst(
+        &self,
+        context: &mut ApplyContext<'_>,
+        burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+    ) -> bool {
+        // Walk the burst preserving arrival order, processing contiguous
+        // runs of Ok envelopes together and Err items individually so error
+        // handling and ordering semantics match the pre-coalesce behavior.
+        let mut iter = burst.into_iter().peekable();
+        while let Some(item) = iter.next() {
+            match item {
+                Ok(first_env) => {
+                    let mut envelopes = Vec::with_capacity(8);
+                    envelopes.push(first_env);
+                    while let Some(Ok(_)) = iter.peek() {
+                        let Some(Ok(next)) = iter.next() else {
+                            unreachable!("peeked Ok above");
+                        };
+                        envelopes.push(next);
+                    }
+
+                    if !self.apply_envelope_run(context, envelopes).await {
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    // Transient errors (e.g., Kafka poll timeout) keep the
+                    // refresh status healthy; fatal errors flip status to
+                    // Error but we do not abort the loop, matching the
+                    // pre-coalesce contract.
+                    if handle_stream_error(&e, context.dataset_name) == StreamErrorType::Transient {
+                        continue;
+                    }
+
+                    let error_message = format_datafusion_error(&e);
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                }
+            }
+        }
+        true
+    }
+
+    /// Apply a contiguous run of successful envelopes as a single coalesced
+    /// write, then schedule their commits in a background task that overlaps
+    /// with the next burst's apply.
+    async fn apply_envelope_run(
+        &self,
+        context: &mut ApplyContext<'_>,
+        envelopes: Vec<cdc::ChangeEnvelope>,
+    ) -> bool {
+        debug_assert!(
+            !envelopes.is_empty(),
+            "run must contain at least one envelope"
+        );
+
+        // Split envelopes into (committers, batches, ready_flags) preserving
+        // arrival order. Committers will be drained sequentially in the
+        // background commit task; per-source semantics (e.g., PG `Standby
+        // Status Update` carrying the latest LSN, Kafka per-partition
+        // offsets) require this ordering.
+        let any_ready = envelopes.iter().any(cdc::ChangeEnvelope::is_dataset_ready);
+        let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
+            Vec::with_capacity(envelopes.len());
+        let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
+        for env in envelopes {
+            let (committer, batch, _is_ready) = env.into_parts();
+            committers.push(committer);
+            batches.push(batch);
+        }
+
+        // Fast path: a single envelope (low-load / serial behavior). Skips
+        // concat allocation entirely so the no-coalesce path matches the
+        // pre-pipelining cost exactly.
+        let coalesced_batch = if batches.len() == 1 {
+            batches.into_iter().next().unwrap_or_else(|| unreachable!())
+        } else {
+            match concat_change_batches(&batches) {
+                Ok(b) => b,
+                Err(e) => {
+                    let error_message = format!(
+                        "Failed to coalesce {} CDC envelopes for {}: {e}",
+                        batches.len(),
+                        context.dataset_name,
+                    );
+                    tracing::error!("{error_message}");
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    // Drop committers without acking — the source will
+                    // re-send these envelopes on reconnect, and CDC apply
+                    // is idempotent at the upsert/delete level.
+                    return true;
+                }
+            }
+        };
+
+        match self.write_change(coalesced_batch).await {
+            Ok(write_result) => {
+                if any_ready {
+                    context
+                        .initial_load_completed
+                        .store(true, Ordering::Relaxed);
+                    if let Some(sender) = context.ready_sender {
+                        sender.notify_waiters();
+                    }
+                    self.update_component_status(status::ComponentStatus::Ready)
+                        .await;
+                }
+
+                if write_result == WriteChangeResult::DataWritten
+                    && let Some(cache_provider_ref) = context.caching
+                    && let Some(cache_provider) = cache_provider_ref.upgrade()
+                    && let Err(e) =
+                        cache_provider.invalidate_for_table(context.dataset_name.clone())
+                    && !self.runtime_status.is_shutdown()
+                {
+                    tracing::error!(
+                        "Failed to invalidate cached results for dataset {}: {e}",
+                        context.dataset_name
+                    );
+                }
+
+                // Wait for the previous burst's commit to land before
+                // spawning this burst's commit. This preserves strict
+                // commit ordering across bursts (LSN/offsets must advance
+                // monotonically) while letting commit(N) overlap with the
+                // next apply(N+1).
+                if let Some(prev) = context.pending_commit.take()
+                    && let Some(error_message) = join_pending_commit(
+                        prev,
+                        context.dataset_name,
+                        self.runtime_status.is_shutdown(),
+                        context.commit_timeout,
+                    )
+                    .await
+                {
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    return false;
+                }
+
+                let runtime_status = Arc::clone(&self.runtime_status);
+                let commit_dataset = context.dataset_name.clone();
+                *context.pending_commit = Some(tokio::spawn(async move {
+                    for committer in committers {
+                        if let Err(e) = committer.commit().await
+                            && !runtime_status.is_shutdown()
+                        {
+                            tracing::error!(
+                                "Failed to commit CDC change envelope for {commit_dataset}: {e}"
+                            );
+                        }
+                    }
+                }));
+            }
+            Err(e) => {
+                let error_message = format_datafusion_error(&e);
+                self.set_refresh_status(
+                    context.refresh_sql,
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+                if !self.runtime_status.is_shutdown() {
+                    tracing::error!("Error writing change for {}: {e}", context.dataset_name);
+                }
+                // Drop committers without acking, and stop this stream before
+                // any later envelope can commit past the uncommitted gap.
+                return false;
+            }
+        }
+        true
+    }
+
     async fn write_change(
         &self,
         change_batch: ChangeBatch,
@@ -249,6 +666,8 @@ impl RefreshTask {
         let dataset_name = self.dataset_name.clone();
 
         let sub_batches = group_into_sub_batches(&change_batch);
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
 
         tracing::trace!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
@@ -261,17 +680,17 @@ impl RefreshTask {
         for (op_type, row_indices) in sub_batches {
             match op_type {
                 ChangeOperationType::Delete => {
-                    self.process_delete_batch(&change_batch, &row_indices)
+                    self.process_delete_batch(&change_batch, &row_indices, &ctx, &session_state)
                         .await?;
                     had_change = true;
                 }
                 ChangeOperationType::Upsert => {
-                    self.process_upsert_batch(&change_batch, &row_indices)
+                    self.process_upsert_batch(&change_batch, &row_indices, &ctx, &session_state)
                         .await?;
                     had_change = true;
                 }
                 ChangeOperationType::Truncate => {
-                    self.process_truncate().await?;
+                    self.process_truncate(&ctx, &session_state).await?;
                     had_change = true;
                 }
                 ChangeOperationType::Unknown => {
@@ -297,6 +716,8 @@ impl RefreshTask {
         &self,
         change_batch: &ChangeBatch,
         row_indices: &[usize],
+        ctx: &SessionContext,
+        session_state: &SessionState,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
 
@@ -309,25 +730,7 @@ impl RefreshTask {
             );
         }
 
-        let indices_array = UInt32Array::from(
-            row_indices
-                .iter()
-                .filter_map(|&i| u32::try_from(i).ok())
-                .collect::<Vec<_>>(),
-        );
-
-        let selected_columns: Vec<ArrayRef> = data_batch
-            .columns()
-            .iter()
-            .map(|col| arrow::compute::take(col.as_ref(), &indices_array, None))
-            .collect::<Result<Vec<_>, _>>()
-            .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
-
-        let selected_batch = RecordBatch::try_new(data_batch.schema(), selected_columns)
-            .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
-
-        let ctx = SessionContext::new();
-        let session_state = ctx.state();
+        let selected_batch = select_rows(&data_batch, row_indices)?;
 
         let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
             selected_batch.schema(),
@@ -346,7 +749,7 @@ impl RefreshTask {
 
         let insert_plan = self
             .accelerator
-            .insert_into(&session_state, cast_plan, InsertOp::Append)
+            .insert_into(session_state, cast_plan, InsertOp::Append)
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
@@ -354,18 +757,21 @@ impl RefreshTask {
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        perform_change_write_maintenance(&self.accelerator).await?;
 
         self.update_last_updated_at();
 
         Ok(())
     }
 
-    async fn process_truncate(&self) -> crate::accelerated_table::Result<()> {
+    async fn process_truncate(
+        &self,
+        ctx: &SessionContext,
+        session_state: &SessionState,
+    ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
         tracing::info!("Processing TRUNCATE for {dataset_name}");
 
-        let ctx = SessionContext::new();
-        let session_state = ctx.state();
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         // Some accelerator impls (notably DuckDB) treat an empty filter list as
         // a no-op to guard against accidental full-table deletes. To get
@@ -374,7 +780,7 @@ impl RefreshTask {
         // applied consistently across engines.
         let delete_plan = self
             .accelerator
-            .delete_from(&session_state, vec![lit(true)])
+            .delete_from(session_state, vec![lit(true)])
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
@@ -382,6 +788,7 @@ impl RefreshTask {
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        perform_change_write_maintenance(&self.accelerator).await?;
 
         self.update_last_updated_at();
         Ok(())
@@ -391,6 +798,8 @@ impl RefreshTask {
         &self,
         change_batch: &ChangeBatch,
         row_indices: &[usize],
+        ctx: &SessionContext,
+        session_state: &SessionState,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
 
@@ -399,20 +808,38 @@ impl RefreshTask {
             row_indices.len()
         );
 
+        let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
+            .iter()
+            .copied()
+            .partition(|row| change_batch.primary_keys(*row).is_empty());
+
+        let mut wrote = false;
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
+
+        if !keyless_rows.is_empty() {
+            let selected_batch = select_rows(&change_batch.data_batch(), &keyless_rows)?;
+            if delete_matching_rows_from_arrow_provider(&self.accelerator, &selected_batch)
+                .await?
+                .is_some()
+            {
+                wrote = true;
+            } else {
+                return Err(crate::accelerated_table::Error::NoPrimaryKeysDefined {
+                    dataset_name: dataset_name.to_string(),
+                });
+            }
+        }
+
         let combined = build_batch_delete_expr_from_change_batch(
             change_batch,
-            row_indices,
+            &keyed_rows,
             dataset_name.to_string().as_str(),
         )?;
 
         if let Some(combined) = combined {
-            let ctx = SessionContext::new();
-            let session_state = ctx.state();
-
-            let _lock_guard = self.accelerator_write_mutex.lock().await;
             let delete_plan = self
                 .accelerator
-                .delete_from(&session_state, vec![combined])
+                .delete_from(session_state, vec![combined])
                 .await
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
@@ -420,16 +847,254 @@ impl RefreshTask {
                 .await
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            wrote = true;
         }
 
-        self.update_last_updated_at();
+        if wrote {
+            perform_change_write_maintenance(&self.accelerator).await?;
+            self.update_last_updated_at();
+        }
 
         Ok(())
     }
 }
 
+/// Concatenate the underlying `RecordBatch`es of multiple `ChangeBatch`es
+/// into a single `ChangeBatch` so a coalesced burst can be applied with one
+/// `insert_into` call. All batches in a single CDC stream share the same
+/// `changes_schema(table_schema)`, so the schema check inside
+/// `arrow::compute::concat_batches` will not fail in normal operation; if it
+/// does we surface the error and let the caller skip committing those
+/// envelopes (the source will redeliver them).
+fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::Result<ChangeBatch> {
+    debug_assert!(
+        !batches.is_empty(),
+        "concat_change_batches requires at least one batch",
+    );
+
+    let schema = batches[0].record.schema();
+    let records: Vec<&RecordBatch> = batches.iter().map(|b| &b.record).collect();
+    let combined = arrow::compute::concat_batches(&schema, records)
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+    ChangeBatch::try_new(combined).map_err(|e| {
+        // ChangeBatchError isn't part of the AcceleratedTable Error enum;
+        // wrap it in FailedToBuildRecordBatch so the caller's status path
+        // doesn't have to learn about a new variant.
+        crate::accelerated_table::Error::FailedToBuildRecordBatch {
+            source: arrow::error::ArrowError::ExternalError(Box::new(e)),
+        }
+    })
+}
+
+fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
+    item.as_ref()
+        .map_or(0, |env| env.change_batch.record.get_array_memory_size())
+}
+
+fn select_rows(
+    data_batch: &RecordBatch,
+    row_indices: &[usize],
+) -> crate::accelerated_table::Result<RecordBatch> {
+    if let Some((offset, length)) = contiguous_row_span(row_indices) {
+        return Ok(data_batch.slice(offset, length));
+    }
+
+    let indices = row_indices
+        .iter()
+        .map(|&i| {
+            u32::try_from(i).map_err(|e| {
+                arrow::error::ArrowError::InvalidArgumentError(format!(
+                    "CDC row index {i} exceeds UInt32 take index range: {e}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+    let indices_array = UInt32Array::from(indices);
+
+    let selected_columns: Vec<ArrayRef> = data_batch
+        .columns()
+        .iter()
+        .map(|col| arrow::compute::take(col.as_ref(), &indices_array, None))
+        .collect::<Result<Vec<_>, _>>()
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+
+    RecordBatch::try_new(data_batch.schema(), selected_columns)
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)
+}
+
+async fn delete_matching_rows_from_arrow_provider(
+    provider: &Arc<dyn TableProvider>,
+    rows: &RecordBatch,
+) -> crate::accelerated_table::Result<Option<u64>> {
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        return Box::pin(delete_matching_rows_from_arrow_provider(
+            indexed.get_underlying_ref(),
+            rows,
+        ))
+        .await;
+    }
+
+    if let Some(embedding_table) = provider
+        .as_any()
+        .downcast_ref::<crate::embeddings::table::EmbeddingTable>()
+    {
+        return Box::pin(delete_matching_rows_from_arrow_provider(
+            embedding_table.get_underlying_ref(),
+            rows,
+        ))
+        .await;
+    }
+
+    if let Some(table) = provider.as_any().downcast_ref::<MemTable>() {
+        return table
+            .delete_matching_rows(rows)
+            .await
+            .map(Some)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu);
+    }
+
+    if let Some(table) = provider.as_any().downcast_ref::<IndexedMemTable>() {
+        return table
+            .delete_matching_rows(rows)
+            .await
+            .map(Some)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu);
+    }
+
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+        let mut deleted = 0_u64;
+        let mut matched_arrow_provider = false;
+        for partition_provider in partitioned.partition_table_providers().await {
+            if let Some(partition_deleted) = Box::pin(delete_matching_rows_from_arrow_provider(
+                &partition_provider,
+                rows,
+            ))
+            .await?
+            {
+                deleted += partition_deleted;
+                matched_arrow_provider = true;
+            }
+        }
+
+        return Ok(matched_arrow_provider.then_some(deleted));
+    }
+
+    Ok(None)
+}
+
+async fn perform_change_write_maintenance(
+    provider: &Arc<dyn TableProvider>,
+) -> crate::accelerated_table::Result<()> {
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        return Box::pin(perform_change_write_maintenance(
+            indexed.get_underlying_ref(),
+        ))
+        .await;
+    }
+
+    if let Some(embedding_table) = provider
+        .as_any()
+        .downcast_ref::<crate::embeddings::table::EmbeddingTable>()
+    {
+        return Box::pin(perform_change_write_maintenance(
+            embedding_table.get_underlying_ref(),
+        ))
+        .await;
+    }
+
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+        for partition_provider in partitioned.partition_table_providers().await {
+            Box::pin(perform_change_write_maintenance(&partition_provider)).await?;
+        }
+        return Ok(());
+    }
+
+    perform_index_maintenance(provider.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(find_datafusion_root)
+        .context(crate::accelerated_table::FailedToWriteDataSnafu)
+}
+
+fn contiguous_row_span(row_indices: &[usize]) -> Option<(usize, usize)> {
+    let first = *row_indices.first()?;
+    if row_indices
+        .iter()
+        .enumerate()
+        .all(|(offset, &row)| row == first + offset)
+    {
+        Some((first, row_indices.len()))
+    } else {
+        None
+    }
+}
+
+/// Await an in-flight commit task spawned by `apply_envelope_run`. Surfaces
+/// panics loudly (we must never silently swallow a commit-task panic — that
+/// would leave the dataset healthy while source-side offsets stop advancing)
+/// but treats cancellation during shutdown as expected.
+async fn join_pending_commit(
+    mut handle: tokio::task::JoinHandle<()>,
+    dataset_name: &TableReference,
+    is_shutdown: bool,
+    commit_timeout: Duration,
+) -> Option<String> {
+    tokio::select! {
+        result = &mut handle => {
+            match result {
+                Err(e) if e.is_panic() => {
+                    let error_message =
+                        format!("CDC commit task for {dataset_name} panicked: {e}");
+                    tracing::error!("{error_message}");
+                    Some(error_message)
+                }
+                Err(e) if e.is_cancelled() && is_shutdown => {
+                    tracing::debug!("CDC commit task for {dataset_name} was cancelled (likely shutdown)");
+                    None
+                }
+                Err(e) => {
+                    let error_message =
+                        format!("CDC commit task for {dataset_name} ended unexpectedly: {e}");
+                    tracing::error!("{error_message}");
+                    Some(error_message)
+                }
+                Ok(()) => None,
+            }
+        }
+        () = tokio::time::sleep(commit_timeout) => {
+            handle.abort();
+            if is_shutdown {
+                tracing::debug!(
+                    "CDC commit task for {dataset_name} timed out during shutdown after {}ms",
+                    commit_timeout.as_millis()
+                );
+                None
+            } else {
+                let error_message = format!(
+                    "CDC commit task for {dataset_name} did not finish within {}ms",
+                    commit_timeout.as_millis()
+                );
+                tracing::error!("{error_message}");
+                Some(error_message)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn get_primary_key_value(
     data: &RecordBatch,
+    key: &str,
+) -> crate::accelerated_table::Result<(String, Expr)> {
+    get_primary_key_value_at_row(data, 0, key)
+}
+
+pub(crate) fn get_primary_key_value_at_row(
+    data: &RecordBatch,
+    row: usize,
     key: &str,
 ) -> crate::accelerated_table::Result<(String, Expr)> {
     let data_schema = data.schema();
@@ -444,13 +1109,13 @@ pub(crate) fn get_primary_key_value(
     let key_col = data.column(primary_key_idx);
     match field.data_type() {
         DataType::Int32 => {
-            extract_primary_key!(key_col, key, data_schema, Int32Array, "Int32")
+            extract_primary_key!(key_col, key, data_schema, Int32Array, "Int32", row)
         }
         DataType::Int64 => {
-            extract_primary_key!(key_col, key, data_schema, Int64Array, "Int64")
+            extract_primary_key!(key_col, key, data_schema, Int64Array, "Int64", row)
         }
         DataType::Utf8 => {
-            extract_primary_key!(key_col, key, data_schema, StringArray, "String")
+            extract_primary_key!(key_col, key, data_schema, StringArray, "String", row)
         }
         _ => crate::accelerated_table::PrimaryKeyTypeNotYetSupportedSnafu {
             data_type: field.data_type().to_string(),
@@ -479,30 +1144,22 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
     let mut sub_batches = Vec::new();
     let mut current_batch_indices = Vec::new();
     let mut current_op_type: Option<ChangeOperationType> = None;
-    let mut seen_primary_keys: HashSet<String> = HashSet::new();
+    let mut seen_primary_keys: HashSet<Vec<u8>, BuildHasherDefault<twox_hash::XxHash3_64>> =
+        HashSet::default();
+    let has_pks = !pk_col_indices.is_empty();
 
     for row_id in 0..num_rows {
         let op = change_batch.op(row_id);
         let op_type = ChangeOperationType::from_operation(&op);
 
-        // Build PK string directly from column arrays — no per-row RecordBatch allocation.
-        // If there are no PK columns (e.g., Kafka append-only), skip dedup tracking entirely.
-        let has_pks = !pk_col_indices.is_empty();
-        let primary_keys = if has_pks {
-            pk_col_indices
-                .iter()
-                .filter_map(|&col_idx| {
-                    arrow::util::display::array_value_to_string(data_batch.column(col_idx), row_id)
-                        .ok()
-                })
-                .collect::<Vec<_>>()
-                .join(",")
+        let primary_key = if has_pks {
+            encode_primary_key(&data_batch, &pk_col_indices, row_id)
         } else {
-            String::new()
+            Vec::new()
         };
 
         let should_split = if let Some(current_type) = current_op_type {
-            current_type != op_type || (has_pks && seen_primary_keys.contains(&primary_keys))
+            current_type != op_type || (has_pks && seen_primary_keys.contains(&primary_key))
         } else {
             false
         };
@@ -511,10 +1168,9 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
             if !current_batch_indices.is_empty()
                 && let Some(op_type) = current_op_type
             {
-                sub_batches.push((op_type, current_batch_indices.clone()));
+                sub_batches.push((op_type, std::mem::take(&mut current_batch_indices)));
             }
 
-            current_batch_indices.clear();
             seen_primary_keys.clear();
             current_op_type = Some(op_type);
         } else if current_op_type.is_none() {
@@ -523,7 +1179,7 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
 
         current_batch_indices.push(row_id);
         if has_pks {
-            seen_primary_keys.insert(primary_keys);
+            seen_primary_keys.insert(primary_key);
         }
     }
 
@@ -534,6 +1190,162 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
     }
 
     sub_batches
+}
+
+fn encode_primary_key(
+    data_batch: &RecordBatch,
+    pk_col_indices: &[usize],
+    row_id: usize,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(pk_col_indices.len().saturating_mul(16));
+    for &col_idx in pk_col_indices {
+        key.extend_from_slice(&col_idx.to_le_bytes());
+        encode_array_value(data_batch.column(col_idx).as_ref(), row_id, &mut key);
+    }
+    key
+}
+
+macro_rules! encode_primitive_value {
+    ($array:expr, $row_id:expr, $array_type:ty, $key:expr) => {{
+        if let Some(array) = $array.as_any().downcast_ref::<$array_type>() {
+            $key.extend_from_slice(&array.value($row_id).to_le_bytes());
+            return;
+        }
+    }};
+}
+
+fn encode_bytes(bytes: &[u8], key: &mut Vec<u8>) {
+    key.extend_from_slice(&bytes.len().to_le_bytes());
+    key.extend_from_slice(bytes);
+}
+
+fn encode_array_value(array: &dyn Array, row_id: usize, key: &mut Vec<u8>) {
+    if array.is_null(row_id) {
+        key.push(0);
+        return;
+    }
+    key.push(1);
+
+    match array.data_type() {
+        DataType::Boolean => {
+            if let Some(array) = array.as_any().downcast_ref::<arrow::array::BooleanArray>() {
+                key.push(u8::from(array.value(row_id)));
+                return;
+            }
+        }
+        DataType::Int8 => {
+            encode_primitive_value!(array, row_id, arrow::array::Int8Array, key);
+        }
+        DataType::Int16 => {
+            encode_primitive_value!(array, row_id, arrow::array::Int16Array, key);
+        }
+        DataType::Int32 => {
+            encode_primitive_value!(array, row_id, Int32Array, key);
+        }
+        DataType::Int64 => {
+            encode_primitive_value!(array, row_id, Int64Array, key);
+        }
+        DataType::UInt8 => {
+            encode_primitive_value!(array, row_id, arrow::array::UInt8Array, key);
+        }
+        DataType::UInt16 => {
+            encode_primitive_value!(array, row_id, arrow::array::UInt16Array, key);
+        }
+        DataType::UInt32 => {
+            encode_primitive_value!(array, row_id, UInt32Array, key);
+        }
+        DataType::UInt64 => {
+            encode_primitive_value!(array, row_id, arrow::array::UInt64Array, key);
+        }
+        DataType::Float32 => {
+            if let Some(array) = array.as_any().downcast_ref::<arrow::array::Float32Array>() {
+                key.extend_from_slice(&array.value(row_id).to_bits().to_le_bytes());
+                return;
+            }
+        }
+        DataType::Float64 => {
+            if let Some(array) = array.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                key.extend_from_slice(&array.value(row_id).to_bits().to_le_bytes());
+                return;
+            }
+        }
+        DataType::Utf8 => {
+            if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+                encode_bytes(array.value(row_id).as_bytes(), key);
+                return;
+            }
+        }
+        DataType::LargeUtf8 => {
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+            {
+                encode_bytes(array.value(row_id).as_bytes(), key);
+                return;
+            }
+        }
+        DataType::Date32 => {
+            encode_primitive_value!(array, row_id, arrow::array::Date32Array, key);
+        }
+        DataType::Date64 => {
+            encode_primitive_value!(array, row_id, arrow::array::Date64Array, key);
+        }
+        DataType::Time32(_) => {
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::Time32SecondArray>()
+            {
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
+                return;
+            }
+            encode_primitive_value!(array, row_id, arrow::array::Time32MillisecondArray, key);
+        }
+        DataType::Time64(_) => {
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::Time64MicrosecondArray>()
+            {
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
+                return;
+            }
+            encode_primitive_value!(array, row_id, arrow::array::Time64NanosecondArray, key);
+        }
+        DataType::Timestamp(_, _) => {
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampSecondArray>()
+            {
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
+                return;
+            }
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            {
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
+                return;
+            }
+            if let Some(array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            {
+                key.extend_from_slice(&array.value(row_id).to_le_bytes());
+                return;
+            }
+            encode_primitive_value!(array, row_id, arrow::array::TimestampNanosecondArray, key);
+        }
+        DataType::Decimal128(_, _) => {
+            encode_primitive_value!(array, row_id, arrow::array::Decimal128Array, key);
+        }
+        _ => {}
+    }
+
+    if let Ok(value) = arrow::util::display::array_value_to_string(array, row_id) {
+        key.push(0xfe);
+        encode_bytes(value.as_bytes(), key);
+    } else {
+        key.push(0xff);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -916,6 +1728,30 @@ mod tests {
     }
 
     #[test]
+    fn test_primary_key_encoding_distinguishes_composite_string_boundaries() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("left", DataType::Utf8, false),
+            Field::new("right", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["ab", "a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["c", "bc"])) as ArrayRef,
+            ],
+        )
+        .expect("record batch should be created");
+
+        let first_key = encode_primary_key(&batch, &[0, 1], 0);
+        let second_key = encode_primary_key(&batch, &[0, 1], 1);
+
+        assert_ne!(
+            first_key, second_key,
+            "composite keys ('ab', 'c') and ('a', 'bc') must not collapse to the same grouping key"
+        );
+    }
+
+    #[test]
     fn test_alternating_operations() {
         let change_batch = create_test_change_batch(
             vec!["c", "d", "c", "d"],
@@ -1006,6 +1842,85 @@ mod tests {
                 .expect("write_change should succeed"),
             WriteChangeResult::NoChange
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_change_mixed_keyed_and_keyless_deletes() {
+        let schema = Arc::new(create_test_data_schema());
+        let initial = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("keyed"), Some("keyless")])) as ArrayRef,
+            ],
+        )
+        .expect("initial batch should be created");
+        let table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![initial]])
+                .expect("mem table should be created"),
+        );
+        let task = make_refresh_task(Arc::clone(&table) as Arc<dyn TableProvider>);
+
+        let change_batch = create_test_change_batch(
+            vec!["d", "d"],
+            &[vec![], vec!["id"]],
+            vec![2, 1],
+            vec![Some("keyless"), Some("changed")],
+        );
+
+        assert_eq!(
+            task.write_change(change_batch)
+                .await
+                .expect("mixed delete should succeed"),
+            WriteChangeResult::DataWritten
+        );
+
+        let ctx = SessionContext::new();
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let remaining = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+        let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(remaining_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_keyless_delete_unwraps_indexed_provider() {
+        let schema = Arc::new(create_test_data_schema());
+        let initial = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("row")])) as ArrayRef,
+            ],
+        )
+        .expect("initial batch should be created");
+        let table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![initial.clone()]])
+                .expect("mem table should be created"),
+        );
+        let wrapped = Arc::new(IndexedTableProvider::new(
+            Arc::clone(&table) as Arc<dyn TableProvider>
+        )) as Arc<dyn TableProvider>;
+
+        let deleted = delete_matching_rows_from_arrow_provider(&wrapped, &initial)
+            .await
+            .expect("delete should succeed through wrapper");
+        assert_eq!(deleted, Some(1));
+
+        let ctx = SessionContext::new();
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let remaining = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+        let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(remaining_rows, 0);
     }
 
     #[test]
@@ -1208,7 +2123,7 @@ mod tests {
     #[derive(Debug)]
     struct WriteOrderRecordingProvider {
         inner: Arc<dyn TableProvider>,
-        write_log: Arc<TokioMutex<Vec<&'static str>>>,
+        write_log: Arc<TokioMutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -1237,7 +2152,61 @@ mod tests {
             input: Arc<dyn ExecutionPlan>,
             insert_op: InsertOp,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.write_log.lock().await.push("write");
+            self.write_log.lock().await.push("write".to_string());
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailFirstWriteProvider {
+        inner: Arc<dyn TableProvider>,
+        failures_remaining: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TableProvider for FailFirstWriteProvider {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if self
+                .failures_remaining
+                .fetch_update(
+                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "synthetic write failure".to_string(),
+                ));
+            }
+
             self.inner.insert_into(state, input, insert_op).await
         }
     }
@@ -1246,19 +2215,20 @@ mod tests {
     /// can assert the interleaved write/commit sequence in
     /// `test_start_changes_stream_commits_after_write`.
     struct SequencedCommitter {
-        log: Arc<TokioMutex<Vec<&'static str>>>,
+        id: i32,
+        log: Arc<TokioMutex<Vec<String>>>,
     }
     #[async_trait]
     impl CommitChange for SequencedCommitter {
         async fn commit(&self) -> Result<(), CommitError> {
-            self.log.lock().await.push("commit");
+            self.log.lock().await.push(format!("commit:{}", self.id));
             Ok(())
         }
     }
 
     #[tokio::test]
     async fn test_start_changes_stream_commits_after_write() {
-        let write_log: Arc<TokioMutex<Vec<&'static str>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let write_log: Arc<TokioMutex<Vec<String>>> = Arc::new(TokioMutex::new(Vec::new()));
         let provider = Arc::new(WriteOrderRecordingProvider {
             inner: make_mem_table() as Arc<dyn TableProvider>,
             write_log: Arc::clone(&write_log),
@@ -1267,13 +2237,14 @@ mod tests {
 
         // Use a single shared log; both `insert_into` and `commit()` push
         // markers, so we can read off the interleaved write/commit sequence.
-        let combined: Arc<TokioMutex<Vec<&'static str>>> = Arc::clone(&write_log);
+        let combined: Arc<TokioMutex<Vec<String>>> = Arc::clone(&write_log);
 
         let mk = |id: i32| -> ChangeEnvelope {
             let batch =
                 create_test_change_batch(vec!["c"], &[vec!["id"]], vec![id], vec![Some("row")]);
             ChangeEnvelope::new(
                 Box::new(SequencedCommitter {
+                    id,
                     log: Arc::clone(&combined),
                 }),
                 batch,
@@ -1287,12 +2258,27 @@ mod tests {
             .expect("start_changes_stream should succeed");
 
         let observed = combined.lock().await.clone();
-        // For each envelope: write must precede the next commit. With three
-        // envelopes the strict expected sequence is W,C,W,C,W,C.
+        // Coalescing depends on how many envelopes the reader has already
+        // buffered when the applier drains with `try_recv`, so Tokio
+        // scheduling can legitimately produce one or more writes here. The
+        // invariant is that no commit happens before a write, and committers
+        // run in stream order.
         assert_eq!(
-            observed,
-            vec!["write", "commit", "write", "commit", "write", "commit"],
-            "each envelope must be written, then committed, in order"
+            observed[0], "write",
+            "a write must happen before the first commit"
+        );
+        let commits: Vec<&str> = observed
+            .iter()
+            .filter_map(|event| event.strip_prefix("commit:"))
+            .collect();
+        assert_eq!(
+            commits,
+            vec!["1", "2", "3"],
+            "committers must run in stream order",
+        );
+        assert!(
+            observed.iter().any(|event| event == "write"),
+            "at least one accelerator write should occur",
         );
     }
 
@@ -1323,6 +2309,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_apply_envelope_run_skips_commits_after_coalesced_write_failure() {
+        let failures_remaining = Arc::new(AtomicUsize::new(1));
+        let provider = Arc::new(FailFirstWriteProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            failures_remaining: Arc::clone(&failures_remaining),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+        let dataset_name = TableReference::bare("test");
+        let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let mut pending_commit = None;
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            dataset_name: &dataset_name,
+            caching: None,
+            ready_sender: None,
+            initial_load_completed: &initial_load_completed,
+            pending_commit: &mut pending_commit,
+            commit_timeout: Duration::from_secs(5),
+        };
+
+        assert!(
+            !task
+                .apply_envelope_run(
+                    &mut context,
+                    vec![
+                        make_tracked_envelope(1, Arc::clone(&log), false),
+                        make_tracked_envelope(2, Arc::clone(&log), false),
+                    ],
+                )
+                .await,
+            "write failures should stop the stream so later commits cannot skip an uncommitted gap"
+        );
+        assert!(
+            context.pending_commit.is_none(),
+            "failed writes must not spawn commit tasks"
+        );
+        assert_eq!(
+            log.ids().await,
+            Vec::<i32>::new(),
+            "failed coalesced writes must not commit any envelope in the run"
+        );
+        assert!(
+            task.runtime_status
+                .get_component_status("dataset:test")
+                .expect("failure should set dataset status")
+                .is_error(),
+            "write failure should mark dataset refresh status as error"
+        );
+        assert!(
+            !initial_load_completed.load(Ordering::Relaxed),
+            "failed writes must not mark initial load complete"
+        );
+    }
+
     // -- Correctness: clean termination on stream end -------------------------
 
     #[tokio::test]
@@ -1342,6 +2384,38 @@ mod tests {
         .expect("must not hang on empty stream");
         res.expect("must return Ok on empty stream");
         assert!(log.ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_join_pending_commit_reports_panic_during_shutdown() {
+        let dataset_name = TableReference::bare("test");
+        let handle = tokio::spawn(async {
+            panic!("synthetic commit panic");
+        });
+
+        let error_message =
+            join_pending_commit(handle, &dataset_name, true, Duration::from_secs(5))
+                .await
+                .expect("panic must be reported even during shutdown");
+
+        assert!(
+            error_message.contains("CDC commit task for test panicked"),
+            "unexpected error message: {error_message}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_join_pending_commit_ignores_cancel_during_shutdown() {
+        let dataset_name = TableReference::bare("test");
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+
+        let result = join_pending_commit(handle, &dataset_name, true, Duration::from_secs(5)).await;
+
+        assert!(
+            result.is_none(),
+            "cancelled commit task should be ignored during shutdown"
+        );
     }
 
     // -- Correctness: dataset-ready signaling ---------------------------------
@@ -1615,5 +2689,49 @@ mod tests {
             "reader task did not drop its source stream within 2s after parent abort — \
              this regression would leak source connections at shutdown"
         );
+    }
+
+    #[test]
+    fn test_get_primary_key_value_null_int32_returns_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![None]));
+        let batch =
+            RecordBatch::try_new(schema, vec![id_array]).expect("Failed to create RecordBatch");
+
+        let result = get_primary_key_value(&batch, "id");
+        let err =
+            result.expect_err("NULL primary key should return an error, not silently produce 0");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("NULL"),
+            "Error should mention NULL: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_get_primary_key_value_null_utf8_returns_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let name_array: ArrayRef = Arc::new(StringArray::from(vec![Option::<&str>::None]));
+        let batch =
+            RecordBatch::try_new(schema, vec![name_array]).expect("Failed to create RecordBatch");
+
+        let result = get_primary_key_value(&batch, "name");
+        assert!(
+            result.is_err(),
+            "NULL primary key should return an error, not silently produce empty string"
+        );
+    }
+
+    #[test]
+    fn test_get_primary_key_value_non_null_succeeds() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![42]));
+        let batch =
+            RecordBatch::try_new(schema, vec![id_array]).expect("Failed to create RecordBatch");
+
+        let result = get_primary_key_value(&batch, "id");
+        assert!(result.is_ok(), "Non-null PK should succeed");
+        let (str_val, _expr) = result.expect("already asserted Ok");
+        assert_eq!(str_val, "42");
     }
 }

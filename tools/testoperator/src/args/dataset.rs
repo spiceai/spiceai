@@ -169,6 +169,9 @@ pub enum QueryOverridesArg {
     MsSqlCatalog,
     #[serde(rename = "oracle-catalog")]
     OracleCatalog,
+    #[serde(rename = "snowflake-catalog")]
+    #[value(name = "snowflake-catalog")]
+    SnowflakeCatalog,
     #[serde(rename = "ducklake-catalog")]
     #[value(name = "ducklake-catalog")]
     DucklakeCatalog,
@@ -184,6 +187,9 @@ pub enum QueryOverridesArg {
     #[serde(rename = "bigquery")]
     #[value(name = "bigquery")]
     BigQuery,
+    #[serde(rename = "scylladb")]
+    #[value(name = "scylladb")]
+    ScyllaDB,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -297,9 +303,11 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::MysqlCatalog => QueryOverrides::MysqlCatalog,
             QueryOverridesArg::MsSqlCatalog => QueryOverrides::MSSqlCatalog,
             QueryOverridesArg::OracleCatalog => QueryOverrides::OracleCatalog,
+            QueryOverridesArg::SnowflakeCatalog => QueryOverrides::SnowflakeCatalog,
             QueryOverridesArg::DucklakeCatalog => QueryOverrides::DucklakeCatalog,
             QueryOverridesArg::Turso => QueryOverrides::Turso,
             QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
+            QueryOverridesArg::ScyllaDB => QueryOverrides::ScyllaDB,
         }
     }
 }

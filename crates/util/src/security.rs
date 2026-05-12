@@ -171,18 +171,13 @@ pub fn validate_non_empty_bytes(bytes: &[u8], context: &str) -> Result<(), Strin
 /// ```
 #[must_use = "quoted table reference must be used in SQL queries to prevent injection"]
 pub fn quote_table_reference(tbl: &TableReference) -> String {
-    /// Quotes a single identifier with double quotes, escaping any embedded quotes.
-    fn quote_part(s: &str) -> String {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    }
-
     match tbl {
-        TableReference::Bare { table } => quote_part(table.as_ref()),
+        TableReference::Bare { table } => quote_sql_identifier(table.as_ref()),
         TableReference::Partial { schema, table } => {
             format!(
                 "{}.{}",
-                quote_part(schema.as_ref()),
-                quote_part(table.as_ref())
+                quote_sql_identifier(schema.as_ref()),
+                quote_sql_identifier(table.as_ref())
             )
         }
         TableReference::Full {
@@ -192,12 +187,18 @@ pub fn quote_table_reference(tbl: &TableReference) -> String {
         } => {
             format!(
                 "{}.{}.{}",
-                quote_part(catalog.as_ref()),
-                quote_part(schema.as_ref()),
-                quote_part(table.as_ref())
+                quote_sql_identifier(catalog.as_ref()),
+                quote_sql_identifier(schema.as_ref()),
+                quote_sql_identifier(table.as_ref())
             )
         }
     }
+}
+
+/// Safely quotes a SQL identifier by wrapping it in double quotes and escaping embedded quotes.
+#[must_use = "quoted identifier must be used in SQL queries to prevent injection"]
+pub fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 /// Calculates the maximum nesting depth of a JSON value.
@@ -439,6 +440,12 @@ mod tests {
         assert!(quoted.contains("DROP TABLE"));
         assert!(quoted.starts_with('"'));
         assert!(quoted.ends_with('"'));
+    }
+
+    #[test]
+    fn test_quote_sql_identifier_keywords_and_quotes() {
+        assert_eq!(quote_sql_identifier("interval"), r#""interval""#);
+        assert_eq!(quote_sql_identifier("has\"quote"), r#""has""quote""#);
     }
 
     #[test]

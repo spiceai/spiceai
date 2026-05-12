@@ -212,7 +212,7 @@ impl CayenneTableProvider {
             });
         }
 
-        if self.has_pending_deletions()? {
+        if self.has_pending_deletions() {
             return Err(Error::Unsupported {
                 operation: "staged append for Cayenne tables with pending deletions",
             });

@@ -31,7 +31,9 @@ use datafusion::{
     sql::TableReference,
 };
 use futures::TryStreamExt;
-use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+use runtime_request_context::{
+    CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
+};
 use snafu::ResultExt;
 use std::sync::OnceLock;
 use std::{collections::HashSet, hash::Hasher, sync::Arc};
@@ -97,19 +99,20 @@ enum CacheResult {
 impl Query {
     /// Returns a `LogicalPlan` if the result is not cached and needs to be executed, otherwise returns a cached `QueryResult`.
     ///
-    /// When `read_only` is true, both the SQL-keyed and plan-keyed results-cache
-    /// lookups are skipped, and the returned [`RequestCacheManager`] is forced to
-    /// [`CacheStatus::CacheDisabled`]. This is required because the read-only
-    /// contract (enforced by [`super::validate_sql_query_read_only`]) runs on the
-    /// [`LogicalPlan`] *after* `get_plan_or_cached` returns — a cache hit would
-    /// otherwise short-circuit validation and let write-capable plans served from
-    /// a prior cache-store bypass the read-only guarantee on `/v1/tools/sql` and
-    /// `/v1/nsql`. The existing cache-eligibility check
-    /// ([`cache::QueryResultsCacheProvider::cache_is_enabled_for_plan`]) only
-    /// filters the classic DDL/DML/Copy/Statement plan variants and does not
-    /// cover Spice's write-capable [`LogicalPlan::Extension`] nodes (e.g.
-    /// `DmlExtension`, `DistributedCayenneInsert`).
-    #[expect(clippy::too_many_arguments)]
+    /// Cache lookups and population are *not* gated on read-only mode. The two
+    /// hazards that would have justified gating are handled elsewhere:
+    ///
+    /// 1. **Cross-principal leakage.** Cache keys are mixed with the originating
+    ///    [`runtime_request_context::CacheNamespace`], so a read-only caller
+    ///    can only ever observe entries it (or another caller in the same
+    ///    namespace) populated.
+    /// 2. **Write-capable plans served from cache.**
+    ///    [`cache::QueryResultsCacheProvider::cache_is_enabled_for_plan`]
+    ///    refuses to cache DDL/DML/Copy/Statement and every
+    ///    [`LogicalPlan::Extension`] whose name appears in
+    ///    [`cache::WRITE_CAPABLE_EXTENSION_NAMES`] (currently `DdlExtension`
+    ///    and `DmlExtension`). New write-capable extension nodes must be
+    ///    added there to keep this property.
     pub(super) async fn get_plan_or_cached(
         df: &Arc<DataFusion>,
         session: &SessionState,
@@ -117,10 +120,11 @@ impl Query {
         sql: &str,
         parameters: Option<ParamValues>,
         tracker: Option<QueryTracker>,
-        read_only: bool,
         pre_parsed_plan: Option<Box<LogicalPlan>>,
     ) -> super::Result<PlanOrCached> {
         let cache_control = request_context.cache_control();
+        let cache_namespace = request_context.cache_namespace();
+        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
         let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
         let scoped_user_cache_key =
             if cache_control.cache_key_type() == Some(CacheKeyType::ClientSupplied) {
@@ -133,35 +137,29 @@ impl Query {
             _ => sql_cache_key,
         };
 
-        // Try to get cached results from SQL or client key. When `read_only` is
-        // true, skip the cache lookup entirely so read-only validation always
-        // gets a chance to run on the freshly-planned query.
+        // Try to get cached results from SQL or client key.
         let CacheResponse {
             tracker,
             raw_key: sql_or_client_raw_key,
             ..
-        } = if read_only {
-            CacheResponse::from(CacheResult::MissOrSkipped, CacheStatus::CacheDisabled)
-                .with_query_tracker(tracker)
-        } else {
-            match Self::try_get_cached_result(
-                df,
-                &request_context,
-                tracker,
-                &sql_or_user_cache_key,
-                sql,
-            )
-            .await?
-            {
-                CacheResponse {
-                    result: CacheResult::Hit(result),
-                    ..
-                } => return Ok(PlanOrCached::Cached(result)),
-                response => response,
-            }
+        } = match Self::try_get_cached_result(
+            df,
+            &request_context,
+            tracker,
+            &sql_or_user_cache_key,
+            sql,
+        )
+        .await?
+        {
+            CacheResponse {
+                result: CacheResult::Hit(result),
+                ..
+            } => return Ok(PlanOrCached::Cached(result)),
+            response => response,
         };
 
-        let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(df));
+        let sql_raw_cache_key =
+            sql_cache_key.as_raw_key_in_namespace(Self::plan_hasher(df), ns_tag, ns_id);
         let plan: Box<LogicalPlan> = if let Some(plan) = pre_parsed_plan {
             // Reuse the pre-parsed plan to avoid re-parsing. Parameters are
             // already bound from `check_read_only_sql`.
@@ -183,32 +181,26 @@ impl Query {
             }
         };
 
-        // Try to get cached results from plan (skipped for read-only, same
-        // reasoning as the SQL-keyed lookup above).
+        // Try to get cached results from plan.
         let CacheResponse {
             mut tracker,
             raw_key: plan_raw_cache_key,
             status,
             ..
-        } = if read_only {
-            CacheResponse::from(CacheResult::MissOrSkipped, CacheStatus::CacheDisabled)
-                .with_query_tracker(tracker)
-        } else {
-            match Self::try_get_cached_result(
-                df,
-                &request_context,
-                tracker,
-                &CacheKey::LogicalPlan(&plan),
-                sql,
-            )
-            .await?
-            {
-                CacheResponse {
-                    result: CacheResult::Hit(result),
-                    ..
-                } => return Ok(PlanOrCached::Cached(result)),
-                response => response,
-            }
+        } = match Self::try_get_cached_result(
+            df,
+            &request_context,
+            tracker,
+            &CacheKey::LogicalPlan(&plan),
+            sql,
+        )
+        .await?
+        {
+            CacheResponse {
+                result: CacheResult::Hit(result),
+                ..
+            } => return Ok(PlanOrCached::Cached(result)),
+            response => response,
         };
 
         let request_raw_cache_key = match request_context.cache_control() {
@@ -220,15 +212,7 @@ impl Query {
         }
         .unwrap_or(sql_raw_cache_key);
 
-        // Read-only requests must also not populate the results cache — the
-        // plan has not yet been validated at this point, and we don't want a
-        // writable surface's cached output to leak back through a read-only
-        // caller on a later identical query.
-        let cache_status = if read_only {
-            CacheStatus::CacheDisabled
-        } else {
-            Self::should_cache_results(df, &plan, status)
-        };
+        let cache_status = Self::should_cache_results(df, &plan, status);
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(
@@ -331,7 +315,11 @@ impl Query {
             }
         }
 
-        let raw_key = key.as_raw_key(cache_provider.hasher());
+        let raw_key = {
+            let ns = request_context.cache_namespace();
+            let (ns_tag, ns_id) = ns.hash_inputs();
+            key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
+        };
 
         let cached_result = match cache_provider.get_raw_key(&raw_key).await {
             Ok(Some(result)) => result,
@@ -388,7 +376,13 @@ impl Query {
                     CacheKey::LogicalPlan(p) => Some(*p),
                     _ => None,
                 };
-                Self::trigger_background_query_revalidation(Arc::clone(df), sql, plan, raw_key);
+                Self::trigger_background_query_revalidation(
+                    Arc::clone(df),
+                    sql,
+                    plan,
+                    raw_key,
+                    request_context.cache_namespace(),
+                );
             }
         }
 
@@ -455,16 +449,21 @@ impl Query {
     /// - The `DataFusion` context is dropped (runtime shutdown)
     /// - The query execution is interrupted via the session context
     ///
-    /// Creates a background request context for cache revalidation.
+    /// Build the request context that drives a background SWR revalidation
+    /// query. We must inherit the originating request's cache namespace so
+    /// the refreshed entry lands in the same scope (otherwise a per-user
+    /// triggered refresh would write into the System scope and the user
+    /// would never see the new data on their next request).
     ///
-    /// Uses `NoCache` to prevent the background query from going through the normal
-    /// cache lookup/store path. This avoids false cache misses and duplicate storage.
-    /// The `cache_revalidation_result` function handles storing results under the correct
-    /// original cache key that triggered the stale-while-revalidate.
-    fn create_background_context() -> Arc<RequestContext> {
+    /// `NoCache` is intentional: the revalidation flow stores the result
+    /// directly under the original cache key via `cache_revalidation_result`,
+    /// so going through the normal cache lookup/store path would be
+    /// redundant and would also confuse hit/miss accounting.
+    fn create_background_context(namespace: CacheNamespace) -> Arc<RequestContext> {
         Arc::new(
             RequestContext::builder(Protocol::Internal)
                 .with_cache_control(CacheControl::NoCache)
+                .with_cache_namespace(namespace)
                 .build(),
         )
     }
@@ -564,6 +563,7 @@ impl Query {
         sql: &str,
         plan: Option<&LogicalPlan>,
         cache_key: RawCacheKey,
+        namespace: CacheNamespace,
     ) {
         // Static Moka cache to track ongoing revalidation tasks by cache key.
         // This provides built-in single-in-flight semantics - if multiple requests
@@ -580,7 +580,7 @@ impl Query {
         let cache_key_u64 = cache_key.as_u64();
 
         // Create a background request context with NoCache to bypass cache lookup
-        let background_context = Self::create_background_context();
+        let background_context = Self::create_background_context(namespace);
 
         // Clone sql and plan for the async block
         let sql_owned = sql.to_string();
@@ -723,7 +723,9 @@ mod tests {
         datafusion::{DataFusion, query::QueryBuilder},
         status,
     };
-    use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+    use runtime_request_context::{
+        CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
+    };
 
     // Helper function to create a test RequestContext
     fn create_test_request_context(
@@ -734,6 +736,21 @@ mod tests {
             RequestContext::builder(Protocol::Internal)
                 .with_cache_control(cache_control)
                 .with_client_supplied_cache_key(user_cache_key)
+                .build(),
+        )
+    }
+
+    /// Build a `RequestContext` with an explicit cache namespace. Used to
+    /// drive cross-principal isolation tests in this module without going
+    /// through real auth middleware.
+    fn create_test_request_context_in_namespace(
+        cache_control: CacheControl,
+        namespace: CacheNamespace,
+    ) -> Arc<RequestContext> {
+        Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_cache_control(cache_control)
+                .with_cache_namespace(namespace)
                 .build(),
         )
     }
@@ -781,6 +798,178 @@ mod tests {
 
         let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
+    }
+
+    /// SWR background revalidation must run under the originating user's
+    /// namespace, not `System`. Without this, any sub-cache lookups in the
+    /// background task (planner cache, accelerator cache) would land in the
+    /// wrong scope and either leak across users or never serve the user
+    /// who triggered the refresh.
+    ///
+    /// We verify the contract end-to-end: Alice triggers SWR, the background
+    /// refresh runs, and a second principal (Bob) still sees a MISS for the
+    /// same SQL. If the background context fell back to `System`, Bob would
+    /// either see a cross-user HIT (security regression) or Alice's refresh
+    /// would land in `System` and leave her STALE.
+    #[tokio::test]
+    async fn test_swr_revalidation_inherits_originating_namespace() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("1s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            stale_while_revalidate_ttl: Some("5s".to_string()),
+            ..Default::default()
+        }))
+        .await;
+
+        let alice = create_test_request_context_in_namespace(
+            CacheControl::MaxStale(CacheKeyType::Raw, Some(Duration::from_secs(5))),
+            CacheNamespace::Principal("apikey:alice".into()),
+        );
+        let bob = create_test_request_context_in_namespace(
+            CacheControl::Cache(CacheKeyType::Raw),
+            CacheNamespace::Principal("apikey:bob".into()),
+        );
+
+        // Alice populates her namespace.
+        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let r = q.run().await.expect("ok");
+                assert_eq!(r.cache_status, CacheStatus::CacheMiss);
+                let _ = r.data.try_collect::<Vec<_>>().await.expect("drain");
+            })
+            .await;
+
+        // Wait past TTL but within stale-while-revalidate window.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Alice's stale request triggers background revalidation.
+        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let r = q.run().await.expect("ok");
+                assert_eq!(r.cache_status, CacheStatus::CacheStaleWhileRevalidate);
+                let _ = r.data.try_collect::<Vec<_>>().await.expect("drain");
+            })
+            .await;
+
+        // Allow the background task to finish.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(cp) = df.results_cache_provider() {
+            cp.run_pending_tasks().await;
+        }
+
+        // Alice now sees a fresh HIT — proving SWR wrote back into her
+        // namespace, not into System.
+        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let r = q.run().await.expect("ok");
+                assert_eq!(r.cache_status, CacheStatus::CacheHit);
+            })
+            .await;
+
+        // Bob still sees MISS for the same SQL — SWR did not bleed Alice's
+        // entry into a cross-user scope.
+        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
+        Arc::clone(&bob)
+            .scope(async move {
+                let r = q.run().await.expect("ok");
+                assert_eq!(
+                    r.cache_status,
+                    CacheStatus::CacheMiss,
+                    "SWR refresh must not leak into bob's scope"
+                );
+            })
+            .await;
+    }
+
+    /// Two distinct principals running the same SQL must each see a cache
+    /// MISS for the other's first request, and a HIT only on their own
+    /// repeat. Cross-principal HITs would be a security regression — the
+    /// whole point of `CacheNamespace`.
+    #[tokio::test]
+    async fn test_results_cache_isolated_per_principal() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+
+        let alice = create_test_request_context_in_namespace(
+            CacheControl::Cache(CacheKeyType::Raw),
+            CacheNamespace::Principal("apikey:alice".into()),
+        );
+        let bob = create_test_request_context_in_namespace(
+            CacheControl::Cache(CacheKeyType::Raw),
+            CacheNamespace::Principal("apikey:bob".into()),
+        );
+
+        // Alice runs SELECT 1, populates the cache under her namespace.
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let _ = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should drain");
+            })
+            .await;
+
+        // Alice repeats: HIT (own namespace).
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&alice)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheHit);
+            })
+            .await;
+
+        // Bob runs the same SQL: MUST be a MISS, otherwise we leaked
+        // Alice's cached result across principals.
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&bob)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.cache_status,
+                    CacheStatus::CacheMiss,
+                    "bob must not see alice's cached entry"
+                );
+                let _ = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should drain");
+            })
+            .await;
+
+        // Bob repeats: HIT in his own namespace.
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&bob)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheHit);
+            })
+            .await;
+
+        // And an unauthenticated (Public) caller must also miss — it
+        // shares no namespace with either Alice or Bob.
+        let public = create_test_request_context_in_namespace(
+            CacheControl::Cache(CacheKeyType::Raw),
+            CacheNamespace::Public,
+        );
+        let q = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        Arc::clone(&public)
+            .scope(async move {
+                let result = q.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+            })
+            .await;
     }
 
     #[tokio::test]

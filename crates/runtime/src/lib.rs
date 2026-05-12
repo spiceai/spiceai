@@ -60,6 +60,7 @@ use futures::{
     Stream, TryFutureExt,
     future::{join_all, try_join_all},
 };
+use governor::RateLimiter;
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use llms::rerank::RerankerModelStore;
@@ -113,6 +114,7 @@ mod metrics;
 pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
+mod object_store_state;
 mod opentelemetry;
 pub mod otel_push_exporter;
 pub mod resource_monitor;
@@ -1029,7 +1031,7 @@ impl Runtime {
                         metrics_server::cluster::ClusterMetricsCollector::new(
                             Arc::clone(peers),
                             Arc::clone(executor_registry),
-                            self.df.cluster_config.client_tls_config().cloned(),
+                            self.df.cluster_config.client_tls_config(),
                             self.df.cluster_config.node_id(),
                             local_metrics_collector,
                         ),
@@ -1148,6 +1150,7 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
         let auth = endpoint_auth.http_auth.clone();
+        let identity_source = endpoint_auth.identity_source;
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
@@ -1161,6 +1164,7 @@ impl Runtime {
                     cloned_config.into(),
                     cloned_tls_config,
                     auth,
+                    identity_source,
                     Some(http_shutdown),
                 )
                 .map_err(Error::from),
@@ -1171,6 +1175,8 @@ impl Runtime {
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
+        let metrics_rate_limiter =
+            Arc::new(RateLimiter::direct(self.rate_limits.metrics_endpoint_limit));
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
@@ -1179,6 +1185,7 @@ impl Runtime {
                     prometheus_registry,
                     cloned_tls_config,
                     cluster_collector,
+                    Some(metrics_rate_limiter),
                 )
                 .await
                 .context(UnableToStartMetricsServerSnafu)
@@ -1449,16 +1456,20 @@ impl Runtime {
 
         let start_time = Instant::now();
 
-        // shutdown all running components except the HTTP and Metrics servers
+        // Shutdown running components in phases so request-serving tasks drain
+        // before query execution resources are cleaned up.
         let mut runtime_tasks = self.tasks.write().await;
 
-        // HTTP and METRICS servers must be shutdown last
+        // Query-serving tasks, including HTTP and Flight, must drain before
+        // DataFusion cleanup so in-flight queries still have access to their
+        // execution resources during graceful shutdown. Metrics can stay up
+        // until the end for health and observability during shutdown.
         let mut first_shutdown_group = Vec::new();
         let mut last_shutdown_group = Vec::new();
 
         for (name, handle) in runtime_tasks.drain() {
             match name.as_str() {
-                HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
+                METRICS_SERVER => last_shutdown_group.push((name, handle)),
                 _ => first_shutdown_group.push((name, handle)),
             }
         }
@@ -1487,11 +1498,11 @@ impl Runtime {
         document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
-        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        // group includes only Metrics endpoints.
         let elapsed = start_time.elapsed();
         let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
-        // Shutdown HTTP & Metrics servers last
+        // Shutdown Metrics server last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {

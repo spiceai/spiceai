@@ -51,6 +51,7 @@ use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
     schema_cast::SchemaCastScanExec, wrap_with_filter,
 };
+
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
@@ -172,6 +173,11 @@ pub enum Error {
     ))]
     PrimaryKeyTypeNotYetSupported { data_type: String },
 
+    #[snafu(display(
+        "Primary key column '{field_name}' contains a NULL value in a CDC change record. NULL primary keys cannot be used for delete or upsert operations."
+    ))]
+    PrimaryKeyNullValue { field_name: String },
+
     #[snafu(display("Invalid time column format: {source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
@@ -269,6 +275,11 @@ pub struct AcceleratedTable {
     /// Sender for batched cache writes. Only used in caching refresh mode.
     batch_write_tx: Option<caching::CacheWriteSender>,
     cluster_role: Option<ClusterRole>,
+    /// Schema exposed to user-facing query planning when it differs from the
+    /// underlying accelerator's storage schema. Currently set only in caching
+    /// mode, where the storage schema is augmented with a hidden
+    /// [`caching::CACHE_NAMESPACE_COLUMN`] for per-principal isolation.
+    user_facing_schema: Option<SchemaRef>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -353,6 +364,7 @@ pub struct Builder {
     is_s3_express_acceleration: bool,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
+    user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
 }
 
@@ -402,7 +414,16 @@ impl Builder {
             is_s3_express_acceleration: false,
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
+            user_facing_schema: None,
         }
+    }
+
+    /// Override the schema reported by the resulting [`AcceleratedTable`] to
+    /// query planners. Used by caching mode to hide the internal namespace
+    /// storage column from users.
+    pub fn user_facing_schema(&mut self, schema: SchemaRef) -> &mut Self {
+        self.user_facing_schema = Some(schema);
+        self
     }
 
     pub fn cluster_role(&mut self, role: Option<ClusterRole>) -> &mut Self {
@@ -852,6 +873,24 @@ impl Builder {
             handlers.push(refresh_handle);
         }
 
+        // In caching mode, `on_zero_results` is effectively a no-op: the
+        // caching scan already treats a zero-row accelerator result (whether
+        // because the cache is empty or because the user's predicate
+        // eliminated every cached row) as a cache miss and fetches the source.
+        // That happens regardless of the configured `on_zero_results`, so the
+        // default `return_empty` is misleading -- we always fall back to
+        // source, not return empty. Warn so users don't reason about caching
+        // mode through the lens of `on_zero_results`.
+        if refresh_mode == RefreshMode::Caching {
+            tracing::warn!(
+                "Dataset {dataset}: `on_zero_results` is ignored when `refresh_mode: caching` is set. \
+                 Caching mode always queries the source on a cache miss. \
+                 Remove `on_zero_results` from the dataset configuration to silence this warning. \
+                 For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#refresh-modes",
+                dataset = self.dataset_name,
+            );
+        }
+
         // For caching mode, create the batched write channel and spawn consumer task.
         let batch_write_tx = if refresh_mode == RefreshMode::Caching {
             let (tx, rx) = caching::create_cache_write_channel();
@@ -1042,6 +1081,7 @@ impl Builder {
             last_updated_at,
             batch_write_tx,
             cluster_role: self.cluster_role,
+            user_facing_schema: self.user_facing_schema,
         })
     }
 }
@@ -1266,6 +1306,9 @@ impl TableProvider for AcceleratedTable {
     }
 
     fn schema(&self) -> SchemaRef {
+        if let Some(s) = self.user_facing_schema.as_ref() {
+            return Arc::clone(s);
+        }
         self.accelerator.schema()
     }
 
@@ -1314,8 +1357,7 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Check if we're in caching mode
-        let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+        let is_caching_mode = self.refresh_mode == RefreshMode::Caching;
 
         if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
             // Accelerated tables aren't accelerated on scheduler. Just scan the federated source.
@@ -1349,10 +1391,24 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
-        // For caching mode with filters, extend projection to include fetched_at for freshness checking if needed.
-        // Added columns will be automatically stripped by `SchemaCastScanExec`, similar to
-        // fallback-to-source on cache miss where results return all columns.
-        let extended_projection = if is_caching_mode && !filters.is_empty() {
+        // For caching mode, extend the accelerator scan projection to
+        // include the storage-only columns the caching pipeline needs:
+        // `fetched_at` (freshness check inside
+        // `CachingAccelerationScanExec`) and `__spice_cache_namespace`
+        // (per-principal isolation `FilterExec` applied below). The added
+        // columns are stripped from the user-facing output by
+        // `SchemaCastScanExec` on top of the plan, so they never leak
+        // into query results.
+        //
+        // Done unconditionally for caching mode (not gated on having
+        // user filters) because the namespace `FilterExec` is always
+        // applied and must always be able to resolve the namespace
+        // column. Without this, a caching-mode scan with a non-empty
+        // user projection but no user filters (e.g. `SELECT content FROM
+        // ds`) would push only the user's columns to the accelerator
+        // and the FilterExec on top would fail with `No field named
+        // __spice_cache_namespace`.
+        let extended_projection = if is_caching_mode {
             extend_projection_for_caching(projection, &self.accelerator.schema())
         } else {
             None
@@ -1360,6 +1416,50 @@ impl TableProvider for AcceleratedTable {
         let scan_projection = extended_projection.as_ref().or(projection);
         // For UseSource mode, the scan is handled inside the match arm below (with filter
         // splitting). For all other modes, perform the accelerator scan upfront.
+        // For caching mode, scope the accelerator scan to the current
+        // request's namespace by appending a `__spice_cache_namespace = $ns_id`
+        // predicate. The federated source still receives only the user's
+        // original filters via `CachingAccelerationScanExec`, since the
+        // namespace column does not exist on the source side. Skipped when
+        // the storage schema does not have the column (e.g. unit-test mocks).
+        //
+        // The originating request context is attached to the session as an
+        // extension by `Query::run_internal`. We must read it from there
+        // and NOT from `RequestContext::current()`, because DataFusion does
+        // not propagate Tokio task-locals across the `TableProvider::scan`
+        // await point. The task-local lookup would silently fall back to
+        // the global `INTERNAL_REQUEST_CONTEXT` (Protocol::Internal, no
+        // principal), collapsing every caller to `CacheNamespace::System`
+        // and defeating isolation.
+        let namespace_filter: Option<Expr> = if is_caching_mode
+            && self
+                .accelerator
+                .schema()
+                .column_with_name(caching::CACHE_NAMESPACE_COLUMN)
+                .is_some()
+        {
+            let ns = state
+                .config()
+                .get_extension::<runtime_request_context::RequestContext>()
+                .map_or(runtime_request_context::CacheNamespace::System, |ctx| {
+                    ctx.cache_namespace()
+                });
+            Some(caching::namespace_filter_expr(ns.storage_id()))
+        } else {
+            None
+        };
+        let storage_filters: Vec<Expr> = if let Some(ref nf) = namespace_filter {
+            let mut sf = filters.to_vec();
+            sf.push(nf.clone());
+            sf
+        } else {
+            filters.to_vec()
+        };
+        let scan_filters: &[Expr] = if is_caching_mode {
+            &storage_filters
+        } else {
+            filters
+        };
         let input = if matches!(
             (is_caching_mode, &self.zero_results_action),
             (false, ZeroResultsAction::UseSource)
@@ -1368,7 +1468,7 @@ impl TableProvider for AcceleratedTable {
         } else {
             Some(
                 self.accelerator
-                    .scan(state, scan_projection, filters, limit)
+                    .scan(state, scan_projection, scan_filters, limit)
                     .await?,
             )
         };
@@ -1387,9 +1487,45 @@ impl TableProvider for AcceleratedTable {
                     )
                 })?;
 
-                // Check which filters the accelerator doesn't fully support and need to be re-applied.
-                // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
-                let filters_to_reapply = self.get_filters_to_reapply(filters)?;
+                // Check which user filters the accelerator doesn't fully
+                // support and need to be re-applied. This ensures correct
+                // results when the accelerator returns Inexact or
+                // Unsupported for some filters.
+                let mut filters_to_reapply = self.get_filters_to_reapply(filters)?;
+                // Re-apply the cache-namespace predicate as a hard
+                // FilterExec only if the accelerator does NOT report exact
+                // pushdown for it.
+                //
+                // The DataFusion contract for `supports_filters_pushdown`
+                // is: `Exact` means the provider guarantees the predicate
+                // will be applied (the caller does not have to re-apply);
+                // `Inexact` / `Unsupported` mean the caller MUST re-apply
+                // or rows that should be filtered may slip through. Cache
+                // isolation is a correctness invariant, so we re-apply
+                // whenever the accelerator does not give an exact
+                // guarantee.
+                //
+                // We deliberately do NOT wrap on `Exact`: the wrap is not
+                // just redundant, it is harmful. `FilterExec` coalesces
+                // its output through `BatchCoalescer`, which strictly
+                // compares `Field` metadata across consecutive batches.
+                // Some accelerator <-> source schema combinations (notably
+                // `Map` field naming round-tripped through DuckDB, which
+                // canonicalizes `keys`/`values` to `key`/`value`) trigger
+                // a false-positive panic in `BatchCoalescer` even though
+                // the data itself is well-formed. This bites the localpod
+                // chained-accelerator path in particular.
+                if let Some(nf) = namespace_filter {
+                    let nf_pushdown = self
+                        .accelerator
+                        .supports_filters_pushdown(&[&nf])?
+                        .into_iter()
+                        .next()
+                        .unwrap_or(TableProviderFilterPushDown::Unsupported);
+                    if !matches!(nf_pushdown, TableProviderFilterPushDown::Exact) {
+                        filters_to_reapply.push(nf);
+                    }
+                }
                 let input = if filters_to_reapply.is_empty() {
                     input
                 } else {
@@ -1631,22 +1767,36 @@ impl TableProvider for AcceleratedTable {
     }
 }
 
-/// Extends projection to include `fetched_at` column for cache freshness checking.
-/// Returns `Some(extended_projection)` if extension was needed,
-/// or `None` if no extension needed (projection already includes it or is None).
+/// Extends projection to include columns required by the caching pipeline
+/// for accelerator scans: `fetched_at` (freshness check) and
+/// `__spice_cache_namespace` (per-principal isolation filter applied as a
+/// hard `FilterExec` on top of the scan).
+///
+/// Returns `Some(extended_projection)` if any extension was needed, or
+/// `None` if both columns are already present (or `projection` is `None`,
+/// meaning the caller already wants the full schema).
 fn extend_projection_for_caching(
     projection: Option<&Vec<usize>>,
     schema: &SchemaRef,
 ) -> Option<Vec<usize>> {
     let proj = projection?;
-    let idx = schema.index_of(caching::CACHE_REFRESHED_AT_COLUMN).ok()?;
-    if proj.contains(&idx) {
-        return None;
+    let mut extended: Option<Vec<usize>> = None;
+    for col in [
+        caching::CACHE_REFRESHED_AT_COLUMN,
+        caching::CACHE_NAMESPACE_COLUMN,
+    ] {
+        let Ok(idx) = schema.index_of(col) else {
+            continue;
+        };
+        if proj.contains(&idx) {
+            continue;
+        }
+        let target = extended.get_or_insert_with(|| proj.clone());
+        if !target.contains(&idx) {
+            target.push(idx);
+        }
     }
-    // User projection doesn't include fetched_at - add it as last column
-    let mut extended = proj.clone();
-    extended.push(idx);
-    Some(extended)
+    extended
 }
 
 fn filters_for_accelerator_scan(

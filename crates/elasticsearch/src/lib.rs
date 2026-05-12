@@ -123,12 +123,15 @@ pub struct KnnQuery {
 /// Top-level search response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchResponse {
+    #[serde(default)]
+    pub pit_id: Option<String>,
     pub hits: HitsEnvelope,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HitsEnvelope {
-    pub total: HitsTotal,
+    #[serde(default)]
+    pub total: Option<HitsTotal>,
     pub hits: Vec<Hit>,
 }
 
@@ -143,8 +146,15 @@ pub struct Hit {
     pub id: String,
     #[serde(default, rename = "_score")]
     pub score: Option<f64>,
+    #[serde(default)]
+    pub sort: Option<Vec<serde_json::Value>>,
     #[serde(default, rename = "_source")]
     pub source: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenPointInTimeResponse {
+    id: String,
 }
 
 // ── Client ─────────────────────────────────────────────────────────────────
@@ -249,8 +259,9 @@ impl Client {
     /// Retry is opt-in per call site: only operations that wrap their request
     /// in `with_retry` are retried. Today this is scoped to `bulk_index`, which
     /// is the hot ingestion path. Other operations (`search`, `index_exists`,
-    /// `create_index`, `put_mapping`, `get_mapping`, `index_document`) bypass
-    /// retries to keep startup/query failures fast and attributable.
+    /// `create_index`, `put_mapping`, `get_mapping`, `index_document`, index
+    /// settings, refresh, and force-merge calls) bypass retries to keep
+    /// startup/query failures fast and attributable.
     async fn with_retry<'a, F, Fut, T>(&'a self, op: &'static str, mut f: F) -> Result<T>
     where
         F: FnMut(&'a Self) -> Fut,
@@ -322,6 +333,46 @@ impl Client {
         resp.json().await.context(JsonParseSnafu)
     }
 
+    /// Open an Elasticsearch point-in-time reader for `index`.
+    pub async fn open_point_in_time(&self, index: &str, keep_alive: &str) -> Result<String> {
+        let url = format!("{}/{index}/_pit", self.base_url);
+        let resp = self
+            .auth(self.http.post(&url))
+            .query(&[("keep_alive", keep_alive)])
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        let body: OpenPointInTimeResponse = resp.json().await.context(JsonParseSnafu)?;
+        Ok(body.id)
+    }
+
+    /// Execute a raw JSON search using a point-in-time reader.
+    pub async fn search_point_in_time(&self, body: &serde_json::Value) -> Result<SearchResponse> {
+        let url = format!("{}/_search", self.base_url);
+        let resp = self
+            .auth(self.http.post(&url))
+            .json(body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
+    /// Close an Elasticsearch point-in-time reader.
+    pub async fn close_point_in_time(&self, pit_id: &str) -> Result<()> {
+        let url = format!("{}/_pit", self.base_url);
+        let resp = self
+            .auth(self.http.delete(&url))
+            .json(&serde_json::json!({ "id": pit_id }))
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        check_status(resp).await?;
+        Ok(())
+    }
+
     // ── Index Management ───────────────────────────────────────────────
 
     /// Check whether an index exists via `HEAD /<index>`.
@@ -377,6 +428,81 @@ impl Client {
         let resp = self
             .auth(self.http.put(&url))
             .json(body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
+    /// Fetch the current `index.refresh_interval` for an index via `GET /<index>/_settings`.
+    pub async fn get_index_refresh_interval(&self, index: &str) -> Result<Option<String>> {
+        let url = format!("{}/{}/_settings", self.base_url, index);
+        let resp = self
+            .auth(self.http.get(&url))
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        let settings: serde_json::Value = resp.json().await.context(JsonParseSnafu)?;
+
+        let index_settings = settings
+            .get(index)
+            .or_else(|| settings.as_object().and_then(|o| o.values().next()));
+
+        Ok(index_settings
+            .and_then(|s| s.pointer("/settings/index/refresh_interval"))
+            .and_then(|v| {
+                v.as_str().map(ToString::to_string).or_else(|| {
+                    if v.is_null() {
+                        None
+                    } else {
+                        Some(v.to_string())
+                    }
+                })
+            }))
+    }
+
+    /// Update dynamic index settings via `PUT /<index>/_settings`.
+    pub async fn put_index_settings(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/_settings", self.base_url, index);
+        let resp = self
+            .auth(self.http.put(&url))
+            .json(body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
+    /// Make recently indexed documents searchable via `POST /<index>/_refresh`.
+    pub async fn refresh_index(&self, index: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/_refresh", self.base_url, index);
+        let resp = self
+            .auth(self.http.post(&url))
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
+    /// Force-merge an index via `POST /<index>/_forcemerge`.
+    pub async fn force_merge(
+        &self,
+        index: &str,
+        max_num_segments: u32,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/_forcemerge", self.base_url, index);
+        let max_num_segments = max_num_segments.to_string();
+        let resp = self
+            .auth(self.http.post(&url))
+            .query(&[("max_num_segments", max_num_segments.as_str())])
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -497,6 +623,9 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
     async fn get_mapping(&self, index: &str) -> Result<MappingResponse>;
     async fn search(&self, index: &str, body: &SearchRequest) -> Result<SearchResponse>;
     async fn search_raw(&self, index: &str, body: &serde_json::Value) -> Result<SearchResponse>;
+    async fn open_point_in_time(&self, index: &str, keep_alive: &str) -> Result<String>;
+    async fn search_point_in_time(&self, body: &serde_json::Value) -> Result<SearchResponse>;
+    async fn close_point_in_time(&self, pit_id: &str) -> Result<()>;
     async fn index_exists(&self, index: &str) -> Result<bool>;
     async fn create_index(
         &self,
@@ -505,6 +634,14 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
     ) -> Result<serde_json::Value>;
     async fn put_mapping(&self, index: &str, body: &serde_json::Value)
     -> Result<serde_json::Value>;
+    async fn get_index_refresh_interval(&self, index: &str) -> Result<Option<String>>;
+    async fn put_index_settings(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value>;
+    async fn refresh_index(&self, index: &str) -> Result<serde_json::Value>;
+    async fn force_merge(&self, index: &str, max_num_segments: u32) -> Result<serde_json::Value>;
     async fn index_document(
         &self,
         index: &str,
@@ -532,6 +669,18 @@ impl Elasticsearch for Client {
         self.search_raw(index, body).await
     }
 
+    async fn open_point_in_time(&self, index: &str, keep_alive: &str) -> Result<String> {
+        Client::open_point_in_time(self, index, keep_alive).await
+    }
+
+    async fn search_point_in_time(&self, body: &serde_json::Value) -> Result<SearchResponse> {
+        Client::search_point_in_time(self, body).await
+    }
+
+    async fn close_point_in_time(&self, pit_id: &str) -> Result<()> {
+        Client::close_point_in_time(self, pit_id).await
+    }
+
     async fn index_exists(&self, index: &str) -> Result<bool> {
         self.index_exists(index).await
     }
@@ -550,6 +699,26 @@ impl Elasticsearch for Client {
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         self.put_mapping(index, body).await
+    }
+
+    async fn get_index_refresh_interval(&self, index: &str) -> Result<Option<String>> {
+        self.get_index_refresh_interval(index).await
+    }
+
+    async fn put_index_settings(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.put_index_settings(index, body).await
+    }
+
+    async fn refresh_index(&self, index: &str) -> Result<serde_json::Value> {
+        self.refresh_index(index).await
+    }
+
+    async fn force_merge(&self, index: &str, max_num_segments: u32) -> Result<serde_json::Value> {
+        self.force_merge(index, max_num_segments).await
     }
 
     async fn index_document(

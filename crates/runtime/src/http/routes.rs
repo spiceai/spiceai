@@ -42,6 +42,8 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
 use spicepod::component::runtime::CorsConfig;
+#[cfg(feature = "mcp")]
+use spicepod::component::runtime::McpConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -181,6 +183,24 @@ selected via the `Accept` header. Session continuity is carried via the `Mcp-Ses
                         .build(),
                 )
                 .response(
+                    "403",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list. \
+Configure `runtime.mcp.allowed_hosts` or set it to `[\"*\"]` to allow all hosts.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "401",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. \
+Configure an API key provider in your Spicepod and retry with credentials.",
+                        )
+                        .build(),
+                )
+                .response(
                     "413",
                     utoipa::openapi::ResponseBuilder::new()
                         .description("Payload too large. Maximum allowed size is 32 MiB.")
@@ -212,6 +232,23 @@ The `Mcp-Session-Id` header must identify an existing session created via `POST 
                         .description("Unknown or expired `Mcp-Session-Id`.")
                         .build(),
                 )
+                .response(
+                    "401",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. \
+Configure an API key provider in your Spicepod and retry with credentials.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "403",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list.",
+                        )
+                        .build(),
+                )
                 .build(),
         );
         openai.paths.add_path_operation(
@@ -235,6 +272,23 @@ The `Mcp-Session-Id` header must identify an existing session created via `POST 
                     "404",
                     utoipa::openapi::ResponseBuilder::new()
                         .description("Unknown or already-terminated `Mcp-Session-Id`.")
+                        .build(),
+                )
+                .response(
+                    "401",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. \
+Configure an API key provider in your Spicepod and retry with credentials.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "403",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list.",
+                        )
                         .build(),
                 )
                 .build(),
@@ -262,9 +316,15 @@ pub(crate) fn routes(
     search: Arc<search_engine::SearchEngine>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
+    #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+        .route("/v1/sql/active", get(v1::queries::list_active))
+        .route(
+            "/v1/sql/{query_id}/cancel",
+            post(v1::queries::cancel_active),
+        )
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/functions", get(v1::functions::list))
@@ -393,10 +453,11 @@ pub(crate) fn routes(
         // Streamable HTTP transport endpoint per MCP 2025-11-25 spec.
         // This replaces the legacy SSE transport that was removed in rmcp 1.x.
         let runtime_arc = Arc::clone(rt);
+        let mcp_config = mcp_server_config(mcp_config);
         let mcp_service = StreamableHttpService::new(
             move || Ok(RuntimeServer::from(&runtime_arc)),
             Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
+            mcp_config,
         );
 
         tracing::debug!(
@@ -430,6 +491,15 @@ pub(crate) fn routes(
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 
+    // mTLS route gate. Wired onto the authenticated router *before* the
+    // unauthenticated `/health` and `/v1/ready` are merged in, so probe
+    // routes bypass the gate by construction. Under `client_auth: required`
+    // the HTTP listener admits no-cert handshakes (so probes work over
+    // TLS without mounting a probe certificate); this layer 401s any
+    // non-probe request whose connection presented no verified peer cert.
+    authenticated_router = authenticated_router
+        .route_layer(middleware::from_fn(super::mtls::require_channel_identity));
+
     let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/ready", get(v1::ready::get))
@@ -438,6 +508,7 @@ pub(crate) fn routes(
 
     unauthenticated_router
         .merge(authenticated_router)
+        .route_layer(middleware::from_fn(super::mtls::mtls_request_layer))
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&rt.df),
@@ -486,7 +557,24 @@ async fn track_metrics(
     let response = Arc::clone(&request_context)
         .scope(async move {
             request_context.load_extensions().await;
-            next.run(req).await
+            // Install a drop guard on the request's cancellation token so
+            // that if the response body is dropped before the body completes
+            // (for example, the client disconnects while a streaming SQL or
+            // SSE response is being produced), the cancellation token fires
+            // and any cooperating in-flight query terminates promptly.
+            //
+            // The guard is attached to the response body via
+            // `CancelGuardBody`, which disarms the guard once the body
+            // signals end-of-stream. This means the guard's lifetime tracks
+            // the streaming response, not just the response future.
+            let cancel_guard = request_context.cancellation_token().clone().drop_guard();
+            let response = next.run(req).await;
+            let (parts, body) = response.into_parts();
+            let body = axum::body::Body::new(util::cancel_guard_body::CancelGuardBody::new(
+                body,
+                cancel_guard,
+            ));
+            axum::response::Response::from_parts(parts, body)
         })
         .await;
 
@@ -506,6 +594,23 @@ async fn track_metrics(
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
 
     response
+}
+
+/// Build the MCP [`StreamableHttpServerConfig`] from the optional `runtime.mcp` config.
+///
+/// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None`, rmcp defaults
+///   apply (`localhost`, `127.0.0.1`, `::1`).
+/// - If `runtime.mcp.allowed_hosts` contains `"*"`, host checking is disabled entirely
+///   (matches how `runtime.cors.allowed_origins: ["*"]` works).
+/// - Otherwise the provided list replaces the defaults entirely.
+#[cfg(feature = "mcp")]
+fn mcp_server_config(mcp_config: Option<&McpConfig>) -> StreamableHttpServerConfig {
+    let config = StreamableHttpServerConfig::default();
+    match mcp_config.and_then(|c| c.allowed_hosts.as_deref()) {
+        Some(hosts) if hosts.iter().any(|h| h == "*") => config.disable_allowed_hosts(),
+        Some(hosts) => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
+        None => config,
+    }
 }
 
 fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {

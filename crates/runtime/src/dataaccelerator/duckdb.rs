@@ -20,7 +20,7 @@ use crate::{
     component::{
         dataset::{
             Dataset,
-            acceleration::{Acceleration, Engine, Mode},
+            acceleration::{Acceleration, Engine, Mode, RefreshMode},
         },
         view::View,
     },
@@ -449,6 +449,12 @@ impl DataAccelerator for DuckDBAccelerator {
             );
         }
 
+        let is_changes_refresh = source
+            .and_then(|src| src.acceleration())
+            .and_then(|acceleration| acceleration.refresh_mode)
+            .is_some_and(|refresh_mode| refresh_mode == RefreshMode::Changes);
+        apply_changes_refresh_write_defaults(&mut cmd, is_changes_refresh);
+
         // Modify the `cmd` by adding options to attach other databases
         if let Some(source) = source {
             if let Some(temp_directory) = source
@@ -571,11 +577,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
             }
 
-            if config.is_empty() {
-                None
-            } else {
-                Some(make_on_refresh_write_handler(dataset_name, config))
-            }
+            Some(make_on_refresh_write_handler(dataset_name, config))
         });
 
         Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
@@ -673,6 +675,15 @@ impl DataAccelerator for DuckDBAccelerator {
         )
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+    }
+}
+
+fn apply_changes_refresh_write_defaults(cmd: &mut CreateExternalTable, is_changes_refresh: bool) {
+    if is_changes_refresh && !cmd.options.contains_key("recompute_statistics_on_write") {
+        cmd.options.insert(
+            "recompute_statistics_on_write".to_string(),
+            "false".to_string(),
+        );
     }
 }
 
@@ -792,10 +803,6 @@ impl OnRefreshConfig {
         self.sort_columns = columns;
         self
     }
-
-    fn is_empty(&self) -> bool {
-        self.retention_delete.is_none() && self.sort_columns.is_empty()
-    }
 }
 
 fn make_on_refresh_write_handler(
@@ -895,6 +902,12 @@ fn make_on_refresh_write_handler(
             );
         }
 
+        table_manager.create_indexes(tx).map_err(|err| {
+            DataFusionError::Execution(format!(
+                "Failed to create DuckDB indexes for dataset {dataset_name} (table {internal_table_name}) before refresh commit: {err}"
+            ))
+        })?;
+
         Ok(())
     })
 }
@@ -922,6 +935,75 @@ mod tests {
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
     use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
+
+    fn external_table_with_options(options: HashMap<String, String>) -> CreateExternalTable {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let df_schema = ToDFSchema::to_dfschema_ref(schema)
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("write_settings_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        }
+    }
+
+    #[test]
+    fn duckdb_write_settings_changes_refresh_disables_recompute_statistics_by_default() {
+        let mut external_table = external_table_with_options(HashMap::new());
+
+        super::apply_changes_refresh_write_defaults(&mut external_table, true);
+
+        assert_eq!(
+            external_table.options.get("recompute_statistics_on_write"),
+            Some(&"false".to_string())
+        );
+    }
+
+    #[test]
+    fn duckdb_write_settings_changes_refresh_preserves_explicit_recompute_statistics_setting() {
+        let mut options = HashMap::new();
+        options.insert(
+            "recompute_statistics_on_write".to_string(),
+            "true".to_string(),
+        );
+        let mut external_table = external_table_with_options(options);
+
+        super::apply_changes_refresh_write_defaults(&mut external_table, true);
+
+        assert_eq!(
+            external_table.options.get("recompute_statistics_on_write"),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn duckdb_write_settings_non_changes_refresh_keeps_recompute_statistics_unset() {
+        let mut external_table = external_table_with_options(HashMap::new());
+
+        super::apply_changes_refresh_write_defaults(&mut external_table, false);
+
+        assert!(
+            !external_table
+                .options
+                .contains_key("recompute_statistics_on_write")
+        );
+    }
 
     #[tokio::test]
     async fn retention_sql_applies_before_commit() {
@@ -1015,6 +1097,107 @@ mod tests {
         }
 
         assert_eq!(values, vec![5, 7]);
+    }
+
+    #[tokio::test]
+    async fn overwrite_index_failure_keeps_previous_duckdb_view() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        let mut options = HashMap::new();
+        options.insert("indexes".to_string(), "value:unique".to_string());
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("indexed_overwrite_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        let handler = super::make_on_refresh_write_handler(
+            "indexed_overwrite_dataset".to_string(),
+            super::OnRefreshConfig::empty(),
+        );
+
+        let table = super::create_table_provider(
+            &duckdb_accelerator.duckdb_factory,
+            &external_table,
+            Some(handler),
+        )
+        .await
+        .expect("table should be created");
+
+        let write_ctx = SessionContext::new();
+        let initial_input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .expect("to create initial RecordBatch");
+        let initial_exec = Arc::new(MockExec::new(vec![Ok(initial_input)], Arc::clone(&schema)));
+        let initial_insert = table
+            .insert_into(&write_ctx.state(), initial_exec, InsertOp::Overwrite)
+            .await
+            .expect("to create initial insert plan");
+        collect(initial_insert, write_ctx.task_ctx())
+            .await
+            .expect("initial overwrite should succeed");
+
+        let duplicate_input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![3, 3]))],
+        )
+        .expect("to create duplicate RecordBatch");
+        let duplicate_exec = Arc::new(MockExec::new(
+            vec![Ok(duplicate_input)],
+            Arc::clone(&schema),
+        ));
+        let duplicate_insert = table
+            .insert_into(&write_ctx.state(), duplicate_exec, InsertOp::Overwrite)
+            .await
+            .expect("to create duplicate insert plan");
+        let duplicate_result = collect(duplicate_insert, write_ctx.task_ctx()).await;
+        assert!(
+            duplicate_result.is_err(),
+            "duplicate unique-index overwrite should fail"
+        );
+
+        let read_ctx = SessionContext::new();
+        let scan_plan = table
+            .scan(&read_ctx.state(), None, &[], None)
+            .await
+            .expect("to create scan plan");
+        let batches = collect(scan_plan, read_ctx.task_ctx())
+            .await
+            .expect("to execute scan");
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("to downcast column to Int64Array");
+            values.extend((0..column.len()).map(|idx| column.value(idx)));
+        }
+        values.sort_unstable();
+
+        assert_eq!(values, vec![1, 2]);
     }
 
     #[tokio::test]

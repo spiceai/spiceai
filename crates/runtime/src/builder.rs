@@ -40,6 +40,7 @@ use crate::{
 use app::App;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
+use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use telemetry::timing::TimeMeasurement;
@@ -238,12 +239,30 @@ impl RuntimeBuilder {
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
+        // Resolve CDC tunables once at startup so the per-envelope hot path
+        // doesn't pay map lookup or spicepod-traversal cost. Reads
+        // `cdc_*` knobs from `runtime.params`; missing or rejected values
+        // fall back to the matching `SPICE_CDC_*` env var, then to defaults,
+        // with a warning for rejected explicit values.
+        crate::accelerated_table::refresh_task::changes::set_cdc_config(
+            crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
+                &spicepod_rt.params,
+            ),
+        );
+
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
         let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
 
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
+
+        let http_rate_control_registry = build_http_rate_control_registry(
+            spicepod_rt.source_rate_control.as_ref(),
+            Arc::clone(&secrets),
+            io_runtime.clone(),
+        )
+        .await;
 
         let distributed: Option<DistributedNode> = match self
             .resolved_cluster_config
@@ -406,9 +425,7 @@ impl RuntimeBuilder {
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
             model_rate_controllers: Arc::new(RwLock::new(HashMap::new())),
-            http_rate_control_registry: Arc::new(
-                dataconnector::http_rate_control::HttpRateControlRegistry::default(),
-            ),
+            http_rate_control_registry,
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
@@ -482,6 +499,100 @@ impl RuntimeBuilder {
 impl Default for RuntimeBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+async fn build_http_rate_control_registry(
+    source_rate_control: Option<&SpicepodSourceRateControl>,
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+    #[cfg(not(feature = "rate-control"))]
+    {
+        let _ = (&secrets, &io_runtime);
+        if source_rate_control
+            .and_then(|config| config.state_location.as_ref())
+            .is_some()
+        {
+            tracing::warn!(
+                "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
+            );
+        }
+        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+    }
+
+    #[cfg(feature = "rate-control")]
+    {
+        let Some((state_location, params, refresh_interval, config_path)) = source_rate_control
+            .and_then(|config| {
+                config.state_location.as_deref().map(|state_location| {
+                    (
+                        state_location,
+                        config.params.as_ref(),
+                        config.refresh_interval.as_str(),
+                        "runtime.source_rate_control",
+                    )
+                })
+            })
+        else {
+            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+        };
+
+        let Some(refresh_interval) =
+            parse_rate_control_refresh_interval(refresh_interval, config_path)
+        else {
+            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+        };
+
+        match crate::object_store_state::build_object_store(
+            secrets,
+            io_runtime,
+            state_location,
+            params,
+            "rate-control state",
+        )
+        .await
+        {
+            Ok((store, base_prefix)) => {
+                tracing::info!(
+                    "Initialized persisted HTTP governor rate-control state with location: {}",
+                    state_location
+                );
+                let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
+                    store,
+                    base_prefix,
+                    refresh_interval,
+                ));
+                registry.start_persistence_task();
+                registry
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to initialize persisted HTTP governor rate-control state: {error}"
+                );
+                Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rate-control")]
+fn parse_rate_control_refresh_interval(
+    refresh_interval: &str,
+    config_path: &str,
+) -> Option<Duration> {
+    match fundu::parse_duration(refresh_interval) {
+        Ok(parsed_refresh_interval) if parsed_refresh_interval.is_zero() => {
+            tracing::error!(
+                "Invalid {config_path}.refresh_interval '{refresh_interval}': value must be greater than 0"
+            );
+            None
+        }
+        Ok(parsed_refresh_interval) => Some(parsed_refresh_interval),
+        Err(error) => {
+            tracing::error!("Invalid {config_path}.refresh_interval '{refresh_interval}': {error}");
+            None
+        }
     }
 }
 

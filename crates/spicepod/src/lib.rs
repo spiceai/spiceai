@@ -40,6 +40,7 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 pub mod acceleration;
 pub mod component;
 pub mod extension;
+pub mod fts;
 mod keywords;
 pub mod metric;
 pub mod param;
@@ -100,6 +101,21 @@ pub enum Error {
         path: PathBuf,
     },
 
+    #[snafu(display(
+        "Not a valid Spicepod file: {}\n\n\
+        Expected 'kind: Spicepod' but found 'kind: {kind}'.\n\
+        Ensure the file is a valid Spicepod YAML file.",
+        path.display()
+    ))]
+    InvalidSpicepodKind { kind: String, path: PathBuf },
+
+    #[snafu(display(
+        "Unsupported Spicepod version in {}: '{version}'\n\n\
+        Supported versions are: v1, v2 (or full semver: v1.0.0, v2.0.0-rc.1, etc.)",
+        path.display()
+    ))]
+    InvalidSpicepodVersion { version: String, path: PathBuf },
+
     #[cfg(feature = "object-store")]
     #[snafu(display("Unable to parse S3 URL {}: {source}", path))]
     UnableToParseS3Url {
@@ -150,6 +166,30 @@ pub struct Spicepod {
     pub management: Option<Management>,
 
     pub snapshots: Option<Snapshots>,
+}
+
+fn validate_spicepod_header(raw: &yaml::Value, path: &Path) -> Result<()> {
+    if let Some(kind) = raw.get("kind").and_then(yaml::Value::as_str)
+        && kind != "Spicepod"
+    {
+        return InvalidSpicepodKindSnafu {
+            kind: kind.to_string(),
+            path: path.to_path_buf(),
+        }
+        .fail();
+    }
+
+    if let Some(version_val) = raw.get("version")
+        && yaml::from_value::<SpicepodVersion>(version_val.clone()).is_err()
+    {
+        return InvalidSpicepodVersionSnafu {
+            version: version_val.as_str().unwrap_or("unknown").to_string(),
+            path: path.to_path_buf(),
+        }
+        .fail();
+    }
+
+    Ok(())
 }
 
 fn detect_duplicate_component_names(
@@ -230,8 +270,14 @@ impl Spicepod {
         path: impl Into<PathBuf>,
     ) -> Result<Spicepod> {
         let path = path.into();
-        let spicepod_definition: SpicepodDefinition =
+
+        let raw: yaml::Value =
             yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+
+        validate_spicepod_header(&raw, &path)?;
+
+        let spicepod_definition: SpicepodDefinition =
+            yaml::from_value(raw).context(UnableToParseSpicepodSnafu)?;
 
         let resolved_datasets = component::resolve_component_references(
             fs,
@@ -350,14 +396,9 @@ impl Spicepod {
     ) -> Result<Spicepod> {
         let path = path.into();
 
-        let file_stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
         let is_file = path.is_file() || path.extension().is_some();
 
-        let (spicepod_rdr, base_path) = if file_stem == "spicepod" && is_file {
+        let (spicepod_rdr, base_path) = if is_file {
             let spicepod_rdr = fs
                 .open_exact_yaml(path.clone())
                 .await
@@ -607,16 +648,139 @@ mod version_tests {
         assert_eq!(def.name, "test_pod");
     }
 
-    /// Unknown version strings produce a deserialization error.
+    /// Malformed version strings produce a deserialization error.
     #[test]
     fn test_invalid_version_rejected() {
         let yaml = r"
-            version: v3
+            version: not-a-version
             kind: Spicepod
             name: invalid
         ";
         let result: Result<SpicepodDefinition, _> = yaml::from_str(yaml);
-        assert!(result.is_err(), "Unknown version 'v3' should be rejected");
+        assert!(
+            result.is_err(),
+            "Malformed version 'not-a-version' should be rejected"
+        );
+    }
+
+    /// Partial and full version strings are accepted for supported majors (v1, v2).
+    #[test]
+    fn test_free_form_versions_accepted() {
+        let cases = [
+            "v1",
+            "v2",
+            "v1.0",
+            "v2.0",
+            "v1.0.0",
+            "v2.0.0",
+            "v2.0.0-rc.1",
+            "v1.10.20-beta-2",
+        ];
+        for case in cases {
+            let parsed: SpicepodVersion =
+                yaml::from_str(case).unwrap_or_else(|e| panic!("Should parse '{case}': {e}"));
+            assert_eq!(
+                parsed.to_string(),
+                case,
+                "Parsed version should round-trip to the same string"
+            );
+        }
+    }
+
+    /// Unsupported major versions (anything other than v1 or v2) are rejected
+    /// with an "unsupported spicepod version" error that names the major.
+    #[test]
+    fn test_unsupported_major_rejected() {
+        let cases = ["v0", "v3", "v3.0.0", "v100", "v4.5.6-rc.1"];
+        for case in cases {
+            let result: Result<SpicepodVersion, _> = yaml::from_str(case);
+            let err =
+                result.expect_err(&format!("'{case}' should be rejected as unsupported major"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unsupported spicepod version") && msg.contains(case),
+                "Error for '{case}' should mention unsupported version, got: {msg}"
+            );
+        }
+    }
+
+    /// Malformed version strings produce errors with a friendly message.
+    #[test]
+    fn test_malformed_version_error_message() {
+        let cases = [
+            "v1beta1",
+            "1.0.0",
+            "vfoo",
+            "v",
+            "v1.",
+            "v1.0.0-",
+            "v1-rc.1",
+            "v1.0-rc.1",
+            "v1.0.0.0",
+            "v01",
+            "v2.01",
+            "v2.0.01",
+            "v02.0.0",
+        ];
+        for case in cases {
+            let result: Result<SpicepodVersion, _> = yaml::from_str(case);
+            let err = result.expect_err(&format!("'{case}' should be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("invalid spicepod version") && msg.contains(case),
+                "Error for '{case}' should be user-friendly, got: {msg}"
+            );
+        }
+    }
+
+    /// Partial and full version strings are structurally distinct.
+    #[test]
+    fn test_partial_versions_are_distinct() {
+        let v2: SpicepodVersion = yaml::from_str("v2").expect("v2");
+        let v2_0: SpicepodVersion = yaml::from_str("v2.0").expect("v2.0");
+        let v2_0_0: SpicepodVersion = yaml::from_str("v2.0.0").expect("v2.0.0");
+        assert_ne!(v2, v2_0);
+        assert_ne!(v2_0, v2_0_0);
+        assert_eq!(v2, SpicepodVersion::V2);
+    }
+
+    /// A full version string with pre-release roundtrips through YAML.
+    #[test]
+    fn test_prerelease_version_roundtrip() {
+        let original: SpicepodVersion = yaml::from_str("v2.0.0-rc.1").expect("Should parse");
+        let yaml_str = yaml::to_string(&original).expect("Should serialize");
+        let roundtripped: SpicepodVersion = yaml::from_str(&yaml_str).expect("Should deserialize");
+        assert_eq!(original, roundtripped);
+        assert_eq!(original.to_string(), "v2.0.0-rc.1");
+    }
+
+    /// End-to-end: a full `vMAJOR.MINOR.PATCH-PRERELEASE` tag in a complete
+    /// `SpicepodDefinition` YAML deserializes and round-trips through serialization.
+    #[test]
+    fn test_full_version_tag_in_spicepod_definition() {
+        let yaml = r"
+            version: v2.0.0-rc.1
+            kind: Spicepod
+            name: prerelease_pod
+        ";
+        let def: SpicepodDefinition =
+            yaml::from_str(yaml).expect("Should parse SpicepodDefinition with v2.0.0-rc.1");
+        assert_eq!(def.version.to_string(), "v2.0.0-rc.1");
+        assert_eq!(def.version.major(), 2);
+        assert_eq!(def.version.minor(), Some(0));
+        assert_eq!(def.version.patch(), Some(0));
+        assert_eq!(def.version.pre_release(), Some("rc.1"));
+        assert_eq!(def.name, "prerelease_pod");
+
+        // Round-trip through serialize → deserialize preserves the version tag exactly.
+        let serialized = yaml::to_string(&def).expect("Should serialize");
+        assert!(
+            serialized.contains("version: v2.0.0-rc.1"),
+            "Serialized YAML should preserve full version tag, got:\n{serialized}"
+        );
+        let reparsed: SpicepodDefinition =
+            yaml::from_str(&serialized).expect("Should re-parse round-tripped YAML");
+        assert_eq!(reparsed.version, def.version);
     }
 
     // ========================================================================
@@ -974,6 +1138,32 @@ mod version_tests {
         assert_eq!(scheduler.partition_discovery_timeout, "60s");
     }
 
+    #[test]
+    fn test_runtime_source_rate_control_deserializes() {
+        let yaml = r"
+            source_rate_control:
+              state_location: file:///tmp/spice-source-rate-control
+              refresh_interval: 15s
+              github_concurrent_connections_limit: 5
+              params:
+                allow_http: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let source_rate_control = runtime
+            .source_rate_control
+            .expect("source_rate_control section should exist");
+        assert_eq!(
+            source_rate_control.state_location.as_deref(),
+            Some("file:///tmp/spice-source-rate-control")
+        );
+        assert_eq!(source_rate_control.refresh_interval, "15s");
+        assert_eq!(
+            source_rate_control.github_concurrent_connections_limit,
+            Some(5)
+        );
+        assert!(source_rate_control.params.is_some());
+    }
+
     /// `read_write_create` access mode deserializes.
     #[test]
     fn test_access_mode_read_write_create() {
@@ -1123,6 +1313,61 @@ mod version_tests {
                 .unwrap_or_else(|e| panic!("Failed to load v1 fixture {file}: {e}"));
             assert_eq!(pod.version, SpicepodVersion::V1, "Expected V1 for {file}");
         }
+    }
+
+    /// `load_from` accepts any YAML file path, not just files named "spicepod".
+    #[tokio::test]
+    async fn test_load_from_accepts_arbitrary_filename() {
+        let pod = Spicepod::load_from(&reader::StdFileSystem, "./tests/basic_spicepod.yaml")
+            .await
+            .expect("load_from should accept a file path with a non-spicepod stem");
+        assert_eq!(pod.name, "basic_spicepod");
+    }
+
+    /// `load_from` with a directory still finds spicepod.yaml inside it.
+    #[tokio::test]
+    async fn test_load_from_directory_finds_spicepod_yaml() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let spicepod_content = "version: v1\nkind: Spicepod\nname: test_pod\n";
+        std::fs::write(dir.path().join("spicepod.yaml"), spicepod_content)
+            .expect("write spicepod.yaml");
+
+        let pod = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .expect("load_from should find spicepod.yaml in a directory");
+        assert_eq!(pod.name, "test_pod");
+    }
+
+    /// A file with a wrong `kind` (e.g. a Kubernetes YAML) is rejected with a clear error.
+    #[tokio::test]
+    async fn test_load_from_rejects_wrong_kind() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("deployment.yaml");
+        std::fs::write(&path, "kind: Deployment\nname: my-app\nversion: v1\n").expect("write file");
+
+        let err = Spicepod::load_from(&reader::StdFileSystem, &path)
+            .await
+            .expect_err("should reject wrong kind");
+        assert!(
+            err.to_string().contains("kind: Deployment"),
+            "error should mention the wrong kind: {err}"
+        );
+    }
+
+    /// A file with an unrecognised version is rejected with a clear error.
+    #[tokio::test]
+    async fn test_load_from_rejects_unknown_version() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("spicepod.yaml");
+        std::fs::write(&path, "kind: Spicepod\nname: my-app\nversion: v99\n").expect("write file");
+
+        let err = Spicepod::load_from(&reader::StdFileSystem, &path)
+            .await
+            .expect_err("should reject unknown version");
+        assert!(
+            err.to_string().contains("v99"),
+            "error should mention the unsupported version: {err}"
+        );
     }
 
     /// All v2-versioned test spicepods load successfully.

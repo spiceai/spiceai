@@ -46,6 +46,7 @@ on:
           - 'duckdb-zero-results'
           - 'duckdb-partitioned'
           - 'snowflake'
+          - 'snowflake-catalog'
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
@@ -62,6 +63,7 @@ on:
           - 'ducklake-catalog'
           - 'turso'
           - 'bigquery'
+          - 'scylladb'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -207,6 +209,18 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
 
+      - name: Set up Python
+        if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Setup ScyllaDB
+        if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
+        uses: ./.github/actions/setup-scylladb
+        with:
+          keyspace: tpch_sf1
+
       - name: Install PostgreSQL for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         uses: ./.github/actions/install-postgres
@@ -235,12 +249,6 @@ jobs:
           echo 'MinIO did not become ready in time.'
           docker logs minio
           exit 1
-
-      - name: Set up Python for DuckLake
-        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
-        with:
-          python-version: '3.12'
 
       - name: Bootstrap DuckLake TPCH SF1 catalog
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
@@ -383,6 +391,9 @@ jobs:
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
+          SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
+          SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
 
       - name: Run the benchmark test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -458,6 +469,9 @@ jobs:
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
+          SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
+          SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
 
       - name: Install GH CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
