@@ -78,12 +78,15 @@ jobs:
           - name: Rust Lint
             command: lint-rust
             spiceio_bind: 127.0.0.1:8333
+            sccache_server_port: 4233
           - name: Rust Lint (Models)
             command: lint-rust-models
             spiceio_bind: 127.0.0.1:8334
+            sccache_server_port: 4234
           - name: Rust Lint (NAS)
             command: lint-rust-nas
             spiceio_bind: 127.0.0.1:8335
+            sccache_server_port: 4235
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -112,9 +115,8 @@ jobs:
         run: |
           # Self-hosted runners can leak spiceio processes from prior jobs whose
           # setup failed before producing a pid output (skipping the cleanup step).
-          # Any survivors hold the bind port and cause the next setup to time out.
-          pkill -f '^spiceio( |$)' 2>/dev/null || true
-          # Also clear anything still bound to the port we're about to use.
+          # Clear only the port this matrix variant owns so concurrent variants
+          # on the same host keep their spiceio endpoints alive.
           PORT="${BIND##*:}"
           if command -v lsof >/dev/null 2>&1; then
             PIDS="$(lsof -ti tcp:"$PORT" 2>/dev/null || true)"
@@ -143,6 +145,7 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          server_port: ${{ matrix.variant.sccache_server_port }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -176,6 +179,13 @@ jobs:
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
+
+      - name: Stop sccache
+        if: always() && needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          if [ -n "${SCCACHE_SERVER_PORT:-}" ]; then
+            sccache --stop-server || true
+          fi
 
       - name: Kill spiceio
         if: always() && steps.setup-spiceio.outputs.pid != ''

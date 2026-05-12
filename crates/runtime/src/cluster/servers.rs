@@ -134,6 +134,7 @@ pub async fn start_internal_cluster_server(
             mtls_enabled,
         )
     };
+
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 
     let server = server

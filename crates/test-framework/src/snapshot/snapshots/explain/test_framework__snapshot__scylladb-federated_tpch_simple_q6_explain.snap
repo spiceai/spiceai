@@ -1,6 +1,5 @@
 ---
 source: crates/test-framework/src/snapshot/mod.rs
-assertion_line: 80
 description: "Query: tpch_simple_q6"
 ---
 +---------------+-------------------------------------------------------------------------+
@@ -11,10 +10,9 @@ description: "Query: tpch_simple_q6"
 |               |     Limit: skip=0, fetch=10                                             |
 |               |       TableScan: orders projection=[o_orderkey], fetch=10               |
 | physical_plan | ProjectionExec: expr=[CAST(o_orderkey@0 AS Int64) + 1 as key]           |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
-|               |     GlobalLimitExec: skip=0, fetch=10                                   |
-|               |       CooperativeExec                                                   |
-|               |         BytesProcessedExec                                              |
-|               |           SqlExec sql=SELECT "o_orderkey" FROM orders  LIMIT 10         |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
+|               |     CooperativeExec                                                     |
+|               |       BytesProcessedExec                                                |
+|               |         SqlExec sql=SELECT "o_orderkey" FROM "orders" LIMIT 10          |
 |               |                                                                         |
 +---------------+-------------------------------------------------------------------------+

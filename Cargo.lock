@@ -3415,6 +3415,7 @@ name = "cayenne"
 version = "2.0.0-enterprise-beta"
 dependencies = [
  "aegis",
+ "arc-swap",
  "arrow",
  "arrow-flight",
  "arrow-ipc",
@@ -3478,11 +3479,14 @@ dependencies = [
 name = "cayenne-flightsql"
 version = "2.0.0-enterprise-beta"
 dependencies = [
+ "async-trait",
  "cayenne",
  "clap",
  "data_components",
  "datafusion",
+ "datafusion-ddl",
  "datafusion-flightsql",
+ "runtime-datafusion",
  "snafu",
  "tokio",
  "tonic",
@@ -6286,7 +6290,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=f4f864d22cc92ee65e33b76afbd128a2ffc50d48#f4f864d22cc92ee65e33b76afbd128a2ffc50d48"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be#81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -13917,7 +13921,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
- "arrayvec 0.5.2",
+ "arrayvec 0.7.6",
  "hashbrown 0.17.0",
  "parking_lot 0.12.5",
  "rand 0.8.6",
@@ -15920,6 +15924,7 @@ dependencies = [
  "datafusion-optimizer-rules",
  "datafusion-proto",
  "datafusion-spark",
+ "datafusion-substrait",
  "datafusion-table-providers",
  "db_connection_pool",
  "document_parse",
@@ -18288,6 +18293,7 @@ version = "2.0.0-enterprise-beta"
 dependencies = [
  "anyhow",
  "arrow",
+ "arrow-flight",
  "async-trait",
  "clap",
  "dirs",
@@ -18299,6 +18305,7 @@ dependencies = [
  "spicepod",
  "system-adapter-protocol",
  "tokio",
+ "tonic",
  "url",
  "uuid 1.23.1",
  "yaml",

@@ -57,6 +57,7 @@ datafusion-functions-json = { workspace = true }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true }
 datafusion-spark.workspace = true
+datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
@@ -405,3 +406,7 @@ name = "prepared_statement"
 [[bench]]
 harness = false
 name = "flatten_json_properties"
+
+[[bench]]
+harness = false
+name = "cdc_cayenne_inline"

@@ -68,6 +68,7 @@ on:
           - 'ducklake-catalog'
           - 'turso'
           - 'bigquery'
+          - 'scylladb'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true

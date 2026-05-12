@@ -672,6 +672,7 @@ pub enum QueryOverrides {
     Arrow,
     Turso,
     BigQuery,
+    ScyllaDB,
 }
 
 impl QueryOverrides {
@@ -689,6 +690,7 @@ impl QueryOverrides {
             "arrow" => Some(Self::Arrow),
             "turso" => Some(Self::Turso),
             "bigquery" => Some(Self::BigQuery),
+            "scylladb" => Some(Self::ScyllaDB),
             _ => None,
         }
     }
@@ -1057,8 +1059,10 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Turso) => remove_tpch_query!(
             queries,
             2, // Correlated scalar subquery not supported; DF limitation, Turso tests are not cross-table federated
+            4, // Federation fails for cross-provider EXISTS subquery filters; https://github.com/spiceai/spiceai/issues/10167
             17, // Correlated scalar subquery not supported
-            21  // Correlated scalar subquery not supported
+            21, // Correlated scalar subquery not supported
+            22 // Federation fails for cross-provider EXISTS subquery filters; https://github.com/spiceai/spiceai/issues/10167
         ),
         Some(QueryOverrides::BigQuery) => {
             let mut queries: Vec<Query> = remove_tpch_query!(
@@ -1069,6 +1073,10 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             queries.extend(generate_tpch_queries_override!("bigquery", q1, q6));
             queries
         }
+        Some(QueryOverrides::ScyllaDB) => remove_tpch_query!(
+            queries,
+            simple_q3 // ORDER BY is only supported when the partition key is restricted by an EQ or an IN; https://github.com/spiceai/spiceai/issues/10775
+        ),
         _ => queries,
     }
 }
@@ -1178,8 +1186,8 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
     );
 
     let overrides = match overrides {
-        Some(QueryOverrides::SQLite) => {
-            queries.remove(28); // q29 includes regexp_replace which is not supported by sqlite
+        Some(QueryOverrides::SQLite | QueryOverrides::Turso) => {
+            queries.remove(28); // q29 includes regexp_replace which is not supported by SQLite/Turso
             Some(generate_clickbench_query_overrides!(
                 "sqlite", 7, 19, 24, 25, 27, 37, 38, 39, 40, 41, 42, 43
             ))

@@ -12,16 +12,20 @@ build-cli:
 build-cli-dev:
 	cargo build -p spice
 
-.PHONY: build-runtime
-build-runtime:
+.PHONY: build-spiced
+build-spiced:
 	make -C bin/spiced
+
+.PHONY: build-spiced-dev
+build-spiced-dev:
+	cargo build -p spiced
 
 .PHONY: build-validator
 build-validator:
 	cargo build --release -p spicepod-validator
 
 .PHONY: build
-build: build-cli build-runtime
+build: build-cli build-spiced
 
 .PHONY: build-dev
 build-dev:
@@ -484,8 +488,8 @@ install-cli: build-cli
 	mkdir -p ~/.spice/bin
 	install -m 755 $(TARGET_DIR)/release/spice ~/.spice/bin/spice
 
-.PHONY: install-runtime
-install-runtime: build-runtime
+.PHONY: install-spiced
+install-spiced: build-spiced
 	mkdir -p ~/.spice/bin
 	install -m 755 $(TARGET_DIR)/release/spiced ~/.spice/bin/spiced
 
@@ -493,6 +497,11 @@ install-runtime: build-runtime
 install-cli-dev: build-cli-dev
 	mkdir -p ~/.spice/bin
 	install -m 755 $(TARGET_DIR)/debug/spice ~/.spice/bin/spice
+
+.PHONY: install-spiced-dev
+install-spiced-dev: build-spiced-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 $(TARGET_DIR)/debug/spiced ~/.spice/bin/spiced
 
 ################################################################################
 # Target: distributed                                                          #

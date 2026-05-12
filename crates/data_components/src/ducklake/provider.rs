@@ -32,7 +32,9 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbcon
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use globset::GlobSet;
 use snafu::prelude::*;
+use tokio::sync::Mutex;
 
+use super::writer::DuckDbFederatedTableWriter;
 use crate::RefreshableCatalogProvider;
 
 #[derive(Debug, Snafu)]
@@ -79,6 +81,11 @@ pub struct DuckLakeCatalogProvider {
     ddl_enabled: bool,
     /// Optional glob filter for table inclusion (`schema.table` format)
     include: Option<Arc<GlobSet>>,
+    /// Shared write lock to serialize concurrent writes across all schemas.
+    /// All schemas share one `DuckDB` instance which enforces single-writer semantics;
+    /// serializing here avoids wasting blocking threads that would just wait on `DuckDB`'s
+    /// internal write lock.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for DuckLakeCatalogProvider {
@@ -118,6 +125,7 @@ impl DuckLakeCatalogProvider {
             writable,
             ddl_enabled,
             include: include.map(Arc::new),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -187,6 +195,7 @@ impl DuckLakeCatalogProvider {
                 self.writable,
                 self.ddl_enabled,
                 self.include.clone(),
+                Arc::clone(&self.write_lock),
             );
             schema_provider.refresh().await?;
             schemas.insert(schema_name, Arc::new(schema_provider));
@@ -279,6 +288,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                 ducklake_schema.writable,
                 ducklake_schema.ddl_enabled,
                 ducklake_schema.include.clone(),
+                Arc::clone(&ducklake_schema.write_lock),
             ))
         } else {
             Arc::new(DuckLakeSchemaProvider::new(
@@ -289,6 +299,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                 self.writable,
                 self.ddl_enabled,
                 self.include.clone(),
+                Arc::clone(&self.write_lock),
             ))
         };
 
@@ -403,6 +414,11 @@ pub struct DuckLakeSchemaProvider {
     ddl_enabled: bool,
     /// Optional glob filter for table inclusion (`schema.table` format)
     include: Option<Arc<GlobSet>>,
+    /// Shared write lock to serialize concurrent writes across all schemas.
+    /// All schemas share one `DuckDB` instance which enforces single-writer semantics;
+    /// serializing here avoids wasting blocking threads that would just wait on `DuckDB`'s
+    /// internal write lock.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for DuckLakeSchemaProvider {
@@ -428,6 +444,10 @@ impl DuckLakeSchemaProvider {
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
     /// * `include` - Optional glob filter for table inclusion (`schema.table` format)
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "schema provider requires all these configuration parameters"
+    )]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
         duckdb_factory: Arc<DuckDBTableFactory>,
@@ -436,6 +456,7 @@ impl DuckLakeSchemaProvider {
         writable: bool,
         ddl_enabled: bool,
         include: Option<Arc<GlobSet>>,
+        write_lock: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             pool,
@@ -446,6 +467,7 @@ impl DuckLakeSchemaProvider {
             writable,
             ddl_enabled,
             include,
+            write_lock,
         }
     }
 
@@ -510,9 +532,22 @@ impl DuckLakeSchemaProvider {
                 table_name.clone(),
             );
 
-            // Use the DuckDB table factory (which shares the same pool with ducklake attached)
-            match self.duckdb_factory.table_provider(table_ref).await {
+            // Use the DuckDB table factory to get a read provider, then wrap with
+            // DuckDbFederatedTableWriter when writable. The writer properly
+            // handles multi-part table references (catalog.schema.table) in SQL generation.
+            let provider_result = self.duckdb_factory.table_provider(table_ref.clone()).await;
+            match provider_result {
                 Ok(provider) => {
+                    let provider: Arc<dyn TableProvider> = if self.writable {
+                        DuckDbFederatedTableWriter::create(
+                            provider,
+                            Arc::clone(&self.pool),
+                            &table_ref,
+                            Arc::clone(&self.write_lock),
+                        )
+                    } else {
+                        provider
+                    };
                     tables.insert(table_name, provider);
                 }
                 Err(e) => {
