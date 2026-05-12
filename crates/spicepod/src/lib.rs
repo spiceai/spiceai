@@ -101,6 +101,21 @@ pub enum Error {
         path: PathBuf,
     },
 
+    #[snafu(display(
+        "Not a valid Spicepod file: {}\n\n\
+        Expected 'kind: Spicepod' but found 'kind: {kind}'.\n\
+        Ensure the file is a valid Spicepod YAML file.",
+        path.display()
+    ))]
+    InvalidSpicepodKind { kind: String, path: PathBuf },
+
+    #[snafu(display(
+        "Unsupported Spicepod version in {}: '{version}'\n\n\
+        Supported versions are: v1, v2 (or full semver: v1.0.0, v2.0.0-rc.1, etc.)",
+        path.display()
+    ))]
+    InvalidSpicepodVersion { version: String, path: PathBuf },
+
     #[cfg(feature = "object-store")]
     #[snafu(display("Unable to parse S3 URL {}: {source}", path))]
     UnableToParseS3Url {
@@ -151,6 +166,30 @@ pub struct Spicepod {
     pub management: Option<Management>,
 
     pub snapshots: Option<Snapshots>,
+}
+
+fn validate_spicepod_header(raw: &yaml::Value, path: &Path) -> Result<()> {
+    if let Some(kind) = raw.get("kind").and_then(yaml::Value::as_str)
+        && kind != "Spicepod"
+    {
+        return InvalidSpicepodKindSnafu {
+            kind: kind.to_string(),
+            path: path.to_path_buf(),
+        }
+        .fail();
+    }
+
+    if let Some(version_val) = raw.get("version")
+        && yaml::from_value::<SpicepodVersion>(version_val.clone()).is_err()
+    {
+        return InvalidSpicepodVersionSnafu {
+            version: version_val.as_str().unwrap_or("unknown").to_string(),
+            path: path.to_path_buf(),
+        }
+        .fail();
+    }
+
+    Ok(())
 }
 
 fn detect_duplicate_component_names(
@@ -231,8 +270,14 @@ impl Spicepod {
         path: impl Into<PathBuf>,
     ) -> Result<Spicepod> {
         let path = path.into();
-        let spicepod_definition: SpicepodDefinition =
+
+        let raw: yaml::Value =
             yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+
+        validate_spicepod_header(&raw, &path)?;
+
+        let spicepod_definition: SpicepodDefinition =
+            yaml::from_value(raw).context(UnableToParseSpicepodSnafu)?;
 
         let resolved_datasets = component::resolve_component_references(
             fs,
@@ -351,14 +396,9 @@ impl Spicepod {
     ) -> Result<Spicepod> {
         let path = path.into();
 
-        let file_stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
         let is_file = path.is_file() || path.extension().is_some();
 
-        let (spicepod_rdr, base_path) = if file_stem == "spicepod" && is_file {
+        let (spicepod_rdr, base_path) = if is_file {
             let spicepod_rdr = fs
                 .open_exact_yaml(path.clone())
                 .await
@@ -1273,6 +1313,61 @@ mod version_tests {
                 .unwrap_or_else(|e| panic!("Failed to load v1 fixture {file}: {e}"));
             assert_eq!(pod.version, SpicepodVersion::V1, "Expected V1 for {file}");
         }
+    }
+
+    /// `load_from` accepts any YAML file path, not just files named "spicepod".
+    #[tokio::test]
+    async fn test_load_from_accepts_arbitrary_filename() {
+        let pod = Spicepod::load_from(&reader::StdFileSystem, "./tests/basic_spicepod.yaml")
+            .await
+            .expect("load_from should accept a file path with a non-spicepod stem");
+        assert_eq!(pod.name, "basic_spicepod");
+    }
+
+    /// `load_from` with a directory still finds spicepod.yaml inside it.
+    #[tokio::test]
+    async fn test_load_from_directory_finds_spicepod_yaml() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let spicepod_content = "version: v1\nkind: Spicepod\nname: test_pod\n";
+        std::fs::write(dir.path().join("spicepod.yaml"), spicepod_content)
+            .expect("write spicepod.yaml");
+
+        let pod = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .expect("load_from should find spicepod.yaml in a directory");
+        assert_eq!(pod.name, "test_pod");
+    }
+
+    /// A file with a wrong `kind` (e.g. a Kubernetes YAML) is rejected with a clear error.
+    #[tokio::test]
+    async fn test_load_from_rejects_wrong_kind() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("deployment.yaml");
+        std::fs::write(&path, "kind: Deployment\nname: my-app\nversion: v1\n").expect("write file");
+
+        let err = Spicepod::load_from(&reader::StdFileSystem, &path)
+            .await
+            .expect_err("should reject wrong kind");
+        assert!(
+            err.to_string().contains("kind: Deployment"),
+            "error should mention the wrong kind: {err}"
+        );
+    }
+
+    /// A file with an unrecognised version is rejected with a clear error.
+    #[tokio::test]
+    async fn test_load_from_rejects_unknown_version() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("spicepod.yaml");
+        std::fs::write(&path, "kind: Spicepod\nname: my-app\nversion: v99\n").expect("write file");
+
+        let err = Spicepod::load_from(&reader::StdFileSystem, &path)
+            .await
+            .expect_err("should reject unknown version");
+        assert!(
+            err.to_string().contains("v99"),
+            "error should mention the unsupported version: {err}"
+        );
     }
 
     /// All v2-versioned test spicepods load successfully.
