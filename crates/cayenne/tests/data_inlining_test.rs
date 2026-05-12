@@ -343,10 +343,19 @@ async fn test_pk_upsert_inline_mutation(
     assert_eq!(ids.values(), &[1_i64, 2]);
     assert_eq!(names.value(0), "Alicia");
     assert_eq!(names.value(1), "Bob");
-    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 3);
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+    let mut inlined_record_counts = fixture
+        .catalog
+        .get_inlined_data(&table_id)
+        .await?
+        .into_iter()
+        .map(|entry| entry.record_count)
+        .collect::<Vec<_>>();
+    inlined_record_counts.sort_unstable();
+    assert_eq!(inlined_record_counts, vec![1_i64, 1]);
     assert_eq!(
         fixture.catalog.get_inlined_deletes(&table_id).await?.len(),
-        1
+        0
     );
     assert!(
         fixture
@@ -388,10 +397,13 @@ async fn test_pk_delete_inline_mutation(
     assert_eq!(ids.values(), &[1_i64, 3]);
     assert_eq!(names.value(0), "Alice");
     assert_eq!(names.value(1), "Cara");
-    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 3);
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+    let inlined_data = fixture.catalog.get_inlined_data(&table_id).await?;
+    assert_eq!(inlined_data.len(), 1);
+    assert_eq!(inlined_data[0].record_count, 2);
     assert_eq!(
         fixture.catalog.get_inlined_deletes(&table_id).await?.len(),
-        1
+        0
     );
     assert!(
         fixture

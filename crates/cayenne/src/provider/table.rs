@@ -29,14 +29,14 @@ use super::delete::{
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use crate::metadata::{CreateTableOptions, TableMetadata};
+use crate::metadata::{CreateTableOptions, InlinedData, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
 use datafusion::datasource::file_format::FileFormat;
@@ -323,24 +323,6 @@ fn deserialize_ipc_to_batch(
     reader.collect()
 }
 
-fn serialize_delete_keys_to_ipc(
-    row_keys: &[Box<[u8]>],
-) -> std::result::Result<Vec<u8>, arrow::error::ArrowError> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("row_key", DataType::Binary, false),
-        Field::new("deleted_at", DataType::Int64, false),
-    ]));
-    let key_refs: Vec<&[u8]> = row_keys.iter().map(AsRef::as_ref).collect();
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::BinaryArray::from(key_refs)),
-            Arc::new(arrow::array::Int64Array::from(vec![0_i64; row_keys.len()])),
-        ],
-    )?;
-    serialize_batches_to_ipc(&[batch])
-}
-
 fn deserialize_delete_keys_from_ipc(
     ipc_bytes: &[u8],
 ) -> std::result::Result<Vec<Box<[u8]>>, arrow::error::ArrowError> {
@@ -609,6 +591,20 @@ struct InlinedDeletionMaps {
 struct ExtractedPrimaryKeys {
     int64_pk: Vec<i64>,
     row_keys: Vec<Box<[u8]>>,
+}
+
+#[derive(Default)]
+struct InlinedDataRewrite {
+    updated_data: Vec<InlinedData>,
+    deleted_inlined_ids: Vec<String>,
+    removed_rows: usize,
+}
+
+impl InlinedDataRewrite {
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.updated_data.is_empty() && self.deleted_inlined_ids.is_empty()
+    }
 }
 
 struct InlineAwareDeletionSink {
@@ -2567,92 +2563,215 @@ impl CayenneTableProvider {
         Ok((Some(filtered_batch), kept_keys))
     }
 
-    fn build_inlined_pk_delete_entry(
-        &self,
-        deleted_pk_i64: &[i64],
-        deleted_row_keys: &[Box<[u8]>],
-        sequence_number: i64,
-    ) -> CatalogResult<Option<crate::metadata::InlinedDelete>> {
-        let mut row_keys: Vec<Box<[u8]>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { .. } => deleted_pk_i64
-                .iter()
-                .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                .collect(),
-            PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys.to_vec(),
-            PkDeletionStrategyWithCache::PositionBased { .. } => Vec::new(),
-        };
+    fn adjust_cached_inlined_row_count(&self, delta: i64) {
+        let _ =
+            self.inlined_row_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(if delta >= 0 {
+                        current.saturating_add(delta)
+                    } else {
+                        current.saturating_sub(delta.saturating_abs())
+                    })
+                });
+    }
 
-        if row_keys.is_empty() {
-            return Ok(None);
+    fn rewritten_inlined_data_entry(
+        source: &InlinedData,
+        batches: &[RecordBatch],
+        record_count: usize,
+    ) -> Result<InlinedData> {
+        let data_ipc = serialize_batches_to_ipc(batches)?;
+
+        Ok(InlinedData {
+            inlined_id: source.inlined_id.clone(),
+            table_id: source.table_id.clone(),
+            partition_key: source.partition_key.clone(),
+            data_ipc,
+            record_count: i64::try_from(record_count).unwrap_or(i64::MAX),
+            sequence_number: source.sequence_number,
+            created_at: source.created_at.clone(),
+        })
+    }
+
+    fn filter_inlined_batch_for_pk_deletions(
+        &self,
+        batch: RecordBatch,
+        deleted_pk_i64: &HashSet<i64>,
+        deleted_row_keys: &HashSet<Box<[u8]>>,
+    ) -> Result<(Option<RecordBatch>, usize)> {
+        if batch.num_rows() == 0 {
+            return Ok((None, 0));
         }
 
-        row_keys.sort();
-        row_keys.dedup();
+        let pk_indices = &self.pk_column_indices;
+        if pk_indices.is_empty() {
+            return Ok((Some(batch), 0));
+        }
 
-        let delete_ipc = serialize_delete_keys_to_ipc(&row_keys).map_err(|err| {
-            CatalogError::InvalidOperationNoSource {
-                message: format!("Failed to serialize inlined delete keys: {err}"),
+        let mut keep_mask = Vec::with_capacity(batch.num_rows());
+        let mut removed_rows = 0_usize;
+
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                if deleted_pk_i64.is_empty() {
+                    return Ok((Some(batch), 0));
+                }
+
+                let pk_array = batch
+                    .column(pk_indices[0])
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .ok_or_else(|| Error::DataValidation {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Int64 primary key column has unexpected type".to_string(),
+                    })?;
+
+                for row_index in 0..batch.num_rows() {
+                    if pk_array.is_null(row_index) {
+                        return Err(Error::DataValidation {
+                            table: self.table_metadata.table_name.clone(),
+                            message: "Primary key values must be non-null".to_string(),
+                        });
+                    }
+                    let should_delete = deleted_pk_i64.contains(&pk_array.value(row_index));
+                    keep_mask.push(!should_delete);
+                    removed_rows += usize::from(should_delete);
+                }
             }
-        })?;
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                if deleted_row_keys.is_empty() {
+                    return Ok((Some(batch), 0));
+                }
 
-        Ok(Some(crate::metadata::InlinedDelete {
-            inlined_id: String::new(),
-            table_id: self.table_metadata.table_id.clone(),
-            delete_ipc,
-            delete_count: i64::try_from(row_keys.len()).unwrap_or(i64::MAX),
-            sequence_number,
-            created_at: String::new(),
-        }))
+                let converter = self.build_pk_converter(pk_indices)?;
+                let pk_columns: Vec<_> = pk_indices
+                    .iter()
+                    .map(|idx| Arc::clone(batch.column(*idx)))
+                    .collect();
+                let rows = converter.convert_columns(&pk_columns)?;
+
+                for row_index in 0..batch.num_rows() {
+                    if pk_columns.iter().any(|column| column.is_null(row_index)) {
+                        return Err(Error::DataValidation {
+                            table: self.table_metadata.table_name.clone(),
+                            message: "Primary key values must be non-null".to_string(),
+                        });
+                    }
+                    let should_delete = deleted_row_keys.contains(rows.row(row_index).as_ref());
+                    keep_mask.push(!should_delete);
+                    removed_rows += usize::from(should_delete);
+                }
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => return Ok((Some(batch), 0)),
+        }
+
+        if removed_rows == 0 {
+            return Ok((Some(batch), 0));
+        }
+        if removed_rows == batch.num_rows() {
+            return Ok((None, removed_rows));
+        }
+
+        let filter_array = arrow::array::BooleanArray::from(keep_mask);
+        let filtered_batch = arrow::compute::filter_record_batch(&batch, &filter_array)?;
+        Ok((Some(filtered_batch), removed_rows))
     }
 
-    async fn persist_inlined_pk_deletions_with_sequence(
+    async fn build_inlined_data_rewrite_for_pk_keys(
         &self,
         deleted_pk_i64: &[i64],
         deleted_row_keys: &[Box<[u8]>],
-        delete_sequence: i64,
-    ) -> CatalogResult<()> {
-        let Some(delete) =
-            self.build_inlined_pk_delete_entry(deleted_pk_i64, deleted_row_keys, delete_sequence)?
-        else {
-            return Ok(());
-        };
+    ) -> Result<InlinedDataRewrite> {
+        let deleted_pk_i64: HashSet<i64> = deleted_pk_i64.iter().copied().collect();
+        let deleted_row_keys: HashSet<Box<[u8]>> = deleted_row_keys.iter().cloned().collect();
+        if deleted_pk_i64.is_empty() && deleted_row_keys.is_empty() {
+            return Ok(InlinedDataRewrite::default());
+        }
 
-        let delete_count = delete.delete_count;
+        let inlined_data = self
+            .catalog
+            .get_inlined_data(&self.table_metadata.table_id)
+            .await?;
+        if inlined_data.is_empty() {
+            return Ok(InlinedDataRewrite::default());
+        }
 
-        self.catalog.add_inlined_delete(delete).await?;
+        let legacy_inlined_deletions = self.load_inlined_deletion_maps().await?;
+        let mut rewrite = InlinedDataRewrite::default();
 
-        tracing::debug!(
-            "Inlined {} delete key(s) for table {} (seq={})",
-            delete_count,
-            self.table_metadata.table_name,
-            delete_sequence,
-        );
+        for entry in inlined_data {
+            let batches = deserialize_ipc_to_batch(&entry.data_ipc)?;
+            let mut rewritten_batches = Vec::with_capacity(batches.len());
+            let mut original_rows = 0_usize;
+            let mut remaining_rows = 0_usize;
+            let mut entry_removed_rows = 0_usize;
 
-        Ok(())
+            for batch in batches {
+                original_rows += batch.num_rows();
+                let Some(visible_batch) = self.filter_inlined_batch_for_deletions(
+                    batch,
+                    entry.sequence_number,
+                    &legacy_inlined_deletions,
+                )?
+                else {
+                    continue;
+                };
+                let (filtered_batch, removed_rows) = self.filter_inlined_batch_for_pk_deletions(
+                    visible_batch,
+                    &deleted_pk_i64,
+                    &deleted_row_keys,
+                )?;
+                entry_removed_rows += removed_rows;
+                if let Some(batch) = filtered_batch {
+                    remaining_rows += batch.num_rows();
+                    rewritten_batches.push(batch);
+                }
+            }
+
+            if entry_removed_rows == 0 {
+                continue;
+            }
+
+            rewrite.removed_rows += original_rows.saturating_sub(remaining_rows);
+            if remaining_rows == 0 {
+                rewrite.deleted_inlined_ids.push(entry.inlined_id);
+            } else {
+                rewrite
+                    .updated_data
+                    .push(Self::rewritten_inlined_data_entry(
+                        &entry,
+                        &rewritten_batches,
+                        remaining_rows,
+                    )?);
+            }
+        }
+
+        Ok(rewrite)
     }
 
-    async fn commit_inlined_pk_deletions(
+    async fn commit_inlined_data_mutation(
         &self,
-        deleted_pk_i64: &[i64],
-        deleted_row_keys: &[Box<[u8]>],
+        rewrite: InlinedDataRewrite,
+        data: Vec<InlinedData>,
+        appended_rows: usize,
     ) -> CatalogResult<()> {
-        let Some(delete) =
-            self.build_inlined_pk_delete_entry(deleted_pk_i64, deleted_row_keys, 0)?
-        else {
+        if rewrite.is_empty() && data.is_empty() {
             return Ok(());
-        };
+        }
 
-        let delete_count = delete.delete_count;
-
+        let removed_rows = rewrite.removed_rows;
         self.catalog
-            .commit_inlined_mutation(&self.table_metadata.table_id, vec![delete], vec![])
+            .commit_inlined_mutation(
+                &self.table_metadata.table_id,
+                rewrite.updated_data,
+                rewrite.deleted_inlined_ids,
+                data,
+            )
             .await?;
 
-        tracing::debug!(
-            "Inlined {} delete key(s) for table {}",
-            delete_count,
-            self.table_metadata.table_name,
-        );
+        let appended_rows = i64::try_from(appended_rows).unwrap_or(i64::MAX);
+        let removed_rows = i64::try_from(removed_rows).unwrap_or(i64::MAX);
+        self.adjust_cached_inlined_row_count(appended_rows.saturating_sub(removed_rows));
 
         Ok(())
     }
@@ -2689,6 +2808,35 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
+        let inlined_rewrite = if has_inlined_deletions {
+            self.build_inlined_data_rewrite_for_pk_keys(
+                &deleted_inlined_pk_i64,
+                &deleted_inlined_row_keys,
+            )
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to rewrite inlined data for upserted PKs: {err}"),
+            })?
+        } else {
+            InlinedDataRewrite::default()
+        };
+
+        if !inlined_rewrite.is_empty() {
+            let removed_rows = inlined_rewrite.removed_rows;
+            self.commit_inlined_data_mutation(inlined_rewrite, vec![], 0)
+                .await?;
+
+            tracing::debug!(
+                "Removed {} inlined row(s) for table {} during upsert rewrite",
+                removed_rows,
+                self.table_metadata.table_name,
+            );
+        }
+
+        if !has_file_deletions {
+            return Ok(());
+        }
+
         // Get a fresh sequence number for this deletion operation.
         // This ensures proper ordering: data written after this delete but before
         // the next delete will be properly filtered.
@@ -2703,20 +2851,6 @@ impl CayenneTableProvider {
         // The insert sequence must be higher than delete sequence so the new row
         // isn't filtered out. We use delete_sequence + 1 for the re-insertion.
         let insert_sequence = delete_sequence + 1;
-
-        self.persist_inlined_pk_deletions_with_sequence(
-            &deleted_inlined_pk_i64,
-            &deleted_inlined_row_keys,
-            delete_sequence,
-        )
-        .await
-        .map_err(|err| CatalogError::InvalidOperationNoSource {
-            message: format!("Failed to persist inlined delete markers for upserted PKs: {err}"),
-        })?;
-
-        if !has_file_deletions {
-            return Ok(());
-        }
 
         // Create a temporary metadata with the fresh delete sequence number.
         // The table_metadata's current_sequence_number is stale (set at table open time),
@@ -3630,7 +3764,7 @@ impl CayenneTableProvider {
     }
 
     /// Write small batches directly to the metastore, optionally atomically
-    /// committing primary-key delete markers for inline rows they replace.
+    /// rewriting inline rows they replace.
     pub(crate) async fn try_inline_batches_with_inlined_deletions(
         &self,
         batches: &[RecordBatch],
@@ -3650,38 +3784,34 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
-        let deletes = self
-            .build_inlined_pk_delete_entry(deleted_inlined_pk_i64, deleted_inlined_row_keys, 0)?
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        self.catalog
-            .commit_inlined_mutation(
-                &self.table_metadata.table_id,
-                deletes,
-                vec![crate::metadata::InlinedData {
-                    inlined_id: String::new(), // auto-generated
-                    table_id: self.table_metadata.table_id.clone(),
-                    partition_key: None,
-                    data_ipc: ipc_bytes,
-                    record_count: i64::try_from(total_rows).unwrap_or(i64::MAX),
-                    sequence_number: 0,
-                    created_at: String::new(), // default in DDL
-                }],
+        let rewrite = self
+            .build_inlined_data_rewrite_for_pk_keys(
+                deleted_inlined_pk_i64,
+                deleted_inlined_row_keys,
             )
             .await?;
+        let removed_rows = rewrite.removed_rows;
 
-        let delta = i64::try_from(total_rows).unwrap_or(i64::MAX);
-        let _ =
-            self.inlined_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    Some(current.saturating_add(delta))
-                });
+        self.commit_inlined_data_mutation(
+            rewrite,
+            vec![InlinedData {
+                inlined_id: String::new(), // auto-generated
+                table_id: self.table_metadata.table_id.clone(),
+                partition_key: None,
+                data_ipc: ipc_bytes,
+                record_count: i64::try_from(total_rows).unwrap_or(i64::MAX),
+                sequence_number: 0,
+                created_at: String::new(), // default in DDL
+            }],
+            total_rows,
+        )
+        .await?;
 
         tracing::debug!(
-            "Inlined {} rows for table {}",
+            "Inlined {} rows for table {} after removing {} replaced inline row(s)",
             total_rows,
             self.table_metadata.table_name,
+            removed_rows,
         );
 
         Ok(true)
@@ -3695,10 +3825,9 @@ impl CayenneTableProvider {
     /// Read visible inlined data for this table and return as `RecordBatch`es.
     ///
     /// Used at scan time to union inlined data with the file-based data. For
-    /// primary-key tables this applies metastore-inlined delete markers and
-    /// regular key-based deletion vectors using each inline entry's sequence
-    /// number, so re-inserts after deletes remain visible without materializing
-    /// the inline batch to a Vortex file.
+    /// primary-key tables this still honors legacy metastore-inlined delete
+    /// markers, while new inline mutations rewrite `cayenne_inlined_data` rows
+    /// directly.
     pub(crate) async fn read_inlined_batches(&self) -> Result<Vec<RecordBatch>> {
         let inlined = self
             .catalog
@@ -3957,53 +4086,123 @@ impl CayenneTableProvider {
             return Ok(0);
         }
 
-        let inlined_batches = self.read_inlined_batches().await.map_err(|e| {
+        let inlined_data = self
+            .catalog
+            .get_inlined_data(&self.table_metadata.table_id)
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read inlined data for delete on table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+        if inlined_data.is_empty() {
+            return Ok(0);
+        }
+
+        let legacy_inlined_deletions = self.load_inlined_deletion_maps().await.map_err(|e| {
             datafusion_common::DataFusionError::Execution(format!(
-                "Failed to read inlined data for delete on table {}: {e}",
+                "Failed to read inlined delete metadata for delete on table {}: {e}",
                 self.table_metadata.table_name
             ))
         })?;
-        if inlined_batches.is_empty() {
-            return Ok(0);
-        }
 
         let coerced_filters = self.coerce_filters_for_inlined_delete(filters)?;
         let physical_filters = self.build_physical_filters_for_inlined_delete(&coerced_filters)?;
-        let mut deleted = ExtractedPrimaryKeys::default();
-        let mut deleted_rows: u64 = 0;
+        let mut rewrite = InlinedDataRewrite::default();
+        let mut matched_deleted_rows = 0_usize;
 
-        for batch in inlined_batches {
-            let filtered_batch = self.apply_inlined_delete_filters(batch, &physical_filters)?;
-            if filtered_batch.num_rows() == 0 {
+        for entry in inlined_data {
+            let batches = deserialize_ipc_to_batch(&entry.data_ipc)?;
+            let mut rewritten_batches = Vec::with_capacity(batches.len());
+            let mut original_rows = 0_usize;
+            let mut remaining_rows = 0_usize;
+            let mut entry_matched_rows = 0_usize;
+
+            for batch in batches {
+                original_rows += batch.num_rows();
+                let Some(visible_batch) = self
+                    .filter_inlined_batch_for_deletions(
+                        batch,
+                        entry.sequence_number,
+                        &legacy_inlined_deletions,
+                    )
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to apply inlined delete visibility for table {}: {e}",
+                            self.table_metadata.table_name
+                        ))
+                    })?
+                else {
+                    continue;
+                };
+
+                let filtered_batch =
+                    self.apply_inlined_delete_filters(visible_batch.clone(), &physical_filters)?;
+                if filtered_batch.num_rows() == 0 {
+                    remaining_rows += visible_batch.num_rows();
+                    rewritten_batches.push(visible_batch);
+                    continue;
+                }
+
+                let keys = self.extract_primary_keys_from_batch(&filtered_batch)?;
+                let deleted_pk_i64: HashSet<i64> = keys.int64_pk.into_iter().collect();
+                let deleted_row_keys: HashSet<Box<[u8]>> = keys.row_keys.into_iter().collect();
+                let (filtered_batch, removed_rows) = self
+                    .filter_inlined_batch_for_pk_deletions(
+                        visible_batch,
+                        &deleted_pk_i64,
+                        &deleted_row_keys,
+                    )
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to rewrite inlined data for delete on table {}: {e}",
+                            self.table_metadata.table_name
+                        ))
+                    })?;
+                entry_matched_rows += removed_rows;
+                if let Some(batch) = filtered_batch {
+                    remaining_rows += batch.num_rows();
+                    rewritten_batches.push(batch);
+                }
+            }
+
+            if entry_matched_rows == 0 {
                 continue;
             }
 
-            deleted_rows = deleted_rows
-                .checked_add(u64::try_from(filtered_batch.num_rows()).map_err(|_| {
-                    datafusion_common::DataFusionError::Execution(
-                        "Inlined delete row count exceeds u64::MAX".to_string(),
-                    )
-                })?)
-                .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(
-                        "Inlined delete row count overflowed u64".to_string(),
-                    )
-                })?;
-
-            let keys = self.extract_primary_keys_from_batch(&filtered_batch)?;
-            deleted.int64_pk.extend(keys.int64_pk);
-            deleted.row_keys.extend(keys.row_keys);
+            matched_deleted_rows += entry_matched_rows;
+            rewrite.removed_rows += original_rows.saturating_sub(remaining_rows);
+            if remaining_rows == 0 {
+                rewrite.deleted_inlined_ids.push(entry.inlined_id);
+            } else {
+                rewrite.updated_data.push(
+                    Self::rewritten_inlined_data_entry(&entry, &rewritten_batches, remaining_rows)
+                        .map_err(|e| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to serialize rewritten inlined data for table {}: {e}",
+                                self.table_metadata.table_name
+                            ))
+                        })?,
+                );
+            }
         }
 
-        if deleted_rows == 0 {
+        if rewrite.is_empty() {
             return Ok(0);
         }
 
-        self.commit_inlined_pk_deletions(&deleted.int64_pk, &deleted.row_keys)
+        let deleted_rows = u64::try_from(matched_deleted_rows).map_err(|_| {
+            datafusion_common::DataFusionError::Execution(
+                "Inlined delete row count exceeds u64::MAX".to_string(),
+            )
+        })?;
+
+        self.commit_inlined_data_mutation(rewrite, vec![], 0)
             .await
             .map_err(|err| {
                 datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to persist inlined delete markers for table {}: {err}",
+                    "Failed to rewrite inlined data for table {}: {err}",
                     self.table_metadata.table_name
                 ))
             })?;
