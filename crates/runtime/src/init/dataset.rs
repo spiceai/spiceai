@@ -1119,7 +1119,11 @@ impl Runtime {
             && let Some(assignments) = self.partition_assignments()
         {
             let assignments = assignments.read().await;
-            let partition_filters = get_partition_filter_exprs(&ds.name, &assignments);
+            let resolved = ds.name.clone().resolve(
+                crate::datafusion::SPICE_DEFAULT_CATALOG,
+                crate::datafusion::SPICE_DEFAULT_SCHEMA,
+            );
+            let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
             if !partition_filters.is_empty() {
                 tracing::debug!(
                     "For table={}, extracted {} partition filter(s) for assigned partitions.",
