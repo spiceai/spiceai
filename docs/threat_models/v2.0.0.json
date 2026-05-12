@@ -121,7 +121,7 @@
             "data": {
               "type": "tm.Process",
               "name": "Spice Runtime",
-              "description": "Rust daemon exposing SQL, Flight, OpenAI-compatible, MCP, and Iceberg APIs with embedded accelerators. Enterprise v2.0 adds external authentication via API key and OIDC/JWT bearer tokens (with OpenID discovery, JWKS retrieval and refresh, claim mapping, and per-protocol auth middleware) and identity-aware SQL functions (`current_user_id()`, `current_org_id()`, `current_role()`, `session_property()`). v2.0 also adds DDL support (CREATE/DROP TABLE) for Iceberg and Cayenne catalogs, async query materialization to object storage, distributed ingestion, URL Tables (opt-in SSRF surface), SMB/NFS data connectors, and acceleration snapshot management API.",
+              "description": "Rust daemon exposing SQL, Flight, OpenAI-compatible, MCP, and Iceberg APIs with embedded accelerators. Enterprise v2.0 adds external authentication via API key and OIDC/JWT bearer tokens (with OpenID discovery, JWKS retrieval and refresh, claim mapping, and per-protocol auth middleware) and identity-aware SQL functions (`current_user_id()`, `current_org_id()`, `current_role()`, `session_property()`). v2.0 also adds DDL support (CREATE/DROP TABLE) for Iceberg and Cayenne catalogs, expanded DML (INSERT/UPDATE/DELETE) across Cayenne, Snowflake, Postgres, DynamoDB, and Sharepoint plus DuckLake INSERT on read_write catalogs, async query materialization to object storage, distributed ingestion, URL Tables (opt-in SSRF surface), SMB/NFS data connectors, acceleration snapshot management API, public-listener mTLS for HTTP and Flight (`runtime.tls.client_auth_mode` none/request/required), and on-disk TLS cert hot-reload across all TLS endpoints.",
               "outOfScope": false,
               "reasonOutOfScope": "",
               "hasOpenThreats": true,
@@ -388,6 +388,19 @@
                   "modelType": "STRIDE",
                   "new": true,
                   "number": 74,
+                  "score": ""
+                },
+                {
+                  "id": "9117a827-6ce6-47cb-8ab4-e4ab7e6eaa40",
+                  "title": "Public mTLS request mode admits anonymous callers while presented certs are promoted to a principal",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Spoofing",
+                  "description": "runtime.tls.client_auth_mode=request configures the public HTTP and Flight listeners to request a client certificate but still accept connections without one. Verified certs are promoted to an auth principal; anonymous callers continue to reach handlers. An operator may believe mTLS is enforced when only opportunistic client auth is in effect.",
+                  "mitigation": "Use client_auth_mode=required for production mTLS enforcement; reserve request mode for migration/audit windows and pair it with logging that surfaces no-cert vs cert-bearing requests. Validation rejects request/required without a CA and rejects none with a CA.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 75,
                   "score": ""
                 }
               ]
@@ -1524,6 +1537,6 @@
     ],
     "diagramTop": 2,
     "reviewer": "Spice AI Engineering Team",
-    "threatTop": 74
+    "threatTop": 75
   }
 }
