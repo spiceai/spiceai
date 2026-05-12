@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-     https://www.apache.org/licenses/LICENSE-2.0
+    https://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,7 +21,7 @@ use data_components::Read;
 use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
 use datafusion::datasource::TableProvider;
 use flight_client::cookie::{CookieService, CookieStore};
-use flight_client::tls::new_tls_flight_channel;
+use flight_client::tls::{ClientIdentity, ClientTlsOptions, new_tls_flight_channel_with_options};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
@@ -56,9 +56,77 @@ pub enum Error {
         parameter: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "mTLS client identity is half-configured: '{set_field}' is set but '{missing_field}' is missing. Set both fields to present a client certificate to the upstream Flight server, or set neither."
+    ))]
+    IncompleteClientIdentity {
+        set_field: String,
+        missing_field: String,
+    },
+
+    #[snafu(display(
+        "mTLS client identity is ambiguous: both file-based ('tls_client_certificate_file') and inline ('tls_client_certificate') params are set. Use one or the other, not both."
+    ))]
+    AmbiguousClientIdentity,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Resolve client identity from file-based and inline params.
+/// Returns `Ok(None)` if none configured, `Err` if half-configured or ambiguous.
+fn resolve_client_identity_params(
+    cert_file: Option<PathBuf>,
+    key_file: Option<PathBuf>,
+    cert_inline: Option<Vec<u8>>,
+    key_inline: Option<Vec<u8>>,
+) -> std::result::Result<Option<ClientIdentity>, Box<dyn std::error::Error + Send + Sync>> {
+    let has_file_cert = cert_file.is_some();
+    let has_file_key = key_file.is_some();
+    let has_inline_cert = cert_inline.is_some();
+    let has_inline_key = key_inline.is_some();
+
+    if (has_file_cert || has_file_key) && (has_inline_cert || has_inline_key) {
+        return Err(Box::new(Error::AmbiguousClientIdentity));
+    }
+
+    if has_file_cert || has_file_key {
+        return match (cert_file, key_file) {
+            (Some(cert_path), Some(key_path)) => Ok(Some(ClientIdentity::FromFiles {
+                cert_path,
+                key_path,
+            })),
+            (Some(_), None) => Err(Box::new(Error::IncompleteClientIdentity {
+                set_field: "tls_client_certificate_file".to_string(),
+                missing_field: "tls_client_key_file".to_string(),
+            })),
+            (None, Some(_)) => Err(Box::new(Error::IncompleteClientIdentity {
+                set_field: "tls_client_key_file".to_string(),
+                missing_field: "tls_client_certificate_file".to_string(),
+            })),
+            (None, None) => unreachable!(),
+        };
+    }
+
+    if has_inline_cert || has_inline_key {
+        return match (cert_inline, key_inline) {
+            (Some(cert_pem), Some(key_pem)) => {
+                Ok(Some(ClientIdentity::FromPem { cert_pem, key_pem }))
+            }
+            (Some(_), None) => Err(Box::new(Error::IncompleteClientIdentity {
+                set_field: "tls_client_certificate".to_string(),
+                missing_field: "tls_client_key".to_string(),
+            })),
+            (None, Some(_)) => Err(Box::new(Error::IncompleteClientIdentity {
+                set_field: "tls_client_key".to_string(),
+                missing_field: "tls_client_certificate".to_string(),
+            })),
+            (None, None) => unreachable!(),
+        };
+    }
+
+    Ok(None)
+}
 
 #[derive(Debug, Clone)]
 pub struct FlightSQL {
@@ -81,11 +149,19 @@ impl FlightSQLFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("username").secret(),
-    ParameterSpec::component("password").secret(),
-    ParameterSpec::component("endpoint"),
-    ParameterSpec::component("tls_ca_certificate_file")
-        .description("Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates."),
+   ParameterSpec::component("username").secret(),
+   ParameterSpec::component("password").secret(),
+   ParameterSpec::component("endpoint"),
+   ParameterSpec::component("tls_ca_certificate_file")
+       .description("Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates."),
+    ParameterSpec::component("tls_client_certificate_file")
+        .description("Path to a PEM client certificate chain to present during the TLS handshake when the upstream Flight server requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'."),
+    ParameterSpec::component("tls_client_key_file")
+        .description("Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'."),
+    ParameterSpec::component("tls_client_certificate").secret()
+        .description("Inline PEM client certificate chain (or ${ secrets:... } reference) for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'."),
+    ParameterSpec::component("tls_client_key").secret()
+        .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'."),
 ];
 
 impl DataConnectorFactory for FlightSQLFactory {
@@ -114,8 +190,45 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .ok()
                 .map(PathBuf::from);
 
+            let client_certificate_path: Option<PathBuf> = params
+                .parameters
+                .get("tls_client_certificate_file")
+                .expose()
+                .ok()
+                .map(PathBuf::from);
+            let client_key_path: Option<PathBuf> = params
+                .parameters
+                .get("tls_client_key_file")
+                .expose()
+                .ok()
+                .map(PathBuf::from);
+            let client_certificate_inline: Option<Vec<u8>> = params
+                .parameters
+                .get("tls_client_certificate")
+                .expose()
+                .ok()
+                .map(|s| s.as_bytes().to_vec());
+            let client_key_inline: Option<Vec<u8>> = params
+                .parameters
+                .get("tls_client_key")
+                .expose()
+                .ok()
+                .map(|s| s.as_bytes().to_vec());
+
+            let client_identity = resolve_client_identity_params(
+                client_certificate_path,
+                client_key_path,
+                client_certificate_inline,
+                client_key_inline,
+            )?;
+
+            let tls_options = ClientTlsOptions {
+                ca_certificate_path: ca_certificate_path.clone(),
+                client_identity,
+            };
+
             let cookie_store = Arc::new(CookieStore::new());
-            let flight_channel = new_tls_flight_channel(&endpoint, ca_certificate_path.as_deref())
+            let flight_channel = new_tls_flight_channel_with_options(&endpoint, &tls_options)
                 .await
                 .context(UnableToConstructTlsChannelSnafu)?;
             let flight_channel = CookieService::new(flight_channel, Arc::clone(&cookie_store));
