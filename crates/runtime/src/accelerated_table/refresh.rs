@@ -1215,7 +1215,7 @@ impl Refresher {
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
         let notifier = self.on_complete_notification.clone();
-        tokio::spawn(async move {
+        let changes_task = async move {
             let refresh_task = refresh_task_builder.build();
             if let Err(err) = refresh_task
                 .start_changes_stream(
@@ -1229,7 +1229,13 @@ impl Refresher {
             {
                 tracing::error!("Changes stream failed with error: {err}");
             }
-        })
+        };
+
+        if let Some(runtime) = self.cpu_runtime.clone() {
+            runtime.spawn(changes_task)
+        } else {
+            tokio::spawn(changes_task)
+        }
     }
 }
 

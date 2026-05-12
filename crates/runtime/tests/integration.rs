@@ -96,6 +96,7 @@ mod metadata;
 mod mongo;
 #[cfg(feature = "mssql")]
 mod mssql;
+mod mtls_connector;
 mod mtls_public;
 #[cfg(feature = "mysql")]
 mod mysql;
