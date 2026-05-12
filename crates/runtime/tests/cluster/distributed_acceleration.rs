@@ -556,7 +556,6 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
 /// - EXPLAIN plan reflects the distributed scatter-gather for both tables
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Flaky. Needs to be fixed. https://github.com/spiceai/spiceai/issues/10210"]
 async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -600,11 +599,19 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                         let mut cfg = make_named_scheduler_config(
                             "test_distributed_acceleration_join_two_partitioned_tables",
                         );
-                        // Limit each executor to 2 of the 4 partitions per table so
+                        // Limit each executor to 4 partitions (2 per table) so
                         // that partitions are forced to split across the 2 executors,
                         // producing a UnionExec in the query plan.
+                        // Note: this is a global limit across all tables, so with
+                        // 2 tables × 4 buckets we need at least 4 per executor.
                         cfg.partition_assignment_interval = "1s".to_string();
-                        cfg.max_partitions_per_executor = 2;
+                        cfg.max_partitions_per_executor = 4;
+                        // This is to avoid:
+                        //  - 4 partitions of tableA -> executor1, then
+                        //  - 4 partitions of tableB -> executor2
+                        //
+                        // We want executor1: 2 partitions of tableA, 2 partitions of tableB. (similar for executor2).
+                        cfg.max_partition_assignments_per_interval = 2;
                         cfg
                     }),
                     ..SpicepodRuntime::default()
@@ -622,67 +629,44 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
             wait_for_row_count(&harness, "categories", 10, Duration::from_secs(60)).await?;
 
-            // Wait for partition metadata to be fully initialized and assigned
-            // to executors. Poll until the EXPLAIN shows a distributed plan
-            // (FlightSqlExec with bucket filters) rather than an EmptyRelation.
+            // Wait for partition metadata to be fully assigned across both
+            // executors before querying. Without this, the scheduler may
+            // route to a single executor producing a non-distributed plan.
+            let partition_store = harness
+                .scheduler
+                .partition_store()
+                .expect("scheduler should have partition store");
+
+            for table_name in ["test_data", "categories"] {
+                let table_ref = datafusion::sql::TableReference::parse_str(table_name);
+                let assigned = crate::utils::wait_until_true(Duration::from_secs(30), || async {
+                    partition_store.refresh().await.ok();
+                    partition_store
+                        .get_table_metadata(&table_ref)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| {
+                            m.partitions.len() == 4 && m.partitions.iter().all(|p| p.is_assigned())
+                        })
+                })
+                .await;
+                assert!(
+                    assigned,
+                    "All 4 partitions for {table_name} should be assigned"
+                );
+            }
+
             let join_sql = "SELECT t.id, t.name, c.category, c.rating \
                             FROM test_data t JOIN categories c ON t.id = c.id \
                             ORDER BY t.id";
 
-            let start = tokio::time::Instant::now();
-            let plan = loop {
-                let plan = harness.explain(join_sql).await?;
-                let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
-                    .expect("format explain")
-                    .to_string();
-                if plan_fmt.contains("FlightSqlExec")
-                    && plan_fmt.contains("bucket")
-                {
-                    break plan;
-                }
-                assert!(
-                    start.elapsed() <= Duration::from_secs(30),
-                    "Timed out waiting for distributed EXPLAIN plan. Got:\n{plan_fmt}"
-                );
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            };
+            let plan = harness.explain(join_sql).await?;
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
 
-            // Verify plan structure without relying on partition ordering (which depends
-            // on non-deterministic executor-to-partition assignment).
-            assert!(
-                plan_fmt.contains("Inner Join: t.id = c.id"),
-                "plan should contain inner join"
-            );
-            assert!(
-                plan_fmt.contains("TableScan: test_data"),
-                "plan should contain test_data"
-            );
-            assert!(
-                plan_fmt.contains("TableScan: categories"),
-                "plan should contain categories"
-            );
-            // Partition values are no longer injected as bucket filters because
-            // executors only materialise data for their assigned partitions.
-            assert!(
-                !plan_fmt.contains("bucket("),
-                "plan should not contain bucket filters; executors already own only their assigned data"
-            );
-            // Verify distributed execution operators
-            assert!(
-                plan_fmt.contains("FlightSqlExec"),
-                "plan should use FlightSqlExec for distributed execution \n {plan_fmt}"
-            );
-            assert!(
-                plan_fmt.contains("HashJoinExec"),
-                "plan should contain HashJoinExec"
-            );
-            assert!(
-                plan_fmt.contains("SortPreservingMergeExec"),
-                "plan should contain SortPreservingMerge"
-            );
+            assert_explain_snapshot!("join_plan", plan_fmt);
 
             let rows = harness.query(join_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
@@ -1091,15 +1075,15 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
                 ("s3_region".to_string(), "us-east-1".to_string()),
-                (
-                    "s3_key".to_string(),
-                    "${env:AWS_S3_VECTORS_KEY}".to_string(),
-                ),
-                (
-                    "s3_secret".to_string(),
-                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
-                ),
-                ("s3_auth".to_string(), "key".to_string()),
+                // (
+                //     "s3_key".to_string(),
+                //     "${env:AWS_S3_VECTORS_KEY}".to_string(),
+                // ),
+                // (
+                //     "s3_secret".to_string(),
+                //     "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+                // ),
+                // ("s3_auth".to_string(), "key".to_string()),
             ]),
         )),
         partition_assignment_interval: "1s".to_string(),
