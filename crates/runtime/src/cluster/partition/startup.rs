@@ -23,8 +23,8 @@ use datafusion::{
     logical_expr::Expr,
     sql::{ResolvedTableReference, TableReference},
 };
-use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use datafusion_proto::bytes::Serializeable;
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
