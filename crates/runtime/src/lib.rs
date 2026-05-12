@@ -803,9 +803,9 @@ impl Runtime {
             crate::cluster::partition::get_partition_filter_exprs(&table, assignments);
 
         let table_ref = TableReference::full(
-            table.catalog.clone(),
-            table.schema.clone(),
-            table.table.clone(),
+            Arc::<str>::clone(&table.catalog),
+            Arc::<str>::clone(&table.schema),
+            Arc::<str>::clone(&table.table),
         );
         if let Err(e) = self
             .datafusion()
