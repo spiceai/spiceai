@@ -41,7 +41,7 @@ use test_framework::{
     utils::{observe_memory, recursively_get_dir_size},
 };
 
-fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::Result<()> {
+pub(crate) fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::Result<()> {
     // determine if any dataset has acceleration enabled with a file mode engine
     if !app.datasets.iter().any(|ds| {
         ds.acceleration.as_ref().is_some_and(|accel| {
@@ -74,7 +74,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let query_set = args.load_query_set()?;
     if query_set == test_framework::queries::QuerySet::ChBench {
         println!("Preparing chbench source database...");
-        let config = chbench_config_from_env();
+        let config = chbench_config_from_env()?;
         let driver = chbench_driver::ChBenchDriver::connect(config).await?;
         driver.prepare().await?;
         println!("chbench source database ready");
@@ -253,15 +253,15 @@ fn snapshot_predicate(query_name: &str) -> bool {
 /// | `CHBENCH_PG_DB` | `chbench` |
 /// | `CHBENCH_PG_USER` | `bench` |
 /// | `CHBENCH_PG_PASS` | `bench` |
-fn chbench_config_from_env() -> chbench_driver::config::ChBenchConfig {
+pub(crate) fn chbench_config_from_env() -> anyhow::Result<chbench_driver::config::ChBenchConfig> {
     let mut cfg = chbench_driver::config::ChBenchConfig::default();
     if let Ok(v) = std::env::var("CHBENCH_PG_HOST") {
         cfg.pg_host = v;
     }
     if let Ok(v) = std::env::var("CHBENCH_PG_PORT") {
-        if let Ok(p) = v.parse() {
-            cfg.pg_port = p;
-        }
+        cfg.pg_port = v
+            .parse()
+            .map_err(|e| anyhow::anyhow!("CHBENCH_PG_PORT={v:?} is not a valid port number: {e}"))?;
     }
     if let Ok(v) = std::env::var("CHBENCH_PG_DB") {
         cfg.pg_db = v;
@@ -273,5 +273,5 @@ fn chbench_config_from_env() -> chbench_driver::config::ChBenchConfig {
         cfg.pg_pass = v;
     }
 
-    cfg
+    Ok(cfg)
 }

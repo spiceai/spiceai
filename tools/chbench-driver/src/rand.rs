@@ -75,9 +75,10 @@ pub fn rand_tax(rng: &mut impl Rng) -> f64 {
 pub fn rand_original_string(rng: &mut impl Rng) -> String {
     let mut s = rand_chars(rng, 26, 50);
     if rng.gen_range(0..10) == 0 {
-        let bytes = unsafe { s.as_bytes_mut() };
+        let mut bytes = s.into_bytes();
         let pos = rng.gen_range(0..bytes.len().saturating_sub(8));
         bytes[pos..pos + 8].copy_from_slice(b"ORIGINAL");
+        s = String::from_utf8(bytes).unwrap_or_default();
     }
     s
 }

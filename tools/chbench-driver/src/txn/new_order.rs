@@ -19,13 +19,13 @@ limitations under the License.
 //! Inserts an order with 5-15 line items. Updates district.d_next_o_id and stock quantities.
 //! CDC impact: ~15-35 rows per transaction.
 
+use std::time::SystemTime;
+
 use ::rand::Rng;
 use tokio_postgres::Client;
 
 use crate::rand as tpcc_rand;
 use crate::Result;
-
-const TIME_FORMAT: &str = "2026-01-02 15:04:05";
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.gen_range(1..=warehouses);
@@ -111,7 +111,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     })?;
 
     let o_id = d_next_o_id;
-    let now = TIME_FORMAT;
+    let now = SystemTime::now();
 
     // 4. INSERT orders
     tx.execute(

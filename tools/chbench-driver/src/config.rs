@@ -63,7 +63,7 @@ impl Default for ChBenchConfig {
             pg_user: "bench".into(),
             pg_pass: "bench".into(),
             terminals: 10,
-            duration: std::time::Duration::from_secs(60),
+            duration: std::time::Duration::from_secs(300),
             mix: crate::txn::DEFAULT_MIX,
         }
     }

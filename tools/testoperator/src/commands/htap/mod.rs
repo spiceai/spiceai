@@ -1,0 +1,226 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! HTAP test command — runs concurrent TPC-C OLTP workload against the source
+//! PostgreSQL database while executing CH-benCH analytical queries through spiced.
+
+use std::time::{Duration, Instant};
+
+use test_framework::{
+    TestType, anyhow,
+    git,
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
+    spiced::SpicedInstance,
+    spicetest::{
+        SpiceTest,
+        datasets::{EndCondition, NotStarted},
+    },
+    tokio_util::sync::CancellationToken,
+    utils::observe_memory,
+};
+
+use crate::{
+    args::HtapArgs,
+    commands::bench::chbench_config_from_env,
+    health::HealthMonitor,
+    spiced_metrics::MetricsScraper,
+    wait_test_and_memory,
+};
+
+pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
+    let test_args = &args.test_args;
+    let (app, start_request) = super::get_app_and_start_request(&test_args.common).await?;
+
+    // 1. Prepare the source (schema + seed data).
+    println!("Preparing chbench source...");
+    let mut config = chbench_config_from_env()?;
+    config.warehouses = args.warehouses;
+    config.terminals = args.terminals;
+    config.duration = Duration::from_secs(test_args.common.duration);
+    let driver = chbench_driver::ChBenchDriver::connect(config).await?;
+    driver.prepare().await?;
+    println!("chbench source is ready");
+
+    // 2. Start spiced.
+    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let ready_wait_start = Instant::now();
+
+    let memory_token = CancellationToken::new();
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
+
+    spiced_instance
+        .wait_for_ready(Duration::from_secs(test_args.common.ready_wait))
+        .await?;
+
+    let _ready_wait_duration = ready_wait_start.elapsed();
+
+    // Build telemetry resource.
+    let spiced_version = spiced_instance.version().to_string();
+    let spiced_commit_sha =
+        std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let testoperator_commit_sha = git::get_commit_sha();
+    let branch_name = git::get_branch_name();
+    let query_set = test_args.load_query_set()?;
+
+    let benchmark_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "htap"),
+            KeyValue::new("name", app.name.clone()),
+            KeyValue::new("spiced_version", spiced_version),
+            KeyValue::new("query_set", query_set.to_string()),
+            KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("branch_name", branch_name),
+        ])
+        .build();
+
+    let telemetry =
+        super::create_telemetry_with_resource(&test_args.common, benchmark_resource);
+
+    let health_monitor = HealthMonitor::spawn()?;
+
+    let metrics_scraper = if test_args.common.scrape_spiced_metrics {
+        Some(MetricsScraper::spawn()?)
+    } else {
+        None
+    };
+
+    // 3. Start the OLTP workload in the background.
+    let oltp_cancel = CancellationToken::new();
+    let oltp_handle = {
+        let cancel = oltp_cancel.clone();
+        tokio::spawn(async move { driver.run(cancel).await })
+    };
+
+    // 4. Run analytical queries through spiced concurrently with the OLTP load.
+    println!("Running HTAP analytical queries under OLTP load");
+
+    let executor = super::create_query_executor(test_args, &spiced_instance).await?;
+
+    let (_, test_builder) = super::build_test_with_validation(
+        test_args,
+        NotStarted::new()
+            .with_parallel_count(1)
+            .with_end_condition(EndCondition::Duration(Duration::from_secs(
+                test_args.common.duration,
+            )))
+            .with_validate(test_args.validate)
+            .with_scale_factor(test_args.scale_factor.unwrap_or(1.0))
+            .with_query_executor(executor),
+    )
+    .await?;
+
+    let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_results_snapshot(|_| false) // No snapshots for HTAP — results change under OLTP
+        .with_progress_bars(!test_args.common.disable_progress_bars)
+        .start()?;
+
+    let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
+
+    // 5. Stop OLTP and collect results.
+    oltp_cancel.cancel();
+    let oltp_result = oltp_handle.await;
+
+    // Skip row count consistency validation — OLTP mutations cause row counts to vary between iterations.
+    let _metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
+    let test_succeeded = test.succeeded();
+    let mut spiced_instance = test.end()?;
+    let (_max_memory, _median_memory) = observe_memory(memory_token, memory_readings).await?;
+
+    // 6. Report analytical query metrics.
+    // TODO: Re-enable metrics reporting after reviewing/adjusting for HTAP workload.
+    let failures: Vec<String> = Vec::new();
+    // for query in &metrics.metrics {
+    //     let query_name = &query.query_name;
+    //     let row_count = row_counts.get(query_name).unwrap_or(&0);
+    //     let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
+
+    //     let status: u64 = u64::from(match &query.query_status {
+    //         QueryStatus::Passed => true,
+    //         QueryStatus::Failed(reason) => {
+    //             if let Some(reason) = reason {
+    //                 failures.push(format!("{query_name}: {reason}"));
+    //             } else {
+    //                 failures.push(format!("{query_name}: failed with an undetermined error"));
+    //             }
+    //             false
+    //         }
+    //     });
+
+    //     crate::metrics::QUERY_STATUS.record(status, &attributes);
+    //     crate::metrics::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
+    //     crate::metrics::MIN_DURATION.record(query.min_duration_ms, &attributes);
+    //     crate::metrics::MAX_DURATION.record(query.max_duration_ms, &attributes);
+    //     crate::metrics::ITERATIONS.record(query.iterations.try_into()?, &attributes);
+    //     crate::metrics::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
+    //     crate::metrics::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
+    //     crate::metrics::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
+    // }
+
+    // crate::metrics::READY_DURATION.record(ready_wait_duration.as_millis().try_into()?, &[]);
+    // crate::metrics::TEST_DURATION
+    //     .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
+    // crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+    // crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+
+    // super::bench::emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path()?)?;
+
+    // let records = metrics.with_memory_usage(max_memory).build_records()?;
+    // print_batches(&records)?;
+
+    // 7. Report OLTP results.
+    match oltp_result {
+        Ok(Ok(report)) => {
+            println!("\n--- OLTP Workload Summary ---");
+            report.print_summary();
+        }
+        Ok(Err(e)) => {
+            eprintln!("OLTP workload error: {e}");
+        }
+        Err(e) => {
+            eprintln!("OLTP task join error: {e}");
+        }
+    }
+
+    let health_report = health_monitor.stop().await;
+    super::process_spiced_metrics(metrics_scraper, test_args.common.metrics, &[]).await;
+    telemetry.emit().await?;
+    spiced_instance.stop()?;
+
+    let health_report = health_report?;
+    let mut error_messages = Vec::new();
+
+    if !test_succeeded {
+        error_messages.push(format!(
+            "HTAP test failed due to failed queries:\n{}",
+            failures.join("\n")
+        ));
+    }
+
+    if let Some(message) = health_report.failure_message() {
+        eprintln!("Warning: {message}");
+    }
+
+    if !error_messages.is_empty() {
+        return Err(anyhow::anyhow!(error_messages.join("\n")));
+    }
+
+    Ok(())
+}

@@ -19,12 +19,12 @@ limitations under the License.
 //! Delivers the oldest pending order for each of 10 districts.
 //! CDC impact: ~30 rows per transaction (10 DELETEs + 10+10 UPDATEs + up to 10 customer UPDATEs).
 
+use std::time::SystemTime;
+
 use ::rand::Rng;
 use tokio_postgres::Client;
 
 use crate::Result;
-
-const TIME_FORMAT: &str = "2026-01-02 15:04:05";
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.gen_range(1..=warehouses);
@@ -94,9 +94,10 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
         let o_c_id: i32 = o_row.get(0);
 
         // 5. UPDATE order_line delivery date
+        let delivery_d = SystemTime::now();
         tx.execute(
             "UPDATE order_line SET ol_delivery_d = $1 WHERE ol_w_id = $2 AND ol_d_id = $3 AND ol_o_id = $4",
-            &[&TIME_FORMAT, &w_id, &d_id, &no_o_id],
+            &[&delivery_d, &w_id, &d_id, &no_o_id],
         )
         .await
         .map_err(|source| crate::Error::Sql {

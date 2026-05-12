@@ -4,7 +4,7 @@ select
 from
     customer, new_order, orders, order_line
 where
-    c_state like 'a%'
+    c_state like 'A%'
     and c_id = o_c_id
     and c_w_id = o_w_id
     and c_d_id = o_d_id

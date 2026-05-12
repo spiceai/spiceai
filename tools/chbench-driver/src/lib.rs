@@ -156,7 +156,6 @@ impl ChBenchDriver {
         }
 
         let report = combined.finish();
-        report.print_summary();
         Ok(report)
     }
 }

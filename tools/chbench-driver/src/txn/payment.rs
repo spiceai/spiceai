@@ -19,13 +19,13 @@ limitations under the License.
 //! Updates warehouse/district/customer balances and inserts a history record.
 //! CDC impact: 4 rows per transaction (3 UPDATEs + 1 INSERT).
 
+use std::time::SystemTime;
+
 use ::rand::Rng;
 use tokio_postgres::Client;
 
 use crate::rand as tpcc_rand;
 use crate::Result;
-
-const TIME_FORMAT: &str = "2026-01-02 15:04:05";
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.gen_range(1..=warehouses);
@@ -170,8 +170,12 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
             })?;
 
         let old_data: String = c_data_row.get(0);
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let new_prefix = format!(
-            "| {c_id:4} {c_d_id:2} {c_w_id:4} {d_id:2} {w_id:4} ${h_amount:7.2} {TIME_FORMAT}"
+            "| {c_id:4} {c_d_id:2} {c_w_id:4} {d_id:2} {w_id:4} ${h_amount:7.2} {now_secs}"
         );
         let mut new_data = new_prefix;
         let remaining = 500 - new_data.len().min(500);
@@ -203,9 +207,10 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
 
     // 9. INSERT history
     let h_data = format!("{w_name:>10}    {d_name:>10}");
+    let h_date = SystemTime::now();
     tx.execute(
         "INSERT INTO history (h_c_d_id, h_c_w_id, h_c_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        &[&c_d_id, &c_w_id, &c_id, &d_id, &w_id, &TIME_FORMAT, &h_amount, &h_data],
+        &[&c_d_id, &c_w_id, &c_id, &d_id, &w_id, &h_date, &h_amount, &h_data],
     )
     .await
     .map_err(|source| crate::Error::Sql {
