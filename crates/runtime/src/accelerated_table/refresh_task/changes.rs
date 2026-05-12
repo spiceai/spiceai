@@ -734,9 +734,11 @@ impl RefreshTask {
         // old-tuple). Promote those fields to non-nullable so the batch dtype matches
         // acceleration schema. SchemaCastScanExec handles type coercion;
         // this step only adjusts nullability metadata.
-        let selected_batch = try_cast_to(selected_batch, Arc::clone(&target_schema))
-            .map_err(|e| crate::accelerated_table::Error::FailedToBuildRecordBatch {
-                source: arrow::error::ArrowError::SchemaError(e.to_string()),
+        let selected_batch =
+            try_cast_to(selected_batch, Arc::clone(&target_schema)).map_err(|e| {
+                crate::accelerated_table::Error::FailedToBuildRecordBatch {
+                    source: arrow::error::ArrowError::SchemaError(e.to_string()),
+                }
             })?;
 
         let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
