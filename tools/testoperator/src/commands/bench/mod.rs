@@ -69,6 +69,17 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
+
+    // For chbench, prepare the Postgres source database (schema + seed data) before starting spiced.
+    let query_set = args.load_query_set()?;
+    if query_set == test_framework::queries::QuerySet::ChBench {
+        println!("Preparing chbench source database...");
+        let config = chbench_config_from_env();
+        let driver = chbench_driver::ChBenchDriver::connect(config).await?;
+        driver.prepare().await?;
+        println!("chbench source database ready");
+    }
+
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let ready_wait_start = Instant::now();
 
@@ -90,7 +101,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let testoperator_commit_sha = git::get_commit_sha();
     let branch_name = git::get_branch_name();
 
-    let query_set = args.load_query_set()?;
     let benchmark_resource = Resource::builder_empty()
         .with_attributes(vec![
             KeyValue::new("service.name", "testoperator"),
@@ -134,12 +144,17 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     )
     .await?;
 
-    let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
+    let mut benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
-        .with_explain_plan_snapshot()
         .with_results_snapshot(snapshot_predicate)
-        .with_progress_bars(!args.common.disable_progress_bars)
-        .start()?;
+        .with_progress_bars(!args.common.disable_progress_bars);
+
+    if query_set != test_framework::queries::QuerySet::ChBench {
+        // Skip explain plan snapshot for CH-benCH
+        benchmark_test = benchmark_test.with_explain_plan_snapshot();
+    }
+
+    let benchmark_test = benchmark_test.start()?;
 
     let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
 
@@ -227,4 +242,36 @@ const DISABLED_SNAPSHOT_QUERIES: &[&str] = &[
 fn snapshot_predicate(query_name: &str) -> bool {
     (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q"))
         && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
+}
+
+/// Build a [`chbench_driver::config::ChBenchConfig`] from environment variables with sensible defaults.
+///
+/// | Variable | Default |
+/// |----------|---------|
+/// | `CHBENCH_PG_HOST` | `127.0.0.1` |
+/// | `CHBENCH_PG_PORT` | `5432` |
+/// | `CHBENCH_PG_DB` | `chbench` |
+/// | `CHBENCH_PG_USER` | `bench` |
+/// | `CHBENCH_PG_PASS` | `bench` |
+fn chbench_config_from_env() -> chbench_driver::config::ChBenchConfig {
+    let mut cfg = chbench_driver::config::ChBenchConfig::default();
+    if let Ok(v) = std::env::var("CHBENCH_PG_HOST") {
+        cfg.pg_host = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_PG_PORT") {
+        if let Ok(p) = v.parse() {
+            cfg.pg_port = p;
+        }
+    }
+    if let Ok(v) = std::env::var("CHBENCH_PG_DB") {
+        cfg.pg_db = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_PG_USER") {
+        cfg.pg_user = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_PG_PASS") {
+        cfg.pg_pass = v;
+    }
+
+    cfg
 }

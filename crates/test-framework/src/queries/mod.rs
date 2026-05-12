@@ -583,7 +583,29 @@ impl QuerySet {
             QuerySet::ChBench => {
                 // CH-benCH results are non-deterministic under concurrent OLTP load;
                 // skip row count validation for all queries
-                vec![]
+                vec![
+                    "chbench_q1",
+                    "chbench_q2",
+                    "chbench_q3",
+                    "chbench_q4",
+                    "chbench_q5",
+                    "chbench_q6",
+                    "chbench_q7",
+                    "chbench_q8",
+                    "chbench_q9",
+                    "chbench_q10",
+                    "chbench_q11",
+                    "chbench_q12",
+                    "chbench_q13",
+                    "chbench_q14",
+                    "chbench_q16",
+                    "chbench_q17",
+                    "chbench_q18",
+                    "chbench_q19",
+                    "chbench_q20",
+                    "chbench_q21",
+                    "chbench_q22",
+                ]
             }
             QuerySet::Scenario { .. } => vec![],
         }

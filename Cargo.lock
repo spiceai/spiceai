@@ -3571,7 +3571,6 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-postgres",
- "tracing",
 ]
 
 [[package]]
@@ -18961,6 +18960,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-dynamodb",
  "bollard",
+ "chbench-driver",
  "clap",
  "duckdb",
  "futures",

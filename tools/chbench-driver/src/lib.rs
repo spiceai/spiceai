@@ -72,7 +72,7 @@ impl ChBenchDriver {
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                tracing::error!("CH-benCH source PostgreSQL connection error: {e}");
+                eprintln!("CH-benCH source PostgreSQL connection error: {e}");
             }
         });
 
@@ -81,7 +81,7 @@ impl ChBenchDriver {
 
     /// Drop and recreate all 12 CH-benCH tables, then load seed data.
     pub async fn prepare(&self) -> Result<()> {
-        tracing::info!(
+        println!(
             "Preparing CH-benCH schema with {} warehouse(s)",
             self.config.warehouses,
         );
@@ -90,7 +90,7 @@ impl ChBenchDriver {
         schema::create_tables(&self.client).await?;
         loader::load_all(&self.client, self.config.warehouses, self.config.seed).await?;
 
-        tracing::info!("CH-benCH prepare complete");
+        println!("CH-benCH prepare complete");
         Ok(())
     }
 }

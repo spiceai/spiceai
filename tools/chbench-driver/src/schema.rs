@@ -36,11 +36,61 @@ pub const ALL_TABLES: &[&str] = &[
     "supplier",
 ];
 
+/// Drop stale Spice replication slots and publications left from previous runs (if any).
+pub async fn drop_replication_artifacts(client: &Client) -> Result<()> {
+    // Drop replication slots named spice_*
+    let rows = client
+        .query(
+            "SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'spice_%'",
+            &[],
+        )
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "list replication slots".into(),
+            source,
+        })?;
+
+    for row in &rows {
+        let slot_name: &str = row.get(0);
+        let sql = format!("SELECT pg_drop_replication_slot('{slot_name}')");
+        let _unused = client.execute(&sql, &[]).await;
+    }
+
+    // Drop publications named spice_*
+    let rows = client
+        .query(
+            "SELECT pubname FROM pg_publication WHERE pubname LIKE 'spice_%'",
+            &[],
+        )
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "list publications".into(),
+            source,
+        })?;
+
+    for row in &rows {
+        let pubname: &str = row.get(0);
+        let sql = format!("DROP PUBLICATION IF EXISTS {pubname}");
+        let _unused = client.execute(&sql, &[]).await;
+    }
+
+    if !rows.is_empty() {
+        println!(
+            "  cleaned up {} replication slots, {} publications",
+            rows.len(),
+            rows.len()
+        );
+    }
+
+    Ok(())
+}
+
 /// Drop all CH-benCH tables (reverse order).
 pub async fn drop_tables(client: &Client) -> Result<()> {
+    drop_replication_artifacts(client).await?;
+    println!("  dropping {} tables", ALL_TABLES.len());
     for table in ALL_TABLES.iter().rev() {
         let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
-        tracing::info!("dropping table {table}");
         client.execute(&sql, &[]).await.map_err(|source| {
             crate::Error::Sql {
                 action: format!("drop table {table}"),
@@ -64,8 +114,8 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 w_city VARCHAR(20),
                 w_state CHAR(2),
                 w_zip CHAR(9),
-                w_tax DECIMAL(4, 4),
-                w_ytd DECIMAL(12, 2),
+                w_tax DOUBLE PRECISION,
+                w_ytd DOUBLE PRECISION,
                 PRIMARY KEY (w_id)
             )",
         ),
@@ -80,8 +130,8 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 d_city VARCHAR(20),
                 d_state CHAR(2),
                 d_zip CHAR(9),
-                d_tax DECIMAL(4, 4),
-                d_ytd DECIMAL(12, 2),
+                d_tax DOUBLE PRECISION,
+                d_ytd DOUBLE PRECISION,
                 d_next_o_id INT,
                 PRIMARY KEY (d_w_id, d_id)
             )",
@@ -103,10 +153,10 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 c_phone CHAR(16),
                 c_since TIMESTAMP,
                 c_credit CHAR(2),
-                c_credit_lim DECIMAL(12, 2),
-                c_discount DECIMAL(4, 4),
-                c_balance DECIMAL(12, 2),
-                c_ytd_payment DECIMAL(12, 2),
+                c_credit_lim DOUBLE PRECISION,
+                c_discount DOUBLE PRECISION,
+                c_balance DOUBLE PRECISION,
+                c_ytd_payment DOUBLE PRECISION,
                 c_payment_cnt INT,
                 c_delivery_cnt INT,
                 c_data VARCHAR(500),
@@ -122,7 +172,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 h_d_id INT NOT NULL,
                 h_w_id INT NOT NULL,
                 h_date TIMESTAMP,
-                h_amount DECIMAL(6, 2),
+                h_amount DOUBLE PRECISION,
                 h_data VARCHAR(24)
             )",
         ),
@@ -160,7 +210,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 ol_supply_w_id INT,
                 ol_delivery_d TIMESTAMP,
                 ol_quantity INT,
-                ol_amount DECIMAL(6, 2),
+                ol_amount DOUBLE PRECISION,
                 ol_dist_info CHAR(24),
                 PRIMARY KEY (ol_w_id, ol_d_id, ol_o_id, ol_number)
             )",
@@ -194,7 +244,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 i_id INT NOT NULL,
                 i_im_id INT,
                 i_name VARCHAR(24),
-                i_price DECIMAL(5, 2),
+                i_price DOUBLE PRECISION,
                 i_data VARCHAR(50),
                 PRIMARY KEY (i_id)
             )",
@@ -227,15 +277,15 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 s_address VARCHAR(40) NOT NULL,
                 s_nationkey BIGINT NOT NULL,
                 s_phone CHAR(15) NOT NULL,
-                s_acctbal DECIMAL(15, 2) NOT NULL,
+                s_acctbal DOUBLE PRECISION NOT NULL,
                 s_comment VARCHAR(101) NOT NULL,
                 PRIMARY KEY (s_suppkey)
             )",
         ),
     ];
 
+    println!("  creating {} tables + 4 indexes", ddl_statements.len());
     for (table, ddl) in ddl_statements {
-        tracing::info!("creating table {table}");
         client.execute(*ddl, &[]).await.map_err(|source| {
             crate::Error::Sql {
                 action: format!("create table {table}"),
@@ -265,7 +315,6 @@ pub async fn create_tables(client: &Client) -> Result<()> {
     ];
 
     for (name, ddl) in indexes {
-        tracing::info!("creating index {name}");
         client.execute(*ddl, &[]).await.map_err(|source| {
             crate::Error::Sql {
                 action: format!("create index {name}"),

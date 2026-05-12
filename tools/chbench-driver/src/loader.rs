@@ -16,9 +16,10 @@ limitations under the License.
 
 //! Seed data loader for TPC-C + CH-benCH supplemental tables.
 //!
-//! Mirrors go-tpc's loading logic: for each warehouse, loads warehouse, district,
-//! stock, customer, history, orders, new_order, and order_line. Also loads the
-//! static item, nation, region, and supplier tables.
+//! Uses batched multi-row `INSERT ... VALUES (...), (...), ...` statements
+//! (1024 rows per batch) for faster inserts.
+
+use std::fmt::Write as _;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -35,7 +36,86 @@ const ORDERS_PER_DISTRICT: i32 = 3_000;
 const NEW_ORDERS_PER_DISTRICT: i32 = 900;
 
 const INIT_LOAD_TIME: &str = "2007-01-02 15:04:05";
-const BATCH_SIZE: usize = 500;
+const BATCH_SIZE: usize = 1024;
+
+// ─── Batch sink ───────────────────────────────────────────────────────────────
+
+/// Accumulates rows as SQL value-tuple strings and flushes them as multi-row
+/// `INSERT ... VALUES (...), (...), ...` statements.
+struct BatchSink {
+    insert_hint: String,
+    buf: String,
+    buffered_rows: usize,
+    max_batch_rows: usize,
+}
+
+impl BatchSink {
+    fn new(insert_hint: &str) -> Self {
+        Self {
+            insert_hint: insert_hint.to_owned(),
+            buf: String::with_capacity(64 * 1024),
+            buffered_rows: 0,
+            max_batch_rows: BATCH_SIZE,
+        }
+    }
+
+    fn write_row(&mut self, row: &str) {
+        if self.buffered_rows == 0 {
+            self.buf.push_str(&self.insert_hint);
+            self.buf.push(' ');
+            self.buf.push_str(row);
+        } else {
+            self.buf.push_str(", ");
+            self.buf.push_str(row);
+        }
+        self.buffered_rows += 1;
+    }
+
+    fn needs_flush(&self) -> bool {
+        self.buffered_rows >= self.max_batch_rows
+    }
+
+    async fn flush(&mut self, client: &Client, table: &str) -> Result<()> {
+        if self.buffered_rows == 0 {
+            return Ok(());
+        }
+        client.execute(self.buf.as_str(), &[]).await.map_err(|source| crate::Error::Sql {
+            action: format!("batch insert into {table}"),
+            source,
+        })?;
+        self.buf.clear();
+        self.buffered_rows = 0;
+        Ok(())
+    }
+
+    async fn maybe_flush(&mut self, client: &Client, table: &str) -> Result<()> {
+        if self.needs_flush() {
+            self.flush(client, table).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Escape a string value for SQL literal inclusion (single-quote escaping).
+fn sql_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn sql_opt_str(s: Option<&str>) -> String {
+    match s {
+        Some(v) => sql_str(v),
+        None => "NULL".to_owned(),
+    }
+}
+
+fn sql_opt_i32(v: Option<i32>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "NULL".to_owned(),
+    }
+}
+
+// ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Load all seed data for the given number of warehouses.
 ///
@@ -55,6 +135,13 @@ pub async fn load_all(client: &Client, warehouses: usize, seed: Option<u64>) -> 
 
     for w in 1..=warehouses {
         let w_id = i32::try_from(w).unwrap_or(i32::MAX);
+        println!(
+            "  loading warehouse {w_id}: {DISTRICTS_PER_WAREHOUSE} districts, \
+             {}K customers, {}K orders, ~{}K order lines",
+            DISTRICTS_PER_WAREHOUSE * CUSTOMERS_PER_DISTRICT / 1000,
+            DISTRICTS_PER_WAREHOUSE * ORDERS_PER_DISTRICT / 1000,
+            DISTRICTS_PER_WAREHOUSE * ORDERS_PER_DISTRICT * 10 / 1000,
+        );
         load_warehouse(client, &mut rng, w_id).await?;
         load_district(client, &mut rng, w_id).await?;
         load_stock(client, &mut rng, w_id).await?;
@@ -71,32 +158,35 @@ pub async fn load_all(client: &Client, warehouses: usize, seed: Option<u64>) -> 
     Ok(())
 }
 
+// ─── Per-table loaders ────────────────────────────────────────────────────────
+
 async fn load_item(client: &Client, rng: &mut impl Rng) -> Result<()> {
-    tracing::info!("loading item ({MAX_ITEMS} rows)");
-    let stmt = client
-        .prepare("INSERT INTO item (i_id, i_im_id, i_name, i_price, i_data) VALUES ($1, $2, $3, $4, $5)")
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare item insert".into(), source })?;
+    println!("  loading item ({MAX_ITEMS} rows)");
+    let mut sink = BatchSink::new(
+        "INSERT INTO item (i_id, i_im_id, i_name, i_price, i_data) VALUES",
+    );
+    let mut row = String::new();
 
-    for batch_start in (1..=MAX_ITEMS).step_by(BATCH_SIZE) {
-        let batch_end = (batch_start + i32::try_from(BATCH_SIZE).unwrap_or(i32::MAX) - 1).min(MAX_ITEMS);
-        for i in batch_start..=batch_end {
-            let i_im_id: i32 = rng.gen_range(1..=10_000);
-            let i_price: f64 = f64::from(rng.gen_range(100..=10_000)) / 100.0;
-            let i_name = tpcc_rand::rand_chars(rng, 14, 24);
-            let i_data = tpcc_rand::rand_original_string(rng);
+    for i in 1..=MAX_ITEMS {
+        let i_im_id: i32 = rng.gen_range(1..=10_000);
+        let i_price: f64 = f64::from(rng.gen_range(100..=10_000)) / 100.0;
+        let i_name = tpcc_rand::rand_chars(rng, 14, 24);
+        let i_data = tpcc_rand::rand_original_string(rng);
 
-            client
-                .execute(&stmt, &[&i, &i_im_id, &i_name, &i_price, &i_data])
-                .await
-                .map_err(|source| crate::Error::Sql { action: format!("insert item {i}"), source })?;
-        }
+        row.clear();
+        let _ = write!(row, "({i}, {i_im_id}, {}, {i_price}, {})", sql_str(&i_name), sql_str(&i_data));
+        sink.write_row(&row);
+        sink.maybe_flush(client, "item").await?;
     }
-    Ok(())
+    sink.flush(client, "item").await
 }
 
 async fn load_warehouse(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result<()> {
-    tracing::info!("loading warehouse {w_id}");
+
+    let mut sink = BatchSink::new(
+        "INSERT INTO warehouse (w_id, w_name, w_street_1, w_street_2, w_city, w_state, w_zip, w_tax, w_ytd) VALUES",
+    );
+
     let w_name = tpcc_rand::rand_chars(rng, 6, 10);
     let w_street_1 = tpcc_rand::rand_chars(rng, 10, 20);
     let w_street_2 = tpcc_rand::rand_chars(rng, 10, 20);
@@ -106,25 +196,21 @@ async fn load_warehouse(client: &Client, rng: &mut impl Rng, w_id: i32) -> Resul
     let w_tax = tpcc_rand::rand_tax(rng);
     let w_ytd: f64 = 300_000.00;
 
-    client
-        .execute(
-            "INSERT INTO warehouse (w_id, w_name, w_street_1, w_street_2, w_city, w_state, w_zip, w_tax, w_ytd) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-            &[&w_id, &w_name, &w_street_1, &w_street_2, &w_city, &w_state, &w_zip, &w_tax, &w_ytd],
-        )
-        .await
-        .map_err(|source| crate::Error::Sql { action: format!("insert warehouse {w_id}"), source })?;
-
-    Ok(())
+    let row = format!(
+        "({w_id}, {}, {}, {}, {}, {}, {}, {w_tax}, {w_ytd})",
+        sql_str(&w_name), sql_str(&w_street_1), sql_str(&w_street_2),
+        sql_str(&w_city), sql_str(&w_state), sql_str(&w_zip),
+    );
+    sink.write_row(&row);
+    sink.flush(client, "warehouse").await
 }
 
 async fn load_district(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result<()> {
-    tracing::info!("loading district for warehouse {w_id}");
-    let stmt = client
-        .prepare(
-            "INSERT INTO district (d_id, d_w_id, d_name, d_street_1, d_street_2, d_city, d_state, d_zip, d_tax, d_ytd, d_next_o_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-        )
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare district insert".into(), source })?;
+
+    let mut sink = BatchSink::new(
+        "INSERT INTO district (d_id, d_w_id, d_name, d_street_1, d_street_2, d_city, d_state, d_zip, d_tax, d_ytd, d_next_o_id) VALUES",
+    );
+    let mut row = String::new();
 
     for d in 1..=DISTRICTS_PER_WAREHOUSE {
         let d_name = tpcc_rand::rand_chars(rng, 6, 10);
@@ -135,27 +221,25 @@ async fn load_district(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result
         let d_zip = tpcc_rand::rand_zip(rng);
         let d_tax = tpcc_rand::rand_tax(rng);
         let d_ytd: f64 = 30_000.00;
-        let d_next_o_id: i32 = 3001;
 
-        client
-            .execute(
-                &stmt,
-                &[&d, &w_id, &d_name, &d_street_1, &d_street_2, &d_city, &d_state, &d_zip, &d_tax, &d_ytd, &d_next_o_id],
-            )
-            .await
-            .map_err(|source| crate::Error::Sql { action: format!("insert district {d} warehouse {w_id}"), source })?;
+        row.clear();
+        let _ = write!(
+            row, "({d}, {w_id}, {}, {}, {}, {}, {}, {}, {d_tax}, {d_ytd}, 3001)",
+            sql_str(&d_name), sql_str(&d_street_1), sql_str(&d_street_2),
+            sql_str(&d_city), sql_str(&d_state), sql_str(&d_zip),
+        );
+        sink.write_row(&row);
+        sink.maybe_flush(client, "district").await?;
     }
-    Ok(())
+    sink.flush(client, "district").await
 }
 
 async fn load_stock(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result<()> {
-    tracing::info!("loading stock for warehouse {w_id} ({STOCK_PER_WAREHOUSE} rows)");
-    let stmt = client
-        .prepare(
-            "INSERT INTO stock (s_i_id, s_w_id, s_quantity, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10, s_ytd, s_order_cnt, s_remote_cnt, s_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
-        )
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare stock insert".into(), source })?;
+
+    let mut sink = BatchSink::new(
+        "INSERT INTO stock (s_i_id, s_w_id, s_quantity, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10, s_ytd, s_order_cnt, s_remote_cnt, s_data) VALUES",
+    );
+    let mut row = String::new();
 
     for i in 1..=STOCK_PER_WAREHOUSE {
         let s_quantity: i32 = rng.gen_range(10..=100);
@@ -169,25 +253,20 @@ async fn load_stock(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result<()
         let s_dist_08 = tpcc_rand::rand_letters(rng, 24, 24);
         let s_dist_09 = tpcc_rand::rand_letters(rng, 24, 24);
         let s_dist_10 = tpcc_rand::rand_letters(rng, 24, 24);
-        let s_ytd: i32 = 0;
-        let s_order_cnt: i32 = 0;
-        let s_remote_cnt: i32 = 0;
         let s_data = tpcc_rand::rand_original_string(rng);
 
-        client
-            .execute(
-                &stmt,
-                &[
-                    &i, &w_id, &s_quantity,
-                    &s_dist_01, &s_dist_02, &s_dist_03, &s_dist_04, &s_dist_05,
-                    &s_dist_06, &s_dist_07, &s_dist_08, &s_dist_09, &s_dist_10,
-                    &s_ytd, &s_order_cnt, &s_remote_cnt, &s_data,
-                ],
-            )
-            .await
-            .map_err(|source| crate::Error::Sql { action: format!("insert stock i_id={i} w_id={w_id}"), source })?;
+        row.clear();
+        let _ = write!(
+            row, "({i}, {w_id}, {s_quantity}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, 0, 0, {})",
+            sql_str(&s_dist_01), sql_str(&s_dist_02), sql_str(&s_dist_03),
+            sql_str(&s_dist_04), sql_str(&s_dist_05), sql_str(&s_dist_06),
+            sql_str(&s_dist_07), sql_str(&s_dist_08), sql_str(&s_dist_09),
+            sql_str(&s_dist_10), sql_str(&s_data),
+        );
+        sink.write_row(&row);
+        sink.maybe_flush(client, "stock").await?;
     }
-    Ok(())
+    sink.flush(client, "stock").await
 }
 
 async fn load_customer(
@@ -197,13 +276,11 @@ async fn load_customer(
     d_id: i32,
     c_load: usize,
 ) -> Result<()> {
-    tracing::info!("loading customer for warehouse {w_id} district {d_id}");
-    let stmt = client
-        .prepare(
-            "INSERT INTO customer (c_id, c_d_id, c_w_id, c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount, c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt, c_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
-        )
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare customer insert".into(), source })?;
+
+    let mut sink = BatchSink::new(
+        "INSERT INTO customer (c_id, c_d_id, c_w_id, c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount, c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt, c_data) VALUES",
+    );
+    let mut row = String::new();
 
     for i in 1..=CUSTOMERS_PER_DISTRICT {
         let c_last = if i <= 1000 {
@@ -212,58 +289,54 @@ async fn load_customer(
             tpcc_rand::rand_c_last(rng, c_load)
         };
         let c_first = tpcc_rand::rand_chars(rng, 8, 16);
-        let c_middle = "OE";
         let c_street_1 = tpcc_rand::rand_chars(rng, 10, 20);
         let c_street_2 = tpcc_rand::rand_chars(rng, 10, 20);
         let c_city = tpcc_rand::rand_chars(rng, 10, 20);
         let c_state = tpcc_rand::rand_state(rng);
         let c_zip = tpcc_rand::rand_zip(rng);
         let c_phone = tpcc_rand::rand_numbers(rng, 16, 16);
-        let c_since = INIT_LOAD_TIME;
         let c_credit = if rng.gen_range(0..10) == 0 { "BC" } else { "GC" };
         let c_credit_lim: f64 = 50_000.00;
         let c_discount: f64 = f64::from(rng.gen_range(0..=5_000)) / 10_000.0;
         let c_balance: f64 = -10.00;
         let c_ytd_payment: f64 = 10.00;
-        let c_payment_cnt: i32 = 1;
-        let c_delivery_cnt: i32 = 0;
         let c_data = tpcc_rand::rand_chars(rng, 300, 500);
 
-        client
-            .execute(
-                &stmt,
-                &[
-                    &i, &d_id, &w_id, &c_first, &c_middle, &c_last,
-                    &c_street_1, &c_street_2, &c_city, &c_state, &c_zip, &c_phone,
-                    &c_since, &c_credit, &c_credit_lim, &c_discount, &c_balance,
-                    &c_ytd_payment, &c_payment_cnt, &c_delivery_cnt, &c_data,
-                ],
-            )
-            .await
-            .map_err(|source| crate::Error::Sql { action: format!("insert customer {i} d={d_id} w={w_id}"), source })?;
+        row.clear();
+        let _ = write!(
+            row,
+            "({i}, {d_id}, {w_id}, {}, 'OE', {}, {}, {}, {}, {}, {}, {}, {}, {}, {c_credit_lim}, {c_discount}, {c_balance}, {c_ytd_payment}, 1, 0, {})",
+            sql_str(&c_first), sql_str(&c_last),
+            sql_str(&c_street_1), sql_str(&c_street_2), sql_str(&c_city),
+            sql_str(&c_state), sql_str(&c_zip), sql_str(&c_phone),
+            sql_str(INIT_LOAD_TIME), sql_str(c_credit),
+            sql_str(&c_data),
+        );
+        sink.write_row(&row);
+        sink.maybe_flush(client, "customer").await?;
     }
-    Ok(())
+    sink.flush(client, "customer").await
 }
 
 async fn load_history(client: &Client, rng: &mut impl Rng, w_id: i32, d_id: i32) -> Result<()> {
-    tracing::info!("loading history for warehouse {w_id} district {d_id}");
-    let stmt = client
-        .prepare(
-            "INSERT INTO history (h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare history insert".into(), source })?;
+
+    let mut sink = BatchSink::new(
+        "INSERT INTO history (h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES",
+    );
+    let mut row = String::new();
 
     for i in 1..=CUSTOMERS_PER_DISTRICT {
-        let h_amount: f64 = 10.00;
         let h_data = tpcc_rand::rand_chars(rng, 12, 24);
 
-        client
-            .execute(&stmt, &[&i, &d_id, &w_id, &d_id, &w_id, &INIT_LOAD_TIME, &h_amount, &h_data])
-            .await
-            .map_err(|source| crate::Error::Sql { action: format!("insert history c={i} d={d_id} w={w_id}"), source })?;
+        row.clear();
+        let _ = write!(
+            row, "({i}, {d_id}, {w_id}, {d_id}, {w_id}, {}, 10.00, {})",
+            sql_str(INIT_LOAD_TIME), sql_str(&h_data),
+        );
+        sink.write_row(&row);
+        sink.maybe_flush(client, "history").await?;
     }
-    Ok(())
+    sink.flush(client, "history").await
 }
 
 /// Load orders and return per-order `ol_cnt` values (needed by `load_order_line`).
@@ -273,13 +346,11 @@ async fn load_orders(
     w_id: i32,
     d_id: i32,
 ) -> Result<Vec<i32>> {
-    tracing::info!("loading orders for warehouse {w_id} district {d_id}");
-    let stmt = client
-        .prepare(
-            "INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare orders insert".into(), source })?;
+
+    let mut sink = BatchSink::new(
+        "INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) VALUES",
+    );
+    let mut row = String::new();
 
     // Random permutation of customer IDs
     let mut cids: Vec<i32> = (1..=ORDERS_PER_DISTRICT).collect();
@@ -300,35 +371,35 @@ async fn load_orders(
         };
         let o_ol_cnt: i32 = rng.gen_range(5..=15);
         ol_cnts.push(o_ol_cnt);
-        let o_all_local: i32 = 1;
 
-        client
-            .execute(
-                &stmt,
-                &[&o_id, &d_id, &w_id, &o_c_id, &INIT_LOAD_TIME, &o_carrier_id, &o_ol_cnt, &o_all_local],
-            )
-            .await
-            .map_err(|source| crate::Error::Sql { action: format!("insert order {o_id} d={d_id} w={w_id}"), source })?;
+        row.clear();
+        let _ = write!(
+            row, "({o_id}, {d_id}, {w_id}, {o_c_id}, {}, {}, {o_ol_cnt}, 1)",
+            sql_str(INIT_LOAD_TIME), sql_opt_i32(o_carrier_id),
+        );
+        sink.write_row(&row);
+        sink.maybe_flush(client, "orders").await?;
     }
+    sink.flush(client, "orders").await?;
 
     Ok(ol_cnts)
 }
 
 async fn load_new_order(client: &Client, w_id: i32, d_id: i32) -> Result<()> {
-    tracing::info!("loading new_order for warehouse {w_id} district {d_id}");
-    let stmt = client
-        .prepare("INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES ($1, $2, $3)")
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare new_order insert".into(), source })?;
+
+    let mut sink = BatchSink::new(
+        "INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES",
+    );
+    let mut row = String::new();
 
     for i in 0..NEW_ORDERS_PER_DISTRICT {
         let no_o_id = 2101 + i;
-        client
-            .execute(&stmt, &[&no_o_id, &d_id, &w_id])
-            .await
-            .map_err(|source| crate::Error::Sql { action: format!("insert new_order {no_o_id} d={d_id} w={w_id}"), source })?;
+        row.clear();
+        let _ = write!(row, "({no_o_id}, {d_id}, {w_id})");
+        sink.write_row(&row);
+        sink.maybe_flush(client, "new_order").await?;
     }
-    Ok(())
+    sink.flush(client, "new_order").await
 }
 
 async fn load_order_line(
@@ -338,20 +409,17 @@ async fn load_order_line(
     d_id: i32,
     ol_cnts: &[i32],
 ) -> Result<()> {
-    tracing::info!("loading order_line for warehouse {w_id} district {d_id}");
-    let stmt = client
-        .prepare(
-            "INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-        )
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare order_line insert".into(), source })?;
+
+    let mut sink = BatchSink::new(
+        "INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info) VALUES",
+    );
+    let mut row = String::new();
 
     for (i, &ol_cnt) in ol_cnts.iter().enumerate() {
         let o_id = i32::try_from(i).unwrap_or(0) + 1;
 
         for j in 1..=ol_cnt {
             let ol_i_id: i32 = rng.gen_range(1..=100_000);
-            let ol_quantity: i32 = 5;
 
             let (ol_delivery_d, ol_amount): (Option<&str>, f64) = if o_id < 2101 {
                 (Some(INIT_LOAD_TIME), 0.00)
@@ -360,19 +428,16 @@ async fn load_order_line(
             };
             let ol_dist_info = tpcc_rand::rand_chars(rng, 24, 24);
 
-            client
-                .execute(
-                    &stmt,
-                    &[&o_id, &d_id, &w_id, &j, &ol_i_id, &w_id, &ol_delivery_d, &ol_quantity, &ol_amount, &ol_dist_info],
-                )
-                .await
-                .map_err(|source| crate::Error::Sql {
-                    action: format!("insert order_line o={o_id} ol={j} d={d_id} w={w_id}"),
-                    source,
-                })?;
+            row.clear();
+            let _ = write!(
+                row, "({o_id}, {d_id}, {w_id}, {j}, {ol_i_id}, {w_id}, {}, 5, {ol_amount}, {})",
+                sql_opt_str(ol_delivery_d), sql_str(&ol_dist_info),
+            );
+            sink.write_row(&row);
+            sink.maybe_flush(client, "order_line").await?;
         }
     }
-    Ok(())
+    sink.flush(client, "order_line").await
 }
 
 // ─── CH-benCH supplemental tables (static data) ──────────────────────────────
@@ -459,47 +524,44 @@ const REGIONS: &[(i64, &str)] = &[
 
 async fn load_nation(client: &Client) -> Result<()> {
     let total = NATIONS.len() + EXTRA_NATIONS.len();
-    tracing::info!("loading nation ({total} rows)");
-    let stmt = client
-        .prepare("INSERT INTO nation (n_nationkey, n_name, n_regionkey, n_comment) VALUES ($1, $2, $3, $4)")
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare nation insert".into(), source })?;
+    println!("  loading nation ({total} rows)");
+    let mut sink = BatchSink::new(
+        "INSERT INTO nation (n_nationkey, n_name, n_regionkey, n_comment) VALUES",
+    );
+    let mut row = String::new();
 
-    let comment: Option<&str> = None;
     for &(key, name, region) in NATIONS.iter().chain(EXTRA_NATIONS.iter()) {
-        client
-            .execute(&stmt, &[&key, &name, &region, &comment])
-            .await
-            .map_err(|source| crate::Error::Sql { action: format!("insert nation {key}"), source })?;
+        row.clear();
+        let _ = write!(row, "({key}, {}, {region}, NULL)", sql_str(name));
+        sink.write_row(&row);
+        sink.maybe_flush(client, "nation").await?;
     }
-    Ok(())
+    sink.flush(client, "nation").await
 }
 
 async fn load_region(client: &Client) -> Result<()> {
-    tracing::info!("loading region ({} rows)", REGIONS.len());
-    let stmt = client
-        .prepare("INSERT INTO region (r_regionkey, r_name, r_comment) VALUES ($1, $2, $3)")
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare region insert".into(), source })?;
+    println!("  loading region ({} rows)", REGIONS.len());
+    let mut sink = BatchSink::new(
+        "INSERT INTO region (r_regionkey, r_name, r_comment) VALUES",
+    );
+    let mut row = String::new();
 
-    let comment: Option<&str> = None;
     for &(key, name) in REGIONS {
-        client
-            .execute(&stmt, &[&key, &name, &comment])
-            .await
-            .map_err(|source| crate::Error::Sql { action: format!("insert region {key}"), source })?;
+        row.clear();
+        let _ = write!(row, "({key}, {}, NULL)", sql_str(name));
+        sink.write_row(&row);
     }
-    Ok(())
+    sink.flush(client, "region").await
 }
 
 /// Load 10,000 supplier rows (matching go-tpc / TPC-H dbgen at SF1).
 async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
     const SUPPLIER_COUNT: i64 = 10_000;
-    tracing::info!("loading supplier ({SUPPLIER_COUNT} rows)");
-    let stmt = client
-        .prepare("INSERT INTO supplier (s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-        .await
-        .map_err(|source| crate::Error::Sql { action: "prepare supplier insert".into(), source })?;
+    println!("  loading supplier ({SUPPLIER_COUNT} rows)");
+    let mut sink = BatchSink::new(
+        "INSERT INTO supplier (s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment) VALUES",
+    );
+    let mut row = String::new();
 
     let nation_count = i64::try_from(NATIONS.len()).unwrap_or(25);
 
@@ -517,10 +579,13 @@ async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
         let s_acctbal: f64 = f64::from(rng.gen_range(-99_999..=999_999)) / 100.0;
         let s_comment = tpcc_rand::rand_chars(rng, 25, 63);
 
-        client
-            .execute(&stmt, &[&i, &s_name, &s_address, &s_nationkey, &s_phone, &s_acctbal, &s_comment])
-            .await
-            .map_err(|source| crate::Error::Sql { action: format!("insert supplier {i}"), source })?;
+        row.clear();
+        let _ = write!(
+            row, "({i}, {}, {}, {s_nationkey}, {}, {s_acctbal}, {})",
+            sql_str(&s_name), sql_str(&s_address), sql_str(&s_phone), sql_str(&s_comment),
+        );
+        sink.write_row(&row);
+        sink.maybe_flush(client, "supplier").await?;
     }
-    Ok(())
+    sink.flush(client, "supplier").await
 }
