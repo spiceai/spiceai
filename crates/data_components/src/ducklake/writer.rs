@@ -197,6 +197,27 @@ impl TableProvider for DuckDbFederatedTableWriter {
 
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)) as _)
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.read_provider.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.read_provider.update(state, assignments, filters).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.read_provider.truncate(state).await
+    }
 }
 
 struct DuckDbFederatedDataSink {
