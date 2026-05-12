@@ -1035,11 +1035,14 @@ mod accelerator_compat_tests {
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
     use datafusion::{
-        common::{Constraints, TableReference, ToDFSchema},
+        common::{Constraint, Constraints, TableReference, ToDFSchema},
         datasource::TableProvider,
         execution::context::SessionContext,
         logical_expr::{CreateExternalTable, col, dml::InsertOp, lit},
         physical_plan::collect,
+    };
+    use datafusion_table_providers::util::{
+        column_reference::ColumnReference, on_conflict::OnConflict,
     };
     use datafusion_table_providers::util::test::MockExec;
     use std::{collections::HashMap, sync::Arc};
@@ -1069,17 +1072,39 @@ mod accelerator_compat_tests {
     }
 
     /// Helper function to construct mode label with optional timestamp format
-    fn make_mode_label(mode: &str, timestamp_format: Option<&str>) -> String {
+    fn make_mode_label(
+        mode: &str,
+        timestamp_format: Option<&str>,
+        metastore_type: Option<&str>,
+    ) -> String {
+        let mut labels = vec![mode.to_string()];
         if let Some(ts_fmt) = timestamp_format {
-            format!("{}, timestamp_format={}", mode, ts_fmt)
-        } else {
-            mode.to_string()
+            labels.push(format!("timestamp_format={ts_fmt}"));
         }
+        if let Some(metastore) = metastore_type {
+            labels.push(format!("metastore={metastore}"));
+        }
+        labels.join(", ")
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct CompatTableOptions {
+        primary_key: bool,
     }
 
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
+        F: Fn(Engine, Arc<dyn TableProvider>, String, &TestEnvironment) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        run_compat_test_with_table_options(test_fn, CompatTableOptions::default()).await;
+    }
+
+    async fn run_compat_test_with_table_options<F, Fut>(
+        test_fn: F,
+        table_options: CompatTableOptions,
+    ) where
         F: Fn(Engine, Arc<dyn TableProvider>, String, &TestEnvironment) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
@@ -1115,7 +1140,7 @@ mod accelerator_compat_tests {
             // Create a unique test environment for this test run
             let test_env = TestEnvironment::new();
 
-            let mode_label = make_mode_label(mode, timestamp_format);
+            let mode_label = make_mode_label(mode, timestamp_format, metastore_type);
 
             println!("Testing with engine: {:?} ({})", engine, mode_label);
 
@@ -1158,6 +1183,16 @@ mod accelerator_compat_tests {
                 options.insert("internal_timestamp_format".to_string(), ts_fmt.to_string());
             }
 
+            let constraints = if table_options.primary_key {
+                options.insert(
+                    "on_conflict".to_string(),
+                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])).to_string(),
+                );
+                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])])
+            } else {
+                Constraints::new_unverified(vec![])
+            };
+
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare(format!("test_table_{:?}_{}", engine, mode)),
@@ -1170,7 +1205,7 @@ mod accelerator_compat_tests {
                 order_exprs: vec![],
                 unbounded: false,
                 options,
-                constraints: Constraints::new_unverified(vec![]),
+                constraints,
                 column_defaults: HashMap::default(),
                 temporary: false,
             };

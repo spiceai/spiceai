@@ -999,12 +999,23 @@ mod tests {
         .await
         .expect("Failed to create table for upsert restart test");
 
-        // Initial insert.
+        // Initial insert. Use enough rows to bypass inlining so this test keeps
+        // exercising the file-backed upsert path and its insert-record metadata.
+        let initial_row_count = table::INLINE_MAX_ROWS + 1;
+        let mut emails: Vec<String> = (0..initial_row_count)
+            .map(|idx| format!("user{idx}@sample.com"))
+            .collect();
+        emails[0] = "alice@sample.com".to_string();
+        let mut items_bought: Vec<i64> = (0..initial_row_count)
+            .map(|idx| i64::try_from(idx).expect("test row index fits in i64"))
+            .collect();
+        items_bought[0] = 100;
+
         let batch1 = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(StringArray::from(vec!["alice@sample.com"])),
-                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(emails)),
+                Arc::new(Int64Array::from(items_bought)),
             ],
         )
         .expect("to create initial batch");

@@ -2566,12 +2566,12 @@ impl CayenneTableProvider {
         Ok((Some(filtered_batch), kept_keys))
     }
 
-    async fn persist_inlined_pk_deletions_with_sequence(
+    fn build_inlined_pk_delete_entry(
         &self,
         deleted_pk_i64: &[i64],
         deleted_row_keys: &[Box<[u8]>],
-        delete_sequence: i64,
-    ) -> CatalogResult<()> {
+        sequence_number: i64,
+    ) -> CatalogResult<Option<crate::metadata::InlinedDelete>> {
         let mut row_keys: Vec<Box<[u8]>> = match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => deleted_pk_i64
                 .iter()
@@ -2582,7 +2582,7 @@ impl CayenneTableProvider {
         };
 
         if row_keys.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         row_keys.sort();
@@ -2594,22 +2594,63 @@ impl CayenneTableProvider {
             }
         })?;
 
-        self.catalog
-            .add_inlined_delete(crate::metadata::InlinedDelete {
-                inlined_id: String::new(),
-                table_id: self.table_metadata.table_id.clone(),
-                delete_ipc,
-                delete_count: i64::try_from(row_keys.len()).unwrap_or(i64::MAX),
-                sequence_number: delete_sequence,
-                created_at: String::new(),
-            })
-            .await?;
+        Ok(Some(crate::metadata::InlinedDelete {
+            inlined_id: String::new(),
+            table_id: self.table_metadata.table_id.clone(),
+            delete_ipc,
+            delete_count: i64::try_from(row_keys.len()).unwrap_or(i64::MAX),
+            sequence_number,
+            created_at: String::new(),
+        }))
+    }
+
+    async fn persist_inlined_pk_deletions_with_sequence(
+        &self,
+        deleted_pk_i64: &[i64],
+        deleted_row_keys: &[Box<[u8]>],
+        delete_sequence: i64,
+    ) -> CatalogResult<()> {
+        let Some(delete) =
+            self.build_inlined_pk_delete_entry(deleted_pk_i64, deleted_row_keys, delete_sequence)?
+        else {
+            return Ok(());
+        };
+
+        let delete_count = delete.delete_count;
+
+        self.catalog.add_inlined_delete(delete).await?;
 
         tracing::debug!(
             "Inlined {} delete key(s) for table {} (seq={})",
-            row_keys.len(),
+            delete_count,
             self.table_metadata.table_name,
             delete_sequence,
+        );
+
+        Ok(())
+    }
+
+    async fn commit_inlined_pk_deletions(
+        &self,
+        deleted_pk_i64: &[i64],
+        deleted_row_keys: &[Box<[u8]>],
+    ) -> CatalogResult<()> {
+        let Some(delete) =
+            self.build_inlined_pk_delete_entry(deleted_pk_i64, deleted_row_keys, 0)?
+        else {
+            return Ok(());
+        };
+
+        let delete_count = delete.delete_count;
+
+        self.catalog
+            .commit_inlined_mutation(&self.table_metadata.table_id, vec![delete], vec![])
+            .await?;
+
+        tracing::debug!(
+            "Inlined {} delete key(s) for table {}",
+            delete_count,
+            self.table_metadata.table_name,
         );
 
         Ok(())
@@ -3587,9 +3628,14 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Write small batches directly to the metastore as a single Arrow IPC
-    /// stream without concatenating them first.
-    pub(crate) async fn try_inline_batches(&self, batches: &[RecordBatch]) -> Result<bool> {
+    /// Write small batches directly to the metastore, optionally atomically
+    /// committing primary-key delete markers for inline rows they replace.
+    pub(crate) async fn try_inline_batches_with_inlined_deletions(
+        &self,
+        batches: &[RecordBatch],
+        deleted_inlined_pk_i64: &[i64],
+        deleted_inlined_row_keys: &[Box<[u8]>],
+    ) -> Result<bool> {
         let total_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         if total_rows == 0 {
             return Ok(true); // nothing to write
@@ -3603,21 +3649,25 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
-        let sequence_number = self
-            .catalog
-            .increment_sequence_number(&self.table_metadata.table_id)
-            .await?;
+        let deletes = self
+            .build_inlined_pk_delete_entry(deleted_inlined_pk_i64, deleted_inlined_row_keys, 0)?
+            .into_iter()
+            .collect::<Vec<_>>();
 
         self.catalog
-            .add_inlined_data(crate::metadata::InlinedData {
-                inlined_id: String::new(), // auto-generated
-                table_id: self.table_metadata.table_id.clone(),
-                partition_key: None,
-                data_ipc: ipc_bytes,
-                record_count: i64::try_from(total_rows).unwrap_or(i64::MAX),
-                sequence_number,
-                created_at: String::new(), // default in DDL
-            })
+            .commit_inlined_mutation(
+                &self.table_metadata.table_id,
+                deletes,
+                vec![crate::metadata::InlinedData {
+                    inlined_id: String::new(), // auto-generated
+                    table_id: self.table_metadata.table_id.clone(),
+                    partition_key: None,
+                    data_ipc: ipc_bytes,
+                    record_count: i64::try_from(total_rows).unwrap_or(i64::MAX),
+                    sequence_number: 0,
+                    created_at: String::new(), // default in DDL
+                }],
+            )
             .await?;
 
         let delta = i64::try_from(total_rows).unwrap_or(i64::MAX);
@@ -3628,10 +3678,9 @@ impl CayenneTableProvider {
                 });
 
         tracing::debug!(
-            "Inlined {} rows for table {} (seq={})",
+            "Inlined {} rows for table {}",
             total_rows,
             self.table_metadata.table_name,
-            sequence_number,
         );
 
         Ok(true)
@@ -3949,29 +3998,14 @@ impl CayenneTableProvider {
             return Ok(0);
         }
 
-        let delete_sequence = self
-            .catalog
-            .increment_sequence_number(&self.table_metadata.table_id)
+        self.commit_inlined_pk_deletions(&deleted.int64_pk, &deleted.row_keys)
             .await
             .map_err(|err| {
                 datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to get inlined delete sequence number for table {}: {err}",
+                    "Failed to persist inlined delete markers for table {}: {err}",
                     self.table_metadata.table_name
                 ))
             })?;
-
-        self.persist_inlined_pk_deletions_with_sequence(
-            &deleted.int64_pk,
-            &deleted.row_keys,
-            delete_sequence,
-        )
-        .await
-        .map_err(|err| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to persist inlined delete markers for table {}: {err}",
-                self.table_metadata.table_name
-            ))
-        })?;
 
         Ok(deleted_rows)
     }

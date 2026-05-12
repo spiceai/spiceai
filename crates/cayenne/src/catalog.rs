@@ -386,6 +386,18 @@ pub trait MetadataCatalog: Send + Sync {
     /// Add a small batch of delete identifiers inlined in the metastore.
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String>;
 
+    /// Atomically persist inline delete markers and inline data rows.
+    ///
+    /// The catalog allocates sequence numbers inside the same metastore transaction:
+    /// delete markers, when present, receive the first sequence; data rows, when present,
+    /// receive the following sequence so replacement rows remain visible.
+    async fn commit_inlined_mutation(
+        &self,
+        table_id: &str,
+        deletes: Vec<InlinedDelete>,
+        data: Vec<InlinedData>,
+    ) -> CatalogResult<()>;
+
     /// Get all inlined delete entries for a table.
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;
 
