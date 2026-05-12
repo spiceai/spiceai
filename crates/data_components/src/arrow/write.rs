@@ -17,7 +17,7 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
-use arrow::array::{Array, BooleanBuilder};
+use arrow::array::{Array, ArrayRef, BooleanBuilder};
 use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
@@ -37,13 +37,14 @@ use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use arrow_row::{RowConverter, SortField};
 use async_trait::async_trait;
 use datafusion::common::{Constraint, Constraints, SchemaExt};
 use datafusion::datasource::{TableProvider, TableType, provider_as_source};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder, is_not_true};
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, Operator, is_not_true};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
@@ -86,6 +87,8 @@ impl std::hash::Hasher for XxHash3_64WithFixedSeed {
 
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
+
+const DELETE_REPLACE_MAX_RETRIES: usize = 8;
 
 /// In-memory data source for presenting a `Vec<RecordBatch>` as a
 /// data source that can be queried by `DataFusion`. This allows data to
@@ -350,12 +353,254 @@ impl TableProvider for MemTable {
         _state: &dyn Session,
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let primary_key = self.constraints().and_then(|constraints| {
+            constraints.iter().find_map(|constraint| match constraint {
+                Constraint::PrimaryKey(primary_key) => Some(primary_key.clone()),
+                Constraint::Unique(_) => None,
+            })
+        });
+
         Ok(Arc::new(DeletionExec::new(Arc::new(MemDeletionSink::new(
             self.batches.clone(),
             self.schema(),
+            primary_key,
             &filters,
         )))))
     }
+}
+
+impl MemTable {
+    /// Deletes one matching row from this table for each row in `rows`, matching by the
+    /// full Arrow row representation.
+    ///
+    /// This is used by CDC streams that do not have a primary key but include a full
+    /// before-image for deletes. It preserves duplicate row multiplicity by removing at
+    /// most one existing row per delete row.
+    pub async fn delete_matching_rows(&self, rows: &RecordBatch) -> Result<u64> {
+        if rows.num_rows() == 0 {
+            return Ok(0);
+        }
+
+        let rows = reorder_record_batch_to_schema(rows, &self.schema)?;
+        let converter = row_converter_for_schema(&self.schema)?;
+        let delete_counts = row_key_counts(&rows, &converter)?;
+
+        for _ in 0..DELETE_REPLACE_MAX_RETRIES {
+            let snapshot = snapshot_partitions(&self.batches).await;
+            let (replacement, deleted) =
+                delete_matching_rows_from_snapshot(&snapshot, &converter, &delete_counts)?;
+
+            if replace_partitions_if_unchanged(&self.batches, &snapshot, replacement).await {
+                return Ok(deleted);
+            }
+        }
+
+        Err(concurrent_delete_error())
+    }
+}
+
+fn delete_matching_rows_from_snapshot(
+    snapshot: &[Vec<RecordBatch>],
+    converter: &RowConverter,
+    delete_counts: &HashMap<Vec<u8>, usize>,
+) -> Result<(Vec<Vec<RecordBatch>>, u64)> {
+    let mut delete_counts = delete_counts.clone();
+    let mut deleted = 0_u64;
+    let mut replacement = Vec::with_capacity(snapshot.len());
+
+    for partition_batches in snapshot {
+        let mut filtered_batches = Vec::with_capacity(partition_batches.len());
+
+        for batch in partition_batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let existing_rows = converter
+                .convert_columns(batch.columns())
+                .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+            let mut keep_row_builder = BooleanBuilder::with_capacity(batch.num_rows());
+            let mut removed_from_batch = false;
+
+            for row_idx in 0..batch.num_rows() {
+                let key = existing_rows.row(row_idx);
+                let should_delete = if let Some(count) = delete_counts.get_mut(key.as_ref()) {
+                    if *count > 0 {
+                        *count -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if should_delete {
+                    deleted += 1;
+                    removed_from_batch = true;
+                }
+                keep_row_builder.append_value(!should_delete);
+            }
+
+            if removed_from_batch {
+                let filtered_batch = filter_record_batch(batch, &keep_row_builder.finish())?;
+                if filtered_batch.num_rows() > 0 {
+                    filtered_batches.push(filtered_batch);
+                }
+            } else {
+                filtered_batches.push(batch.clone());
+            }
+        }
+
+        replacement.push(filtered_batches);
+    }
+
+    Ok((replacement, deleted))
+}
+
+async fn snapshot_partitions(batches: &[PartitionData]) -> Vec<Vec<RecordBatch>> {
+    let mut snapshot = Vec::with_capacity(batches.len());
+    for partition in batches {
+        snapshot.push(partition.read().await.clone());
+    }
+    snapshot
+}
+
+async fn replace_partitions_if_unchanged(
+    batches: &[PartitionData],
+    expected: &[Vec<RecordBatch>],
+    replacement: Vec<Vec<RecordBatch>>,
+) -> bool {
+    let writable_targets =
+        futures::future::join_all(batches.iter().map(|target| target.write())).await;
+
+    if writable_targets
+        .iter()
+        .zip(expected)
+        .any(|(current, expected)| !record_batches_are_same(current.as_slice(), expected))
+    {
+        return false;
+    }
+
+    for (mut target, batches) in writable_targets.into_iter().zip(replacement) {
+        *target = batches;
+    }
+
+    true
+}
+
+fn record_batches_are_same(left: &[RecordBatch], right: &[RecordBatch]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| record_batch_is_same(left, right))
+}
+
+fn record_batch_is_same(left: &RecordBatch, right: &RecordBatch) -> bool {
+    let left_schema = left.schema();
+    let right_schema = right.schema();
+
+    left.num_rows() == right.num_rows()
+        && left.num_columns() == right.num_columns()
+        && Arc::ptr_eq(&left_schema, &right_schema)
+        && left
+            .columns()
+            .iter()
+            .zip(right.columns())
+            .all(|(left, right)| Arc::ptr_eq(left, right))
+}
+
+fn concurrent_delete_error() -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "Failed to delete rows from in-memory table because concurrent writes modified the table during {DELETE_REPLACE_MAX_RETRIES} delete attempts; retry the delete"
+    ))
+}
+
+fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {
+    let sort_fields = schema
+        .fields()
+        .iter()
+        .map(|field| SortField::new(field.data_type().clone()))
+        .collect();
+
+    RowConverter::new(sort_fields)
+        .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))
+}
+
+fn reorder_record_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    let batch_schema = batch.schema();
+    if schema.fields().len() != batch_schema.fields().len() {
+        return Err(DataFusionError::Execution(format!(
+            "Deleting rows by full-row match requires the same number of columns as the table. Expected {}, got {}.",
+            schema.fields().len(),
+            batch_schema.fields().len()
+        )));
+    }
+
+    for field in schema.fields() {
+        let index = batch_schema.index_of(field.name()).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Deleting rows by full-row match requires table column '{}' in the delete batch. {e}",
+                field.name()
+            ))
+        })?;
+        let batch_field = batch_schema.field(index);
+        if field.data_type() != batch_field.data_type() {
+            return Err(DataFusionError::Execution(format!(
+                "Deleting rows by full-row match requires table column '{}' to have type {}, got {}.",
+                field.name(),
+                field.data_type(),
+                batch_field.data_type()
+            )));
+        }
+    }
+
+    if schema
+        .fields()
+        .iter()
+        .zip(batch_schema.fields().iter())
+        .all(|(field, batch_field)| {
+            field.name() == batch_field.name() && field.data_type() == batch_field.data_type()
+        })
+    {
+        return Ok(batch.clone());
+    }
+
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let index = batch_schema.index_of(field.name()).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Deleting rows by full-row match requires table column '{}' in the delete batch. {e}",
+                    field.name()
+                ))
+            })?;
+            Ok(Arc::clone(batch.column(index)) as ArrayRef)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))
+}
+
+fn row_key_counts(
+    batch: &RecordBatch,
+    converter: &RowConverter,
+) -> Result<HashMap<Vec<u8>, usize>> {
+    let rows = converter
+        .convert_columns(batch.columns())
+        .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+    let mut counts = HashMap::with_capacity(batch.num_rows());
+
+    for row_idx in 0..rows.num_rows() {
+        *counts
+            .entry(rows.row(row_idx).as_ref().to_vec())
+            .or_insert(0) += 1;
+    }
+
+    Ok(counts)
 }
 
 /// Implements for writing to a [`MemTable`]
@@ -952,6 +1197,8 @@ impl DataSink for MemSink {
             .transpose()
             .map_err(check_and_mark_retriable_error)?
         {
+            let batch = arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&self.schema))
+                .map_err(DataFusionError::from)?;
             row_count += batch.num_rows();
             new_batches[i].push(batch);
             i = (i + 1) % num_partitions;
@@ -1070,62 +1317,230 @@ impl DataSink for MemSink {
 struct MemDeletionSink {
     batches: Vec<PartitionData>,
     schema: SchemaRef,
+    primary_key: Option<Vec<usize>>,
     filters: Vec<Expr>,
 }
 
 impl MemDeletionSink {
-    fn new(batches: Vec<PartitionData>, schema: SchemaRef, filters: &[Expr]) -> Self {
+    fn new(
+        batches: Vec<PartitionData>,
+        schema: SchemaRef,
+        primary_key: Option<Vec<usize>>,
+        filters: &[Expr],
+    ) -> Self {
         Self {
             batches,
             schema,
+            primary_key,
             filters: filters.to_vec(),
         }
     }
+
+    async fn delete_primary_keys(
+        &self,
+        primary_key_values: &HashSet<
+            String,
+            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
+        >,
+        primary_key: &[usize],
+    ) -> Result<u64> {
+        let batches = self.batches.clone();
+
+        for _ in 0..DELETE_REPLACE_MAX_RETRIES {
+            let snapshot = snapshot_partitions(&batches).await;
+            let (new_batches, deleted) =
+                delete_primary_keys_from_snapshot(&snapshot, primary_key_values, primary_key)?;
+
+            if replace_partitions_if_unchanged(&batches, &snapshot, new_batches).await {
+                return Ok(deleted);
+            }
+        }
+
+        Err(concurrent_delete_error())
+    }
+}
+
+fn delete_primary_keys_from_snapshot(
+    snapshot: &[Vec<RecordBatch>],
+    primary_key_values: &HashSet<String, std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>>,
+    primary_key: &[usize],
+) -> Result<(Vec<Vec<RecordBatch>>, u64)> {
+    let mut new_batches = Vec::with_capacity(snapshot.len());
+    let mut deleted = 0_u64;
+
+    for partition_batches in snapshot {
+        let mut filtered_batches = Vec::with_capacity(partition_batches.len());
+
+        for batch in partition_batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let keys = extract_primary_keys_str(batch, primary_key)?;
+            let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
+            let mut removed_from_batch = false;
+
+            for key in keys {
+                let should_delete = key.is_some_and(|key| primary_key_values.contains(&key));
+                if should_delete {
+                    deleted += 1;
+                    removed_from_batch = true;
+                }
+                keep_row_builder.append_value(!should_delete);
+            }
+
+            if removed_from_batch {
+                let filtered_batch = filter_record_batch(batch, &keep_row_builder.finish())?;
+                if filtered_batch.num_rows() > 0 {
+                    filtered_batches.push(filtered_batch);
+                }
+            } else {
+                filtered_batches.push(batch.clone());
+            }
+        }
+
+        new_batches.push(filtered_batches);
+    }
+
+    Ok((new_batches, deleted))
 }
 
 #[async_trait]
 impl DeletionSink for MemDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let batches = self.batches.clone();
+        if let Some(primary_key) = &self.primary_key
+            && let Some(primary_key_values) =
+                delete_primary_key_values(&self.filters, &self.schema, primary_key)
+        {
+            return Ok(self
+                .delete_primary_keys(&primary_key_values, primary_key)
+                .await?);
+        }
 
         let ctx = SessionContext::new();
-        let mut tmp_batches = vec![vec![]; batches.len()];
 
-        for (i, partition) in batches.iter().enumerate() {
-            let mut partition_vec = partition.write().await;
-            tmp_batches[i].append(&mut *partition_vec);
-        }
+        for _ in 0..DELETE_REPLACE_MAX_RETRIES {
+            let batches = self.batches.clone();
+            let tmp_batches = snapshot_partitions(&batches).await;
 
-        let provider = MemTable::try_new(Arc::clone(&self.schema), tmp_batches)?;
+            let rows_before_delete: usize = tmp_batches
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum();
+            let provider = MemTable::try_new(Arc::clone(&self.schema), tmp_batches.clone())?;
 
-        let mut df = DataFrame::new(
-            ctx.state(),
-            LogicalPlanBuilder::scan("?table?", provider_as_source(Arc::new(provider)), None)?
-                .build()?,
-        );
+            let mut df = DataFrame::new(
+                ctx.state(),
+                LogicalPlanBuilder::scan("?table?", provider_as_source(Arc::new(provider)), None)?
+                    .build()?,
+            );
 
-        let mut count = df.clone().count().await?;
-
-        for filter in self.filters.clone() {
-            df = df.filter(is_not_true(filter))?;
-        }
-
-        count -= df.clone().count().await?;
-        let mut new_batches = vec![vec![]; batches.len()];
-        let mut i = 0;
-        for vec in df.collect_partitioned().await? {
-            for batch in vec {
-                new_batches[i].push(batch);
+            for filter in self.filters.clone() {
+                df = df.filter(is_not_true(filter))?;
             }
 
-            i = (i + 1) % batches.len();
+            let mut new_batches = vec![vec![]; batches.len()];
+            let mut rows_after_delete = 0_usize;
+            let mut i = 0;
+            for vec in df.collect_partitioned().await? {
+                for batch in vec {
+                    rows_after_delete += batch.num_rows();
+                    new_batches[i].push(batch);
+                }
+
+                i = (i + 1) % batches.len();
+            }
+
+            let count = rows_before_delete.checked_sub(rows_after_delete).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Delete output row count ({rows_after_delete}) exceeds input row count ({rows_before_delete})"
+                ))
+            })?;
+
+            if replace_partitions_if_unchanged(&batches, &tmp_batches, new_batches).await {
+                return Ok(count as u64);
+            }
         }
 
-        for (target, mut batches) in batches.iter().zip(new_batches.into_iter()) {
-            target.write().await.append(&mut batches);
-        }
+        Err(Box::new(concurrent_delete_error()))
+    }
+}
 
-        Ok(count as u64)
+fn delete_primary_key_values(
+    filters: &[Expr],
+    schema: &SchemaRef,
+    primary_key: &[usize],
+) -> Option<HashSet<String, std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>>> {
+    let [primary_key_index] = primary_key else {
+        return None;
+    };
+    let primary_key_name = schema.field(*primary_key_index).name();
+    let mut keys = HashSet::default();
+
+    for filter in filters {
+        collect_delete_primary_key_values(filter, primary_key_name, &mut keys)?;
+    }
+
+    Some(keys)
+}
+
+fn collect_delete_primary_key_values(
+    expr: &Expr,
+    primary_key_name: &str,
+    keys: &mut HashSet<String, std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>>,
+) -> Option<()> {
+    match expr {
+        Expr::InList(in_list) if !in_list.negated => {
+            if !matches!(in_list.expr.as_ref(), Expr::Column(column) if column.name() == primary_key_name)
+            {
+                return None;
+            }
+
+            for value in &in_list.list {
+                keys.insert(literal_key_value(value)?);
+            }
+            Some(())
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            if let Some(value) = equality_literal_for_column(
+                binary.left.as_ref(),
+                binary.right.as_ref(),
+                primary_key_name,
+            ) {
+                keys.insert(value);
+                return Some(());
+            }
+            if let Some(value) = equality_literal_for_column(
+                binary.right.as_ref(),
+                binary.left.as_ref(),
+                primary_key_name,
+            ) {
+                keys.insert(value);
+                return Some(());
+            }
+            None
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+            collect_delete_primary_key_values(binary.left.as_ref(), primary_key_name, keys)?;
+            collect_delete_primary_key_values(binary.right.as_ref(), primary_key_name, keys)
+        }
+        _ => None,
+    }
+}
+
+fn equality_literal_for_column(left: &Expr, right: &Expr, column_name: &str) -> Option<String> {
+    if matches!(left, Expr::Column(column) if column.name() == column_name) {
+        return literal_key_value(right);
+    }
+    None
+}
+
+fn literal_key_value(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(value, _) if value.is_null() => None,
+        Expr::Literal(value, _) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -1134,9 +1549,10 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use super::{PartitionData, replace_partitions_if_unchanged, snapshot_partitions};
     use arrow::{
-        array::{RecordBatch, StringArray, UInt64Array},
-        datatypes::{DataType, Schema, SchemaRef},
+        array::{Int32Array, RecordBatch, StringArray, UInt64Array},
+        datatypes::{DataType, Field, Schema, SchemaRef},
     };
     use arrow_array::Array;
     use arrow_buffer::ArrowNativeType;
@@ -1149,6 +1565,7 @@ mod tests {
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::{on_conflict::OnConflict, test::MockExec};
+    use tokio::sync::RwLock;
 
     use crate::arrow::write::MemTable;
 
@@ -1272,6 +1689,61 @@ mod tests {
             ],
             results
         );
+    }
+
+    #[tokio::test]
+    async fn test_insert_normalizes_nullable_input_to_table_schema() {
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let table = MemTable::try_new(Arc::clone(&table_schema), vec![vec![]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]))
+            .await
+            .expect("satisfy primary key constraints")
+            .with_on_conflict(OnConflict::try_from("upsert:id").expect("create on_conflict"));
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let input_batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")])),
+            ],
+        )
+        .expect("input batch should be created");
+        let exec = Arc::new(MockExec::new(vec![Ok(input_batch)], input_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("scan plan can be constructed after insert");
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("query successful");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].schema(), table_schema);
     }
 
     #[tokio::test]
@@ -1713,6 +2185,150 @@ mod tests {
             .expect("result should be UInt64Array");
         let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_error_preserves_existing_batches() {
+        let (rb, schema) = create_batch_with_string_columns(&[("id", vec!["1", "2", "3"])]);
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![rb]])
+            .expect("mem table should be created");
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let plan = TableProvider::delete_from(&table, &state, vec![col("missing").eq(lit("x"))])
+            .await
+            .expect("deletion plan should be created");
+        let result = collect(plan, ctx.task_ctx()).await;
+        assert!(result.is_err(), "delete should fail for missing column");
+
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("scan plan can be constructed");
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("query successful");
+        let remaining_ids: Vec<_> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("id column should be StringArray")
+                    .iter()
+            })
+            .collect();
+
+        assert_eq!(remaining_ids, vec![Some("1"), Some("2"), Some("3")]);
+    }
+
+    #[tokio::test]
+    async fn test_conditional_partition_replace_preserves_concurrent_append() {
+        let (first_batch, _) = create_batch_with_string_columns(&[("id", vec!["1"])]);
+        let (second_batch, _) = create_batch_with_string_columns(&[("id", vec!["2"])]);
+        let partition: PartitionData = Arc::new(RwLock::new(vec![first_batch]));
+        let batches = vec![Arc::clone(&partition)];
+        let snapshot = snapshot_partitions(&batches).await;
+
+        partition.write().await.push(second_batch);
+
+        let replaced = replace_partitions_if_unchanged(&batches, &snapshot, vec![vec![]]).await;
+        assert!(!replaced, "replacement should detect concurrent writes");
+
+        let current = partition.read().await;
+        assert_eq!(current.len(), 2, "concurrent append should be preserved");
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_primary_key_in_list() {
+        let (rb, schema) = create_batch_with_string_columns(&[("id", vec!["1", "2", "3", "4"])]);
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]))
+            .await
+            .expect("table should satisfy primary key constraint");
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let plan = TableProvider::delete_from(
+            &table,
+            &state,
+            vec![col("id").in_list(vec![lit("2"), lit("4")], false)],
+        )
+        .await
+        .expect("deletion plan should be created");
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion should complete");
+        let deleted = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("delete count should be UInt64")
+            .value(0);
+        assert_eq!(deleted, 2);
+
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+        let remaining_ids: Vec<_> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("id column should be StringArray")
+                    .iter()
+            })
+            .collect();
+        assert_eq!(remaining_ids, vec![Some("1"), Some("3")]);
+    }
+
+    #[tokio::test]
+    async fn test_delete_matching_rows_reorders_columns() {
+        let (rb, schema) = create_batch_with_string_columns(&[
+            ("id", vec!["1", "2", "3"]),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![rb]])
+            .expect("mem table should be created");
+        let (delete_rows, _) =
+            create_batch_with_string_columns(&[("value", vec!["b"]), ("id", vec!["2"])]);
+
+        let deleted = table
+            .delete_matching_rows(&delete_rows)
+            .await
+            .expect("delete by reordered full-row batch should succeed");
+        assert_eq!(deleted, 1);
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+        let remaining_ids: Vec<_> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("id column should be StringArray")
+                    .iter()
+            })
+            .collect();
+        assert_eq!(remaining_ids, vec![Some("1"), Some("3")]);
     }
 
     #[tokio::test]
