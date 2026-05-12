@@ -469,6 +469,47 @@ impl TableProvider for PartitionTableProvider {
         Ok(plan)
     }
 
+    fn get_table_definition(&self) -> Option<&str> {
+        None
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        None
+    }
+
+    fn get_column_default(&self, _column: &str) -> Option<&Expr> {
+        None
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> Result<datafusion::catalog::ScanResult> {
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(|p| p.to_vec());
+        let limit = args.limit();
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
+        Ok(datafusion::catalog::ScanResult::new(plan))
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        None
+    }
+
+    async fn truncate(
+        &self,
+        _state: &dyn Session,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::NotImplemented(
+            "PartitionTableProvider does not support truncate".to_string(),
+        ))
+    }
+
     async fn insert_into(
         &self,
         _state: &dyn Session,
