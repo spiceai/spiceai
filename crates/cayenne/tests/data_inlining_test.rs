@@ -38,6 +38,7 @@ use std::sync::Arc;
 test_with_backends!(test_inlined_data_crud);
 test_with_backends!(test_small_insert_inlined);
 test_with_backends!(test_inlined_data_visible_in_scan);
+test_with_backends!(test_limit_on_inlined_scan);
 test_with_backends!(test_roundtrip_preserves_values);
 test_with_backends!(test_roundtrip_preserves_nulls);
 test_with_backends!(test_roundtrip_mixed_types);
@@ -226,6 +227,44 @@ async fn test_inlined_data_visible_in_scan(
     assert_eq!(id_col.value(0), 10);
     assert_eq!(id_col.value(1), 20);
     assert_eq!(id_col.value(2), 30);
+
+    Ok(())
+}
+
+async fn test_limit_on_inlined_scan(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let (table, ctx) = create_table(&fixture, "inline_limit", Arc::clone(&schema)).await?;
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+
+    ctx.register_table("inline_limit", Arc::new(table))?;
+    let results = ctx
+        .sql("SELECT id FROM inline_limit LIMIT 2")
+        .await?
+        .collect()
+        .await?;
+    assert!(!results.is_empty(), "no result batches for LIMIT query");
+    let got = arrow::compute::concat_batches(&results[0].schema(), &results)?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+
+    assert_eq!(got.num_rows(), 2);
+    assert_eq!(ids.values(), &[1_i64, 2]);
 
     Ok(())
 }
