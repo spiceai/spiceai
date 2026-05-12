@@ -23306,7 +23306,7 @@ dependencies = [
  "deflate64",
  "flate2",
  "generic-array",
- "getrandom 0.4.1",
+ "getrandom 0.3.4",
  "hmac 0.12.1",
  "indexmap 2.14.0",
  "lzma-rust2 0.15.7",
