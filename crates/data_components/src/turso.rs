@@ -684,13 +684,15 @@ impl TursoTableProvider {
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(millis) => {
-                                // Integer format: Convert from stored milliseconds to the target unit
-                                Some(match unit {
-                                    TimeUnit::Second => millis / MILLIS_PER_SECOND,
-                                    TimeUnit::Millisecond => *millis,
-                                    TimeUnit::Microsecond => millis * MICROS_PER_MILLI,
-                                    TimeUnit::Nanosecond => millis * NANOS_PER_MILLI,
-                                })
+                                // Integer format: Convert from stored milliseconds to the target unit.
+                                // Use checked arithmetic for Nanosecond to avoid silent overflow
+                                // for dates outside ~1677-2262 (same range as timestamp_nanos_opt).
+                                match unit {
+                                    TimeUnit::Second => Some(millis / MILLIS_PER_SECOND),
+                                    TimeUnit::Millisecond => Some(*millis),
+                                    TimeUnit::Microsecond => millis.checked_mul(MICROS_PER_MILLI),
+                                    TimeUnit::Nanosecond => millis.checked_mul(NANOS_PER_MILLI),
+                                }
                             }
                             TursoValue::Text(rfc3339_str) => {
                                 // RFC3339 TEXT format: Parse and convert to target unit.
@@ -2627,5 +2629,72 @@ mod tests {
             result.is_err(),
             "TimestampMillisecond i64::MAX should overflow when converting to nanoseconds"
         );
+    }
+
+    #[test]
+    fn test_integer_millis_timestamp_outside_nanos_range() {
+        use arrow::datatypes::{DataType, Field, TimeUnit};
+
+        // Year 2300 as milliseconds since epoch — outside the i64 nanosecond range (~1677-2262).
+        // millis * 1_000_000 would overflow i64 and silently wrap in release builds.
+        let millis_2300: i64 = 10_413_792_000_000;
+        let rows = vec![vec![TursoValue::Integer(millis_2300)]];
+
+        // Nanosecond unit: millis * 1_000_000 overflows — should produce NULL, not a wrapped value
+        let schema_nanos = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_nanos)
+            .expect("should succeed (overflow produces NULL, not error)");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .expect("should be TimestampNanosecondArray");
+        assert!(
+            arr.is_null(0),
+            "Nanosecond-precision integer millis timestamp should be NULL for year 2300 (overflow)"
+        );
+
+        // Microsecond unit: millis * 1_000 is well within range — should produce a valid value
+        let schema_micros = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_micros)
+            .expect("should succeed for Microsecond unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("should be TimestampMicrosecondArray");
+        assert!(
+            !arr.is_null(0),
+            "Microsecond-precision integer millis should not be NULL for year 2300"
+        );
+        assert_eq!(
+            arr.value(0),
+            millis_2300 * 1_000,
+            "Microsecond value should be millis * 1000"
+        );
+
+        // Millisecond unit: identity — should always work
+        let schema_millis = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_millis)
+            .expect("should succeed for Millisecond unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .expect("should be TimestampMillisecondArray");
+        assert!(!arr.is_null(0), "Millisecond identity should not be NULL");
+        assert_eq!(arr.value(0), millis_2300);
     }
 }
