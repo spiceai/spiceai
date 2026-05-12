@@ -1235,6 +1235,31 @@ mod accelerator_compat_tests {
         }
     }
 
+    fn clean_cayenne_metadata(metadata_dir: &str) {
+        let metadata_path = std::path::Path::new(metadata_dir);
+        if !metadata_path.exists() {
+            let _ = std::fs::create_dir_all(metadata_path);
+            return;
+        }
+
+        if let Ok(entries) = std::fs::read_dir(metadata_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("cayenne.db"))
+                {
+                    if path.is_dir() {
+                        let _ = std::fs::remove_dir_all(&path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+
     /// Helper function to construct mode label with optional timestamp format
     fn make_mode_label(
         mode: &str,
@@ -1455,12 +1480,7 @@ mod accelerator_compat_tests {
                             let _ = std::fs::create_dir_all(test_dir);
                         }
 
-                        // Also clean up Cayenne metadata to ensure fresh schema
-                        // Use test environment's metadata directory
-                        let cayenne_db_path = format!("{}/cayenne.db", test_env.metadata_dir());
-                        if std::path::Path::new(&cayenne_db_path).exists() {
-                            let _ = std::fs::remove_file(&cayenne_db_path);
-                        }
+                        clean_cayenne_metadata(&test_env.metadata_dir());
                     }
 
                     // Create a proper Dataset that implements AccelerationSource
@@ -2686,12 +2706,7 @@ mod accelerator_compat_tests {
                                 let _ = std::fs::create_dir_all(test_dir);
                             }
 
-                            // Clean up Cayenne metadata
-                            // Use test environment's metadata directory
-                            let cayenne_db_path = format!("{}/cayenne.db", metadata_dir);
-                            if std::path::Path::new(&cayenne_db_path).exists() {
-                                let _ = std::fs::remove_file(&cayenne_db_path);
-                            }
+                            clean_cayenne_metadata(&metadata_dir);
                         }
 
                         let test_app_obj = app::AppBuilder::new("test").build();
