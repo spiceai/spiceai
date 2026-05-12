@@ -60,6 +60,7 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::SendableRecordBatchStream;
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::limit::GlobalLimitExec;
@@ -5152,7 +5153,11 @@ impl TableProvider for CayenneTableProvider {
         };
 
         let plan: Arc<dyn ExecutionPlan> = if let Some(limit) = limit {
-            Arc::new(GlobalLimitExec::new(plan, 0, Some(limit)))
+            Arc::new(GlobalLimitExec::new(
+                Arc::new(CoalescePartitionsExec::new(plan)),
+                0,
+                Some(limit),
+            ))
         } else {
             plan
         };
