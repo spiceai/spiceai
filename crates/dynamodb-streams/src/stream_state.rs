@@ -109,11 +109,10 @@ impl StreamState {
         shard_id: &str,
         new_iterator: Option<String>,
         records: Vec<Record>,
-    ) -> Result<ShardPollResult> {
+    ) -> Option<ShardPollResult> {
         let Some(shard) = self.active.get(shard_id) else {
-            return Err(Error::UnexpectedShardId {
-                shard_id: shard_id.to_string(),
-            });
+            tracing::warn!("Received poll result for unknown shard {shard_id}, skipping");
+            return None;
         };
         let mut current_checkpoint = shard.last_checkpoint.clone();
         let mut current_watermark = shard.current_watermark;
@@ -174,7 +173,7 @@ impl StreamState {
             PollOutcome::Records { records }
         };
 
-        Ok(ShardPollResult {
+        Some(ShardPollResult {
             shard_id: shard_id.to_string(),
             outcome,
             last_checkpoint: current_checkpoint,
@@ -182,11 +181,10 @@ impl StreamState {
         })
     }
 
-    pub fn handle_poll_error(&mut self, shard_id: &str, error: Error) -> Result<ShardPollResult> {
+    pub fn handle_poll_error(&mut self, shard_id: &str, error: Error) -> Option<ShardPollResult> {
         let Some(shard) = self.active.get(shard_id) else {
-            return Err(Error::UnexpectedShardId {
-                shard_id: shard_id.to_string(),
-            });
+            tracing::warn!("Received poll error for unknown shard {shard_id}, skipping");
+            return None;
         };
 
         // Capture current state before any modifications
@@ -197,14 +195,7 @@ impl StreamState {
             current_watermark: shard.current_watermark,
         };
 
-        // Handle iterator expiration by reinitializing with current checkpoint
-        if error.is_retriable() {
-            tracing::warn!(
-                "Poll error for shard {}. Will retry on next iteration: {}",
-                shard_id,
-                error
-            );
-        } else if matches!(error, Error::IteratorExpired) {
+        if matches!(error, Error::IteratorExpired) {
             tracing::warn!(
                 "Iterator expired for shard {}, marking for reinitialization with checkpoint: {:?}",
                 shard_id,
@@ -212,10 +203,14 @@ impl StreamState {
             );
             self.reinitialize_shard_with_checkpoint(shard_id);
         } else {
-            return Err(error);
+            tracing::warn!(
+                "Poll error for shard {}. Will retry on next iteration: {}",
+                shard_id,
+                error
+            );
         }
 
-        Ok(result)
+        Some(result)
     }
 
     /// Reinitialize a shard when its iterator expires.
@@ -237,7 +232,7 @@ impl StreamState {
     }
 
     /// Add discovered shards, returns shard IDs that need initialization
-    pub fn add_discovered(&mut self, shards: &[ApiShard]) -> Result<()> {
+    pub fn add_discovered(&mut self, shards: &[ApiShard]) {
         for shard in shards.iter().cloned() {
             let shard_id = shard.shard_id.clone();
 
@@ -275,10 +270,14 @@ impl StreamState {
             tracing::debug!("Current state: {:#?}", self);
             tracing::debug!("Discovered shards: {:#?}", shards);
 
+            let Some(sequence_number) = shard.starting_sequence_number.clone() else {
+                tracing::warn!(
+                    "Skipping discovered shard {shard_id}: missing starting_sequence_number"
+                );
+                continue;
+            };
             let checkpoint = ShardCheckpoint {
-                sequence_number: shard
-                    .starting_sequence_number
-                    .context(MissingStaringSequenceNumberSnafu)?,
+                sequence_number,
                 parent_id: shard.parent_shard_id.clone(),
                 updated_at: SystemTime::now(),
                 position: CheckpointPosition::At,
@@ -305,8 +304,6 @@ impl StreamState {
                 );
             }
         }
-
-        Ok(())
     }
 
     /// Move shard from initializing to active with its iterator
@@ -544,7 +541,7 @@ mod tests {
                 vec![create_record("123")],
             );
 
-            assert!(result.is_err());
+            assert!(result.is_none());
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
             assert_eq!(state.initializing.len(), 0);
@@ -575,7 +572,7 @@ mod tests {
                 vec![create_record("123")],
             );
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("Expected result to be Ok");
             assert_eq!(result.shard_id, "shard-1");
             if let PollOutcome::Records { records } = result.outcome {
@@ -622,7 +619,7 @@ mod tests {
 
             let result = state.handle_poll_result("shard-1", None, vec![create_record("123")]);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("Expected result to be Ok");
             assert_eq!(result.shard_id, "shard-1");
             if let PollOutcome::Records { records } = result.outcome {
@@ -660,8 +657,8 @@ mod tests {
 
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), vec![]);
 
-            assert!(result.is_ok());
-            if let Ok(result) = result {
+            assert!(result.is_some());
+            if let Some(result) = result {
                 assert!(matches!(result.outcome, PollOutcome::Empty));
             }
 
@@ -784,7 +781,7 @@ mod tests {
 
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("Expected result to be Ok");
             assert_eq!(result.shard_id, "shard-1");
             if let PollOutcome::Records { records } = result.outcome {
@@ -852,7 +849,7 @@ mod tests {
             // Exhaust parent shard
             let result = state.handle_poll_result("parent", None, vec![create_record("100")]);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("Expected result to be Ok");
             assert_eq!(result.shard_id, "parent");
             assert_eq!(result.last_checkpoint.sequence_number, "100");
@@ -902,7 +899,7 @@ mod tests {
 
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("result");
 
             // Verify watermark is max timestamp (1010)
@@ -944,7 +941,7 @@ mod tests {
 
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("result");
 
             // Watermark should still be None
@@ -985,7 +982,7 @@ mod tests {
                 vec![create_record_without_seq()],
             );
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("result");
 
             // Checkpoint sequence should be unchanged
@@ -1029,7 +1026,7 @@ mod tests {
             // Shard exhausted (new_iterator = None) but has final records
             let result = state.handle_poll_result("shard-1", None, records);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("result");
 
             // Should have records
@@ -1077,7 +1074,7 @@ mod tests {
             // Shard exhausted with no records
             let result = state.handle_poll_result("shard-1", None, vec![]);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("result");
 
             // Should be empty
@@ -1158,12 +1155,7 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
             let result = state.handle_poll_error("nonexistent-shard", Error::Timeout);
 
-            assert!(result.is_err());
-            if let Err(Error::UnexpectedShardId { shard_id }) = result {
-                assert_eq!(shard_id, "nonexistent-shard");
-            } else {
-                panic!("Expected UnexpectedShardId error");
-            }
+            assert!(result.is_none());
         }
 
         #[test]
@@ -1187,7 +1179,7 @@ mod tests {
 
             let result = state.handle_poll_error("shard-1", Error::Timeout);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let poll_result = result.expect("result");
             assert_eq!(poll_result.shard_id, "shard-1");
             assert!(matches!(poll_result.outcome, PollOutcome::Failed));
@@ -1270,7 +1262,7 @@ mod tests {
 
             let result = state.handle_poll_error("shard-1", Error::IteratorExpired);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let poll_result = result.expect("result");
             assert_eq!(poll_result.shard_id, "shard-1");
             assert!(matches!(poll_result.outcome, PollOutcome::Failed));
@@ -1291,7 +1283,7 @@ mod tests {
         }
 
         #[test]
-        fn test_handle_poll_error_permanent_error_returns_error() {
+        fn test_handle_poll_error_any_error_keeps_shard_active() {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
             state.active.insert(
                 "shard-1".to_string(),
@@ -1309,12 +1301,15 @@ mod tests {
                 },
             );
 
+            // All errors (including previously-permanent ones) return Ok(PollOutcome::Failed)
+            // so the shard stays active and is retried on the next iteration.
             let result = state.handle_poll_error("shard-1", Error::StreamBeyondRetention);
 
-            assert!(result.is_err());
-            assert!(matches!(result, Err(Error::StreamBeyondRetention)));
-
-            // Shard should still be active (error is propagated, not handled)
+            assert!(result.is_some());
+            assert!(matches!(
+                result.expect("result").outcome,
+                PollOutcome::Failed
+            ));
             assert!(state.active.contains_key("shard-1"));
         }
 
@@ -1340,7 +1335,7 @@ mod tests {
 
             let result = state.handle_poll_error("shard-1", Error::Timeout);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let poll_result = result.expect("result");
             assert_eq!(poll_result.current_watermark, Some(watermark));
         }
@@ -1459,7 +1454,7 @@ mod tests {
         #[test]
         fn test_add_discovered_empty_list() {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
-            state.add_discovered(&[]).expect("result");
+            state.add_discovered(&[]);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
@@ -1474,7 +1469,7 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
             let shards = vec![create_api_shard("shard-1", None, None)];
 
-            state.add_discovered(&shards).expect("result");
+            state.add_discovered(&shards);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
@@ -1497,7 +1492,7 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
             let shards = vec![create_api_shard("shard-1", None, Some("999"))];
 
-            state.add_discovered(&shards).expect("result");
+            state.add_discovered(&shards);
 
             // Closed shards are ignored
             assert_eq!(state.active.len(), 0);
@@ -1539,7 +1534,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("child", Some("parent"), None)];
-            state.add_discovered(&shards).expect("result");
+            state.add_discovered(&shards);
 
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 1);
@@ -1580,7 +1575,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("child", Some("parent"), None)];
-            state.add_discovered(&shards).expect("result");
+            state.add_discovered(&shards);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 2);
@@ -1622,7 +1617,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("child", Some("parent"), None)];
-            state.add_discovered(&shards).expect("result");
+            state.add_discovered(&shards);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 1);
@@ -1672,7 +1667,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("shard-1", None, None)];
-            state.add_discovered(&shards).expect("result");
+            state.add_discovered(&shards);
 
             // Should not change existing active shard
             assert_eq!(state.active.len(), 1);
@@ -1719,7 +1714,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("shard-1", None, None)];
-            state.add_discovered(&shards).expect("result");
+            state.add_discovered(&shards);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 1);
@@ -1765,7 +1760,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("shard-1", None, None)];
-            state.add_discovered(&shards).expect("result");
+            state.add_discovered(&shards);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
@@ -1810,7 +1805,7 @@ mod tests {
                 create_api_shard("child-2", Some("nonexistent"), None), // Should go to initializing
             ];
 
-            state.add_discovered(&shards).expect("result");
+            state.add_discovered(&shards);
 
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 1);
@@ -1912,7 +1907,7 @@ mod tests {
             create_api_shard("shard-A", None, Some("100")),
         ];
 
-        state.add_discovered(&discovered).expect("result");
+        state.add_discovered(&discovered);
 
         assert!(
             !state.initializing.contains_key("shard-A"),
@@ -2518,9 +2513,7 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Discover initial shard
-            state
-                .add_discovered(&[create_api_shard("shard-1", None, None)])
-                .expect("result");
+            state.add_discovered(&[create_api_shard("shard-1", None, None)]);
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
             assert_eq!(state.initializing.len(), 1);
@@ -2562,7 +2555,7 @@ mod tests {
 
             // Exhaust shard
             let result = state.handle_poll_result("shard-1", None, vec![create_record("101")]);
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("Expected result to be Ok");
             assert_eq!(result.shard_id, "shard-1");
             assert_eq!(result.last_checkpoint.sequence_number, "101");
@@ -2578,12 +2571,10 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Discover parent and child
-            state
-                .add_discovered(&[
-                    create_api_shard("parent", None, None),
-                    create_api_shard("child", Some("parent"), None),
-                ])
-                .expect("result");
+            state.add_discovered(&[
+                create_api_shard("parent", None, None),
+                create_api_shard("child", Some("parent"), None),
+            ]);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 1);
@@ -2639,13 +2630,11 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Add three generations
-            state
-                .add_discovered(&[
-                    create_api_shard("gen1", None, None),
-                    create_api_shard("gen2", Some("gen1"), None),
-                    create_api_shard("gen3", Some("gen2"), None),
-                ])
-                .expect("result");
+            state.add_discovered(&[
+                create_api_shard("gen1", None, None),
+                create_api_shard("gen2", Some("gen1"), None),
+                create_api_shard("gen3", Some("gen2"), None),
+            ]);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 2);
@@ -2661,9 +2650,7 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
 
             // Exhaust gen1
-            state
-                .handle_poll_result("gen1", None, vec![create_record("100")])
-                .expect("result");
+            state.handle_poll_result("gen1", None, vec![create_record("100")]);
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 1);
             assert_eq!(state.initializing.len(), 1);
@@ -2677,9 +2664,7 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
 
             // Exhaust gen2
-            state
-                .handle_poll_result("gen2", None, vec![create_record("200")])
-                .expect("result");
+            state.handle_poll_result("gen2", None, vec![create_record("200")]);
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
             assert_eq!(state.initializing.len(), 1);
@@ -2703,13 +2688,11 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Parent splits into two children
-            state
-                .add_discovered(&[
-                    create_api_shard("parent", None, None),
-                    create_api_shard("child-a", Some("parent"), None),
-                    create_api_shard("child-b", Some("parent"), None),
-                ])
-                .expect("result");
+            state.add_discovered(&[
+                create_api_shard("parent", None, None),
+                create_api_shard("child-a", Some("parent"), None),
+                create_api_shard("child-b", Some("parent"), None),
+            ]);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 2);
@@ -2725,9 +2708,7 @@ mod tests {
             assert!(state.blocked.contains_key("child-b"));
 
             // Exhaust parent
-            state
-                .handle_poll_result("parent", None, vec![create_record("100")])
-                .expect("result");
+            state.handle_poll_result("parent", None, vec![create_record("100")]);
 
             // Both children should now be initializing
             assert_eq!(state.active.len(), 0);
@@ -2768,9 +2749,7 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Add initial shard
-            state
-                .add_discovered(&[create_api_shard("shard-1", None, None)])
-                .expect("result");
+            state.add_discovered(&[create_api_shard("shard-1", None, None)]);
             state.mark_active("shard-1".to_string(), "iter-1".to_string());
 
             assert_eq!(state.active.len(), 1);
@@ -2778,9 +2757,7 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
 
             // Rediscover same shard - should be ignored
-            state
-                .add_discovered(&[create_api_shard("shard-1", None, None)])
-                .expect("result");
+            state.add_discovered(&[create_api_shard("shard-1", None, None)]);
 
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 0);
@@ -2825,7 +2802,7 @@ mod tests {
 
             let result = state.handle_poll_result("shard-1", Some("iter-2".to_string()), records);
 
-            assert!(result.is_ok());
+            assert!(result.is_some());
             let result = result.expect("Expected result to be Ok");
             assert_eq!(result.shard_id, "shard-1");
             if let PollOutcome::Records { records } = result.outcome {
@@ -2914,14 +2891,12 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Two independent parent-child chains
-            state
-                .add_discovered(&[
-                    create_api_shard("parent-1", None, None),
-                    create_api_shard("parent-2", None, None),
-                    create_api_shard("child-1", Some("parent-1"), None),
-                    create_api_shard("child-2", Some("parent-2"), None),
-                ])
-                .expect("result");
+            state.add_discovered(&[
+                create_api_shard("parent-1", None, None),
+                create_api_shard("parent-2", None, None),
+                create_api_shard("child-1", Some("parent-1"), None),
+                create_api_shard("child-2", Some("parent-2"), None),
+            ]);
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 2);
@@ -2935,9 +2910,7 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
 
             // Exhaust parent-1
-            state
-                .handle_poll_result("parent-1", None, vec![create_record("100")])
-                .expect("result");
+            state.handle_poll_result("parent-1", None, vec![create_record("100")]);
 
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 1);

@@ -33,8 +33,6 @@ pub use client::Client;
 pub use metrics::{Metrics, MetricsCollector};
 pub use stream::{DynamoDBStreamBatch, DynamodbStream};
 
-pub type StreamResult = Result<DynamoDBStreamBatch, Error>;
-
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -109,14 +107,6 @@ fn is_throttling_error_code(code: Option<&str>) -> bool {
 }
 
 impl Error {
-    #[must_use]
-    pub fn is_retriable(&self) -> bool {
-        matches!(
-            self,
-            Error::Timeout | Error::ConnectionFailure | Error::Throttled
-        )
-    }
-
     pub fn from_describe_table(err: SdkError<DescribeTableError>) -> Self {
         match err {
             SdkError::TimeoutError(_) => Error::Timeout,
@@ -202,96 +192,6 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    mod error_is_retriable {
-        use super::*;
-
-        #[test]
-        fn test_timeout_is_retriable() {
-            let err = Error::Timeout;
-            assert!(err.is_retriable());
-        }
-
-        #[test]
-        fn test_connection_failure_is_retriable() {
-            let err = Error::ConnectionFailure;
-            assert!(err.is_retriable());
-        }
-
-        #[test]
-        fn test_throttled_is_retriable() {
-            let err = Error::Throttled;
-            assert!(err.is_retriable());
-        }
-
-        #[test]
-        fn test_table_not_found_is_not_retriable() {
-            let err = Error::TableNotFound;
-            assert!(!err.is_retriable());
-        }
-
-        #[test]
-        fn test_stream_not_found_is_not_retriable() {
-            let err = Error::StreamNotFound;
-            assert!(!err.is_retriable());
-        }
-
-        #[test]
-        fn test_stream_description_not_found_is_not_retriable() {
-            let err = Error::StreamDescriptionNotFound {
-                stream_arn: "arn:aws:dynamodb:region:account:table/name/stream/time".to_string(),
-            };
-            assert!(!err.is_retriable());
-        }
-
-        #[test]
-        fn test_shard_iterator_not_found_is_not_retriable() {
-            let err = Error::ShardIteratorNotFound {
-                shard_id: "shard-123".to_string(),
-            };
-            assert!(!err.is_retriable());
-        }
-
-        #[test]
-        fn test_failed_to_initialize_checkpoint_is_not_retriable() {
-            let err = Error::FailedToInitializeCheckpoint;
-            assert!(!err.is_retriable());
-        }
-
-        #[test]
-        fn test_stream_beyond_retention_is_not_retriable() {
-            let err = Error::StreamBeyondRetention;
-            assert!(!err.is_retriable());
-        }
-
-        #[test]
-        fn test_shard_not_found_is_not_retriable() {
-            let err = Error::ShardNotFound;
-            assert!(!err.is_retriable());
-        }
-
-        #[test]
-        fn test_missing_starting_sequence_number_is_not_retriable() {
-            let err = Error::MissingStaringSequenceNumber;
-            assert!(!err.is_retriable());
-        }
-
-        #[test]
-        fn test_unexpected_shard_id_is_not_retriable() {
-            let err = Error::UnexpectedShardId {
-                shard_id: "shard-xyz".to_string(),
-            };
-            assert!(!err.is_retriable());
-        }
-
-        #[test]
-        fn test_iterator_expired_is_not_retriable() {
-            // Iterator expired is handled specially (reinitialization)
-            // but should NOT be in the retriable category
-            let err = Error::IteratorExpired;
-            assert!(!err.is_retriable());
-        }
-    }
 
     mod error_display {
         use super::*;
