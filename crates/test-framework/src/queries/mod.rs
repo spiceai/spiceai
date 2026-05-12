@@ -152,6 +152,20 @@ macro_rules! generate_clickbench_query_overrides {
   }
 }
 
+macro_rules! generate_chbench_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("chbench_q", stringify!($i)).into(),
+                    include_str!(concat!("./chbench/q", stringify!($i), ".sql")).into(),
+                    false
+                )
+            ),*
+        ]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub name: Arc<str>,
@@ -289,6 +303,7 @@ pub enum QuerySet {
     Tpch,
     Tpcds,
     Clickbench,
+    ChBench,
     ParameterizedTpch,
     /// Scenario query set loaded from a file
     Scenario {
@@ -337,6 +352,7 @@ impl QuerySet {
             QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
             QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides)),
             QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
+            QuerySet::ChBench => Ok(get_chbench_test_queries(overrides)),
             QuerySet::Scenario { queries, .. } => Ok(queries.clone()),
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
@@ -418,6 +434,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithRowCount::from)
                 .collect(),
+            QuerySet::ChBench => vec![],
         }
     }
 
@@ -471,6 +488,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithTimeColumn::from)
                 .collect(),
+            QuerySet::ChBench => vec![],
         }
     }
 
@@ -562,6 +580,11 @@ impl QuerySet {
                     "clickbench_q43",
                 ]
             }
+            QuerySet::ChBench => {
+                // CH-benCH results are non-deterministic under concurrent OLTP load;
+                // skip row count validation for all queries
+                vec![]
+            }
             QuerySet::Scenario { .. } => vec![],
         }
     }
@@ -573,6 +596,7 @@ impl Display for QuerySet {
             QuerySet::Tpch => write!(f, "tpch"),
             QuerySet::Tpcds => write!(f, "tpcds"),
             QuerySet::Clickbench => write!(f, "clickbench"),
+            QuerySet::ChBench => write!(f, "chbench"),
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
             QuerySet::Scenario { scenario_set, .. } => {
                 if let Some(name) = &scenario_set.name {
@@ -1166,6 +1190,19 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
     }
 
     queries
+}
+
+#[must_use]
+pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
+    let queries = generate_chbench_queries!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22
+    );
+    // q15 excluded: requires a `revenue1` view
+
+    match overrides {
+        // No engine-specific overrides yet
+        Some(_) | None => queries,
+    }
 }
 
 #[cfg(test)]
