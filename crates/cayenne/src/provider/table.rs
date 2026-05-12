@@ -63,7 +63,7 @@ use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::limit::GlobalLimitExec;
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_table_providers::util::constraints::UpsertOptions;
@@ -3798,15 +3798,12 @@ impl CayenneTableProvider {
 
         self.commit_inlined_data_mutation(
             rewrite,
-            vec![InlinedData {
-                inlined_id: String::new(), // auto-generated
-                table_id: self.table_metadata.table_id.clone(),
-                partition_key: None,
-                data_ipc: ipc_bytes,
-                record_count: i64::try_from(total_rows).unwrap_or(i64::MAX),
-                sequence_number: 0,
-                created_at: String::new(), // default in DDL
-            }],
+            vec![InlinedData::pending_catalog_insert(
+                self.table_metadata.table_id.clone(),
+                None,
+                ipc_bytes,
+                i64::try_from(total_rows).unwrap_or(i64::MAX),
+            )],
             total_rows,
         )
         .await?;
@@ -3877,19 +3874,13 @@ impl CayenneTableProvider {
                 .map_err(|e| super::Error::Arrow { source: e })?;
             for row_key in row_keys {
                 if self.pk_deletion_strategy.is_int64_pk() {
-                    if let Some(pk) = Self::row_key_to_i64(&row_key) {
-                        maps.int64_pk
-                            .entry(pk)
-                            .and_modify(|sequence| {
-                                *sequence = (*sequence).max(delete.sequence_number);
-                            })
-                            .or_insert(delete.sequence_number);
-                    } else {
-                        tracing::warn!(
-                            "Skipping invalid inlined Int64 delete key for table {}",
-                            self.table_metadata.table_name
-                        );
-                    }
+                    let pk = Self::row_key_to_i64(&row_key, &self.table_metadata.table_name)?;
+                    maps.int64_pk
+                        .entry(pk)
+                        .and_modify(|sequence| {
+                            *sequence = (*sequence).max(delete.sequence_number);
+                        })
+                        .or_insert(delete.sequence_number);
                 } else {
                     maps.row_keys
                         .entry(row_key)
@@ -3902,13 +3893,19 @@ impl CayenneTableProvider {
         Ok(maps)
     }
 
-    fn row_key_to_i64(row_key: &[u8]) -> Option<i64> {
-        if row_key.len() < 8 {
-            return None;
+    fn row_key_to_i64(row_key: &[u8], table_name: &str) -> Result<i64> {
+        if row_key.len() != 8 {
+            return Err(Error::DataValidation {
+                table: table_name.to_string(),
+                message: format!(
+                    "Invalid inlined Int64 delete key length {}; expected 8 bytes",
+                    row_key.len()
+                ),
+            });
         }
         let mut bytes = [0_u8; 8];
-        bytes.copy_from_slice(&row_key[..8]);
-        Some(i64::from_be_bytes(bytes))
+        bytes.copy_from_slice(row_key);
+        Ok(i64::from_be_bytes(bytes))
     }
 
     fn filter_inlined_batch_for_deletions(
@@ -5167,11 +5164,10 @@ impl TableProvider for CayenneTableProvider {
         };
 
         let plan: Arc<dyn ExecutionPlan> = if let Some(limit) = limit {
-            Arc::new(GlobalLimitExec::new(
-                Arc::new(CoalescePartitionsExec::new(plan)),
-                0,
-                Some(limit),
-            ))
+            let local_limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(plan, limit));
+            let single_partition: Arc<dyn ExecutionPlan> =
+                Arc::new(CoalescePartitionsExec::new(local_limit));
+            Arc::new(GlobalLimitExec::new(single_partition, 0, Some(limit)))
         } else {
             plan
         };
@@ -6003,6 +5999,17 @@ mod tests {
 
         assert_eq!(keyset.len(), 3, "all rows should be in keyset");
         assert_eq!(row_id_base, 3, "row_id_base should advance by batch size");
+    }
+
+    #[test]
+    fn test_row_key_to_i64_rejects_invalid_length() {
+        let err = CayenneTableProvider::row_key_to_i64(&[1, 2, 3], "test_table")
+            .expect_err("invalid inlined Int64 key should fail");
+
+        assert!(
+            err.to_string().contains("expected 8 bytes"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Helper to create a `CayenneTableProvider` with sort columns configured.
