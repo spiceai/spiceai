@@ -44,8 +44,6 @@ pub struct ReplicationParams {
     pub status_interval: Duration,
     /// Rows per emitted snapshot batch during initial bootstrap.
     pub bootstrap_batch_size: usize,
-    /// Advance the acknowledged LSN on keepalives when no decoded transaction is pending.
-    pub ack_filtered_lsn: bool,
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -63,7 +61,6 @@ impl std::fmt::Debug for ReplicationParams {
             .field("temporary_slot", &self.temporary_slot)
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
-            .field("ack_filtered_lsn", &self.ack_filtered_lsn)
             .finish_non_exhaustive()
     }
 }

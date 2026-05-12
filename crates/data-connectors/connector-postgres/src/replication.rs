@@ -439,8 +439,6 @@ fn replication_params_from_connector_params(
         DEFAULT_BOOTSTRAP_BATCH_SIZE,
         MAX_BOOTSTRAP_BATCH_SIZE,
     )?;
-    let ack_filtered_lsn = optional_string(params, "replication_ack_filtered_lsn")
-        .is_none_or(|s| parse_bool_default_true(&s));
 
     Ok(ReplicationParams {
         host,
@@ -456,7 +454,6 @@ fn replication_params_from_connector_params(
         temporary_slot,
         status_interval,
         bootstrap_batch_size,
-        ack_filtered_lsn,
     })
 }
 

@@ -121,7 +121,6 @@ All replication-specific parameters live under `params:` on the dataset and star
 | `pg_replication_temporary_slot`        | `false`                             | If `true`, the slot is dropped when Spice disconnects. Every restart re-bootstraps. |
 | `pg_replication_status_interval`       | `10s`                               | How often `StandbyStatusUpdate` (LSN acknowledgement) is sent back to Postgres. Lower values free WAL faster; higher values reduce network chatter. Accepts any [fundu](https://docs.rs/fundu) duration string (`500ms`, `30s`, `2m`). |
 | `pg_replication_bootstrap_batch_size`  | `8192`                              | Rows per batch emitted by the initial snapshot stream. Increase for large tables to reduce per-batch write/planning overhead; decrease to reduce peak memory. Maximum: `1048576`. |
-| `pg_replication_ack_filtered_lsn`      | `true`                              | If `true`, Spice advances slot acknowledgement on keepalives when no decoded transaction is pending. This lets quiet or filtered publications release retained WAL even when no table changes are emitted. |
 
 All existing `pg_host`, `pg_port`, `pg_user`, `pg_pass`, `pg_db`, `pg_sslmode`, `pg_connection_string`, etc. parameters continue to apply.
 

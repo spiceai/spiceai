@@ -128,7 +128,6 @@ fn wal_stream(
     let primary_keys = input.primary_keys;
     let confirmed_flush = Arc::clone(&input.confirmed_flush);
     let mark_ready_on_first = input.is_dataset_ready_on_first_event;
-    let ack_filtered_lsn = input.params.ack_filtered_lsn;
     let metrics = input.metrics;
 
     try_stream! {
@@ -365,7 +364,6 @@ fn wal_stream(
                     // last applied commit LSN so we never ACK past buffered rows.
                     let applied = keepalive_applied_lsn(
                         &confirmed_flush,
-                        ack_filtered_lsn,
                         txn.is_some(),
                         last_emitted_commit_lsn,
                         wal_end.0,
@@ -424,13 +422,12 @@ fn resolve_relation(
 
 fn keepalive_applied_lsn(
     confirmed_flush: &AtomicU64,
-    ack_filtered_lsn: bool,
     transaction_pending: bool,
     last_emitted_commit_lsn: u64,
     wal_end: u64,
 ) -> u64 {
     let applied = confirmed_flush.load(Ordering::Acquire);
-    if ack_filtered_lsn && !transaction_pending && applied >= last_emitted_commit_lsn {
+    if !transaction_pending && applied >= last_emitted_commit_lsn {
         advance(confirmed_flush, wal_end);
     }
     confirmed_flush.load(Ordering::Relaxed)
@@ -498,7 +495,7 @@ mod tests {
     fn keepalive_advances_filtered_lsn_when_idle() {
         let confirmed = AtomicU64::new(100);
 
-        let applied = keepalive_applied_lsn(&confirmed, true, false, 100, 250);
+        let applied = keepalive_applied_lsn(&confirmed, false, 100, 250);
 
         assert_eq!(applied, 250);
         assert_eq!(confirmed.load(Ordering::Relaxed), 250);
@@ -508,7 +505,7 @@ mod tests {
     fn keepalive_does_not_advance_past_uncommitted_emitted_envelope() {
         let confirmed = AtomicU64::new(100);
 
-        let applied = keepalive_applied_lsn(&confirmed, true, false, 200, 250);
+        let applied = keepalive_applied_lsn(&confirmed, false, 200, 250);
 
         assert_eq!(applied, 100);
         assert_eq!(confirmed.load(Ordering::Relaxed), 100);
@@ -518,17 +515,7 @@ mod tests {
     fn keepalive_does_not_advance_past_pending_transaction() {
         let confirmed = AtomicU64::new(100);
 
-        let applied = keepalive_applied_lsn(&confirmed, true, true, 100, 250);
-
-        assert_eq!(applied, 100);
-        assert_eq!(confirmed.load(Ordering::Relaxed), 100);
-    }
-
-    #[test]
-    fn keepalive_respects_filtered_lsn_disable_switch() {
-        let confirmed = AtomicU64::new(100);
-
-        let applied = keepalive_applied_lsn(&confirmed, false, false, 100, 250);
+        let applied = keepalive_applied_lsn(&confirmed, true, 100, 250);
 
         assert_eq!(applied, 100);
         assert_eq!(confirmed.load(Ordering::Relaxed), 100);

@@ -172,13 +172,6 @@ const PARAMETERS: &[ParameterSpec] = &[
              Default: 8192. Maximum: 1048576.",
         )
         .default("8192"),
-    ParameterSpec::component("replication_ack_filtered_lsn")
-        .description(
-            "Whether to acknowledge keepalive WAL positions when no decoded transaction \
-             is pending, allowing filtered publications to release retained WAL. \
-             Default: true.",
-        )
-        .default("true"),
 ];
 
 impl DataConnectorFactory for PostgresFactory {
