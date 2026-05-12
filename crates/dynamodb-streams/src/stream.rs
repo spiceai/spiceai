@@ -79,7 +79,7 @@ impl DynamodbStreamProducer {
                 }
                 Err(e) => {
                     had_error = true;
-                    self.state.handle_poll_error(&shard_id, e)
+                    self.state.handle_poll_error(&shard_id, &e)
                 }
             };
             if let Some(poll_result) = poll_result {

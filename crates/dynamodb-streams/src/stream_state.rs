@@ -181,7 +181,7 @@ impl StreamState {
         })
     }
 
-    pub fn handle_poll_error(&mut self, shard_id: &str, error: Error) -> Option<ShardPollResult> {
+    pub fn handle_poll_error(&mut self, shard_id: &str, error: &Error) -> Option<ShardPollResult> {
         let Some(shard) = self.active.get(shard_id) else {
             tracing::warn!("Received poll error for unknown shard {shard_id}, skipping");
             return None;
@@ -1155,7 +1155,7 @@ mod tests {
         #[test]
         fn test_handle_poll_error_shard_not_found() {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
-            let result = state.handle_poll_error("nonexistent-shard", Error::Timeout);
+            let result = state.handle_poll_error("nonexistent-shard", &Error::Timeout);
 
             assert!(result.is_none());
         }
@@ -1179,7 +1179,7 @@ mod tests {
                 },
             );
 
-            let result = state.handle_poll_error("shard-1", Error::Timeout);
+            let result = state.handle_poll_error("shard-1", &Error::Timeout);
 
             assert!(result.is_some());
             let poll_result = result.expect("result");
@@ -1211,7 +1211,7 @@ mod tests {
                 },
             );
 
-            let result = state.handle_poll_error("shard-1", Error::ConnectionFailure);
+            let result = state.handle_poll_error("shard-1", &Error::ConnectionFailure);
 
             result.expect("should be ok");
             assert!(state.active.contains_key("shard-1"));
@@ -1236,7 +1236,7 @@ mod tests {
                 },
             );
 
-            let result = state.handle_poll_error("shard-1", Error::Throttled);
+            let result = state.handle_poll_error("shard-1", &Error::Throttled);
 
             result.expect("should be ok");
             assert!(state.active.contains_key("shard-1"));
@@ -1262,7 +1262,7 @@ mod tests {
                 },
             );
 
-            let result = state.handle_poll_error("shard-1", Error::IteratorExpired);
+            let result = state.handle_poll_error("shard-1", &Error::IteratorExpired);
 
             assert!(result.is_some());
             let poll_result = result.expect("result");
@@ -1305,7 +1305,7 @@ mod tests {
 
             // All errors (including previously-permanent ones) return Ok(PollOutcome::Failed)
             // so the shard stays active and is retried on the next iteration.
-            let result = state.handle_poll_error("shard-1", Error::StreamBeyondRetention);
+            let result = state.handle_poll_error("shard-1", &Error::StreamBeyondRetention);
 
             assert!(result.is_some());
             assert!(matches!(
@@ -1335,7 +1335,7 @@ mod tests {
                 },
             );
 
-            let result = state.handle_poll_error("shard-1", Error::Timeout);
+            let result = state.handle_poll_error("shard-1", &Error::Timeout);
 
             assert!(result.is_some());
             let poll_result = result.expect("result");
