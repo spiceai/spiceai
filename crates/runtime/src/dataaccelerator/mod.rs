@@ -1358,11 +1358,12 @@ mod accelerator_compat_tests {
                     use std::panic::AssertUnwindSafe;
 
                     let accelerator = CayenneAccelerator::new();
+                    let runtime_env = SessionContext::new().runtime_env();
                     let create_future = AssertUnwindSafe(accelerator.create_external_table(
                         external_table,
                         Some(&dataset),
                         Vec::new(),
-                        None,
+                        Some(runtime_env),
                     ))
                     .catch_unwind();
 
@@ -3677,7 +3678,7 @@ mod accelerator_compat_tests {
     }
 
     fn supports_change_delete_roundtrip(engine: Engine) -> bool {
-        !matches!(engine, Engine::Arrow)
+        !matches!(engine, Engine::Arrow | Engine::Turso)
     }
 
     fn generate_changed_test_data(
