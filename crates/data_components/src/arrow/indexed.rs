@@ -566,6 +566,7 @@ impl PrimaryKeyValue {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for IndexedMemTable {
     fn as_any(&self) -> &dyn Any {

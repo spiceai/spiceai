@@ -72,6 +72,7 @@ impl FullTextConnector {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl DataConnector for FullTextConnector {
     fn as_any(&self) -> &dyn Any {

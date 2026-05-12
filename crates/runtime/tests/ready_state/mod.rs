@@ -208,6 +208,7 @@ struct DelayedNativeTableProvider {
     inner_provider: Arc<dyn TableProvider>,
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for DelayedNativeTableProvider {
     fn as_any(&self) -> &dyn Any {

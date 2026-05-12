@@ -94,6 +94,7 @@ impl std::fmt::Debug for UpsertDedupTableProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for UpsertDedupTableProvider {
     fn as_any(&self) -> &dyn Any {

@@ -89,6 +89,7 @@ impl TaskEmbed {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Embed for TaskEmbed {
     async fn embed<'b>(&'b self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {

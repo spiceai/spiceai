@@ -195,6 +195,7 @@ impl DeletionFilteringVortexFormat {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl FileFormat for DeletionFilteringVortexFormat {
     fn as_any(&self) -> &dyn Any {

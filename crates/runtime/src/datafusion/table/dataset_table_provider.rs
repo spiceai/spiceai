@@ -171,6 +171,7 @@ impl std::fmt::Debug for DatasetTableProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for DatasetTableProvider {
     fn as_any(&self) -> &dyn Any {

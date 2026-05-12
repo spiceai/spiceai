@@ -199,6 +199,7 @@ impl RefreshSkipTableProvider for S3SingleFileCached {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for S3SingleFileCached {
     fn as_any(&self) -> &dyn Any {

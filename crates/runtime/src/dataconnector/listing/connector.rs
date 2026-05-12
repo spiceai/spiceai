@@ -154,6 +154,7 @@ fn parse_partition_values(
     Some(part_values)
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for LocationPruningListingTable {
     fn as_any(&self) -> &dyn Any {

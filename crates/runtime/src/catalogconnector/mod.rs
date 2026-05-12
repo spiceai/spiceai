@@ -421,6 +421,7 @@ impl RefreshingCatalogProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl CatalogProvider for RefreshingCatalogProvider {
     fn as_any(&self) -> &dyn Any {
         self.inner.as_any()

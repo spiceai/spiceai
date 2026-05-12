@@ -150,6 +150,7 @@ impl SwappableTableProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for SwappableTableProvider {
     fn as_any(&self) -> &dyn Any {

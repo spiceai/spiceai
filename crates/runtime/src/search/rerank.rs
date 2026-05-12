@@ -647,6 +647,7 @@ impl RerankUDTFProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for RerankUDTFProvider {
     fn as_any(&self) -> &dyn Any {

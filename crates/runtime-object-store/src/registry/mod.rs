@@ -708,6 +708,7 @@ impl SpiceObjectStoreRegistry {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
     fn register_store(
         &self,

@@ -52,6 +52,7 @@ impl DeferredConnector {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl DataConnector for DeferredConnector {
     fn as_any(&self) -> &dyn Any {
@@ -80,6 +81,7 @@ impl DataConnector for DeferredConnector {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for DeferredConnector {
     fn as_any(&self) -> &dyn Any {

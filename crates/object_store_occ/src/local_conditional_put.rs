@@ -141,6 +141,7 @@ impl Display for LocalConditionalPut {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl ObjectStore for LocalConditionalPut {
     async fn put_opts(
