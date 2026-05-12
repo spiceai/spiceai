@@ -725,6 +725,10 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
             Ok(store)
         })
     }
+
+    fn deregister_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        self.inner.deregister_store(url)
+    }
 }
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See

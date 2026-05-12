@@ -12592,6 +12592,7 @@ name = "object_store_occ"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "futures",
  "object_store",
  "parking_lot 0.12.5",

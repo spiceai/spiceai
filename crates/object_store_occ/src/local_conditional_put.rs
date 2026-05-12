@@ -34,9 +34,11 @@ limitations under the License.
 use std::fmt::{self, Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::ops::Range;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
@@ -237,6 +239,53 @@ impl ObjectStore for LocalConditionalPut {
 
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<(), ObjectStoreError> {
         self.inner.rename_if_not_exists(from, to).await
+    }
+
+    async fn put(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+    ) -> Result<PutResult, ObjectStoreError> {
+        self.put_opts(location, payload, PutOptions::default())
+            .await
+    }
+
+    async fn put_multipart(
+        &self,
+        location: &Path,
+    ) -> Result<Box<dyn MultipartUpload>, ObjectStoreError> {
+        self.inner.put_multipart(location).await
+    }
+
+    async fn get(&self, location: &Path) -> Result<GetResult, ObjectStoreError> {
+        self.inner.get(location).await
+    }
+
+    async fn get_range(
+        &self,
+        location: &Path,
+        range: Range<u64>,
+    ) -> Result<Bytes, ObjectStoreError> {
+        self.inner.get_range(location, range).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> Result<Vec<Bytes>, ObjectStoreError> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, Result<Path, ObjectStoreError>>,
+    ) -> BoxStream<'a, Result<Path, ObjectStoreError>> {
+        self.inner.delete_stream(locations)
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> Result<(), ObjectStoreError> {
+        self.inner.rename(from, to).await
     }
 }
 
