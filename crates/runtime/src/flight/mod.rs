@@ -69,6 +69,7 @@ mod get_schema;
 mod handshake;
 mod metrics;
 pub mod middleware;
+mod mtls;
 mod session;
 pub(crate) mod session_auth;
 mod util;
@@ -643,6 +644,7 @@ pub async fn start(
         endpoint_auth.flight_basic_auth,
         session_store.clone(),
     );
+    let identity_source = endpoint_auth.identity_source;
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(session_aware_auth))
         .into_inner();
@@ -659,6 +661,11 @@ pub async fn start(
             RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
                 .with_job_executor(job_executor),
         )
+        // mTLS principal injection runs *after* RequestContextLayer
+        // (which sets up the AuthRequestContext extension) and
+        // *before* BasicAuthLayer (which short-circuits when a
+        // principal is already present).
+        .layer(mtls::MtlsLayer::new(identity_source))
         .layer(auth_layer)
         .layer(WriteRateLimitLayer::new(
             RateLimiter::direct(rate_limits.flight_write_limit),
@@ -692,7 +699,7 @@ pub async fn start(
         runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         let incoming = crate::tls::flight_incoming::tls_incoming(
             listener,
-            Arc::clone(&tls_config.server_config),
+            Arc::clone(&tls_config.flight_server_config),
         );
         if let Some(token) = shutdown_signal {
             server
