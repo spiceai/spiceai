@@ -647,7 +647,10 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                         .ok()
                         .flatten()
                         .is_some_and(|m| {
-                            m.partitions.len() == 4 && m.partitions.iter().all(|p| p.is_assigned())
+                            m.partitions.len() == 4
+                                && m.partitions
+                                    .iter()
+                                    .all(runtime::cluster::PartitionMetadata::is_assigned)
                         })
                 })
                 .await;
@@ -1075,15 +1078,15 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
                 ("s3_region".to_string(), "us-east-1".to_string()),
-                // (
-                //     "s3_key".to_string(),
-                //     "${env:AWS_S3_VECTORS_KEY}".to_string(),
-                // ),
-                // (
-                //     "s3_secret".to_string(),
-                //     "${env:AWS_S3_VECTORS_SECRET}".to_string(),
-                // ),
-                // ("s3_auth".to_string(), "key".to_string()),
+                (
+                    "s3_key".to_string(),
+                    "${env:AWS_S3_VECTORS_KEY}".to_string(),
+                ),
+                (
+                    "s3_secret".to_string(),
+                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+                ),
+                ("s3_auth".to_string(), "key".to_string()),
             ]),
         )),
         partition_assignment_interval: "1s".to_string(),
