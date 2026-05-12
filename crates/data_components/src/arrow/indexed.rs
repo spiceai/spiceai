@@ -807,7 +807,9 @@ impl TableProvider for IndexedMemTable {
         self.inner.get_table_definition()
     }
 
-    fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
         self.inner.get_logical_plan()
     }
 
