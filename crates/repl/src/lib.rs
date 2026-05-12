@@ -849,7 +849,7 @@ fn add_api_key<T>(
 /// Display a set of record batches to the user. This function will display the first 500 rows.
 ///
 /// When `expanded` is true, each row is rendered as a vertical block of
-/// `column | value` lines instead of a table, similar to PostgreSQL's `\x`.
+/// `column | value` lines instead of a table, similar to `PostgreSQL`'s `\x`.
 ///
 /// # Errors
 ///

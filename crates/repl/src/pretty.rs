@@ -52,7 +52,7 @@ pub fn format_batches_with_types(batches: &[RecordBatch]) -> Result<String, Arro
 /// Formats Arrow `RecordBatch`es in expanded view: each row becomes a vertical
 /// stack of `column | value` lines, separated by a `-[ RECORD n ]-` divider.
 ///
-/// This mirrors PostgreSQL's `\x` (expanded) display mode and is useful when
+/// This mirrors `PostgreSQL`'s `\x` (expanded) display mode and is useful when
 /// tables are wider than the terminal.
 ///
 /// # Errors
@@ -77,7 +77,7 @@ pub fn format_batches_expanded(batches: &[RecordBatch]) -> Result<String, ArrowE
         // batch's schema, so all batches must share that schema.
         if batch.schema() != schema {
             return Err(ArrowError::SchemaError(
-                "format_batches_expanded: all batches must share the same schema".to_string(),
+                "cannot format results: result batches have differing schemas".to_string(),
             ));
         }
         let formatters = batch
