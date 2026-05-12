@@ -65,7 +65,7 @@ pub fn format_batches_expanded(batches: &[RecordBatch]) -> Result<String, ArrowE
 
     let schema = batches[0].schema();
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    // Width of the label column is the widest column name; capped to keep things sane.
+    // Label column width is the widest column name in the (first) batch schema.
     let name_width = field_names.iter().map(|n| n.len()).max().unwrap_or(0);
 
     let format_opts = FormatOptions::default().with_display_error(true);
@@ -73,6 +73,13 @@ pub fn format_batches_expanded(batches: &[RecordBatch]) -> Result<String, ArrowE
     let mut record_num: usize = 0;
 
     for batch in batches {
+        // We index `formatters` by the column position derived from the first
+        // batch's schema, so all batches must share that schema.
+        if batch.schema() != schema {
+            return Err(ArrowError::SchemaError(
+                "format_batches_expanded: all batches must share the same schema".to_string(),
+            ));
+        }
         let formatters = batch
             .columns()
             .iter()
@@ -476,6 +483,72 @@ mod tests {
         let formatted = format_batches_expanded(&[batch]).expect("formatting should succeed");
         assert!(formatted.contains("-[ RECORD 1 ]"));
         assert!(formatted.contains("name"));
+    }
+
+    #[test]
+    fn test_format_batches_expanded_multiline_value_alignment() {
+        // A Utf8 value that contains embedded newlines should be split across
+        // continuation rows, with the label column blank but the `|` still
+        // anchored under the first row's `|`.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("note", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["line1\nline2\nline3"])),
+                Arc::new(Int32Array::from(vec![7])),
+            ],
+        )
+        .expect("creating test batch");
+
+        let formatted = format_batches_expanded(&[batch]).expect("formatting should succeed");
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        // The first value row, plus 2 continuation rows, plus the id row.
+        // Layout (name_width = 4):
+        //   note | line1
+        //        | line2
+        //        | line3
+        //   id   | 7
+        let note_row = lines.iter().find(|l| l.starts_with("note ")).expect("note row");
+        let pipe_col = note_row.find('|').expect("pipe in note row");
+        let cont1 = lines
+            .iter()
+            .find(|l| l.contains("| line2"))
+            .expect("first continuation");
+        let cont2 = lines
+            .iter()
+            .find(|l| l.contains("| line3"))
+            .expect("second continuation");
+        let id_row = lines.iter().find(|l| l.starts_with("id ")).expect("id row");
+
+        assert_eq!(cont1.find('|'), Some(pipe_col), "continuation 1 misaligned");
+        assert_eq!(cont2.find('|'), Some(pipe_col), "continuation 2 misaligned");
+        assert_eq!(id_row.find('|'), Some(pipe_col), "id row misaligned");
+        // Continuation rows have a blank label column.
+        let label = &cont1[..pipe_col];
+        assert!(
+            label.chars().all(|c| c == ' '),
+            "continuation label should be blank, got {label:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_batches_expanded_rejects_schema_mismatch() {
+        let s1 = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let s2 = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
+        let b1 = RecordBatch::try_new(s1, vec![Arc::new(Int32Array::from(vec![1]))])
+            .expect("b1");
+        let b2 = RecordBatch::try_new(s2, vec![Arc::new(Int32Array::from(vec![2]))])
+            .expect("b2");
+
+        let err = format_batches_expanded(&[b1, b2]).expect_err("schema mismatch should error");
+        assert!(
+            matches!(err, ArrowError::SchemaError(_)),
+            "expected SchemaError, got {err:?}"
+        );
     }
 
     #[test]

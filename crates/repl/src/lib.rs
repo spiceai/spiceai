@@ -532,7 +532,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let _ = std::io::stdout().flush();
                 continue;
             }
-            ".expanded" => {
+            // Match meta-commands case-insensitively: the multi-line read loop already
+            // breaks out on lower-cased SPECIAL_COMMANDS, so `.EXPANDED` should be
+            // recognised here as well rather than fall through to the SQL path.
+            line if line.eq_ignore_ascii_case(".expanded") => {
                 expanded = !expanded;
                 println!(
                     "Expanded display is {}.",
@@ -541,13 +544,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let _ = std::io::stdout().flush();
                 continue;
             }
-            ".expanded on" => {
+            line if line.eq_ignore_ascii_case(".expanded on") => {
                 expanded = true;
                 println!("Expanded display is on.");
                 let _ = std::io::stdout().flush();
                 continue;
             }
-            ".expanded off" => {
+            line if line.eq_ignore_ascii_case(".expanded off") => {
                 expanded = false;
                 println!("Expanded display is off.");
                 let _ = std::io::stdout().flush();
