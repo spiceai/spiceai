@@ -493,12 +493,18 @@ fn optional_usize_in_range(
 
     match raw.trim().parse::<usize>() {
         Ok(value) if (1..=max).contains(&value) => Ok(value),
-        Ok(value) => Err(format!(
-            "parameter `{key}` must be between 1 and {max}, got {value}"
-        )),
-        Err(e) => Err(format!(
-            "parameter `{key}` must be a positive integer, got {raw:?}: {e}"
-        )),
+        Ok(value) => {
+            let user_param = params.user_param(key);
+            Err(format!(
+                "parameter `{user_param}` must be between 1 and {max}, got {value}"
+            ))
+        }
+        Err(parse_error) => {
+            let user_param = params.user_param(key);
+            Err(format!(
+                "parameter `{user_param}` must be a positive integer, got {raw:?}: {parse_error}"
+            ))
+        }
     }
 }
 
@@ -537,4 +543,57 @@ fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params_with_bootstrap_batch_size(value: &str) -> Parameters {
+        Parameters::new(
+            vec![(
+                "replication_bootstrap_batch_size".to_string(),
+                SecretString::from(value),
+            )],
+            "pg",
+            crate::PARAMETERS,
+        )
+    }
+
+    #[test]
+    fn optional_usize_in_range_uses_user_facing_name_for_out_of_range_error() {
+        let params = params_with_bootstrap_batch_size("0");
+
+        let result = optional_usize_in_range(
+            &params,
+            "replication_bootstrap_batch_size",
+            DEFAULT_BOOTSTRAP_BATCH_SIZE,
+            MAX_BOOTSTRAP_BATCH_SIZE,
+        );
+
+        assert_eq!(
+            result,
+            Err("parameter `pg_replication_bootstrap_batch_size` must be between 1 and 1048576, got 0".to_string())
+        );
+    }
+
+    #[test]
+    fn optional_usize_in_range_uses_user_facing_name_for_parse_error() {
+        let params = params_with_bootstrap_batch_size("many");
+
+        let result = optional_usize_in_range(
+            &params,
+            "replication_bootstrap_batch_size",
+            DEFAULT_BOOTSTRAP_BATCH_SIZE,
+            MAX_BOOTSTRAP_BATCH_SIZE,
+        );
+
+        assert!(
+            result
+                .expect_err("invalid bootstrap batch size should return an error")
+                .starts_with(
+                    "parameter `pg_replication_bootstrap_batch_size` must be a positive integer, got \"many\""
+                )
+        );
+    }
 }
