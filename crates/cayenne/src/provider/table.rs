@@ -3828,7 +3828,7 @@ impl CayenneTableProvider {
                         .max();
                     keep_mask.push(
                         max_delete_sequence
-                            .is_none_or(|delete_sequence| delete_sequence <= data_sequence),
+                            .is_none_or(|delete_sequence| data_sequence > delete_sequence),
                     );
                 }
             }
@@ -3859,7 +3859,7 @@ impl CayenneTableProvider {
                         .max();
                     keep_mask.push(
                         max_delete_sequence
-                            .is_none_or(|delete_sequence| delete_sequence <= data_sequence),
+                            .is_none_or(|delete_sequence| data_sequence > delete_sequence),
                     );
                 }
             }

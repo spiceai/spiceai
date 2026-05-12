@@ -259,12 +259,14 @@ impl CayenneDataSink {
         // ── Data inlining fast-path ────────────────────────────────────
         // For small data, store directly in the metastore as Arrow IPC to avoid
         // Vortex file overhead. PK tables can use this path when conflicts are
-        // inline-only: file-backed conflicts still need the protected-snapshot
-        // path so old file rows stay hidden while replacement rows are visible.
+        // inline-only and there are no pending file-backed PK deletions: those
+        // paths still need a protected snapshot so old rows stay hidden while
+        // replacement rows are visible.
         let has_primary_key = !self.table.pk_deletion_strategy().is_position_based();
         let has_sort_columns = self.context.has_sort_columns();
         let is_partitioned = self.table.metadata().partition_column.is_some();
-        let can_inline = !has_file_on_conflict_deletions
+        let can_inline = !needs_new_snapshot_for_pending_deletions
+            && !has_file_on_conflict_deletions
             && !has_sort_columns
             && !is_partitioned
             && !self.table.has_retention_filters();
