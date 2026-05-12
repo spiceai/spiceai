@@ -62,6 +62,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
+use datafusion_physical_plan::limit::GlobalLimitExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_table_providers::util::constraints::UpsertOptions;
@@ -4947,6 +4948,12 @@ impl TableProvider for CayenneTableProvider {
         // enabling file-level pruning via min/max stats and row-level filtering.
         let plan: Arc<dyn ExecutionPlan> = if let Some(ref keep_filter) = retention_keep_filter {
             self.wrap_plan_with_retention_filter(plan, keep_filter)?
+        } else {
+            plan
+        };
+
+        let plan: Arc<dyn ExecutionPlan> = if let Some(limit) = limit {
+            Arc::new(GlobalLimitExec::new(plan, limit, None))
         } else {
             plan
         };

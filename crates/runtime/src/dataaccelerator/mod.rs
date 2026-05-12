@@ -2581,6 +2581,11 @@ mod accelerator_compat_tests {
             let metadata_dir = test_env.metadata_dir();
             async move {
                 let ctx = SessionContext::new();
+                let mode = if _mode.starts_with("file") {
+                    "file"
+                } else {
+                    "memory"
+                };
                 let schema = Arc::new(Schema::new(vec![
                     Field::new("id", DataType::Int64, false),
                     Field::new("name", DataType::Utf8, false),
@@ -2591,7 +2596,7 @@ mod accelerator_compat_tests {
                     ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
 
                 // Create location for file-based engines
-                let location = if _mode == "file" {
+                let location = if mode == "file" {
                     format!(
                         "/tmp/spice_benchmark_{:?}_boolean_{}_{}.db",
                         engine,
@@ -2606,10 +2611,10 @@ mod accelerator_compat_tests {
                 };
 
                 let mut options = HashMap::new();
-                if _mode == "file" {
+                if mode == "file" {
                     options.insert("file".to_string(), location.clone());
                 }
-                options.insert("mode".to_string(), _mode.clone());
+                options.insert("mode".to_string(), mode.to_string());
 
                 let external_table = CreateExternalTable {
                     schema: df_schema,
@@ -2664,7 +2669,7 @@ mod accelerator_compat_tests {
                     Engine::Cayenne => {
                         use crate::component::dataset::builder::DatasetBuilder;
                         use crate::dataaccelerator::cayenne::CayenneAccelerator; // Clean up any existing files and metadata
-                        if _mode == "file" && !location.is_empty() {
+                        if mode == "file" && !location.is_empty() {
                             let test_dir = std::path::Path::new(&location);
                             if test_dir.exists() {
                                 if let Ok(entries) = std::fs::read_dir(test_dir) {
@@ -2713,16 +2718,19 @@ mod accelerator_compat_tests {
                             };
 
                         let mut params = HashMap::new();
-                        if _mode == "file" {
+                        if mode == "file" {
                             params.insert("cayenne_file_path".to_string(), location.clone());
                         }
                         // Use test environment's metadata directory for Cayenne
                         params.insert("cayenne_metadata_dir".to_string(), metadata_dir.clone());
                         params.insert("unsupported_type_action".to_string(), "error".to_string());
+                        if _mode.contains("metastore=turso") {
+                            params.insert("cayenne_metastore".to_string(), "turso".to_string());
+                        }
 
                         dataset.acceleration = Some(Acceleration {
                             enabled: true,
-                            mode: if _mode == "file" {
+                            mode: if mode == "file" {
                                 Mode::File
                             } else {
                                 Mode::Memory
@@ -2732,8 +2740,14 @@ mod accelerator_compat_tests {
                             ..Acceleration::default()
                         });
 
+                        let runtime_env = SessionContext::new().runtime_env();
                         CayenneAccelerator::new()
-                            .create_external_table(external_table, Some(&dataset), Vec::new(), None)
+                            .create_external_table(
+                                external_table,
+                                Some(&dataset),
+                                Vec::new(),
+                                Some(runtime_env),
+                            )
                             .await
                             .expect("Vortex table should be created")
                     }
@@ -2803,7 +2817,7 @@ mod accelerator_compat_tests {
                 );
 
                 // Cleanup
-                if _mode == "file" && !location.is_empty() {
+                if mode == "file" && !location.is_empty() {
                     let _ = std::fs::remove_file(&location);
                 }
             }
