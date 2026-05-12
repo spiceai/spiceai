@@ -3804,7 +3804,7 @@ impl CayenneTableProvider {
                 partition_key: None,
                 data_ipc: ipc_bytes,
                 record_count: i64::try_from(total_rows).unwrap_or(i64::MAX),
-                sequence_number: 0,
+                sequence_number: 0, // sequence_number will be set by catalog
                 created_at: String::new(), // default in DDL
             }],
             total_rows,
@@ -3885,10 +3885,12 @@ impl CayenneTableProvider {
                             })
                             .or_insert(delete.sequence_number);
                     } else {
-                        tracing::warn!(
-                            "Skipping invalid inlined Int64 delete key for table {}",
-                            self.table_metadata.table_name
-                        );
+                        return Err(super::Error::Arrow {
+                            source: arrow::error::ArrowError::ParseError(format!(
+                                "Failed to decode legacy inlined Int64 delete key for table {} at sequence {}",
+                                self.table_metadata.table_name, delete.sequence_number
+                            )),
+                        });
                     }
                 } else {
                     maps.row_keys
