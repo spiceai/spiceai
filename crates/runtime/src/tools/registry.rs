@@ -546,7 +546,8 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
                 return Err(Box::new(ToolRegistryError::ToolNotFound {
                     tool_id: params.tool_id,
                     available_tools,
-                }) as Box<dyn std::error::Error + Send + Sync>);
+                })
+                    as Box<dyn std::error::Error + Send + Sync>);
             };
 
             let tool_id = tool.name().to_string();
@@ -556,13 +557,12 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
                 Some(arguments) => serde_json::to_string(&arguments)?,
             };
 
-            let result =
-                tool.call(&arguments)
-                    .await
-                    .map_err(|source| ToolRegistryError::ToolInvokeFailed {
-                        tool_id: tool_id.clone(),
-                        source,
-                    })?;
+            let result = tool.call(&arguments).await.map_err(|source| {
+                ToolRegistryError::ToolInvokeFailed {
+                    tool_id: tool_id.clone(),
+                    source,
+                }
+            })?;
             Ok(json!({
                 "tool_id": tool_id,
                 "result": result,
