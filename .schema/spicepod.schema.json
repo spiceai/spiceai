@@ -6806,10 +6806,6 @@
         "file_watcher": {
           "type": "string"
         },
-        "hash_index": {
-          "description": "Enable hash index for fast primary key lookups. Set to 'enabled' to enable (requires primary_key). Default: disabled.",
-          "type": "string"
-        },
         "arrow_sort_columns": {
           "description": "Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id').",
           "type": "string"
