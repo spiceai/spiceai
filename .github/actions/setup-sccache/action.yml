@@ -8,6 +8,9 @@ inputs:
   spiceio_endpoint:
     description: 'Spiceio S3-compatible endpoint (used for macOS)'
     required: false
+  server_port:
+    description: 'Optional sccache server port to isolate concurrent jobs on shared runners'
+    required: false
 
 runs:
   using: 'composite'
@@ -20,7 +23,11 @@ runs:
         echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
         echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-        echo "SCCACHE_CONF=${HOME}/.config/sccache/config" >> $GITHUB_ENV
+        SCCACHE_CONF_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sccache.XXXXXX")"
+        echo "SCCACHE_CONF=${SCCACHE_CONF_DIR}/config" >> $GITHUB_ENV
+        if [ -n "${{ inputs.server_port }}" ]; then
+          echo "SCCACHE_SERVER_PORT=${{ inputs.server_port }}" >> $GITHUB_ENV
+        fi
 
     - name: Configure apt mirrors (Linux)
       if: runner.os == 'Linux' && inputs.minio_endpoint != ''
@@ -35,9 +42,8 @@ runs:
         tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
         sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
         echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
-        rm -rf ~/.config/sccache/config
-        mkdir -p ~/.config/sccache
-        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > ~/.config/sccache/config
+        mkdir -p "$(dirname "$SCCACHE_CONF")"
+        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > "$SCCACHE_CONF"
 
     - name: Set up sccache (macOS)
       if: runner.os == 'macOS'
@@ -65,9 +71,8 @@ runs:
           echo "spiceio not available, using local MinIO"
         fi
 
-        rm -rf ~/.config/sccache/config
-        mkdir -p ~/.config/sccache
-        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > ~/.config/sccache/config
+        mkdir -p "$(dirname "$SCCACHE_CONF")"
+        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > "$SCCACHE_CONF"
 
     - name: Set up sccache (Windows)
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
