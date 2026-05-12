@@ -43,8 +43,6 @@ pub use config::ChBenchConfig;
 pub use metrics::OltpReport;
 pub use txn::TxnType;
 
-use std::time::Instant;
-
 use ::rand::rngs::StdRng;
 use ::rand::SeedableRng;
 use snafu::Snafu;
@@ -197,16 +195,18 @@ async fn run_terminal(
         }
 
         let txn_type = txn::pick_txn_type(&mut rng, &mix);
-        let start = Instant::now();
 
         match txn::execute(&mut client, &mut rng, txn_type, warehouses).await {
             Ok(()) => {
-                metrics.record_success(txn_type, start.elapsed());
+                metrics.record_success(txn_type);
             }
             Err(e) => {
-                metrics.record_abort(txn_type, start.elapsed());
-                // Log at debug level — aborts are expected in TPC-C
-                eprintln!("Terminal {terminal_id} {txn_type} error: {e}");
+                metrics.record_abort();
+                if !cancel.is_cancelled() {
+                    // Log only if not shutting down — connection-closed errors
+                    // during cancellation are expected and noisy.
+                    eprintln!("Terminal {terminal_id} {txn_type} error: {e}");
+                }
             }
         }
     }

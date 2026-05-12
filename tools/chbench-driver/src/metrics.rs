@@ -14,81 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! OLTP metrics: per-transaction latency tracking and tpmC calculation.
+//! OLTP metrics: tpmC and abort rate tracking.
+//!
+//! Per-transaction-type latency histograms are intentionally omitted — they measure
+//! Postgres performance, not Spice. The metrics that matter for Spice benchmarking are
+//! tpmC (CDC input intensity), the analytical query latencies, and staleness gap reported by testoperator.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::txn::TxnType;
-
-/// Per-transaction-type latency histogram (simple sorted-list approach).
-#[derive(Debug, Default)]
-pub struct LatencyHistogram {
-    samples: Vec<Duration>,
-}
-
-impl LatencyHistogram {
-    pub fn record(&mut self, d: Duration) {
-        self.samples.push(d);
-    }
-
-    pub fn count(&self) -> usize {
-        self.samples.len()
-    }
-
-    /// Merge samples from another histogram into this one.
-    pub fn merge(&mut self, other: Self) {
-        self.samples.extend(other.samples);
-    }
-
-    fn sorted(&self) -> Vec<Duration> {
-        let mut s = self.samples.clone();
-        s.sort();
-        s
-    }
-
-    /// Return the percentile value. `p` should be 0.0..=1.0.
-    pub fn percentile(&self, p: f64) -> Duration {
-        let sorted = self.sorted();
-        if sorted.is_empty() {
-            return Duration::ZERO;
-        }
-        let idx = ((sorted.len() as f64) * p).ceil() as usize;
-        sorted[idx.min(sorted.len()) - 1]
-    }
-
-    pub fn p50(&self) -> Duration {
-        self.percentile(0.50)
-    }
-
-    pub fn p90(&self) -> Duration {
-        self.percentile(0.90)
-    }
-
-    pub fn p95(&self) -> Duration {
-        self.percentile(0.95)
-    }
-
-    pub fn p99(&self) -> Duration {
-        self.percentile(0.99)
-    }
-
-    pub fn min(&self) -> Duration {
-        self.samples.iter().copied().min().unwrap_or(Duration::ZERO)
-    }
-
-    pub fn max(&self) -> Duration {
-        self.samples.iter().copied().max().unwrap_or(Duration::ZERO)
-    }
-}
 
 /// Collected OLTP metrics from a benchmark run.
 #[derive(Debug)]
 pub struct OltpReport {
     /// NewOrder committed transactions per minute.
     pub tpmc: f64,
-    /// Per-transaction-type latency histograms.
-    pub latencies: HashMap<TxnType, LatencyHistogram>,
     /// Total committed transactions.
     pub total_committed: u64,
     /// Total aborted/failed transactions.
@@ -102,7 +42,7 @@ pub struct OltpReport {
 /// Accumulates metrics during an OLTP run.
 pub struct OltpMetrics {
     start: Instant,
-    latencies: HashMap<TxnType, LatencyHistogram>,
+    new_order_committed: u64,
     committed: u64,
     aborted: u64,
 }
@@ -111,38 +51,28 @@ impl OltpMetrics {
     pub fn new() -> Self {
         Self {
             start: Instant::now(),
-            latencies: HashMap::new(),
+            new_order_committed: 0,
             committed: 0,
             aborted: 0,
         }
     }
 
     /// Record a successful transaction.
-    pub fn record_success(&mut self, txn_type: TxnType, latency: Duration) {
-        self.latencies
-            .entry(txn_type)
-            .or_default()
-            .record(latency);
+    pub fn record_success(&mut self, txn_type: TxnType) {
+        if txn_type == TxnType::NewOrder {
+            self.new_order_committed += 1;
+        }
         self.committed += 1;
     }
 
     /// Record a failed/aborted transaction.
-    pub fn record_abort(&mut self, txn_type: TxnType, latency: Duration) {
-        self.latencies
-            .entry(txn_type)
-            .or_default()
-            .record(latency);
+    pub fn record_abort(&mut self) {
         self.aborted += 1;
     }
 
     /// Merge another terminal's metrics into this one.
     pub fn merge(&mut self, other: Self) {
-        for (txn_type, hist) in other.latencies {
-            self.latencies
-                .entry(txn_type)
-                .or_default()
-                .merge(hist);
-        }
+        self.new_order_committed += other.new_order_committed;
         self.committed += other.committed;
         self.aborted += other.aborted;
     }
@@ -152,14 +82,8 @@ impl OltpMetrics {
         let duration = self.start.elapsed();
         let minutes = duration.as_secs_f64() / 60.0;
 
-        // tpmC = NewOrder committed per minute
-        let new_order_committed = self
-            .latencies
-            .get(&TxnType::NewOrder)
-            .map_or(0, |h| h.count());
-
         let tpmc = if minutes > 0.0 {
-            new_order_committed as f64 / minutes
+            self.new_order_committed as f64 / minutes
         } else {
             0.0
         };
@@ -173,7 +97,6 @@ impl OltpMetrics {
 
         OltpReport {
             tpmc,
-            latencies: self.latencies,
             total_committed: self.committed,
             total_aborted: self.aborted,
             abort_rate,
@@ -193,29 +116,5 @@ impl OltpReport {
             self.total_aborted,
             self.abort_rate * 100.0,
         );
-
-        let types = [
-            TxnType::NewOrder,
-            TxnType::Payment,
-            TxnType::Delivery,
-            TxnType::OrderStatus,
-            TxnType::StockLevel,
-        ];
-
-        for txn_type in &types {
-            if let Some(hist) = self.latencies.get(txn_type) {
-                println!(
-                    "  {}: {} txns, p50={:.1}ms p90={:.1}ms p95={:.1}ms p99={:.1}ms min={:.1}ms max={:.1}ms",
-                    txn_type,
-                    hist.count(),
-                    hist.p50().as_secs_f64() * 1000.0,
-                    hist.p90().as_secs_f64() * 1000.0,
-                    hist.p95().as_secs_f64() * 1000.0,
-                    hist.p99().as_secs_f64() * 1000.0,
-                    hist.min().as_secs_f64() * 1000.0,
-                    hist.max().as_secs_f64() * 1000.0,
-                );
-            }
-        }
     }
 }
