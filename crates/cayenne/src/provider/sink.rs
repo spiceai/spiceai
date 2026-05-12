@@ -262,7 +262,6 @@ impl CayenneDataSink {
         // inline-only and there are no pending file-backed PK deletions: those
         // paths still need a protected snapshot so old rows stay hidden while
         // replacement rows are visible.
-        let has_primary_key = !self.table.pk_deletion_strategy().is_position_based();
         let has_sort_columns = self.context.has_sort_columns();
         let is_partitioned = self.table.metadata().partition_column.is_some();
         let can_inline = !needs_new_snapshot_for_pending_deletions
@@ -315,8 +314,7 @@ impl CayenneDataSink {
 
                 // Auto-checkpoint when accumulated inline data reaches 10K rows
                 let inlined_count = self.table.cached_inlined_row_count();
-                if !has_primary_key
-                    && inlined_count >= 10_000
+                if inlined_count >= 10_000
                     && let Err(e) = self.table.checkpoint_inlined_data().await
                 {
                     tracing::warn!(

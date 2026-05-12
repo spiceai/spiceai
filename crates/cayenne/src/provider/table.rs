@@ -4013,8 +4013,7 @@ impl CayenneTableProvider {
     /// Checkpoint: flush all inlined data to a Vortex file and clear from metastore.
     ///
     /// Reads all inlined data entries, concatenates them into a single stream,
-    /// writes to the current snapshot via the normal write path, and clears the
-    /// inlined data in the metastore.
+    /// writes to Vortex, and clears the inlined data in the metastore.
     pub(crate) async fn checkpoint_inlined_data(&self) -> Result<u64> {
         let batches = self.read_inlined_batches().await?;
         if batches.is_empty() {
@@ -4040,10 +4039,22 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         let stream = datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
 
-        let target_size_bytes = self.context.target_file_size_bytes();
-        let (_rows, _ops, stats) = self
-            .write_to_snapshot(stream, target_size_bytes, &self.get_current_snapshot_id()?)
-            .await?;
+        let stats = if self.pk_deletion_strategy.is_position_based() {
+            let target_size_bytes = self.context.target_file_size_bytes();
+            let (_rows, _ops, stats) = self
+                .write_to_snapshot(stream, target_size_bytes, &self.get_current_snapshot_id()?)
+                .await?;
+            stats
+        } else {
+            let sequence_number = self
+                .catalog
+                .increment_sequence_number(&self.table_metadata.table_id)
+                .await?;
+            let (_rows, stats) = self
+                .insert_to_new_snapshot_with_sequence(stream, sequence_number)
+                .await?;
+            stats
+        };
 
         // Persist table stats from the checkpoint write (best-effort; logs on error).
         self.persist_table_stats(&stats).await;

@@ -48,6 +48,7 @@ test_with_backends!(test_roundtrip_across_reopen);
 test_with_backends!(test_roundtrip_exceeds_byte_threshold);
 test_with_backends!(test_pk_upsert_inline_mutation);
 test_with_backends!(test_pk_delete_inline_mutation);
+test_with_backends!(test_pk_auto_checkpoint_preserves_rows);
 
 /// Test basic CRUD for inlined data via the catalog API.
 async fn test_inlined_data_crud(
@@ -251,7 +252,7 @@ async fn test_limit_on_inlined_scan(
 
     ctx.register_table("inline_limit", Arc::new(table))?;
     let results = ctx
-        .sql("SELECT id FROM inline_limit LIMIT 2")
+        .sql("SELECT id FROM inline_limit ORDER BY id LIMIT 2")
         .await?
         .collect()
         .await?;
@@ -451,6 +452,56 @@ async fn test_pk_delete_inline_mutation(
             .await?
             .is_empty()
     );
+
+    Ok(())
+}
+
+async fn test_pk_auto_checkpoint_preserves_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_pk_checkpoint").await?;
+    let schema = table.schema();
+
+    for chunk in 0..10_i64 {
+        let start = chunk * 1_024;
+        let ids = (start..start + 1_024).collect::<Vec<_>>();
+        let names = ids
+            .iter()
+            .map(|id| format!("name_{id}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )?;
+        common::insert_batch(&table, batch).await?;
+    }
+
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 0);
+
+    let got = collect_sorted(
+        &ctx,
+        "SELECT id, name FROM inline_pk_checkpoint WHERE id IN (0, 5120, 10239) ORDER BY id",
+    )
+    .await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 3);
+    assert_eq!(ids.values(), &[0_i64, 5_120, 10_239]);
+    assert_eq!(names.value(0), "name_0");
+    assert_eq!(names.value(1), "name_5120");
+    assert_eq!(names.value(2), "name_10239");
 
     Ok(())
 }
