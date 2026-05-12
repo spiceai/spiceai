@@ -1476,9 +1476,8 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
-        let sequence_increment =
-            (if deletes.is_empty() { 0 } else { 1 }) + (if data.is_empty() { 0 } else { 1 });
-        let delete_sequence_offset = if data.is_empty() { 0 } else { 1 };
+        let sequence_increment = i64::from(!deletes.is_empty()) + i64::from(!data.is_empty());
+        let delete_sequence_offset = i64::from(!data.is_empty());
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
             return Err(CatalogError::InvalidOperationNoSource {

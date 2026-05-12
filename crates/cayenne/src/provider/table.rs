@@ -3747,7 +3747,7 @@ impl CayenneTableProvider {
                         maps.int64_pk
                             .entry(pk)
                             .and_modify(|sequence| {
-                                *sequence = (*sequence).max(delete.sequence_number)
+                                *sequence = (*sequence).max(delete.sequence_number);
                             })
                             .or_insert(delete.sequence_number);
                     } else {
