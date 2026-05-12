@@ -3564,6 +3564,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chbench-driver"
+version = "2.0.0-unstable"
+dependencies = [
+ "rand 0.8.5",
+ "snafu",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
