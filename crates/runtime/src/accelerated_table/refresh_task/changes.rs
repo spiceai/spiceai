@@ -21,7 +21,8 @@ use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::DataType;
+use arrow_tools::record_batch::try_cast_to;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 #[cfg(feature = "dynamodb")]
@@ -733,7 +734,10 @@ impl RefreshTask {
         // old-tuple). Promote those fields to non-nullable so the batch dtype matches
         // acceleration schema. SchemaCastScanExec handles type coercion;
         // this step only adjusts nullability metadata.
-        let selected_batch = coerce_batch_nullability(selected_batch, &target_schema)?;
+        let selected_batch = try_cast_to(selected_batch, Arc::clone(&target_schema))
+            .map_err(|e| crate::accelerated_table::Error::FailedToBuildRecordBatch {
+                source: arrow::error::ArrowError::SchemaError(e.to_string()),
+            })?;
 
         let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
             selected_batch.schema(),
@@ -864,44 +868,6 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
 fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
     item.as_ref()
         .map_or(0, |env| env.change_batch.record.get_array_memory_size())
-}
-
-/// Rebuild `batch` with nullability flags promoted to match `target_schema`.
-///
-/// Fields that are nullable in the batch but non-nullable in the target are
-/// declared non-nullable in the returned batch. The underlying `ArrayRef`s are
-/// shared unchanged — Arrow arrays hold null values independently of the
-/// schema's nullability declaration. `SchemaCastScanExec` handles data-type
-/// differences; this function only adjusts nullability metadata.
-fn coerce_batch_nullability(
-    batch: RecordBatch,
-    target_schema: &SchemaRef,
-) -> crate::accelerated_table::Result<RecordBatch> {
-    let needs_coercion = batch.schema().fields().iter().any(|f| {
-        target_schema
-            .field_with_name(f.name())
-            .is_ok_and(|tf| f.is_nullable() && !tf.is_nullable())
-    });
-
-    if !needs_coercion {
-        return Ok(batch);
-    }
-
-    let new_fields: Vec<Arc<Field>> = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| match target_schema.field_with_name(f.name()) {
-            Ok(tf) if f.is_nullable() && !tf.is_nullable() => {
-                Arc::new(Field::new(f.name(), f.data_type().clone(), false))
-            }
-            _ => Arc::clone(f),
-        })
-        .collect();
-
-    let new_schema = Arc::new(Schema::new(new_fields));
-    RecordBatch::try_new(new_schema, batch.columns().to_vec())
-        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)
 }
 
 fn select_rows(
