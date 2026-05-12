@@ -29,9 +29,10 @@ use llms::embeddings::{Embed, EmbeddingInput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use tokio::sync::OnceCell;
 use tools::SpiceModelTool;
+use tracing_futures::Instrument;
 
 use crate::{
     Runtime,
@@ -437,44 +438,62 @@ impl SpiceModelTool for ToolRegistrySearchTool {
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let params: ToolSearchParams = serde_json::from_str(arg)?;
-        let limit = params
-            .limit
-            .unwrap_or(DEFAULT_SEARCH_LIMIT)
-            .clamp(1, MAX_SEARCH_LIMIT);
-        let min_score = params.min_score.unwrap_or(0.0).clamp(0.0, 1.0);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::tool_search", tool = self.name().to_string(), input = arg);
 
-        let mut ranked_tools = hybrid_rank_tools(
-            self.documents.as_slice(),
-            self.document_texts.as_slice(),
-            &params,
-            &self.embedding_model,
-            &self.tool_embeddings,
-        )
-        .await?;
-        ranked_tools.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.tool_id.cmp(&right.tool_id))
-        });
+        let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
+            let params: ToolSearchParams = serde_json::from_str(arg)?;
+            let limit = params
+                .limit
+                .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                .clamp(1, MAX_SEARCH_LIMIT);
+            let min_score = params.min_score.unwrap_or(0.0).clamp(0.0, 1.0);
 
-        let max_score = ranked_tools
-            .first()
-            .map_or(0.0, |ranked_tool| ranked_tool.score);
-        let tools = ranked_tools
-            .into_iter()
-            .filter(|ranked_tool| ranked_tool.score >= min_score || max_score == 0.0)
-            .take(limit)
-            .map(ToolSearchResult::from)
-            .collect::<Vec<_>>();
+            let mut ranked_tools = hybrid_rank_tools(
+                self.documents.as_slice(),
+                self.document_texts.as_slice(),
+                &params,
+                &self.embedding_model,
+                &self.tool_embeddings,
+            )
+            .await?;
+            ranked_tools.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| left.tool_id.cmp(&right.tool_id))
+            });
 
-        Ok(json!({
-            "query": params.query,
-            "keywords": params.keywords,
-            "search_mode": "hybrid_rrf",
-            "tools": tools,
-        }))
+            let max_score = ranked_tools
+                .first()
+                .map_or(0.0, |ranked_tool| ranked_tool.score);
+            let tools = ranked_tools
+                .into_iter()
+                .filter(|ranked_tool| ranked_tool.score >= min_score || max_score == 0.0)
+                .take(limit)
+                .map(ToolSearchResult::from)
+                .collect::<Vec<_>>();
+
+            Ok(json!({
+                "query": params.query,
+                "keywords": params.keywords,
+                "search_mode": "hybrid_rrf",
+                "tools": tools,
+            }))
+        }
+        .instrument(span.clone())
+        .await;
+
+        match result {
+            Ok(value) => {
+                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                Ok(value)
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
     }
 }
 
@@ -512,39 +531,57 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let params: ToolInvokeParams = serde_json::from_str(arg)?;
-        let Some(tool) = self.find_tool(&params.tool_id) else {
-            let available_tools = self
-                .tools
-                .iter()
-                .map(|tool| tool.name().to_string())
-                .take(MAX_SEARCH_LIMIT)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(Box::new(ToolRegistryError::ToolNotFound {
-                tool_id: params.tool_id,
-                available_tools,
-            }));
-        };
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::tool_invoke", tool = self.name().to_string(), input = arg);
 
-        let tool_id = tool.name().to_string();
-        let arguments = match params.arguments {
-            Some(Value::String(arguments)) => arguments,
-            Some(Value::Null) | None => "{}".to_string(),
-            Some(arguments) => serde_json::to_string(&arguments)?,
-        };
+        let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
+            let params: ToolInvokeParams = serde_json::from_str(arg)?;
+            let Some(tool) = self.find_tool(&params.tool_id) else {
+                let available_tools = self
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .take(MAX_SEARCH_LIMIT)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Box::new(ToolRegistryError::ToolNotFound {
+                    tool_id: params.tool_id,
+                    available_tools,
+                })
+                    as Box<dyn std::error::Error + Send + Sync>);
+            };
 
-        let result =
-            tool.call(&arguments)
-                .await
-                .map_err(|source| ToolRegistryError::ToolInvokeFailed {
+            let tool_id = tool.name().to_string();
+            let arguments = match params.arguments {
+                Some(Value::String(arguments)) => arguments,
+                Some(Value::Null) | None => "{}".to_string(),
+                Some(arguments) => serde_json::to_string(&arguments)?,
+            };
+
+            let result = tool.call(&arguments).await.map_err(|source| {
+                ToolRegistryError::ToolInvokeFailed {
                     tool_id: tool_id.clone(),
                     source,
-                })?;
-        Ok(json!({
-            "tool_id": tool_id,
-            "result": result,
-        }))
+                }
+            })?;
+            Ok(json!({
+                "tool_id": tool_id,
+                "result": result,
+            }))
+        }
+        .instrument(span.clone())
+        .await;
+
+        match result {
+            Ok(value) => {
+                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                Ok(value)
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
     }
 }
 
