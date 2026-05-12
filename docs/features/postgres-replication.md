@@ -47,13 +47,13 @@ SHOW max_replication_slots;
 
 On managed Postgres services:
 
-| Service              | How to enable                                                                       |
-|----------------------|-------------------------------------------------------------------------------------|
-| AWS RDS              | Set `rds.logical_replication = 1` in the parameter group and restart.               |
-| Aurora PostgreSQL    | Set `rds.logical_replication = 1`; wait for DB reboot.                              |
-| GCP Cloud SQL        | Flags: `cloudsql.logical_decoding = on`.                                            |
-| Azure Database       | Under **Replication**, set *Replication support* to `LOGICAL`.                      |
-| Supabase / Neon      | Logical replication is enabled by default.                                          |
+| Service           | How to enable                                                         |
+| ----------------- | --------------------------------------------------------------------- |
+| AWS RDS           | Set `rds.logical_replication = 1` in the parameter group and restart. |
+| Aurora PostgreSQL | Set `rds.logical_replication = 1`; wait for DB reboot.                |
+| GCP Cloud SQL     | Flags: `cloudsql.logical_decoding = on`.                              |
+| Azure Database    | Under **Replication**, set *Replication support* to `LOGICAL`.        |
+| Supabase / Neon   | Logical replication is enabled by default.                            |
 
 ### 2. The source table must have a replica identity
 
@@ -113,14 +113,14 @@ Start the runtime. Spice will:
 
 All replication-specific parameters live under `params:` on the dataset and start with `pg_`:
 
-| Parameter                              | Default                             | Description |
-|----------------------------------------|-------------------------------------|-------------|
-| `pg_replication_slot`                  | `spice_<dataset>_<dataset-hash>_<instance-hash>` | Name of the replication slot. Must be unique per replica. The dataset-hash protects against truncation collisions between long dataset names. |
-| `pg_publication`                       | `spice_<dataset>_<dataset-hash>_pub` | Publication name. Shared across replicas. Auto-created if missing. The short hash disambiguates datasets whose names share a long truncated prefix. |
-| `pg_replication_initial_snapshot`      | `true`                              | If `true`, take an initial snapshot of the table's existing rows before streaming. Set to `false` if you are pre-seeding the accelerator yourself. |
-| `pg_replication_temporary_slot`        | `false`                             | If `true`, the slot is dropped when Spice disconnects. Every restart re-bootstraps. |
-| `pg_replication_status_interval`       | `10s`                               | How often `StandbyStatusUpdate` (LSN acknowledgement) is sent back to Postgres. Lower values free WAL faster; higher values reduce network chatter. Accepts any [fundu](https://docs.rs/fundu) duration string (`500ms`, `30s`, `2m`). |
-| `pg_replication_bootstrap_batch_size`  | `8192`                              | Rows per batch emitted by the initial snapshot stream. Increase for large tables to reduce per-batch write/planning overhead; decrease to reduce peak memory. Maximum: `1048576`. |
+| Parameter                             | Default                                          | Description                                                                                                                                                                                                                            |
+| ------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pg_replication_slot`                 | `spice_<dataset>_<dataset-hash>_<instance-hash>` | Name of the replication slot. Must be unique per replica. The dataset-hash protects against truncation collisions between long dataset names.                                                                                          |
+| `pg_publication`                      | `spice_<dataset>_<dataset-hash>_pub`             | Publication name. Shared across replicas. Auto-created if missing. The short hash disambiguates datasets whose names share a long truncated prefix.                                                                                    |
+| `pg_replication_initial_snapshot`     | `true`                                           | If `true`, take an initial snapshot of the table's existing rows before streaming. Set to `false` if you are pre-seeding the accelerator yourself.                                                                                     |
+| `pg_replication_temporary_slot`       | `false`                                          | If `true`, the slot is dropped when Spice disconnects. Every restart re-bootstraps.                                                                                                                                                    |
+| `pg_replication_status_interval`      | `10s`                                            | How often `StandbyStatusUpdate` (LSN acknowledgement) is sent back to Postgres. Lower values free WAL faster; higher values reduce network chatter. Accepts any [fundu](https://docs.rs/fundu) duration string (`500ms`, `30s`, `2m`). |
+| `pg_replication_bootstrap_batch_size` | `8192`                                           | Rows per batch emitted by the initial snapshot stream. Increase for large tables to reduce per-batch write/planning overhead; decrease to reduce peak memory. Maximum: `1048576`.                                                      |
 
 All existing `pg_host`, `pg_port`, `pg_user`, `pg_pass`, `pg_db`, `pg_sslmode`, `pg_connection_string`, etc. parameters continue to apply.
 
@@ -153,25 +153,25 @@ Set this near the number of CPU cores or expected scan partitions, then verify w
 
 The table below reflects how each `pg_sslmode` value behaves for the replication stream. `verify-full` is the recommended production default.
 
-| `pg_sslmode` | Replication transport | Cert chain verified | Hostname verified |
-|--------------|-----------------------|:-------------------:|:-----------------:|
-| `disable`    | plaintext             | —                   | —                 |
-| `prefer` (default) | plaintext       | —                   | —                 |
-| `require`    | TLS                   | ❌                  | ❌                |
-| `verify-ca`  | TLS                   | ✅                  | ❌                |
-| `verify-full`| TLS                   | ✅                  | ✅                |
+| `pg_sslmode`       | Replication transport | Cert chain verified | Hostname verified |
+| ------------------ | --------------------- | :-----------------: | :---------------: |
+| `disable`          | plaintext             |          —          |         —         |
+| `prefer` (default) | plaintext             |          —          |         —         |
+| `require`          | TLS                   |          ❌          |         ❌         |
+| `verify-ca`        | TLS                   |          ✅          |         ❌         |
+| `verify-full`      | TLS                   |          ✅          |         ✅         |
 
 Note: `prefer` behaves as plaintext here because the replication transport does not expose a safe "try TLS, fall back to plaintext" path. Set `require`, `verify-ca`, or `verify-full` to force TLS on the WAL stream. A `tracing::warn!` is emitted at startup whenever a non-verifying mode is in effect.
 
 ### Accelerator engines
 
-| Engine        | `INSERT` | `UPDATE` | `DELETE` | Notes |
-|---------------|:--------:|:--------:|:--------:|-------|
-| `duckdb`      | ✅       | ✅ (upsert) | ✅       | Recommended for most workloads. |
-| `sqlite`      | ✅       | ✅ (upsert) | ✅       | Great for small/medium datasets. |
-| `postgres`    | ✅       | ✅ (upsert) | ✅       | Use when the accelerator is another Postgres. |
-| `cayenne`     | ✅       | ✅ (upsert) | ✅       | S3-backed Vortex format, good for read-heavy analytics. |
-| `arrow`       | ✅       | ❌ (becomes insert) | ✅ | Arrow's in-memory engine does not support `on_conflict` semantics, so `UPDATE`s are appended as new rows instead of being merged. `DELETE` and `TRUNCATE` are applied via Arrow's `DeletionTableProvider`. |
+| Engine     | `INSERT` |      `UPDATE`      | `DELETE` | Notes                                                                                                                                                                                                      |
+| ---------- | :------: | :----------------: | :------: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `duckdb`   |    ✅     |     ✅ (upsert)     |    ✅     | Recommended for most workloads.                                                                                                                                                                            |
+| `sqlite`   |    ✅     |     ✅ (upsert)     |    ✅     | Great for small/medium datasets.                                                                                                                                                                           |
+| `postgres` |    ✅     |     ✅ (upsert)     |    ✅     | Use when the accelerator is another Postgres.                                                                                                                                                              |
+| `cayenne`  |    ✅     |     ✅ (upsert)     |    ✅     | S3-backed Vortex format, good for read-heavy analytics.                                                                                                                                                    |
+| `arrow`    |    ✅     | ❌ (becomes insert) |    ✅     | Arrow's in-memory engine does not support `on_conflict` semantics, so `UPDATE`s are appended as new rows instead of being merged. `DELETE` and `TRUNCATE` are applied via Arrow's `DeletionTableProvider`. |
 
 For workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), use DuckDB, SQLite, Postgres, or Cayenne. Arrow is a good fit for append-only replication where deletes are OK but updates are rare.
 
@@ -179,9 +179,9 @@ For workloads that need true upsert semantics (so `UPDATE`s replace existing row
 
 Every Spice replica must have its own replication slot. Spice handles this automatically by hashing the replica's identity into the default slot name:
 
-| Source                          | Used for |
-|---------------------------------|----------|
-| `SPICE_INSTANCE_ID` env         | Preferred — set it explicitly per replica. |
+| Source                          | Used for                                                        |
+| ------------------------------- | --------------------------------------------------------------- |
+| `SPICE_INSTANCE_ID` env         | Preferred — set it explicitly per replica.                      |
 | `HOSTNAME` / `COMPUTERNAME` env | Fallback — works on k8s where each pod has a distinct hostname. |
 
 ### Example: Kubernetes StatefulSet
@@ -243,38 +243,38 @@ Spice emits OpenTelemetry observables for every replicated Postgres dataset. Met
 
 ### Core freshness signals
 
-| Metric                                 | Type    | Unit  | Description |
-|----------------------------------------|---------|-------|-------------|
-| `dataset_postgres_replication_lag_ms`  | Gauge   | ms    | `now() − commit_time(latest ingested txn)`. Primary CDC freshness signal. Alert when this crosses your SLO (e.g. `> 5000`). |
-| `dataset_postgres_replication_lag_bytes` | Gauge | bytes | `server_wal_end_lsn − confirmed_flush_lsn`. Indicates unacknowledged WAL still held by Spice's slot. Track alongside Postgres disk headroom. |
-| `dataset_postgres_replication_confirmed_flush_lsn` | Gauge | — | Most recent LSN Spice has acknowledged. Matches `pg_replication_slots.confirmed_flush_lsn` for the dataset's slot. |
-| `dataset_postgres_replication_server_wal_end_lsn` | Gauge | — | Latest WAL end LSN reported by the server via keepalive. Diff against `confirmed_flush_lsn` to reproduce `lag_bytes`. |
+| Metric                                             | Type  | Unit  | Description                                                                                                                                  |
+| -------------------------------------------------- | ----- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dataset_postgres_replication_lag_ms`              | Gauge | ms    | `now() − commit_time(latest ingested txn)`. Primary CDC freshness signal. Alert when this crosses your SLO (e.g. `> 5000`).                  |
+| `dataset_postgres_replication_lag_bytes`           | Gauge | bytes | `server_wal_end_lsn − confirmed_flush_lsn`. Indicates unacknowledged WAL still held by Spice's slot. Track alongside Postgres disk headroom. |
+| `dataset_postgres_replication_confirmed_flush_lsn` | Gauge | —     | Most recent LSN Spice has acknowledged. Matches `pg_replication_slots.confirmed_flush_lsn` for the dataset's slot.                           |
+| `dataset_postgres_replication_server_wal_end_lsn`  | Gauge | —     | Latest WAL end LSN reported by the server via keepalive. Diff against `confirmed_flush_lsn` to reproduce `lag_bytes`.                        |
 
 ### Throughput counters
 
-| Metric                                        | Type    | Description |
-|-----------------------------------------------|---------|-------------|
-| `dataset_postgres_replication_transactions_total` | Counter | Committed transactions applied. |
-| `dataset_postgres_replication_inserts_total`  | Counter | `INSERT` rows from WAL. |
-| `dataset_postgres_replication_updates_total`  | Counter | `UPDATE` rows from WAL. |
-| `dataset_postgres_replication_deletes_total`  | Counter | `DELETE` rows from WAL. |
-| `dataset_postgres_replication_truncates_total` | Counter | `TRUNCATE` operations received and applied to the accelerator (all rows deleted). |
+| Metric                                            | Type    | Description                                                                       |
+| ------------------------------------------------- | ------- | --------------------------------------------------------------------------------- |
+| `dataset_postgres_replication_transactions_total` | Counter | Committed transactions applied.                                                   |
+| `dataset_postgres_replication_inserts_total`      | Counter | `INSERT` rows from WAL.                                                           |
+| `dataset_postgres_replication_updates_total`      | Counter | `UPDATE` rows from WAL.                                                           |
+| `dataset_postgres_replication_deletes_total`      | Counter | `DELETE` rows from WAL.                                                           |
+| `dataset_postgres_replication_truncates_total`    | Counter | `TRUNCATE` operations received and applied to the accelerator (all rows deleted). |
 
 ### Bootstrap progress
 
-| Metric                                        | Type    | Description |
-|-----------------------------------------------|---------|-------------|
-| `dataset_postgres_replication_bootstrap_rows_total` | Counter | Rows loaded during the initial `REPEATABLE READ` snapshot. |
+| Metric                                              | Type    | Description                                                                                                   |
+| --------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------- |
+| `dataset_postgres_replication_bootstrap_rows_total` | Counter | Rows loaded during the initial `REPEATABLE READ` snapshot.                                                    |
 | `dataset_postgres_replication_bootstrap_complete`   | Gauge   | `1` once bootstrap has finished (or was skipped on resume); `0` while snapshotting. Use as a readiness probe. |
 
 ### Errors and resilience
 
-| Metric                                                        | Type    | Description |
-|---------------------------------------------------------------|---------|-------------|
-| `dataset_postgres_replication_decode_errors_total`            | Counter | pgoutput decoder errors. Non-zero usually means a Postgres version mismatch or a replication protocol bug — check logs. |
-| `dataset_postgres_replication_schema_mismatch_errors_total`   | Counter | Source relation no longer matches the dataset's declared schema. The stream errors out; fix the schema and restart. |
-| `dataset_postgres_replication_recv_errors_total`              | Counter | Transport-level errors receiving from the replication connection. Each one triggers a reconnect attempt. |
-| `dataset_postgres_replication_reconnects_total`               | Counter | Number of times the stream has reconnected after a transient failure (network drop, Postgres restart, TLS reset). A non-zero value with no stream-level error means the connection wobbled and we recovered automatically. |
+| Metric                                                      | Type    | Description                                                                                                                                                                                                                |
+| ----------------------------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dataset_postgres_replication_decode_errors_total`          | Counter | pgoutput decoder errors. Non-zero usually means a Postgres version mismatch or a replication protocol bug — check logs.                                                                                                    |
+| `dataset_postgres_replication_schema_mismatch_errors_total` | Counter | Source relation no longer matches the dataset's declared schema. The stream errors out; fix the schema and restart.                                                                                                        |
+| `dataset_postgres_replication_recv_errors_total`            | Counter | Transport-level errors receiving from the replication connection. Each one triggers a reconnect attempt.                                                                                                                   |
+| `dataset_postgres_replication_reconnects_total`             | Counter | Number of times the stream has reconnected after a transient failure (network drop, Postgres restart, TLS reset). A non-zero value with no stream-level error means the connection wobbled and we recovered automatically. |
 
 ### Example Prometheus queries
 
@@ -304,21 +304,21 @@ max by (name) (dataset_postgres_replication_lag_bytes) > 100 * 1024 * 1024   # >
 
 To keep the default metric cardinality reasonable, only operationally critical metrics auto-register. Everything else shows up once you explicitly enable it under the dataset's `metrics` block:
 
-| Metric name                                       | Auto-registered |
-|---------------------------------------------------|-----------------|
-| `replication_lag_ms`                              | ✅              |
-| `replication_lag_bytes`                           | ✅              |
-| `replication_transactions_total`                  | ✅              |
-| `replication_inserts_total` / `updates_total` / `deletes_total` | ✅ |
-| `replication_bootstrap_complete`                  | ✅              |
-| `replication_decode_errors_total`                 | ✅              |
-| `replication_schema_mismatch_errors_total`        | ✅              |
-| `replication_recv_errors_total`                   | ✅              |
-| `replication_reconnects_total`                    | ✅              |
-| `replication_confirmed_flush_lsn`                 | — enable manually |
-| `replication_server_wal_end_lsn`                  | — enable manually |
-| `replication_truncates_total`                     | — enable manually |
-| `replication_bootstrap_rows_total`                | — enable manually |
+| Metric name                                                     | Auto-registered   |
+| --------------------------------------------------------------- | ----------------- |
+| `replication_lag_ms`                                            | ✅                 |
+| `replication_lag_bytes`                                         | ✅                 |
+| `replication_transactions_total`                                | ✅                 |
+| `replication_inserts_total` / `updates_total` / `deletes_total` | ✅                 |
+| `replication_bootstrap_complete`                                | ✅                 |
+| `replication_decode_errors_total`                               | ✅                 |
+| `replication_schema_mismatch_errors_total`                      | ✅                 |
+| `replication_recv_errors_total`                                 | ✅                 |
+| `replication_reconnects_total`                                  | ✅                 |
+| `replication_confirmed_flush_lsn`                               | — enable manually |
+| `replication_server_wal_end_lsn`                                | — enable manually |
+| `replication_truncates_total`                                   | — enable manually |
+| `replication_bootstrap_rows_total`                              | — enable manually |
 
 Enable an opt-in metric on a dataset:
 
@@ -408,18 +408,18 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 
 ## Troubleshooting
 
-| Symptom                                                                                     | Cause and fix |
-|---------------------------------------------------------------------------------------------|---------------|
-| Error: *`Table public.X has REPLICA IDENTITY NOTHING`*                                      | Run `ALTER TABLE public.X REPLICA IDENTITY FULL;` (or add a primary key). |
-| Error: *`Table public.X has no primary key and no REPLICA IDENTITY FULL`*                   | Either add a primary key, or run `ALTER TABLE ... REPLICA IDENTITY FULL;`. |
-| Error: *`Source table public.X does not exist`*                                             | The fully qualified table in `from: postgres:<schema>.<table>` is wrong or the role lacks SELECT. |
-| Error: *`replication slot "..." already exists`* on startup                                 | Another Spice replica is using the same slot name. Set `pg_replication_slot` uniquely, or ensure `SPICE_INSTANCE_ID` differs between replicas. |
-| Error mentioning *permission denied for database* during setup                              | The role needs `CREATE` on the database, or you need to pre-create the publication/slot yourself. |
-| `pg_replication_slots.active` is `true` but the accelerator isn't updating                  | Check the Spice logs for schema-mismatch errors. The replication task will still hold the slot even after a failure — restart Spice after fixing the schema to advance. |
-| `wal` on the source disk growing forever                                                    | An abandoned slot. Drop it with `pg_drop_replication_slot`. |
-| `UPDATE`s on Arrow-engine dataset don't replace rows                                        | Arrow does not support `on_conflict`. Switch to `duckdb`, `sqlite`, `postgres`, or `cayenne`. |
-| Huge `TEXT`/`JSONB` columns show as `NULL` after `UPDATE`                                   | Unchanged TOASTed columns are omitted by pgoutput. Run `ALTER TABLE ... REPLICA IDENTITY FULL;` if you need them in every event. |
-| Logged *`TRUNCATE from postgres replication queued for accelerator`*                        | Informational. A source `TRUNCATE` is being applied — the accelerated table will be emptied. |
+| Symptom                                                                    | Cause and fix                                                                                                                                                           |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Error: *`Table public.X has REPLICA IDENTITY NOTHING`*                     | Run `ALTER TABLE public.X REPLICA IDENTITY FULL;` (or add a primary key).                                                                                               |
+| Error: *`Table public.X has no primary key and no REPLICA IDENTITY FULL`*  | Either add a primary key, or run `ALTER TABLE ... REPLICA IDENTITY FULL;`.                                                                                              |
+| Error: *`Source table public.X does not exist`*                            | The fully qualified table in `from: postgres:<schema>.<table>` is wrong or the role lacks SELECT.                                                                       |
+| Error: *`replication slot "..." already exists`* on startup                | Another Spice replica is using the same slot name. Set `pg_replication_slot` uniquely, or ensure `SPICE_INSTANCE_ID` differs between replicas.                          |
+| Error mentioning *permission denied for database* during setup             | The role needs `CREATE` on the database, or you need to pre-create the publication/slot yourself.                                                                       |
+| `pg_replication_slots.active` is `true` but the accelerator isn't updating | Check the Spice logs for schema-mismatch errors. The replication task will still hold the slot even after a failure — restart Spice after fixing the schema to advance. |
+| `wal` on the source disk growing forever                                   | An abandoned slot. Drop it with `pg_drop_replication_slot`.                                                                                                             |
+| `UPDATE`s on Arrow-engine dataset don't replace rows                       | Arrow does not support `on_conflict`. Switch to `duckdb`, `sqlite`, `postgres`, or `cayenne`.                                                                           |
+| Huge `TEXT`/`JSONB` columns show as `NULL` after `UPDATE`                  | Unchanged TOASTed columns are omitted by pgoutput. Run `ALTER TABLE ... REPLICA IDENTITY FULL;` if you need them in every event.                                        |
+| Logged *`TRUNCATE from postgres replication queued for accelerator`*       | Informational. A source `TRUNCATE` is being applied — the accelerated table will be emptied.                                                                            |
 
 ## Limitations (current release)
 
@@ -429,14 +429,14 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 
 ## Comparison with Debezium + Kafka
 
-| Aspect                   | Debezium + Kafka                                | Native WAL streaming (this feature) |
-|--------------------------|-------------------------------------------------|--------------------------------------|
-| External services        | Kafka + Schema Registry + Debezium + Connect    | None — Spice connects to Postgres directly |
-| Deployment footprint     | JVM stack + ZooKeeper/KRaft                     | Zero extra pods                       |
-| Setup complexity         | Multiple topics, connector configs, ACLs        | One connector config                  |
-| Operational model        | Consumer groups, topic retention                | One replication slot per replica     |
-| Schema registry required | Yes (Avro/Protobuf)                             | No — schema derived from Postgres catalog + Spice dataset |
-| Latency                  | Kafka-bound (~100ms+)                           | Commit-driven, typically <100ms       |
+| Aspect                   | Debezium + Kafka                             | Native WAL streaming (this feature)                       |
+| ------------------------ | -------------------------------------------- | --------------------------------------------------------- |
+| External services        | Kafka + Schema Registry + Debezium + Connect | None — Spice connects to Postgres directly                |
+| Deployment footprint     | JVM stack + ZooKeeper/KRaft                  | Zero extra pods                                           |
+| Setup complexity         | Multiple topics, connector configs, ACLs     | One connector config                                      |
+| Operational model        | Consumer groups, topic retention             | One replication slot per replica                          |
+| Schema registry required | Yes (Avro/Protobuf)                          | No — schema derived from Postgres catalog + Spice dataset |
+| Latency                  | Kafka-bound (~100ms+)                        | Commit-driven, typically <100ms                           |
 
 If you are already running Kafka for other reasons, the Debezium path still works via the existing `kafka` / `debezium` connectors. For greenfield Postgres → Spice CDC, prefer this feature.
 
