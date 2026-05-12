@@ -6242,7 +6242,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be#81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b798c391b6566c172d44361f8acc8472c958ca75#b798c391b6566c172d44361f8acc8472c958ca75"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6843,12 +6843,13 @@ checksum = "ab23e69df104e2fd85ee63a533a22d2132ef5975dc6b36f9f3e5a7305e4a8ed7"
 
 [[package]]
 name = "duckdb"
-version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=f4096c7592ed46b9e68755a49252d69783dece96#f4096c7592ed46b9e68755a49252d69783dece96"
+version = "1.10502.0"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=119fc5df0568fa165154697eb9c6a302938fe848#119fc5df0568fa165154697eb9c6a302938fe848"
 dependencies = [
  "arrow",
  "calamine",
  "cast",
+ "comfy-table",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink 0.10.0",
@@ -10382,8 +10383,8 @@ checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
 
 [[package]]
 name = "libduckdb-sys"
-version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=f4096c7592ed46b9e68755a49252d69783dece96#f4096c7592ed46b9e68755a49252d69783dece96"
+version = "1.10502.0"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=119fc5df0568fa165154697eb9c6a302938fe848#119fc5df0568fa165154697eb9c6a302938fe848"
 dependencies = [
  "cc",
  "flate2",
