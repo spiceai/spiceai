@@ -165,15 +165,15 @@ Note: `prefer` behaves as plaintext here because the replication transport does 
 
 ### Accelerator engines
 
-| Engine     | `INSERT` |      `UPDATE`      | `DELETE` | Notes                                                                                                                                                                                                      |
-| ---------- | :------: | :----------------: | :------: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `duckdb`   |    ✅     |     ✅ (upsert)     |    ✅     | Recommended for most workloads.                                                                                                                                                                            |
-| `sqlite`   |    ✅     |     ✅ (upsert)     |    ✅     | Great for small/medium datasets.                                                                                                                                                                           |
-| `postgres` |    ✅     |     ✅ (upsert)     |    ✅     | Use when the accelerator is another Postgres.                                                                                                                                                              |
-| `cayenne`  |    ✅     |     ✅ (upsert)     |    ✅     | S3-backed Vortex format, good for read-heavy analytics.                                                                                                                                                    |
-| `arrow`    |    ✅     | ❌ (becomes insert) |    ✅     | Arrow's in-memory engine does not support `on_conflict` semantics, so `UPDATE`s are appended as new rows instead of being merged. `DELETE` and `TRUNCATE` are applied via Arrow's `DeletionTableProvider`. |
+| Engine     | `INSERT` |          `UPDATE`           | `DELETE` | Notes                                                                                                                                                                                                 |
+| ---------- | :------: | :-------------------------: | :------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `duckdb`   |    ✅     |         ✅ (upsert)          |    ✅     | Recommended for most workloads.                                                                                                                                                                       |
+| `sqlite`   |    ✅     |         ✅ (upsert)          |    ✅     | Great for small/medium datasets.                                                                                                                                                                      |
+| `postgres` |    ✅     |         ✅ (upsert)          |    ✅     | Use when the accelerator is another Postgres.                                                                                                                                                         |
+| `cayenne`  |    ✅     |         ✅ (upsert)          |    ✅     | S3-backed Vortex format, good for read-heavy analytics.                                                                                                                                               |
+| `arrow`    |    ✅     | ✅ (upsert with primary key) |    ✅     | Arrow's in-memory engine uses a hash index for primary-key upserts. Without a primary key, updates are appended as new rows. `DELETE` and `TRUNCATE` are applied via Arrow's `DeletionTableProvider`. |
 
-For workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), use DuckDB, SQLite, Postgres, or Cayenne. Arrow is a good fit for append-only replication where deletes are OK but updates are rare.
+For Arrow workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), configure a primary key. DuckDB, SQLite, Postgres, and Cayenne also support upsert behavior.
 
 ## Multi-replica deployments
 
@@ -417,7 +417,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 | Error mentioning *permission denied for database* during setup             | The role needs `CREATE` on the database, or you need to pre-create the publication/slot yourself.                                                                       |
 | `pg_replication_slots.active` is `true` but the accelerator isn't updating | Check the Spice logs for schema-mismatch errors. The replication task will still hold the slot even after a failure — restart Spice after fixing the schema to advance. |
 | `wal` on the source disk growing forever                                   | An abandoned slot. Drop it with `pg_drop_replication_slot`.                                                                                                             |
-| `UPDATE`s on Arrow-engine dataset don't replace rows                       | Arrow does not support `on_conflict`. Switch to `duckdb`, `sqlite`, `postgres`, or `cayenne`.                                                                           |
+| `UPDATE`s on Arrow-engine dataset don't replace rows                       | Configure a `primary_key` so Arrow can use its hash index for upserts, or switch to `duckdb`, `sqlite`, `postgres`, or `cayenne`.                                       |
 | Huge `TEXT`/`JSONB` columns show as `NULL` after `UPDATE`                  | Unchanged TOASTed columns are omitted by pgoutput. Run `ALTER TABLE ... REPLICA IDENTITY FULL;` if you need them in every event.                                        |
 | Logged *`TRUNCATE from postgres replication queued for accelerator`*       | Informational. A source `TRUNCATE` is being applied — the accelerated table will be emptied.                                                                            |
 
@@ -425,7 +425,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 
 - **One table per dataset.** Each Spice dataset replicates exactly one source table; each dataset gets its own slot and publication.
 - **No DDL replication.** Schema changes on the source are not propagated automatically. See *Changing the source schema* above.
-- **Arrow engine** does not support `on_conflict` (upsert) semantics. `UPDATE`s therefore appear as additional inserts rather than replacing existing rows. `DELETE` and `TRUNCATE` are applied. For true upsert behavior use DuckDB, SQLite, Postgres, or Cayenne.
+- **Arrow engine** supports `on_conflict` upserts when a primary key is configured. Without a primary key, `UPDATE`s appear as additional inserts rather than replacing existing rows. `DELETE` and `TRUNCATE` are applied.
 
 ## Comparison with Debezium + Kafka
 
