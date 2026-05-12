@@ -1,0 +1,1516 @@
+{
+  "version": "2.2.0",
+  "summary": {
+    "title": "Threat Model for Spice.ai OSS v2.0.0",
+    "owner": "Phillip LeBlanc",
+    "description": "Spice.ai is a portable, open-source runtime for fast, last-mile SQL query, search, and AI inference.",
+    "id": 0
+  },
+  "detail": {
+    "contributors": [],
+    "diagrams": [
+      {
+        "id": 0,
+        "title": "Data + AI Runtime (Local/Network)",
+        "diagramType": "STRIDE",
+        "placeholder": "New STRIDE diagram description",
+        "thumbnail": "./public/content/images/thumbnail.stride.jpg",
+        "version": "2.2.0",
+        "cells": [
+          {
+            "position": {
+              "x": 290,
+              "y": 179.99999999999983
+            },
+            "size": {
+              "width": 250,
+              "height": 370
+            },
+            "shape": "trust-boundary-box",
+            "attrs": {
+              "headerText": {
+                "text": "Spice Runtime Process"
+              }
+            },
+            "zIndex": -1,
+            "id": "d7fa1282-6622-4dda-b3c8-a4f51746ef86",
+            "data": {
+              "type": "tm.BoundaryBox",
+              "name": "Spice Runtime Process",
+              "description": "",
+              "isTrustBoundary": true,
+              "hasOpenThreats": true,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": -21.00000000000233,
+              "y": 90
+            },
+            "size": {
+              "width": 600,
+              "height": 600
+            },
+            "shape": "trust-boundary-box",
+            "attrs": {
+              "headerText": {
+                "text": "Local Machine/Network"
+              }
+            },
+            "zIndex": -1,
+            "id": "b2bbd52d-f20e-4d29-8246-5c24a7d84de6",
+            "data": {
+              "type": "tm.BoundaryBox",
+              "name": "Local Machine/Network",
+              "description": "",
+              "isTrustBoundary": true,
+              "hasOpenThreats": true,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": -3.126388037344441e-13,
+              "y": 179.99999999999983
+            },
+            "size": {
+              "width": 260,
+              "height": 270
+            },
+            "shape": "trust-boundary-box",
+            "attrs": {
+              "headerText": {
+                "text": "Application Process"
+              }
+            },
+            "zIndex": -1,
+            "id": "e98ca2eb-b692-4154-a852-b6329be72330",
+            "data": {
+              "type": "tm.BoundaryBox",
+              "name": "Application Process",
+              "description": "",
+              "isTrustBoundary": true,
+              "hasOpenThreats": false,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 410,
+              "y": 210
+            },
+            "size": {
+              "width": 130,
+              "height": 120
+            },
+            "attrs": {
+              "text": {
+                "text": "Spice Runtime"
+              },
+              "body": {
+                "stroke": "red",
+                "strokeWidth": 2.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "process",
+            "zIndex": 1,
+            "id": "910108ef-e112-4d35-869a-55bae2e7e631",
+            "data": {
+              "type": "tm.Process",
+              "name": "Spice Runtime",
+              "description": "Rust daemon exposing SQL, Flight, OpenAI-compatible, MCP, and Iceberg APIs with embedded accelerators. v2.0 adds DDL support (CREATE/DROP TABLE) for Iceberg and Cayenne catalogs, expanded DML (INSERT/UPDATE/DELETE) across Cayenne, Snowflake, Postgres, and DynamoDB plus DuckLake INSERT on read_write catalogs, async query materialization to object storage, distributed ingestion, URL Tables (opt-in SSRF surface), SMB/NFS/Sharepoint data connectors, acceleration snapshot management API, public-listener mTLS for HTTP and Flight (`runtime.tls.client_auth_mode` none/request/required) deriving `IdentitySource` as Channel/RuntimeAuth/Anonymous from the combination of mTLS and `runtime.auth`, and on-disk TLS cert hot-reload across all TLS endpoints. External authentication is `runtime.auth` API key and/or public mTLS; internal cluster authentication is mTLS.",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "handlesCardPayment": false,
+              "handlesGoodsOrServices": false,
+              "isWebApplication": true,
+              "privilegeLevel": "",
+              "threats": [
+                {
+                  "id": "5caf188d-20ad-44e8-9668-fd8bbb2fff5b",
+                  "title": "Task history reset on restart",
+                  "status": "Open",
+                  "severity": "Low",
+                  "type": "Repudiation",
+                  "description": "The task history table is only kept in-memory, which means any tasks that would be captured are lost if an attacker wants to conceal what they did by either timing their activity to occur before a maintenance activity that results in a restart, or by purposefully causing the runtime to restart.",
+                  "mitigation": "Persist task_history locally",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 5,
+                  "score": ""
+                },
+                {
+                  "id": "6f77fbb6-e541-4cf7-8a01-66c8fb5fa1fc",
+                  "title": "No persistent audit logs",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Repudiation",
+                  "description": "Spice does not provide persistent audit logging of actions taken that could repudiate that a certain action was taken. In OSS v2.0, callers may be authenticated via API key or via a verified client certificate under public mTLS, so caller identity (API-key id, MtlsPrincipal, ChannelIdentity) is available for in-process logging — but task history records are not persisted across restarts, so they cannot be relied on as durable audit evidence.",
+                  "mitigation": "Implement a proper audit/task history log tracking both changes to the runtime operation (i.e. modifying Spicepod, runtime settings) as well as data operations (queries, refreshes) that is persistent across restarts.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 11,
+                  "score": ""
+                },
+                {
+                  "id": "3b998f5e-b14c-471a-821a-70492d1f03cf",
+                  "title": "Data source connection details (or any secrets) leaked via errors/logging",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "Metadata about connected data sources is leaked through error messages, revealing sensitive infrastructure details.",
+                  "mitigation": "Review code where logs are emitted to ensure that potential sensitive information (i.e. credentials encoded in headers) is not leaked via error messages. Token redaction in debug/error output has been implemented. The /v1/spicepods endpoint returns summaries instead of full configuration to avoid leaking connection details.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 12,
+                  "score": ""
+                },
+                {
+                  "id": "1b7e7d8e-91f6-44c2-8b23-4e6ae2e59e1f",
+                  "title": "Malicious SQL / SQL injection leading to ACE",
+                  "status": "Mitigated",
+                  "severity": "Medium",
+                  "type": "Elevation of privilege",
+                  "description": "A user exploits a vulnerability in the SQL parser to execute arbitrary code (ACE) on the Spice runtime.",
+                  "mitigation": "Queries that would allow modifying the state of the runtime are rejected at the parsing layer. v2.0 introduces DDL (CREATE TABLE / DROP TABLE) for Iceberg and Cayenne catalogs only; DDL is validated against an allowlist of permitted catalogs and operations. SQL identifier quoting is enforced across all connectors to prevent injection via table/column names. Prepared statements with parameterized queries are used for federated execution.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 14,
+                  "score": ""
+                },
+                {
+                  "id": "b2f796eb-4409-446f-8888-61d46a165b49",
+                  "title": "Malicious compressed small payload has unbounded/very large size",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Denial of service",
+                  "description": "If an attacker is able to send a payload to a Spice endpoint that is compressed, and the decompression of that payload causes Spice to run out of memory due to the payload itself having a very large/potentially unbounded size - then it could cause a denial of service. (i.e. Zipbomb)",
+                  "mitigation": "- No known Gzip attack vector and the HTTP endpoints only accept Gzip compression\n- For connecting to data sources, we rely on object_store's implementation which should protect against this.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 18,
+                  "score": ""
+                },
+                {
+                  "id": "9982eda7-8112-42ee-9459-a6606d997b28",
+                  "title": "Task History shows truncated results",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "If you have access to the runtime, you can access the task_history table along with some truncated outputs of data you might not normally be able to access.\n\nThis isn't a problem in v0.17.4-beta, because if you can access the task_history table, then you trivially can access any of the data sources.",
+                  "mitigation": "No mitigation currently. Once we add AuthN/AuthZ, we will need to design how to lock this down appropriately. (i.e. RLS)",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 19,
+                  "score": ""
+                },
+                {
+                  "id": "5432e91b-7e85-45eb-ae9f-0d9649b3c969",
+                  "title": "Malicious SQL / SQL injection leading to information disclosure",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "If there are functions that allow reading from the environment/file-system, this could lead to unexpected information disclosure of the system details/secrets",
+                  "mitigation": "- Run in a chroot process with limited file-system access\n- Disable functions that allow this access",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 21,
+                  "score": ""
+                },
+                {
+                  "id": "0c78df7c-43c7-4be4-9a31-78bb4d60acd6",
+                  "title": "Supply chain attack leading to compromised dependency",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Elevation of privilege",
+                  "description": "If an attacker is able to compromise a dependency that we depend on, and we release a version of Spice with that compromised dependency, then all of Spice users would potentially be affected.",
+                  "mitigation": "- CVE scanner/dependabot to scan for known issues with dependencies\n- Adopt a policy of waiting before upgrading a dependency to allow for the community to identify\n- Processing scanning to identify suspicious behavior",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 22,
+                  "score": ""
+                },
+                {
+                  "id": "27386708-0996-4c5c-b635-7c831d1493f7",
+                  "title": "Unprotected control plane endpoints",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Elevation of privilege",
+                  "description": "HTTP/Arrow Flight/OpenAI-compatible/MCP/Iceberg APIs accept requests without built-in authentication or rate limits by default. Exposure of these endpoints beyond a trusted network allows attackers to run arbitrary queries or inference, modify runtime state, or exfiltrate data.",
+                  "mitigation": "Configure runtime.auth (API key) and/or runtime.tls.client_auth_mode=required, restrict bind addresses/firewall rules, optionally terminate behind an upstream API gateway, and apply per-endpoint rate limiting before exposing services to untrusted clients.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 23,
+                  "score": ""
+                },
+                {
+                  "id": "db0f037e-6d2e-4eed-a4b4-e513783ce935",
+                  "title": "Telemetry and traces leak sensitive data",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "Verbose traces, query logs, or model prompt/response bodies may include secrets or PII that are exported to OTEL/metrics backends without redaction.",
+                  "mitigation": "Default to minimal logging, scrub sensitive fields before emission, isolate telemetry destinations, and apply retention policies/PII filtering in observability pipelines.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 28,
+                  "score": ""
+                },
+                {
+                  "id": "8a2cce08-2b76-4d23-9b6d-0b7a28e0280a",
+                  "title": "Unauthorized Iceberg table writes",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Tampering",
+                  "description": "The Iceberg connector supports writes while other data sources are read-only. Without strong authentication, input validation, and authorization, attackers with endpoint access can corrupt, drop, or poison Iceberg tables.",
+                  "mitigation": "Require runtime.auth (API key) or public mTLS on write-capable endpoints, enforce schema/operation allowlists, validate write destinations, and run Iceberg connectors on isolated identities with least-privilege storage permissions.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 29,
+                  "score": ""
+                },
+                {
+                  "id": "a3d7c1e2-5f89-4b6a-9c34-8e7f1a2b3c4d",
+                  "title": "DDL operations allow schema manipulation (CREATE/DROP TABLE)",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Tampering",
+                  "description": "v2.0 introduces CREATE TABLE and DROP TABLE DDL via FlightSQL and /v1/sql for Iceberg and Cayenne catalogs. An unauthenticated caller could create tables to exhaust storage, drop critical tables to cause data loss, or create tables pointing to attacker-controlled locations.",
+                  "mitigation": "DDL is gated by catalog access mode (only catalogs with access: read_write_create accept DDL) and backend capability (currently Iceberg and Cayenne). Deploy behind authentication (API key, mTLS). Use storage-level IAM to restrict object creation. Monitor for unexpected DDL operations via task history and tracing. Consider an approval workflow or tighter access-mode policy for production environments.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 31,
+                  "score": ""
+                },
+                {
+                  "id": "c5f9e3a4-7ba1-4d8c-be56-0a9123d4e6f7",
+                  "title": "Distributed ingestion allows unauthorized data writes",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Tampering",
+                  "description": "In v2.0, distributed ingestion allows executor nodes to write data to accelerated tables (including Cayenne). A compromised or rogue executor could inject malicious data, corrupt accelerated tables, or overwrite legitimate data during distributed ingestion.",
+                  "mitigation": "Restrict executor registration to trusted nodes via allowlisting. Run cluster communication over private networks or with mTLS. Validate ingested data schemas before commit. Use Cayenne's WAL-based staged writes to detect and roll back partial/corrupt ingestions. Monitor for data anomalies post-ingestion.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 33,
+                  "score": ""
+                },
+                {
+                  "id": "f8c2b6d7-0ed4-4abf-e189-3dc456a7b920",
+                  "title": "GCS credential exposure via data connector",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "The GCS data connector (Alpha) requires Google Cloud credentials for bucket access. Service account keys or application default credentials could be leaked through error messages, verbose logging, or Spicepod configuration stored in version control.",
+                  "mitigation": "Use Workload Identity Federation instead of long-lived service account keys. Store credentials in runtime-secrets, not in Spicepod YAML. Review error handling to ensure credential material is not logged. Apply least-privilege IAM roles scoped to specific buckets/prefixes.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 36,
+                  "score": ""
+                },
+                {
+                  "id": "bba2de6c-bd2b-43ba-9b26-6030b813fd64",
+                  "title": "Search filter/column injection into planner",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "DoS / Tampering",
+                  "description": "Search request fields such as where_cond, keywords, and additional_columns flow into planning and can cause filter bypass, planning errors, or DoS if not validated.",
+                  "mitigation": "Validate and quote identifiers; constrain filters and columns; sanitize planner errors.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 53,
+                  "score": ""
+                },
+                {
+                  "id": "64504850-bccb-4091-8705-e32235f448ee",
+                  "title": "Databricks auth header principal confusion",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Spoofing",
+                  "description": "User-controlled Databricks auth headers can confuse principal identity across Databricks-backed datasets if not scoped carefully.",
+                  "mitigation": "Keep passthrough narrow and connector-specific; avoid generic credential forwarding; document scope.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 58,
+                  "score": ""
+                },
+                {
+                  "id": "2594f50f-f994-4e21-bece-ebf2fd3a87cc",
+                  "title": "Protocol auth drift: API key enforced on HTTP but not consistently mounted on Flight/FlightSQL/gRPC/internal services",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Spoofing / Elevation of privilege",
+                  "description": "runtime.auth API-key middleware may be enforced on one protocol but missing on another (HTTP, Flight/FlightSQL, or gRPC). Equivalent drift can occur with public mTLS if client-auth enforcement isn't consistent across listeners.",
+                  "mitigation": "Verify middleware mounting on all exposed protocols; keep cluster mTLS separate from external auth; integration-test API-key and mTLS gating across HTTP, Flight, and FlightSQL.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 59,
+                  "score": ""
+                },
+                {
+                  "id": "1d9a4cd5-f4bc-4cfc-873a-aafa12f58eeb",
+                  "title": "API keys and verified-cert principal data leak via logs, errors, telemetry, task history, or connector forwarding",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Information disclosure",
+                  "description": "runtime.auth API keys and verified-cert principal data (MtlsPrincipal / ChannelIdentity values such as the cert subject/SAN) can leak via logs, error messages, telemetry exporters, the task_history table, or unintended connector forwarding.",
+                  "mitigation": "Redact X-API-Key and Flight-basic-auth credentials in logs; avoid logging full cert chains/subjects at non-debug levels; scrub task_history captured_context for sensitive material; review OTEL push headers for embedded secrets.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 69,
+                  "score": ""
+                },
+                {
+                  "id": "9117a827-6ce6-47cb-8ab4-e4ab7e6eaa40",
+                  "title": "Public mTLS request mode admits anonymous callers; with runtime.auth unset, presented certs are also promoted to the auth principal",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Spoofing",
+                  "description": "runtime.tls.client_auth_mode=request configures the public HTTP and Flight listeners to request a client certificate but still accept connections without one. The process-wide IdentitySource is derived from the combination of runtime.auth and the mTLS mode: when runtime.auth is configured, the cert is recorded only as a ChannelIdentity for audit and the principal still comes from the API key (RuntimeAuth); when runtime.auth is unset and mTLS is request or required, the verified cert is promoted to MtlsPrincipal (Channel). In request mode, anonymous callers continue to reach handlers regardless. An operator may believe mTLS is enforced when only opportunistic client auth is in effect.",
+                  "mitigation": "Use client_auth_mode=required for production mTLS enforcement; reserve request mode for migration/audit windows and pair it with logging that surfaces no-cert vs cert-bearing requests. Validation rejects request/required without a CA and rejects none with a CA, so configuration cannot silently downgrade to no client auth.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 75,
+                  "score": ""
+                }
+              ]
+            }
+          },
+          {
+            "shape": "trust-boundary-curve",
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Boundary",
+              "name": "Internet/Untrusted Network",
+              "description": "",
+              "isTrustBoundary": true,
+              "hasOpenThreats": false,
+              "threats": []
+            },
+            "id": "32f83b98-a3b6-478e-8415-f64b6886e44b",
+            "labels": [
+              "Internet/Untrusted Network"
+            ],
+            "source": {
+              "x": 530,
+              "y": 30
+            },
+            "target": {
+              "x": 880,
+              "y": 320
+            }
+          },
+          {
+            "position": {
+              "x": 620,
+              "y": 360
+            },
+            "size": {
+              "width": 280,
+              "height": 190
+            },
+            "shape": "trust-boundary-box",
+            "attrs": {
+              "headerText": {
+                "text": "Spice Cluster (Scheduler/Executors)"
+              }
+            },
+            "zIndex": -1,
+            "id": "a8b5b7e9-8698-4c17-8c5b-df85733858d4",
+            "data": {
+              "type": "tm.BoundaryBox",
+              "name": "Spice Cluster (Scheduler/Executors)",
+              "description": "Ballista-based distributed query execution over gRPC with built-in mTLS on internal port 50052. v2.0 adds active-active HA via object-store-based scheduler registry, partition-aware data distribution with greedy set cover executor selection, ExpandSecret RPC for secret forwarding, bidirectional control streams, and distributed ingestion.",
+              "isTrustBoundary": true,
+              "hasOpenThreats": true,
+              "threats": []
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "In-memory Arrow",
+              "threats": []
+            },
+            "id": "25b3a98a-0e28-4d2b-bf74-bede05ce95eb",
+            "labels": [
+              ""
+            ],
+            "source": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "target": {
+              "cell": "f32481b0-efee-44f0-991f-ad091abceba2"
+            },
+            "vertices": [
+              {
+                "x": 390,
+                "y": 330
+              }
+            ]
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Data Flow",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "",
+              "threats": []
+            },
+            "id": "fb051e3e-9e0f-4158-87c4-610a8435286e",
+            "source": {
+              "cell": "f32481b0-efee-44f0-991f-ad091abceba2"
+            },
+            "target": {
+              "cell": "03fb0ac1-ff87-46cc-8c51-f75357f8d350"
+            },
+            "vertices": []
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Data Flow",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "",
+              "threats": []
+            },
+            "id": "635ec413-fcc8-458b-b664-debefc2c249d",
+            "source": {
+              "x": 448,
+              "y": 430
+            },
+            "target": {
+              "cell": "03fb0ac1-ff87-46cc-8c51-f75357f8d350"
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Data Flow",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "",
+              "threats": []
+            },
+            "id": "fa7ba349-b32b-4435-bf04-62dc4c148cd9",
+            "source": {
+              "x": 459,
+              "y": 330
+            },
+            "target": {
+              "cell": "81367a19-0ccf-4772-b2fe-55f1232cd67f"
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Data Flow",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": false,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "",
+              "threats": []
+            },
+            "id": "aae7d043-5c7c-46ca-b335-b2c62e0e7fca",
+            "source": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "target": {
+              "cell": "df26fc07-6901-4028-b816-f7fdc36bffb5"
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Data Flow",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "isBidirectional": false,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "",
+              "threats": [
+                {
+                  "id": "a6c73295-0d6b-4b9d-af68-80fc976115a0",
+                  "title": "Man-in-the-middle Data Sources",
+                  "status": "Mitigated",
+                  "severity": "Medium",
+                  "type": "Tampering",
+                  "description": "A potential man-in-the-middle attack is possible where an attacker can inject themselves in the middle of the data source data stream to modify data in transit, causing Spice to return attacker-controlled payloads to the client applications.",
+                  "mitigation": "Connect to remote data sources using TLS/SSL\nFor data connectors that don't support TLS (FTP, Debezium) - connect over a secure network instead.\n",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 9,
+                  "score": ""
+                },
+                {
+                  "id": "1ce4c004-6b61-43ae-9555-7a39e1b60544",
+                  "title": "Unauthenticated Iceberg write path abuse",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Tampering",
+                  "description": "Because Iceberg supports writes, a compromised or unauthenticated caller could alter, overwrite, or delete Iceberg tables via the data connector.",
+                  "mitigation": "Enforce authentication/authorization for Iceberg write endpoints, isolate Iceberg credentials, and apply storage-level ACLs and table-level governance.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 30,
+                  "score": ""
+                }
+              ]
+            },
+            "id": "2f011021-dff5-4dc3-9e8d-218272cbfe15",
+            "source": {
+              "cell": "b7b0e199-6a96-4240-b70e-5a349ec627bc"
+            },
+            "target": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "vertices": [
+              {
+                "x": 540,
+                "y": 150
+              }
+            ]
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Model API Calls",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "isBidirectional": true,
+              "isEncrypted": true,
+              "isPublicNetwork": true,
+              "protocol": "HTTPS",
+              "threats": [
+                {
+                  "id": "b9623f17-5bda-4fdf-a354-ea4d2bdf1f36",
+                  "title": "Model gateway key leakage and unbounded spend",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "Hosted model and embedding providers are called with API keys. A compromised runtime, verbose logs, or replay of this channel can expose keys or allow attackers to trigger costly inference at scale.",
+                  "mitigation": "Store provider keys in runtime-secrets, avoid logging headers/bodies, enforce egress allowlists and rate limits, and rotate provider credentials regularly.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 25,
+                  "score": ""
+                }
+              ]
+            },
+            "id": "9ba63256-5f79-4aae-b8b9-4f68c4c0b591",
+            "source": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "target": {
+              "cell": "7e3894d9-f316-4f7b-bcec-7be3d95b34c1"
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Snapshot Download",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "isBidirectional": false,
+              "isEncrypted": true,
+              "isPublicNetwork": true,
+              "protocol": "HTTPS/S3",
+              "threats": []
+            },
+            "id": "4de5fd32-1f5b-40d2-8c79-5f64f0338a2c",
+            "source": {
+              "cell": "27af5e68-7bba-4d32-8b5d-f073f73ff9f2"
+            },
+            "target": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Cluster Control Plane",
+              "description": "gRPC communication between the Spice runtime and the Ballista scheduler, and between scheduler and executors. Network connections are executor-initiated (executor connects to scheduler); the gRPC stream itself is bidirectional. Scheduler\u2192executor messages carry privileged commands (UpdatePartitions, CancelTasks, PollNow); executor\u2192scheduler messages carry Heartbeat (every 10s) and metrics. Includes SchedulerGrpcServer (Ballista task dispatch) and ClusterService (GetAppDefinition, ExpandSecret, GetSchedulers, GetTaskHistory, GetMetrics, ControlStream, AllocateInitialPartitions RPCs per crates/runtime-proto/proto/spice.proto). Previously, GetAppDefinition and ExpandSecret were Flight Actions on the public port (50051); they are now served only on the internal mTLS-protected port (50052).",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "isBidirectional": true,
+              "isEncrypted": true,
+              "isPublicNetwork": false,
+              "protocol": "gRPC",
+              "threats": [
+                {
+                  "id": "58b52a2c-a47e-4476-a098-2da60355b6a4",
+                  "title": "Rogue cluster node injection",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Elevation of privilege",
+                  "description": "Ballista scheduler and executor communication occurs over gRPC on a dedicated internal port (50052). Without mTLS enabled, a malicious host on the network could register a fake executor, intercept ExpandSecret RPCs to steal secrets, inject UpdatePartitions control-stream commands to reassign data, or read query data in transit. v2.0 increases risk: active-active HA with scheduler registry in object storage and dynamic cluster sizing mean executors join/leave frequently, and distributed ingestion allows executors to write data, not just read it.",
+                  "mitigation": "Enable built-in mTLS (--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file), which is required by default for cluster mode (opt-out only via --allow-insecure-connections). Keep cluster traffic on a private network, restrict scheduler/executor discovery to allowlisted peers, and disable the cluster feature when not required.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 27,
+                  "score": ""
+                },
+                {
+                  "id": "9822be85-3ce2-4431-8c84-37960d7346dc",
+                  "title": "Control stream hijacking",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Tampering",
+                  "description": "The bidirectional gRPC control stream carries privileged scheduler\u2192executor commands (UpdatePartitions reassigns data ownership, CancelTasks aborts query execution, PollNow triggers immediate task polling) and executor\u2192scheduler messages (Heartbeat every 10s for session liveness, periodic metrics reports). Without mTLS, an attacker could inject control-stream messages to reassign partitions to attacker-controlled nodes, cancel legitimate queries, or spoof heartbeats/metrics to keep stale sessions alive or poison scheduler state.",
+                  "mitigation": "Enable built-in mTLS to authenticate both sides of the control stream. Deploy control-stream endpoints on the internal port (50052) not reachable from external networks. Monitor for unexpected control-stream commands via cluster observability. Implement command-level validation and rate limiting on the scheduler side.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 41,
+                  "score": ""
+                }
+              ]
+            },
+            "id": "8b05b05c-4a71-4d60-9ae9-6a823bdc4412",
+            "source": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "target": {
+              "cell": "0f2b61f2-3f68-46e3-a9e8-0646b8d9c071"
+            }
+          },
+          {
+            "position": {
+              "x": 690,
+              "y": 30
+            },
+            "size": {
+              "width": 120,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "Data Source(s)"
+              },
+              "topLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              },
+              "bottomLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "zIndex": 12,
+            "id": "b7b0e199-6a96-4240-b70e-5a349ec627bc",
+            "data": {
+              "type": "tm.Store",
+              "name": "Data Source(s)",
+              "description": "Represents any number of data sources that Spice can connect to, including new GCS (Alpha) and DuckLake catalog connectors in v2.0.",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isALog": false,
+              "isEncrypted": false,
+              "isSigned": false,
+              "storesCredentials": false,
+              "storesInventory": true,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 300,
+              "y": 370
+            },
+            "size": {
+              "width": 100,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "Embedded \nDuckDB"
+              },
+              "topLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              },
+              "bottomLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "zIndex": 13,
+            "id": "f32481b0-efee-44f0-991f-ad091abceba2",
+            "data": {
+              "type": "tm.Store",
+              "name": "Embedded \nDuckDB",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isALog": false,
+              "isEncrypted": false,
+              "isSigned": false,
+              "storesCredentials": false,
+              "storesInventory": true,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 46.99999999999993,
+              "y": 270.0000000000001
+            },
+            "size": {
+              "width": 160,
+              "height": 80
+            },
+            "attrs": {
+              "text": {
+                "text": "Client Application"
+              },
+              "body": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "actor",
+            "zIndex": 14,
+            "id": "df26fc07-6901-4028-b816-f7fdc36bffb5",
+            "data": {
+              "type": "tm.Actor",
+              "name": "Client Application",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "providesAuthentication": false,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 410,
+              "y": 370
+            },
+            "size": {
+              "width": 120,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "Embedded SQLite"
+              },
+              "topLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              },
+              "bottomLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "zIndex": 15,
+            "id": "81367a19-0ccf-4772-b2fe-55f1232cd67f",
+            "data": {
+              "type": "tm.Store",
+              "name": "Embedded SQLite",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isALog": false,
+              "isEncrypted": false,
+              "isSigned": false,
+              "storesCredentials": false,
+              "storesInventory": false,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 430,
+              "y": 460
+            },
+            "size": {
+              "width": 140,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "Cayenne Accelerator\n(Vortex + SQLite)"
+              },
+              "topLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              },
+              "bottomLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "zIndex": 15,
+            "id": "5c1a6f0c-3b1b-4b8c-bc2d-0c05345d52a6",
+            "data": {
+              "type": "tm.Store",
+              "name": "Cayenne Accelerator (Vortex + SQLite)",
+              "description": "Multi-file acceleration format combining Vortex columnar data and SQLite metadata. v2.0 RC adds staged WAL writes, DDL support, and distributed ingestion.",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isALog": false,
+              "isEncrypted": false,
+              "isSigned": false,
+              "storesCredentials": false,
+              "storesInventory": true,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 290,
+              "y": 580
+            },
+            "size": {
+              "width": 250,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "Local Machine Filesystem"
+              },
+              "topLine": {
+                "stroke": "red",
+                "strokeWidth": 2.5,
+                "strokeDasharray": null
+              },
+              "bottomLine": {
+                "stroke": "red",
+                "strokeWidth": 2.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "zIndex": 16,
+            "id": "03fb0ac1-ff87-46cc-8c51-f75357f8d350",
+            "data": {
+              "type": "tm.Store",
+              "name": "Local Machine Filesystem",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "isALog": false,
+              "isEncrypted": false,
+              "isSigned": false,
+              "storesCredentials": false,
+              "storesInventory": false,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 820,
+              "y": 170
+            },
+            "size": {
+              "width": 150,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "Hosted Model Provider"
+              },
+              "topLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              },
+              "bottomLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "zIndex": 17,
+            "id": "7e3894d9-f316-4f7b-bcec-7be3d95b34c1",
+            "data": {
+              "type": "tm.Store",
+              "name": "Hosted Model Provider",
+              "description": "Third-party LLM/embedding APIs (OpenAI, Anthropic, Bedrock, x.ai, etc.).",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isALog": false,
+              "isEncrypted": false,
+              "isSigned": false,
+              "storesCredentials": false,
+              "storesInventory": false,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 700,
+              "y": 300
+            },
+            "size": {
+              "width": 180,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "Acceleration Snapshots / Object Storage"
+              },
+              "topLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              },
+              "bottomLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "zIndex": 18,
+            "id": "27af5e68-7bba-4d32-8b5d-f073f73ff9f2",
+            "data": {
+              "type": "tm.Store",
+              "name": "Acceleration Snapshots / Object Storage",
+              "description": "Remote S3/GCS/object storage (or local file://) for snapshot bootstrap, Cayenne/Vortex artifacts, async query results (jobs/{job_id}/chunk_N.arrow with 12h default TTL), DuckLake data files, scheduler registry records (schedulers/{scheduler_id}.json), cluster metadata (metadata/cluster.json), job state (jobs/{job_id}.json), and partition metadata (accelerations/partitions/{table}.json). Uses ETag-based optimistic concurrency control (OCC) for state coordination.",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "isALog": false,
+              "isEncrypted": false,
+              "isSigned": false,
+              "storesCredentials": false,
+              "storesInventory": true,
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 650,
+              "y": 400
+            },
+            "size": {
+              "width": 140,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "Ballista Scheduler"
+              },
+              "body": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "process",
+            "zIndex": 19,
+            "id": "0f2b61f2-3f68-46e3-a9e8-0646b8d9c071",
+            "data": {
+              "type": "tm.Process",
+              "name": "Ballista Scheduler",
+              "description": "Distributes query fragments and ingestion tasks to executors. v2.0 adds active-active HA via a scheduler registry (schedulers/{scheduler_id}.json, 30s default TTL) backed by either object storage or a local file:// directory. Manages partition assignments under accelerations/partitions/, serves secrets to executors via ExpandSecret RPC, and broadcasts UpdatePartitions/PollNow commands over bidirectional gRPC control streams. Listens on internal port 50052 (mTLS-protected by default).",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "handlesCardPayment": false,
+              "handlesGoodsOrServices": false,
+              "isWebApplication": false,
+              "privilegeLevel": "",
+              "threats": [
+                {
+                  "id": "f1a2b3c4-d5e6-7890-abcd-ef1234567891",
+                  "title": "Secret forwarding interception via ExpandSecret RPC",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Information disclosure",
+                  "description": "The scheduler serves secret values to executors via the ExpandSecret gRPC RPC on the internal port (50052). Secrets are transmitted in cleartext within the gRPC payload. Without mTLS, an attacker with network access could intercept ExpandSecret responses to capture data source credentials, API keys, and other secrets held in the scheduler's secret store.",
+                  "mitigation": "Enable built-in mTLS for cluster communication (required by default; opt-out only via --allow-insecure-connections). Restrict network access to port 50052. Apply least-privilege secret scoping so executors only receive secrets required for their assigned partitions. Rotate secrets regularly. Monitor ExpandSecret call patterns for anomalies.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 40,
+                  "score": ""
+                }
+              ]
+            }
+          },
+          {
+            "position": {
+              "x": 760,
+              "y": 480
+            },
+            "size": {
+              "width": 140,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "Ballista Executor"
+              },
+              "body": {
+                "stroke": "red",
+                "strokeWidth": 2.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "process",
+            "zIndex": 20,
+            "id": "d5e905d2-3d15-4b74-bb79-8fd3cb37f405",
+            "data": {
+              "type": "tm.Process",
+              "name": "Ballista Executor",
+              "description": "Executes query fragments and, in v2.0, performs distributed data ingestion into accelerated tables including Cayenne. Retrieves secrets from the scheduler via ExpandSecret RPC (secrets are never stored locally). Receives partition assignments and control commands (UpdatePartitions, CancelTasks) over a bidirectional gRPC control stream. Reports metrics back to the scheduler through the same control stream.",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "handlesCardPayment": false,
+              "handlesGoodsOrServices": false,
+              "isWebApplication": false,
+              "privilegeLevel": "",
+              "threats": [
+                {
+                  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                  "title": "Executor data exfiltration via distributed ingestion",
+                  "status": "Open",
+                  "severity": "High",
+                  "type": "Information disclosure",
+                  "description": "v2.0 executors now perform distributed ingestion, reading from data sources and writing to accelerated tables. A compromised executor could exfiltrate source data during ingestion, or redirect writes to an attacker-controlled destination.",
+                  "mitigation": "Restrict executor network egress to only required data sources and object storage. Use IAM roles/instance profiles scoped to specific resources. Audit executor activity via cluster observability metrics. Run executors in isolated network segments.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 37,
+                  "score": ""
+                },
+                {
+                  "id": "cdd7d795-a409-4eb8-8d72-751a752f605a",
+                  "title": "Shuffle data exposure in executor memory or storage",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "During distributed query execution, intermediate shuffle data (partial query results exchanged between executors) is held in executor memory, local disk, or object storage in Arrow IPC or Vortex format. A compromised executor or an attacker with access to the executor's filesystem or object storage prefix could read sensitive intermediate results that would not otherwise be accessible.",
+                  "mitigation": "Enable mTLS for all inter-executor data exchange (Flight shuffle). Use encrypted local storage for shuffle spill files. Apply short TTLs and automatic cleanup for shuffle artifacts in object storage. Restrict executor filesystem access and object storage prefixes with least-privilege IAM.",
+                  "modelType": "STRIDE",
+                  "new": true,
+                  "number": 43,
+                  "score": ""
+                }
+              ]
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Task Dispatch",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": false,
+              "isEncrypted": true,
+              "isPublicNetwork": false,
+              "protocol": "gRPC",
+              "threats": []
+            },
+            "id": "4d3eeb77-3a4b-4b29-98fb-932e8aa1b027",
+            "source": {
+              "cell": "0f2b61f2-3f68-46e3-a9e8-0646b8d9c071"
+            },
+            "target": {
+              "cell": "d5e905d2-3d15-4b74-bb79-8fd3cb37f405"
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Data Flow",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "",
+              "threats": []
+            },
+            "id": "d0b2f763-0a56-4d70-bd63-5846cfacdd19",
+            "source": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "target": {
+              "cell": "5c1a6f0c-3b1b-4b8c-bc2d-0c05345d52a6"
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "MCP (HTTP + SSE)",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": true,
+              "protocol": "HTTP/SSE",
+              "threats": []
+            },
+            "id": "8b8c9cc2-6f4d-43b3-9b48-2d9ef3d7b8c7",
+            "source": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "target": {
+              "cell": "df26fc07-6901-4028-b816-f7fdc36bffb5"
+            }
+          },
+          {
+            "position": {
+              "x": 300,
+              "y": 460
+            },
+            "size": {
+              "width": 120,
+              "height": 60
+            },
+            "attrs": {
+              "text": {
+                "text": "DuckLake\nMetadata (DuckDB)"
+              },
+              "topLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              },
+              "bottomLine": {
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "zIndex": 15,
+            "id": "c7d8e9f0-1a2b-3c4d-5e6f-789012345678",
+            "data": {
+              "type": "tm.Store",
+              "name": "DuckLake Metadata (DuckDB)",
+              "description": "DuckDB-backed metadata catalog for DuckLake lakehouse tables. Stores table schemas, file references, and snapshot history for time travel. New in v2.0.",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isALog": false,
+              "isEncrypted": false,
+              "isSigned": false,
+              "storesCredentials": false,
+              "storesInventory": true,
+              "threats": []
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Async Query Results",
+              "description": "Async query results materialized to and retrieved from object storage.",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": true,
+              "isBidirectional": true,
+              "isEncrypted": true,
+              "isPublicNetwork": true,
+              "protocol": "HTTPS/S3",
+              "threats": []
+            },
+            "id": "e8f90123-4567-89ab-cdef-012345678901",
+            "source": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "target": {
+              "cell": "27af5e68-7bba-4d32-8b5d-f073f73ff9f2"
+            }
+          }
+        ],
+        "description": "Models the components involved in federated query, acceleration, LLM inference, DDL operations, async query execution, and distributed execution for the Spice runtime v2.0."
+      }
+    ],
+    "diagramTop": 2,
+    "reviewer": "Spice AI Engineering Team",
+    "threatTop": 75
+  }
+}
