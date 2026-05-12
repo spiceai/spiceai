@@ -170,11 +170,7 @@ impl DynamodbStreamProducer {
             }
 
             if had_error {
-                if let Some(mut duration) = backoff.next_backoff() {
-                    if duration > Duration::from_secs(60) {
-                        duration = Duration::from_secs(1);
-                        backoff.reset();
-                    }
+                if let Some(duration) = backoff.next_backoff() {
                     tokio::time::sleep(duration).await;
                 }
             } else {
