@@ -9,8 +9,6 @@ datasets:
       engine: arrow
       indexes:
         c_name: unique
-      params:
-        hash_index: enabled
   - from: file:data/nation.parquet
     name: nation
     acceleration:
@@ -18,8 +16,6 @@ datasets:
       engine: arrow
       indexes:
         n_name: unique
-      params:
-        hash_index: enabled
   - from: file:data/orders.parquet
     name: orders
     acceleration:
@@ -27,8 +23,6 @@ datasets:
       engine: arrow
       indexes:
         o_orderkey: unique
-      params:
-        hash_index: enabled
   - from: file:data/part.parquet
     name: part
     acceleration:
@@ -36,8 +30,6 @@ datasets:
       engine: arrow
       indexes:
         p_name: unique
-      params:
-        hash_index: enabled
   - from: file:data/region.parquet
     name: region
     acceleration:
@@ -45,8 +37,6 @@ datasets:
       engine: arrow
       indexes:
         r_name: unique
-      params:
-        hash_index: enabled
   - from: file:data/supplier.parquet
     name: supplier
     acceleration:
@@ -54,8 +44,6 @@ datasets:
       engine: arrow
       indexes:
         s_name: unique
-      params:
-        hash_index: enabled
   # lineitem and partsupp don't have natural unique columns for secondary index
   - from: file:data/lineitem.parquet
     name: lineitem

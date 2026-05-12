@@ -33,7 +33,6 @@ use opentelemetry::KeyValue;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerMetrics};
 use tokio::sync::RwLock;
 use url::Url;
-use uuid::Uuid;
 
 const DEFAULT_RATE_CONTROL_JITTER_MIN: Duration = Duration::from_millis(5);
 const DEFAULT_RATE_CONTROL_JITTER_MAX: Duration = Duration::from_millis(10);
@@ -42,6 +41,7 @@ const RUNTIME_REQUESTS_PER_SECOND_LIMIT: &str = "http_requests_per_second_limit"
 const RUNTIME_REQUESTS_PER_MINUTE_LIMIT: &str = "http_requests_per_minute_limit";
 const RUNTIME_RATE_CONTROL_JITTER_MIN: &str = "http_rate_control_jitter_min";
 const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
+#[cfg(feature = "rate-control")]
 const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
 
 // Fallback for direct connector construction without a Runtime. Factory-created
@@ -600,7 +600,7 @@ impl HttpRateControlRegistry {
                 store,
                 base_prefix: base_prefix.into(),
                 refresh_interval,
-                instance_id: Uuid::new_v4().to_string(),
+                instance_id: uuid::Uuid::new_v4().to_string(),
                 instance_ttl: persisted_instance_ttl(refresh_interval),
             }),
             ..Self::default()
@@ -1272,6 +1272,7 @@ fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+#[cfg(feature = "rate-control")]
 fn persisted_instance_ttl(refresh_interval: Duration) -> Duration {
     refresh_interval
         .saturating_mul(3)

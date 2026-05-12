@@ -166,6 +166,12 @@ const PARAMETERS: &[ParameterSpec] = &[
              Default: 10s.",
         )
         .default("10s"),
+    ParameterSpec::component("replication_bootstrap_batch_size")
+        .description(
+            "Rows per emitted batch during the initial replication snapshot. \
+             Default: 8192. Maximum: 1048576.",
+        )
+        .default("8192"),
 ];
 
 impl DataConnectorFactory for PostgresFactory {
