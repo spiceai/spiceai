@@ -20,9 +20,8 @@ mod startup;
 
 use std::collections::HashMap;
 
-use datafusion::sql::{ResolvedTableReference, TableReference};
+use datafusion::sql::ResolvedTableReference;
 use datafusion_expr::Expr;
-use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use snafu::Snafu;
 
 // Re-export types that moved into the `runtime-cluster` crate so callers inside
@@ -100,8 +99,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// as a single-element `Vec<Expr>` so that applying them via `.filter()` is correct.
 /// Returns an empty `Vec` if no partitions are assigned.
 ///
-/// The lookup key is resolved against the default catalog/schema so that bare,
-/// partial, and fully-qualified references all match the same entry.
+/// The caller is responsible for resolving the table reference to a
+/// `ResolvedTableReference` (e.g. against the default catalog/schema) before
+/// calling this function, so that bare, partial, and fully-qualified references
+/// all produce the same key and match correctly against the assignments map.
 #[expect(clippy::implicit_hasher)]
 pub fn get_partition_filter_exprs(
     tbl: &ResolvedTableReference,
