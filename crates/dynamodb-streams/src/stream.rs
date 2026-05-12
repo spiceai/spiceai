@@ -56,7 +56,7 @@ impl DynamodbStreamProducer {
         let mut had_error = false;
 
         // 1. Initialize shards that require iterators
-        self.initialize_shards_iterators().await;
+        had_error |= self.initialize_shards_iterators().await;
 
         // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
@@ -99,10 +99,11 @@ impl DynamodbStreamProducer {
         (combine_shard_batches(&poll_results), had_error)
     }
 
-    async fn initialize_shards_iterators(&mut self) {
+    async fn initialize_shards_iterators(&mut self) -> bool {
         let shards: Vec<InitializingShard> =
             self.state.get_initializing_shards().cloned().collect();
 
+        let mut had_error = false;
         for shard in shards {
             // Shards that were already polled use `After`.
             // Newly discovered shards use `At`.
@@ -125,6 +126,7 @@ impl DynamodbStreamProducer {
                     self.state.mark_active(shard.shard_id, iterator);
                 }
                 Err(e) => {
+                    had_error = true;
                     tracing::warn!(
                         "Failed to initialize shard. Will retry on next iteration: {}",
                         e
@@ -132,6 +134,7 @@ impl DynamodbStreamProducer {
                 }
             }
         }
+        had_error
     }
 
     pub async fn streaming(mut self) {

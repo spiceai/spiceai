@@ -241,15 +241,6 @@ impl StreamState {
                 continue;
             }
 
-            self.historical.insert(
-                shard_id.clone(),
-                HistoricalShard {
-                    shard_id: shard_id.clone(),
-                    parent_shard_id: shard.parent_shard_id.clone(),
-                    created_at: SystemTime::now(),
-                },
-            );
-
             // Shards in DynamoDB Streams have a parent-child relationship.
             // Until we exhausted the parent shard, we don't want to read from its children.
             // As long as the parent of the discovered shard is either active/pending/initializing,
@@ -276,6 +267,17 @@ impl StreamState {
                 );
                 continue;
             };
+
+            // Insert into historical only after required fields are validated so a shard
+            // with missing metadata can be retried on the next discovery cycle.
+            self.historical.insert(
+                shard_id.clone(),
+                HistoricalShard {
+                    shard_id: shard_id.clone(),
+                    parent_shard_id: shard.parent_shard_id.clone(),
+                    created_at: SystemTime::now(),
+                },
+            );
             let checkpoint = ShardCheckpoint {
                 sequence_number,
                 parent_id: shard.parent_shard_id.clone(),

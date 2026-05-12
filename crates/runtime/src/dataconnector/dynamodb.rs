@@ -50,8 +50,8 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::Mutex;
 use util::time_format::is_valid_format;
 
-// If we get `ShardNotFound` error on startup and checkpoint is old enough, behavior will depend on
-// lag_exceeds_shard_retention_behavior param.
+// If we get `ShardNotFound` or `StreamBeyondRetention` on startup and checkpoint is old enough,
+// behavior will depend on lag_exceeds_shard_retention_behavior param.
 // DynamoDB retention is 24h, and shards expire every 4h. 2h are added for safety.
 const CHECKPOINT_EXPIRATION_HOURS: u64 = 18;
 
@@ -80,7 +80,7 @@ const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const SEGMENTS_AUTO_STR: &str = "auto";
 const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 
-/// Behavior when the stream lag exceeds shard retention (`ShardNotFound` error).
+/// Behavior when the stream lag exceeds shard retention (`ShardNotFound` or `StreamBeyondRetention`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LagExceedsShardRetentionBehavior {
     /// Dataset is marked as Error state.
@@ -738,6 +738,45 @@ fn resume_from_checkpoint_stream(
                             lag_age = %humantime::format_duration(checkpoint_age),
                             behavior = ?lag_exceeds_behavior,
                             "DynamoDB table lag references expired shard. Initiating table re-initialization"
+                        );
+                        rebootstrap_table(
+                            &dynamodb,
+                            &dynamodb_sys,
+                            acceptable_lag,
+                            &dataset_name,
+                            accelerated_table_provider,
+                            accelerator_write_mutex,
+                            lag_exceeds_behavior,
+                            metrics_collector,
+                            cpu_runtime,
+                        )
+                        .await
+                    }
+                }
+                Err(Error::FailedToInitializeCheckpoint {
+                    source: dynamodb_streams::Error::StreamBeyondRetention,
+                }) => {
+                    // StreamBeyondRetention definitively means checkpoint is >24h old
+                    if lag_exceeds_behavior == LagExceedsShardRetentionBehavior::Error {
+                        tracing::error!(
+                            dataset = %dataset_name,
+                            "DynamoDB Stream data has exceeded 24h retention period. Configured behavior is 'error'"
+                        );
+                        Some(
+                            stream::once(async move {
+                                Err(StreamError::DynamoDB(
+                                    DynamoDBStreamError::FailedToReceiveMessage {
+                                        source: dynamodb_streams::Error::StreamBeyondRetention,
+                                    },
+                                ))
+                            })
+                            .boxed(),
+                        )
+                    } else {
+                        tracing::info!(
+                            dataset = %dataset_name,
+                            behavior = ?lag_exceeds_behavior,
+                            "DynamoDB Stream data has exceeded 24h retention period. Initiating table re-initialization"
                         );
                         rebootstrap_table(
                             &dynamodb,
