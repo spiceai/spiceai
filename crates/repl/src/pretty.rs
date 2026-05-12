@@ -452,12 +452,30 @@ mod tests {
 
         let formatted = format_batches_expanded(&[batch]).expect("formatting should succeed");
 
-        assert!(formatted.contains("-[ RECORD 1 ]"), "missing RECORD 1 header in:\n{formatted}");
-        assert!(formatted.contains("-[ RECORD 2 ]"), "missing RECORD 2 header in:\n{formatted}");
-        assert!(formatted.contains("id"), "missing column name `id` in:\n{formatted}");
-        assert!(formatted.contains("name"), "missing column name `name` in:\n{formatted}");
-        assert!(formatted.contains("Alice"), "missing value `Alice` in:\n{formatted}");
-        assert!(formatted.contains("Bob"), "missing value `Bob` in:\n{formatted}");
+        assert!(
+            formatted.contains("-[ RECORD 1 ]"),
+            "missing RECORD 1 header in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("-[ RECORD 2 ]"),
+            "missing RECORD 2 header in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("id"),
+            "missing column name `id` in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("name"),
+            "missing column name `name` in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("Alice"),
+            "missing value `Alice` in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("Bob"),
+            "missing value `Bob` in:\n{formatted}"
+        );
         // Records are separated by the divider line, so RECORD 1's header
         // should appear before RECORD 2's header.
         let p1 = formatted.find("-[ RECORD 1 ]").expect("RECORD 1 header");
@@ -512,7 +530,10 @@ mod tests {
         //        | line2
         //        | line3
         //   id   | 7
-        let note_row = lines.iter().find(|l| l.starts_with("note ")).expect("note row");
+        let note_row = lines
+            .iter()
+            .find(|l| l.starts_with("note "))
+            .expect("note row");
         let pipe_col = note_row.find('|').expect("pipe in note row");
         let cont1 = lines
             .iter()
@@ -539,10 +560,8 @@ mod tests {
     fn test_format_batches_expanded_rejects_schema_mismatch() {
         let s1 = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let s2 = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
-        let b1 = RecordBatch::try_new(s1, vec![Arc::new(Int32Array::from(vec![1]))])
-            .expect("b1");
-        let b2 = RecordBatch::try_new(s2, vec![Arc::new(Int32Array::from(vec![2]))])
-            .expect("b2");
+        let b1 = RecordBatch::try_new(s1, vec![Arc::new(Int32Array::from(vec![1]))]).expect("b1");
+        let b2 = RecordBatch::try_new(s2, vec![Arc::new(Int32Array::from(vec![2]))]).expect("b2");
 
         let err = format_batches_expanded(&[b1, b2]).expect_err("schema mismatch should error");
         assert!(
