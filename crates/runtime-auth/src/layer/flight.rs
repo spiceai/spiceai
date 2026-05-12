@@ -150,6 +150,29 @@ where
         let version = req.version();
         let req = tonic::Request::from_http(req);
 
+        // Short-circuit when an upstream layer (e.g. the mTLS layer
+        // in mTLS-as-identity mode) has already established the auth
+        // principal. Without this check we would still demand a
+        // bearer token even though a verified client cert is
+        // sufficient on its own. We check via the request's
+        // `AuthRequestContext` extension; if it's not present we fall
+        // through to the bearer-token path so misconfiguration cannot
+        // accidentally open the endpoint.
+        if let Some(ctx) = req
+            .extensions()
+            .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+            && ctx.auth_principal().is_some()
+        {
+            let (metadata, extensions, msg) = req.into_parts();
+            let mut request = http::Request::new(msg);
+            *request.version_mut() = version;
+            *request.method_mut() = method;
+            *request.uri_mut() = uri;
+            *request.headers_mut() = metadata.into_headers();
+            *request.extensions_mut() = extensions;
+            return ResponseFuture::future(inner.call(request));
+        }
+
         let bearer_token = match get_authorization_value(req.metadata(), "Bearer") {
             Ok(bearer_token) => bearer_token,
             Err(e) => return ResponseFuture::status(e),

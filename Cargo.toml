@@ -322,6 +322,7 @@ tonic = { version = "0.14", features = [
     "gzip",
     "tls-ring",
     "tls-native-roots",
+    "tls-connect-info",
 ] }
 tonic-health = { version = "0.14" }
 tower = "0.5.2"
