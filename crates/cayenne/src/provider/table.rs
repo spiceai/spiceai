@@ -4953,7 +4953,7 @@ impl TableProvider for CayenneTableProvider {
         };
 
         let plan: Arc<dyn ExecutionPlan> = if let Some(limit) = limit {
-            Arc::new(GlobalLimitExec::new(plan, limit, None))
+            Arc::new(GlobalLimitExec::new(plan, 0, Some(limit)))
         } else {
             plan
         };
