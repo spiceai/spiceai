@@ -17,7 +17,7 @@ limitations under the License.
 //! Display-only `DataSource` wrapper that surfaces the pushed-down `limit` in
 //! the `tree` `EXPLAIN` format.
 //!
-//! Upstream DataFusion's `FileScanConfig::fmt_as` includes `limit=N` for the
+//! Upstream `DataFusion`'s `FileScanConfig::fmt_as` includes `limit=N` for the
 //! `Default`/`Verbose` formats but omits it for `TreeRender`, so a `DataSourceExec`
 //! that received a fetch limit looks identical to one without when rendered as a
 //! tree. [`LimitDisplayDataSource`] wraps an existing `DataSource`, delegates every
@@ -170,7 +170,7 @@ impl DataSource for LimitDisplayDataSource {
 /// Physical optimizer rule that wraps each `DataSourceExec`'s `DataSource` with
 /// [`LimitDisplayDataSource`] when a fetch limit has been pushed down. The wrap
 /// is purely cosmetic — it does not alter execution, statistics, or plan
-/// properties — and must run after all DataFusion rules that mutate the data
+/// properties — and must run after all `DataFusion` rules that mutate the data
 /// source (in particular, limit pushdown).
 #[derive(Debug, Default)]
 pub struct DataSourceTreeDisplayOptimizer;
@@ -206,7 +206,7 @@ impl PhysicalOptimizerRule for DataSourceTreeDisplayOptimizer {
         .data()
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DataSourceTreeDisplayOptimizer"
     }
 
