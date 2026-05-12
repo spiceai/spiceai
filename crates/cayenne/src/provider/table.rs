@@ -1990,8 +1990,6 @@ impl CayenneTableProvider {
             .scan(&ctx.state(), Some(&pk_projection), &[], None)
             .await?;
 
-        let main_batches = collect(scan_plan, ctx.task_ctx()).await?;
-
         // Load the deletion caches based on pk_deletion_strategy.
         // Note: PositionBased strategy is never used here since it implies no primary key,
         // and this function is only called for tables with primary keys.
@@ -2022,8 +2020,9 @@ impl CayenneTableProvider {
         // This mirrors scan()'s apply_deletion_filter() which uses all deletions without
         // insert_records when protected snapshots exist.
         // min_delete_seq_threshold=None means ALL deletions apply.
-        Self::process_batches_into_keyset(
-            &main_batches,
+        let main_stream = datafusion_physical_plan::execute_stream(scan_plan, ctx.task_ctx())?;
+        Self::process_stream_into_keyset(
+            main_stream,
             &self.pk_deletion_strategy,
             pk_indices,
             converter,
@@ -2034,7 +2033,8 @@ impl CayenneTableProvider {
             &self.table_metadata.table_name,
             &mut keyset,
             &mut row_id_base,
-        )?;
+        )
+        .await?;
 
         // Process each protected snapshot with a PARTIAL deletion filter.
         // Only deletions with seq > max_delete_seq_at_creation apply, mirroring
@@ -2057,10 +2057,11 @@ impl CayenneTableProvider {
                 .scan(&ctx.state(), Some(&pk_projection), &[], None)
                 .await?;
 
-            let snapshot_batches = collect(snapshot_plan, ctx.task_ctx()).await?;
+            let snapshot_stream =
+                datafusion_physical_plan::execute_stream(snapshot_plan, ctx.task_ctx())?;
 
-            Self::process_batches_into_keyset(
-                &snapshot_batches,
+            Self::process_stream_into_keyset(
+                snapshot_stream,
                 &self.pk_deletion_strategy,
                 pk_indices,
                 converter,
@@ -2071,7 +2072,8 @@ impl CayenneTableProvider {
                 &self.table_metadata.table_name,
                 &mut keyset,
                 &mut row_id_base,
-            )?;
+            )
+            .await?;
         }
 
         let inlined_batches = self.read_inlined_batches().await?;
@@ -2124,7 +2126,7 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Process record batches and add visible keys to the keyset.
+    /// Process a record batch stream and add visible keys to the keyset.
     ///
     /// Filters out deleted rows using the provided deletion maps. No `insert_records` are
     /// used — visibility is determined solely by whether a deletion exists for the key.
@@ -2137,8 +2139,8 @@ impl CayenneTableProvider {
     /// Keys from later batches override earlier ones in the keyset, which is correct
     /// because protected snapshots contain data inserted at higher sequence numbers.
     #[expect(clippy::too_many_arguments)]
-    fn process_batches_into_keyset(
-        batches: &[RecordBatch],
+    async fn process_stream_into_keyset(
+        mut stream: SendableRecordBatchStream,
         pk_deletion_strategy: &PkDeletionStrategyWithCache,
         pk_indices: &[usize],
         converter: &RowConverter,
@@ -2150,7 +2152,8 @@ impl CayenneTableProvider {
         keyset: &mut HashMap<OwnedRow, RowLocation>,
         row_id_base: &mut i64,
     ) -> Result<()> {
-        for batch in batches {
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
             let pk_columns: Vec<_> = projected_pk_indices
                 .iter()
                 .map(|idx| Arc::clone(batch.column(*idx)))
@@ -5890,8 +5893,16 @@ mod tests {
         (batch, converter)
     }
 
-    #[test]
-    fn test_process_batches_into_keyset_int64pk_filters_deleted() {
+    fn single_batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
+        let schema = batch.schema();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter([Ok(batch)]),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_process_stream_into_keyset_int64pk_filters_deleted() {
         let (batch, converter) = make_int64_pk_batch(&[1, 2, 3]);
 
         // Delete pk=2 with del_seq=1
@@ -5904,8 +5915,8 @@ mod tests {
         let mut keyset = HashMap::new();
         let mut row_id_base: i64 = 0;
 
-        CayenneTableProvider::process_batches_into_keyset(
-            &[batch],
+        CayenneTableProvider::process_stream_into_keyset(
+            single_batch_stream(batch),
             &strategy,
             &[0],
             &converter,
@@ -5917,14 +5928,15 @@ mod tests {
             &mut keyset,
             &mut row_id_base,
         )
-        .expect("process_batches_into_keyset should succeed");
+        .await
+        .expect("process_stream_into_keyset should succeed");
 
         assert_eq!(keyset.len(), 2, "pk=2 should be filtered out");
         assert_eq!(row_id_base, 3);
     }
 
-    #[test]
-    fn test_process_batches_into_keyset_threshold_filters_partial() {
+    #[tokio::test]
+    async fn test_process_stream_into_keyset_threshold_filters_partial() {
         let (batch, converter) = make_int64_pk_batch(&[1, 2, 3]);
 
         // pk=1 deleted at seq 5, pk=2 deleted at seq 15
@@ -5939,8 +5951,8 @@ mod tests {
         let mut row_id_base: i64 = 0;
 
         // threshold=10: only deletions with del_seq > 10 apply
-        CayenneTableProvider::process_batches_into_keyset(
-            &[batch],
+        CayenneTableProvider::process_stream_into_keyset(
+            single_batch_stream(batch),
             &strategy,
             &[0],
             &converter,
@@ -5952,7 +5964,8 @@ mod tests {
             &mut keyset,
             &mut row_id_base,
         )
-        .expect("process_batches_into_keyset should succeed");
+        .await
+        .expect("process_stream_into_keyset should succeed");
 
         // pk=1 (del_seq=5 <= 10) => visible, pk=2 (del_seq=15 > 10) => filtered, pk=3 => visible
         assert_eq!(
@@ -5963,8 +5976,8 @@ mod tests {
         assert_eq!(row_id_base, 3);
     }
 
-    #[test]
-    fn test_process_batches_into_keyset_no_deletions() {
+    #[tokio::test]
+    async fn test_process_stream_into_keyset_no_deletions() {
         let (batch, converter) = make_int64_pk_batch(&[10, 20, 30]);
 
         let strategy = PkDeletionStrategyWithCache::empty_int64_pk();
@@ -5972,8 +5985,8 @@ mod tests {
         let mut keyset = HashMap::new();
         let mut row_id_base: i64 = 0;
 
-        CayenneTableProvider::process_batches_into_keyset(
-            &[batch],
+        CayenneTableProvider::process_stream_into_keyset(
+            single_batch_stream(batch),
             &strategy,
             &[0],
             &converter,
@@ -5985,7 +5998,8 @@ mod tests {
             &mut keyset,
             &mut row_id_base,
         )
-        .expect("process_batches_into_keyset should succeed");
+        .await
+        .expect("process_stream_into_keyset should succeed");
 
         assert_eq!(keyset.len(), 3, "all rows should be in keyset");
         assert_eq!(row_id_base, 3, "row_id_base should advance by batch size");
