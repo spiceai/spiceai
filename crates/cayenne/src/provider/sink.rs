@@ -24,10 +24,12 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::datasource::sink::DataSink;
 use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, SendableRecordBatchStream};
 use datafusion_common::Result as DFResult;
 use datafusion_execution::TaskContext;
 use datafusion_expr::dml::InsertOp;
+use futures::StreamExt;
 
 use super::constants::STAGING_DIR_NAME;
 use super::context::CayenneContext;
@@ -147,10 +149,25 @@ impl DataSink for CayenneDataSink {
         // prevent concurrent races on catalog state, snapshot IDs, and listing table.
         let _write_guard = self.table.write_lock().lock().await;
 
+        // Normalize incoming batches to the table schema (e.g. CDC nullability mismatches)
+        // causing Vortex assertion failures.
+        let target_schema = Arc::clone(&self.schema);
+        let normalized = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&target_schema),
+            data.map(move |batch_result| {
+                batch_result.and_then(|batch| {
+                    arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
+                        .map_err(Into::into)
+                })
+            }),
+        ));
+
         if self.overwrite == InsertOp::Overwrite {
-            self.write_all_overwrite(data).await.map_err(Into::into)
+            self.write_all_overwrite(normalized)
+                .await
+                .map_err(Into::into)
         } else {
-            self.write_all_append(data, context)
+            self.write_all_append(normalized, context)
                 .await
                 .map_err(Into::into)
         }
