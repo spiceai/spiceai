@@ -219,16 +219,26 @@ impl CayenneDataSink {
         // validate_on_conflict() (via prepare_stream_for_insert) on the incoming stream
         // to handle upserts for PKs that already exist in the table. Without this,
         // duplicate PKs would appear in query results.
-        let (mut prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
-            self.table.prepare_stream_for_insert(data).await?;
+        let (
+            mut prepared_stream,
+            delete_specs,
+            deleted_pk_i64,
+            deleted_row_keys,
+            deleted_inlined_pk_i64,
+            deleted_inlined_row_keys,
+        ) = self.table.prepare_stream_for_insert(data).await?;
 
-        let has_on_conflict_deletions = !delete_specs.is_empty();
+        let has_file_on_conflict_deletions = !delete_specs.is_empty();
+        let has_inlined_on_conflict_deletions =
+            !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty();
+        let has_on_conflict_deletions =
+            has_file_on_conflict_deletions || has_inlined_on_conflict_deletions;
 
         tracing::debug!(
             "write_all_append: delete_specs={} files, deleted_pk_i64={} keys, \
              pending_deletions={}, on_conflict_deletions={}",
             delete_specs.len(),
-            deleted_pk_i64.len(),
+            deleted_pk_i64.len() + deleted_inlined_pk_i64.len(),
             needs_new_snapshot_for_pending_deletions,
             has_on_conflict_deletions
         );
@@ -241,23 +251,22 @@ impl CayenneDataSink {
         // - On-conflict deletions exist (from INSERT upserts) — the deletion vectors
         //   target rows in the current snapshot
         let needs_new_snapshot =
-            needs_new_snapshot_for_pending_deletions || has_on_conflict_deletions;
+            needs_new_snapshot_for_pending_deletions || has_file_on_conflict_deletions;
 
         // Always clear staging dir first to self-heal from previous crashes,
         // even if we end up using the inline fast-path.
         self.table.clear_staging_dir().await?;
+        let mut on_conflict_deletions_applied = false;
 
         // ── Data inlining fast-path ────────────────────────────────────
-        // For simple appends (no deletions, no on-conflict) with small data,
-        // store directly in the metastore as Arrow IPC to avoid Vortex file overhead.
-        // Skip inlining for tables with primary keys — they need data in Vortex
-        // for on-conflict deduplication and PK-based deletion to work correctly.
+        // For small data, store directly in the metastore as Arrow IPC to avoid
+        // Vortex file overhead. PK tables can use this path when conflicts are
+        // inline-only: file-backed conflicts still need the protected-snapshot
+        // path so old file rows stay hidden while replacement rows are visible.
         let has_primary_key = !self.table.pk_deletion_strategy().is_position_based();
         let has_sort_columns = self.context.has_sort_columns();
         let is_partitioned = self.table.metadata().partition_column.is_some();
-        let can_inline = !needs_new_snapshot
-            && !has_on_conflict_deletions
-            && !has_primary_key
+        let can_inline = !has_file_on_conflict_deletions
             && !has_sort_columns
             && !is_partitioned
             && !self.table.has_retention_filters();
@@ -285,6 +294,19 @@ impl CayenneDataSink {
                 }
             }
 
+            if !exceeded && total_rows > 0 {
+                self.table
+                    .apply_on_conflict_deletions(
+                        delete_specs.clone(),
+                        deleted_pk_i64.clone(),
+                        deleted_row_keys.clone(),
+                        deleted_inlined_pk_i64.clone(),
+                        deleted_inlined_row_keys.clone(),
+                    )
+                    .await?;
+                on_conflict_deletions_applied = true;
+            }
+
             if !exceeded && total_rows > 0 && self.table.try_inline_batches(&batches).await? {
                 // Persist stats from the inlined batches
                 let stats_acc = super::table::ColumnStatsAccumulator::new(&schema);
@@ -296,7 +318,8 @@ impl CayenneDataSink {
 
                 // Auto-checkpoint when accumulated inline data reaches 10K rows
                 let inlined_count = self.table.cached_inlined_row_count();
-                if inlined_count >= 10_000
+                if !has_primary_key
+                    && inlined_count >= 10_000
                     && let Err(e) = self.table.checkpoint_inlined_data().await
                 {
                     tracing::warn!(
@@ -353,9 +376,17 @@ impl CayenneDataSink {
             let staged_append = self.table.staged_append_for_existing_staging();
             staged_append.finalize_staged_write().await?;
 
-            self.table
-                .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
-                .await?;
+            if !on_conflict_deletions_applied {
+                self.table
+                    .apply_on_conflict_deletions(
+                        delete_specs,
+                        deleted_pk_i64,
+                        deleted_row_keys,
+                        deleted_inlined_pk_i64,
+                        deleted_inlined_row_keys,
+                    )
+                    .await?;
+            }
 
             let retention_deleted_rows = self.apply_retention_if_configured().await?;
             let sorted = self.sort_if_configured().await?;
@@ -369,9 +400,17 @@ impl CayenneDataSink {
 
         let (total_rows, write_stats_acc) = if needs_new_snapshot {
             // Apply on-conflict deletion vectors BEFORE creating the protected snapshot.
-            self.table
-                .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
-                .await?;
+            if !on_conflict_deletions_applied {
+                self.table
+                    .apply_on_conflict_deletions(
+                        delete_specs,
+                        deleted_pk_i64,
+                        deleted_row_keys,
+                        deleted_inlined_pk_i64,
+                        deleted_inlined_row_keys,
+                    )
+                    .await?;
+            }
 
             // Write to a NEW snapshot with a higher sequence number so that:
             // - Old data filtered by deletions (delete_seq >= old_snapshot_seq)
@@ -424,9 +463,17 @@ impl CayenneDataSink {
             );
 
             // Apply deletion vectors generated by on-conflict handling (no-op if empty).
-            self.table
-                .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
-                .await?;
+            if !on_conflict_deletions_applied {
+                self.table
+                    .apply_on_conflict_deletions(
+                        delete_specs,
+                        deleted_pk_i64,
+                        deleted_row_keys,
+                        deleted_inlined_pk_i64,
+                        deleted_inlined_row_keys,
+                    )
+                    .await?;
+            }
 
             (rows, stats_acc)
         };

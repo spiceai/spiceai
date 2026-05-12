@@ -22,7 +22,7 @@ mod common;
 
 use arrow::array::{
     Array, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMillisecondArray,
+    TimestampMillisecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -30,6 +30,9 @@ use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, on_conflict::OnConflict,
+};
 use std::sync::Arc;
 
 test_with_backends!(test_inlined_data_crud);
@@ -42,6 +45,8 @@ test_with_backends!(test_roundtrip_many_small_batches);
 test_with_backends!(test_roundtrip_mixed_inline_and_vortex);
 test_with_backends!(test_roundtrip_across_reopen);
 test_with_backends!(test_roundtrip_exceeds_byte_threshold);
+test_with_backends!(test_pk_upsert_inline_mutation);
+test_with_backends!(test_pk_delete_inline_mutation);
 
 /// Test basic CRUD for inlined data via the catalog API.
 async fn test_inlined_data_crud(
@@ -255,6 +260,148 @@ async fn create_table(
     )
     .await?;
     Ok((table, ctx))
+}
+
+async fn create_pk_upsert_table(
+    fixture: &common::TestFixture,
+    name: &str,
+) -> Result<(Arc<CayenneTableProvider>, SessionContext, String), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            CreateTableOptions {
+                table_name: name.to_string(),
+                schema,
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let table_id = fixture.catalog.get_table(name).await?.table_id;
+
+    Ok((table, ctx, table_id))
+}
+
+async fn collect_delete_count(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let results = ctx.sql(sql).await?.collect().await?;
+    let batch = results.first().ok_or("delete returned no batches")?;
+    let count = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or("delete count should be UInt64")?
+        .value(0);
+    Ok(count)
+}
+
+async fn test_pk_upsert_inline_mutation(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_pk_upsert").await?;
+
+    ctx.sql("INSERT INTO inline_pk_upsert VALUES (1, 'Alice'), (2, 'Bob')")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+
+    ctx.sql("INSERT INTO inline_pk_upsert VALUES (1, 'Alicia')")
+        .await?
+        .collect()
+        .await?;
+
+    let got = collect_sorted(&ctx, "SELECT id, name FROM inline_pk_upsert ORDER BY id").await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 2);
+    assert_eq!(ids.values(), &[1_i64, 2]);
+    assert_eq!(names.value(0), "Alicia");
+    assert_eq!(names.value(1), "Bob");
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 3);
+    assert_eq!(
+        fixture.catalog.get_inlined_deletes(&table_id).await?.len(),
+        1
+    );
+    assert!(
+        fixture
+            .catalog
+            .get_table_delete_files(&table_id)
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+async fn test_pk_delete_inline_mutation(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_pk_delete").await?;
+
+    ctx.sql("INSERT INTO inline_pk_delete VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Cara')")
+        .await?
+        .collect()
+        .await?;
+
+    let deleted = collect_delete_count(&ctx, "DELETE FROM inline_pk_delete WHERE id = 2").await?;
+    assert_eq!(deleted, 1);
+
+    let got = collect_sorted(&ctx, "SELECT id, name FROM inline_pk_delete ORDER BY id").await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 2);
+    assert_eq!(ids.values(), &[1_i64, 3]);
+    assert_eq!(names.value(0), "Alice");
+    assert_eq!(names.value(1), "Cara");
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 3);
+    assert_eq!(
+        fixture.catalog.get_inlined_deletes(&table_id).await?.len(),
+        1
+    );
+    assert!(
+        fixture
+            .catalog
+            .get_table_delete_files(&table_id)
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
 }
 
 /// Collect all rows from `SELECT * FROM t ORDER BY <key>` into a single batch.
