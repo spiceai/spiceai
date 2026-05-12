@@ -33,6 +33,9 @@ Examples:
 
   show tables;  -- list available tables
 
+  $ spice sql --expanded
+  -- start the REPL in expanded view (column-per-line); toggle at runtime with `.expanded`.
+
 See more at: https://spiceai.org/docs/"#
 )]
 pub struct SqlArgs {
@@ -69,6 +72,11 @@ pub struct SqlArgs {
     /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
     #[arg(long = "headers", value_name = "KEY:VALUE")]
     custom_headers: Vec<String>,
+
+    /// Start the REPL in expanded view, rendering each column on its own line
+    /// per record. Useful for wide tables; can be toggled at runtime with `.expanded`.
+    #[arg(long, short = 'x')]
+    expanded: bool,
 }
 
 /// Execute the sql command.
@@ -126,5 +134,6 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         user_agent: Some(ctx.user_agent().to_string()),
         cache_control,
         custom_headers: args.custom_headers.clone(),
+        expanded: args.expanded,
     }
 }

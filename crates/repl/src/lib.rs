@@ -37,7 +37,7 @@ use arrow_flight::{
 };
 
 use crate::completer::SchemaCache;
-use crate::pretty::format_batches_with_types;
+use crate::pretty::{format_batches_expanded, format_batches_with_types};
 use ansi_colors::Color;
 use arrow::array::RecordBatch;
 use clap::Parser;
@@ -136,6 +136,11 @@ pub struct ReplConfig {
     /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
     #[arg(long = "headers", value_name = "KEY:VALUE", help_heading = "SQL REPL")]
     pub custom_headers: Vec<String>,
+
+    /// Start the REPL in expanded view mode, rendering each column on its own
+    /// line per record (useful for wide tables). Toggle at runtime with `.expanded`.
+    #[arg(long, short = 'x', help_heading = "SQL REPL")]
+    pub expanded: bool,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -169,7 +174,7 @@ async fn send_nsql_request(
         .await
 }
 
-const SPECIAL_COMMANDS: [&str; 9] = [
+const SPECIAL_COMMANDS: [&str; 12] = [
     ".exit",
     "exit",
     "quit",
@@ -179,6 +184,9 @@ const SPECIAL_COMMANDS: [&str; 9] = [
     "?",
     ".clear",
     ".clear history",
+    ".expanded",
+    ".expanded on",
+    ".expanded off",
 ];
 const PROMPT_COLOR: Color = Color::Fixed(8);
 
@@ -436,6 +444,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     println!();
 
     let mut last_error: Option<Status> = None;
+    let mut expanded = repl_config.expanded;
 
     'outer: loop {
         let mut first_line = true;
@@ -523,6 +532,27 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let _ = std::io::stdout().flush();
                 continue;
             }
+            ".expanded" => {
+                expanded = !expanded;
+                println!(
+                    "Expanded display is {}.",
+                    if expanded { "on" } else { "off" }
+                );
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".expanded on" => {
+                expanded = true;
+                println!("Expanded display is on.");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".expanded off" => {
+                expanded = false;
+                println!("Expanded display is off.");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
             "help" | "?" => {
                 println!("Meta-commands:\n");
                 println!(
@@ -540,6 +570,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 println!(
                     "  {} Clear persisted query history",
                     PROMPT_COLOR.paint(".clear history        ")
+                );
+                println!(
+                    "  {} Toggle expanded (column-per-line) display; pass `on`/`off` to set",
+                    PROMPT_COLOR.paint(".expanded [on|off]    ")
                 );
                 println!(
                     "  {} Show this help message",
@@ -633,7 +667,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 .await
                 {
                     Ok((records, total_rows, from_cache)) => {
-                        display_records(&records, start_time, total_rows, from_cache)?;
+                        display_records(&records, start_time, total_rows, from_cache, expanded)?;
                     }
                     Err(FlightError::Tonic(status)) => {
                         display_grpc_error(&status);
@@ -657,6 +691,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                         .unwrap_or(line)
                         .to_string(),
                     &user_agent,
+                    expanded,
                 )
                 .await
                 {
@@ -683,7 +718,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .await
         {
             Ok((records, total_rows, from_cache)) => {
-                display_records(&records, start_time, total_rows, from_cache)?;
+                display_records(&records, start_time, total_rows, from_cache, expanded)?;
             }
             Err(FlightError::Tonic(status)) => {
                 display_grpc_error(&status);
@@ -810,6 +845,9 @@ fn add_api_key<T>(
 
 /// Display a set of record batches to the user. This function will display the first 500 rows.
 ///
+/// When `expanded` is true, each row is rendered as a vertical block of
+/// `column | value` lines instead of a table, similar to PostgreSQL's `\x`.
+///
 /// # Errors
 ///
 /// Returns an error if the record batches cannot be formatted.
@@ -818,6 +856,7 @@ fn display_records(
     start_time: Instant,
     total_rows: usize,
     from_cache: bool,
+    expanded: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut limited_records = Vec::new();
     let mut rows_collected = 0;
@@ -836,7 +875,12 @@ fn display_records(
         }
     }
 
-    let pretty_batches = match format_batches_with_types(&limited_records) {
+    let format_result = if expanded {
+        format_batches_expanded(&limited_records)
+    } else {
+        format_batches_with_types(&limited_records)
+    };
+    let pretty_batches = match format_result {
         Ok(pretty) => pretty,
         Err(e) => {
             println!(
@@ -883,6 +927,7 @@ async fn get_and_display_nql_records(
     endpoint: String,
     query: String,
     user_agent: &str,
+    expanded: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
@@ -921,7 +966,7 @@ async fn get_and_display_nql_records(
         .reduce(|x, y| x + y)
         .unwrap_or(0) as usize;
 
-    display_records(&records, start_time, total_rows, false)?;
+    display_records(&records, start_time, total_rows, false, expanded)?;
 
     Ok(())
 }
@@ -1101,10 +1146,23 @@ mod tests {
         let start_time = Instant::now();
         let from_cache = false;
 
-        let result = display_records(records, start_time, total_rows, from_cache)
+        let result = display_records(records, start_time, total_rows, from_cache, false)
             .expect("Failed to display records");
 
         insta::assert_snapshot!(test_name, result);
+    }
+
+    #[test]
+    fn test_display_records_expanded() {
+        let records = vec![create_test_batch(3, 1)];
+        let total_rows = 3;
+        let start_time = Instant::now();
+        let from_cache = false;
+
+        let result = display_records(&records, start_time, total_rows, from_cache, true)
+            .expect("Failed to display records in expanded view");
+
+        insta::assert_snapshot!("display_records_expanded", result);
     }
 
     #[test]
