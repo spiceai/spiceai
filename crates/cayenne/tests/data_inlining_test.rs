@@ -35,6 +35,8 @@ use datafusion_table_providers::util::{
 };
 use std::sync::Arc;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 test_with_backends!(test_inlined_data_crud);
 test_with_backends!(test_small_insert_inlined);
 test_with_backends!(test_inlined_data_visible_in_scan);
@@ -50,13 +52,12 @@ test_with_backends!(test_pk_upsert_inline_mutation);
 test_with_backends!(test_pk_delete_inline_mutation);
 test_with_backends!(test_pk_auto_checkpoint_preserves_rows);
 test_with_backends!(test_inline_memtable_segment_pressure_checkpoints);
-test_with_backends!(test_inline_memtable_pressure_clears_fully_deleted_entries);
+test_with_backends!(test_inline_memtable_pressure_flushes_after_legacy_deletes);
 test_with_backends!(test_inline_writer_fallback_preserves_buffered_and_remaining_batches);
 
 #[tokio::test]
 #[ignore = "performance regression coverage; run explicitly with --ignored"]
-async fn performance_many_small_inline_appends_preserve_results_sqlite()
--> Result<(), Box<dyn std::error::Error>> {
+async fn perf_many_small_inline_appends_sqlite() -> TestResult {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
     let (table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_writer_perf").await?;
     let schema = table.schema();
@@ -634,12 +635,13 @@ async fn test_inline_memtable_segment_pressure_checkpoints(
     Ok(())
 }
 
-async fn test_inline_memtable_pressure_clears_fully_deleted_entries(
+async fn test_inline_memtable_pressure_flushes_after_legacy_deletes(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (table, ctx, table_id) =
-        create_pk_upsert_table(&fixture, "inline_memtable_fully_deleted").await?;
+        create_pk_upsert_table(&fixture, "inline_memtable_legacy_deletes").await?;
     let schema = table.schema();
+    let data_sequence = fixture.catalog.increment_sequence_number(&table_id).await?;
 
     for row_id in 0..65_i64 {
         let batch = RecordBatch::try_new(
@@ -664,11 +666,13 @@ async fn test_inline_memtable_pressure_clears_fully_deleted_entries(
                 partition_key: None,
                 data_ipc: ipc_buf,
                 record_count: 1,
-                sequence_number: 1,
+                sequence_number: data_sequence,
                 created_at: String::new(),
             })
             .await?;
     }
+
+    let delete_sequence = fixture.catalog.increment_sequence_number(&table_id).await?;
 
     let delete_schema = Arc::new(Schema::new(vec![Field::new(
         "row_key",
@@ -699,7 +703,7 @@ async fn test_inline_memtable_pressure_clears_fully_deleted_entries(
             table_id: table_id.clone(),
             delete_ipc,
             delete_count: 66,
-            sequence_number: 2,
+            sequence_number: delete_sequence,
             created_at: String::new(),
         })
         .await?;
@@ -726,7 +730,7 @@ async fn test_inline_memtable_pressure_clears_fully_deleted_entries(
     );
 
     let count_batches = ctx
-        .sql("SELECT COUNT(*) FROM inline_memtable_fully_deleted")
+        .sql("SELECT COUNT(*) FROM inline_memtable_legacy_deletes")
         .await?
         .collect()
         .await?;
@@ -736,25 +740,11 @@ async fn test_inline_memtable_pressure_clears_fully_deleted_entries(
         .downcast_ref::<Int64Array>()
         .expect("COUNT(*) should be Int64")
         .value(0);
-    assert_eq!(count, 0);
-
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![65_i64])),
-            Arc::new(StringArray::from(vec!["name_65_visible"])),
-        ],
-    )?;
-    common::insert_batch(&table, batch).await?;
-
-    let stats = fixture.catalog.get_inlined_data_stats(&table_id).await?;
-    assert_eq!(stats.record_count, 1);
-    assert_eq!(stats.entry_count, 1);
-    assert!(stats.ipc_bytes > 0);
+    assert_eq!(count, 1);
 
     let got = collect_sorted(
         &ctx,
-        "SELECT id, name FROM inline_memtable_fully_deleted ORDER BY id",
+        "SELECT id, name FROM inline_memtable_legacy_deletes ORDER BY id",
     )
     .await?;
     let ids = got
@@ -770,7 +760,43 @@ async fn test_inline_memtable_pressure_clears_fully_deleted_entries(
 
     assert_eq!(got.num_rows(), 1);
     assert_eq!(ids.value(0), 65);
-    assert_eq!(names.value(0), "name_65_visible");
+    assert_eq!(names.value(0), "name_65");
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![66_i64])),
+            Arc::new(StringArray::from(vec!["name_66_visible"])),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+
+    let stats = fixture.catalog.get_inlined_data_stats(&table_id).await?;
+    assert_eq!(stats.record_count, 1);
+    assert_eq!(stats.entry_count, 1);
+    assert!(stats.ipc_bytes > 0);
+
+    let got = collect_sorted(
+        &ctx,
+        "SELECT id, name FROM inline_memtable_legacy_deletes ORDER BY id",
+    )
+    .await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 2);
+    assert_eq!(ids.value(0), 65);
+    assert_eq!(ids.value(1), 66);
+    assert_eq!(names.value(0), "name_65");
+    assert_eq!(names.value(1), "name_66_visible");
 
     Ok(())
 }
