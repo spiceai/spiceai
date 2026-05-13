@@ -355,6 +355,38 @@ pub struct InlinedData {
     pub created_at: String,
 }
 
+/// Aggregate size information for inline data entries in the metastore.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InlinedDataStats {
+    /// Total number of visible rows represented by inline entries.
+    pub record_count: i64,
+    /// Number of inline entries for the table.
+    pub entry_count: i64,
+    /// Total serialized Arrow IPC bytes stored inline.
+    pub ipc_bytes: i64,
+}
+
+impl InlinedData {
+    /// Build an inline data row whose identity, sequence number, and timestamp
+    /// are assigned by `MetadataCatalog::commit_inlined_mutation`.
+    pub(crate) fn pending_catalog_insert(
+        table_id: String,
+        partition_key: Option<String>,
+        data_ipc: Vec<u8>,
+        record_count: i64,
+    ) -> Self {
+        Self {
+            inlined_id: String::new(),
+            table_id,
+            partition_key,
+            data_ipc,
+            record_count,
+            sequence_number: 0,
+            created_at: String::new(),
+        }
+    }
+}
+
 /// A small batch of delete identifiers inlined in the metastore.
 ///
 /// Mirrors `InlinedData` but for deletions. Stores deletion identifiers
