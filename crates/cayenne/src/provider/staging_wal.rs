@@ -152,8 +152,8 @@ impl CayenneStagedAppend {
     /// # Errors
     ///
     /// Returns an error if refreshing the listing table fails.
-    pub fn refresh_listing_table(&self) -> Result<()> {
-        self.table.refresh_listing_table()
+    pub async fn refresh_listing_table(&self) -> Result<()> {
+        self.table.refresh_listing_table().await
     }
 
     /// Executes the full WAL finalize sequence in order.
@@ -166,7 +166,7 @@ impl CayenneStagedAppend {
         self.write_wal().await?;
         self.move_staged_files().await?;
         self.remove_wal().await?;
-        self.refresh_listing_table()?;
+        self.refresh_listing_table().await?;
         Ok(())
     }
 
@@ -282,7 +282,7 @@ impl PreparedStagedAppend {
     pub async fn apply_under_barrier(&self) -> Result<()> {
         self.table.move_files_to_current_snapshot().await?;
         self.table.remove_staging_wal().await?;
-        self.table.refresh_listing_table()?;
+        self.table.refresh_listing_table().await?;
         Ok(())
     }
 

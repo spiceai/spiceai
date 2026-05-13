@@ -401,7 +401,7 @@ impl CayenneDataSink {
             let retention_deleted_rows = self.apply_retention_if_configured().await?;
             let sorted = self.sort_if_configured().await?;
             if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted) {
-                self.table.refresh_listing_table()?;
+                self.table.refresh_listing_table().await?;
             }
             self.table.persist_table_stats(&stats_acc).await;
 
@@ -487,7 +487,7 @@ impl CayenneDataSink {
         // Listing table refresh is already part of the staged WAL finalize flow.
         // For snapshot-creation paths, we still need this explicit refresh.
         if needs_new_snapshot {
-            self.table.refresh_listing_table()?;
+            self.table.refresh_listing_table().await?;
         }
 
         let retention_deleted_rows = self.apply_retention_if_configured().await?;
@@ -502,7 +502,7 @@ impl CayenneDataSink {
         // new-snapshot writes refresh it immediately above. Refresh again only
         // when a post-write operation can change file visibility/statistics.
         if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted) {
-            self.table.refresh_listing_table()?;
+            self.table.refresh_listing_table().await?;
         }
 
         // Persist table-level column statistics to the metastore (best-effort).
@@ -600,7 +600,8 @@ impl CayenneDataSink {
         // Update the provider's listing table to point to the new snapshot
         // This ensures subsequent queries in the same context will read from the new data
         self.table
-            .update_listing_table_for_snapshot(&new_snapshot_id)?;
+            .update_listing_table_for_snapshot(&new_snapshot_id)
+            .await?;
 
         // Trigger cleanup of old snapshot directories after successful full refresh
         self.table

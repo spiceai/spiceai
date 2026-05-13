@@ -33,7 +33,6 @@ limitations under the License.
 
 use crate::catalog::MetadataCatalog;
 use crate::provider::Error;
-use crate::provider::constants::LISTING_TABLE_LOCK_POISONED;
 use crate::provider::retention::extract_retention_column_and_threshold;
 use crate::provider::table::CayenneTableProvider;
 use async_trait::async_trait;
@@ -47,6 +46,7 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use object_store::{ObjectMeta, ObjectStore};
 use std::collections::HashMap;
+use arc_swap::ArcSwap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex as TokioMutex;
 
@@ -89,7 +89,7 @@ struct DeletionCheckScanResult {
 /// 6. Return the total number of deleted rows and cleanup metadata.
 pub struct FileBasedDeletionSink {
     /// Main listing table to enumerate files and collect per-file statistics.
-    listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    listing_table: Arc<ArcSwap<ListingTable>>,
     /// Protected snapshot listing tables keyed by snapshot ID (PK-based strategies only).
     /// `None` for position-based tables.
     protected_snapshot_tables: Option<Vec<(String, Arc<ListingTable>)>>,
@@ -128,7 +128,7 @@ impl FileBasedDeletionSink {
     /// * `runtime_env` - Shared runtime environment for cache invalidation.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
-        listing_table: Arc<RwLock<Arc<ListingTable>>>,
+        listing_table: Arc<ArcSwap<ListingTable>>,
         protected_snapshot_tables: Option<Vec<(String, Arc<ListingTable>)>>,
         filter: Expr,
         table_name: String,
@@ -302,16 +302,10 @@ impl FileBasedDeletionSink {
             "File-based retention: discovering eligible files"
         );
 
-        // Clone main listing table once to avoid holding locks across await points
-        let listing_table = {
-            self.listing_table
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_name.clone(),
-                    lock: LISTING_TABLE_LOCK_POISONED,
-                })?
-                .clone()
-        };
+        // Wait-free ArcSwap snapshot. Concurrent refreshes are serialized by
+        // the table-level write lock, which is held for the duration of the
+        // calling write operation.
+        let listing_table = self.listing_table.load_full();
 
         // Use the shared RuntimeEnv which has S3 object stores pre-registered.
         // Vortex footer/segment caches live inside the VortexFormat embedded in the
