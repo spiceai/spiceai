@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use arrow::array::{Array, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
 use chbench_driver::ChBenchDriver;
 use futures::TryStreamExt;
 use test_framework::anyhow;
@@ -161,10 +160,9 @@ async fn query_max_bench_ts_spice(
     table: &str,
 ) -> anyhow::Result<Option<i64>> {
     let query = format!("SELECT MAX(_bench_ts) AS max_ts FROM {table}");
-    let stream = client.sql(&query).await?;
-    let batches = stream.try_collect::<Vec<RecordBatch>>().await?;
+    let mut stream = client.sql(&query).await?;
 
-    for batch in &batches {
+    while let Some(batch) = stream.try_next().await? {
         if batch.num_rows() == 0 {
             continue;
         }
