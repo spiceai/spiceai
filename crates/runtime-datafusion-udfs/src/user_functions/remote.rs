@@ -38,8 +38,8 @@ limitations under the License.
 //!   * `max_rows` — maximum table-function response rows without a query `LIMIT`, default `100000`.
 //!   * `auth_bearer` — optional `Authorization: Bearer <value>` header value (already secret-resolved by the caller).
 //!   * `allowed_endpoint_ranges` — optional list of CIDR ranges that may be
-//!     targeted even when they are loopback / RFC1918 / link-local / metadata
-//!     IPs. Default `[]`; set to `["*"]` only for trusted deployments to allow
+//!     targeted even when they are non-public / metadata IPs. Default `[]`; set
+//!     to `["*"]` only for trusted deployments to allow
 //!     every endpoint range. Literal hosts are checked at build time and DNS
 //!     results are checked by the HTTP client before connecting to prevent SSRF.
 //!
@@ -156,8 +156,8 @@ pub enum RemoteBuildError {
     UnsupportedScheme { scheme: String },
 
     #[snafu(display(
-        "endpoint host '{host}' resolves to a loopback / private / link-local / metadata \
-            address and is rejected to prevent SSRF; add a specific CIDR to \
+        "endpoint host '{host}' resolves to a non-public address and is rejected \
+            to prevent SSRF; add a specific CIDR to \
             `allowed_endpoint_ranges` in `params`, or set it to [\"*\"] only for trusted endpoints"
     ))]
     PrivateEndpoint { host: String },
@@ -1166,41 +1166,55 @@ fn ip_addr_is_disallowed(ip: IpAddr) -> Option<&'static str> {
 }
 
 fn ipv4_addr_is_disallowed(ip: Ipv4Addr) -> Option<&'static str> {
-    if ip.is_loopback() {
-        Some("IPv4 loopback")
-    } else if ip.is_private() {
-        Some("IPv4 RFC1918 private range")
-    } else if ip.is_link_local() {
-        // 169.254.0.0/16 — covers AWS / GCP / Azure IMDS.
-        Some("IPv4 link-local (covers cloud metadata services)")
-    } else if ip.is_multicast() {
-        Some("IPv4 multicast")
-    } else if ip.is_broadcast() {
-        Some("IPv4 broadcast")
-    } else if ip.is_unspecified() {
-        Some("IPv4 unspecified (0.0.0.0)")
-    } else if ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 0x40 {
-        // 100.64.0.0/10 — carrier-grade NAT / shared address space.
-        Some("IPv4 carrier-grade NAT shared space")
-    } else {
+    if ipv4_addr_is_global_endpoint(ip) {
         None
+    } else {
+        Some("IPv4 non-public address")
     }
 }
 
 fn ipv6_addr_is_disallowed(ip: Ipv6Addr) -> Option<&'static str> {
-    if ip.is_loopback() {
-        Some("IPv6 loopback")
-    } else if ip.is_unspecified() {
-        Some("IPv6 unspecified (::)")
-    } else if ip.is_multicast() {
-        Some("IPv6 multicast")
-    } else if (ip.segments()[0] & 0xffc0) == 0xfe80 {
-        Some("IPv6 link-local")
-    } else if (ip.segments()[0] & 0xfe00) == 0xfc00 {
-        Some("IPv6 unique-local (ULA)")
-    } else {
+    if ipv6_addr_is_global_endpoint(ip) {
         None
+    } else {
+        Some("IPv6 non-public address")
     }
+}
+
+fn ipv4_addr_is_global_endpoint(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !(octets[0] == 0
+        || ip.is_private()
+        || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000)
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || (matches!(octets, [192, 0, 0, d] if d != 9 && d != 10))
+        || ip.is_documentation()
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+        || ip.is_multicast()
+        || octets[0] >= 240)
+}
+
+fn ipv6_addr_is_global_endpoint(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let bits = u128::from(ip);
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || matches!(segments, [0, 0, 0, 0, 0, 0xffff, _, _])
+        || matches!(segments, [0x64, 0xff9b, 1, _, _, _, _, _])
+        || matches!(segments, [0x100, 0, 0, 0, _, _, _, _])
+        || (matches!(segments, [0x2001, b, _, _, _, _, _, _] if b < 0x200)
+            && !(bits == 0x2001_0001_0000_0000_0000_0000_0000_0001
+                || bits == 0x2001_0001_0000_0000_0000_0000_0000_0002
+                || matches!(segments, [0x2001, 3, _, _, _, _, _, _])
+                || matches!(segments, [0x2001, 4, 0x112, _, _, _, _, _])
+                || matches!(segments, [0x2001, b, _, _, _, _, _, _] if (0x20..=0x3f).contains(&b))))
+        || matches!(segments, [0x2002, _, _, _, _, _, _, _])
+        || matches!(segments, [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..])
+        || matches!(segments, [0x5f00, ..])
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80)
 }
 
 fn parse_endpoint_policy(v: Option<&Value>) -> Result<EndpointAccessPolicy> {
@@ -2111,6 +2125,9 @@ mod tests {
             "http://192.168.1.1/udf",
             "http://172.16.0.1/udf",
             "http://0.0.0.0/udf",
+            "http://0.0.0.1/udf",
+            "http://192.0.2.1/udf",
+            "http://198.18.0.1/udf",
             "http://localhost/udf",
             "http://localhost./udf",
             "http://service.localhost./udf",
@@ -2119,8 +2136,11 @@ mod tests {
             "http://[::1]/udf",
             "http://[fe80::1]/udf",
             "http://[fc00::1]/udf",
+            "http://[2001:db8::1]/udf",
             "http://[::ffff:127.0.0.1]/udf",
             "http://[::ffff:0.0.0.0]/udf",
+            "http://[::ffff:0.0.0.1]/udf",
+            "http://[::ffff:198.18.0.1]/udf",
             "http://[::ffff:100.64.0.1]/udf",
             "http://[::ffff:224.0.0.1]/udf",
             "http://[::ffff:255.255.255.255]/udf",
@@ -2138,6 +2158,16 @@ mod tests {
                 "expected PrivateEndpoint for {from}, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn endpoint_parse_allows_configured_non_public_range() {
+        let mut d = sample_decl("http://198.18.0.1:9000/udf");
+        d.params.insert(
+            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("198.18.0.1/32".into())]),
+        );
+        build_scalar_udf(&d).expect("non-public endpoint allowed by explicit CIDR");
     }
 
     #[test]
