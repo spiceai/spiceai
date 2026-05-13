@@ -82,27 +82,30 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
         // eagerly evaluate the expression and store the resulting array
         // this avoids storing the entire record batch in memory, only storing the evaluated column
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
-        self.range_bounds.update(array.as_ref())?;
 
         if self.exact_values_exceeded_memory_limit {
+            self.range_bounds.update(array.as_ref())?;
             return Ok(());
         }
 
-        self.total_memory_size = self
+        let total_memory_size = self
             .total_memory_size
             .saturating_add(array.get_array_memory_size());
 
-        if self.total_memory_size > self.max_inlist_memory_size {
+        if total_memory_size > self.max_inlist_memory_size {
             tracing::debug!(
                 "ExactLeftAccumulator exceeded maximum in-list memory size ({} bytes > {} bytes); using range fallback.",
-                self.total_memory_size,
+                total_memory_size,
                 self.max_inlist_memory_size
             );
+            self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
             self.arrays.clear();
+            self.total_memory_size = total_memory_size;
             self.exact_values_exceeded_memory_limit = true;
             return Ok(());
         }
 
+        self.total_memory_size = total_memory_size;
         self.arrays.push(array);
         Ok(())
     }
@@ -133,6 +136,18 @@ impl ExactLeftAccumulator {
             range_bounds: RangeBounds::default(),
             exact_values_exceeded_memory_limit: false,
         }
+    }
+
+    fn range_bounds_from_collected_arrays(
+        &self,
+        array: &dyn Array,
+    ) -> DataFusionResult<RangeBounds> {
+        let mut range_bounds = RangeBounds::default();
+        for collected_array in &self.arrays {
+            range_bounds.update(collected_array.as_ref())?;
+        }
+        range_bounds.update(array)?;
+        Ok(range_bounds)
     }
 }
 
@@ -549,6 +564,44 @@ mod tests {
         let probe_array: ArrayRef = Arc::new(UInt64Array::from(vec![0, 1, 3, 5, 6]));
         let probe_batch = RecordBatch::try_new(Arc::new(probe_schema), vec![probe_array])
             .expect("Should create probe record batch");
+        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
+
+        assert_eq!(
+            vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
+            actual_values
+        );
+    }
+
+    #[test]
+    fn test_exact_left_accumulator_defers_range_bounds_until_memory_limit_exceeded() {
+        let first_batch = create_uint64_batch(vec![10, 20]);
+        let second_batch = create_uint64_batch(vec![1, 30]);
+        let max_memory_size = first_batch.column(0).get_array_memory_size();
+
+        let left_expr = col("a", &first_batch.schema()).expect("Should create column expr");
+        let mut accumulator =
+            ExactLeftAccumulator::new_with_memory_limit(Arc::clone(&left_expr), max_memory_size);
+
+        accumulator
+            .update_batch(&first_batch)
+            .expect("Should update first batch");
+        assert_eq!(1, accumulator.arrays.len());
+        assert!(accumulator.range_bounds.min_value.is_none());
+        assert!(accumulator.range_bounds.max_value.is_none());
+        assert!(!accumulator.exact_values_exceeded_memory_limit);
+
+        accumulator
+            .update_batch(&second_batch)
+            .expect("Should update second batch");
+        assert!(accumulator.arrays.is_empty());
+        assert!(accumulator.exact_values_exceeded_memory_limit);
+
+        let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
+        let physical_expr = column_bounds
+            .physical_expr(left_expr)
+            .expect("Should create physical expr");
+
+        let probe_batch = create_uint64_batch(vec![0, 1, 15, 30, 31]);
         let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
 
         assert_eq!(
