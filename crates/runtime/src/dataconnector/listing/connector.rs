@@ -25,7 +25,7 @@ use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use dataformat_json::{Format, SpiceJsonFormat};
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, DFSchema, Result as DFResult, ScalarValue};
+use datafusion::common::{Constraints, DFSchema, GetExt, Result as DFResult, ScalarValue};
 use datafusion::config::{ConfigField, TableParquetOptions};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::file_format::{
@@ -62,7 +62,10 @@ use crate::dataconnector::{
 use crate::parameters::{ExposedParamLookup, Parameters};
 use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
-use super::DelimitedFormat;
+use super::{
+    DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
+    detect_file_extension_from_url_or_path, parse_file_extension_param,
+};
 use crate::dataconnector::DataConnectorError::SchemaMismatch;
 use crate::datafusion::builder::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
@@ -520,32 +523,71 @@ pub trait ListingTableConnector: DataConnector {
         Self: Display,
     {
         let params = self.get_params();
-        let extension = params
+        let configured_extension = params
             .get("file_extension")
             .expose()
             .ok()
-            .map(str::to_string);
-        let file_extension = std::path::Path::new(dataset.path())
-            .extension()
-            .map(|ext| ext.to_ascii_lowercase().to_string_lossy().to_string());
-        let file_format_param = params.get("file_format").expose().ok();
+            .and_then(parse_file_extension_param);
+        let path_extension = detect_file_extension_from_url_or_path(&dataset.from);
+        let detected_extension = configured_extension.as_ref().or(path_extension.as_ref());
+        let inferred_file_extension =
+            detected_extension.and_then(|ext| ext.format_extension.as_deref());
+        let file_format_param = params
+            .get("file_format")
+            .expose()
+            .ok()
+            .map(str::to_ascii_lowercase);
+        let file_compression_type = resolve_file_compression_type(
+            &format!("{self}"),
+            dataset,
+            params,
+            detected_extension.and_then(|ext| ext.compression),
+        )?;
 
-        match (file_format_param, file_extension.as_deref()) {
+        match (file_format_param.as_deref(), inferred_file_extension) {
             (Some("csv"), _) | (None, Some("csv")) => Ok((
-                Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Csv)?),
-                extension.unwrap_or(".csv".to_string()),
+                Some(self.delimiter_separated_format(
+                    params,
+                    DelimitedFormat::Csv,
+                    file_compression_type,
+                )?),
+                listing_extension(
+                    configured_extension.as_ref(),
+                    path_extension.as_ref(),
+                    ".csv",
+                    file_compression_type,
+                ),
             )),
             (Some("tsv"), _) | (None, Some("tsv")) => Ok((
-                Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
-                extension.unwrap_or(".tsv".to_string()),
+                Some(self.delimiter_separated_format(
+                    params,
+                    DelimitedFormat::Tsv,
+                    file_compression_type,
+                )?),
+                listing_extension(
+                    configured_extension.as_ref(),
+                    path_extension.as_ref(),
+                    ".tsv",
+                    file_compression_type,
+                ),
             )),
             (Some("json"), _) => Ok((
-                Some(self.get_json_format(dataset, params, Format::Json)?),
-                extension.unwrap_or(".json".to_string()),
+                Some(self.get_json_format(dataset, params, Format::Json, file_compression_type)?),
+                listing_extension(
+                    configured_extension.as_ref(),
+                    path_extension.as_ref(),
+                    ".json",
+                    file_compression_type,
+                ),
             )),
             (None, Some("json")) => Ok((
-                Some(self.get_json_format(dataset, params, Format::Auto)?),
-                extension.unwrap_or(".json".to_string()),
+                Some(self.get_json_format(dataset, params, Format::Auto, file_compression_type)?),
+                listing_extension(
+                    configured_extension.as_ref(),
+                    path_extension.as_ref(),
+                    ".json",
+                    file_compression_type,
+                ),
             )),
             (Some("jsonl" | "ndjson" | "ldjson"), _) | (None, Some("jsonl" | "ndjson" | "ldjson")) => {
                 // If json_pointer or json_path is set, route through SpiceJsonFormat
@@ -558,47 +600,86 @@ pub trait ListingTableConnector: DataConnector {
                     params.get("json_path").expose(),
                     ExposedParamLookup::Present(v) if !v.is_empty()
                 );
-                let default_ext = file_extension.as_deref().map_or(".jsonl", |e| match e {
-                    "ndjson" => ".ndjson",
-                    "ldjson" => ".ldjson",
-                    _ => ".jsonl",
-                });
+                let default_ext = default_jsonl_extension(file_format_param.as_deref(), inferred_file_extension);
                 if has_pointer {
                     Ok((
-                        Some(self.get_json_format(dataset, params, Format::Auto)?),
-                        extension.unwrap_or_else(|| default_ext.to_string()),
+                        Some(self.get_json_format(dataset, params, Format::Auto, file_compression_type)?),
+                        listing_extension(
+                            configured_extension.as_ref(),
+                            path_extension.as_ref(),
+                            default_ext,
+                            file_compression_type,
+                        ),
                     ))
                 } else {
                     Ok((
-                        Some(self.get_jsonl_format(dataset, params)?),
-                        extension.unwrap_or_else(|| default_ext.to_string()),
+                        Some(self.get_jsonl_format(dataset, params, file_compression_type)?),
+                        listing_extension(
+                            configured_extension.as_ref(),
+                            path_extension.as_ref(),
+                            default_ext,
+                            file_compression_type,
+                        ),
                     ))
                 }
             },
             (Some("soda" | "socrata"), _) => Ok((
-                Some(self.get_json_format(dataset, params, Format::Soda)?),
-                extension.unwrap_or(".json".to_string()),
+                Some(self.get_json_format(dataset, params, Format::Soda, file_compression_type)?),
+                listing_extension(
+                    configured_extension.as_ref(),
+                    path_extension.as_ref(),
+                    ".json",
+                    file_compression_type,
+                ),
             )),
             #[cfg(not(windows))]
             (Some("vortex"), _) | (None, Some("vortex")) => Ok((
                 Some(VortexFormatFactory::new().default()),
-                extension.unwrap_or(".vortex".to_string()),
+                listing_extension(
+                    configured_extension.as_ref(),
+                    path_extension.as_ref(),
+                    ".vortex",
+                    FileCompressionType::UNCOMPRESSED,
+                ),
             )),
             (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
                 Some(Arc::new(
                     ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
                 )),
-                extension.unwrap_or(".parquet".to_string()),
+                listing_extension(
+                    configured_extension.as_ref(),
+                    path_extension.as_ref(),
+                    ".parquet",
+                    FileCompressionType::UNCOMPRESSED,
+                ),
             )),
             (Some("auto"), ext) => {
                 match ext {
                     Some("csv") => Ok((
-                        Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Csv)?),
-                        extension.unwrap_or(".csv".to_string()),
+                        Some(self.delimiter_separated_format(
+                            params,
+                            DelimitedFormat::Csv,
+                            file_compression_type,
+                        )?),
+                        listing_extension(
+                            configured_extension.as_ref(),
+                            path_extension.as_ref(),
+                            ".csv",
+                            file_compression_type,
+                        ),
                     )),
                     Some("tsv") => Ok((
-                        Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
-                        extension.unwrap_or(".tsv".to_string()),
+                        Some(self.delimiter_separated_format(
+                            params,
+                            DelimitedFormat::Tsv,
+                            file_compression_type,
+                        )?),
+                        listing_extension(
+                            configured_extension.as_ref(),
+                            path_extension.as_ref(),
+                            ".tsv",
+                            file_compression_type,
+                        ),
                     )),
                     Some("jsonl" | "ndjson" | "ldjson") => {
                         let has_pointer = matches!(
@@ -608,20 +689,26 @@ pub trait ListingTableConnector: DataConnector {
                             params.get("json_path").expose(),
                             ExposedParamLookup::Present(v) if !v.is_empty()
                         );
-                        let default_ext = match ext {
-                            Some("ndjson") => ".ndjson",
-                            Some("ldjson") => ".ldjson",
-                            _ => ".jsonl",
-                        };
+                        let default_ext = default_jsonl_extension(file_format_param.as_deref(), ext);
                         if has_pointer {
                             Ok((
-                                Some(self.get_json_format(dataset, params, Format::Auto)?),
-                                extension.unwrap_or_else(|| default_ext.to_string()),
+                                Some(self.get_json_format(dataset, params, Format::Auto, file_compression_type)?),
+                                listing_extension(
+                                    configured_extension.as_ref(),
+                                    path_extension.as_ref(),
+                                    default_ext,
+                                    file_compression_type,
+                                ),
                             ))
                         } else {
                             Ok((
-                                Some(self.get_jsonl_format(dataset, params)?),
-                                extension.unwrap_or_else(|| default_ext.to_string()),
+                                Some(self.get_jsonl_format(dataset, params, file_compression_type)?),
+                                listing_extension(
+                                    configured_extension.as_ref(),
+                                    path_extension.as_ref(),
+                                    default_ext,
+                                    file_compression_type,
+                                ),
                             ))
                         }
                     },
@@ -629,12 +716,22 @@ pub trait ListingTableConnector: DataConnector {
                         Some(Arc::new(
                             ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
                         )),
-                        extension.unwrap_or(".parquet".to_string()),
+                        listing_extension(
+                            configured_extension.as_ref(),
+                            path_extension.as_ref(),
+                            ".parquet",
+                            FileCompressionType::UNCOMPRESSED,
+                        ),
                     )),
                     // For .json or unknown/no extension, use JSON with auto sub-format detection
                     _ => Ok((
-                        Some(self.get_json_format(dataset, params, Format::Auto)?),
-                        extension.unwrap_or_else(|| ext.map_or(".json".to_string(), |e| format!(".{e}"))),
+                        Some(self.get_json_format(dataset, params, Format::Auto, file_compression_type)?),
+                        listing_extension(
+                            configured_extension.as_ref(),
+                            path_extension.as_ref(),
+                            &ext.map_or(".json".to_string(), |e| format!(".{e}")),
+                            file_compression_type,
+                        ),
                     )),
                 }
             },
@@ -657,23 +754,12 @@ pub trait ListingTableConnector: DataConnector {
         &self,
         dataset: &Dataset,
         params: &Parameters,
+        file_compression_type: FileCompressionType,
     ) -> DataConnectorResult<Arc<JsonFormat>>
     where
         Self: Display,
     {
-        let mut format = JsonFormat::default();
-
-        if let ExposedParamLookup::Present(comp_as_str) =
-            params.get("file_compression_type").expose()
-        {
-            let compression = comp_as_str.parse::<FileCompressionType>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
-                    dataconnector: format!("{self}"),
-                    message: format!(
-                        "Invalid JSONL compression_type: {comp_as_str}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
-                    connector_component: ConnectorComponent::from(dataset)
-                })?;
-            format = format.with_file_compression_type(compression);
-        }
+        let mut format = JsonFormat::default().with_file_compression_type(file_compression_type);
 
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
@@ -698,23 +784,14 @@ pub trait ListingTableConnector: DataConnector {
         dataset: &Dataset,
         params: &Parameters,
         default_format: Format,
+        file_compression_type: FileCompressionType,
     ) -> DataConnectorResult<Arc<SpiceJsonFormat>>
     where
         Self: Display,
     {
-        let mut format = SpiceJsonFormat::default().with_format(default_format);
-
-        if let ExposedParamLookup::Present(comp_as_str) =
-            params.get("file_compression_type").expose()
-        {
-            let compression = comp_as_str.parse::<FileCompressionType>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
-                    dataconnector: format!("{self}"),
-                    message: format!(
-                        "Invalid JSON compression_type: {comp_as_str}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
-                    connector_component: ConnectorComponent::from(dataset)
-                })?;
-            format = format.with_file_compression_type(compression);
-        }
+        let mut format = SpiceJsonFormat::default()
+            .with_format(default_format)
+            .with_file_compression_type(file_compression_type);
 
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
@@ -775,9 +852,9 @@ pub trait ListingTableConnector: DataConnector {
     /// Uses the appropriate parameters based on the [`DelimitedFormat`] provided.
     fn delimiter_separated_format(
         &self,
-        dataset: &Dataset,
         params: &Parameters,
         delimiter: DelimitedFormat,
+        file_compression_type: FileCompressionType,
     ) -> DataConnectorResult<Arc<CsvFormat>>
     where
         Self: Display,
@@ -806,12 +883,6 @@ pub trait ListingTableConnector: DataConnector {
                 .expose()
                 .ok()) // For backwards compatibility
             .map_or_else(|| 1000, |f| usize::from_str(f).unwrap_or(1000));
-        let compression_type = params
-            .get("file_compression_type")
-            .expose()
-            .ok()
-            .unwrap_or_default();
-
         let delimiter = match delimiter {
             DelimitedFormat::Tsv => delimiter.separator(),
             DelimitedFormat::Csv => params
@@ -829,17 +900,7 @@ pub trait ListingTableConnector: DataConnector {
                 .with_escape(escape)
                 .with_schema_infer_max_rec(schema_infer_max_rec)
                 .with_delimiter(delimiter)
-                .with_file_compression_type(
-                    FileCompressionType::from_str(compression_type)
-                        .boxed()
-                        .context(crate::dataconnector::InvalidConfigurationSnafu {
-                            dataconnector: format!("{self}"),
-                            message: format!(
-                                "Invalid {} compression_type: {compression_type}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED", delimiter.to_string().to_uppercase()
-                            ),
-                            connector_component: ConnectorComponent::from(dataset),
-                        })?,
-                ),
+                .with_file_compression_type(file_compression_type),
         ))
     }
 
@@ -1313,6 +1374,57 @@ fn get_url_prefix(table_url: &Url) -> String {
     format!("{}/", &table_url[..url::Position::BeforePath])
 }
 
+fn resolve_file_compression_type(
+    dataconnector: &str,
+    dataset: &Dataset,
+    params: &Parameters,
+    detected_compression: Option<FileCompressionType>,
+) -> DataConnectorResult<FileCompressionType> {
+    if let ExposedParamLookup::Present(compression) = params.get("file_compression_type").expose() {
+        return compression.parse::<FileCompressionType>().boxed().context(
+            crate::dataconnector::InvalidConfigurationSnafu {
+                dataconnector: dataconnector.to_string(),
+                message: format!(
+                    "Invalid file_compression_type: {compression}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"
+                ),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        );
+    }
+
+    Ok(detected_compression.unwrap_or(FileCompressionType::UNCOMPRESSED))
+}
+
+fn listing_extension(
+    configured_extension: Option<&ParsedFileExtension>,
+    path_extension: Option<&ParsedFileExtension>,
+    default_extension: &str,
+    file_compression_type: FileCompressionType,
+) -> String {
+    if let Some(extension) = configured_extension {
+        return extension.file_extension.clone();
+    }
+
+    if let Some(extension) = path_extension
+        && extension.compression.is_some()
+    {
+        return extension.file_extension.clone();
+    }
+
+    format!("{}{}", default_extension, file_compression_type.get_ext())
+}
+
+fn default_jsonl_extension(
+    file_format_param: Option<&str>,
+    inferred_file_extension: Option<&str>,
+) -> &'static str {
+    match inferred_file_extension.or(file_format_param) {
+        Some("ndjson") => ".ndjson",
+        Some("ldjson") => ".ldjson",
+        _ => ".jsonl",
+    }
+}
+
 // 1024³
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 
@@ -1371,10 +1483,9 @@ async fn get_last_modified(
             );
         }
 
-        if let Some(ext) = file.location.extension() {
-            let file_ext = format!(".{ext}");
-            found_extensions.insert(file_ext.clone());
-            if file_ext == extension {
+        if let Some(file_ext) = detect_file_extension_from_path(file.location.as_ref()) {
+            found_extensions.insert(file_ext.file_extension.clone());
+            if file_matches_extension(&file.location, extension) {
                 if let Some(ref current) = last_modified_file {
                     if current.last_modified < file.last_modified {
                         last_modified_file = Some(file);
@@ -1451,9 +1562,7 @@ async fn verify_schema_source_path(
                 source: err.into(),
             })?
     {
-        if let Some(ext) = file.location.extension()
-            && format!(".{ext}") == extension
-        {
+        if file_matches_extension(&file.location, extension) {
             return Ok(Some(file));
         }
 
@@ -1475,6 +1584,10 @@ async fn verify_schema_source_path(
             "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}`. Verify that `schema_source_path` is correct and try again."
         ),
     })
+}
+
+fn file_matches_extension(location: &Path, extension: &str) -> bool {
+    location.as_ref().ends_with(extension)
 }
 
 fn to_listing_table_url(
@@ -1747,6 +1860,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_file_format_and_extension_detect_csv_gzip_extension() {
+        let (connector, dataset) =
+            setup_connector("test:test.csv.gz".to_string(), HashMap::new()).await;
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".csv.gz");
+            assert_eq!(
+                file_format.compression_type(),
+                Some(FileCompressionType::GZIP)
+            );
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_detect_jsonl_zstd_extension() {
+        let (connector, dataset) =
+            setup_connector("test:test.ndjson.zst".to_string(), HashMap::new()).await;
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".ndjson.zst");
+            assert_eq!(
+                file_format.compression_type(),
+                Some(FileCompressionType::ZSTD)
+            );
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_detect_file_extension_param_compression() {
+        let mut params = HashMap::new();
+        params.insert("file_extension".to_string(), ".jsonl.gz".to_string());
+        let (connector, dataset) = setup_connector("test:test/".to_string(), params).await;
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".jsonl.gz");
+            assert_eq!(
+                file_format.compression_type(),
+                Some(FileCompressionType::GZIP)
+            );
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_file_compression_type_sets_extension() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        params.insert("file_compression_type".to_string(), "GZIP".to_string());
+        let (connector, dataset) = setup_connector("test:test/".to_string(), params).await;
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".csv.gz");
+            assert_eq!(
+                file_format.compression_type(),
+                Some(FileCompressionType::GZIP)
+            );
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
     async fn test_get_file_format_and_extension_csv_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "csv".to_string());
@@ -1926,6 +2114,42 @@ mod tests {
         .expect("to get last modified");
 
         assert_eq!(last_modified.location.as_ref(), "file_new.parquet");
+    }
+
+    #[tokio::test]
+    async fn test_get_last_modified_returns_latest_compressed_extension() {
+        let url = Url::parse("s3://bucket/").expect("to parse url");
+        let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
+        let ctx = SessionContext::new();
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let dataset = DatasetBuilder::try_new("s3://bucket/".to_string(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        let meta_files = vec![
+            create_meta("file_old.csv.gz", 100, 100),
+            create_meta("file_new.csv.gz", 200, 200),
+            create_meta("file_plain.csv", 300, 300),
+        ];
+
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let last_modified = get_last_modified(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".csv.gz",
+            table_path,
+            &ctx,
+            &test_store,
+        )
+        .await
+        .expect("to get last modified");
+
+        assert_eq!(last_modified.location.as_ref(), "file_new.csv.gz");
     }
 
     #[derive(Debug)]
@@ -2369,6 +2593,40 @@ mod tests {
         .await;
 
         result.expect("should succeed with matching files");
+    }
+
+    #[tokio::test]
+    async fn test_verify_schema_source_path_compressed_extension_valid() {
+        let url = Url::parse("s3://bucket/schema/").expect("to parse url");
+        let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
+        let ctx = SessionContext::new();
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let dataset = DatasetBuilder::try_new("s3://bucket/schema/".to_string(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        let meta_files = vec![
+            create_meta("schema/file1.csv", 100, 100),
+            create_meta("schema/file2.csv.gz", 200, 200),
+        ];
+
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let result = verify_schema_source_path(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".csv.gz",
+            schema_source_path,
+            &ctx,
+            &test_store,
+        )
+        .await;
+
+        result.expect("should succeed with matching compressed files");
     }
 
     #[tokio::test]
