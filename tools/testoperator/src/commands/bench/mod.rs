@@ -19,6 +19,7 @@ use crate::{
     args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper,
     wait_test_and_memory,
 };
+use chbench_driver::ChBenchDriver as _;
 use std::{
     path::Path,
     time::{Duration, Instant},
@@ -74,8 +75,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let query_set = args.load_query_set()?;
     if query_set == test_framework::queries::QuerySet::ChBench {
         println!("Preparing chbench source database...");
-        let config = chbench_config_from_env()?;
-        let driver = chbench_driver::ChBenchDriver::connect(config).await?;
+        let (config, source) = chbench_config_from_env()?;
+        let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
         driver.prepare().await?;
         println!("chbench source database ready");
     }
@@ -244,7 +245,7 @@ fn snapshot_predicate(query_name: &str) -> bool {
         && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
 }
 
-/// Build a [`chbench_driver::config::ChBenchConfig`] from environment variables with sensible defaults.
+/// Build CH-benCH configs from environment variables with sensible defaults.
 ///
 /// | Variable | Default |
 /// |----------|---------|
@@ -253,25 +254,27 @@ fn snapshot_predicate(query_name: &str) -> bool {
 /// | `CHBENCH_PG_DB` | `chbench` |
 /// | `CHBENCH_PG_USER` | `bench` |
 /// | `CHBENCH_PG_PASS` | `bench` |
-pub(crate) fn chbench_config_from_env() -> anyhow::Result<chbench_driver::config::ChBenchConfig> {
-    let mut cfg = chbench_driver::config::ChBenchConfig::default();
+pub(crate) fn chbench_config_from_env(
+) -> anyhow::Result<(chbench_driver::ChBenchConfig, chbench_driver::PostgresSourceConfig)> {
+    let workload = chbench_driver::ChBenchConfig::default();
+    let mut source = chbench_driver::PostgresSourceConfig::default();
     if let Ok(v) = std::env::var("CHBENCH_PG_HOST") {
-        cfg.pg_host = v;
+        source.host = v;
     }
     if let Ok(v) = std::env::var("CHBENCH_PG_PORT") {
-        cfg.pg_port = v
+        source.port = v
             .parse()
             .map_err(|e| anyhow::anyhow!("CHBENCH_PG_PORT={v:?} is not a valid port number: {e}"))?;
     }
     if let Ok(v) = std::env::var("CHBENCH_PG_DB") {
-        cfg.pg_db = v;
+        source.db = v;
     }
     if let Ok(v) = std::env::var("CHBENCH_PG_USER") {
-        cfg.pg_user = v;
+        source.user = v;
     }
     if let Ok(v) = std::env::var("CHBENCH_PG_PASS") {
-        cfg.pg_pass = v;
+        source.pass = v;
     }
 
-    Ok(cfg)
+    Ok((workload, source))
 }

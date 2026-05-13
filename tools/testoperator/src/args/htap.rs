@@ -23,17 +23,12 @@ use super::DatasetTestArgs;
 /// Runs a TPC-C OLTP workload against the source
 /// concurrently with CH-benCH analytical queries against spiced,
 /// measuring analytical query freshness under write load.
+///
+/// CH-benCH convention: `--scale-factor` maps to warehouses (SF1 = 1 warehouse
+/// ≈ 100 MB seed data). The TPC-C terminal count is `warehouses * 10`, matching
+/// the spec's requirement of 10 terminals per warehouse.
 #[derive(Parser, Debug, Clone)]
 pub struct HtapArgs {
     #[command(flatten)]
     pub(crate) test_args: DatasetTestArgs,
-
-    /// Number of TPC-C warehouses (scale factor). Each warehouse ≈ 100 MB of seed data.
-    #[arg(long, default_value = "1")]
-    pub(crate) warehouses: usize,
-
-    /// Number of concurrent OLTP terminals writing to the source database.
-    /// TPC-C spec recommends 10 per warehouse for realistic contention.
-    #[arg(long, default_value = "10")]
-    pub(crate) terminals: usize,
 }

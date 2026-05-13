@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-/// Configuration for the CH-benCH driver.
+/// Source-agnostic workload configuration for CH-benCH.
 pub struct ChBenchConfig {
     /// Number of TPC-C warehouses (scale factor). Each warehouse ≈ 100 MB seed data.
     pub warehouses: usize,
@@ -22,21 +22,6 @@ pub struct ChBenchConfig {
     /// Optional RNG seed for deterministic data generation.
     /// When `Some(seed)`, the same seed produces the exact same dataset.
     pub seed: Option<u64>,
-
-    /// PostgreSQL host.
-    pub pg_host: String,
-
-    /// PostgreSQL port.
-    pub pg_port: u16,
-
-    /// PostgreSQL database name.
-    pub pg_db: String,
-
-    /// PostgreSQL user (must have REPLICATION privilege for Spice CDC).
-    pub pg_user: String,
-
-    /// PostgreSQL password.
-    pub pg_pass: String,
 
     /// Number of concurrent OLTP terminals for the HTAP workload.
     pub terminals: usize,
@@ -57,11 +42,6 @@ impl Default for ChBenchConfig {
         Self {
             warehouses: 1,
             seed: Some(DEFAULT_SEED),
-            pg_host: "127.0.0.1".into(),
-            pg_port: 5432,
-            pg_db: "chbench".into(),
-            pg_user: "bench".into(),
-            pg_pass: "bench".into(),
             terminals: 10,
             duration: std::time::Duration::from_secs(300),
             mix: crate::txn::DEFAULT_MIX,
@@ -69,12 +49,42 @@ impl Default for ChBenchConfig {
     }
 }
 
-impl ChBenchConfig {
+/// PostgreSQL-specific connection configuration.
+pub struct PostgresSourceConfig {
+    /// PostgreSQL host.
+    pub host: String,
+
+    /// PostgreSQL port.
+    pub port: u16,
+
+    /// PostgreSQL database name.
+    pub db: String,
+
+    /// PostgreSQL user (must have REPLICATION privilege for Spice CDC).
+    pub user: String,
+
+    /// PostgreSQL password.
+    pub pass: String,
+}
+
+impl Default for PostgresSourceConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            db: "chbench".into(),
+            user: "bench".into(),
+            pass: "bench".into(),
+        }
+    }
+}
+
+impl PostgresSourceConfig {
     /// Build a `tokio-postgres` connection string from this config.
-    pub fn pg_connection_string(&self) -> String {
+    pub fn connection_string(&self) -> String {
         format!(
             "host={} port={} dbname={} user={} password={}",
-            self.pg_host, self.pg_port, self.pg_db, self.pg_user, self.pg_pass,
+            self.host, self.port, self.db, self.user, self.pass,
         )
     }
 }

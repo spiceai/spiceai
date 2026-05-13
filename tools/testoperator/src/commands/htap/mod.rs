@@ -19,6 +19,7 @@ limitations under the License.
 
 mod staleness;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use test_framework::{
@@ -38,11 +39,8 @@ use test_framework::{
 };
 
 use crate::{
-    args::HtapArgs,
-    commands::bench::chbench_config_from_env,
-    health::HealthMonitor,
-    spiced_metrics::MetricsScraper,
-    wait_test_and_memory,
+    args::HtapArgs, commands::bench::chbench_config_from_env, health::HealthMonitor,
+    spiced_metrics::MetricsScraper, wait_test_and_memory,
 };
 
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
@@ -56,13 +54,20 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     // 1. Prepare the source (schema + seed data).
-    println!("Preparing chbench source...");
-    let mut config = chbench_config_from_env()?;
-    config.warehouses = args.warehouses;
-    config.terminals = args.terminals;
+    // CH-benCH convention: scale_factor = warehouses, terminals = warehouses * 10.
+    let scale_factor = test_args.scale_factor.unwrap_or(1.0);
+    let warehouses = scale_factor as usize;
+    let terminals = warehouses * 10;
+
+    println!(
+        "Preparing chbench source (SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminals)..."
+    );
+    let (mut config, source) = chbench_config_from_env()?;
+    config.warehouses = warehouses;
+    config.terminals = terminals;
     config.duration = Duration::from_secs(test_args.common.duration);
-    let pg_connection_string = config.pg_connection_string();
-    let driver = chbench_driver::ChBenchDriver::connect(config).await?;
+    let driver: Arc<dyn chbench_driver::ChBenchDriver> =
+        Arc::new(chbench_driver::PostgresChBenchDriver::connect(config, source).await?);
     driver.prepare().await?;
     println!("chbench source is ready");
 
@@ -97,11 +102,11 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
             KeyValue::new("spiced_commit_sha", spiced_commit_sha),
             KeyValue::new("branch_name", branch_name),
+            KeyValue::new("scale_factor", scale_factor.to_string()),
         ])
         .build();
 
-    let telemetry =
-        super::create_telemetry_with_resource(&test_args.common, benchmark_resource);
+    let telemetry = super::create_telemetry_with_resource(&test_args.common, benchmark_resource);
 
     let health_monitor = HealthMonitor::spawn()?;
 
@@ -112,13 +117,14 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let oltp_cancel = CancellationToken::new();
     let oltp_handle = {
         let cancel = oltp_cancel.clone();
+        let driver = Arc::clone(&driver);
         tokio::spawn(async move { driver.run(cancel).await })
     };
 
     // 3b. Start staleness probe alongside the OLTP workload.
     let staleness_spice_client = spiced_instance.spice_client(None, false).await?;
     let staleness_handle = staleness::spawn_staleness_probe(
-        pg_connection_string,
+        Arc::clone(&driver),
         staleness_spice_client,
         oltp_cancel.clone(),
     );
@@ -201,12 +207,13 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
+    println!("\n=== Analytical Queries ===");
     print_batches(&records)?;
 
     // 7. Report OLTP results.
+    println!("\n=== TPC-C OLTP ===");
     match oltp_result {
         Ok(Ok(report)) => {
-            println!("\n--- OLTP Workload Summary ---");
             report.print_summary();
         }
         Ok(Err(e)) => {
@@ -217,10 +224,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
-    // 8. Report staleness gap.
+    // 8. Report data freshness and replication metrics.
     match staleness_result {
         Ok(Ok(report)) => {
-            report.print_summary();
+            report.emit();
         }
         Ok(Err(e)) => {
             eprintln!("Staleness probe error: {e}");
@@ -232,7 +239,6 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     let health_report = health_monitor.stop().await;
 
-    // 10. Report native replication metrics from spiced /metrics endpoint.
     if let Some(ref metrics) = spiced_metrics {
         print_replication_metrics(metrics);
     }
@@ -276,11 +282,17 @@ fn print_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
     let mut deletes: BTreeMap<String, f64> = BTreeMap::new();
 
     let gauge_metrics = [
-        ("dataset_postgres_replication_lag_ms", &mut lag_ms as &mut BTreeMap<String, f64>),
+        (
+            "dataset_postgres_replication_lag_ms",
+            &mut lag_ms as &mut BTreeMap<String, f64>,
+        ),
         ("dataset_postgres_replication_lag_bytes", &mut lag_bytes),
     ];
     let counter_metrics = [
-        ("dataset_postgres_replication_inserts_total", &mut inserts as &mut BTreeMap<String, f64>),
+        (
+            "dataset_postgres_replication_inserts_total",
+            &mut inserts as &mut BTreeMap<String, f64>,
+        ),
         ("dataset_postgres_replication_updates_total", &mut updates),
         ("dataset_postgres_replication_deletes_total", &mut deletes),
     ];
@@ -317,7 +329,7 @@ fn print_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
         return;
     }
 
-    println!("\n--- Replication Metrics (from spiced /metrics) ---");
+    println!("\nReplication Metrics (last scrape from spiced)");
     // Header
     println!(
         "  {:<14} {:>10} {:>12} {:>10} {:>10} {:>10}",

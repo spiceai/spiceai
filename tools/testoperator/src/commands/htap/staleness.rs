@@ -16,25 +16,23 @@ limitations under the License.
 
 //! Staleness gap measurement for HTAP benchmarks.
 //!
-//! Probes 4 TPC-C tables every ~100ms by comparing `MAX(_bench_ts)` between the
-//! Postgres source and the Spice accelerated copy. The gap is the replication
+//! Probes TPC-C tables every ~100ms by comparing `MAX(_bench_ts)` between the
+//! source and the Spice accelerated copy. The gap is the replication
 //! staleness — how far behind Spice is from the source at any given moment.
 //!
-//! Probe tables (selected for diversity of CDC code paths):
-//! - `district`: small (10 rows), pipeline baseline
-//! - `order_line`: high write volume (300K+ rows), 4-column PK
-//! - `new_order`: exercises DELETE path (Delivery removes oldest orders)
-//! - `history`: append-only, no primary key
+//! Which tables are probed is determined by the driver's `probe_tables()` method.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use chbench_driver::schema::STALENESS_PROBE_TABLES;
+use chbench_driver::ChBenchDriver;
 use futures::TryStreamExt;
 use test_framework::anyhow;
+use test_framework::opentelemetry::KeyValue;
 use tokio_util::sync::CancellationToken;
 
 /// Per-table staleness statistics.
@@ -46,21 +44,23 @@ pub struct StalenessStats {
     pub samples: u64,
 }
 
-/// Staleness report across all probed tables.
+/// Data freshness report across all probed tables.
 #[derive(Debug)]
 pub struct StalenessReport {
     /// Per-table staleness statistics.
     pub tables: HashMap<String, StalenessStats>,
-    /// Headline metric: worst-case P99 across all tables.
-    pub headline_p99: Duration,
+    /// Ordered list of probed table names (for consistent output).
+    pub probe_tables: Vec<String>,
+    /// Worst-case P99 across all tables.
+    pub worst_p99: Duration,
 }
 
 impl StalenessReport {
-    /// Print a human-readable staleness summary.
-    pub fn print_summary(&self) {
-        println!("\n--- Staleness Gap ---");
-        for table in STALENESS_PROBE_TABLES {
-            if let Some(stats) = self.tables.get(*table) {
+    /// Print a human-readable data freshness summary and record OTEL metrics.
+    pub fn emit(&self) {
+        println!("\nData Freshness");
+        for table in &self.probe_tables {
+            if let Some(stats) = self.tables.get(table.as_str()) {
                 println!(
                     "  {:<14} P50={:>5}ms  P99={:>5}ms  max={:>5}ms  ({} samples)",
                     format!("{table}:"),
@@ -69,12 +69,20 @@ impl StalenessReport {
                     stats.max.as_millis(),
                     stats.samples,
                 );
+                crate::metrics::DATA_FRESHNESS_P99.record(
+                    stats.p99.as_millis() as f64,
+                    &[KeyValue::new("table", table.clone())],
+                );
             }
         }
         println!("  ─────────────────");
         println!(
-            "  headline P99:  {}ms (worst-case)",
-            self.headline_p99.as_millis()
+            "  worst P99:     {}ms",
+            self.worst_p99.as_millis()
+        );
+        crate::metrics::DATA_FRESHNESS_P99.record(
+            self.worst_p99.as_millis() as f64,
+            &[],
         );
     }
 }
@@ -83,43 +91,32 @@ impl StalenessReport {
 ///
 /// Returns a `JoinHandle` that resolves to a `StalenessReport`.
 pub fn spawn_staleness_probe(
-    pg_connection_string: String,
+    driver: Arc<dyn ChBenchDriver>,
     spice_client: spiceai::Client,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<anyhow::Result<StalenessReport>> {
     tokio::spawn(async move {
-        run_staleness_probe(&pg_connection_string, spice_client, cancel).await
+        run_staleness_probe(driver, spice_client, cancel).await
     })
 }
 
 /// Core probe loop. Runs until cancelled, collecting gap samples for each table.
 async fn run_staleness_probe(
-    pg_conn_str: &str,
+    driver: Arc<dyn ChBenchDriver>,
     spice_client: spiceai::Client,
     cancel: CancellationToken,
 ) -> anyhow::Result<StalenessReport> {
     let poll_interval = Duration::from_millis(100);
-
-    // Connect to Postgres source.
-    let (pg_client, pg_connection) =
-        tokio_postgres::connect(pg_conn_str, tokio_postgres::NoTls).await?;
-    let pg_cancel = cancel.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            result = pg_connection => {
-                if let Err(e) = result {
-                    eprintln!("Staleness probe Postgres connection error: {e}");
-                }
-            }
-            () = pg_cancel.cancelled() => {}
-        }
-    });
+    let probe_tables = driver.probe_tables();
 
     // Per-table gap samples (microseconds).
-    let mut samples: HashMap<String, Vec<i64>> = STALENESS_PROBE_TABLES
+    let mut samples: HashMap<String, Vec<i64>> = probe_tables
         .iter()
         .map(|t| ((*t).to_string(), Vec::new()))
         .collect();
+
+    // Ordered list of table names for consistent report output.
+    let probe_table_names: Vec<String> = probe_tables.iter().map(|t| (*t).to_string()).collect();
 
     // Wait briefly for initial data to be loaded and replicated before probing.
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -129,10 +126,10 @@ async fn run_staleness_probe(
             break;
         }
 
-        for table in STALENESS_PROBE_TABLES {
+        for table in probe_tables {
             // Query both endpoints concurrently.
-            let (pg_result, spice_result) = tokio::join!(
-                query_max_bench_ts_pg(&pg_client, table),
+            let (source_result, spice_result) = tokio::join!(
+                driver.max_bench_ts(table),
                 query_max_bench_ts_spice(&spice_client, table),
             );
 
@@ -142,15 +139,15 @@ async fn run_staleness_probe(
                 break;
             }
 
-            match (pg_result, spice_result) {
-                (Ok(Some(pg_ts)), Ok(Some(spice_ts))) => {
-                    let gap_us = (pg_ts - spice_ts).max(0);
+            match (source_result, spice_result) {
+                (Ok(Some(source_ts)), Ok(Some(spice_ts))) => {
+                    let gap_us = (source_ts - spice_ts).max(0);
                     if let Some(table_samples) = samples.get_mut(*table) {
                         table_samples.push(gap_us);
                     }
                 }
-                (pg, spice) => {
-                    eprintln!("Staleness probe: {table} pg={pg:?} spice={spice:?}");
+                (source, spice) => {
+                    eprintln!("Staleness probe: {table} source={source:?} spice={spice:?}");
                 }
             }
         }
@@ -161,24 +158,7 @@ async fn run_staleness_probe(
         }
     }
 
-    Ok(build_report(samples))
-}
-
-/// Query `MAX(_bench_ts)` from Postgres, returning microseconds since epoch.
-///
-/// Retrieves the `TIMESTAMPTZ` value directly (via `tokio-postgres`'s `with-chrono-0_4`
-/// feature) and converts to microseconds.
-async fn query_max_bench_ts_pg(
-    client: &tokio_postgres::Client,
-    table: &str,
-) -> anyhow::Result<Option<i64>> {
-    let query = format!("SELECT MAX(_bench_ts) FROM {table}");
-    let rows = client.query(&query, &[]).await?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    let ts: Option<chrono::DateTime<chrono::Utc>> = rows[0].get(0);
-    Ok(ts.map(|t| t.timestamp_micros()))
+    Ok(build_report(samples, probe_table_names))
 }
 
 /// Query `MAX(_bench_ts)` from Spice via Flight SQL, returning microseconds since epoch.
@@ -229,7 +209,7 @@ async fn query_max_bench_ts_spice(
 }
 
 /// Build the final report from raw gap samples (in microseconds).
-fn build_report(samples: HashMap<String, Vec<i64>>) -> StalenessReport {
+fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -> StalenessReport {
     let mut tables = HashMap::new();
     let mut worst_p99 = Duration::ZERO;
 
@@ -271,6 +251,7 @@ fn build_report(samples: HashMap<String, Vec<i64>>) -> StalenessReport {
 
     StalenessReport {
         tables,
-        headline_p99: worst_p99,
+        probe_tables,
+        worst_p99,
     }
 }

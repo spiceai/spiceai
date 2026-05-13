@@ -3567,6 +3567,8 @@ dependencies = [
 name = "chbench-driver"
 version = "2.0.0-unstable"
 dependencies = [
+ "async-trait",
+ "chrono",
  "rand 0.8.5",
  "snafu",
  "tokio",

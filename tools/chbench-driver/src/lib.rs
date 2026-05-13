@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! CH-benCH driver — TPC-C schema + seed data loader and OLTP workload driver for PostgreSQL.
+//! CH-benCH driver — TPC-C schema + seed data loader and OLTP workload driver.
 //!
 //! Creates 12 tables (9 TPC-C + 3 CH supplemental), loads seed data,
 //! and runs a TPC-C OLTP workload with configurable terminals and duration.
@@ -22,11 +22,11 @@ limitations under the License.
 //! # Usage
 //!
 //! ```rust,no_run
-//! use chbench_driver::{ChBenchConfig, ChBenchDriver};
+//! use chbench_driver::{ChBenchConfig, PostgresChBenchDriver};
 //!
 //! # async fn example() -> chbench_driver::Result<()> {
 //! let config = ChBenchConfig { warehouses: 1, ..Default::default() };
-//! let driver = ChBenchDriver::connect(config).await?;
+//! let driver = PostgresChBenchDriver::connect(config).await?;
 //! driver.prepare().await?;
 //! # Ok(())
 //! # }
@@ -39,12 +39,13 @@ pub mod rand;
 pub mod schema;
 pub mod txn;
 
-pub use config::ChBenchConfig;
+pub use config::{ChBenchConfig, PostgresSourceConfig};
 pub use metrics::OltpReport;
 pub use txn::TxnType;
 
 use ::rand::rngs::StdRng;
 use ::rand::SeedableRng;
+use async_trait::async_trait;
 use snafu::Snafu;
 use tokio_util::sync::CancellationToken;
 
@@ -59,16 +60,44 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// CH-benCH driver for TPC-C schema setup, data loading, and OLTP workload.
-pub struct ChBenchDriver {
-    client: tokio_postgres::Client,
-    config: ChBenchConfig,
+/// Source-agnostic interface for CH-benCH benchmarks.
+///
+/// Each source (Postgres, MySQL, DynamoDB, etc.) implements this trait to
+/// provide schema setup, OLTP workload execution, and staleness probing.
+#[async_trait]
+pub trait ChBenchDriver: Send + Sync {
+    /// Set up the schema, seed data, and any source-specific instrumentation
+    /// (e.g. `_bench_ts` triggers).
+    async fn prepare(&self) -> Result<()>;
+
+    /// Run the TPC-C OLTP workload until `cancel` fires or the configured
+    /// duration elapses.
+    async fn run(&self, cancel: CancellationToken) -> Result<OltpReport>;
+
+    /// Tables to probe for staleness measurement.
+    ///
+    /// Returns a subset of mutated tables chosen for CDC path diversity
+    /// (e.g. small-table updates, high-volume inserts, deletes).
+    fn probe_tables(&self) -> &[&str];
+
+    /// Read `MAX(_bench_ts)` from the *source* for a given table.
+    ///
+    /// Returns microseconds since Unix epoch, or `None` if the table is empty
+    /// or the column doesn't exist.
+    async fn max_bench_ts(&self, table: &str) -> Result<Option<i64>>;
 }
 
-impl ChBenchDriver {
+/// Postgres-backed CH-benCH driver.
+pub struct PostgresChBenchDriver {
+    client: tokio_postgres::Client,
+    config: ChBenchConfig,
+    source: PostgresSourceConfig,
+}
+
+impl PostgresChBenchDriver {
     /// Connect to PostgreSQL using the provided configuration.
-    pub async fn connect(config: ChBenchConfig) -> Result<Self> {
-        let conn_str = config.pg_connection_string();
+    pub async fn connect(config: ChBenchConfig, source: PostgresSourceConfig) -> Result<Self> {
+        let conn_str = source.connection_string();
         let (client, connection) =
             tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
                 .await
@@ -83,11 +112,14 @@ impl ChBenchDriver {
             }
         });
 
-        Ok(Self { client, config })
+        Ok(Self { client, config, source })
     }
+}
 
+#[async_trait]
+impl ChBenchDriver for PostgresChBenchDriver {
     /// Drop and recreate all 12 CH-benCH tables, then load seed data.
-    pub async fn prepare(&self) -> Result<()> {
+    async fn prepare(&self) -> Result<()> {
         println!(
             "Preparing CH-benCH schema with {} warehouse(s)",
             self.config.warehouses,
@@ -106,7 +138,7 @@ impl ChBenchDriver {
     ///
     /// Each terminal opens its own Postgres connection and runs transactions
     /// in a tight loop with the configured mix weights.
-    pub async fn run(&self, cancel: CancellationToken) -> Result<OltpReport> {
+    async fn run(&self, cancel: CancellationToken) -> Result<OltpReport> {
         let terminals = self.config.terminals;
         let duration = self.config.duration;
         let mix = self.config.mix;
@@ -129,7 +161,7 @@ impl ChBenchDriver {
 
         let mut handles = Vec::with_capacity(terminals);
         for terminal_id in 0..terminals {
-            let conn_str = self.config.pg_connection_string();
+            let conn_str = self.source.connection_string();
             let cancel = cancel.clone();
 
             handles.push(tokio::spawn(async move {
@@ -155,6 +187,27 @@ impl ChBenchDriver {
 
         let report = combined.finish();
         Ok(report)
+    }
+
+    fn probe_tables(&self) -> &[&str] {
+        schema::STALENESS_PROBE_TABLES
+    }
+
+    async fn max_bench_ts(&self, table: &str) -> Result<Option<i64>> {
+        let query = format!("SELECT MAX(_bench_ts) FROM {table}");
+        let rows = self
+            .client
+            .query(&query, &[])
+            .await
+            .map_err(|source| Error::Sql {
+                action: format!("query MAX(_bench_ts) from {table}"),
+                source,
+            })?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let ts: Option<chrono::DateTime<chrono::Utc>> = rows[0].get(0);
+        Ok(ts.map(|t| t.timestamp_micros()))
     }
 }
 

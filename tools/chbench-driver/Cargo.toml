@@ -6,6 +6,8 @@ rust-version.workspace = true
 license-file.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
 rand = "0.8"
 snafu = "0.8"
 tokio = { workspace = true, features = ["macros", "rt"] }
