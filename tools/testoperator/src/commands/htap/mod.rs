@@ -236,7 +236,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let health_report = health_monitor.stop().await;
 
     if let Some(ref metrics) = spiced_metrics {
-        print_replication_metrics(metrics);
+        emit_replication_metrics(metrics);
     }
 
     telemetry.emit().await?;
@@ -263,8 +263,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print per-dataset Postgres replication metrics scraped from spiced's `/metrics` endpoint.
-fn print_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
+/// Emits replication metrics scraped from spiced's `/metrics` endpoint.
+fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
     use std::collections::{BTreeMap, BTreeSet};
 
     // Collect replication metrics per dataset from scraped samples.
@@ -334,6 +334,7 @@ fn print_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
 
     let all_datasets: BTreeSet<&String> = lag_ms.keys().chain(inserts.keys()).collect();
 
+    let mut worst_lag_ms: f64 = 0.0;
     for dataset in &all_datasets {
         let l_ms = lag_ms.get(*dataset).copied().unwrap_or(0.0);
         let l_bytes = lag_bytes.get(*dataset).copied().unwrap_or(0.0);
@@ -343,5 +344,14 @@ fn print_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
         println!(
             "  {dataset:<14} {l_ms:>10.0} {l_bytes:>12.0} {ins:>10.0} {upd:>10.0} {del:>10.0}",
         );
+
+        crate::metrics::REPLICATION_LAG_MS
+            .record(l_ms, &[KeyValue::new("dataset", (*dataset).clone())]);
+        if l_ms > worst_lag_ms {
+            worst_lag_ms = l_ms;
+        }
     }
+
+    // Headline: worst replication lag across all datasets.
+    crate::metrics::REPLICATION_LAG_MS.record(worst_lag_ms, &[]);
 }

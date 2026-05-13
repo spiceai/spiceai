@@ -71,7 +71,7 @@ impl StalenessReport {
                 #[expect(clippy::cast_precision_loss)]
                 let p99_ms = stats.p99.as_millis() as f64;
                 crate::metrics::DATA_FRESHNESS_P99
-                    .record(p99_ms, &[KeyValue::new("table", table.clone())]);
+                    .record(p99_ms, &[KeyValue::new("dataset", table.clone())]);
             }
         }
         println!("  ─────────────────");

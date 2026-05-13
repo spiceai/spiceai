@@ -1,5 +1,5 @@
 select
-    c_last, c_id o_id, o_entry_d, o_ol_cnt, sum(ol_amount)
+    c_last, c_id, o_id, o_entry_d, o_ol_cnt, sum(ol_amount)
 from
     customer, orders, order_line
 where
