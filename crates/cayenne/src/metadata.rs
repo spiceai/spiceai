@@ -355,6 +355,17 @@ pub struct InlinedData {
     pub created_at: String,
 }
 
+/// Aggregate size information for inline data entries in the metastore.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InlinedDataStats {
+    /// Total number of visible rows represented by inline entries.
+    pub record_count: i64,
+    /// Number of inline entries for the table.
+    pub entry_count: i64,
+    /// Total serialized Arrow IPC bytes stored inline.
+    pub ipc_bytes: i64,
+}
+
 impl InlinedData {
     /// Build an inline data row whose identity, sequence number, and timestamp
     /// are assigned by `MetadataCatalog::commit_inlined_mutation`.

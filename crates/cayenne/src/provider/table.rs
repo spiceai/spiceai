@@ -29,7 +29,7 @@ use super::delete::{
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use crate::metadata::{CreateTableOptions, InlinedData, TableMetadata};
+use crate::metadata::{CreateTableOptions, InlinedData, InlinedDataStats, TableMetadata};
 use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
@@ -290,6 +290,15 @@ pub(crate) const INLINE_MAX_ROWS: usize = 1024;
 /// Maximum serialized IPC size (bytes) to inline in the metastore.
 const INLINE_MAX_BYTES: usize = 1_048_576; // 1 MB
 
+/// Maximum rows to keep in the inline level-0 memtable before flushing to Vortex.
+pub(crate) const INLINE_MEMTABLE_MAX_ROWS: i64 = 10_000;
+
+/// Maximum inline level-0 entries before flushing to Vortex.
+pub(crate) const INLINE_MEMTABLE_MAX_SEGMENTS: i64 = 64;
+
+/// Maximum serialized IPC bytes to keep inline before flushing to Vortex.
+pub(crate) const INLINE_MEMTABLE_MAX_BYTES: i64 = 8 * 1_048_576;
+
 /// Maximum in-memory byte budget while buffering the inline fast-path stream.
 ///
 /// `INLINE_MAX_ROWS` alone does not bound memory usage — a pathological batch
@@ -300,6 +309,38 @@ const INLINE_MAX_BYTES: usize = 1_048_576; // 1 MB
 /// `INLINE_MAX_BYTES` (the serialized IPC cap) to account for in-memory Arrow
 /// overhead vs. the compact IPC representation.
 pub(crate) const INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576; // 4 MB
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineMemtablePressure {
+    Rows,
+    Segments,
+    IpcBytes,
+}
+
+impl InlineMemtablePressure {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rows => "rows",
+            Self::Segments => "segments",
+            Self::IpcBytes => "ipc_bytes",
+        }
+    }
+}
+
+#[must_use]
+pub(crate) fn inline_memtable_pressure(stats: InlinedDataStats) -> Option<InlineMemtablePressure> {
+    if stats.record_count >= INLINE_MEMTABLE_MAX_ROWS {
+        return Some(InlineMemtablePressure::Rows);
+    }
+    if stats.entry_count > INLINE_MEMTABLE_MAX_SEGMENTS {
+        return Some(InlineMemtablePressure::Segments);
+    }
+    if stats.ipc_bytes >= INLINE_MEMTABLE_MAX_BYTES {
+        return Some(InlineMemtablePressure::IpcBytes);
+    }
+    None
+}
 
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
 fn serialize_batches_to_ipc(
@@ -4090,6 +4131,32 @@ impl CayenneTableProvider {
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
     }
 
+    /// Flush the inline level-0 memtable when accumulated entries would make reads or
+    /// rewrites too expensive.
+    pub(crate) async fn checkpoint_inlined_data_if_memtable_pressure_exceeded(&self) -> Result<()> {
+        let stats = self
+            .catalog
+            .get_inlined_data_stats(&self.table_metadata.table_id)
+            .await?;
+        self.inlined_row_count
+            .store(stats.record_count, Ordering::Relaxed);
+
+        let Some(pressure) = inline_memtable_pressure(stats) else {
+            return Ok(());
+        };
+
+        tracing::info!(
+            table = %self.table_metadata.table_name,
+            rows = stats.record_count,
+            segments = stats.entry_count,
+            ipc_bytes = stats.ipc_bytes,
+            reason = pressure.as_str(),
+            "Checkpointing inline memtable to Vortex"
+        );
+        self.checkpoint_inlined_data().await?;
+        Ok(())
+    }
+
     /// Flush inlined rows to Vortex files when pending inline data exists.
     ///
     /// Callers must hold `write_lock` while calling this helper.
@@ -5685,6 +5752,42 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use test_framework::arrow_record_batch_gen::*;
+
+    #[test]
+    fn inline_memtable_pressure_is_absent_below_thresholds() {
+        let stats = InlinedDataStats {
+            record_count: INLINE_MEMTABLE_MAX_ROWS - 1,
+            entry_count: INLINE_MEMTABLE_MAX_SEGMENTS,
+            ipc_bytes: INLINE_MEMTABLE_MAX_BYTES - 1,
+        };
+
+        assert_eq!(inline_memtable_pressure(stats), None);
+    }
+
+    #[test]
+    fn inline_memtable_pressure_detects_thresholds() {
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                record_count: INLINE_MEMTABLE_MAX_ROWS,
+                ..InlinedDataStats::default()
+            }),
+            Some(InlineMemtablePressure::Rows)
+        );
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                entry_count: INLINE_MEMTABLE_MAX_SEGMENTS + 1,
+                ..InlinedDataStats::default()
+            }),
+            Some(InlineMemtablePressure::Segments)
+        );
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                ipc_bytes: INLINE_MEMTABLE_MAX_BYTES,
+                ..InlinedDataStats::default()
+            }),
+            Some(InlineMemtablePressure::IpcBytes)
+        );
+    }
 
     /// A `TableProviderFactory` implementation to create new instances of `CayenneTableProvider`.
     // Not used outside of tests until https://github.com/spiceai/spiceai/issues/8534 is resolved

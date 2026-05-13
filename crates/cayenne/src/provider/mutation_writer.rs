@@ -324,12 +324,13 @@ impl<'a> AppendMutationWriter<'a> {
 
             self.table.persist_table_stats(&stats_acc).await;
 
-            let inlined_count = self.table.cached_inlined_row_count();
-            if inlined_count >= 10_000
-                && let Err(e) = self.table.checkpoint_inlined_data().await
+            if let Err(e) = self
+                .table
+                .checkpoint_inlined_data_if_memtable_pressure_exceeded()
+                .await
             {
                 tracing::warn!(
-                    "Auto-checkpoint of inlined data failed for {}: {e}",
+                    "Auto-checkpoint of inline memtable failed for {}: {e}",
                     self.table.table_name(),
                 );
             }

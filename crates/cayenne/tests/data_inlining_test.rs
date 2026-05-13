@@ -49,6 +49,7 @@ test_with_backends!(test_roundtrip_exceeds_byte_threshold);
 test_with_backends!(test_pk_upsert_inline_mutation);
 test_with_backends!(test_pk_delete_inline_mutation);
 test_with_backends!(test_pk_auto_checkpoint_preserves_rows);
+test_with_backends!(test_inline_memtable_segment_pressure_checkpoints);
 test_with_backends!(test_inline_writer_fallback_preserves_buffered_and_remaining_batches);
 
 #[tokio::test]
@@ -158,6 +159,10 @@ async fn test_inlined_data_crud(
 
     // Verify count
     assert_eq!(catalog.get_inlined_data_count(&table_id).await?, 3);
+    let stats = catalog.get_inlined_data_stats(&table_id).await?;
+    assert_eq!(stats.record_count, 3);
+    assert_eq!(stats.entry_count, 1);
+    assert!(stats.ipc_bytes > 0);
 
     // Read back
     let data = catalog.get_inlined_data(&table_id).await?;
@@ -558,6 +563,72 @@ async fn test_pk_auto_checkpoint_preserves_rows(
     assert_eq!(names.value(0), "name_0");
     assert_eq!(names.value(1), "name_5120");
     assert_eq!(names.value(2), "name_10239");
+
+    Ok(())
+}
+
+async fn test_inline_memtable_segment_pressure_checkpoints(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let (table, ctx) = create_table(
+        &fixture,
+        "inline_memtable_segment_pressure",
+        Arc::clone(&schema),
+    )
+    .await?;
+    let table_id = fixture
+        .catalog
+        .get_table("inline_memtable_segment_pressure")
+        .await?
+        .table_id;
+
+    for row_id in 0..65_i64 {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![row_id])),
+                Arc::new(StringArray::from(vec![format!("name_{row_id}")])),
+            ],
+        )?;
+        common::insert_batch(&table, batch).await?;
+    }
+
+    assert_eq!(
+        fixture.catalog.get_inlined_data_count(&table_id).await?,
+        0,
+        "inline memtable should flush when level-0 segment pressure is exceeded",
+    );
+    let stats = fixture.catalog.get_inlined_data_stats(&table_id).await?;
+    assert_eq!(stats.record_count, 0);
+    assert_eq!(stats.entry_count, 0);
+    assert_eq!(stats.ipc_bytes, 0);
+
+    ctx.register_table("inline_memtable_segment_pressure", Arc::new(table))?;
+    let got = collect_sorted(
+        &ctx,
+        "SELECT id, name FROM inline_memtable_segment_pressure ORDER BY id",
+    )
+    .await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 65);
+    assert_eq!(ids.value(0), 0);
+    assert_eq!(ids.value(64), 64);
+    assert_eq!(names.value(0), "name_0");
+    assert_eq!(names.value(64), "name_64");
 
     Ok(())
 }
