@@ -30,7 +30,12 @@ use datafusion::{
 };
 use datafusion_table_providers::mongodb::connection_pool::MongoDBConnectionPool;
 use futures::StreamExt as FuturesStreamExt;
-use mongodb::{bson::Document, change_stream::event::ChangeStreamEvent, options::FullDocumentType};
+use mongodb::{
+    Collection,
+    bson::Document,
+    change_stream::{ChangeStream, event::ChangeStreamEvent, event::ResumeToken},
+    options::FullDocumentType,
+};
 use runtime::{
     component::dataset::{
         Dataset,
@@ -72,16 +77,21 @@ pub fn build_changes_stream(
             .database(&connection.db_name)
             .collection::<Document>(&collection_name);
 
-        let change_stream = collection
-            .watch()
-            .full_document(FullDocumentType::UpdateLookup)
-            .max_await_time(config.max_await_time)
-            .batch_size(config.server_batch_size)
-            .await
-            .map_err(|error| data_components::cdc::StreamError::External(format!(
-                "Failed to start MongoDB Change Stream for dataset `{}` collection `{collection_name}`: {error}",
+        let initial_change_stream = open_change_stream(
+            &collection,
+            &config,
+            &dataset.name,
+            &collection_name,
+            None,
+        )
+        .await?;
+        let resume_token = initial_change_stream.resume_token().ok_or_else(|| {
+            data_components::cdc::StreamError::External(format!(
+                "Failed to start MongoDB Change Stream for dataset `{}` collection `{collection_name}`: initial stream did not return a resume token",
                 dataset.name
-            )))?;
+            ))
+        })?;
+        drop(initial_change_stream);
 
         tracing::info!(
             dataset = %dataset.name,
@@ -112,8 +122,17 @@ pub fn build_changes_stream(
         tracing::info!(
             dataset = %dataset.name,
             collection = %collection_name,
-            "MongoDB collection snapshot complete; processing Change Stream events"
+            "MongoDB collection snapshot complete; resuming Change Stream events"
         );
+
+        let change_stream = open_change_stream(
+            &collection,
+            &config,
+            &dataset.name,
+            &collection_name,
+            Some(resume_token),
+        )
+        .await?;
 
         let unnest_parameters = default_unnest_parameters(config.unnest_depth);
         let event_batches = change_stream.chunks_timeout(
@@ -138,6 +157,30 @@ pub fn build_changes_stream(
                 yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, true);
             }
         }
+    })
+}
+
+async fn open_change_stream(
+    collection: &Collection<Document>,
+    config: &ChangeStreamConfig,
+    dataset_name: &datafusion::sql::TableReference,
+    collection_name: &str,
+    resume_token: Option<ResumeToken>,
+) -> Result<ChangeStream<ChangeStreamEvent<Document>>, data_components::cdc::StreamError> {
+    let mut watch = collection
+        .watch()
+        .full_document(FullDocumentType::UpdateLookup)
+        .max_await_time(config.max_await_time)
+        .batch_size(config.server_batch_size);
+
+    if let Some(resume_token) = resume_token {
+        watch = watch.resume_after(resume_token);
+    }
+
+    watch.await.map_err(|error| {
+        data_components::cdc::StreamError::External(format!(
+            "Failed to start MongoDB Change Stream for dataset `{dataset_name}` collection `{collection_name}`: {error}"
+        ))
     })
 }
 

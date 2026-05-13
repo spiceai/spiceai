@@ -17,10 +17,10 @@ limitations under the License.
 use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
+#[cfg(feature = "duckdb")]
+use spicepod::acceleration::{OnConflictBehavior, RefreshMode};
 use spicepod::{
-    acceleration::{Acceleration, OnConflictBehavior, RefreshMode},
-    component::dataset::Dataset,
-    param::Params as DatasetParams,
+    acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
 use tracing::instrument;
 
@@ -53,6 +53,7 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
     dataset
 }
 
+#[cfg(feature = "duckdb")]
 pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
     let connection_string = format!(
@@ -116,6 +117,7 @@ pub async fn start_mongodb_docker_container(
     Ok(running_container)
 }
 
+#[cfg(feature = "duckdb")]
 #[instrument]
 pub async fn start_mongodb_replica_set_docker_container(
     port: u16,
@@ -152,6 +154,7 @@ pub async fn start_mongodb_replica_set_docker_container(
     Ok(running_container)
 }
 
+#[cfg(feature = "duckdb")]
 async fn initiate_mongodb_replica_set(
     running_container: &RunningContainer<'_>,
 ) -> Result<(), anyhow::Error> {
@@ -219,6 +222,7 @@ pub async fn get_mongodb_client(port: u16) -> Result<mongodb::Client, anyhow::Er
     Ok(client)
 }
 
+#[cfg(feature = "duckdb")]
 #[instrument]
 pub async fn get_mongodb_replica_set_client(port: u16) -> Result<mongodb::Client, anyhow::Error> {
     let uri = format!(

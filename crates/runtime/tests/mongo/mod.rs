@@ -17,10 +17,12 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::SystemTime;
 
+#[cfg(feature = "duckdb")]
 use arrow::array::{Array, Int32Array, StringArray};
+use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_container};
+#[cfg(feature = "duckdb")]
 use common::{
-    get_mongodb_client, get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
-    make_mongodb_dataset, start_mongodb_docker_container,
+    get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
     start_mongodb_replica_set_docker_container,
 };
 use mongodb::{Collection, bson::doc};
@@ -29,7 +31,9 @@ use chrono::{DateTime, Utc};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::utils::{register_test_connectors, run_query, test_request_context, wait_until_true};
+#[cfg(feature = "duckdb")]
+use crate::utils::wait_until_true;
+use crate::utils::{register_test_connectors, run_query, test_request_context};
 
 pub mod common;
 
@@ -39,6 +43,7 @@ use runtime::Runtime;
 use tracing::instrument;
 
 const MONGODB_PORT1: u16 = 27019;
+#[cfg(feature = "duckdb")]
 const MONGODB_CHANGE_STREAM_PORT: u16 = 27020;
 
 #[instrument]
@@ -114,6 +119,7 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
 }
 
 #[instrument]
+#[cfg(feature = "duckdb")]
 async fn init_mongodb_change_stream_db(port: u16) -> Result<(), anyhow::Error> {
     tracing::debug!("INIT CHANGE STREAM DB: test");
     let client = get_mongodb_replica_set_client(port).await?;
@@ -136,6 +142,7 @@ async fn init_mongodb_change_stream_db(port: u16) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+#[cfg(feature = "duckdb")]
 async fn change_stream_rows(rt: &Arc<Runtime>) -> Result<Vec<(i32, String)>, anyhow::Error> {
     let batches = run_query(rt, "SELECT _id, name FROM change_stream_users ORDER BY _id").await?;
     let mut rows = Vec::new();

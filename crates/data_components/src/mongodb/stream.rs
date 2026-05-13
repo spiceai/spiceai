@@ -76,6 +76,8 @@ pub fn change_events_to_change_batch(
     unnest_parameters: &UnnestParameters,
 ) -> Result<Option<ChangeBatch>> {
     let mut rows = Vec::with_capacity(events.len());
+    let primary_keys = Arc::<[String]>::from(primary_keys.to_vec());
+    let empty_primary_keys = Arc::<[String]>::from(Vec::<String>::new());
 
     for event in events {
         match event.operation_type {
@@ -83,29 +85,33 @@ pub fn change_events_to_change_batch(
                 let document = event.full_document.context(MissingFullDocumentSnafu {
                     operation: "insert",
                 })?;
-                rows.push(ChangeRow::new("c", primary_keys.to_vec(), document));
+                rows.push(ChangeRow::new("c", Arc::clone(&primary_keys), document));
             }
             OperationType::Update => {
                 let document = event.full_document.context(MissingFullDocumentSnafu {
                     operation: "update",
                 })?;
-                rows.push(ChangeRow::new("u", primary_keys.to_vec(), document));
+                rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
             }
             OperationType::Replace => {
                 let document = event.full_document.context(MissingFullDocumentSnafu {
                     operation: "replace",
                 })?;
-                rows.push(ChangeRow::new("u", primary_keys.to_vec(), document));
+                rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
             }
             OperationType::Delete => {
                 let document = event.document_key.context(MissingDocumentKeySnafu)?;
-                rows.push(ChangeRow::new("d", primary_keys.to_vec(), document));
+                rows.push(ChangeRow::new("d", Arc::clone(&primary_keys), document));
             }
             OperationType::Drop
             | OperationType::Rename
             | OperationType::DropDatabase
             | OperationType::Invalidate => {
-                rows.push(ChangeRow::new("t", Vec::new(), Document::new()));
+                rows.push(ChangeRow::new(
+                    "t",
+                    Arc::clone(&empty_primary_keys),
+                    Document::new(),
+                ));
             }
             operation_type => {
                 return UnsupportedOperationSnafu {
@@ -150,12 +156,12 @@ pub fn truncate_change_batch(table_schema: &SchemaRef) -> Result<ChangeBatch> {
 
 struct ChangeRow {
     op: &'static str,
-    primary_keys: Vec<String>,
+    primary_keys: Arc<[String]>,
     document: Document,
 }
 
 impl ChangeRow {
-    fn new(op: &'static str, primary_keys: Vec<String>, document: Document) -> Self {
+    fn new(op: &'static str, primary_keys: Arc<[String]>, document: Document) -> Self {
         Self {
             op,
             primary_keys,
@@ -172,8 +178,7 @@ fn build_change_batch(
     let change_data_schema = nullable_clone(table_schema);
     let row_count = rows.len();
     let ops = rows.iter().map(|row| row.op).collect::<Vec<_>>();
-    let primary_keys =
-        build_primary_keys_array(rows.iter().map(|row| row.primary_keys.as_slice()))?;
+    let primary_keys = build_primary_keys_array(rows.iter().map(|row| row.primary_keys.as_ref()))?;
     let documents = rows.into_iter().map(|row| row.document).collect::<Vec<_>>();
     let documents = match unnest_parameters.behavior {
         UnnestBehavior::Depth(0) => documents,
