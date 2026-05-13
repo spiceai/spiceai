@@ -59,7 +59,12 @@ impl MongoSys {
 
         conn.execute(
             &upsert,
-            turso::params![dataset_name, resume_token_json, cluster_time_ts, schema_json,],
+            turso::params![
+                dataset_name,
+                resume_token_json,
+                cluster_time_ts,
+                schema_json,
+            ],
         )
         .await
         .map_err(Error::external)?;

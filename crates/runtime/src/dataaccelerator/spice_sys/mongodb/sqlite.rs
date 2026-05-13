@@ -136,9 +136,8 @@ impl MongoSys {
         conn.conn
             .call(
                 move |conn: &mut rusqlite::Connection| -> Result<(), rusqlite::Error> {
-                    let delete = format!(
-                        "DELETE FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?1"
-                    );
+                    let delete =
+                        format!("DELETE FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?1");
                     conn.execute(&delete, [dataset_name])?;
                     Ok::<(), rusqlite::Error>(())
                 },
