@@ -823,7 +823,13 @@ impl TableProvider for IndexedMemTable {
         state: &dyn Session,
         args: datafusion::catalog::ScanArgs<'a>,
     ) -> Result<datafusion::catalog::ScanResult> {
-        self.inner.scan_with_args(state, args).await
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(|p| p.to_vec());
+        let limit = args.limit();
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
+        Ok(datafusion::catalog::ScanResult::new(plan))
     }
 
     fn statistics(&self) -> Option<datafusion::common::Statistics> {
