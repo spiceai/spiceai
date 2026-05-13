@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -33,22 +33,24 @@ use super::table::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct InlineMutationPolicy {
-    pub(crate) pending_pk_deletions: bool,
-    pub(crate) file_on_conflict_deletions: bool,
-    pub(crate) has_sort_columns: bool,
-    pub(crate) is_partitioned: bool,
-    pub(crate) has_retention_filters: bool,
+pub(crate) enum InlineMutationPolicy {
+    Inline,
+    Vortex,
 }
 
 impl InlineMutationPolicy {
     #[must_use]
+    pub(crate) fn from_blocking_conditions(blocking_conditions: [bool; 5]) -> Self {
+        if blocking_conditions.into_iter().any(|condition| condition) {
+            Self::Vortex
+        } else {
+            Self::Inline
+        }
+    }
+
+    #[must_use]
     pub(crate) fn can_inline(self) -> bool {
-        !self.pending_pk_deletions
-            && !self.file_on_conflict_deletions
-            && !self.has_sort_columns
-            && !self.is_partitioned
-            && !self.has_retention_filters
+        matches!(self, Self::Inline)
     }
 }
 
@@ -172,13 +174,13 @@ impl<'a> AppendMutationWriter<'a> {
 
         self.table.clear_staging_dir().await?;
 
-        let inline_policy = InlineMutationPolicy {
+        let inline_policy = InlineMutationPolicy::from_blocking_conditions([
             pending_pk_deletions,
-            file_on_conflict_deletions: has_file_on_conflict_deletions,
-            has_sort_columns: self.context.has_sort_columns(),
-            is_partitioned: self.table.metadata().partition_column.is_some(),
-            has_retention_filters: self.table.has_retention_filters(),
-        };
+            has_file_on_conflict_deletions,
+            self.context.has_sort_columns(),
+            self.table.metadata().partition_column.is_some(),
+            self.table.has_retention_filters(),
+        ]);
 
         if inline_policy.can_inline() {
             match self
@@ -393,65 +395,27 @@ mod tests {
     use arrow::array::{BinaryArray, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
 
-    fn base_policy() -> InlineMutationPolicy {
-        InlineMutationPolicy {
-            pending_pk_deletions: false,
-            file_on_conflict_deletions: false,
-            has_sort_columns: false,
-            is_partitioned: false,
-            has_retention_filters: false,
+    #[test]
+    fn inline_policy_requires_simple_append_shape() {
+        assert!(InlineMutationPolicy::from_blocking_conditions([false; 5]).can_inline());
+
+        for blocking_condition_index in 0..5 {
+            let mut blocking_conditions = [false; 5];
+            blocking_conditions[blocking_condition_index] = true;
+            assert!(
+                !InlineMutationPolicy::from_blocking_conditions(blocking_conditions).can_inline()
+            );
         }
     }
 
     #[test]
-    fn inline_policy_requires_simple_append_shape() {
-        assert!(base_policy().can_inline());
-
-        assert!(
-            !InlineMutationPolicy {
-                pending_pk_deletions: true,
-                ..base_policy()
-            }
-            .can_inline()
-        );
-        assert!(
-            !InlineMutationPolicy {
-                file_on_conflict_deletions: true,
-                ..base_policy()
-            }
-            .can_inline()
-        );
-        assert!(
-            !InlineMutationPolicy {
-                has_sort_columns: true,
-                ..base_policy()
-            }
-            .can_inline()
-        );
-        assert!(
-            !InlineMutationPolicy {
-                is_partitioned: true,
-                ..base_policy()
-            }
-            .can_inline()
-        );
-        assert!(
-            !InlineMutationPolicy {
-                has_retention_filters: true,
-                ..base_policy()
-            }
-            .can_inline()
-        );
-    }
-
-    #[test]
     fn inline_buffer_allows_boundary_row_count() {
+        let inline_max_rows =
+            i64::try_from(INLINE_MAX_ROWS).expect("INLINE_MAX_ROWS should fit in i64");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from_iter_values(
-                0..INLINE_MAX_ROWS as i64,
-            ))],
+            vec![Arc::new(Int64Array::from_iter_values(0..inline_max_rows))],
         )
         .expect("batch should be valid");
 
@@ -464,12 +428,12 @@ mod tests {
 
     #[test]
     fn inline_buffer_exceeds_after_row_limit() {
+        let inline_max_rows =
+            i64::try_from(INLINE_MAX_ROWS).expect("INLINE_MAX_ROWS should fit in i64");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from_iter_values(
-                0..(INLINE_MAX_ROWS as i64 + 1),
-            ))],
+            vec![Arc::new(Int64Array::from_iter_values(0..=inline_max_rows))],
         )
         .expect("batch should be valid");
 

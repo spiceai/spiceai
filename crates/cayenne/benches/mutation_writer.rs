@@ -19,8 +19,9 @@ limitations under the License.
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};

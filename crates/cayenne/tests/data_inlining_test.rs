@@ -682,7 +682,7 @@ async fn test_inline_memtable_pressure_flushes_after_legacy_deletes(
     let delete_keys = (0..66_i64).map(i64::to_be_bytes).collect::<Vec<[u8; 8]>>();
     let delete_key_values = delete_keys
         .iter()
-        .map(|key| key.as_slice())
+        .map(<[u8; 8]>::as_slice)
         .collect::<Vec<_>>();
     let delete_batch = RecordBatch::try_new(
         Arc::clone(&delete_schema),
