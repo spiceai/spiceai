@@ -49,3 +49,7 @@ tokio.workspace = true
 [[bench]]
 harness = false
 name = "data_source_tree_display"
+
+[[bench]]
+harness = false
+name = "join_accumulator"
