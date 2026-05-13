@@ -145,10 +145,6 @@ impl DataSink for CayenneDataSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
-        // Acquire write lock to serialize all writes (append and overwrite) and
-        // prevent concurrent races on catalog state, snapshot IDs, and listing table.
-        let _write_guard = self.table.write_lock().lock().await;
-
         // Normalize incoming batches to the table schema (e.g. CDC nullability mismatches)
         // causing Vortex assertion failures.
         let target_schema = Arc::clone(&self.schema);
@@ -163,10 +159,17 @@ impl DataSink for CayenneDataSink {
         ));
 
         if self.overwrite == InsertOp::Overwrite {
+            // Overwrite path: `CayenneTableProvider::begin_overwrite` acquires the
+            // table write lock internally and the lock is held inside the
+            // returned `PreparedOverwrite` until `finish`/`rollback`. Acquiring
+            // it again here would deadlock.
             self.write_all_overwrite(normalized)
                 .await
                 .map_err(Into::into)
         } else {
+            // Append path: `write_all_append` uses the existing-staging helpers
+            // that assume the caller already holds the write lock.
+            let _write_guard = self.table.write_lock().lock().await;
             self.write_all_append(normalized, context)
                 .await
                 .map_err(Into::into)
@@ -546,110 +549,32 @@ impl CayenneDataSink {
         Ok(true)
     }
 
-    /// Handles overwrite mode writes by creating a new snapshot:
-    /// 1. Generates a new `UUIDv7` snapshot ID
-    /// 2. Writes data to the new snapshot directory with memory bounds
-    /// 3. Syncs the directory for durability (local paths only)
-    /// 4. Atomically updates the catalog to point to the new snapshot
-    /// 5. Updates in-memory state (snapshot ID, listing table, deletion caches)
-    /// 6. Triggers cleanup of old snapshots
+    /// Handles overwrite-mode writes by staging the new snapshot via
+    /// [`CayenneTableProvider::begin_overwrite`] and then committing it
+    /// through a dedicated single-partition transaction.
+    ///
+    /// 1. [`begin_overwrite`] writes the input stream to a fresh
+    ///    `<table_id>/<new_snapshot>/` directory and acquires the table write
+    ///    lock.
+    /// 2. [`PreparedOverwrite::apply_owned_txn`] flips the catalog pointer
+    ///    via the trait-based `commit_compaction` (own transaction, with
+    ///    retry-on-conflict), preserving exact pre-issue-#10125 retry
+    ///    semantics for non-coordinated writes.
+    /// 3. [`PreparedOverwrite::finish`] updates the in-memory snapshot id,
+    ///    listing table, deletion caches, inlined-data caches, and triggers
+    ///    old-snapshot GC.
+    ///
+    /// Cross-partition coordinators (issue #10125 step 4b) take the same
+    /// `PreparedOverwrite` handle and call
+    /// [`PreparedOverwrite::apply_in_txn`] inside one shared transaction
+    /// so every participating partition's pointer flip is atomic.
     async fn write_all_overwrite(&self, data: SendableRecordBatchStream) -> super::Result<u64> {
-        // Generate a new UUIDv7 for the snapshot
-        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-
-        let is_s3 = self.table.table_path().starts_with("s3://");
-
-        // For local paths, ensure the snapshot directory exists
-        // S3 doesn't require directory creation (object storage creates paths on write)
-        if !is_s3 {
-            let snapshot_dir = self.table.snapshot_dir_path_for(&new_snapshot_id);
-            CayenneTableProvider::ensure_snapshot_dir_exists(&snapshot_dir).await?;
-        }
-
-        // Write data to the new snapshot.
-        let target_size = self.context.target_file_size_bytes();
-        let (total_rows, _files_written, write_stats_acc) = self
-            .table
-            .write_to_snapshot(data, target_size, &new_snapshot_id)
-            .await?;
-
-        // Sync the snapshot directory to ensure all data is durably written.
-        // This is critical for ACID durability - we must ensure data files are
-        // on disk before updating the catalog metadata.
-        if !is_s3 {
-            let snapshot_dir = self.table.snapshot_dir_path_for(&new_snapshot_id);
-            CayenneTableProvider::sync_snapshot_dir(&snapshot_dir).await?;
-        }
-
-        // Atomically update the catalog snapshot and clear any delete files.
-        // For overwrite operations, any existing delete files are stale since
-        // we're replacing all data. Using commit_compaction ensures atomicity.
-        self.table.commit_overwrite(&new_snapshot_id).await?;
-
-        // Update the in-memory snapshot ID to match the new catalog state
-        self.table.update_current_snapshot_id(&new_snapshot_id)?;
-
-        // Clear any in-memory deletion caches since all data was replaced
-        if let Err(e) = self.table.clear_all_deletion_caches() {
-            tracing::warn!(
-                "Failed to clear deletion caches after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
-
-        // Update the provider's listing table to point to the new snapshot
-        // This ensures subsequent queries in the same context will read from the new data
-        self.table
-            .update_listing_table_for_snapshot(&new_snapshot_id)
-            .await?;
-
-        // Trigger cleanup of old snapshot directories after successful full refresh
-        self.table
-            .trigger_old_snapshot_cleanup(&new_snapshot_id)
-            .await;
-
-        // Clear stale inlined data and file stats since all data was replaced.
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_inlined_data(self.table.table_id())
+        let prepared = self.table.begin_overwrite(data).await?;
+        prepared
+            .apply_owned_txn()
             .await
-        {
-            tracing::warn!(
-                "Failed to clear inlined data after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_inlined_deletes(self.table.table_id())
-            .await
-        {
-            tracing::warn!(
-                "Failed to clear inlined deletes after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
-        // Clear the prior statistics row before upserting so a zero-row
-        // overwrite leaves no stats at all (rather than stale stats that
-        // describe rows the overwrite just deleted). `persist_table_stats`
-        // is a no-op when the accumulator is empty, so the clear is what
-        // actually removes the stale row in that case.
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_table_statistics(self.table.table_id())
-            .await
-        {
-            tracing::warn!(
-                "Failed to clear table statistics after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
-        self.table.persist_table_stats(&write_stats_acc).await;
-
-        Ok(total_rows)
+            .map_err(super::Error::from)?;
+        prepared.finish().await
     }
 }
 
