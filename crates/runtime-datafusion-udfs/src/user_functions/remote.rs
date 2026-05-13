@@ -37,6 +37,11 @@ limitations under the License.
 //!   * `max_response_bytes` — maximum response body size decoded from the function server, default `10MiB`.
 //!   * `max_rows` — maximum table-function response rows without a query `LIMIT`, default `100000`.
 //!   * `auth_bearer` — optional `Authorization: Bearer <value>` header value (already secret-resolved by the caller).
+//!   * `allowed_endpoint_ranges` — optional list of CIDR ranges that may be
+//!     targeted even when they are non-public / metadata IPs. Default `[]`; set
+//!     to `["*"]` only for trusted deployments to allow
+//!     every endpoint range. Literal hosts are checked at build time and DNS
+//!     results are checked by the HTTP client before connecting to prevent SSRF.
 //!
 //! Remote beta functions use Arrow's JSON reader/writer, supporting scalar and
 //! complex Arrow types that have a JSON representation.
@@ -44,6 +49,7 @@ limitations under the License.
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::hash::Hash;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -74,6 +80,7 @@ use datafusion::sql::TableReference;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use futures::{StreamExt, stream};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::de::DeserializeOwned;
@@ -99,6 +106,7 @@ const MAX_TABLE_RESPONSE_ROWS: usize = 1_000_000;
 const MAX_SCALAR_TABLE_RESPONSE_ROWS: usize = 1;
 const MAX_ERROR_BODY_BYTES: usize = 4096;
 const ERROR_SNIPPET_CHARS: usize = 256;
+const ALLOWED_ENDPOINT_RANGES_PARAM: &str = "allowed_endpoint_ranges";
 
 #[derive(Debug, Snafu)]
 pub enum RemoteBuildError {
@@ -138,14 +146,21 @@ pub enum RemoteBuildError {
     #[snafu(display("duplicate column '{column}' in remote function input table '{table}'"))]
     DuplicateInputTableColumn { table: String, column: String },
 
-    #[snafu(display("failed to parse endpoint URL '{from}': {source}"))]
-    InvalidEndpoint {
-        from: String,
-        source: url::ParseError,
-    },
+    #[snafu(display("failed to parse endpoint URL: {source}"))]
+    InvalidEndpoint { source: url::ParseError },
 
     #[snafu(display("endpoint scheme '{scheme}' is not supported; use `http://` or `https://`"))]
     UnsupportedScheme { scheme: String },
+
+    #[snafu(display(
+        "endpoint host '{host}' resolves to a non-public address and is rejected \
+            to prevent SSRF; add a specific CIDR to \
+            `allowed_endpoint_ranges` in `params`, or set it to [\"*\"] only for trusted endpoints"
+    ))]
+    PrivateEndpoint { host: String },
+
+    #[snafu(display("endpoint URL with scheme '{scheme}' is missing a host"))]
+    MissingHost { scheme: String },
 
     #[snafu(display("param '{key}' is expected to be a {expected}, got {got}"))]
     InvalidParam {
@@ -177,7 +192,8 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
         return build_scalar_table_arg_udf(decl);
     }
 
-    let endpoint = parse_endpoint(&decl.from)?;
+    let endpoint_policy = endpoint_access_policy(decl)?;
+    let endpoint = parse_endpoint(&decl.from, &endpoint_policy)?;
 
     let arg_names: Vec<String> = decl.signature.args.iter().map(|a| a.name.clone()).collect();
     let arg_types: Vec<DataType> = decl
@@ -207,11 +223,7 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
         headers.insert(AUTHORIZATION, hv);
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .default_headers(headers)
-        .build()
-        .context(BuildClientSnafu)?;
+    let client = build_http_client(timeout, headers, &endpoint_policy)?;
 
     let signature = Signature::exact(arg_types.clone(), map_volatility(decl.volatility));
 
@@ -233,7 +245,8 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
 }
 
 fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
-    let endpoint = parse_endpoint(&decl.from)?;
+    let endpoint_policy = endpoint_access_policy(decl)?;
+    let endpoint = parse_endpoint(&decl.from, &endpoint_policy)?;
     let arg_schema = function_arg_schema(&decl.signature.args)?;
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let (return_type, output_schema) = scalar_return_schema(decl)?;
@@ -250,11 +263,7 @@ fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
         headers.insert(AUTHORIZATION, hv);
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .default_headers(headers)
-        .build()
-        .context(BuildClientSnafu)?;
+    let client = build_http_client(timeout, headers, &endpoint_policy)?;
 
     let table_func = Arc::new(RemoteTableFunc {
         name: decl.name.clone(),
@@ -289,7 +298,8 @@ fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
 /// Returns [`RemoteBuildError`] when the endpoint, signature, params, or HTTP
 /// client cannot be constructed.
 pub fn build_table_udtf(decl: &Function) -> Result<Arc<dyn TableFunctionImpl>> {
-    let endpoint = parse_endpoint(&decl.from)?;
+    let endpoint_policy = endpoint_access_policy(decl)?;
+    let endpoint = parse_endpoint(&decl.from, &endpoint_policy)?;
     let arg_schema = function_arg_schema(&decl.signature.args)?;
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let output_schema = table_return_schema(decl)?;
@@ -306,11 +316,7 @@ pub fn build_table_udtf(decl: &Function) -> Result<Arc<dyn TableFunctionImpl>> {
         headers.insert(AUTHORIZATION, hv);
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .default_headers(headers)
-        .build()
-        .context(BuildClientSnafu)?;
+    let client = build_http_client(timeout, headers, &endpoint_policy)?;
 
     Ok(Arc::new(RemoteTableFunc {
         name: decl.name.clone(),
@@ -968,17 +974,369 @@ fn sanitize_body_for_error(body: &str, already_truncated: bool) -> String {
     }
 }
 
-fn parse_endpoint(from: &str) -> Result<Url> {
-    let url = Url::parse(from).map_err(|source| RemoteBuildError::InvalidEndpoint {
-        from: from.to_string(),
-        source,
-    })?;
+fn endpoint_access_policy(decl: &Function) -> Result<EndpointAccessPolicy> {
+    parse_endpoint_policy(decl.params.get(ALLOWED_ENDPOINT_RANGES_PARAM))
+}
+
+fn build_http_client(
+    timeout: Duration,
+    headers: HeaderMap,
+    endpoint_policy: &EndpointAccessPolicy,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(headers);
+    if !endpoint_policy.allow_all {
+        builder = builder.dns_resolver(Arc::new(EndpointFilteringResolver::system(
+            endpoint_policy.clone(),
+        )));
+    }
+    builder.build().context(BuildClientSnafu)
+}
+
+fn parse_endpoint(from: &str, endpoint_policy: &EndpointAccessPolicy) -> Result<Url> {
+    let url = Url::parse(from).map_err(|source| RemoteBuildError::InvalidEndpoint { source })?;
     match url.scheme() {
-        "http" | "https" => Ok(url),
-        other => Err(RemoteBuildError::UnsupportedScheme {
-            scheme: other.to_string(),
+        "http" | "https" => {}
+        other => {
+            return Err(RemoteBuildError::UnsupportedScheme {
+                scheme: other.to_string(),
+            });
+        }
+    }
+    let host = url.host().ok_or_else(|| RemoteBuildError::MissingHost {
+        scheme: url.scheme().to_string(),
+    })?;
+
+    if let Some(reason) = host_endpoint_rejection(&host, endpoint_policy) {
+        tracing::warn!(
+            endpoint_host = %host,
+            endpoint_port = ?url.port_or_known_default(),
+            reason,
+            "rejecting remote UDF endpoint that targets a non-public address"
+        );
+        return Err(RemoteBuildError::PrivateEndpoint {
+            host: host.to_string(),
+        });
+    }
+    Ok(url)
+}
+
+fn host_endpoint_rejection(
+    host: &url::Host<&str>,
+    endpoint_policy: &EndpointAccessPolicy,
+) -> Option<&'static str> {
+    match host {
+        url::Host::Domain(d) => {
+            // Treat the literal "localhost" label and metadata-style
+            // names that some platforms hand out as if they were the
+            // IPs they conventionally resolve to. This is best-effort:
+            // an attacker controlling DNS can still point an arbitrary
+            // name at a private IP.
+            let lower = d.trim_end_matches('.').to_ascii_lowercase();
+            if !endpoint_policy.allow_all
+                && endpoint_policy.allowed_ranges.is_empty()
+                && (lower == "localhost"
+                    || lower.ends_with(".localhost")
+                    || lower == "metadata"
+                    || lower == "metadata.google.internal")
+            {
+                Some("hostname resolves to a loopback or metadata service")
+            } else {
+                None
+            }
+        }
+        url::Host::Ipv4(ip) => endpoint_policy.rejection_reason(IpAddr::V4(*ip)),
+        url::Host::Ipv6(ip) => endpoint_policy.rejection_reason(IpAddr::V6(*ip)),
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct EndpointAccessPolicy {
+    allow_all: bool,
+    allowed_ranges: Vec<IpCidr>,
+}
+
+impl EndpointAccessPolicy {
+    fn rejection_reason(&self, ip: IpAddr) -> Option<&'static str> {
+        if self.allow_all {
+            return None;
+        }
+        let normalized = normalize_ipv4_mapped(ip);
+        let reason = ip_addr_is_disallowed(normalized)?;
+        if self.allows_ip(ip) || self.allows_ip(normalized) {
+            None
+        } else {
+            Some(reason)
+        }
+    }
+
+    fn allows_ip(&self, ip: IpAddr) -> bool {
+        self.allow_all || self.allowed_ranges.iter().any(|range| range.contains(ip))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IpCidr {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl IpCidr {
+    fn parse(input: &str) -> Option<Self> {
+        let (addr, prefix) = input.split_once('/')?;
+        let ip = addr.parse::<IpAddr>().ok()?;
+        let prefix = prefix.parse::<u8>().ok()?;
+        match ip {
+            IpAddr::V4(ip) if prefix <= 32 => Some(Self {
+                network: IpAddr::V4(mask_ipv4(ip, prefix)),
+                prefix,
+            }),
+            IpAddr::V6(ip) if prefix <= 128 => Some(Self {
+                network: IpAddr::V6(mask_ipv6(ip, prefix)),
+                prefix,
+            }),
+            _ => None,
+        }
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.network, ip) {
+            (IpAddr::V4(network), IpAddr::V4(ip)) => mask_ipv4(ip, self.prefix) == network,
+            (IpAddr::V6(network), IpAddr::V6(ip)) => mask_ipv6(ip, self.prefix) == network,
+            _ => false,
+        }
+    }
+}
+
+fn mask_ipv4(ip: Ipv4Addr, prefix: u8) -> Ipv4Addr {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    Ipv4Addr::from(u32::from(ip) & mask)
+}
+
+fn mask_ipv6(ip: Ipv6Addr, prefix: u8) -> Ipv6Addr {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix))
+    };
+    Ipv6Addr::from(u128::from(ip) & mask)
+}
+
+fn normalize_ipv4_mapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .or_else(|| ipv4_compatible_addr(ip))
+            .map_or(IpAddr::V6(ip), IpAddr::V4),
+        IpAddr::V4(ip) => IpAddr::V4(ip),
+    }
+}
+
+fn ipv4_compatible_addr(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    let octets = ip.octets();
+    if octets[..12].iter().all(|&octet| octet == 0) {
+        Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
+    }
+}
+
+fn ip_addr_is_disallowed(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(ip) => ipv4_addr_is_disallowed(ip),
+        IpAddr::V6(ip) => ipv6_addr_is_disallowed(ip),
+    }
+}
+
+fn ipv4_addr_is_disallowed(ip: Ipv4Addr) -> Option<&'static str> {
+    if ipv4_addr_is_global_endpoint(ip) {
+        None
+    } else {
+        Some("IPv4 non-public address")
+    }
+}
+
+fn ipv6_addr_is_disallowed(ip: Ipv6Addr) -> Option<&'static str> {
+    if ipv6_addr_is_global_endpoint(ip) {
+        None
+    } else {
+        Some("IPv6 non-public address")
+    }
+}
+
+fn ipv4_addr_is_global_endpoint(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !(octets[0] == 0
+        || ip.is_private()
+        || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000)
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || matches!(octets, [192, 0, 0, _])
+        || ip.is_documentation()
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+        || ip.is_multicast()
+        || octets[0] >= 240)
+}
+
+fn ipv6_addr_is_global_endpoint(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let bits = u128::from(ip);
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || matches!(segments, [0, 0, 0, 0, 0, 0xffff, _, _])
+        || matches!(segments, [0x64, 0xff9b, 0, 0, 0, 0, _, _])
+        || matches!(segments, [0x64, 0xff9b, 1, _, _, _, _, _])
+        || matches!(segments, [0x100, 0, 0, 0, _, _, _, _])
+        || (matches!(segments, [0x2001, b, _, _, _, _, _, _] if b < 0x200)
+            && !(bits == 0x2001_0001_0000_0000_0000_0000_0000_0001
+                || bits == 0x2001_0001_0000_0000_0000_0000_0000_0002
+                || matches!(segments, [0x2001, 3, _, _, _, _, _, _])
+                || matches!(segments, [0x2001, 4, 0x112, _, _, _, _, _])
+                || matches!(segments, [0x2001, b, _, _, _, _, _, _] if (0x20..=0x3f).contains(&b))))
+        || matches!(segments, [0x2002, _, _, _, _, _, _, _])
+        || matches!(segments, [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..])
+        || matches!(segments, [0x5f00, ..])
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0)
+}
+
+fn parse_endpoint_policy(v: Option<&Value>) -> Result<EndpointAccessPolicy> {
+    match v {
+        None | Some(Value::Null) => Ok(EndpointAccessPolicy::default()),
+        Some(Value::Array(values)) => {
+            if values.is_empty() {
+                return Ok(EndpointAccessPolicy::default());
+            }
+            if values.len() == 1 && values[0].as_str() == Some("*") {
+                return Ok(EndpointAccessPolicy {
+                    allow_all: true,
+                    allowed_ranges: vec![],
+                });
+            }
+            let mut allowed_ranges = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(range) = value.as_str() else {
+                    return Err(RemoteBuildError::InvalidParam {
+                        key: ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+                        expected: "array of CIDR range strings or [\"*\"]".into(),
+                        got: format!("{value}"),
+                    });
+                };
+                if range == "*" {
+                    return Err(RemoteBuildError::InvalidParam {
+                        key: ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+                        expected: "[\"*\"] by itself or CIDR range strings".into(),
+                        got: format!("{values:?}"),
+                    });
+                }
+                let Some(cidr) = IpCidr::parse(range) else {
+                    return Err(RemoteBuildError::InvalidParam {
+                        key: ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+                        expected: "CIDR range like '10.20.5.42/32' or [\"*\"]".into(),
+                        got: range.to_string(),
+                    });
+                };
+                allowed_ranges.push(cidr);
+            }
+            Ok(EndpointAccessPolicy {
+                allow_all: false,
+                allowed_ranges,
+            })
+        }
+        Some(other) => Err(RemoteBuildError::InvalidParam {
+            key: ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            expected: "array of CIDR range strings or [\"*\"]".into(),
+            got: format!("{other}"),
         }),
     }
+}
+
+struct SystemDnsResolver;
+
+impl Resolve for SystemDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = tokio::net::lookup_host((host, 0)).await?;
+            Ok(Box::new(addrs) as Addrs)
+        })
+    }
+}
+
+struct EndpointFilteringResolver {
+    inner: Arc<dyn Resolve>,
+    policy: EndpointAccessPolicy,
+}
+
+impl EndpointFilteringResolver {
+    fn system(policy: EndpointAccessPolicy) -> Self {
+        Self {
+            inner: Arc::new(SystemDnsResolver),
+            policy,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_inner(policy: EndpointAccessPolicy, inner: Arc<dyn Resolve>) -> Self {
+        Self { inner, policy }
+    }
+}
+
+impl Resolve for EndpointFilteringResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        let inner = Arc::clone(&self.inner);
+        let policy = self.policy.clone();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = inner.resolve(name).await?.collect();
+            let addrs = filter_resolved_addrs(&policy, &host, addrs)
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+fn filter_resolved_addrs(
+    policy: &EndpointAccessPolicy,
+    host: &str,
+    addrs: Vec<SocketAddr>,
+) -> std::result::Result<Vec<SocketAddr>, std::io::Error> {
+    let mut allowed = Vec::with_capacity(addrs.len());
+    let mut first_rejected = None;
+
+    for addr in addrs {
+        if let Some(reason) = policy.rejection_reason(addr.ip()) {
+            first_rejected.get_or_insert((addr.ip(), reason));
+        } else {
+            allowed.push(addr);
+        }
+    }
+
+    if allowed.is_empty()
+        && let Some((ip, reason)) = first_rejected
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "remote UDF endpoint host '{host}' resolved only to disallowed addresses, including {ip} ({reason}); add a specific CIDR to `{ALLOWED_ENDPOINT_RANGES_PARAM}` or set it to [\"*\"] only for trusted endpoints"
+            ),
+        ));
+    }
+
+    Ok(allowed)
 }
 
 fn parse_timeout(v: Option<&Value>) -> Result<Duration> {
@@ -1570,6 +1928,17 @@ mod tests {
         groups: &'static [&'static str],
     }
 
+    struct StaticResolver {
+        addrs: Vec<SocketAddr>,
+    }
+
+    impl Resolve for StaticResolver {
+        fn resolve(&self, _name: Name) -> Resolving {
+            let addrs = self.addrs.clone();
+            Box::pin(async move { Ok(Box::new(addrs.into_iter()) as Addrs) })
+        }
+    }
+
     impl runtime_auth::AuthPrincipal for TestPrincipal {
         fn username(&self) -> &'static str {
             "test"
@@ -1671,6 +2040,17 @@ mod tests {
         decl
     }
 
+    /// Round-trip tests bind a mock HTTP server on `127.0.0.1:0`. The endpoint
+    /// guard would normally reject loopback endpoints, so allow only that exact
+    /// loopback host range for these test declarations.
+    fn with_loopback_range_allowed(mut decl: Function) -> Function {
+        decl.params.insert(
+            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("127.0.0.1/32".into())]),
+        );
+        decl
+    }
+
     fn register_numbers(ctx: &SessionContext) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -1718,6 +2098,223 @@ mod tests {
         let d = sample_decl("not-a-url");
         let err = build_scalar_udf(&d).expect_err("invalid URL rejected");
         assert!(matches!(err, RemoteBuildError::InvalidEndpoint { .. }));
+    }
+
+    #[test]
+    fn endpoint_parse_rejects_malformed_url_with_endpoint_range() {
+        let mut d = sample_decl("http://");
+        d.params.insert(
+            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("10.0.0.0/8".into())]),
+        );
+        let err = build_scalar_udf(&d).expect_err("malformed endpoint rejected");
+        assert!(matches!(err, RemoteBuildError::InvalidEndpoint { .. }));
+    }
+
+    #[test]
+    fn endpoint_parse_redacts_invalid_endpoint_url() {
+        let d = sample_decl("http://user:secret@example.com:bad/udf?token=secret#fragment");
+        let err = build_scalar_udf(&d).expect_err("invalid endpoint rejected");
+        let msg = err.to_string();
+        assert!(matches!(err, RemoteBuildError::InvalidEndpoint { .. }));
+        assert!(
+            !msg.contains("secret"),
+            "error leaked endpoint secret: {msg}"
+        );
+        assert!(!msg.contains("token"), "error leaked query string: {msg}");
+        assert!(!msg.contains("fragment"), "error leaked fragment: {msg}");
+    }
+
+    #[test]
+    fn endpoint_parse_rejects_private_addresses_by_default() {
+        // Cloud metadata IPs (AWS / GCP / Azure all use 169.254.169.254).
+        for from in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/udf",
+            "http://10.0.0.1/udf",
+            "http://192.168.1.1/udf",
+            "http://172.16.0.1/udf",
+            "http://0.0.0.0/udf",
+            "http://0.0.0.1/udf",
+            "http://192.0.0.9/udf",
+            "http://192.0.0.10/udf",
+            "http://192.0.2.1/udf",
+            "http://198.18.0.1/udf",
+            "http://localhost/udf",
+            "http://localhost./udf",
+            "http://service.localhost./udf",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://metadata.google.internal./computeMetadata/v1/",
+            "http://[::1]/udf",
+            "http://[fe80::1]/udf",
+            "http://[fc00::1]/udf",
+            "http://[2001:db8::1]/udf",
+            "http://[64:ff9b::a9fe:a9fe]/udf",
+            "http://[::ffff:127.0.0.1]/udf",
+            "http://[::ffff:0.0.0.0]/udf",
+            "http://[::ffff:0.0.0.1]/udf",
+            "http://[::ffff:198.18.0.1]/udf",
+            "http://[::ffff:100.64.0.1]/udf",
+            "http://[::ffff:224.0.0.1]/udf",
+            "http://[::ffff:255.255.255.255]/udf",
+            "http://[::127.0.0.1]/udf",
+            "http://[::10.0.0.1]/udf",
+            "http://[::169.254.169.254]/udf",
+            "http://[::100.64.0.1]/udf",
+        ] {
+            let d = sample_decl(from);
+            let err = build_scalar_udf(&d)
+                .err()
+                .unwrap_or_else(|| panic!("expected rejection of private endpoint {from}"));
+            assert!(
+                matches!(err, RemoteBuildError::PrivateEndpoint { .. }),
+                "expected PrivateEndpoint for {from}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_parse_allows_configured_non_public_range() {
+        let mut d = sample_decl("http://198.18.0.1:9000/udf");
+        d.params.insert(
+            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("198.18.0.1/32".into())]),
+        );
+        build_scalar_udf(&d).expect("non-public endpoint allowed by explicit CIDR");
+    }
+
+    #[test]
+    fn endpoint_parse_rejects_private_address_with_typed_error() {
+        let d = sample_decl("http://169.254.169.254/latest/meta-data/");
+        let err = build_scalar_udf(&d).expect_err("metadata IP rejected");
+        assert!(
+            matches!(err, RemoteBuildError::PrivateEndpoint { .. }),
+            "expected PrivateEndpoint, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_parse_allows_public_addresses() {
+        // 8.8.8.8 is public; should be accepted.
+        let d = sample_decl("http://8.8.8.8/udf");
+        build_scalar_udf(&d).expect("public IP accepted");
+
+        let d = sample_decl("https://example.com/udf");
+        build_scalar_udf(&d).expect("public domain accepted");
+    }
+
+    #[test]
+    fn endpoint_parse_allows_private_with_allowed_range() {
+        let mut d = sample_decl("http://127.0.0.1:9000/udf");
+        d.params.insert(
+            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("127.0.0.1/32".into())]),
+        );
+        build_scalar_udf(&d).expect("private endpoint allowed by explicit CIDR");
+    }
+
+    #[test]
+    fn endpoint_parse_allows_localhost_domain_with_allowed_range() {
+        let mut d = sample_decl("http://localhost:9000/udf");
+        d.params.insert(
+            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("127.0.0.1/32".into())]),
+        );
+        build_scalar_udf(&d).expect("localhost endpoint allowed by explicit CIDR");
+    }
+
+    #[test]
+    fn endpoint_parse_allows_all_ranges_with_wildcard() {
+        let mut d = sample_decl("http://metadata.google.internal/computeMetadata/v1/");
+        d.params.insert(
+            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("*".into())]),
+        );
+        build_scalar_udf(&d).expect("wildcard range allows all endpoints");
+    }
+
+    #[test]
+    fn endpoint_parse_rejects_invalid_allowed_range_value() {
+        let mut d = sample_decl("http://127.0.0.1:9000/udf");
+        d.params.insert(
+            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("definitely".into())]),
+        );
+        let err = build_scalar_udf(&d).expect_err("non-CIDR endpoint range rejected");
+        assert!(
+            matches!(err, RemoteBuildError::InvalidParam { ref key, .. } if key == ALLOWED_ENDPOINT_RANGES_PARAM),
+            "expected InvalidParam, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_filtering_resolver_rejects_disallowed_dns_result() {
+        let resolver = EndpointFilteringResolver::with_inner(
+            EndpointAccessPolicy::default(),
+            Arc::new(StaticResolver {
+                addrs: vec!["10.20.5.42:0".parse().expect("valid socket address")],
+            }),
+        );
+
+        match resolver
+            .resolve("udf.internal.svc".parse().expect("valid dns name"))
+            .await
+        {
+            Ok(_) => panic!("private resolved address should be rejected"),
+            Err(err) => assert!(err.to_string().contains("10.20.5.42")),
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_filtering_resolver_filters_disallowed_dns_results() {
+        let resolver = EndpointFilteringResolver::with_inner(
+            EndpointAccessPolicy::default(),
+            Arc::new(StaticResolver {
+                addrs: vec![
+                    "10.20.5.42:0".parse().expect("valid socket address"),
+                    "8.8.8.8:0".parse().expect("valid socket address"),
+                ],
+            }),
+        );
+
+        match resolver
+            .resolve("udf.internal.svc".parse().expect("valid dns name"))
+            .await
+        {
+            Ok(mut addrs) => {
+                assert_eq!(
+                    addrs.next().expect("one allowed resolved address").ip(),
+                    "8.8.8.8".parse::<IpAddr>().expect("valid IP")
+                );
+                assert!(addrs.next().is_none(), "disallowed address was filtered");
+            }
+            Err(err) => panic!("mixed DNS results should keep allowed addresses: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_filtering_resolver_allows_configured_dns_range() {
+        let policy = parse_endpoint_policy(Some(&serde_json::Value::Array(vec![
+            serde_json::Value::String("10.20.5.42/32".into()),
+        ])))
+        .expect("CIDR range parses");
+        let resolver = EndpointFilteringResolver::with_inner(
+            policy,
+            Arc::new(StaticResolver {
+                addrs: vec!["10.20.5.42:0".parse().expect("valid socket address")],
+            }),
+        );
+
+        match resolver
+            .resolve("udf.internal.svc".parse().expect("valid dns name"))
+            .await
+        {
+            Ok(mut addrs) => assert_eq!(
+                addrs.next().expect("one resolved address").ip(),
+                "10.20.5.42".parse::<IpAddr>().expect("valid IP")
+            ),
+            Err(err) => panic!("configured range should be allowed: {err}"),
+        }
     }
 
     #[test]
@@ -1854,7 +2451,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let decl = sample_table_decl(&format!("http://{addr}/rows"));
+        let decl = with_loopback_range_allowed(sample_table_decl(&format!("http://{addr}/rows")));
         let udtf = build_table_udtf(&decl).expect("builds");
         let ctx = SessionContext::new();
         ctx.register_udtf(&decl.name, udtf);
@@ -1924,7 +2521,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let decl = sample_table_decl(&format!("http://{addr}/rows"));
+        let decl = with_loopback_range_allowed(sample_table_decl(&format!("http://{addr}/rows")));
         let udtf = build_table_udtf(&decl).expect("builds");
         let ctx = SessionContext::new();
         ctx.register_udtf(&decl.name, udtf);
@@ -2030,7 +2627,9 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let decl = sample_dynamic_scalar_decl(&format!("http://{addr}/scalar"));
+        let decl = with_loopback_range_allowed(sample_dynamic_scalar_decl(&format!(
+            "http://{addr}/scalar"
+        )));
         let udf = build_scalar_udf(&decl).expect("builds");
         let ctx = SessionContext::new();
         register_numbers(&ctx);
@@ -2088,7 +2687,8 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let decl = sample_dynamic_table_decl(&format!("http://{addr}/rows"));
+        let decl =
+            with_loopback_range_allowed(sample_dynamic_table_decl(&format!("http://{addr}/rows")));
         let udtf = build_table_udtf(&decl).expect("builds");
         let ctx = SessionContext::new();
         register_numbers(&ctx);
