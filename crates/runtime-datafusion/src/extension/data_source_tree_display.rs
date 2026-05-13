@@ -268,8 +268,8 @@ mod tests {
             "baseline tree should not yet contain limit, got:\n{baseline}"
         );
 
-        let optimizer = DataSourceTreeDisplayOptimizer::new();
-        let optimized = optimizer.optimize(Arc::clone(&plan), &ConfigOptions::new())?;
+        let opt = DataSourceTreeDisplayOptimizer::new();
+        let optimized = opt.optimize(Arc::clone(&plan), &ConfigOptions::new())?;
 
         let rendered = displayable(optimized.as_ref()).tree_render().to_string();
         assert!(
@@ -294,8 +294,8 @@ mod tests {
         let plan = data_source_exec_with_fetch(None)?;
 
         let before = displayable(plan.as_ref()).tree_render().to_string();
-        let optimizer = DataSourceTreeDisplayOptimizer::new();
-        let optimized = optimizer.optimize(Arc::clone(&plan), &ConfigOptions::new())?;
+        let opt = DataSourceTreeDisplayOptimizer::new();
+        let optimized = opt.optimize(Arc::clone(&plan), &ConfigOptions::new())?;
         let after = displayable(optimized.as_ref()).tree_render().to_string();
 
         assert_eq!(before, after);
@@ -309,8 +309,8 @@ mod tests {
         // contents gain a `limit` line.
         let plan = data_source_exec_with_fetch(Some(5))?;
 
-        let optimizer = DataSourceTreeDisplayOptimizer::new();
-        let optimized = optimizer.optimize(plan, &ConfigOptions::new())?;
+        let opt = DataSourceTreeDisplayOptimizer::new();
+        let optimized = opt.optimize(plan, &ConfigOptions::new())?;
 
         let rendered = displayable(optimized.as_ref()).tree_render().to_string();
         assert!(
