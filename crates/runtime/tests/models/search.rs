@@ -317,11 +317,20 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value) {
 }
 
 fn use_structural_search_response_validation(test_name: &str) -> bool {
-    let is_s3_vectors_composite =
-        test_name.starts_with("s3vectors_composite") && !test_name.contains("with_where");
+    // S3 Vectors is a remote ANN backend: the specific items returned can vary across
+    // runs (not just their ordering), and model2vec similarity scores drift ±0.01
+    // across CI runner hardware which crosses 2-decimal rounding boundaries. Use
+    // structural validation for `s3vectors_*` HTTP search tests instead of exact
+    // snapshot comparison. The `vector_search_sql` paths exercise SQL ordering and
+    // are excluded. For non-chunking variants (basic / metadata / hybrid /
+    // multiple_embeddings / composite), `with_where` tests have deterministic filter
+    // expectations and are excluded; chunking `with_where` tests have historically
+    // used structural validation and continue to do so.
     let is_s3_vectors_chunking = test_name.starts_with("s3vectors_chunking");
+    let is_other_s3_vectors =
+        test_name.starts_with("s3vectors_") && !test_name.contains("with_where");
 
-    (is_s3_vectors_composite || is_s3_vectors_chunking) && !test_name.contains("vector_search_sql")
+    (is_s3_vectors_chunking || is_other_s3_vectors) && !test_name.contains("vector_search_sql")
 }
 
 /// Validate the structure and invariants of a search response without asserting exact item content.
