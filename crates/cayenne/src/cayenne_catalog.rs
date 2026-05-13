@@ -18,8 +18,8 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
-    TableStatistics,
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    PartitionMetadata, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -1411,6 +1411,31 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats> {
+        self.metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: r"
+                    SELECT
+                        COALESCE(SUM(record_count), 0),
+                        COUNT(*),
+                        COALESCE(SUM(LENGTH(data_ipc)), 0)
+                    FROM cayenne_inlined_data
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(InlinedDataStats {
+                        record_count: row.get_i64(0)?,
+                        entry_count: row.get_i64(1)?,
+                        ipc_bytes: row.get_i64(2)?,
+                    })
+                },
+            )
+            .await
+    }
+
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
@@ -1443,6 +1468,165 @@ impl MetadataCatalog for CayenneCatalog {
             })
             .await?;
         Ok(inlined_id)
+    }
+
+    async fn commit_inlined_mutation(
+        &self,
+        table_id: &str,
+        updated_data: Vec<InlinedData>,
+        deleted_inlined_ids: Vec<String>,
+        data: Vec<InlinedData>,
+    ) -> CatalogResult<()> {
+        if updated_data.is_empty() && deleted_inlined_ids.is_empty() && data.is_empty() {
+            return Ok(());
+        }
+
+        for updated in &updated_data {
+            if updated.table_id != table_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Inline data table_id '{}' does not match commit table_id '{table_id}'",
+                        updated.table_id
+                    ),
+                });
+            }
+            if updated.inlined_id.is_empty() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: "Updated inline data rows must include an inlined_id".to_string(),
+                });
+            }
+        }
+        for data_entry in &data {
+            if data_entry.table_id != table_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Inline data table_id '{}' does not match commit table_id '{table_id}'",
+                        data_entry.table_id
+                    ),
+                });
+            }
+        }
+
+        let sequence_increment = i64::from(!data.is_empty());
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "commit_inlined_mutation requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let tx = self.metastore.begin_transaction().await.map_err(|e| {
+                CatalogError::InvalidOperation {
+                    message: "Failed to begin inline mutation transaction".to_string(),
+                    source: Box::new(e),
+                }
+            })?;
+
+            if sequence_increment > 0 {
+                tx.execute(ExecuteParams {
+                    sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?1 WHERE table_id = ?2",
+                    params: vec![
+                        MetastoreValue::Integer(sequence_increment),
+                        MetastoreValue::Text(table_id.to_string()),
+                    ],
+                })
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to execute inline mutation transaction".to_string(),
+                    source: Box::new(e),
+                })?;
+            }
+
+            for updated in &updated_data {
+                tx.execute(ExecuteParams {
+                    sql: r"
+                    UPDATE cayenne_inlined_data
+                    SET data_ipc = ?1, record_count = ?2
+                    WHERE table_id = ?3 AND inlined_id = ?4
+                    ",
+                    params: vec![
+                        MetastoreValue::Blob(updated.data_ipc.clone()),
+                        MetastoreValue::Integer(updated.record_count),
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Text(updated.inlined_id.clone()),
+                    ],
+                })
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to execute inline mutation transaction".to_string(),
+                    source: Box::new(e),
+                })?;
+            }
+
+            for inlined_id in &deleted_inlined_ids {
+                tx.execute(ExecuteParams {
+                    sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1 AND inlined_id = ?2",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Text(inlined_id.clone()),
+                    ],
+                })
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to execute inline mutation transaction".to_string(),
+                    source: Box::new(e),
+                })?;
+            }
+
+            for data_entry in &data {
+                let inlined_id = if data_entry.inlined_id.is_empty() {
+                    uuid::Uuid::now_v7().to_string()
+                } else {
+                    data_entry.inlined_id.clone()
+                };
+                tx.execute(ExecuteParams {
+                    sql: r"
+                    INSERT INTO cayenne_inlined_data
+                        (inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number)
+                    VALUES (?1, ?2, ?3, ?4, ?5, (SELECT current_sequence_number FROM cayenne_table WHERE table_id = ?2))
+                    ",
+                    params: vec![
+                        MetastoreValue::Text(inlined_id),
+                        MetastoreValue::Text(table_id.to_string()),
+                        data_entry.partition_key.clone().into(),
+                        MetastoreValue::Blob(data_entry.data_ipc.clone()),
+                        MetastoreValue::Integer(data_entry.record_count),
+                    ],
+                })
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to execute inline mutation transaction".to_string(),
+                    source: Box::new(e),
+                })?;
+            }
+
+            match tx.commit().await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                    let delay = retry_backoff_delay(attempt);
+                    tracing::debug!(
+                        attempt,
+                        max_attempts,
+                        ?delay,
+                        "Retrying inline mutation transaction after commit conflict"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    return Err(CatalogError::InvalidOperation {
+                        message: "Failed to commit inline mutation transaction".to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_inlined_mutation exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
     }
 
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>> {
