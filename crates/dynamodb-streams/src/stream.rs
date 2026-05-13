@@ -17,7 +17,6 @@ use crate::checkpoint::{Checkpoint, CheckpointPosition};
 use crate::client_sdk::SDKClient;
 use crate::metrics::MetricsCollector;
 use crate::stream_state::{InitializingShard, PollOutcome, ShardPollResult, StreamState};
-use crate::{Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use futures::{Stream, future::join_all};
 use std::collections::HashMap;
@@ -37,7 +36,7 @@ pub struct DynamodbStreamProducer {
     pub stream_arn: String,
     pub state: StreamState,
     pub interval: Option<Duration>,
-    pub sender: mpsc::Sender<StreamResult>,
+    pub sender: mpsc::Sender<DynamoDBStreamBatch>,
     pub client: Arc<SDKClient>,
     pub retry_strategy: RetryBackoff,
     pub metrics_collector: Arc<MetricsCollector>,
@@ -52,13 +51,12 @@ pub struct DynamoDBStreamBatch {
 const DEFAULT_SLEEP_DURATION: Duration = Duration::from_millis(500);
 
 impl DynamodbStreamProducer {
-    async fn collect(&mut self) -> Result<(DynamoDBStreamBatch, bool)> {
+    async fn collect(&mut self) -> (DynamoDBStreamBatch, bool) {
         let mut poll_results = Vec::new();
-        let mut had_transient_error = false;
+        let mut had_error = false;
 
         // 1. Initialize shards that require iterators
-        // If permanent error is encountered, it is surfaced to the client.
-        self.initialize_shards_iterators().await?;
+        had_error |= self.initialize_shards_iterators().await;
 
         // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
@@ -76,37 +74,36 @@ impl DynamodbStreamProducer {
         // 3. Process poll results
         for (shard_id, result) in results {
             let poll_result = match result {
-                Ok((next_iter, records)) => self
-                    .state
-                    .handle_poll_result(&shard_id, next_iter, records)?,
+                Ok((next_iter, records)) => {
+                    self.state.handle_poll_result(&shard_id, next_iter, records)
+                }
                 Err(e) => {
-                    had_transient_error = true;
-                    self.state.handle_poll_error(&shard_id, e)?
+                    had_error = true;
+                    self.state.handle_poll_error(&shard_id, &e)
                 }
             };
-            poll_results.push(poll_result);
+            if let Some(poll_result) = poll_result {
+                poll_results.push(poll_result);
+            }
         }
 
         // 4. Discover new shards
-        // If permanent error is encountered, it is surfaced to the client.
         match self.client.get_all_shards(&self.stream_arn).await {
-            Ok(shards) => self.state.add_discovered(&shards)?,
+            Ok(shards) => self.state.add_discovered(&shards),
             Err(e) => {
-                if !e.is_retriable() {
-                    return Err(e);
-                }
-                had_transient_error = true;
+                had_error = true;
                 tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}");
             }
         }
 
-        Ok((combine_shard_batches(&poll_results), had_transient_error))
+        (combine_shard_batches(&poll_results), had_error)
     }
 
-    async fn initialize_shards_iterators(&mut self) -> Result<()> {
+    async fn initialize_shards_iterators(&mut self) -> bool {
         let shards: Vec<InitializingShard> =
             self.state.get_initializing_shards().cloned().collect();
 
+        let mut had_error = false;
         for shard in shards {
             // Shards that were already polled use `After`.
             // Newly discovered shards use `At`.
@@ -129,18 +126,15 @@ impl DynamodbStreamProducer {
                     self.state.mark_active(shard.shard_id, iterator);
                 }
                 Err(e) => {
-                    if !e.is_retriable() {
-                        return Err(e);
-                    }
+                    had_error = true;
                     tracing::warn!(
-                        "Failed to initialize shard. Will retry on next iteration : {}",
+                        "Failed to initialize shard. Will retry on next iteration: {}",
                         e
                     );
                 }
             }
         }
-
-        Ok(())
+        had_error
     }
 
     pub async fn streaming(mut self) {
@@ -151,65 +145,46 @@ impl DynamodbStreamProducer {
                 *guard = self.state.get_active_shards().count();
             }
 
-            match self.collect().await {
-                Ok((batch, had_transient_error)) => {
-                    let is_batch_empty = batch.records.is_empty();
+            let (batch, had_error) = self.collect().await;
+            let is_batch_empty = batch.records.is_empty();
 
-                    self.metrics_collector
-                        .records
-                        .fetch_add(batch.records.len(), Ordering::Relaxed);
+            self.metrics_collector
+                .records
+                .fetch_add(batch.records.len(), Ordering::Relaxed);
 
-                    if let Some(watermark) = batch.watermark
-                        && let Ok(mut wm) = self.metrics_collector.watermark.write()
-                    {
-                        *wm = Some(watermark);
-                    }
+            if let Some(watermark) = batch.watermark
+                && let Ok(mut wm) = self.metrics_collector.watermark.write()
+            {
+                *wm = Some(watermark);
+            }
 
-                    if had_transient_error {
-                        self.metrics_collector
-                            .transient_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+            if had_error {
+                self.metrics_collector
+                    .transient_errors
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
-                    // Send batch even if it's empty
-                    if self.sender.send(Ok(batch)).await.is_err() {
-                        return;
-                    }
+            // Send batch even if it's empty
+            if self.sender.send(batch).await.is_err() {
+                return;
+            }
 
-                    if had_transient_error {
-                        // Transient error occurred during collection - apply backoff
-                        if let Some(mut duration) = backoff.next_backoff() {
-                            // Avoid sleeping for more than 60 seconds
-                            if duration > Duration::from_secs(60) {
-                                duration = Duration::from_secs(1);
-                                backoff.reset();
-                            }
-                            tokio::time::sleep(duration).await;
-                        } else {
-                            // Backoff exhausted - transient errors persisted too long
-                            // Shouldn't happen as we should have infinite retries.
-                            return;
-                        }
-                    } else {
-                        // Clean success - reset backoff and use normal interval
-                        backoff = self.retry_strategy.clone();
-
-                        if is_batch_empty {
-                            // To avoid throttling - wait at least 500ms before polling again
-                            sleep(
-                                DEFAULT_SLEEP_DURATION
-                                    .max(self.interval.unwrap_or(Duration::from_secs(0))),
-                            )
-                            .await;
-                        } else if let Some(duration) = self.interval {
-                            sleep(duration).await;
-                        }
-                    }
+            if had_error {
+                if let Some(duration) = backoff.next_backoff() {
+                    tokio::time::sleep(duration).await;
                 }
-                Err(e) => {
-                    // Permanent error - return immediately without retry
-                    let _ = self.sender.send(Err(e)).await;
-                    return;
+            } else {
+                // Clean cycle — reset backoff and use normal interval
+                backoff = self.retry_strategy.clone();
+
+                if is_batch_empty {
+                    // To avoid throttling - wait at least 500ms before polling again
+                    sleep(
+                        DEFAULT_SLEEP_DURATION.max(self.interval.unwrap_or(Duration::from_secs(0))),
+                    )
+                    .await;
+                } else if let Some(duration) = self.interval {
+                    sleep(duration).await;
                 }
             }
         }
@@ -290,11 +265,11 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
 
 #[derive(Debug)]
 pub struct DynamodbStream {
-    pub receiver: mpsc::Receiver<StreamResult>,
+    pub receiver: mpsc::Receiver<DynamoDBStreamBatch>,
 }
 
 impl Stream for DynamodbStream {
-    type Item = StreamResult;
+    type Item = DynamoDBStreamBatch;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx)
