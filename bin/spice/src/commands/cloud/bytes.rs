@@ -33,7 +33,7 @@ const GIB: u64 = MIB * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NumBytes(u64);
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 impl NumBytes {
     /// Create a `NumBytes` from a raw byte count.
     pub fn from_bytes(bytes: u64) -> Self {
@@ -101,9 +101,9 @@ impl NumBytes {
     ///
     /// Picks the largest unit (Gi > Mi > Ki) for which the value is exactly divisible.
     fn to_parse_string(self) -> String {
-        if self.0 % GIB == 0 {
+        if self.0.is_multiple_of(GIB) {
             format!("{}Gi", self.0 / GIB)
-        } else if self.0 % MIB == 0 {
+        } else if self.0.is_multiple_of(MIB) {
             format!("{}Mi", self.0 / MIB)
         } else {
             format!("{}Ki", self.0 / KIB)

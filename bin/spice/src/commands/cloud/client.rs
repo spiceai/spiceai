@@ -159,7 +159,7 @@ impl CloudClient {
         self.inner.get_app_by_id(app_id).await.map_err(into_cli)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn create_app(
         &self,
         name: &str,
@@ -205,7 +205,7 @@ impl CloudClient {
         self.inner.create_app(&request).await.map_err(into_cli)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn update_app(
         &self,
         org_app: &str,
@@ -238,7 +238,6 @@ impl CloudClient {
             executor,
             storage_size_gb,
             spicepod,
-            ..Default::default()
         };
         self.inner
             .update_app(app.id, &request)
@@ -472,7 +471,7 @@ fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Option<AppReso
     Some(AppResources {
         limits: AppResourceLimits {
             cpu: cpu.map(|v| v.to_string()),
-            memory: memory.map_or_else(|| "8Gi".to_string(), |m| m.to_gi_string()),
+            memory: memory.map_or_else(|| "8Gi".to_string(), NumBytes::to_gi_string),
             ephemeral_storage: None,
         },
         requests: None,
