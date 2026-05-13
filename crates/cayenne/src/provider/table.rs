@@ -4106,6 +4106,24 @@ impl CayenneTableProvider {
     pub(crate) async fn checkpoint_inlined_data(&self) -> Result<u64> {
         let batches = self.read_inlined_batches().await?;
         if batches.is_empty() {
+            let stats = self
+                .catalog
+                .get_inlined_data_stats(&self.table_metadata.table_id)
+                .await?;
+            self.inlined_row_count
+                .store(stats.record_count, Ordering::Relaxed);
+
+            if stats.entry_count > 0 {
+                tracing::info!(
+                    table = %self.table_metadata.table_name,
+                    rows = stats.record_count,
+                    segments = stats.entry_count,
+                    ipc_bytes = stats.ipc_bytes,
+                    "Clearing fully-deleted inline memtable"
+                );
+                self.clear_inlined_metadata_after_checkpoint().await?;
+            }
+
             return Ok(0);
         }
 
@@ -4148,7 +4166,14 @@ impl CayenneTableProvider {
         // Persist table stats from the checkpoint write (best-effort; logs on error).
         self.persist_table_stats(&stats).await;
 
-        // Clear inlined data from metastore after successful write
+        self.clear_inlined_metadata_after_checkpoint().await?;
+
+        self.refresh_listing_table()?;
+
+        Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
+    }
+
+    async fn clear_inlined_metadata_after_checkpoint(&self) -> Result<()> {
         self.catalog
             .clear_inlined_data(&self.table_metadata.table_id)
             .await?;
@@ -4156,10 +4181,7 @@ impl CayenneTableProvider {
             .clear_inlined_deletes(&self.table_metadata.table_id)
             .await?;
         self.inlined_row_count.store(0, Ordering::Relaxed);
-
-        self.refresh_listing_table()?;
-
-        Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
+        Ok(())
     }
 
     /// Flush the inline level-0 memtable when accumulated entries would make reads or

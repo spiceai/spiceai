@@ -21,13 +21,13 @@ limitations under the License.
 mod common;
 
 use arrow::array::{
-    Array, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMillisecondArray, UInt64Array,
+    Array, BinaryArray, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
+    StringArray, TimestampMillisecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::CreateTableOptions;
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneTableProvider, InlinedData, InlinedDelete, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use datafusion_table_providers::util::{
@@ -50,6 +50,7 @@ test_with_backends!(test_pk_upsert_inline_mutation);
 test_with_backends!(test_pk_delete_inline_mutation);
 test_with_backends!(test_pk_auto_checkpoint_preserves_rows);
 test_with_backends!(test_inline_memtable_segment_pressure_checkpoints);
+test_with_backends!(test_inline_memtable_pressure_clears_fully_deleted_entries);
 test_with_backends!(test_inline_writer_fallback_preserves_buffered_and_remaining_batches);
 
 #[tokio::test]
@@ -629,6 +630,107 @@ async fn test_inline_memtable_segment_pressure_checkpoints(
     assert_eq!(ids.value(64), 64);
     assert_eq!(names.value(0), "name_0");
     assert_eq!(names.value(64), "name_64");
+
+    Ok(())
+}
+
+async fn test_inline_memtable_pressure_clears_fully_deleted_entries(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx, table_id) =
+        create_pk_upsert_table(&fixture, "inline_memtable_fully_deleted").await?;
+    let schema = table.schema();
+
+    for row_id in 0..65_i64 {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![row_id])),
+                Arc::new(StringArray::from(vec![format!("name_{row_id}")])),
+            ],
+        )?;
+        let mut ipc_buf = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc_buf, &schema)?;
+            writer.write(&batch)?;
+            writer.finish()?;
+        }
+
+        fixture
+            .catalog
+            .add_inlined_data(InlinedData {
+                inlined_id: String::new(),
+                table_id: table_id.clone(),
+                partition_key: None,
+                data_ipc: ipc_buf,
+                record_count: 1,
+                sequence_number: 1,
+                created_at: String::new(),
+            })
+            .await?;
+    }
+
+    let delete_schema = Arc::new(Schema::new(vec![Field::new(
+        "row_key",
+        DataType::Binary,
+        false,
+    )]));
+    let delete_keys = (0..66_i64).map(i64::to_be_bytes).collect::<Vec<[u8; 8]>>();
+    let delete_key_values = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+    let delete_batch = RecordBatch::try_new(
+        Arc::clone(&delete_schema),
+        vec![Arc::new(BinaryArray::from_vec(delete_key_values))],
+    )?;
+    let mut delete_ipc = Vec::new();
+    {
+        let mut writer =
+            arrow::ipc::writer::StreamWriter::try_new(&mut delete_ipc, &delete_schema)?;
+        writer.write(&delete_batch)?;
+        writer.finish()?;
+    }
+
+    fixture
+        .catalog
+        .add_inlined_delete(InlinedDelete {
+            inlined_id: String::new(),
+            table_id: table_id.clone(),
+            delete_ipc,
+            delete_count: 66,
+            sequence_number: 2,
+            created_at: String::new(),
+        })
+        .await?;
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![65_i64])),
+            Arc::new(StringArray::from(vec!["name_65"])),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+
+    let stats = fixture.catalog.get_inlined_data_stats(&table_id).await?;
+    assert_eq!(stats.record_count, 0);
+    assert_eq!(stats.entry_count, 0);
+    assert_eq!(stats.ipc_bytes, 0);
+    assert!(
+        fixture
+            .catalog
+            .get_inlined_deletes(&table_id)
+            .await?
+            .is_empty()
+    );
+
+    let got = collect_sorted(
+        &ctx,
+        "SELECT id, name FROM inline_memtable_fully_deleted ORDER BY id",
+    )
+    .await?;
+    assert_eq!(got.num_rows(), 0);
 
     Ok(())
 }
