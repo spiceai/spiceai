@@ -207,7 +207,7 @@ impl<'a> AppendMutationWriter<'a> {
                     let sorted = self.sort_if_configured().await?;
                     if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted)
                     {
-                        self.table.refresh_listing_table()?;
+                        self.table.refresh_listing_table().await?;
                     }
                     self.table.persist_table_stats(&stats_acc).await;
 
@@ -250,14 +250,14 @@ impl<'a> AppendMutationWriter<'a> {
         };
 
         if needs_new_snapshot {
-            self.table.refresh_listing_table()?;
+            self.table.refresh_listing_table().await?;
         }
 
         let retention_deleted_rows = self.apply_retention_if_configured().await?;
         let sorted = self.sort_if_configured().await?;
 
         if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted) {
-            self.table.refresh_listing_table()?;
+            self.table.refresh_listing_table().await?;
         }
 
         self.table.persist_table_stats(&write_stats_acc).await;

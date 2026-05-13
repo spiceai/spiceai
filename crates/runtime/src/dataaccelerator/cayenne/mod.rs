@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod partitioned_insert_strategy;
 pub mod s3;
 pub mod snapshot_engine;
 
@@ -1248,12 +1249,22 @@ impl DataAccelerator for CayenneAccelerator {
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
 
-            // Create a new catalog - it will use WAL mode and busy timeout internally
-            let catalog = Arc::new(
+            // Create a new catalog - it will use WAL mode and busy timeout internally.
+            // We keep both a concrete and a trait-object handle: the trait
+            // object goes to the per-partition CayenneTableProviders (which use
+            // the MetadataCatalog API), while the concrete handle is needed by
+            // `CayennePartitionedInsertStrategy` to open a shared
+            // MetastoreTransaction across all partitions (issue #10125).
+            let catalog_concrete: Arc<cayenne::CayenneCatalog> = Arc::new(
                 cayenne::CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?,
-            ) as Arc<dyn cayenne::MetadataCatalog>;
+            );
+            // Promote to a trait object for the existing per-partition callers.
+            // The coercion from Arc<CayenneCatalog> to Arc<dyn MetadataCatalog>
+            // happens via the unsizing rule on the let-binding's declared type.
+            let catalog: Arc<dyn cayenne::MetadataCatalog> =
+                Arc::<cayenne::CayenneCatalog>::clone(&catalog_concrete);
 
             // Initialize the catalog (creates tables if needed)
             catalog
@@ -1307,12 +1318,22 @@ impl DataAccelerator for CayenneAccelerator {
                 runtime_env,
             ));
 
-            // Wrap the base table provider with partitioning logic
+            // Wrap the base table provider with partitioning logic, installing
+            // the Cayenne-specific cross-partition insert strategy so that
+            // overwrite-mode writes batch every partition's catalog mutation
+            // into a single MetastoreTransaction (#10125).
+            let insert_strategy = Arc::new(
+                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
+                    Arc::clone(&catalog_concrete),
+                    PathBuf::from(&dir_path),
+                ),
+            );
             let partition_provider = Arc::new(
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
-                    .context(AccelerationCreationFailedSnafu)?,
+                    .context(AccelerationCreationFailedSnafu)?
+                    .with_insert_strategy(insert_strategy),
             );
 
             // Wrap with upsert deduplication if needed based on on_conflict settings

@@ -426,11 +426,27 @@ pub struct CayenneTableProvider {
     /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory.
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
     /// but this `ListingTable` currently scans all of them together.
-    /// Wrapped in `RwLock` to allow updating the listing table on overwrite operations.
-    /// Uses `std::sync::RwLock` instead of `tokio::sync::RwLock` because we need
-    /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
-    /// and `statistics`), and the lock is held for very short durations (just Arc clones).
-    listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    ///
+    /// Held in an [`ArcSwap`] so synchronous `TableProvider` trait methods
+    /// (`supports_filters_pushdown` and `statistics`) get a wait-free snapshot
+    /// of the current `ListingTable`, and writers can atomically install a new
+    /// one without blocking readers' Arc-loads. Read/write *coordination* with
+    /// the append-side write barrier (issue #10125) lives in
+    /// [`Self::listing_fence`], not in the `ArcSwap` itself.
+    listing_table: Arc<ArcSwap<ListingTable>>,
+    /// Read/write fence that synchronizes [`Self::scan`] with the append-side
+    /// write barrier described in issue #10125 §6.4.
+    ///
+    /// Scans take `listing_fence.read().await` and hold it across the inner
+    /// `DataFusion` listing call so that concurrent file-move + listing-table
+    /// swap by a writer cannot interleave with the listing operation. The
+    /// writer barrier takes `listing_fence.write().await` for the duration of
+    /// its move + cache-invalidate + Arc swap.
+    ///
+    /// Sync `TableProvider` methods (`statistics`, `supports_filters_pushdown`)
+    /// do *not* take the fence — they read a snapshot of the listing table
+    /// atomically via [`Self::listing_table`] and never observe partial state.
+    listing_fence: Arc<tokio::sync::RwLock<()>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
     /// Optional builder to construct time-based retention filter.
@@ -830,7 +846,13 @@ impl CayenneTableProvider {
     /// Update the listing table to point to a new snapshot directory.
     ///
     /// This ensures subsequent queries in the same context will read from the new data.
-    pub(crate) fn update_listing_table_for_snapshot(&self, new_snapshot_id: &str) -> Result<()> {
+    /// Holds [`Self::listing_fence`] for write across the Arc swap so any in-flight
+    /// [`Self::scan`] using `listing_fence.read()` either resolves entirely
+    /// before this swap or entirely after it.
+    pub(crate) async fn update_listing_table_for_snapshot(
+        &self,
+        new_snapshot_id: &str,
+    ) -> Result<()> {
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -844,14 +866,8 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
-        let mut listing_table_guard =
-            self.listing_table
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: LISTING_TABLE_LOCK_POISONED,
-                })?;
-        *listing_table_guard = new_listing_table;
+        let _fence = self.listing_fence.write().await;
+        self.listing_table.store(new_listing_table);
         Ok(())
     }
 
@@ -1665,7 +1681,8 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_metadata,
             catalog,
-            listing_table: Arc::new(RwLock::new(listing_table)),
+            listing_table: Arc::new(ArcSwap::new(listing_table)),
+            listing_fence: Arc::new(tokio::sync::RwLock::new(())),
             retention_filters,
             time_retention_filter_builder,
             context,
@@ -1994,6 +2011,7 @@ impl CayenneTableProvider {
             table_metadata: self.table_metadata.clone(),
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
+            listing_fence: Arc::clone(&self.listing_fence),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
@@ -2058,14 +2076,8 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
     ) -> Result<HashMap<OwnedRow, RowLocation>> {
-        // Clone listing table to avoid holding locks across await points
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
-            Arc::clone(&guard)
-        };
+        // Snapshot the current listing table via ArcSwap (wait-free).
+        let listing_table = self.listing_table.load_full();
 
         // Clone protected snapshots to avoid holding locks across await points
         let protected_snapshots = {
@@ -3186,14 +3198,8 @@ impl CayenneTableProvider {
             self.context.sort_columns()
         );
 
-        // Read all data from the current listing table
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
-            Arc::clone(&*guard)
-        };
+        // Snapshot the current listing table via ArcSwap (wait-free).
+        let listing_table = self.listing_table.load_full();
 
         // Create a session context and scan the listing table to get all data
         let ctx = self.create_session_context();
@@ -3333,15 +3339,11 @@ impl CayenneTableProvider {
         }
 
         // Now that catalog is committed, update the in-memory listing table.
+        // Hold listing_fence for write across the Arc swap so any concurrent
+        // scan() picks up either the old or the new listing atomically.
         {
-            let mut listing_table_guard =
-                self.listing_table
-                    .write()
-                    .map_err(|_| Error::LockPoisoned {
-                        table: self.table_metadata.table_name.clone(),
-                        lock: LISTING_TABLE_LOCK_POISONED,
-                    })?;
-            *listing_table_guard = new_listing_table;
+            let _fence = self.listing_fence.write().await;
+            self.listing_table.store(new_listing_table);
         }
 
         // Update in-memory state to match the new catalog
@@ -3688,7 +3690,7 @@ impl CayenneTableProvider {
         self.update_current_snapshot_id(&fresh_metadata.current_snapshot_id)?;
 
         // Rebuild the listing table from the fresh snapshot ID on disk.
-        self.refresh_listing_table()?;
+        self.refresh_listing_table().await?;
 
         tracing::debug!(
             "Refreshed in-memory state for table {} from catalog",
@@ -3754,7 +3756,27 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the listing table cannot be refreshed.
-    pub(crate) fn refresh_listing_table(&self) -> Result<()> {
+    pub(crate) async fn refresh_listing_table(&self) -> Result<()> {
+        // Acquire the listing fence for the duration of the swap. Single-partition
+        // path; the cross-partition append coordinator (issue #10125 step 6)
+        // uses `refresh_listing_table_under_held_fence` instead so it can hold
+        // every participating partition's fence across one barrier window.
+        let _fence = self.listing_fence.write().await;
+        self.refresh_listing_table_under_held_fence()
+    }
+
+    /// Refresh the listing table, ASSUMING the caller already holds
+    /// [`Self::listing_fence`] for write.
+    ///
+    /// Cross-partition coordinators (#10125 step 6) lock every participating
+    /// partition's fence in sorted order and call this method on each so the
+    /// listing-table swap happens under one combined barrier. Single-partition
+    /// callers should use [`Self::refresh_listing_table`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing table cannot be reconstructed.
+    pub(crate) fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
         // Construct URL to current snapshot using the live snapshot ID
         // (which may differ from table_metadata after compaction)
         let current_snapshot = self.get_current_snapshot_id()?;
@@ -3775,22 +3797,45 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
-        // Update the listing table with write lock
-        let mut guard = self
-            .listing_table
-            .write()
-            .map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
-        *guard = new_listing_table;
+        self.listing_table.store(new_listing_table);
 
         tracing::debug!(
-            "Refreshed listing table for {} to pick up new files and update statistics",
+            "Refreshed listing table for {} (under held fence) to pick up new files",
             self.table_metadata.table_name
         );
 
         Ok(())
+    }
+
+    /// Acquire `listing_fence` for write and return an owned guard.
+    ///
+    /// Used by the cross-partition append coordinator (#10125 step 6) so it
+    /// can hold fences across every participating partition for the duration
+    /// of one barrier window.
+    pub async fn lock_listing_fence_write_owned(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.listing_fence).write_owned().await
+    }
+
+    /// Return the absolute path to the table's data root. Used by the
+    /// cross-partition coordinator to derive the top-level partitioned-WAL
+    /// directory (`<table_root>/_partitioned_wal/`).
+    #[must_use]
+    pub fn table_path_str(&self) -> &str {
+        &self.table_metadata.path
+    }
+
+    /// Return this partition's staging WAL path for top-level recovery
+    /// records. Local-filesystem only — S3-backed tables return the same
+    /// shape but recovery is not yet wired for object stores (#10125 step 6
+    /// scope).
+    #[must_use]
+    pub fn staging_wal_path_for_recovery(&self) -> std::path::PathBuf {
+        let staging_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            STAGING_DIR_NAME,
+        );
+        staging_dir.join(STAGING_WAL_FILENAME)
     }
 
     /// Invalidate the `list_files_cache` entry for the given snapshot directory URL.
@@ -4168,7 +4213,7 @@ impl CayenneTableProvider {
 
         self.clear_inlined_metadata_after_checkpoint().await?;
 
-        self.refresh_listing_table()?;
+        self.refresh_listing_table().await?;
 
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
     }
@@ -5196,6 +5241,17 @@ impl TableProvider for CayenneTableProvider {
 
         let target_partitions = state.config().target_partitions();
 
+        // Hold listing_fence.read() across the inner ListingTable::scan() call
+        // so concurrent writer barriers (#10125 §6.4) cannot interleave file
+        // moves with this scan's listing operation. Multiple concurrent scans
+        // share the read fence and do not block each other; only a writer-side
+        // barrier holding the write fence blocks scans, and vice versa.
+        //
+        // PR #10811 builds a fresh ListingTable per scan from the live
+        // current_snapshot_id so it can apply per-scan DataFusion config
+        // (target_partitions, etc.). The fence still matters because
+        // append-mode coordinators move files into the CURRENT snapshot dir.
+        let _fence = self.listing_fence.read().await;
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -5211,6 +5267,12 @@ impl TableProvider for CayenneTableProvider {
         let main_plan = listing_table
             .scan(state, effective_projection.as_ref(), scan_filters, limit)
             .await?;
+        // Note: we deliberately keep `_fence` alive until after the main plan
+        // has been built (i.e. until end of this function). DataFusion's
+        // ListingTable::scan resolves the file listing eagerly, so the fence
+        // really only needs to outlive `listing_table.scan(...).await`; we
+        // hold it slightly longer for clarity and to avoid micro-optimizing a
+        // microsecond-scale wait.
 
         // Check for protected snapshots that need to be scanned with partial deletion filter.
         let protected_snapshot_plans = self
@@ -5333,15 +5395,11 @@ impl TableProvider for CayenneTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
-        // Synchronous method - clone Arc quickly and release lock immediately
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    LISTING_TABLE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            Arc::clone(&guard)
-        };
+        // Synchronous TableProvider trait method: a wait-free ArcSwap snapshot
+        // is sufficient. No need to hold the listing fence — this delegates to
+        // ListingTable::supports_filters_pushdown which doesn't touch the
+        // filesystem.
+        let listing_table = self.listing_table.load_full();
         listing_table.supports_filters_pushdown(filters)
     }
 
@@ -5361,11 +5419,8 @@ impl TableProvider for CayenneTableProvider {
         // Note: Statistics are cached by the ListingTable and may not reflect
         // very recent writes until the table metadata is refreshed.
         //
-        // Clone Arc quickly and release lock immediately to minimize contention
-        let listing_table = {
-            let guard = self.listing_table.read().ok()?;
-            Arc::clone(&guard)
-        };
+        // Synchronous method: wait-free ArcSwap snapshot is sufficient.
+        let listing_table = self.listing_table.load_full();
         listing_table.statistics()
     }
 
@@ -5632,15 +5687,9 @@ impl CayenneTableProvider {
         self.checkpoint_inlined_data_if_present_for_delete().await?;
 
         let ctx = self.create_session_context();
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| {
-                datafusion_common::DataFusionError::Internal(format!(
-                    "Failed to read listing table lock for '{}'",
-                    self.table_metadata.table_name
-                ))
-            })?;
-            Arc::clone(&guard)
-        };
+        // Wait-free ArcSwap snapshot. Refreshes are serialized against this
+        // path by `self.write_lock`, held above.
+        let listing_table = self.listing_table.load_full();
 
         // PositionBased tables have no protected snapshots, so we only scan the main listing table.
         let all_tables = vec![listing_table];
@@ -6466,6 +6515,126 @@ mod tests {
                 &format!("row_{ts}"),
                 "name should match its timestamp"
             );
+        }
+    }
+
+    // ========================================================================
+    // Issue #10125 §6.4 — listing_fence regression guards
+    // ========================================================================
+    //
+    // These tests pin the fence semantics that scan() relies on. They access
+    // the private `listing_fence` field directly, so they must live in this
+    // module rather than in an integration test crate.
+    //
+    // Property under test: `scan()` holds `listing_fence.read()` across the
+    // inner DataFusion listing call, and `refresh_listing_table` /
+    // `update_listing_table_for_snapshot` hold `listing_fence.write()` across
+    // the ArcSwap store. Any reader/writer overlap is therefore serialized by
+    // the fence.
+
+    /// A held `listing_fence` read guard blocks an attempted write fence
+    /// acquisition until the read guard is dropped.
+    ///
+    /// This is the load-bearing guarantee for the append-side coordinator
+    /// (future work): with the read guard held by an in-flight scan, a
+    /// writer's `apply_under_barrier` (which is the future code path that
+    /// will replace `refresh_listing_table` for cross-partition commits) is
+    /// fenced out.
+    #[tokio::test]
+    async fn read_fence_blocks_write_fence_acquisition() {
+        let temp_dir = tempfile::TempDir::new().expect("create tempdir");
+        let db_path = temp_dir.path().join("test.db");
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("create data dir");
+
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("create catalog"));
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let options = CreateTableOptions {
+            table_name: "fence_test".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+        let runtime_env = SessionContext::new().runtime_env();
+        let catalog_dyn: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let table = CayenneTableProvider::create_table(catalog_dyn, options, runtime_env)
+            .await
+            .expect("create table");
+
+        // Take the read fence — this models an in-flight scan().
+        let fence_arc = Arc::clone(&table.listing_fence);
+        let read_guard = fence_arc.read().await;
+
+        // Spawn a refresh: it must block on the write fence until we drop the
+        // read guard. (Cloning via clone_for_write shares the same fence.)
+        let table_for_writer = table.clone_for_write();
+        let writer = tokio::spawn(async move { table_for_writer.refresh_listing_table().await });
+
+        // Within a generous slice, the writer is still pending.
+        match tokio::time::timeout(std::time::Duration::from_millis(50), writer).await {
+            Err(_) => {
+                // Timeout — expected. Drop the read guard and verify the
+                // writer can now make progress.
+                drop(read_guard);
+                let table_for_writer = table.clone_for_write();
+                let writer =
+                    tokio::spawn(async move { table_for_writer.refresh_listing_table().await });
+                tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+                    .await
+                    .expect("refresh completes once the read fence is released")
+                    .expect("spawned task did not panic")
+                    .expect("refresh_listing_table returned Ok");
+            }
+            Ok(completed) => {
+                panic!("refresh_listing_table completed despite held read fence: {completed:?}");
+            }
+        }
+    }
+
+    /// A held `listing_fence` write guard blocks reader-side fence
+    /// acquisitions. Pairs with the previous test: under contention the fence
+    /// is bidirectional, so concurrent scans and the writer barrier always
+    /// observe consistent state.
+    #[tokio::test]
+    async fn write_fence_blocks_read_fence_acquisition() {
+        // Pure fence-primitive test — no need to construct a full
+        // CayenneTableProvider, since the field is just
+        // `Arc<tokio::sync::RwLock<()>>`.
+        let fence: Arc<tokio::sync::RwLock<()>> = Arc::new(tokio::sync::RwLock::new(()));
+
+        let write_guard = fence.write().await;
+
+        let fence_for_reader = Arc::clone(&fence);
+        let reader = tokio::spawn(async move {
+            let _read = fence_for_reader.read().await;
+        });
+
+        match tokio::time::timeout(std::time::Duration::from_millis(50), reader).await {
+            Err(_) => {
+                // Expected: reader blocked. Release the writer and ensure the
+                // reader can now proceed.
+                drop(write_guard);
+                let fence_for_reader = Arc::clone(&fence);
+                let reader = tokio::spawn(async move {
+                    let _read = fence_for_reader.read().await;
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+                    .await
+                    .expect("read fence acquires once writer is released")
+                    .expect("spawned task did not panic");
+            }
+            Ok(completed) => panic!("read fence acquired despite held write fence: {completed:?}"),
         }
     }
 }
