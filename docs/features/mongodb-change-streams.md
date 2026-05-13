@@ -50,8 +50,28 @@ These optional parameters live under dataset `params:` and are not prefixed with
 - `change_stream_batch_max_duration` (default `1s`): Maximum time to wait for a Change Stream batch to fill before applying it. Accepts [fundu](https://docs.rs/fundu) duration strings and must be greater than 0.
 - `change_stream_max_await_time` (default `1s`): Maximum time MongoDB waits for new Change Stream events before returning an empty server batch. Accepts [fundu](https://docs.rs/fundu) duration strings and must be greater than 0.
 - `change_stream_batch_size` (default `1000`): Number of Change Stream events MongoDB should request from the server per batch. Must fit in a `u32` and be greater than 0.
+- `mongodb_resume_token_invalid_behavior` (default `error`): Behavior when a persisted Change Stream resume token cannot be honored by the server (e.g. it is past the oplog retention window). `error` surfaces a clear error so the operator can decide; `rebootstrap` drops the persisted token and re-snapshots the collection.
 
 The existing `mongodb_unnest_depth` parameter also applies to Change Stream documents, so nested BSON documents are flattened the same way as normal MongoDB reads.
+
+## Resumability across restarts
+
+For file-accelerated datasets (acceleration `mode: file` / `file_create` / `file_update`, or `engine: postgres`), Spice persists the most recent Change Stream resume token in a sidecar table called `spice_sys_mongodb`, stored alongside the accelerator data. The schema is one row per dataset:
+
+| column              | type      | description                                                                                      |
+| ------------------- | --------- | ------------------------------------------------------------------------------------------------ |
+| `dataset_name`      | TEXT PK   | Dataset name.                                                                                    |
+| `resume_token_json` | TEXT      | Serialized MongoDB resume token (the `_id` field of the most recently processed change event).   |
+| `cluster_time_ts`   | INTEGER   | Optional unix-seconds cluster operation time, retained as a fallback for `startAtOperationTime`. |
+| `schema_json`       | TEXT      | Optional serialized Arrow schema snapshot, used to log a warning on schema drift between runs.   |
+| `created_at`        | TIMESTAMP | Row creation time.                                                                               |
+| `updated_at`        | TIMESTAMP | Last commit time.                                                                                |
+
+The token is written once after the initial collection snapshot completes (piggy-backed onto the dataset-ready signal so a crash mid-snapshot still triggers a clean re-bootstrap), then re-written after each live Change Stream batch is persisted to the accelerator. The committer fires only once the downstream accelerator write has succeeded, so the persisted token always reflects data already in the accelerator (at-least-once semantics).
+
+On restart with a persisted token, Spice resumes the Change Stream from that token and skips the collection snapshot. If MongoDB rejects the token (typical codes `ChangeStreamHistoryLost` 286 or `ChangeStreamFatalError` 280, e.g. when the oplog window has rolled past the token's position), the behavior is governed by `mongodb_resume_token_invalid_behavior` above. Re-snapshotting a large collection is opt-in by default.
+
+Datasets that are not file-accelerated (in-memory Arrow, etc.) do not get a sidecar row; restarts re-bootstrap from a fresh snapshot.
 
 ## Event mapping
 

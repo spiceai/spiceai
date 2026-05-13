@@ -133,6 +133,10 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("change_stream_batch_size")
         .description("Number of Change Stream events MongoDB should request from the server per batch.")
         .default("1000"),
+    ParameterSpec::runtime("mongodb_resume_token_invalid_behavior")
+        .description("Behavior when a persisted Change Stream resume token cannot be honored by the server (e.g. past the oplog retention window). 'error' surfaces a clear error so the operator can decide (recommended default; re-snapshotting a large collection should be opt-in). 'rebootstrap' drops the persisted token and re-snapshots the collection.")
+        .default("error")
+        .one_of(&["error", "rebootstrap"]),
 ];
 
 const IGNORED_IF_URI: &[&str] = &[

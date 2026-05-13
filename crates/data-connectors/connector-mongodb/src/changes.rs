@@ -15,10 +15,11 @@ limitations under the License.
 */
 
 use async_stream::try_stream;
+use async_trait::async_trait;
 use data_components::{
     cdc::{
-        ChangeEnvelope, ChangesStream, NoOpCommitter, build_ready_signal_envelope,
-        wrap_data_as_change_batch,
+        ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
+        build_ready_signal_envelope, wrap_data_as_change_batch,
     },
     mongodb::stream::{
         change_events_to_change_batch, default_unnest_parameters, truncate_change_batch,
@@ -40,6 +41,10 @@ use runtime::{
     component::dataset::{
         Dataset,
         acceleration::{Acceleration, Engine, OnConflictBehavior},
+    },
+    dataaccelerator::spice_sys::{
+        OpenOption,
+        mongodb::{MongoCheckpointMetadata, MongoSys},
     },
     federated_table::FederatedTable,
     parameters::{ExposedParamLookup, Parameters},
@@ -63,12 +68,13 @@ pub fn build_changes_stream(
         let schema = table_provider.schema();
         let primary_keys = resolve_primary_keys(&dataset.name, dataset.acceleration.as_ref(), &schema)?;
         let config = ChangeStreamConfig::from_params(&params)?;
+        let invalid_token_behavior = ResumeTokenInvalidBehavior::from_params(&params)?;
         let collection_name = dataset.path().to_string();
 
         let connection = pool
             .connect()
             .await
-            .map_err(|error| data_components::cdc::StreamError::External(format!(
+            .map_err(|error| StreamError::External(format!(
                 "Failed to connect to MongoDB Change Stream for dataset `{}` collection `{collection_name}`: {error}",
                 dataset.name
             )))?;
@@ -77,65 +83,149 @@ pub fn build_changes_stream(
             .database(&connection.db_name)
             .collection::<Document>(&collection_name);
 
-        let initial_change_stream = open_change_stream(
-            &collection,
-            &config,
-            &dataset.name,
-            &collection_name,
-            None,
-        )
-        .await?;
-        let resume_token = initial_change_stream.resume_token().ok_or_else(|| {
-            data_components::cdc::StreamError::External(format!(
-                "Failed to start MongoDB Change Stream for dataset `{}` collection `{collection_name}`: initial stream did not return a resume token",
-                dataset.name
-            ))
-        })?;
-        drop(initial_change_stream);
+        let mongo_sys = Arc::new(if dataset.is_file_accelerated() {
+            initialize_mongo_sys(&dataset).await
+        } else {
+            tracing::info!(
+                dataset = %dataset.name,
+                collection = %collection_name,
+                "MongoDB Change Stream dataset is not file-accelerated; resume token will not be persisted across restarts"
+            );
+            None
+        });
 
-        tracing::info!(
-            dataset = %dataset.name,
-            collection = %collection_name,
-            "MongoDB Change Stream started; bootstrapping accelerator from collection snapshot"
-        );
+        let current_schema_json = serialize_current_schema(&schema, &dataset.name);
+        let persisted = persisted_checkpoint(&mongo_sys, &dataset, &current_schema_json).await;
 
-        let truncate = truncate_change_batch(&schema)
-            .map_err(data_components::cdc::StreamError::MongoDB)?;
-        yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
+        let live_change_stream = if let Some(metadata) = persisted {
+            let resume_token = deserialize_resume_token(&metadata.resume_token_json)
+                .map_err(|error| StreamError::External(format!(
+                    "Failed to deserialize persisted MongoDB resume token for dataset `{}` collection `{collection_name}`: {error}. To recover, delete the dataset's row from `spice_sys_mongodb` or restart with `mongodb_resume_token_invalid_behavior: rebootstrap`.",
+                    dataset.name
+                )))?;
 
-        let mut snapshot_stream = snapshot_stream(table_provider).await?;
-        while let Some(batch) = FuturesStreamExt::next(&mut snapshot_stream).await {
-            let batch = batch.map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))?;
-            if batch.num_rows() == 0 {
-                continue;
+            match try_open_change_stream(&collection, &config, Some(resume_token)).await {
+                Ok(stream) => {
+                    tracing::info!(
+                        dataset = %dataset.name,
+                        collection = %collection_name,
+                        "MongoDB Change Stream resumed from persisted resume token; skipping collection snapshot"
+                    );
+
+                    let ready = build_ready_signal_envelope(&schema)
+                        .map_err(|error| StreamError::Arrow(error.to_string()))?;
+                    yield ready;
+                    Some(stream)
+                }
+                Err(error) if is_stale_resume_token_error(&error) => match invalid_token_behavior {
+                    ResumeTokenInvalidBehavior::Error => Err(StreamError::External(format!(
+                        "MongoDB Change Stream resume token for dataset `{}` collection `{collection_name}` is past the oplog retention window or otherwise invalid (driver code {}). Set `mongodb_resume_token_invalid_behavior: rebootstrap` to drop the persisted token and re-snapshot the collection. Source: {error}",
+                        dataset.name,
+                        resume_token_error_code(&error).map_or_else(|| "unknown".to_string(), |c| c.to_string()),
+                    )))?,
+                    ResumeTokenInvalidBehavior::Rebootstrap => {
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            collection = %collection_name,
+                            error = %error,
+                            "MongoDB Change Stream resume token is stale; rebootstrap behavior enabled, falling back to cold bootstrap"
+                        );
+                        clear_persisted_token(&mongo_sys, &dataset).await;
+                        None
+                    }
+                },
+                Err(error) => Err(StreamError::External(format!(
+                    "Failed to start MongoDB Change Stream for dataset `{}` collection `{collection_name}` while resuming from persisted token: {error}",
+                    dataset.name
+                )))?,
+            }
+        } else {
+            None
+        };
+
+        let live_change_stream = if let Some(stream) = live_change_stream {
+            stream
+        } else {
+            let initial_change_stream = open_change_stream(
+                &collection,
+                &config,
+                &dataset.name,
+                &collection_name,
+                None,
+            )
+            .await?;
+            let resume_token = initial_change_stream.resume_token().ok_or_else(|| {
+                StreamError::External(format!(
+                    "Failed to start MongoDB Change Stream for dataset `{}` collection `{collection_name}`: initial stream did not return a resume token",
+                    dataset.name
+                ))
+            })?;
+            drop(initial_change_stream);
+
+            tracing::info!(
+                dataset = %dataset.name,
+                collection = %collection_name,
+                "MongoDB Change Stream started; bootstrapping accelerator from collection snapshot"
+            );
+
+            let truncate = truncate_change_batch(&schema)
+                .map_err(StreamError::MongoDB)?;
+            yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
+
+            let mut snapshot_stream = snapshot_stream(table_provider).await?;
+            while let Some(batch) = FuturesStreamExt::next(&mut snapshot_stream).await {
+                let batch = batch.map_err(|error| StreamError::Arrow(error.to_string()))?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
+                let change_batch = wrap_data_as_change_batch(&schema, &batch)
+                    .map_err(|error| StreamError::Arrow(error.to_string()))?;
+                yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false);
             }
 
-            let change_batch = wrap_data_as_change_batch(&schema, &batch)
-                .map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))?;
-            yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false);
-        }
+            // Commit the captured resume token piggy-backed on the ready signal envelope.
+            // The committer fires after the downstream has fully persisted the empty
+            // ready batch, which is the natural barrier between "bootstrap" and "live"
+            // phases. A crash any time before this commit leaves the sidecar empty, so
+            // the next start will re-bootstrap.
+            let initial_token_json = serialize_resume_token(&resume_token)
+                .map_err(|error| StreamError::External(format!(
+                    "Failed to serialize MongoDB resume token for dataset `{}` collection `{collection_name}`: {error}",
+                    dataset.name
+                )))?;
+            let ready = build_ready_signal_envelope(&schema)
+                .map_err(|error| StreamError::Arrow(error.to_string()))?;
+            let (_, batch, is_ready) = ready.into_parts();
+            let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
+                Some(_) => Box::new(MongoResumeTokenCommitter::new(
+                    Arc::clone(&mongo_sys),
+                    initial_token_json,
+                    None,
+                    current_schema_json.clone(),
+                )),
+                None => Box::new(NoOpCommitter),
+            };
+            yield ChangeEnvelope::from_parts(committer, batch, is_ready);
 
-        let ready = build_ready_signal_envelope(&schema)
-            .map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))?;
-        yield ready;
+            tracing::info!(
+                dataset = %dataset.name,
+                collection = %collection_name,
+                "MongoDB collection snapshot complete; resuming Change Stream events from captured token"
+            );
 
-        tracing::info!(
-            dataset = %dataset.name,
-            collection = %collection_name,
-            "MongoDB collection snapshot complete; resuming Change Stream events"
-        );
-
-        let change_stream = open_change_stream(
-            &collection,
-            &config,
-            &dataset.name,
-            &collection_name,
-            Some(resume_token),
-        )
-        .await?;
+            open_change_stream(
+                &collection,
+                &config,
+                &dataset.name,
+                &collection_name,
+                Some(resume_token),
+            )
+            .await?
+        };
 
         let unnest_parameters = default_unnest_parameters(config.unnest_depth);
-        let event_batches = change_stream.chunks_timeout(
+        let event_batches = live_change_stream.chunks_timeout(
             config.batch_max_size,
             config.batch_max_duration,
         );
@@ -147,26 +237,231 @@ pub fn build_changes_stream(
             }
 
             let events = collect_change_events(batch, &dataset)?;
+
+            let tail_token = events.last().map(|event| event.id.clone());
+            let tail_cluster_time = events
+                .last()
+                .and_then(|event| event.cluster_time)
+                .map(|ts| i64::from(ts.time));
+
             if let Some(change_batch) = change_events_to_change_batch(
                 events,
                 &schema,
                 &primary_keys,
                 &unnest_parameters,
             )
-            .map_err(data_components::cdc::StreamError::MongoDB)? {
-                yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, true);
+            .map_err(StreamError::MongoDB)? {
+                let committer = build_batch_committer(
+                    &mongo_sys,
+                    tail_token,
+                    tail_cluster_time,
+                    &current_schema_json,
+                    &dataset.name,
+                );
+                yield ChangeEnvelope::new(committer, change_batch, true);
             }
         }
     })
 }
 
-async fn open_change_stream(
+async fn initialize_mongo_sys(dataset: &Dataset) -> Option<MongoSys> {
+    match MongoSys::try_new(dataset, OpenOption::OpenExisting).await {
+        Ok(sys) => Some(sys),
+        Err(error) => {
+            tracing::error!(
+                dataset = %dataset.name,
+                error = %error,
+                "Failed to initialize MongoDB resume-token sidecar; resume token will not be persisted across restarts"
+            );
+            None
+        }
+    }
+}
+
+async fn persisted_checkpoint(
+    mongo_sys: &Arc<Option<MongoSys>>,
+    dataset: &Dataset,
+    current_schema_json: &Option<String>,
+) -> Option<MongoCheckpointMetadata> {
+    let sys = mongo_sys.as_ref().as_ref()?;
+    let metadata = sys.get().await?;
+
+    // Warn (don't fail) on schema drift between runs. The connector schema is
+    // inferred from sampled documents and may legitimately evolve; treating
+    // drift as a hard error here would surprise operators. Followup work can
+    // make this behavior configurable.
+    if let (Some(persisted_schema_json), Some(current_schema_json)) =
+        (metadata.schema_json.as_ref(), current_schema_json.as_ref())
+        && persisted_schema_json != current_schema_json
+    {
+        tracing::warn!(
+            dataset = %dataset.name,
+            "MongoDB Change Stream resume detected schema drift between runs; continuing with the current schema. If new fields fail to populate, restart with `mongodb_resume_token_invalid_behavior: rebootstrap` to re-snapshot."
+        );
+    }
+
+    Some(metadata)
+}
+
+async fn clear_persisted_token(mongo_sys: &Arc<Option<MongoSys>>, dataset: &Dataset) {
+    if let Some(sys) = mongo_sys.as_ref()
+        && let Err(error) = sys.delete().await
+    {
+        tracing::warn!(
+            dataset = %dataset.name,
+            error = %error,
+            "Failed to clear stale MongoDB resume token; the subsequent bootstrap will overwrite it"
+        );
+    }
+}
+
+fn serialize_current_schema(
+    schema: &SchemaRef,
+    dataset_name: &datafusion::sql::TableReference,
+) -> Option<String> {
+    match MongoSys::serialize_schema(schema) {
+        Ok(json) => Some(json),
+        Err(error) => {
+            tracing::warn!(
+                dataset = %dataset_name,
+                error = %error,
+                "Failed to serialize MongoDB dataset schema for the resume-token sidecar; schema drift detection will be disabled for this run"
+            );
+            None
+        }
+    }
+}
+
+fn serialize_resume_token(token: &ResumeToken) -> Result<String, StreamError> {
+    serde_json::to_string(token).map_err(|error| {
+        StreamError::SerdeJsonError(format!("failed to serialize resume token: {error}"))
+    })
+}
+
+fn deserialize_resume_token(token_json: &str) -> Result<ResumeToken, StreamError> {
+    serde_json::from_str(token_json).map_err(|error| {
+        StreamError::SerdeJsonError(format!("failed to deserialize resume token: {error}"))
+    })
+}
+
+fn resume_token_error_code(error: &mongodb::error::Error) -> Option<i32> {
+    match error.kind.as_ref() {
+        mongodb::error::ErrorKind::Command(cmd) => Some(cmd.code),
+        _ => None,
+    }
+}
+
+fn build_batch_committer(
+    mongo_sys: &Arc<Option<MongoSys>>,
+    tail_token: Option<ResumeToken>,
+    tail_cluster_time: Option<i64>,
+    schema_json: &Option<String>,
+    dataset_name: &datafusion::sql::TableReference,
+) -> Box<dyn CommitChange + Send + Sync> {
+    if mongo_sys.as_ref().is_none() {
+        return Box::new(NoOpCommitter);
+    }
+
+    let Some(token) = tail_token else {
+        return Box::new(NoOpCommitter);
+    };
+
+    match serialize_resume_token(&token) {
+        Ok(token_json) => Box::new(MongoResumeTokenCommitter::new(
+            Arc::clone(mongo_sys),
+            token_json,
+            tail_cluster_time,
+            schema_json.clone(),
+        )),
+        Err(error) => {
+            tracing::warn!(
+                dataset = %dataset_name,
+                error = %error,
+                "Failed to serialize MongoDB resume token for batch checkpoint; falling back to NoOpCommitter for this batch"
+            );
+            Box::new(NoOpCommitter)
+        }
+    }
+}
+
+/// Behavior when the persisted resume token cannot be honored by the source
+/// (e.g. the oplog window has rolled past the token's position).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ResumeTokenInvalidBehavior {
+    /// Surface a clear error so the operator can decide. Recommended default
+    /// because a re-snapshot of a large collection should be opt-in.
+    #[default]
+    Error,
+    /// Drop the persisted token and fall through to the cold-bootstrap path,
+    /// re-snapshotting the collection.
+    Rebootstrap,
+}
+
+impl ResumeTokenInvalidBehavior {
+    fn from_params(params: &Parameters) -> Result<Self, StreamError> {
+        match optional_string(params, "mongodb_resume_token_invalid_behavior").as_deref() {
+            None => Ok(Self::default()),
+            Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "error" => Ok(Self::Error),
+                "rebootstrap" => Ok(Self::Rebootstrap),
+                other => Err(invalid_parameter_error(
+                    params,
+                    "mongodb_resume_token_invalid_behavior",
+                    format!("must be 'error' or 'rebootstrap', got {other:?}"),
+                )),
+            },
+        }
+    }
+}
+
+pub(crate) struct MongoResumeTokenCommitter {
+    mongo_sys: Arc<Option<MongoSys>>,
+    resume_token_json: String,
+    cluster_time_ts: Option<i64>,
+    schema_json: Option<String>,
+}
+
+impl MongoResumeTokenCommitter {
+    fn new(
+        mongo_sys: Arc<Option<MongoSys>>,
+        resume_token_json: String,
+        cluster_time_ts: Option<i64>,
+        schema_json: Option<String>,
+    ) -> Self {
+        Self {
+            mongo_sys,
+            resume_token_json,
+            cluster_time_ts,
+            schema_json,
+        }
+    }
+}
+
+#[async_trait]
+impl CommitChange for MongoResumeTokenCommitter {
+    async fn commit(&self) -> Result<(), CommitError> {
+        let Some(sys) = self.mongo_sys.as_ref() else {
+            return Ok(());
+        };
+
+        sys.upsert(&MongoCheckpointMetadata {
+            resume_token_json: self.resume_token_json.clone(),
+            cluster_time_ts: self.cluster_time_ts,
+            schema_json: self.schema_json.clone(),
+            updated_at: None,
+        })
+        .await
+        .map_err(|error| CommitError::UnableToCommitChange {
+            source: Box::new(error),
+        })
+    }
+}
+
+async fn try_open_change_stream(
     collection: &Collection<Document>,
     config: &ChangeStreamConfig,
-    dataset_name: &datafusion::sql::TableReference,
-    collection_name: &str,
     resume_token: Option<ResumeToken>,
-) -> Result<ChangeStream<ChangeStreamEvent<Document>>, data_components::cdc::StreamError> {
+) -> mongodb::error::Result<ChangeStream<ChangeStreamEvent<Document>>> {
     let mut watch = collection
         .watch()
         .full_document(FullDocumentType::UpdateLookup)
@@ -177,11 +472,33 @@ async fn open_change_stream(
         watch = watch.resume_after(resume_token);
     }
 
-    watch.await.map_err(|error| {
-        data_components::cdc::StreamError::External(format!(
-            "Failed to start MongoDB Change Stream for dataset `{dataset_name}` collection `{collection_name}`: {error}"
-        ))
-    })
+    watch.await
+}
+
+async fn open_change_stream(
+    collection: &Collection<Document>,
+    config: &ChangeStreamConfig,
+    dataset_name: &datafusion::sql::TableReference,
+    collection_name: &str,
+    resume_token: Option<ResumeToken>,
+) -> Result<ChangeStream<ChangeStreamEvent<Document>>, StreamError> {
+    try_open_change_stream(collection, config, resume_token)
+        .await
+        .map_err(|error| {
+            StreamError::External(format!(
+                "Failed to start MongoDB Change Stream for dataset `{dataset_name}` collection `{collection_name}`: {error}"
+            ))
+        })
+}
+
+/// Returns `true` if the driver error indicates the resume token is past the
+/// oplog retention window (`ChangeStreamHistoryLost`, code 286) or the cursor
+/// is otherwise unresumable (`ChangeStreamFatalError`, code 280).
+fn is_stale_resume_token_error(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Command(cmd) if matches!(cmd.code, 286 | 280)
+    )
 }
 
 async fn snapshot_stream(
