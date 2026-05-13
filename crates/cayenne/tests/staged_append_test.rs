@@ -31,7 +31,10 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use cayenne::metadata::CreateTableOptions;
-use cayenne::{CayenneTableProvider, MetadataCatalog, STAGING_DIR_NAME, STAGING_WAL_FILENAME};
+use cayenne::{
+    CayenneStagedAppend, CayenneTableProvider, MetadataCatalog, PreparedStagedAppend,
+    STAGING_DIR_NAME, STAGING_WAL_FILENAME,
+};
 
 use datafusion::datasource::TableProvider;
 use datafusion::execution::SendableRecordBatchStream;
@@ -420,6 +423,110 @@ async fn test_wal_persists_on_move_failure_impl(
 }
 
 // ============================================================================
+// Test 9 (issue #10125): prepare → apply_under_barrier → finish is observably
+// equivalent to the legacy commit() path. The legacy commit() is now
+// implemented on top of the new lifecycle, so passing this test exercises the
+// parity guarantee.
+// ============================================================================
+
+test_with_backends!(test_prepared_lifecycle_matches_commit_impl);
+
+async fn test_prepared_lifecycle_matches_commit_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "lifecycle_parity").await;
+
+    // Drive the staged-append API directly, then walk the three-phase lifecycle.
+    let staged = begin_staged_append_with_rows(&table, &[(1, "Alice"), (2, "Bob")]).await?;
+    let staged_rows = staged.row_count();
+
+    let prepared: PreparedStagedAppend = staged.prepare().await?;
+
+    // After prepare(), the WAL exists and the staged data is NOT yet visible.
+    let staging = staging_dir(&table);
+    assert!(
+        staging.join(STAGING_WAL_FILENAME).exists(),
+        "prepare() must write the staging WAL"
+    );
+    assert_eq!(
+        row_count(&ctx, "lifecycle_parity").await,
+        0,
+        "staged data must not be visible before apply_under_barrier"
+    );
+
+    prepared.apply_under_barrier().await?;
+
+    // After apply_under_barrier(), files are moved, the WAL is removed, and the
+    // listing table is refreshed. Removing the WAL inside apply_under_barrier
+    // preserves the invariant that "WAL absent ⇒ files moved successfully"; a
+    // crash between WAL removal and listing refresh is self-healing.
+    assert!(
+        !staging.join(STAGING_WAL_FILENAME).exists(),
+        "apply_under_barrier() must remove the staging WAL"
+    );
+    assert_eq!(
+        row_count(&ctx, "lifecycle_parity").await,
+        2,
+        "staged data must be visible after apply_under_barrier"
+    );
+
+    let returned = prepared.finish().await?;
+    assert_eq!(returned, staged_rows);
+
+    // Sanity: a follow-up insert via the existing path (which now flows through
+    // the same lifecycle internally) lands on top correctly.
+    ctx.sql("INSERT INTO lifecycle_parity VALUES (3, 'Charlie')")
+        .await?
+        .collect()
+        .await?;
+
+    let rows = query_all(&ctx, "lifecycle_parity").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "Alice".to_string()),
+            (2, "Bob".to_string()),
+            (3, "Charlie".to_string()),
+        ]
+    );
+    assert_staging_empty(&staging);
+
+    Ok(())
+}
+
+// ============================================================================
+// Test 10 (issue #10125): rollback() on a PreparedStagedAppend clears the
+// staging directory (including the WAL), so subsequent writes are not blocked.
+// ============================================================================
+
+test_with_backends!(test_prepared_rollback_clears_staging_impl);
+
+async fn test_prepared_rollback_clears_staging_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "lifecycle_rollback").await;
+
+    let staged = begin_staged_append_with_rows(&table, &[(10, "X"), (11, "Y")]).await?;
+    let prepared = staged.prepare().await?;
+    assert!(staging_dir(&table).join(STAGING_WAL_FILENAME).exists());
+
+    prepared.rollback().await?;
+
+    // Staging dir must be empty: no leftover files, no WAL.
+    assert_staging_empty(&staging_dir(&table));
+
+    // The table must remain writable — no IncompleteWrite block.
+    ctx.sql("INSERT INTO lifecycle_rollback VALUES (1, 'Alice')")
+        .await?
+        .collect()
+        .await?;
+    let rows = query_all(&ctx, "lifecycle_rollback").await;
+    assert_eq!(rows, vec![(1, "Alice".to_string())]);
+
+    Ok(())
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -612,4 +719,22 @@ async fn setup_table(
         .expect("register");
 
     (table, ctx)
+}
+
+/// Drive `CayenneTableProvider::begin_staged_append` with a fixed-shape batch
+/// of `(id, name)` rows, returning the `CayenneStagedAppend` handle so the
+/// caller can walk the three-phase lifecycle directly.
+async fn begin_staged_append_with_rows(
+    table: &CayenneTableProvider,
+    rows: &[(i64, &str)],
+) -> Result<CayenneStagedAppend, Box<dyn std::error::Error>> {
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    let names: Vec<&str> = rows.iter().map(|(_, name)| *name).collect();
+    let batch = make_batch(&ids, &names);
+    let schema = batch.schema();
+    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+    ));
+    Ok(table.begin_staged_append(stream).await?)
 }
