@@ -72,27 +72,8 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
 
-      - name: Start PostgreSQL for CH-benCH
-        run: |
-          docker run -d --name chbench-pg \
-            -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=chbench \
-            -p 5432:5432 postgres:16 \
-            -c wal_level=logical \
-            -c max_replication_slots=20 \
-            -c max_wal_senders=20
-
-      - name: Wait for CH-benCH PostgreSQL
-        run: |
-          for _ in {1..30}; do
-            if docker exec chbench-pg pg_isready -U bench > /dev/null 2>&1; then
-              echo "PostgreSQL is ready"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "PostgreSQL did not become ready in time."
-          docker logs chbench-pg
-          exit 1
+      - name: Setup CH-benCH PostgreSQL
+        uses: ./.github/actions/setup-chbench-postgres
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
