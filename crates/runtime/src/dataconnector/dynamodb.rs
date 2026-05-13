@@ -760,7 +760,7 @@ fn resume_from_checkpoint_stream(
                     if lag_exceeds_behavior == LagExceedsShardRetentionBehavior::Error {
                         tracing::error!(
                             dataset = %dataset_name,
-                            "DynamoDB Stream data has exceeded 24h retention period. Configured behavior is 'error'"
+                            "DynamoDB Streams checkpoint is older than the stream retention window; ingestion cannot resume from the saved checkpoint."
                         );
                         Some(
                             stream::once(async move {
@@ -775,8 +775,8 @@ fn resume_from_checkpoint_stream(
                     } else {
                         tracing::info!(
                             dataset = %dataset_name,
-                            behavior = ?lag_exceeds_behavior,
-                            "DynamoDB Stream data has exceeded 24h retention period. Initiating table re-initialization"
+                            "DynamoDB Streams checkpoint is older than the stream retention window; \
+                             ingestion cannot resume from the saved checkpoint. Rebuilding the dataset from a fresh DynamoDB table scan."
                         );
                         rebootstrap_table(
                             &dynamodb,
