@@ -71,7 +71,7 @@ impl Default for ChBenchConfig {
 
 impl ChBenchConfig {
     /// Build a `tokio-postgres` connection string from this config.
-    pub(crate) fn pg_connection_string(&self) -> String {
+    pub fn pg_connection_string(&self) -> String {
         format!(
             "host={} port={} dbname={} user={} password={}",
             self.pg_host, self.pg_port, self.pg_db, self.pg_user, self.pg_pass,

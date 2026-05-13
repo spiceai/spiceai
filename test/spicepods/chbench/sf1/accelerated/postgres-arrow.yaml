@@ -7,7 +7,6 @@ runtime:
     sql_results:
       enabled: false
 
-
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
 
@@ -24,8 +23,7 @@ datasets:
       pg_replication_initial_snapshot: "true"
     acceleration: &cayenne_accel
       enabled: true
-      engine: cayenne
-      mode: file
+      engine: arrow
       refresh_mode: changes
       primary_key: w_id
       on_conflict:

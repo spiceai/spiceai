@@ -24,7 +24,7 @@ datasets:
       pg_replication_initial_snapshot: "true"
     acceleration: &cayenne_accel
       enabled: true
-      engine: cayenne
+      engine: duckdb
       mode: file
       refresh_mode: changes
       primary_key: w_id

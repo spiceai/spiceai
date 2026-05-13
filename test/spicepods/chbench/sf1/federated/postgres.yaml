@@ -2,6 +2,11 @@ version: v1
 kind: Spicepod
 name: postgres-federated
 
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+
 datasets:
   - from: postgres:warehouse
     name: warehouse
