@@ -30,6 +30,8 @@ use cayenne::metadata::CreateTableOptions;
 
 use cayenne::CayenneTableProvider;
 
+use datafusion::datasource::TableProvider;
+
 use datafusion::execution::config::SessionConfig;
 
 use datafusion::prelude::*;
@@ -390,13 +392,16 @@ async fn test_cayenne_scan_uses_target_partitions_impl(
     };
 
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
-    let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
-        table_options,
-        ctx.runtime_env(),
-    )
-    .await?;
-    ctx.register_table("target_partitioned_table", Arc::new(table))?;
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::<cayenne::CayenneCatalog>::clone(catalog),
+            table_options,
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let registered_table: Arc<dyn TableProvider> = table.clone();
+    ctx.register_table("target_partitioned_table", registered_table)?;
 
     ctx.sql(
         "INSERT INTO target_partitioned_table VALUES \
@@ -413,10 +418,9 @@ async fn test_cayenne_scan_uses_target_partitions_impl(
     .collect()
     .await?;
 
-    let df = ctx.sql("SELECT * FROM target_partitioned_table").await?;
-    let physical_plan = df.clone().create_physical_plan().await?;
+    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
     assert_eq!(
-        physical_plan
+        scan_plan
             .properties()
             .output_partitioning()
             .partition_count(),
@@ -424,6 +428,7 @@ async fn test_cayenne_scan_uses_target_partitions_impl(
         "Full Cayenne scan should honor SessionConfig target_partitions"
     );
 
+    let df = ctx.sql("SELECT * FROM target_partitioned_table").await?;
     let results = df.collect().await?;
     let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total_rows, 8, "Expected all rows from full scan");
