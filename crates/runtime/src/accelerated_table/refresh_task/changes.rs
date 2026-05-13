@@ -1870,7 +1870,7 @@ mod tests {
             !coerced
                 .schema()
                 .field_with_name("id")
-                .unwrap()
+                .expect("id field exists")
                 .is_nullable(),
             "id should be promoted to non-nullable"
         );
@@ -1878,7 +1878,7 @@ mod tests {
             coerced
                 .schema()
                 .field_with_name("name")
-                .unwrap()
+                .expect("name field exists")
                 .is_nullable(),
             "name should remain nullable"
         );
