@@ -21,6 +21,8 @@ use snafu::ResultExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+const GENERIC_MANIFEST: &str = "spicepod.yaml";
+
 /// Registry that fetches Spicepods from the local file system.
 pub struct LocalFileRegistry;
 
@@ -76,34 +78,56 @@ impl LocalFileRegistry {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
-            .to_lowercase();
+            .to_string();
 
-        // Check for spicepod.yaml in the source directory
-        let manifest_name = format!("{pod_name}.yaml");
-        let source_manifest = source_path.join(&manifest_name);
-        if !source_manifest.exists() {
-            // Also check for spicepod.yaml (generic name)
-            let generic_manifest = source_path.join("spicepod.yaml");
-            if !generic_manifest.exists() {
-                return Err(Error::InvalidSpicepod {
-                    path: source_path.display().to_string(),
-                });
-            }
-        }
+        let source_manifest =
+            find_manifest(&source_path, &pod_name).ok_or_else(|| Error::InvalidSpicepod {
+                path: source_path.display().to_string(),
+            })?;
+
+        let destination_dir = pods_dir.join(&pod_name);
 
         // Create destination directory
-        std::fs::create_dir_all(pods_dir).context(IoSnafu {
+        std::fs::create_dir_all(&destination_dir).context(IoSnafu {
             operation: "create directory",
-            path: pods_dir.display().to_string(),
+            path: destination_dir.display().to_string(),
         })?;
 
-        // Copy all files from source to pods_dir
-        copy_dir_recursive(&source_path, pods_dir)?;
+        // Copy all files from source to the installed dependency directory.
+        if source_path != destination_dir {
+            copy_dir_recursive(&source_path, &destination_dir)?;
+        }
 
-        // Return path to the manifest in pods_dir
-        let dest_manifest = pods_dir.join(&manifest_name);
-        Ok(dest_manifest)
+        let destination_manifest = destination_dir.join(GENERIC_MANIFEST);
+        if source_manifest.file_name().and_then(|name| name.to_str()) != Some(GENERIC_MANIFEST) {
+            std::fs::copy(&source_manifest, &destination_manifest).context(IoSnafu {
+                operation: "copy file",
+                path: source_manifest.display().to_string(),
+            })?;
+        }
+
+        Ok(destination_dir)
     }
+}
+
+fn find_manifest(source_path: &Path, pod_name: &str) -> Option<PathBuf> {
+    let lowercase_pod_name = pod_name.to_lowercase();
+    let mut candidate_names = vec![
+        GENERIC_MANIFEST.to_string(),
+        "spicepod.yml".to_string(),
+        format!("{pod_name}.yaml"),
+        format!("{pod_name}.yml"),
+    ];
+
+    if lowercase_pod_name != pod_name {
+        candidate_names.push(format!("{lowercase_pod_name}.yaml"));
+        candidate_names.push(format!("{lowercase_pod_name}.yml"));
+    }
+
+    candidate_names
+        .into_iter()
+        .map(|candidate_name| source_path.join(candidate_name))
+        .find(|candidate_path| candidate_path.exists())
 }
 
 /// Recursively copy a directory and its contents.
@@ -146,10 +170,73 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_file_url_strip() {
         let path = "file:///path/to/pod";
         let stripped = path.strip_prefix("file://").unwrap_or(path);
         assert_eq!(stripped, "/path/to/pod");
+    }
+
+    #[tokio::test]
+    async fn copies_generic_yml_manifest_to_dependency_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let source_dir = temp_dir.path().join("localpod");
+        let pods_dir = temp_dir.path().join("spicepods");
+        std::fs::create_dir_all(&source_dir).expect("source directory should be created");
+        std::fs::write(
+            source_dir.join("spicepod.yml"),
+            "version: v2\nkind: Spicepod\nname: localpod\n",
+        )
+        .expect("spicepod.yml should be written");
+
+        let installed_path = LocalFileRegistry
+            .get_pod(
+                source_dir.to_str().expect("source path should be utf-8"),
+                &pods_dir,
+                &HashMap::new(),
+                &reqwest::Client::new(),
+            )
+            .await
+            .expect("local pod should be installed");
+
+        assert_eq!(installed_path, pods_dir.join("localpod"));
+        assert!(
+            pods_dir.join("localpod").join("spicepod.yml").exists(),
+            "original yml manifest should be copied"
+        );
+        assert!(
+            pods_dir.join("localpod").join("spicepod.yaml").exists(),
+            "generic yaml manifest should be created for dependency loading"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_pod_named_yml_manifest() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let source_dir = temp_dir.path().join("namedpod");
+        let pods_dir = temp_dir.path().join("spicepods");
+        std::fs::create_dir_all(&source_dir).expect("source directory should be created");
+        std::fs::write(
+            source_dir.join("namedpod.yml"),
+            "version: v2\nkind: Spicepod\nname: namedpod\n",
+        )
+        .expect("namedpod.yml should be written");
+
+        LocalFileRegistry
+            .get_pod(
+                source_dir.to_str().expect("source path should be utf-8"),
+                &pods_dir,
+                &HashMap::new(),
+                &reqwest::Client::new(),
+            )
+            .await
+            .expect("local pod should be installed");
+
+        assert!(
+            pods_dir.join("namedpod").join("spicepod.yaml").exists(),
+            "pod-named yml manifest should be normalized to spicepod.yaml"
+        );
     }
 }

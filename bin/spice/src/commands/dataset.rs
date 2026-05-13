@@ -18,12 +18,11 @@ limitations under the License.
 
 use crate::Result;
 use crate::error::{ConfigIoSnafu, CreateDirectorySnafu, InvalidArgumentSnafu};
+use crate::manifest;
 use ansi_colors::Color;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use spicepod::component::{ComponentOrReference, ComponentReference};
-use spicepod::spec::SpicepodDefinition;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -88,13 +87,12 @@ struct AccelerationSpec {
 
 /// Interactive dataset configuration.
 fn configure_dataset() -> Result<()> {
-    // Check that spicepod.yaml exists
-    let spicepod_path = Path::new("spicepod.yaml");
-    if !spicepod_path.exists() {
+    let Some(spicepod_path) = manifest::existing_spicepod_path(Path::new(".")) else {
         return Err(crate::error::Error::InvalidArgument {
-            message: "No spicepod.yaml found. Run 'spice init <app>' first.".to_string(),
+            message: "No spicepod.yaml or spicepod.yml found. Run 'spice init <app>' first."
+                .to_string(),
         });
-    }
+    };
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -213,10 +211,10 @@ fn configure_dataset() -> Result<()> {
 
     // Write dataset.yaml
     let file_path = dir_path.join("dataset.yaml");
-    write_secure_file(&file_path, dataset_yaml.as_bytes())?;
+    manifest::write_secure_file(&file_path, dataset_yaml.as_bytes())?;
 
-    // Update spicepod.yaml to reference the dataset
-    update_spicepod_with_dataset(&dir_path)?;
+    // Update the Spicepod manifest to reference the dataset.
+    update_spicepod_with_dataset(&spicepod_path, &dir_path)?;
 
     println!(
         "{}",
@@ -277,64 +275,13 @@ fn is_valid_dataset_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Write a file with secure permissions (0600 on Unix).
-fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
-    fs::write(path, contents).context(ConfigIoSnafu {
-        operation: "write",
-        path: path.to_path_buf(),
-    })?;
+/// Update the Spicepod manifest to include a reference to the dataset.
+fn update_spicepod_with_dataset(spicepod_path: &Path, dataset_dir: &Path) -> Result<()> {
+    let mut spicepod = manifest::read_spicepod_value(spicepod_path)?;
+    let dataset_ref_path = manifest::path_to_spicepod_ref(dataset_dir);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(path, permissions).context(ConfigIoSnafu {
-            operation: "set permissions on",
-            path: path.to_path_buf(),
-        })?;
-    }
-
-    Ok(())
-}
-
-/// Update spicepod.yaml to include a reference to the dataset.
-fn update_spicepod_with_dataset(dataset_dir: &Path) -> Result<()> {
-    let spicepod_path = Path::new("spicepod.yaml");
-
-    // Read existing spicepod.yaml
-    let content = fs::read_to_string(spicepod_path).context(ConfigIoSnafu {
-        operation: "read",
-        path: spicepod_path.to_path_buf(),
-    })?;
-
-    let mut spicepod: SpicepodDefinition =
-        yaml::from_str(&content).map_err(|e| crate::error::Error::ConfigParse {
-            message: format!("Failed to parse spicepod.yaml: {e}"),
-        })?;
-
-    // Check if dataset is already referenced
-    let dataset_ref_path = dataset_dir.to_string_lossy().to_string();
-    let already_referenced = spicepod.datasets.iter().any(|d| match d {
-        ComponentOrReference::Reference(r) => r.r#ref == dataset_ref_path,
-        ComponentOrReference::Component(_) => false,
-    });
-
-    if !already_referenced {
-        // Add the dataset reference
-        spicepod
-            .datasets
-            .push(ComponentOrReference::Reference(ComponentReference {
-                r#ref: dataset_ref_path,
-                depends_on: Vec::new(),
-            }));
-
-        // Write back to spicepod.yaml
-        let updated_yaml =
-            yaml::to_string(&spicepod).map_err(|e| crate::error::Error::ConfigParse {
-                message: format!("Failed to serialize spicepod.yaml: {e}"),
-            })?;
-
-        write_secure_file(spicepod_path, updated_yaml.as_bytes())?;
+    if manifest::ensure_component_reference(&mut spicepod, "datasets", &dataset_ref_path)? {
+        manifest::write_spicepod_value(spicepod_path, &spicepod)?;
     }
 
     Ok(())
@@ -373,15 +320,29 @@ mod tests {
     }
 
     #[test]
-    fn test_component_reference() {
-        let ref_dataset: ComponentOrReference<spicepod::component::dataset::Dataset> =
-            ComponentOrReference::Reference(ComponentReference {
-                r#ref: "datasets/test".to_string(),
-                depends_on: Vec::new(),
-            });
-        match &ref_dataset {
-            ComponentOrReference::Reference(r) => assert_eq!(r.r#ref, "datasets/test"),
-            ComponentOrReference::Component(_) => panic!("expected reference"),
-        }
+    fn test_update_spicepod_with_dataset_uses_existing_yml() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let spicepod_path = temp_dir.path().join(manifest::SPICEPOD_YML);
+        std::fs::write(
+            &spicepod_path,
+            "version: v2\nkind: Spicepod\nname: test_app\nmodels: []\nembeddings: []\nworkers: []\n",
+        )
+        .expect("spicepod.yml should be written");
+
+        update_spicepod_with_dataset(&spicepod_path, Path::new("datasets/test"))
+            .expect("spicepod.yml should be updated");
+
+        let updated =
+            std::fs::read_to_string(&spicepod_path).expect("spicepod.yml should be readable");
+        assert!(updated.contains("models:"), "models should be preserved");
+        assert!(
+            updated.contains("embeddings:"),
+            "embeddings should be preserved"
+        );
+        assert!(updated.contains("workers:"), "workers should be preserved");
+        assert!(
+            updated.contains("ref: datasets/test"),
+            "dataset reference should be added"
+        );
     }
 }

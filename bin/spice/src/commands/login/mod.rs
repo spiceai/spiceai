@@ -21,6 +21,7 @@ mod providers;
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
+use crate::manifest;
 use clap::{Args, Subcommand};
 
 pub use auth_config::{merge_auth_config, store_keychain};
@@ -235,7 +236,7 @@ async fn login_spiceai(
         }
     };
 
-    // Try to read spicepod.yaml for preferred org/app
+    // Try to read the Spicepod manifest for preferred org/app.
     let (org_name, app_name) = read_spicepod_metadata();
 
     // Get auth context
@@ -309,9 +310,13 @@ fn generate_auth_code() -> String {
         .collect()
 }
 
-/// Read org and app name from spicepod.yaml if it exists.
+/// Read org and app name from spicepod.yaml or spicepod.yml if it exists.
 fn read_spicepod_metadata() -> (Option<String>, Option<String>) {
-    let Ok(contents) = std::fs::read_to_string("spicepod.yaml") else {
+    let Some(spicepod_path) = manifest::existing_spicepod_path(std::path::Path::new(".")) else {
+        return (None, None);
+    };
+
+    let Ok(contents) = std::fs::read_to_string(spicepod_path) else {
         return (None, None);
     };
 

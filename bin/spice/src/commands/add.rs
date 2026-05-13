@@ -17,11 +17,10 @@ limitations under the License.
 //! Add command - adds a Spicepod to the project.
 
 use crate::context::RuntimeContext;
-use crate::error::{ConfigIoSnafu, Result};
+use crate::error::Result;
+use crate::manifest;
 use crate::registry;
 use clap::Args;
-use snafu::ResultExt;
-use spicepod::spec::SpicepodDefinition;
 use std::path::Path;
 
 /// Arguments for the add command.
@@ -78,39 +77,21 @@ pub async fn execute_add_or_connect(
     // Get relative path for display
     let relative_path = get_relative_path(ctx.app_dir(), &download_path);
 
-    // Read or create spicepod.yaml
-    let spicepod_path = ctx.app_dir().join("spicepod.yaml");
-    let mut spicepod: SpicepodDefinition = if spicepod_path.exists() {
-        let contents = std::fs::read_to_string(&spicepod_path).context(ConfigIoSnafu {
-            operation: "read",
-            path: spicepod_path.clone(),
-        })?;
-        yaml::from_str(&contents).map_err(|e| crate::error::Error::ConfigParse {
-            message: e.to_string(),
-        })?
-    } else {
-        // Create a new spicepod.yaml
-        let name = ctx
-            .app_dir()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("app");
-        println!("\x1b[32mspicepod.yaml initialized!\x1b[0m");
-        SpicepodDefinition::new(name)
-    };
+    let name = ctx
+        .app_dir()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("app");
+    let (spicepod_path, mut spicepod, created) =
+        manifest::load_or_create_spicepod_value(ctx.app_dir(), name)?;
 
-    // Add dependency if not already present
-    if !spicepod.dependencies.contains(&pod_path.clone()) {
-        spicepod.dependencies.push(pod_path.clone());
+    if created {
+        println!("\x1b[32m{} initialized!\x1b[0m", spicepod_path.display());
+    }
 
-        // Write updated spicepod.yaml
-        let yaml = yaml::to_string(&spicepod).map_err(|e| crate::error::Error::ConfigParse {
-            message: format!("Failed to serialize spicepod.yaml: {e}"),
-        })?;
-        std::fs::write(&spicepod_path, yaml).context(ConfigIoSnafu {
-            operation: "write",
-            path: spicepod_path,
-        })?;
+    let dependency_path = get_relative_path(ctx.pods_dir(), &download_path);
+    if manifest::ensure_string_sequence_item(&mut spicepod, "dependencies", &dependency_path)? {
+        manifest::write_spicepod_value(&spicepod_path, &spicepod)?;
     }
 
     println!("added {relative_path}");
@@ -120,6 +101,8 @@ pub async fn execute_add_or_connect(
 
 /// Get a relative path from a base directory.
 fn get_relative_path(base: &Path, path: &Path) -> String {
-    path.strip_prefix(base)
-        .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
+    path.strip_prefix(base).map_or_else(
+        |_| path.display().to_string(),
+        manifest::path_to_spicepod_ref,
+    )
 }

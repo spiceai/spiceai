@@ -17,6 +17,7 @@ limitations under the License.
 //! Init command implementation - initializes a new Spice app.
 
 use crate::error::{ConfigIoSnafu, CreateDirectorySnafu, Result};
+use crate::manifest;
 use clap::Args;
 use snafu::ResultExt;
 use std::io::{self, Write};
@@ -45,11 +46,16 @@ pub struct InitArgs {
 pub fn execute(args: &InitArgs) -> Result<()> {
     let (spicepod_name, spicepod_dir) = determine_names(&args.name);
 
-    let spicepod_path = Path::new(&spicepod_dir).join("spicepod.yaml");
+    let spicepod_base_dir = Path::new(&spicepod_dir);
+    let spicepod_path = manifest::existing_spicepod_path(spicepod_base_dir)
+        .unwrap_or_else(|| manifest::default_spicepod_path(spicepod_base_dir));
 
     // Check if spicepod.yaml already exists
     if spicepod_path.exists() {
-        print!("spicepod.yaml already exists. Replace (y/n)? ");
+        print!(
+            "{} already exists. Replace (y/n)? ",
+            spicepod_path.display()
+        );
         io::stdout().flush().ok();
 
         let mut confirm = String::new();
@@ -68,7 +74,7 @@ pub fn execute(args: &InitArgs) -> Result<()> {
     }
 
     // Create the spicepod.yaml file
-    let spicepod_content = create_spicepod_yaml(&spicepod_name);
+    let spicepod_content = manifest::create_spicepod_yaml(&spicepod_name);
     std::fs::write(&spicepod_path, spicepod_content).context(ConfigIoSnafu {
         operation: "write",
         path: spicepod_path.clone(),
@@ -116,14 +122,4 @@ fn determine_names(name_arg: &str) -> (String, String) {
         // Use provided name and create directory
         (name_arg.to_string(), name_arg.to_string())
     }
-}
-
-/// Create the spicepod.yaml content.
-///
-/// The `yaml-language-server` directive enables schema validation + completion in
-/// editors (VS Code, Neovim with coc/yaml, `IntelliJ`) without any extra setup.
-fn create_spicepod_yaml(name: &str) -> String {
-    format!(
-        "# yaml-language-server: $schema=https://raw.githubusercontent.com/spiceai/spiceai/trunk/.schema/spicepod.schema.json\nversion: v2\nkind: Spicepod\nname: {name}\n"
-    )
 }

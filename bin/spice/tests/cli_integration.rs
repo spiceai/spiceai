@@ -466,6 +466,69 @@ mod add {
         let mut cmd = spice_cmd();
         cmd.arg("add").assert().failure();
     }
+
+    #[test]
+    fn test_add_local_yml_pod_updates_existing_yml_manifest() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let app_manifest = temp_dir.path().join("spicepod.yml");
+        fs::write(
+            &app_manifest,
+            "version: v2\nkind: Spicepod\nname: app\nmodels: []\nembeddings: []\nworkers: []\n",
+        )
+        .expect("Failed to write app spicepod.yml");
+
+        let local_pod_dir = temp_dir.path().join("localpod");
+        fs::create_dir_all(&local_pod_dir).expect("Failed to create local pod dir");
+        fs::write(
+            local_pod_dir.join("spicepod.yml"),
+            "version: v2\nkind: Spicepod\nname: localpod\n",
+        )
+        .expect("Failed to write local pod spicepod.yml");
+
+        let mut cmd = spice_cmd();
+        cmd.current_dir(temp_dir.path())
+            .arg("add")
+            .arg(&local_pod_dir)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("added spicepods/localpod"));
+
+        let updated_manifest =
+            fs::read_to_string(&app_manifest).expect("Failed to read updated spicepod.yml");
+        assert!(
+            updated_manifest.contains("models:"),
+            "models should be preserved"
+        );
+        assert!(
+            updated_manifest.contains("embeddings:"),
+            "embeddings should be preserved"
+        );
+        assert!(
+            updated_manifest.contains("workers:"),
+            "workers should be preserved"
+        );
+        assert!(
+            updated_manifest.contains("dependencies:"),
+            "dependencies should be added"
+        );
+        assert!(
+            updated_manifest.contains("- localpod"),
+            "dependency should reference the installed path"
+        );
+        assert!(
+            !temp_dir.path().join("spicepod.yaml").exists(),
+            "spice add should edit the existing .yml manifest"
+        );
+        assert!(
+            temp_dir
+                .path()
+                .join("spicepods")
+                .join("localpod")
+                .join("spicepod.yaml")
+                .exists(),
+            "local yml dependency should be normalized to spicepod.yaml"
+        );
+    }
 }
 
 // ============================================================================

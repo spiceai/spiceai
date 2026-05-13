@@ -47,7 +47,7 @@ pub enum Error {
 
     /// Not a valid Spicepod directory
     #[snafu(display(
-        "The directory '{path}' does not contain a spicepod.yaml. Is it a valid Spicepod?"
+        "The directory '{path}' does not contain a spicepod.yaml or spicepod.yml. Is it a valid Spicepod?"
     ))]
     InvalidSpicepod { path: String },
 
