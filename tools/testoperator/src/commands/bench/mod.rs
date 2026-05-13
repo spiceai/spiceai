@@ -77,11 +77,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     // For chbench, prepare the Postgres source database (schema + seed data) before starting spiced.
     let query_set = args.load_query_set()?;
     if query_set == test_framework::queries::QuerySet::ChBench {
-        println!("Preparing chbench source database...");
-        let (config, source) = chbench_config_from_env()?;
-        let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
-        driver.prepare().await?;
-        println!("chbench source database ready");
+        let scale_factor = args.scale_factor.unwrap_or(1.0);
+        prepare_chbench_source(scale_factor, None).await?;
     }
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -248,7 +245,7 @@ fn snapshot_predicate(query_name: &str) -> bool {
         && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
 }
 
-/// Build CH-benCH configs from environment variables with sensible defaults.
+/// Build CH-benCH PostgreSQL source config from environment variables.
 ///
 /// | Variable | Default |
 /// |----------|---------|
@@ -257,11 +254,7 @@ fn snapshot_predicate(query_name: &str) -> bool {
 /// | `CHBENCH_PG_DB` | `chbench` |
 /// | `CHBENCH_PG_USER` | `bench` |
 /// | `CHBENCH_PG_PASS` | `bench` |
-pub(crate) fn chbench_config_from_env() -> anyhow::Result<(
-    chbench_driver::ChBenchConfig,
-    chbench_driver::PostgresSourceConfig,
-)> {
-    let workload = chbench_driver::ChBenchConfig::default();
+fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceConfig> {
     let mut source = chbench_driver::PostgresSourceConfig::default();
     if let Ok(v) = std::env::var("CHBENCH_PG_HOST") {
         source.host = v;
@@ -280,6 +273,42 @@ pub(crate) fn chbench_config_from_env() -> anyhow::Result<(
     if let Ok(v) = std::env::var("CHBENCH_PG_PASS") {
         source.pass = v;
     }
+    Ok(source)
+}
 
-    Ok((workload, source))
+/// Validate scale factor, build the CH-benCH config, connect to the source
+/// PostgreSQL, create the schema and load seed data.
+///
+/// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
+/// `duration` overrides the default OLTP workload duration when set.
+pub(crate) async fn prepare_chbench_source(
+    scale_factor: f64,
+    duration: Option<Duration>,
+) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
+    if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
+        anyhow::bail!(
+            "CH-benCH --scale-factor must be a positive integer (>= 1), got {scale_factor}. \
+             Scale factor maps directly to TPC-C warehouse count."
+        );
+    }
+
+    let warehouses = scale_factor as usize;
+    let terminals = warehouses * 10;
+    let mut config = chbench_driver::ChBenchConfig {
+        warehouses,
+        terminals,
+        ..Default::default()
+    };
+    if let Some(d) = duration {
+        config.duration = d;
+    }
+
+    println!("Preparing chbench source (SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s))...");
+
+    let source = chbench_source_from_env()?;
+    let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
+    driver.prepare().await?;
+
+    println!("chbench source is ready");
+    Ok(driver)
 }

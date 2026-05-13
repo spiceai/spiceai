@@ -29,6 +29,7 @@ use test_framework::{
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
+    queries::QuerySet,
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
@@ -39,13 +40,21 @@ use test_framework::{
 };
 
 use crate::{
-    args::HtapArgs, commands::bench::chbench_config_from_env, health::HealthMonitor,
+    args::HtapArgs, commands::bench::prepare_chbench_source, health::HealthMonitor,
     spiced_metrics::MetricsScraper, wait_test_and_memory,
 };
 
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let test_args = &args.test_args;
     let (app, mut start_request) = super::get_app_and_start_request(&test_args.common).await?;
+
+    let query_set = test_args.load_query_set()?;
+    if !matches!(query_set, QuerySet::ChBench) {
+        anyhow::bail!(
+            "HTAP command requires the 'chbench' query set, but got '{query_set}'. \
+             Use '--query-set chbench' or run 'testoperator run bench' for other query sets."
+        );
+    }
 
     // Always enable the metrics endpoint in HTAP mode for replication metrics.
     if !test_args.common.scrape_spiced_metrics {
@@ -54,22 +63,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     // 1. Prepare the source (schema + seed data).
-    // CH-benCH convention: scale_factor = warehouses, terminals = warehouses * 10.
     let scale_factor = test_args.scale_factor.unwrap_or(1.0);
-    let warehouses = scale_factor as usize;
-    let terminals = warehouses * 10;
-
-    println!(
-        "Preparing chbench source (SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminals)..."
-    );
-    let (mut config, source) = chbench_config_from_env()?;
-    config.warehouses = warehouses;
-    config.terminals = terminals;
-    config.duration = Duration::from_secs(test_args.common.duration);
+    let duration = Duration::from_secs(test_args.common.duration);
     let driver: Arc<dyn chbench_driver::ChBenchDriver> =
-        Arc::new(chbench_driver::PostgresChBenchDriver::connect(config, source).await?);
-    driver.prepare().await?;
-    println!("chbench source is ready");
+        Arc::new(prepare_chbench_source(scale_factor, Some(duration)).await?);
 
     // 2. Start spiced.
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -90,7 +87,6 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string());
     let testoperator_commit_sha = git::get_commit_sha();
     let branch_name = git::get_branch_name();
-    let query_set = test_args.load_query_set()?;
 
     let benchmark_resource = Resource::builder_empty()
         .with_attributes(vec![

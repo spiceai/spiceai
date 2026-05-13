@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: postgres-cayenne[file]
+name: postgres-arrow
 
 runtime:
   caching:

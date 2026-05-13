@@ -141,7 +141,10 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
 
         // Check for rollback item
         if ol_i_id < 0 {
-            tx.execute("ROLLBACK", &[]).await.ok();
+            tx.rollback().await.map_err(|source| crate::Error::Sql {
+                action: "new_order: rollback".into(),
+                source,
+            })?;
             return Ok(());
         }
 

@@ -73,14 +73,14 @@ pub fn rand_tax(rng: &mut impl Rng) -> f64 {
 /// Returns a random a-string `[26..50]`. For 10% of rows, "ORIGINAL" is placed
 /// at a random position within the string.
 pub fn rand_original_string(rng: &mut impl Rng) -> String {
-    let mut s = rand_chars(rng, 26, 50);
+    let mut bytes = rand_chars(rng, 26, 50).into_bytes();
     if rng.random_range(0..10) == 0 {
-        let mut bytes = s.into_bytes();
         let pos = rng.random_range(0..bytes.len().saturating_sub(8));
         bytes[pos..pos + 8].copy_from_slice(b"ORIGINAL");
-        s = String::from_utf8(bytes).unwrap_or_default();
     }
-    s
+    // SAFETY (infallible): `rand_chars` produces ASCII-only bytes and "ORIGINAL" is ASCII,
+    // so the buffer is always valid UTF-8.
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 /// Generate a C-Last name from syllables (spec §4.3.2.3).

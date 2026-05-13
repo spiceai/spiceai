@@ -10,6 +10,6 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 snafu = "0.8"
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tokio-postgres = { workspace = true }
 tokio-util = { workspace = true }

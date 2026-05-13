@@ -39,7 +39,7 @@ pub const ALL_TABLES: &[&str] = &[
 /// Drop stale Spice replication slots and publications left from previous runs (if any).
 pub async fn drop_replication_artifacts(client: &Client) -> Result<()> {
     // Drop replication slots named spice_*
-    let rows = client
+    let slot_rows = client
         .query(
             "SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'spice_%'",
             &[],
@@ -50,14 +50,14 @@ pub async fn drop_replication_artifacts(client: &Client) -> Result<()> {
             source,
         })?;
 
-    for row in &rows {
+    for row in &slot_rows {
         let slot_name: &str = row.get(0);
         let sql = format!("SELECT pg_drop_replication_slot('{slot_name}')");
         let _unused = client.execute(&sql, &[]).await;
     }
 
     // Drop publications named spice_*
-    let rows = client
+    let pub_rows = client
         .query(
             "SELECT pubname FROM pg_publication WHERE pubname LIKE 'spice_%'",
             &[],
@@ -68,17 +68,17 @@ pub async fn drop_replication_artifacts(client: &Client) -> Result<()> {
             source,
         })?;
 
-    for row in &rows {
+    for row in &pub_rows {
         let pubname: &str = row.get(0);
         let sql = format!("DROP PUBLICATION IF EXISTS {pubname}");
         let _unused = client.execute(&sql, &[]).await;
     }
 
-    if !rows.is_empty() {
+    if !slot_rows.is_empty() || !pub_rows.is_empty() {
         println!(
             "  cleaned up {} replication slots, {} publications",
-            rows.len(),
-            rows.len()
+            slot_rows.len(),
+            pub_rows.len()
         );
     }
 
@@ -348,7 +348,7 @@ const MUTATED_TABLES: &[&str] = &[
 
 /// Tables probed for staleness gap measurement.
 /// Selected for diversity: district (small, baseline), order_line (high volume),
-/// new_order (DELETE path), history (append-only, no PK).
+/// new_order (DELETE path).
 pub const STALENESS_PROBE_TABLES: &[&str] = &["district", "order_line", "new_order"];
 
 /// Add `_bench_ts TIMESTAMPTZ` column with `clock_timestamp()` default and

@@ -18,19 +18,6 @@ limitations under the License.
 //!
 //! Creates 12 tables (9 TPC-C + 3 CH supplemental), loads seed data,
 //! and runs a TPC-C OLTP workload with configurable terminals and duration.
-//!
-//! # Usage
-//!
-//! ```rust,no_run
-//! use chbench_driver::{ChBenchConfig, PostgresChBenchDriver};
-//!
-//! # async fn example() -> chbench_driver::Result<()> {
-//! let config = ChBenchConfig { warehouses: 1, ..Default::default() };
-//! let driver = PostgresChBenchDriver::connect(config).await?;
-//! driver.prepare().await?;
-//! # Ok(())
-//! # }
-//! ```
 
 pub mod config;
 pub mod loader;
