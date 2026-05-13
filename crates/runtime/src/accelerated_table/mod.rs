@@ -1295,7 +1295,6 @@ impl Drop for AcceleratedTable {
     }
 }
 
-#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for AcceleratedTable {
     fn as_any(&self) -> &dyn Any {
