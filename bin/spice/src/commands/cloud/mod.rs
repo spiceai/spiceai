@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Cloud commands for managing Spice Cloud resources.
 
-mod bytes;
+pub mod bytes;
 mod client;
 mod config;
 
@@ -490,7 +490,7 @@ pub struct CreateAppArgs {
 
     /// Scheduler memory limit (e.g. 16Gi, 16GiB)
     #[arg(long)]
-    pub memory: Option<String>,
+    pub memory: Option<bytes::NumBytes>,
 
     /// Block storage size in GB
     #[arg(long)]
@@ -506,7 +506,7 @@ pub struct CreateAppArgs {
 
     /// Executor memory limit (e.g. 32Gi, 32GiB)
     #[arg(long)]
-    pub executor_memory: Option<String>,
+    pub executor_memory: Option<bytes::NumBytes>,
 
     /// Path to a spicepod.yaml file
     #[arg(long)]
@@ -606,7 +606,7 @@ pub struct UpdateAppArgs {
 
     /// Scheduler memory limit (e.g. 16Gi, 16GiB)
     #[arg(long)]
-    pub memory: Option<String>,
+    pub memory: Option<bytes::NumBytes>,
 
     /// Block storage size in GB
     #[arg(long)]
@@ -622,7 +622,7 @@ pub struct UpdateAppArgs {
 
     /// Executor memory limit (e.g. 32Gi, 32GiB)
     #[arg(long)]
-    pub executor_memory: Option<String>,
+    pub executor_memory: Option<bytes::NumBytes>,
 
     /// Path to a spicepod.yaml file
     #[arg(long)]
@@ -1324,11 +1324,11 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
                     &args.visibility,
                     args.replicas,
                     args.cpu,
-                    args.memory.as_deref(),
+                    args.memory,
                     args.storage_size_gb,
                     args.executor_replicas,
                     args.executor_cpu,
-                    args.executor_memory.as_deref(),
+                    args.executor_memory,
                 )
                 .await?;
 
@@ -1433,11 +1433,11 @@ async fn execute_update(cmd: &UpdateCommands) -> Result<()> {
                     args.image.as_deref(),
                     args.region.as_deref(),
                     args.cpu,
-                    args.memory.as_deref(),
+                    args.memory,
                     args.storage_size_gb,
                     args.executor_replicas,
                     args.executor_cpu,
-                    args.executor_memory.as_deref(),
+                    args.executor_memory,
                     spicepod_content,
                     args.channel,
                 )

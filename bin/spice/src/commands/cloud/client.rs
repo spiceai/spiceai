@@ -169,16 +169,12 @@ impl CloudClient {
         visibility: &str,
         replicas: Option<i32>,
         cpu: Option<i32>,
-        memory: Option<&str>,
+        memory: Option<NumBytes>,
         storage_size_gb: Option<f64>,
         executor_replicas: Option<i32>,
         executor_cpu: Option<i32>,
-        executor_memory: Option<&str>,
+        executor_memory: Option<NumBytes>,
     ) -> Result<App> {
-        let memory = memory.map(super::bytes::NumBytes::parse).transpose()?;
-        let executor_memory = executor_memory
-            .map(super::bytes::NumBytes::parse)
-            .transpose()?;
         let resources = build_resources(cpu, memory);
         let executor = build_executor(
             executor_replicas,
@@ -219,18 +215,14 @@ impl CloudClient {
         image_tag: Option<&str>,
         region: Option<&str>,
         cpu: Option<i32>,
-        memory: Option<&str>,
+        memory: Option<NumBytes>,
         storage_size_gb: Option<f64>,
         executor_replicas: Option<i32>,
         executor_cpu: Option<i32>,
-        executor_memory: Option<&str>,
+        executor_memory: Option<NumBytes>,
         spicepod: Option<String>,
         channel: Option<UpdateChannel>,
     ) -> Result<App> {
-        let memory = memory.map(super::bytes::NumBytes::parse).transpose()?;
-        let executor_memory = executor_memory
-            .map(super::bytes::NumBytes::parse)
-            .transpose()?;
         let app = self.get_app(org_app).await?;
         let resources = build_resources(cpu, memory);
         let executor = build_executor(executor_replicas, executor_cpu, executor_memory, None);

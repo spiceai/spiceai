@@ -61,7 +61,7 @@ impl std::str::FromStr for UpdateChannel {
     }
 }
 
-/// App kind — determines whether the app is a SpicepodSet or SpicepodCluster.
+/// App kind — determines whether the app is a `SpicepodSet` or `SpicepodCluster`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AppKind {

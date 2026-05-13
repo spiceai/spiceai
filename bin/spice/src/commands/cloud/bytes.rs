@@ -18,6 +18,8 @@ limitations under the License.
 
 use std::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::error::{InvalidArgumentSnafu, Result};
 
 const KIB: u64 = 1024;
@@ -93,6 +95,40 @@ impl NumBytes {
     /// This is the format expected by the Spice Cloud API for memory/storage fields.
     pub fn to_gi_string(self) -> String {
         format!("{}Gi", self.0 / GIB)
+    }
+
+    /// Format as the most compact lossless string accepted by [`NumBytes::parse`].
+    ///
+    /// Picks the largest unit (Gi > Mi > Ki) for which the value is exactly divisible.
+    fn to_parse_string(self) -> String {
+        if self.0 % GIB == 0 {
+            format!("{}Gi", self.0 / GIB)
+        } else if self.0 % MIB == 0 {
+            format!("{}Mi", self.0 / MIB)
+        } else {
+            format!("{}Ki", self.0 / KIB)
+        }
+    }
+}
+
+impl std::str::FromStr for NumBytes {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse(s).map_err(|e| e.to_string())
+    }
+}
+
+impl Serialize for NumBytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_parse_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for NumBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        NumBytes::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -194,5 +230,34 @@ mod tests {
     fn format_f64_gib() {
         let s = format_bytes_f64(2.5 * GIB as f64);
         assert_eq!(s, "2.5 GiB");
+    }
+
+    #[test]
+    fn serde_roundtrip_gi() {
+        let nb = NumBytes::parse("16Gi").unwrap();
+        let json = serde_json::to_string(&nb).unwrap();
+        assert_eq!(json, r#""16Gi""#);
+        assert_eq!(serde_json::from_str::<NumBytes>(&json).unwrap(), nb);
+    }
+
+    #[test]
+    fn serde_roundtrip_mi() {
+        let nb = NumBytes::parse("512Mi").unwrap();
+        let json = serde_json::to_string(&nb).unwrap();
+        assert_eq!(json, r#""512Mi""#);
+        assert_eq!(serde_json::from_str::<NumBytes>(&json).unwrap(), nb);
+    }
+
+    #[test]
+    fn serde_roundtrip_ki() {
+        let nb = NumBytes::from_bytes(4 * KIB);
+        let json = serde_json::to_string(&nb).unwrap();
+        assert_eq!(json, r#""4Ki""#);
+        assert_eq!(serde_json::from_str::<NumBytes>(&json).unwrap(), nb);
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid() {
+        assert!(serde_json::from_str::<NumBytes>(r#""16GB""#).is_err());
     }
 }
