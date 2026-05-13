@@ -19,15 +19,15 @@ limitations under the License.
 //! Read-only: count distinct items in recent orders with stock below threshold.
 //! No WAL events — included for spec-compliant tpmC measurement.
 
-use ::rand::Rng;
+use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
 use crate::Result;
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
-    let w_id = rng.gen_range(1..=warehouses);
-    let d_id = rng.gen_range(1..=10);
-    let threshold = rng.gen_range(10..=20);
+    let w_id = rng.random_range(1..=warehouses);
+    let d_id = rng.random_range(1..=10);
+    let threshold = rng.random_range(10..=20);
 
     let tx = client
         .transaction()

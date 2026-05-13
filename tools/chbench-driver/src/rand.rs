@@ -16,7 +16,7 @@ limitations under the License.
 
 //! TPC-C random data generators (spec §2.1.6 / §4.3.2).
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 const CHARACTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
 const LETTERS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -29,25 +29,25 @@ const C_LAST_TOKENS: &[&str] = &[
 
 /// Generate a random string of characters in `[min_len, max_len]` (spec §4.3.2.2).
 pub fn rand_chars(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String {
-    let len = rng.gen_range(min_len..=max_len);
+    let len = rng.random_range(min_len..=max_len);
     (0..len)
-        .map(|_| CHARACTERS[rng.gen_range(0..CHARACTERS.len())] as char)
+        .map(|_| CHARACTERS[rng.random_range(0..CHARACTERS.len())] as char)
         .collect()
 }
 
 /// Generate a random string of uppercase letters in `[min_len, max_len]`.
 pub fn rand_letters(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String {
-    let len = rng.gen_range(min_len..=max_len);
+    let len = rng.random_range(min_len..=max_len);
     (0..len)
-        .map(|_| LETTERS[rng.gen_range(0..LETTERS.len())] as char)
+        .map(|_| LETTERS[rng.random_range(0..LETTERS.len())] as char)
         .collect()
 }
 
 /// Generate a random string of digits in `[min_len, max_len]`.
 pub fn rand_numbers(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String {
-    let len = rng.gen_range(min_len..=max_len);
+    let len = rng.random_range(min_len..=max_len);
     (0..len)
-        .map(|_| NUMBERS[rng.gen_range(0..NUMBERS.len())] as char)
+        .map(|_| NUMBERS[rng.random_range(0..NUMBERS.len())] as char)
         .collect()
 }
 
@@ -65,7 +65,7 @@ pub fn rand_zip(rng: &mut impl Rng) -> String {
 
 /// Generate a random tax rate in `[0.0000, 0.2000]` (spec §2.4.1).
 pub fn rand_tax(rng: &mut impl Rng) -> f64 {
-    f64::from(rng.gen_range(0..=2000)) / 10_000.0
+    f64::from(rng.random_range(0..=2000)) / 10_000.0
 }
 
 /// Generate a random "original" string (spec §4.3.3.1).
@@ -74,9 +74,9 @@ pub fn rand_tax(rng: &mut impl Rng) -> f64 {
 /// at a random position within the string.
 pub fn rand_original_string(rng: &mut impl Rng) -> String {
     let mut s = rand_chars(rng, 26, 50);
-    if rng.gen_range(0..10) == 0 {
+    if rng.random_range(0..10) == 0 {
         let mut bytes = s.into_bytes();
-        let pos = rng.gen_range(0..bytes.len().saturating_sub(8));
+        let pos = rng.random_range(0..bytes.len().saturating_sub(8));
         bytes[pos..pos + 8].copy_from_slice(b"ORIGINAL");
         s = String::from_utf8(bytes).unwrap_or_default();
     }
@@ -94,15 +94,15 @@ pub fn c_last_syllables(n: usize) -> String {
 
 /// Generate a random C-Last name using NURand (spec §2.1.6).
 pub fn rand_c_last(rng: &mut impl Rng, c_load: usize) -> String {
-    let a = rng.gen_range(0..256);
-    let x = rng.gen_range(0..1000);
+    let a = rng.random_range(0..256);
+    let x = rng.random_range(0..1000);
     c_last_syllables(((a | x) + c_load) % 1000)
 }
 
 /// Generate a random customer ID using NURand(1023, 1, 3000) (spec §2.1.6).
 pub fn rand_customer_id(rng: &mut impl Rng) -> i32 {
-    let a = rng.gen_range(0..1024);
-    let x = rng.gen_range(1..=3000);
-    let c = rng.gen_range(0..1024);
+    let a = rng.random_range(0..1024);
+    let x = rng.random_range(1..=3000);
+    let c = rng.random_range(0..1024);
     ((a | x) + c) % 3000 + 1
 }

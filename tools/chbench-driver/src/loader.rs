@@ -22,7 +22,7 @@ limitations under the License.
 use std::fmt::Write as _;
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use tokio_postgres::Client;
 
 use crate::Result;
@@ -127,9 +127,9 @@ fn sql_opt_i32(v: Option<i32>) -> String {
 pub async fn load_all(client: &Client, warehouses: usize, seed: Option<u64>) -> Result<()> {
     let mut rng: StdRng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
-        None => StdRng::from_rng(rand::thread_rng()).unwrap_or_else(|_| StdRng::seed_from_u64(0)),
+        None => StdRng::from_rng(&mut rand::rng()),
     };
-    let c_load: usize = rng.gen_range(0..256);
+    let c_load: usize = rng.random_range(0..256);
 
     load_item(client, &mut rng).await?;
     load_nation(client).await?;
@@ -170,8 +170,8 @@ async fn load_item(client: &Client, rng: &mut impl Rng) -> Result<()> {
     let mut row = String::new();
 
     for i in 1..=MAX_ITEMS {
-        let i_im_id: i32 = rng.gen_range(1..=10_000);
-        let i_price: f64 = f64::from(rng.gen_range(100..=10_000)) / 100.0;
+        let i_im_id: i32 = rng.random_range(1..=10_000);
+        let i_price: f64 = f64::from(rng.random_range(100..=10_000)) / 100.0;
         let i_name = tpcc_rand::rand_chars(rng, 14, 24);
         let i_data = tpcc_rand::rand_original_string(rng);
 
@@ -255,7 +255,7 @@ async fn load_stock(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result<()
     let mut row = String::new();
 
     for i in 1..=STOCK_PER_WAREHOUSE {
-        let s_quantity: i32 = rng.gen_range(10..=100);
+        let s_quantity: i32 = rng.random_range(10..=100);
         let s_dist_01 = tpcc_rand::rand_letters(rng, 24, 24);
         let s_dist_02 = tpcc_rand::rand_letters(rng, 24, 24);
         let s_dist_03 = tpcc_rand::rand_letters(rng, 24, 24);
@@ -315,13 +315,13 @@ async fn load_customer(
         let c_state = tpcc_rand::rand_state(rng);
         let c_zip = tpcc_rand::rand_zip(rng);
         let c_phone = tpcc_rand::rand_numbers(rng, 16, 16);
-        let c_credit = if rng.gen_range(0..10) == 0 {
+        let c_credit = if rng.random_range(0..10) == 0 {
             "BC"
         } else {
             "GC"
         };
         let c_credit_lim: f64 = 50_000.00;
-        let c_discount: f64 = f64::from(rng.gen_range(0..=5_000)) / 10_000.0;
+        let c_discount: f64 = f64::from(rng.random_range(0..=5_000)) / 10_000.0;
         let c_balance: f64 = -10.00;
         let c_ytd_payment: f64 = 10.00;
         let c_data = tpcc_rand::rand_chars(rng, 300, 500);
@@ -385,7 +385,7 @@ async fn load_orders(
     // Random permutation of customer IDs
     let mut cids: Vec<i32> = (1..=ORDERS_PER_DISTRICT).collect();
     for i in (1..cids.len()).rev() {
-        let j = rng.gen_range(0..=i);
+        let j = rng.random_range(0..=i);
         cids.swap(i, j);
     }
 
@@ -395,11 +395,11 @@ async fn load_orders(
         let o_id = i + 1;
         let o_c_id = cids[usize::try_from(i).unwrap_or(0)];
         let o_carrier_id: Option<i32> = if o_id < 2101 {
-            Some(rng.gen_range(1..=10))
+            Some(rng.random_range(1..=10))
         } else {
             None
         };
-        let o_ol_cnt: i32 = rng.gen_range(5..=15);
+        let o_ol_cnt: i32 = rng.random_range(5..=15);
         ol_cnts.push(o_ol_cnt);
 
         row.clear();
@@ -447,12 +447,12 @@ async fn load_order_line(
         let o_id = i32::try_from(i).unwrap_or(0) + 1;
 
         for j in 1..=ol_cnt {
-            let ol_i_id: i32 = rng.gen_range(1..=100_000);
+            let ol_i_id: i32 = rng.random_range(1..=100_000);
 
             let (ol_delivery_d, ol_amount): (Option<&str>, f64) = if o_id < 2101 {
                 (Some(INIT_LOAD_TIME), 0.00)
             } else {
-                (None, f64::from(rng.gen_range(1..=999_999)) / 100.0)
+                (None, f64::from(rng.random_range(1..=999_999)) / 100.0)
             };
             let ol_dist_info = tpcc_rand::rand_chars(rng, 24, 24);
 
@@ -595,15 +595,15 @@ async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
     for i in 1..=SUPPLIER_COUNT {
         let s_name = format!("Supplier#{i:09}");
         let s_address = tpcc_rand::rand_chars(rng, 10, 25);
-        let s_nationkey: i64 = rng.gen_range(0..nation_count);
+        let s_nationkey: i64 = rng.random_range(0..nation_count);
         let s_phone = format!(
             "{:02}-{}-{}-{}",
             (s_nationkey + 10),
-            rng.gen_range(100..=999),
-            rng.gen_range(100..=999),
-            rng.gen_range(1000..=9999),
+            rng.random_range(100..=999),
+            rng.random_range(100..=999),
+            rng.random_range(1000..=9999),
         );
-        let s_acctbal: f64 = f64::from(rng.gen_range(-99_999..=999_999)) / 100.0;
+        let s_acctbal: f64 = f64::from(rng.random_range(-99_999..=999_999)) / 100.0;
         let s_comment = tpcc_rand::rand_chars(rng, 25, 63);
 
         row.clear();

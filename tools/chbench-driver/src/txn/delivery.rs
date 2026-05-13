@@ -21,14 +21,14 @@ limitations under the License.
 
 use std::time::SystemTime;
 
-use ::rand::Rng;
+use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
 use crate::Result;
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
-    let w_id = rng.gen_range(1..=warehouses);
-    let o_carrier_id = rng.gen_range(1..=10);
+    let w_id = rng.random_range(1..=warehouses);
+    let o_carrier_id = rng.random_range(1..=10);
 
     let tx = client
         .transaction()

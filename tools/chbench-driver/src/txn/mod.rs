@@ -31,7 +31,7 @@ pub mod stock_level;
 
 use std::fmt;
 
-use ::rand::Rng;
+use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
 use crate::Result;
@@ -74,7 +74,7 @@ const TXN_TYPES: [TxnType; 5] = [
 /// Select a random transaction type according to the given mix weights.
 pub fn pick_txn_type(rng: &mut impl Rng, mix: &[u32; 5]) -> TxnType {
     let total: u32 = mix.iter().sum();
-    let roll = rng.gen_range(0..total);
+    let roll = rng.random_range(0..total);
     let mut cumulative = 0;
     for (i, &weight) in mix.iter().enumerate() {
         cumulative += weight;

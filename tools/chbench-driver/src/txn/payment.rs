@@ -21,21 +21,21 @@ limitations under the License.
 
 use std::time::SystemTime;
 
-use ::rand::Rng;
+use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
 use crate::Result;
 use crate::rand as tpcc_rand;
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
-    let w_id = rng.gen_range(1..=warehouses);
-    let d_id = rng.gen_range(1..=10);
-    let h_amount: f64 = f64::from(rng.gen_range(100..=500_000)) / 100.0;
+    let w_id = rng.random_range(1..=warehouses);
+    let d_id = rng.random_range(1..=10);
+    let h_amount: f64 = f64::from(rng.random_range(100..=500_000)) / 100.0;
 
     // 60% by last name, 40% by customer ID (spec 2.5.1.2)
-    let by_name = rng.gen_range(0..100) < 60;
+    let by_name = rng.random_range(0..100) < 60;
     let c_last = if by_name {
-        let c_load: usize = rng.gen_range(0..256);
+        let c_load: usize = rng.random_range(0..256);
         Some(tpcc_rand::rand_c_last(rng, c_load))
     } else {
         None
@@ -47,14 +47,14 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     };
 
     // 85% local, 15% remote (spec 2.5.1.2)
-    let (c_w_id, c_d_id) = if warehouses == 1 || rng.gen_range(0..100) < 85 {
+    let (c_w_id, c_d_id) = if warehouses == 1 || rng.random_range(0..100) < 85 {
         (w_id, d_id)
     } else {
-        let mut other = rng.gen_range(1..=warehouses);
+        let mut other = rng.random_range(1..=warehouses);
         while other == w_id {
-            other = rng.gen_range(1..=warehouses);
+            other = rng.random_range(1..=warehouses);
         }
-        (other, rng.gen_range(1..=10))
+        (other, rng.random_range(1..=10))
     };
 
     let tx = client

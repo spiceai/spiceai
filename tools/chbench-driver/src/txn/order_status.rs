@@ -19,19 +19,19 @@ limitations under the License.
 //! Read-only: look up the most recent order for a customer.
 //! No WAL events — included for spec-compliant tpmC measurement.
 
-use ::rand::Rng;
+use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
 use crate::Result;
 use crate::rand as tpcc_rand;
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
-    let w_id = rng.gen_range(1..=warehouses);
-    let d_id = rng.gen_range(1..=10);
+    let w_id = rng.random_range(1..=warehouses);
+    let d_id = rng.random_range(1..=10);
 
     // 60% by last name, 40% by customer ID (spec 2.6.1.2)
-    let by_name = rng.gen_range(0..100) < 60;
-    let c_load: usize = rng.gen_range(0..256);
+    let by_name = rng.random_range(0..100) < 60;
+    let c_load: usize = rng.random_range(0..256);
 
     let tx = client
         .transaction()

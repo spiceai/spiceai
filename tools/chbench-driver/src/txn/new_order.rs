@@ -21,18 +21,18 @@ limitations under the License.
 
 use std::time::SystemTime;
 
-use ::rand::Rng;
+use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
 use crate::Result;
 use crate::rand as tpcc_rand;
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
-    let w_id = rng.gen_range(1..=warehouses);
-    let d_id = rng.gen_range(1..=10);
+    let w_id = rng.random_range(1..=warehouses);
+    let d_id = rng.random_range(1..=10);
     let c_id = tpcc_rand::rand_customer_id(rng);
-    let ol_cnt = rng.gen_range(5..=15);
-    let rbk = rng.gen_range(1..=100);
+    let ol_cnt = rng.random_range(5..=15);
+    let rbk = rng.random_range(1..=100);
 
     // Generate order items
     let mut items: Vec<(i32, i32, i32, i32)> = Vec::with_capacity(ol_cnt as usize); // (ol_i_id, ol_supply_w_id, ol_quantity, remote)
@@ -43,21 +43,21 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
             // 1% rollback: invalid item ID
             -1
         } else {
-            rng.gen_range(1..=100_000)
+            rng.random_range(1..=100_000)
         };
 
-        let (ol_supply_w_id, remote) = if warehouses == 1 || rng.gen_range(1..=100) != 1 {
+        let (ol_supply_w_id, remote) = if warehouses == 1 || rng.random_range(1..=100) != 1 {
             (w_id, 0)
         } else {
-            let mut other = rng.gen_range(1..=warehouses);
+            let mut other = rng.random_range(1..=warehouses);
             while other == w_id {
-                other = rng.gen_range(1..=warehouses);
+                other = rng.random_range(1..=warehouses);
             }
             all_local = 0;
             (other, 1)
         };
 
-        let ol_quantity = rng.gen_range(1..=10);
+        let ol_quantity = rng.random_range(1..=10);
         items.push((ol_i_id, ol_supply_w_id, ol_quantity, remote));
     }
 

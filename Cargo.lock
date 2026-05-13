@@ -3569,7 +3569,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "chrono",
- "rand 0.8.5",
+ "rand 0.10.1",
  "snafu",
  "tokio",
  "tokio-postgres",
