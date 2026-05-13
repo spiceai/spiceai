@@ -18969,7 +18969,6 @@ dependencies = [
  "aws-sdk-dynamodb",
  "bollard",
  "chbench-driver",
- "chrono",
  "clap",
  "duckdb",
  "futures",
