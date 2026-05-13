@@ -25,8 +25,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio_postgres::Client;
 
-use crate::rand as tpcc_rand;
 use crate::Result;
+use crate::rand as tpcc_rand;
 
 const MAX_ITEMS: i32 = 100_000;
 const STOCK_PER_WAREHOUSE: i32 = 100_000;
@@ -79,10 +79,13 @@ impl BatchSink {
         if self.buffered_rows == 0 {
             return Ok(());
         }
-        client.execute(self.buf.as_str(), &[]).await.map_err(|source| crate::Error::Sql {
-            action: format!("batch insert into {table}"),
-            source,
-        })?;
+        client
+            .execute(self.buf.as_str(), &[])
+            .await
+            .map_err(|source| crate::Error::Sql {
+                action: format!("batch insert into {table}"),
+                source,
+            })?;
         self.buf.clear();
         self.buffered_rows = 0;
         Ok(())
@@ -162,9 +165,8 @@ pub async fn load_all(client: &Client, warehouses: usize, seed: Option<u64>) -> 
 
 async fn load_item(client: &Client, rng: &mut impl Rng) -> Result<()> {
     println!("  loading item ({MAX_ITEMS} rows)");
-    let mut sink = BatchSink::new(
-        "INSERT INTO item (i_id, i_im_id, i_name, i_price, i_data) VALUES",
-    );
+    let mut sink =
+        BatchSink::new("INSERT INTO item (i_id, i_im_id, i_name, i_price, i_data) VALUES");
     let mut row = String::new();
 
     for i in 1..=MAX_ITEMS {
@@ -174,7 +176,12 @@ async fn load_item(client: &Client, rng: &mut impl Rng) -> Result<()> {
         let i_data = tpcc_rand::rand_original_string(rng);
 
         row.clear();
-        let _ = write!(row, "({i}, {i_im_id}, {}, {i_price}, {})", sql_str(&i_name), sql_str(&i_data));
+        let _ = write!(
+            row,
+            "({i}, {i_im_id}, {}, {i_price}, {})",
+            sql_str(&i_name),
+            sql_str(&i_data)
+        );
         sink.write_row(&row);
         sink.maybe_flush(client, "item").await?;
     }
@@ -182,7 +189,6 @@ async fn load_item(client: &Client, rng: &mut impl Rng) -> Result<()> {
 }
 
 async fn load_warehouse(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result<()> {
-
     let mut sink = BatchSink::new(
         "INSERT INTO warehouse (w_id, w_name, w_street_1, w_street_2, w_city, w_state, w_zip, w_tax, w_ytd) VALUES",
     );
@@ -198,15 +204,18 @@ async fn load_warehouse(client: &Client, rng: &mut impl Rng, w_id: i32) -> Resul
 
     let row = format!(
         "({w_id}, {}, {}, {}, {}, {}, {}, {w_tax}, {w_ytd})",
-        sql_str(&w_name), sql_str(&w_street_1), sql_str(&w_street_2),
-        sql_str(&w_city), sql_str(&w_state), sql_str(&w_zip),
+        sql_str(&w_name),
+        sql_str(&w_street_1),
+        sql_str(&w_street_2),
+        sql_str(&w_city),
+        sql_str(&w_state),
+        sql_str(&w_zip),
     );
     sink.write_row(&row);
     sink.flush(client, "warehouse").await
 }
 
 async fn load_district(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result<()> {
-
     let mut sink = BatchSink::new(
         "INSERT INTO district (d_id, d_w_id, d_name, d_street_1, d_street_2, d_city, d_state, d_zip, d_tax, d_ytd, d_next_o_id) VALUES",
     );
@@ -224,9 +233,14 @@ async fn load_district(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result
 
         row.clear();
         let _ = write!(
-            row, "({d}, {w_id}, {}, {}, {}, {}, {}, {}, {d_tax}, {d_ytd}, 3001)",
-            sql_str(&d_name), sql_str(&d_street_1), sql_str(&d_street_2),
-            sql_str(&d_city), sql_str(&d_state), sql_str(&d_zip),
+            row,
+            "({d}, {w_id}, {}, {}, {}, {}, {}, {}, {d_tax}, {d_ytd}, 3001)",
+            sql_str(&d_name),
+            sql_str(&d_street_1),
+            sql_str(&d_street_2),
+            sql_str(&d_city),
+            sql_str(&d_state),
+            sql_str(&d_zip),
         );
         sink.write_row(&row);
         sink.maybe_flush(client, "district").await?;
@@ -235,7 +249,6 @@ async fn load_district(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result
 }
 
 async fn load_stock(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result<()> {
-
     let mut sink = BatchSink::new(
         "INSERT INTO stock (s_i_id, s_w_id, s_quantity, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10, s_ytd, s_order_cnt, s_remote_cnt, s_data) VALUES",
     );
@@ -257,11 +270,19 @@ async fn load_stock(client: &Client, rng: &mut impl Rng, w_id: i32) -> Result<()
 
         row.clear();
         let _ = write!(
-            row, "({i}, {w_id}, {s_quantity}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, 0, 0, {})",
-            sql_str(&s_dist_01), sql_str(&s_dist_02), sql_str(&s_dist_03),
-            sql_str(&s_dist_04), sql_str(&s_dist_05), sql_str(&s_dist_06),
-            sql_str(&s_dist_07), sql_str(&s_dist_08), sql_str(&s_dist_09),
-            sql_str(&s_dist_10), sql_str(&s_data),
+            row,
+            "({i}, {w_id}, {s_quantity}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, 0, 0, {})",
+            sql_str(&s_dist_01),
+            sql_str(&s_dist_02),
+            sql_str(&s_dist_03),
+            sql_str(&s_dist_04),
+            sql_str(&s_dist_05),
+            sql_str(&s_dist_06),
+            sql_str(&s_dist_07),
+            sql_str(&s_dist_08),
+            sql_str(&s_dist_09),
+            sql_str(&s_dist_10),
+            sql_str(&s_data),
         );
         sink.write_row(&row);
         sink.maybe_flush(client, "stock").await?;
@@ -276,7 +297,6 @@ async fn load_customer(
     d_id: i32,
     c_load: usize,
 ) -> Result<()> {
-
     let mut sink = BatchSink::new(
         "INSERT INTO customer (c_id, c_d_id, c_w_id, c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount, c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt, c_data) VALUES",
     );
@@ -295,7 +315,11 @@ async fn load_customer(
         let c_state = tpcc_rand::rand_state(rng);
         let c_zip = tpcc_rand::rand_zip(rng);
         let c_phone = tpcc_rand::rand_numbers(rng, 16, 16);
-        let c_credit = if rng.gen_range(0..10) == 0 { "BC" } else { "GC" };
+        let c_credit = if rng.gen_range(0..10) == 0 {
+            "BC"
+        } else {
+            "GC"
+        };
         let c_credit_lim: f64 = 50_000.00;
         let c_discount: f64 = f64::from(rng.gen_range(0..=5_000)) / 10_000.0;
         let c_balance: f64 = -10.00;
@@ -306,10 +330,16 @@ async fn load_customer(
         let _ = write!(
             row,
             "({i}, {d_id}, {w_id}, {}, 'OE', {}, {}, {}, {}, {}, {}, {}, {}, {}, {c_credit_lim}, {c_discount}, {c_balance}, {c_ytd_payment}, 1, 0, {})",
-            sql_str(&c_first), sql_str(&c_last),
-            sql_str(&c_street_1), sql_str(&c_street_2), sql_str(&c_city),
-            sql_str(&c_state), sql_str(&c_zip), sql_str(&c_phone),
-            sql_str(INIT_LOAD_TIME), sql_str(c_credit),
+            sql_str(&c_first),
+            sql_str(&c_last),
+            sql_str(&c_street_1),
+            sql_str(&c_street_2),
+            sql_str(&c_city),
+            sql_str(&c_state),
+            sql_str(&c_zip),
+            sql_str(&c_phone),
+            sql_str(INIT_LOAD_TIME),
+            sql_str(c_credit),
             sql_str(&c_data),
         );
         sink.write_row(&row);
@@ -319,7 +349,6 @@ async fn load_customer(
 }
 
 async fn load_history(client: &Client, rng: &mut impl Rng, w_id: i32, d_id: i32) -> Result<()> {
-
     let mut sink = BatchSink::new(
         "INSERT INTO history (h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES",
     );
@@ -330,8 +359,10 @@ async fn load_history(client: &Client, rng: &mut impl Rng, w_id: i32, d_id: i32)
 
         row.clear();
         let _ = write!(
-            row, "({i}, {d_id}, {w_id}, {d_id}, {w_id}, {}, 10.00, {})",
-            sql_str(INIT_LOAD_TIME), sql_str(&h_data),
+            row,
+            "({i}, {d_id}, {w_id}, {d_id}, {w_id}, {}, 10.00, {})",
+            sql_str(INIT_LOAD_TIME),
+            sql_str(&h_data),
         );
         sink.write_row(&row);
         sink.maybe_flush(client, "history").await?;
@@ -346,7 +377,6 @@ async fn load_orders(
     w_id: i32,
     d_id: i32,
 ) -> Result<Vec<i32>> {
-
     let mut sink = BatchSink::new(
         "INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) VALUES",
     );
@@ -374,8 +404,10 @@ async fn load_orders(
 
         row.clear();
         let _ = write!(
-            row, "({o_id}, {d_id}, {w_id}, {o_c_id}, {}, {}, {o_ol_cnt}, 1)",
-            sql_str(INIT_LOAD_TIME), sql_opt_i32(o_carrier_id),
+            row,
+            "({o_id}, {d_id}, {w_id}, {o_c_id}, {}, {}, {o_ol_cnt}, 1)",
+            sql_str(INIT_LOAD_TIME),
+            sql_opt_i32(o_carrier_id),
         );
         sink.write_row(&row);
         sink.maybe_flush(client, "orders").await?;
@@ -386,10 +418,7 @@ async fn load_orders(
 }
 
 async fn load_new_order(client: &Client, w_id: i32, d_id: i32) -> Result<()> {
-
-    let mut sink = BatchSink::new(
-        "INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES",
-    );
+    let mut sink = BatchSink::new("INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES");
     let mut row = String::new();
 
     for i in 0..NEW_ORDERS_PER_DISTRICT {
@@ -409,7 +438,6 @@ async fn load_order_line(
     d_id: i32,
     ol_cnts: &[i32],
 ) -> Result<()> {
-
     let mut sink = BatchSink::new(
         "INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info) VALUES",
     );
@@ -430,8 +458,10 @@ async fn load_order_line(
 
             row.clear();
             let _ = write!(
-                row, "({o_id}, {d_id}, {w_id}, {j}, {ol_i_id}, {w_id}, {}, 5, {ol_amount}, {})",
-                sql_opt_str(ol_delivery_d), sql_str(&ol_dist_info),
+                row,
+                "({o_id}, {d_id}, {w_id}, {j}, {ol_i_id}, {w_id}, {}, 5, {ol_amount}, {})",
+                sql_opt_str(ol_delivery_d),
+                sql_str(&ol_dist_info),
             );
             sink.write_row(&row);
             sink.maybe_flush(client, "order_line").await?;
@@ -525,9 +555,8 @@ const REGIONS: &[(i64, &str)] = &[
 async fn load_nation(client: &Client) -> Result<()> {
     let total = NATIONS.len() + EXTRA_NATIONS.len();
     println!("  loading nation ({total} rows)");
-    let mut sink = BatchSink::new(
-        "INSERT INTO nation (n_nationkey, n_name, n_regionkey, n_comment) VALUES",
-    );
+    let mut sink =
+        BatchSink::new("INSERT INTO nation (n_nationkey, n_name, n_regionkey, n_comment) VALUES");
     let mut row = String::new();
 
     for &(key, name, region) in NATIONS.iter().chain(EXTRA_NATIONS.iter()) {
@@ -541,9 +570,7 @@ async fn load_nation(client: &Client) -> Result<()> {
 
 async fn load_region(client: &Client) -> Result<()> {
     println!("  loading region ({} rows)", REGIONS.len());
-    let mut sink = BatchSink::new(
-        "INSERT INTO region (r_regionkey, r_name, r_comment) VALUES",
-    );
+    let mut sink = BatchSink::new("INSERT INTO region (r_regionkey, r_name, r_comment) VALUES");
     let mut row = String::new();
 
     for &(key, name) in REGIONS {
@@ -581,8 +608,12 @@ async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
 
         row.clear();
         let _ = write!(
-            row, "({i}, {}, {}, {s_nationkey}, {}, {s_acctbal}, {})",
-            sql_str(&s_name), sql_str(&s_address), sql_str(&s_phone), sql_str(&s_comment),
+            row,
+            "({i}, {}, {}, {s_nationkey}, {}, {s_acctbal}, {})",
+            sql_str(&s_name),
+            sql_str(&s_address),
+            sql_str(&s_phone),
+            sql_str(&s_comment),
         );
         sink.write_row(&row);
         sink.maybe_flush(client, "supplier").await?;

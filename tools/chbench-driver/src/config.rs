@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-/// Source-agnostic workload configuration for CH-benCH.
+/// Configuration for the CH-benCH driver.
 pub struct ChBenchConfig {
     /// Number of TPC-C warehouses (scale factor). Each warehouse ≈ 100 MB seed data.
     pub warehouses: usize,

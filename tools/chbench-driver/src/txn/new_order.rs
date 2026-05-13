@@ -24,8 +24,8 @@ use std::time::SystemTime;
 use ::rand::Rng;
 use tokio_postgres::Client;
 
-use crate::rand as tpcc_rand;
 use crate::Result;
+use crate::rand as tpcc_rand;
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.gen_range(1..=warehouses);
@@ -136,8 +136,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     })?;
 
     // 6-9. Process each order line: select item, select/update stock, insert order_line
-    for (ol_number_0, &(ol_i_id, ol_supply_w_id, ol_quantity, remote)) in items.iter().enumerate()
-    {
+    for (ol_number_0, &(ol_i_id, ol_supply_w_id, ol_quantity, remote)) in items.iter().enumerate() {
         let ol_number = i32::try_from(ol_number_0).unwrap_or(0) + 1;
 
         // Check for rollback item

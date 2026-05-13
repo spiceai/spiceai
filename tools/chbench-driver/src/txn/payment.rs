@@ -24,8 +24,8 @@ use std::time::SystemTime;
 use ::rand::Rng;
 use tokio_postgres::Client;
 
-use crate::rand as tpcc_rand;
 use crate::Result;
+use crate::rand as tpcc_rand;
 
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.gen_range(1..=warehouses);

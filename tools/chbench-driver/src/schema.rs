@@ -91,12 +91,13 @@ pub async fn drop_tables(client: &Client) -> Result<()> {
     println!("  dropping {} tables", ALL_TABLES.len());
     for table in ALL_TABLES.iter().rev() {
         let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
-        client.execute(&sql, &[]).await.map_err(|source| {
-            crate::Error::Sql {
+        client
+            .execute(&sql, &[])
+            .await
+            .map_err(|source| crate::Error::Sql {
                 action: format!("drop table {table}"),
                 source,
-            }
-        })?;
+            })?;
     }
     Ok(())
 }
@@ -286,12 +287,13 @@ pub async fn create_tables(client: &Client) -> Result<()> {
 
     println!("  creating {} tables + 4 indexes", ddl_statements.len());
     for (table, ddl) in ddl_statements {
-        client.execute(*ddl, &[]).await.map_err(|source| {
-            crate::Error::Sql {
+        client
+            .execute(*ddl, &[])
+            .await
+            .map_err(|source| crate::Error::Sql {
                 action: format!("create table {table}"),
                 source,
-            }
-        })?;
+            })?;
     }
 
     // Indexes (matching go-tpc Postgres DDL)
@@ -315,12 +317,13 @@ pub async fn create_tables(client: &Client) -> Result<()> {
     ];
 
     for (name, ddl) in indexes {
-        client.execute(*ddl, &[]).await.map_err(|source| {
-            crate::Error::Sql {
+        client
+            .execute(*ddl, &[])
+            .await
+            .map_err(|source| crate::Error::Sql {
                 action: format!("create index {name}"),
                 source,
-            }
-        })?;
+            })?;
     }
 
     // Add _bench_ts column and trigger to all mutated TPC-C tables.
@@ -377,22 +380,24 @@ async fn add_bench_ts_column_and_triggers(client: &Client) -> Result<()> {
         let add_col = format!(
             "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS _bench_ts TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()"
         );
-        client.execute(&add_col, &[]).await.map_err(|source| {
-            crate::Error::Sql {
+        client
+            .execute(&add_col, &[])
+            .await
+            .map_err(|source| crate::Error::Sql {
                 action: format!("add _bench_ts column to {table}"),
                 source,
-            }
-        })?;
+            })?;
 
         // Attach the trigger (idempotent via DROP IF EXISTS + CREATE).
         let trigger_name = format!("trg_bench_ts_{table}");
         let drop_trg = format!("DROP TRIGGER IF EXISTS {trigger_name} ON {table}");
-        client.execute(&drop_trg, &[]).await.map_err(|source| {
-            crate::Error::Sql {
+        client
+            .execute(&drop_trg, &[])
+            .await
+            .map_err(|source| crate::Error::Sql {
                 action: format!("drop trigger {trigger_name}"),
                 source,
-            }
-        })?;
+            })?;
 
         let create_trg = format!(
             "CREATE TRIGGER {trigger_name} BEFORE INSERT OR UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION bench_ts_trigger()"

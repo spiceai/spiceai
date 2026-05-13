@@ -76,14 +76,8 @@ impl StalenessReport {
             }
         }
         println!("  ─────────────────");
-        println!(
-            "  worst P99:     {}ms",
-            self.worst_p99.as_millis()
-        );
-        crate::metrics::DATA_FRESHNESS_P99.record(
-            self.worst_p99.as_millis() as f64,
-            &[],
-        );
+        println!("  worst P99:     {}ms", self.worst_p99.as_millis());
+        crate::metrics::DATA_FRESHNESS_P99.record(self.worst_p99.as_millis() as f64, &[]);
     }
 }
 
@@ -95,9 +89,7 @@ pub fn spawn_staleness_probe(
     spice_client: spiceai::Client,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<anyhow::Result<StalenessReport>> {
-    tokio::spawn(async move {
-        run_staleness_probe(driver, spice_client, cancel).await
-    })
+    tokio::spawn(async move { run_staleness_probe(driver, spice_client, cancel).await })
 }
 
 /// Core probe loop. Runs until cancelled, collecting gap samples for each table.

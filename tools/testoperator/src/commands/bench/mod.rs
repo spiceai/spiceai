@@ -42,7 +42,10 @@ use test_framework::{
     utils::{observe_memory, recursively_get_dir_size},
 };
 
-pub(crate) fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::Result<()> {
+pub(crate) fn emit_acceleration_size_if_applicable(
+    app: &App,
+    app_path: &Path,
+) -> anyhow::Result<()> {
     // determine if any dataset has acceleration enabled with a file mode engine
     if !app.datasets.iter().any(|ds| {
         ds.acceleration.as_ref().is_some_and(|accel| {
@@ -254,17 +257,19 @@ fn snapshot_predicate(query_name: &str) -> bool {
 /// | `CHBENCH_PG_DB` | `chbench` |
 /// | `CHBENCH_PG_USER` | `bench` |
 /// | `CHBENCH_PG_PASS` | `bench` |
-pub(crate) fn chbench_config_from_env(
-) -> anyhow::Result<(chbench_driver::ChBenchConfig, chbench_driver::PostgresSourceConfig)> {
+pub(crate) fn chbench_config_from_env() -> anyhow::Result<(
+    chbench_driver::ChBenchConfig,
+    chbench_driver::PostgresSourceConfig,
+)> {
     let workload = chbench_driver::ChBenchConfig::default();
     let mut source = chbench_driver::PostgresSourceConfig::default();
     if let Ok(v) = std::env::var("CHBENCH_PG_HOST") {
         source.host = v;
     }
     if let Ok(v) = std::env::var("CHBENCH_PG_PORT") {
-        source.port = v
-            .parse()
-            .map_err(|e| anyhow::anyhow!("CHBENCH_PG_PORT={v:?} is not a valid port number: {e}"))?;
+        source.port = v.parse().map_err(|e| {
+            anyhow::anyhow!("CHBENCH_PG_PORT={v:?} is not a valid port number: {e}")
+        })?;
     }
     if let Ok(v) = std::env::var("CHBENCH_PG_DB") {
         source.db = v;

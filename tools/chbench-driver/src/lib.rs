@@ -43,8 +43,8 @@ pub use config::{ChBenchConfig, PostgresSourceConfig};
 pub use metrics::OltpReport;
 pub use txn::TxnType;
 
-use ::rand::rngs::StdRng;
 use ::rand::SeedableRng;
+use ::rand::rngs::StdRng;
 use async_trait::async_trait;
 use snafu::Snafu;
 use tokio_util::sync::CancellationToken;
@@ -98,13 +98,12 @@ impl PostgresChBenchDriver {
     /// Connect to PostgreSQL using the provided configuration.
     pub async fn connect(config: ChBenchConfig, source: PostgresSourceConfig) -> Result<Self> {
         let conn_str = source.connection_string();
-        let (client, connection) =
-            tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
-                .await
-                .map_err(|source| Error::Sql {
-                    action: "connect to PostgreSQL".into(),
-                    source,
-                })?;
+        let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .map_err(|source| Error::Sql {
+                action: "connect to PostgreSQL".into(),
+                source,
+            })?;
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -112,7 +111,11 @@ impl PostgresChBenchDriver {
             }
         });
 
-        Ok(Self { client, config, source })
+        Ok(Self {
+            client,
+            config,
+            source,
+        })
     }
 }
 
