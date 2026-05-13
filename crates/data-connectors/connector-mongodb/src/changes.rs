@@ -25,7 +25,7 @@ use data_components::{
     },
 };
 use datafusion::{
-    arrow::datatypes::SchemaRef, datasource::TableProvider, error::DataFusionError,
+    arrow::datatypes::SchemaRef, datasource::TableProvider,
     physical_plan::SendableRecordBatchStream, prelude::SessionContext,
 };
 use datafusion_table_providers::mongodb::connection_pool::MongoDBConnectionPool;
@@ -188,12 +188,12 @@ async fn snapshot_stream(
     table_provider: Arc<dyn TableProvider>,
 ) -> Result<SendableRecordBatchStream, data_components::cdc::StreamError> {
     let ctx = SessionContext::new();
-    let df = ctx.read_table(table_provider).map_err(map_snapshot_error)?;
-    df.execute_stream().await.map_err(map_snapshot_error)
-}
-
-fn map_snapshot_error(error: DataFusionError) -> data_components::cdc::StreamError {
-    data_components::cdc::StreamError::Arrow(error.to_string())
+    let df = ctx
+        .read_table(table_provider)
+        .map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))?;
+    df.execute_stream()
+        .await
+        .map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))
 }
 
 fn collect_change_events(
@@ -218,23 +218,20 @@ fn resolve_primary_keys(
 ) -> Result<Vec<String>, data_components::cdc::StreamError> {
     let acceleration = acceleration.ok_or_else(|| {
         data_components::cdc::StreamError::External(format!(
-            "mongodb change streams for dataset `{}` require acceleration to be enabled",
-            dataset_name
+            "mongodb change streams for dataset `{dataset_name}` require acceleration to be enabled"
         ))
     })?;
 
     let engine = acceleration.engine.to_unpartitioned();
     if matches!(engine, Engine::Arrow) {
         return Err(data_components::cdc::StreamError::External(format!(
-            "mongodb change streams for dataset `{}` require an accelerator engine with upsert support. Use duckdb, sqlite, postgres, turso, or cayenne instead of `{engine}`.",
-            dataset_name
+            "mongodb change streams for dataset `{dataset_name}` require an accelerator engine with upsert support. Use duckdb, sqlite, postgres, turso, or cayenne instead of `{engine}`."
         )));
     }
 
     let primary_key = acceleration.primary_key.as_ref().ok_or_else(|| {
         data_components::cdc::StreamError::External(format!(
-            "mongodb change streams for dataset `{}` require `acceleration.primary_key` so UPDATE and DELETE events can be applied correctly. For most collections, set `primary_key: _id`.",
-            dataset_name
+            "mongodb change streams for dataset `{dataset_name}` require `acceleration.primary_key` so UPDATE and DELETE events can be applied correctly. For most collections, set `primary_key: _id`."
         ))
     })?;
 
@@ -245,11 +242,9 @@ fn resolve_primary_keys(
         let pk_hint = primary_key
             .iter()
             .next()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "_id".to_string());
+            .map_or_else(|| "_id".to_string(), ToString::to_string);
         return Err(data_components::cdc::StreamError::External(format!(
-            "mongodb change streams for dataset `{}` require `acceleration.on_conflict` keyed on `primary_key` with `upsert` behavior so UPDATE events replace existing rows. Add: `on_conflict: {{ {pk_hint}: upsert }}`.",
-            dataset_name
+            "mongodb change streams for dataset `{dataset_name}` require `acceleration.on_conflict` keyed on `primary_key` with `upsert` behavior so UPDATE events replace existing rows. Add: `on_conflict: {{ {pk_hint}: upsert }}`."
         )));
     }
 
@@ -266,8 +261,7 @@ fn resolve_primary_keys(
     for key in &primary_keys {
         if schema.field_with_name(key).is_err() {
             return Err(data_components::cdc::StreamError::External(format!(
-                "mongodb change streams for dataset `{}` require primary key column `{key}` to exist in the inferred MongoDB schema. For ObjectId-backed collections, use `_id` and ensure schema inference includes it.",
-                dataset_name
+                "mongodb change streams for dataset `{dataset_name}` require primary key column `{key}` to exist in the inferred MongoDB schema. For ObjectId-backed collections, use `_id` and ensure schema inference includes it."
             )));
         }
     }
@@ -413,7 +407,7 @@ fn optional_positive_duration(
 fn invalid_parameter_error(
     params: &Parameters,
     name: &str,
-    message: String,
+    message: impl std::fmt::Display,
 ) -> data_components::cdc::StreamError {
     let user_param = params.user_param(name);
     data_components::cdc::StreamError::External(format!(
@@ -425,7 +419,9 @@ fn invalid_parameter_error(
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_table_providers::util::column_reference::ColumnReference;
+    use datafusion_table_providers::util::{
+        column_reference::ColumnReference, constraints::UpsertOptions,
+    };
     use runtime::component::dataset::acceleration::{Acceleration, RefreshMode};
     use secrecy::SecretString;
     use std::collections::HashMap;
@@ -458,7 +454,7 @@ mod tests {
         let mut on_conflict = HashMap::new();
         on_conflict.insert(
             primary_key.clone(),
-            OnConflictBehavior::Upsert(Default::default()),
+            OnConflictBehavior::Upsert(UpsertOptions::default()),
         );
         let acceleration = Acceleration {
             enabled: true,
@@ -490,7 +486,7 @@ mod tests {
         let mut on_conflict = HashMap::new();
         on_conflict.insert(
             primary_key.clone(),
-            OnConflictBehavior::Upsert(Default::default()),
+            OnConflictBehavior::Upsert(UpsertOptions::default()),
         );
         let acceleration = Acceleration {
             enabled: true,
@@ -546,7 +542,7 @@ mod tests {
         let mut on_conflict = HashMap::new();
         on_conflict.insert(
             primary_key.clone(),
-            OnConflictBehavior::Upsert(Default::default()),
+            OnConflictBehavior::Upsert(UpsertOptions::default()),
         );
         let acceleration = Acceleration {
             enabled: true,
@@ -569,7 +565,7 @@ mod tests {
         let mut on_conflict = HashMap::new();
         on_conflict.insert(
             primary_key.clone(),
-            OnConflictBehavior::Upsert(Default::default()),
+            OnConflictBehavior::Upsert(UpsertOptions::default()),
         );
         let acceleration = Acceleration {
             enabled: true,
