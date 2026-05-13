@@ -1214,7 +1214,8 @@ fn ipv6_addr_is_global_endpoint(ip: Ipv6Addr) -> bool {
         || matches!(segments, [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..])
         || matches!(segments, [0x5f00, ..])
         || (segments[0] & 0xfe00) == 0xfc00
-        || (segments[0] & 0xffc0) == 0xfe80)
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0)
 }
 
 fn parse_endpoint_policy(v: Option<&Value>) -> Result<EndpointAccessPolicy> {
