@@ -187,3 +187,81 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
         .data()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CayenneJoinRewriter;
+    use crate::provider::CayenneAccelerationExec;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{JoinType, NullEquality};
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use datafusion_physical_expr::expressions::col;
+    use runtime_datafusion::join_accumulator::ExactLeftAccumulator;
+    use std::sync::Arc;
+
+    fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            column_name,
+            DataType::Int32,
+            false,
+        )]));
+        MemorySourceConfig::try_new_exec(&[vec![]], schema, None)
+            .expect("memory exec should be valid")
+    }
+
+    fn join_with_right(right: Arc<dyn ExecutionPlan>) -> HashJoinExec {
+        let left = memory_exec("left_id");
+        HashJoinExec::try_new(
+            Arc::clone(&left),
+            right,
+            vec![(
+                col("left_id", &left.schema()).expect("left join key should exist"),
+                col("right_id", &memory_exec("right_id").schema())
+                    .expect("right join key should exist"),
+            )],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+        )
+        .expect("hash join should be valid")
+    }
+
+    #[test]
+    fn rewrites_hash_join_with_cayenne_probe_side() {
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let join = Arc::new(join_with_right(right));
+
+        let optimized = CayenneJoinRewriter::new()
+            .optimize(join, &ConfigOptions::default())
+            .expect("optimizer should succeed");
+
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
+                .is_some(),
+            "Cayenne-backed joins should use ExactLeftAccumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_hash_join_without_cayenne_probe_side_unchanged() {
+        let right = memory_exec("right_id");
+        let join = Arc::new(join_with_right(right));
+
+        let optimized = CayenneJoinRewriter::new()
+            .optimize(join, &ConfigOptions::default())
+            .expect("optimizer should succeed");
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Non-Cayenne joins should keep the default accumulator"
+        );
+    }
+}

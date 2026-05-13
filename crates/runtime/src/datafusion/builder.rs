@@ -29,6 +29,8 @@ use crate::cluster::ResolvedClusterConfig;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
+#[cfg(not(windows))]
+use cayenne::optimizer_rules::CayenneJoinRewriter;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -366,7 +368,14 @@ impl DataFusionBuilder {
 
         state = state
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
-            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}));
+
+        #[cfg(not(windows))]
+        {
+            state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+        }
+
+        state = state
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
@@ -766,6 +775,46 @@ mod tests {
                 "spice_ddl_rewrite",
             ],
             "Analyzer rule list or ordering has changed"
+        );
+    }
+
+    /// Cayenne rewrites `HashJoinExec` to use a custom accumulator type, so it
+    /// must run after DataFusion's built-in physical optimizer rules that
+    /// downcast to the default `HashJoinExec` type.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cayenne_join_rewriter_after_datafusion_rules() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        let state = df.ctx.state();
+        let rule_names: Vec<&str> = state
+            .physical_optimizers()
+            .iter()
+            .map(|r| r.name())
+            .collect();
+        let sanity_check_position = rule_names
+            .iter()
+            .position(|name| *name == "SanityCheckPlan")
+            .expect("DataFusion sanity check rule should be registered");
+        let cayenne_rewriter_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneJoinRewriter")
+            .expect("Cayenne join rewriter should be registered");
+
+        assert!(
+            sanity_check_position < cayenne_rewriter_position,
+            "CayenneJoinRewriter must run after DataFusion's built-in physical optimizer rules"
         );
     }
 }
