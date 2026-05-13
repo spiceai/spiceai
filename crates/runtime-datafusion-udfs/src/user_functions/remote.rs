@@ -146,11 +146,8 @@ pub enum RemoteBuildError {
     #[snafu(display("duplicate column '{column}' in remote function input table '{table}'"))]
     DuplicateInputTableColumn { table: String, column: String },
 
-    #[snafu(display("failed to parse endpoint URL '{from}': {source}"))]
-    InvalidEndpoint {
-        from: String,
-        source: url::ParseError,
-    },
+    #[snafu(display("failed to parse endpoint URL: {source}"))]
+    InvalidEndpoint { source: url::ParseError },
 
     #[snafu(display("endpoint scheme '{scheme}' is not supported; use `http://` or `https://`"))]
     UnsupportedScheme { scheme: String },
@@ -162,8 +159,8 @@ pub enum RemoteBuildError {
     ))]
     PrivateEndpoint { host: String },
 
-    #[snafu(display("endpoint URL '{from}' is missing a host"))]
-    MissingHost { from: String },
+    #[snafu(display("endpoint URL with scheme '{scheme}' is missing a host"))]
+    MissingHost { scheme: String },
 
     #[snafu(display("param '{key}' is expected to be a {expected}, got {got}"))]
     InvalidParam {
@@ -999,10 +996,7 @@ fn build_http_client(
 }
 
 fn parse_endpoint(from: &str, endpoint_policy: &EndpointAccessPolicy) -> Result<Url> {
-    let url = Url::parse(from).map_err(|source| RemoteBuildError::InvalidEndpoint {
-        from: from.to_string(),
-        source,
-    })?;
+    let url = Url::parse(from).map_err(|source| RemoteBuildError::InvalidEndpoint { source })?;
     match url.scheme() {
         "http" | "https" => {}
         other => {
@@ -1012,7 +1006,7 @@ fn parse_endpoint(from: &str, endpoint_policy: &EndpointAccessPolicy) -> Result<
         }
     }
     let host = url.host().ok_or_else(|| RemoteBuildError::MissingHost {
-        from: from.to_string(),
+        scheme: url.scheme().to_string(),
     })?;
 
     if let Some(reason) = host_endpoint_rejection(&host, endpoint_policy) {
@@ -1202,6 +1196,7 @@ fn ipv6_addr_is_global_endpoint(ip: Ipv6Addr) -> bool {
         || ip.is_loopback()
         || ip.is_multicast()
         || matches!(segments, [0, 0, 0, 0, 0, 0xffff, _, _])
+        || matches!(segments, [0x64, 0xff9b, 0, 0, 0, 0, _, _])
         || matches!(segments, [0x64, 0xff9b, 1, _, _, _, _, _])
         || matches!(segments, [0x100, 0, 0, 0, _, _, _, _])
         || (matches!(segments, [0x2001, b, _, _, _, _, _, _] if b < 0x200)
@@ -2117,6 +2112,20 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_parse_redacts_invalid_endpoint_url() {
+        let d = sample_decl("http://user:secret@example.com:bad/udf?token=secret#fragment");
+        let err = build_scalar_udf(&d).expect_err("invalid endpoint rejected");
+        let msg = err.to_string();
+        assert!(matches!(err, RemoteBuildError::InvalidEndpoint { .. }));
+        assert!(
+            !msg.contains("secret"),
+            "error leaked endpoint secret: {msg}"
+        );
+        assert!(!msg.contains("token"), "error leaked query string: {msg}");
+        assert!(!msg.contains("fragment"), "error leaked fragment: {msg}");
+    }
+
+    #[test]
     fn endpoint_parse_rejects_private_addresses_by_default() {
         // Cloud metadata IPs (AWS / GCP / Azure all use 169.254.169.254).
         for from in [
@@ -2138,6 +2147,7 @@ mod tests {
             "http://[fe80::1]/udf",
             "http://[fc00::1]/udf",
             "http://[2001:db8::1]/udf",
+            "http://[64:ff9b::a9fe:a9fe]/udf",
             "http://[::ffff:127.0.0.1]/udf",
             "http://[::ffff:0.0.0.0]/udf",
             "http://[::ffff:0.0.0.1]/udf",
