@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use url::form_urlencoded;
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use url::{Url, form_urlencoded};
 
 use crate::parameters::{ParameterSpec, Parameters};
 
@@ -47,7 +48,7 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("csv_delimiter")
         .description("The character separating values within a row."),
     ParameterSpec::runtime("file_compression_type")
-        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED")
+        .description("The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED")
         .one_of(&["GZIP", "BZIP2", "XZ", "ZSTD", "UNCOMPRESSED"]),
     ParameterSpec::runtime("hive_partitioning_enabled")
         .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.")
@@ -74,6 +75,91 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
         .default("enabled")
         .one_of(&["enabled", "disabled"]),
 ];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedFileExtension {
+    pub(crate) file_extension: String,
+    pub(crate) format_extension: Option<String>,
+    pub(crate) compression: Option<FileCompressionType>,
+}
+
+pub(crate) fn parse_file_extension_param(value: &str) -> Option<ParsedFileExtension> {
+    let extension = value.trim().trim_start_matches('.');
+    parse_extension_components(&extension.split('.').collect::<Vec<_>>(), false)
+}
+
+pub(crate) fn detect_file_extension_from_url_or_path(value: &str) -> Option<ParsedFileExtension> {
+    Url::parse(value)
+        .ok()
+        .and_then(|url| detect_file_extension_from_path(url.path()))
+        .or_else(|| detect_file_extension_from_path(value))
+}
+
+pub(crate) fn detect_file_extension_from_path(path: &str) -> Option<ParsedFileExtension> {
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+
+    if file_name.is_empty() || !file_name.contains('.') {
+        return None;
+    }
+
+    parse_extension_components(&file_name.split('.').collect::<Vec<_>>(), true)
+}
+
+fn parse_extension_components(
+    components: &[&str],
+    has_file_stem: bool,
+) -> Option<ParsedFileExtension> {
+    let last = components.last().copied()?.trim();
+    if last.is_empty() {
+        return None;
+    }
+
+    if let Some(compression) = compression_from_extension(last) {
+        let format_index = if has_file_stem {
+            components
+                .len()
+                .checked_sub(2)
+                .filter(|_| components.len() >= 3)
+        } else {
+            components.len().checked_sub(2)
+        };
+
+        let Some(format_index) = format_index else {
+            return Some(ParsedFileExtension {
+                file_extension: format!(".{last}"),
+                format_extension: None,
+                compression: Some(compression),
+            });
+        };
+
+        let format_extension = components[format_index].trim();
+        if format_extension.is_empty() {
+            return None;
+        }
+
+        return Some(ParsedFileExtension {
+            file_extension: format!(".{format_extension}.{last}"),
+            format_extension: Some(format_extension.to_ascii_lowercase()),
+            compression: Some(compression),
+        });
+    }
+
+    Some(ParsedFileExtension {
+        file_extension: format!(".{last}"),
+        format_extension: Some(last.to_ascii_lowercase()),
+        compression: None,
+    })
+}
+
+fn compression_from_extension(extension: &str) -> Option<FileCompressionType> {
+    let compression = extension.parse::<FileCompressionType>().ok()?;
+    compression.is_compressed().then_some(compression)
+}
 
 pub enum DelimitedFormat {
     Tsv,

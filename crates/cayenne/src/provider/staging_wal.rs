@@ -218,21 +218,9 @@ impl CayenneTableProvider {
             });
         }
 
-        let (
-            prepared_stream,
-            delete_specs,
-            deleted_pk_i64,
-            deleted_row_keys,
-            deleted_inlined_pk_i64,
-            deleted_inlined_row_keys,
-        ) = self.prepare_stream_for_insert(data).await?;
+        let prepared_insert = self.prepare_stream_for_insert(data).await?;
 
-        if !delete_specs.is_empty()
-            || !deleted_pk_i64.is_empty()
-            || !deleted_row_keys.is_empty()
-            || !deleted_inlined_pk_i64.is_empty()
-            || !deleted_inlined_row_keys.is_empty()
-        {
+        if !prepared_insert.on_conflict_deletions.is_empty() {
             return Err(Error::Unsupported {
                 operation: "staged append for Cayenne upsert or on-conflict writes",
             });
@@ -242,7 +230,7 @@ impl CayenneTableProvider {
 
         let (row_count, _writer_ops, _stats_acc) = self
             .write_to_snapshot(
-                prepared_stream,
+                prepared_insert.stream,
                 self.target_file_size_bytes(),
                 STAGING_DIR_NAME,
             )

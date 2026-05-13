@@ -24,6 +24,7 @@ use crate::dataconnector::http_rate_control::{
 };
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
+    detect_file_extension_from_url_or_path, parse_file_extension_param,
 };
 
 use data_components::http::auth::{
@@ -158,25 +159,24 @@ impl Https {
         }
 
         // If file_format is "auto", try to detect from URL extension
-        if file_format == "auto"
-            && let Ok(url) = Url::parse(&dataset.from)
-            && let Some(mut path) = url.path_segments()
-            && let Some(last_segment) = path.next_back()
-        {
-            let extension = last_segment
-                .split('.')
-                .next_back()
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
+        if file_format == "auto" {
+            let extension = self
+                .params
+                .get("file_extension")
+                .expose()
+                .ok()
+                .and_then(parse_file_extension_param)
+                .or_else(|| detect_file_extension_from_url_or_path(&dataset.from))
+                .and_then(|extension| extension.format_extension);
 
             if matches!(
-                extension.as_str(),
-                "parquet" | "csv" | "tsv" | "arrow" | "avro" | "jsonl" | "ndjson" | "ldjson"
+                extension.as_deref(),
+                Some("parquet" | "csv" | "tsv" | "arrow" | "avro" | "jsonl" | "ndjson" | "ldjson")
             ) {
                 return true;
             }
 
-            if extension == "json" && !self.has_dynamic_api_params() {
+            if extension.as_deref() == Some("json") && !self.has_dynamic_api_params() {
                 return true;
             }
         }
@@ -2043,6 +2043,23 @@ mod tests {
             .expect_err("structured formats should bypass JSON refresh_sql validation");
 
         assert_invalid_url_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_http_auto_structured_format_detects_compressed_url_extension() {
+        let connector = test_connector(None).await;
+        let dataset =
+            test_dataset("https://example.com/data.jsonl.gz", RefreshMode::Full, None).await;
+
+        assert!(connector.is_structured_format(&dataset));
+    }
+
+    #[tokio::test]
+    async fn test_http_auto_structured_format_detects_compressed_file_extension_param() {
+        let connector = test_connector_with(&[("file_extension", ".csv.zst")]).await;
+        let dataset = test_dataset("https://example.com/download", RefreshMode::Full, None).await;
+
+        assert!(connector.is_structured_format(&dataset));
     }
 
     #[tokio::test]

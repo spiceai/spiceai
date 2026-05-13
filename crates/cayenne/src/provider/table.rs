@@ -29,8 +29,8 @@ use super::delete::{
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use crate::metadata::{CreateTableOptions, InlinedData, TableMetadata};
-use crate::provider::scan::CayenneAccelerationExec;
+use crate::metadata::{CreateTableOptions, InlinedData, InlinedDataStats, TableMetadata};
+use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
 use arrow::array::Array;
@@ -63,7 +63,7 @@ use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::limit::GlobalLimitExec;
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_table_providers::util::constraints::UpsertOptions;
@@ -290,6 +290,15 @@ pub(crate) const INLINE_MAX_ROWS: usize = 1024;
 /// Maximum serialized IPC size (bytes) to inline in the metastore.
 const INLINE_MAX_BYTES: usize = 1_048_576; // 1 MB
 
+/// Maximum rows to keep in the inline level-0 memtable before flushing to Vortex.
+pub(crate) const INLINE_MEMTABLE_MAX_ROWS: i64 = 10_000;
+
+/// Maximum inline level-0 entries before flushing to Vortex.
+pub(crate) const INLINE_MEMTABLE_MAX_SEGMENTS: i64 = 64;
+
+/// Maximum serialized IPC bytes to keep inline before flushing to Vortex.
+pub(crate) const INLINE_MEMTABLE_MAX_BYTES: i64 = 8 * 1_048_576;
+
 /// Maximum in-memory byte budget while buffering the inline fast-path stream.
 ///
 /// `INLINE_MAX_ROWS` alone does not bound memory usage — a pathological batch
@@ -300,6 +309,38 @@ const INLINE_MAX_BYTES: usize = 1_048_576; // 1 MB
 /// `INLINE_MAX_BYTES` (the serialized IPC cap) to account for in-memory Arrow
 /// overhead vs. the compact IPC representation.
 pub(crate) const INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576; // 4 MB
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineMemtablePressure {
+    Rows,
+    Segments,
+    IpcBytes,
+}
+
+impl InlineMemtablePressure {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rows => "rows",
+            Self::Segments => "segments",
+            Self::IpcBytes => "ipc_bytes",
+        }
+    }
+}
+
+#[must_use]
+pub(crate) fn inline_memtable_pressure(stats: InlinedDataStats) -> Option<InlineMemtablePressure> {
+    if stats.record_count >= INLINE_MEMTABLE_MAX_ROWS {
+        return Some(InlineMemtablePressure::Rows);
+    }
+    if stats.entry_count > INLINE_MEMTABLE_MAX_SEGMENTS {
+        return Some(InlineMemtablePressure::Segments);
+    }
+    if stats.ipc_bytes >= INLINE_MEMTABLE_MAX_BYTES {
+        return Some(InlineMemtablePressure::IpcBytes);
+    }
+    None
+}
 
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
 fn serialize_batches_to_ipc(
@@ -649,18 +690,58 @@ struct BatchValidationResult {
     deleted_inlined_row_keys: Vec<Box<[u8]>>,
 }
 
+pub(crate) struct PreparedInsertStream {
+    pub(crate) stream: SendableRecordBatchStream,
+    pub(crate) on_conflict_deletions: OnConflictDeletions,
+}
+
+#[derive(Default)]
+pub(crate) struct OnConflictDeletions {
+    pub(crate) delete_specs: HashMap<i64, Vec<i64>>,
+    /// Deleted file-backed Int64 PK values (for `Int64Pk` strategy).
+    pub(crate) deleted_pk_i64: Vec<i64>,
+    /// Deleted file-backed row keys (for `RowConverterBased` strategy).
+    pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
+    /// Deleted inlined Int64 PK values.
+    pub(crate) deleted_inlined_pk_i64: Vec<i64>,
+    /// Deleted inlined row keys.
+    pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+}
+
+impl OnConflictDeletions {
+    #[must_use]
+    pub(crate) fn has_file_deletions(&self) -> bool {
+        !self.delete_specs.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn has_inlined_deletions(&self) -> bool {
+        !self.deleted_inlined_pk_i64.is_empty() || !self.deleted_inlined_row_keys.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.has_file_deletions() && !self.has_inlined_deletions()
+    }
+
+    #[must_use]
+    pub(crate) fn file_delete_specs_count(&self) -> usize {
+        self.delete_specs.len()
+    }
+
+    #[must_use]
+    pub(crate) fn deleted_key_count(&self) -> usize {
+        self.deleted_pk_i64.len()
+            + self.deleted_row_keys.len()
+            + self.deleted_inlined_pk_i64.len()
+            + self.deleted_inlined_row_keys.len()
+    }
+}
+
 /// Result of on-conflict validation containing deleted PK information.
 struct OnConflictValidationResult {
     filtered_batches: Vec<RecordBatch>,
-    delete_specs: HashMap<i64, Vec<i64>>,
-    /// Deleted file-backed Int64 PK values (for `Int64Pk` strategy).
-    deleted_pk_i64: Vec<i64>,
-    /// Deleted file-backed row keys (for `RowConverterBased` strategy).
-    deleted_row_keys: Vec<Box<[u8]>>,
-    /// Deleted inlined Int64 PK values.
-    deleted_inlined_pk_i64: Vec<i64>,
-    /// Deleted inlined row keys.
-    deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    on_conflict_deletions: OnConflictDeletions,
 }
 
 struct OnConflictContext<'a> {
@@ -1010,9 +1091,25 @@ impl CayenneTableProvider {
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
     ) -> Result<Arc<ListingTable>> {
+        Self::create_listing_table_with_config(
+            snapshot_dir_url,
+            schema,
+            vortex_format,
+            strategy,
+            &SessionConfig::default(),
+        )
+    }
+
+    fn create_listing_table_with_config(
+        snapshot_dir_url: &str,
+        schema: SchemaRef,
+        vortex_format: &Arc<VortexFormat>,
+        strategy: &PkDeletionStrategyWithCache,
+        session_config: &SessionConfig,
+    ) -> Result<Arc<ListingTable>> {
         let table_url = ListingTableUrl::parse(snapshot_dir_url)?;
 
-        let listing_options = Self::create_listing_options(vortex_format, strategy);
+        let listing_options = Self::create_listing_options(vortex_format, strategy, session_config);
 
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
@@ -1031,6 +1128,7 @@ impl CayenneTableProvider {
     fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
+        session_config: &SessionConfig,
     ) -> ListingOptions {
         let file_format: Arc<dyn FileFormat> = match strategy {
             PkDeletionStrategyWithCache::PositionBased {
@@ -1044,7 +1142,7 @@ impl CayenneTableProvider {
                 Arc::clone(vortex_format) as Arc<dyn FileFormat>
             }
         };
-        ListingOptions::new(file_format).with_session_config_options(&SessionConfig::default())
+        ListingOptions::new(file_format).with_session_config_options(session_config)
     }
 
     /// Construct the snapshot directory URL string.
@@ -2266,23 +2364,12 @@ impl CayenneTableProvider {
     pub(crate) async fn prepare_stream_for_insert(
         &self,
         stream: SendableRecordBatchStream,
-    ) -> Result<(
-        SendableRecordBatchStream,
-        HashMap<i64, Vec<i64>>,
-        Vec<i64>,
-        Vec<Box<[u8]>>,
-        Vec<i64>,
-        Vec<Box<[u8]>>,
-    )> {
+    ) -> Result<PreparedInsertStream> {
         let Some(pk_indices) = self.primary_key_indices()? else {
-            return Ok((
+            return Ok(PreparedInsertStream {
                 stream,
-                HashMap::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ));
+                on_conflict_deletions: OnConflictDeletions::default(),
+            });
         };
 
         let converter = self.build_pk_converter(&pk_indices)?;
@@ -2307,14 +2394,10 @@ impl CayenneTableProvider {
             futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok)),
         );
 
-        Ok((
-            Box::pin(validated_stream) as SendableRecordBatchStream,
-            validation_result.delete_specs,
-            validation_result.deleted_pk_i64,
-            validation_result.deleted_row_keys,
-            validation_result.deleted_inlined_pk_i64,
-            validation_result.deleted_inlined_row_keys,
-        ))
+        Ok(PreparedInsertStream {
+            stream: Box::pin(validated_stream) as SendableRecordBatchStream,
+            on_conflict_deletions: validation_result.on_conflict_deletions,
+        })
     }
 
     /// Validate incoming batches against primary key uniqueness and configured on-conflict behavior.
@@ -2390,11 +2473,13 @@ impl CayenneTableProvider {
 
         Ok(OnConflictValidationResult {
             filtered_batches,
-            delete_specs,
-            deleted_pk_i64: all_deleted_pk_i64,
-            deleted_row_keys: all_deleted_row_keys,
-            deleted_inlined_pk_i64: all_deleted_inlined_pk_i64,
-            deleted_inlined_row_keys: all_deleted_inlined_row_keys,
+            on_conflict_deletions: OnConflictDeletions {
+                delete_specs,
+                deleted_pk_i64: all_deleted_pk_i64,
+                deleted_row_keys: all_deleted_row_keys,
+                deleted_inlined_pk_i64: all_deleted_inlined_pk_i64,
+                deleted_inlined_row_keys: all_deleted_inlined_row_keys,
+            },
         })
     }
 
@@ -2798,12 +2883,16 @@ impl CayenneTableProvider {
     /// PK value + sequence number for proper ordering of concurrent operations.
     pub(crate) async fn apply_on_conflict_deletions(
         &self,
-        delete_specs: HashMap<i64, Vec<i64>>,
-        deleted_pk_i64: Vec<i64>,
-        deleted_row_keys: Vec<Box<[u8]>>,
-        deleted_inlined_pk_i64: Vec<i64>,
-        deleted_inlined_row_keys: Vec<Box<[u8]>>,
+        on_conflict_deletions: OnConflictDeletions,
     ) -> CatalogResult<()> {
+        let OnConflictDeletions {
+            delete_specs,
+            deleted_pk_i64,
+            deleted_row_keys,
+            deleted_inlined_pk_i64,
+            deleted_inlined_row_keys,
+        } = on_conflict_deletions;
+
         let has_file_deletions = !delete_specs.is_empty();
         let has_inlined_deletions =
             !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty();
@@ -3798,15 +3887,12 @@ impl CayenneTableProvider {
 
         self.commit_inlined_data_mutation(
             rewrite,
-            vec![InlinedData {
-                inlined_id: String::new(), // auto-generated
-                table_id: self.table_metadata.table_id.clone(),
-                partition_key: None,
-                data_ipc: ipc_bytes,
-                record_count: i64::try_from(total_rows).unwrap_or(i64::MAX),
-                sequence_number: 0, // sequence_number will be set by catalog
-                created_at: String::new(), // default in DDL
-            }],
+            vec![InlinedData::pending_catalog_insert(
+                self.table_metadata.table_id.clone(),
+                None,
+                ipc_bytes,
+                i64::try_from(total_rows).unwrap_or(i64::MAX),
+            )],
             total_rows,
         )
         .await?;
@@ -3877,21 +3963,13 @@ impl CayenneTableProvider {
                 .map_err(|e| super::Error::Arrow { source: e })?;
             for row_key in row_keys {
                 if self.pk_deletion_strategy.is_int64_pk() {
-                    if let Some(pk) = Self::row_key_to_i64(&row_key) {
-                        maps.int64_pk
-                            .entry(pk)
-                            .and_modify(|sequence| {
-                                *sequence = (*sequence).max(delete.sequence_number);
-                            })
-                            .or_insert(delete.sequence_number);
-                    } else {
-                        return Err(super::Error::Arrow {
-                            source: arrow::error::ArrowError::ParseError(format!(
-                                "Failed to decode legacy inlined Int64 delete key for table {} at sequence {}",
-                                self.table_metadata.table_name, delete.sequence_number
-                            )),
-                        });
-                    }
+                    let pk = Self::row_key_to_i64(&row_key, &self.table_metadata.table_name)?;
+                    maps.int64_pk
+                        .entry(pk)
+                        .and_modify(|sequence| {
+                            *sequence = (*sequence).max(delete.sequence_number);
+                        })
+                        .or_insert(delete.sequence_number);
                 } else {
                     maps.row_keys
                         .entry(row_key)
@@ -3904,13 +3982,19 @@ impl CayenneTableProvider {
         Ok(maps)
     }
 
-    fn row_key_to_i64(row_key: &[u8]) -> Option<i64> {
-        if row_key.len() < 8 {
-            return None;
+    fn row_key_to_i64(row_key: &[u8], table_name: &str) -> Result<i64> {
+        if row_key.len() != 8 {
+            return Err(Error::DataValidation {
+                table: table_name.to_string(),
+                message: format!(
+                    "Invalid inlined Int64 delete key length {}; expected 8 bytes",
+                    row_key.len()
+                ),
+            });
         }
         let mut bytes = [0_u8; 8];
-        bytes.copy_from_slice(&row_key[..8]);
-        Some(i64::from_be_bytes(bytes))
+        bytes.copy_from_slice(row_key);
+        Ok(i64::from_be_bytes(bytes))
     }
 
     fn filter_inlined_batch_for_deletions(
@@ -4022,6 +4106,24 @@ impl CayenneTableProvider {
     pub(crate) async fn checkpoint_inlined_data(&self) -> Result<u64> {
         let batches = self.read_inlined_batches().await?;
         if batches.is_empty() {
+            let stats = self
+                .catalog
+                .get_inlined_data_stats(&self.table_metadata.table_id)
+                .await?;
+            self.inlined_row_count
+                .store(stats.record_count, Ordering::Relaxed);
+
+            if stats.entry_count > 0 {
+                tracing::info!(
+                    table = %self.table_metadata.table_name,
+                    rows = stats.record_count,
+                    segments = stats.entry_count,
+                    ipc_bytes = stats.ipc_bytes,
+                    "Clearing fully-deleted inline memtable"
+                );
+                self.clear_inlined_metadata_after_checkpoint().await?;
+            }
+
             return Ok(0);
         }
 
@@ -4064,7 +4166,14 @@ impl CayenneTableProvider {
         // Persist table stats from the checkpoint write (best-effort; logs on error).
         self.persist_table_stats(&stats).await;
 
-        // Clear inlined data from metastore after successful write
+        self.clear_inlined_metadata_after_checkpoint().await?;
+
+        self.refresh_listing_table()?;
+
+        Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
+    }
+
+    async fn clear_inlined_metadata_after_checkpoint(&self) -> Result<()> {
         self.catalog
             .clear_inlined_data(&self.table_metadata.table_id)
             .await?;
@@ -4072,10 +4181,33 @@ impl CayenneTableProvider {
             .clear_inlined_deletes(&self.table_metadata.table_id)
             .await?;
         self.inlined_row_count.store(0, Ordering::Relaxed);
+        Ok(())
+    }
 
-        self.refresh_listing_table()?;
+    /// Flush the inline level-0 memtable when accumulated entries would make reads or
+    /// rewrites too expensive.
+    pub(crate) async fn checkpoint_inlined_data_if_memtable_pressure_exceeded(&self) -> Result<()> {
+        let stats = self
+            .catalog
+            .get_inlined_data_stats(&self.table_metadata.table_id)
+            .await?;
+        self.inlined_row_count
+            .store(stats.record_count, Ordering::Relaxed);
 
-        Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
+        let Some(pressure) = inline_memtable_pressure(stats) else {
+            return Ok(());
+        };
+
+        tracing::info!(
+            table = %self.table_metadata.table_name,
+            rows = stats.record_count,
+            segments = stats.entry_count,
+            ipc_bytes = stats.ipc_bytes,
+            reason = pressure.as_str(),
+            "Checkpointing inline memtable to Vortex"
+        );
+        self.checkpoint_inlined_data().await?;
+        Ok(())
     }
 
     /// Flush inlined rows to Vortex files when pending inline data exists.
@@ -4680,11 +4812,12 @@ impl CayenneTableProvider {
                 &snapshot_id,
             );
 
-            let listing_table = Self::create_listing_table(
+            let listing_table = Self::create_listing_table_with_config(
                 &snapshot_url,
                 Arc::clone(&self.table_metadata.schema),
                 self.context.file_format(),
                 &self.pk_deletion_strategy,
+                state.config(),
             )
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -5061,16 +5194,20 @@ impl TableProvider for CayenneTableProvider {
             filters
         };
 
-        // Delegate to the underlying listing table
-        // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    LISTING_TABLE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            Arc::clone(&guard)
-        };
+        let target_partitions = state.config().target_partitions();
+
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            &self.get_current_snapshot_id()?,
+        );
+        let listing_table = Self::create_listing_table_with_config(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        )?;
         let main_plan = listing_table
             .scan(state, effective_projection.as_ref(), scan_filters, limit)
             .await?;
@@ -5168,12 +5305,17 @@ impl TableProvider for CayenneTableProvider {
             plan
         };
 
-        let plan: Arc<dyn ExecutionPlan> = if let Some(limit) = limit {
-            Arc::new(GlobalLimitExec::new(
-                Arc::new(CoalescePartitionsExec::new(plan)),
-                0,
-                Some(limit),
-            ))
+        let mut plan: Arc<dyn ExecutionPlan> = if scan_filters.is_empty() && limit.is_none() {
+            round_robin_repartition_if_needed(Arc::clone(&plan), target_partitions)?.unwrap_or(plan)
+        } else {
+            plan
+        };
+
+        plan = if let Some(limit) = limit {
+            let local_limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(plan, limit));
+            let single_partition: Arc<dyn ExecutionPlan> =
+                Arc::new(CoalescePartitionsExec::new(local_limit));
+            Arc::new(GlobalLimitExec::new(single_partition, 0, Some(limit)))
         } else {
             plan
         };
@@ -5664,6 +5806,42 @@ mod tests {
     use std::sync::Arc;
     use test_framework::arrow_record_batch_gen::*;
 
+    #[test]
+    fn inline_memtable_pressure_is_absent_below_thresholds() {
+        let stats = InlinedDataStats {
+            record_count: INLINE_MEMTABLE_MAX_ROWS - 1,
+            entry_count: INLINE_MEMTABLE_MAX_SEGMENTS,
+            ipc_bytes: INLINE_MEMTABLE_MAX_BYTES - 1,
+        };
+
+        assert_eq!(inline_memtable_pressure(stats), None);
+    }
+
+    #[test]
+    fn inline_memtable_pressure_detects_thresholds() {
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                record_count: INLINE_MEMTABLE_MAX_ROWS,
+                ..InlinedDataStats::default()
+            }),
+            Some(InlineMemtablePressure::Rows)
+        );
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                entry_count: INLINE_MEMTABLE_MAX_SEGMENTS + 1,
+                ..InlinedDataStats::default()
+            }),
+            Some(InlineMemtablePressure::Segments)
+        );
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                ipc_bytes: INLINE_MEMTABLE_MAX_BYTES,
+                ..InlinedDataStats::default()
+            }),
+            Some(InlineMemtablePressure::IpcBytes)
+        );
+    }
+
     /// A `TableProviderFactory` implementation to create new instances of `CayenneTableProvider`.
     // Not used outside of tests until https://github.com/spiceai/spiceai/issues/8534 is resolved
     #[derive(Debug)]
@@ -6005,6 +6183,17 @@ mod tests {
 
         assert_eq!(keyset.len(), 3, "all rows should be in keyset");
         assert_eq!(row_id_base, 3, "row_id_base should advance by batch size");
+    }
+
+    #[test]
+    fn test_row_key_to_i64_rejects_invalid_length() {
+        let err = CayenneTableProvider::row_key_to_i64(&[1, 2, 3], "test_table")
+            .expect_err("invalid inlined Int64 key should fail");
+
+        assert!(
+            err.to_string().contains("expected 8 bytes"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Helper to create a `CayenneTableProvider` with sort columns configured.
