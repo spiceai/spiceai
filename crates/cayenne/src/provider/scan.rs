@@ -123,7 +123,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![self.inner.properties().output_ordering().is_none()]
+        vec![false]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -156,12 +156,10 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
     fn repartitioned(
         &self,
-        target_partitions: usize,
-        config: &ConfigOptions,
+        _target_partitions: usize,
+        _config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let repartitioned = self.inner.repartitioned(target_partitions, config)?;
-        Ok(repartitioned
-            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>))
+        Ok(None)
     }
 
     fn execute(
@@ -319,9 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn cayenne_exec_benefits_from_unordered_input_partitioning() {
+    fn cayenne_exec_does_not_request_input_repartitioning() {
         let exec = CayenneAccelerationExec::new(one_partition_plan());
 
-        assert_eq!(exec.benefits_from_input_partitioning(), vec![true]);
+        assert_eq!(exec.benefits_from_input_partitioning(), vec![false]);
+        assert!(
+            exec.repartitioned(4, &ConfigOptions::default())
+                .expect("repartition check should succeed")
+                .is_none()
+        );
     }
 }
