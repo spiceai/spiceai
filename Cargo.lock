@@ -15911,6 +15911,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "chrono",
+ "criterion 0.7.0",
  "dashmap",
  "datafusion",
  "datafusion-catalog",
