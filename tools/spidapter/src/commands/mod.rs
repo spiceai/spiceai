@@ -21,7 +21,7 @@ use spice_cloud_client::{
     CloudClient,
     types::{
         AppExecutor, AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
-        CreateDeploymentRequest, UpdateAppRequest,
+        CreateDeploymentRequest, UpdateAppRequest, UpdateChannel,
     },
 };
 
@@ -311,7 +311,7 @@ pub(crate) async fn apply_spicepod_to_app(
 pub(crate) async fn create_deployment(
     cloud: &CloudClient,
     app_id: i64,
-    channel: Option<&str>,
+    channel: Option<&UpdateChannel>,
 ) -> anyhow::Result<()> {
     let created = cloud
         .create_deployment(
@@ -323,7 +323,7 @@ pub(crate) async fn create_deployment(
                 branch: None,
                 commit_sha: None,
                 commit_message: None,
-                channel: channel.map(String::from),
+                channel: channel.cloned(),
                 debug: false,
             },
         )
