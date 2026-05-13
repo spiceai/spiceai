@@ -35,6 +35,7 @@ use crate::catalog::MetadataCatalog;
 use crate::provider::Error;
 use crate::provider::retention::extract_retention_column_and_threshold;
 use crate::provider::table::CayenneTableProvider;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
@@ -46,7 +47,6 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use object_store::{ObjectMeta, ObjectStore};
 use std::collections::HashMap;
-use arc_swap::ArcSwap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex as TokioMutex;
 

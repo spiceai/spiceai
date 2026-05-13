@@ -397,7 +397,7 @@ pub struct CayenneTableProvider {
     /// write barrier described in issue #10125 §6.4.
     ///
     /// Scans take `listing_fence.read().await` and hold it across the inner
-    /// DataFusion listing call so that concurrent file-move + listing-table
+    /// `DataFusion` listing call so that concurrent file-move + listing-table
     /// swap by a writer cannot interleave with the listing operation. The
     /// writer barrier takes `listing_fence.write().await` for the duration of
     /// its move + cache-invalidate + Arc swap.
@@ -3668,6 +3668,26 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the listing table cannot be refreshed.
     pub(crate) async fn refresh_listing_table(&self) -> Result<()> {
+        // Acquire the listing fence for the duration of the swap. Single-partition
+        // path; the cross-partition append coordinator (issue #10125 step 6)
+        // uses `refresh_listing_table_under_held_fence` instead so it can hold
+        // every participating partition's fence across one barrier window.
+        let _fence = self.listing_fence.write().await;
+        self.refresh_listing_table_under_held_fence()
+    }
+
+    /// Refresh the listing table, ASSUMING the caller already holds
+    /// [`Self::listing_fence`] for write.
+    ///
+    /// Cross-partition coordinators (#10125 step 6) lock every participating
+    /// partition's fence in sorted order and call this method on each so the
+    /// listing-table swap happens under one combined barrier. Single-partition
+    /// callers should use [`Self::refresh_listing_table`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing table cannot be reconstructed.
+    pub(crate) fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
         // Construct URL to current snapshot using the live snapshot ID
         // (which may differ from table_metadata after compaction)
         let current_snapshot = self.get_current_snapshot_id()?;
@@ -3688,18 +3708,45 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
-        // Atomically install the new listing table under the listing fence so
-        // concurrent scan()s see either the old or new listing — never an
-        // intermediate state (#10125 §6.4).
-        let _fence = self.listing_fence.write().await;
         self.listing_table.store(new_listing_table);
 
         tracing::debug!(
-            "Refreshed listing table for {} to pick up new files and update statistics",
+            "Refreshed listing table for {} (under held fence) to pick up new files",
             self.table_metadata.table_name
         );
 
         Ok(())
+    }
+
+    /// Acquire `listing_fence` for write and return an owned guard.
+    ///
+    /// Used by the cross-partition append coordinator (#10125 step 6) so it
+    /// can hold fences across every participating partition for the duration
+    /// of one barrier window.
+    pub async fn lock_listing_fence_write_owned(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.listing_fence).write_owned().await
+    }
+
+    /// Return the absolute path to the table's data root. Used by the
+    /// cross-partition coordinator to derive the top-level partitioned-WAL
+    /// directory (`<table_root>/_partitioned_wal/`).
+    #[must_use]
+    pub fn table_path_str(&self) -> &str {
+        &self.table_metadata.path
+    }
+
+    /// Return this partition's staging WAL path for top-level recovery
+    /// records. Local-filesystem only — S3-backed tables return the same
+    /// shape but recovery is not yet wired for object stores (#10125 step 6
+    /// scope).
+    #[must_use]
+    pub fn staging_wal_path_for_recovery(&self) -> std::path::PathBuf {
+        let staging_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            STAGING_DIR_NAME,
+        );
+        staging_dir.join(STAGING_WAL_FILENAME)
     }
 
     /// Invalidate the `list_files_cache` entry for the given snapshot directory URL.
@@ -6339,9 +6386,8 @@ mod tests {
                 // writer can now make progress.
                 drop(read_guard);
                 let table_for_writer = table.clone_for_write();
-                let writer = tokio::spawn(async move {
-                    table_for_writer.refresh_listing_table().await
-                });
+                let writer =
+                    tokio::spawn(async move { table_for_writer.refresh_listing_table().await });
                 tokio::time::timeout(std::time::Duration::from_secs(5), writer)
                     .await
                     .expect("refresh completes once the read fence is released")
@@ -6349,9 +6395,7 @@ mod tests {
                     .expect("refresh_listing_table returned Ok");
             }
             Ok(completed) => {
-                panic!(
-                    "refresh_listing_table completed despite held read fence: {completed:?}"
-                );
+                panic!("refresh_listing_table completed despite held read fence: {completed:?}");
             }
         }
     }
@@ -6388,9 +6432,7 @@ mod tests {
                     .expect("read fence acquires once writer is released")
                     .expect("spawned task did not panic");
             }
-            Ok(completed) => panic!(
-                "read fence acquired despite held write fence: {completed:?}"
-            ),
+            Ok(completed) => panic!("read fence acquired despite held write fence: {completed:?}"),
         }
     }
 }

@@ -60,10 +60,10 @@ pub(crate) mod vortex_format;
 // Re-export the main type at the module level for convenience
 pub use context::CayenneContext;
 pub use deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
+pub use overwrite::PreparedOverwrite;
+pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
-pub use overwrite::PreparedOverwrite;
-pub use partitioned_wal::{PartitionedWal, PartitionedWalEntry, PARTITIONED_WAL_DIR};
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
 pub use vortex_format::{DeletionFilteringVortexFormat, attach_deletion_vectors_to_config};

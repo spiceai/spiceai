@@ -72,7 +72,7 @@ impl std::fmt::Debug for PreparedOverwrite {
             .field("new_snapshot_id", &self.new_snapshot_id)
             .field("row_count", &self.row_count)
             .field("has_write_guard", &self.write_guard.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -171,7 +171,8 @@ impl PreparedOverwrite {
     /// Returns an error if updating the in-memory snapshot id or swapping the
     /// listing table fails. Other steps are best-effort.
     pub async fn finish(self) -> Result<u64> {
-        self.table.update_current_snapshot_id(&self.new_snapshot_id)?;
+        self.table
+            .update_current_snapshot_id(&self.new_snapshot_id)?;
 
         if let Err(e) = self.table.clear_all_deletion_caches() {
             tracing::warn!(

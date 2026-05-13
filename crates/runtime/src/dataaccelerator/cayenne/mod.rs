@@ -1263,7 +1263,8 @@ impl DataAccelerator for CayenneAccelerator {
             // Promote to a trait object for the existing per-partition callers.
             // The coercion from Arc<CayenneCatalog> to Arc<dyn MetadataCatalog>
             // happens via the unsizing rule on the let-binding's declared type.
-            let catalog: Arc<dyn cayenne::MetadataCatalog> = catalog_concrete.clone();
+            let catalog: Arc<dyn cayenne::MetadataCatalog> =
+                Arc::<cayenne::CayenneCatalog>::clone(&catalog_concrete);
 
             // Initialize the catalog (creates tables if needed)
             catalog
@@ -1324,6 +1325,7 @@ impl DataAccelerator for CayenneAccelerator {
             let insert_strategy = Arc::new(
                 partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
                     Arc::clone(&catalog_concrete),
+                    PathBuf::from(&dir_path),
                 ),
             );
             let partition_provider = Arc::new(

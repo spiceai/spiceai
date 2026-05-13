@@ -51,6 +51,7 @@ use super::super::utils::convert_to_u64_box;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
+use arc_swap::ArcSwap;
 use arrow::array::ArrayRef;
 use arrow_row::RowConverter;
 use arrow_schema::SchemaRef;
@@ -69,7 +70,6 @@ use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
-use arc_swap::ArcSwap;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 

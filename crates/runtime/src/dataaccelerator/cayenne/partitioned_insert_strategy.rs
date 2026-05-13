@@ -45,12 +45,16 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use cayenne::{CayenneCatalog, CayenneTableProvider, PreparedOverwrite};
+use cayenne::{
+    CayenneCatalog, CayenneTableProvider, PartitionedWal, PartitionedWalEntry, PreparedOverwrite,
+    PreparedStagedAppend,
+};
 use datafusion::common::{Column, DFSchema};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -66,7 +70,7 @@ use runtime_table_partition::Partition;
 use runtime_table_partition::creator::filename::encode_composite_key;
 use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::insert::{
-    DefaultInsertStrategy, InsertStrategy, PartitionContext, partition_batch_composite,
+    InsertStrategy, PartitionContext, partition_batch_composite,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -81,18 +85,24 @@ type CompositePartitionKey = String;
 /// documentation for the overwrite coordination flow.
 pub struct CayennePartitionedInsertStrategy {
     catalog: Arc<CayenneCatalog>,
-    /// Serializes cross-partition overwrite coordinators on this table.
+    /// Serializes cross-partition coordinators on this table.
     ///
     /// One coordinator may have many concurrent per-partition writer tasks
     /// in flight (each holding its own partition's write lock via
-    /// `begin_overwrite`), but two coordinators on the same table acquire
-    /// per-partition locks in input-stream order — that order is not
-    /// guaranteed consistent across coordinators, so concurrent coordinators
-    /// on overlapping partition sets could deadlock under lock-ordering.
-    /// Serializing the coordinators here eliminates that hazard. Within one
-    /// coordinator, every partition's writer task runs in parallel, so the
-    /// outer serialization does not bottleneck a single refresh.
+    /// `begin_overwrite` / `begin_staged_append`), but two coordinators on
+    /// the same table acquire per-partition locks in input-stream order —
+    /// that order is not guaranteed consistent across coordinators, so
+    /// concurrent coordinators on overlapping partition sets could deadlock
+    /// under lock-ordering. Serializing the coordinators here eliminates
+    /// that hazard. Within one coordinator, every partition's writer task
+    /// runs in parallel, so the outer serialization does not bottleneck a
+    /// single refresh.
     coordinator_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Absolute filesystem path of the table's data root. The append-mode
+    /// coordinator writes its top-level cross-partition WAL under
+    /// `<table_root>/_partitioned_wal/` (issue #10125 §6.5). Unused by the
+    /// overwrite-mode coordinator.
+    table_root: PathBuf,
 }
 
 impl std::fmt::Debug for CayennePartitionedInsertStrategy {
@@ -103,13 +113,19 @@ impl std::fmt::Debug for CayennePartitionedInsertStrategy {
 }
 
 impl CayennePartitionedInsertStrategy {
-    /// Construct a new strategy. `catalog` must be the same
-    /// `CayenneCatalog` that the partition creator was built against.
+    /// Construct a new strategy.
+    ///
+    /// `catalog` must be the same `CayenneCatalog` that the partition
+    /// creator was built against. `table_root` is the absolute path of the
+    /// partitioned table's data directory; it's used by the append
+    /// coordinator to write top-level WAL files at
+    /// `<table_root>/_partitioned_wal/`.
     #[must_use]
-    pub fn new(catalog: Arc<CayenneCatalog>) -> Self {
+    pub fn new(catalog: Arc<CayenneCatalog>, table_root: PathBuf) -> Self {
         Self {
             catalog,
             coordinator_lock: Arc::new(tokio::sync::Mutex::new(())),
+            table_root,
         }
     }
 }
@@ -124,8 +140,10 @@ impl InsertStrategy for CayennePartitionedInsertStrategy {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         match insert_op {
             InsertOp::Overwrite => {
-                let physical_exprs =
-                    create_partition_physical_exprs(&context.partition_by, Arc::clone(&context.schema))?;
+                let physical_exprs = create_partition_physical_exprs(
+                    &context.partition_by,
+                    Arc::clone(&context.schema),
+                )?;
                 let sink = Arc::new(CayennePartitionedOverwriteSink {
                     catalog: Arc::clone(&self.catalog),
                     coordinator_lock: Arc::clone(&self.coordinator_lock),
@@ -136,19 +154,26 @@ impl InsertStrategy for CayennePartitionedInsertStrategy {
                 });
                 Ok(Arc::new(DataSinkExec::new(input, sink, None)))
             }
-            // Append + Replace continue through the default per-partition
-            // path; cross-partition append atomicity is a separate roadmap
-            // step (#10125 step 6).
-            _ => {
-                DefaultInsertStrategy
-                    .execute_insert(input, insert_op, context)
-                    .await
+            InsertOp::Append | InsertOp::Replace => {
+                let physical_exprs = create_partition_physical_exprs(
+                    &context.partition_by,
+                    Arc::clone(&context.schema),
+                )?;
+                let sink = Arc::new(CayennePartitionedAppendSink {
+                    coordinator_lock: Arc::clone(&self.coordinator_lock),
+                    creator: Arc::clone(&context.creator),
+                    partitions: Arc::clone(&context.partitions),
+                    schema: Arc::clone(&context.schema),
+                    physical_exprs,
+                    table_root: self.table_root.clone(),
+                });
+                Ok(Arc::new(DataSinkExec::new(input, sink, None)))
             }
         }
     }
 }
 
-/// DataSink that fans the input stream out by partition key, stages every
+/// `DataSink` that fans the input stream out by partition key, stages every
 /// partition's overwrite, and commits all of them in one shared
 /// `MetastoreTransaction`.
 ///
@@ -160,8 +185,7 @@ struct CayennePartitionedOverwriteSink {
     /// See [`CayennePartitionedInsertStrategy::coordinator_lock`].
     coordinator_lock: Arc<tokio::sync::Mutex<()>>,
     creator: Arc<dyn runtime_table_partition::creator::PartitionCreator>,
-    partitions:
-        Arc<tokio::sync::RwLock<HashMap<CompositePartitionKey, Partition>>>,
+    partitions: Arc<tokio::sync::RwLock<HashMap<CompositePartitionKey, Partition>>>,
     schema: SchemaRef,
     physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
 }
@@ -176,7 +200,7 @@ impl std::fmt::Debug for CayennePartitionedOverwriteSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CayennePartitionedOverwriteSink")
             .field("partition_exprs", &self.physical_exprs.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -218,12 +242,9 @@ impl DataSink for CayennePartitionedOverwriteSink {
         // through the sender, providing natural backpressure (capacity
         // PARTITION_WRITER_CHANNEL_DEPTH). Steady-state memory is
         // O(channel_depth × partition_count), not O(input_size).
-        let mut senders: HashMap<
-            String,
-            mpsc::Sender<datafusion::common::Result<RecordBatch>>,
-        > = HashMap::new();
-        let mut handles: Vec<JoinHandle<cayenne::provider::Result<PreparedOverwrite>>> =
-            Vec::new();
+        let mut senders: HashMap<String, mpsc::Sender<datafusion::common::Result<RecordBatch>>> =
+            HashMap::new();
+        let mut handles: Vec<JoinHandle<cayenne::provider::Result<PreparedOverwrite>>> = Vec::new();
         let mut upstream_err: Option<DataFusionError> = None;
 
         'outer: while let Some(batch_result) = data.next().await {
@@ -259,10 +280,7 @@ impl DataSink for CayennePartitionedOverwriteSink {
                     let schema_clone = Arc::clone(&self.schema);
                     let handle = tokio::spawn(async move {
                         let stream: SendableRecordBatchStream = Box::pin(
-                            RecordBatchStreamAdapter::new(
-                                schema_clone,
-                                ReceiverStream::new(rx),
-                            ),
+                            RecordBatchStreamAdapter::new(schema_clone, ReceiverStream::new(rx)),
                         );
                         cayenne_owned.begin_overwrite(stream).await
                     });
@@ -276,8 +294,7 @@ impl DataSink for CayennePartitionedOverwriteSink {
                     // Stop sending; we'll surface the real error when we
                     // join the handle below.
                     upstream_err = Some(DataFusionError::Execution(
-                        "partition writer task terminated before stream end"
-                            .to_string(),
+                        "partition writer task terminated before stream end".to_string(),
                     ));
                     break 'outer;
                 }
@@ -327,9 +344,7 @@ impl DataSink for CayennePartitionedOverwriteSink {
         if let Some(err) = upstream_err.or(task_err) {
             for prep in prepared {
                 if let Err(rollback_err) = prep.rollback().await {
-                    tracing::warn!(
-                        "rollback after stream/writer error failed: {rollback_err}"
-                    );
+                    tracing::warn!("rollback after stream/writer error failed: {rollback_err}");
                 }
             }
             return Err(err);
@@ -375,7 +390,7 @@ impl DataSink for CayennePartitionedOverwriteSink {
 }
 
 impl CayennePartitionedOverwriteSink {
-    /// Open one transaction, apply every partition's commit_compaction_in_txn,
+    /// Open one transaction, apply every partition's `commit_compaction_in_txn`,
     /// commit. Mirrors the retry-on-conflict shape of
     /// [`crate::cayenne::CayenneCatalog::commit_compaction`] but for the
     /// batched cross-partition case.
@@ -438,12 +453,10 @@ fn create_partition_physical_exprs(
         .iter()
         .map(|partitioned_by| {
             create_physical_expr(
-                &Expr::Column(Column::new_unqualified(
-                    match &partitioned_by.expression {
-                        Expr::Column(c) => c.name.clone(),
-                        other => other.to_string(),
-                    },
-                )),
+                &Expr::Column(Column::new_unqualified(match &partitioned_by.expression {
+                    Expr::Column(c) => c.name.clone(),
+                    other => other.to_string(),
+                })),
                 &input_dfschema,
                 &execution_props,
             )
@@ -470,4 +483,302 @@ fn downcast_to_cayenne(
     provider: &Arc<dyn datafusion::catalog::TableProvider>,
 ) -> Option<&CayenneTableProvider> {
     provider.as_any().downcast_ref::<CayenneTableProvider>()
+}
+
+// ============================================================================
+// Append-mode coordinator (issue #10125 §6.3 + step 6).
+//
+// Append cannot use the overwrite path's MetastoreTransaction batching
+// because append commits don't mutate the catalog at all — visibility is
+// filesystem state + the in-memory ListingTable. The cross-partition
+// guarantee is delivered by a *barrier*: every participating partition's
+// listing fence is held for write while file moves + ListingTable swaps
+// happen, so any reader going through `CayenneTableProvider::scan()`
+// resolves either before or after the whole barrier, never in the middle.
+//
+// Crash safety: the top-level `PartitionedWal` written at
+// `<table_root>/_partitioned_wal/<commit_id>.json` records every partition
+// participating in this barrier. If the writer crashes mid-barrier, the WAL
+// survives and the per-partition staging WALs that exist correspond to
+// partitions in the top-level WAL. Operator/recovery uses this to decide
+// whether to replay or roll back the set. Auto-recovery is a follow-up; the
+// MVP keeps the WAL as a diagnostic anchor + a clean removal on success.
+// ============================================================================
+
+/// `DataSink` that fans the input stream out by partition key, stages every
+/// partition's append, and commits all of them under one shared
+/// cross-partition barrier.
+///
+/// Streaming + backpressure work the same way as the overwrite sink (see
+/// [`CayennePartitionedOverwriteSink`]); only the commit-side differs.
+struct CayennePartitionedAppendSink {
+    coordinator_lock: Arc<tokio::sync::Mutex<()>>,
+    creator: Arc<dyn runtime_table_partition::creator::PartitionCreator>,
+    partitions: Arc<tokio::sync::RwLock<HashMap<CompositePartitionKey, Partition>>>,
+    schema: SchemaRef,
+    physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
+    table_root: PathBuf,
+}
+
+impl std::fmt::Debug for CayennePartitionedAppendSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayennePartitionedAppendSink")
+            .field("partition_exprs", &self.physical_exprs.len())
+            .field("table_root", &self.table_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for CayennePartitionedAppendSink {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CayennePartitionedAppendSink")
+    }
+}
+
+#[async_trait]
+impl DataSink for CayennePartitionedAppendSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> datafusion::common::Result<u64> {
+        let _coordinator_guard = self.coordinator_lock.lock().await;
+
+        // Phase 1: fan input out to per-partition writer tasks that each call
+        // begin_staged_append → prepare (writes the per-partition staging
+        // WAL). Same streaming + backpressure shape as the overwrite sink.
+        let mut senders: HashMap<String, mpsc::Sender<datafusion::common::Result<RecordBatch>>> =
+            HashMap::new();
+        let mut handles: Vec<JoinHandle<cayenne::provider::Result<PreparedStagedAppend>>> =
+            Vec::new();
+        let mut upstream_err: Option<DataFusionError> = None;
+
+        'outer: while let Some(batch_result) = data.next().await {
+            let batch = match batch_result {
+                Ok(batch) => batch,
+                Err(e) => {
+                    upstream_err = Some(e);
+                    break 'outer;
+                }
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let partitioned = partition_batch_composite(&batch, &self.physical_exprs)?;
+            for (key, (values, batch_part)) in partitioned {
+                let sender = if let Some(s) = senders.get(&key) {
+                    s.clone()
+                } else {
+                    let provider = self.get_or_create_partition_provider(values).await?;
+                    let cayenne = downcast_to_cayenne(&provider).ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "CayennePartitionedInsertStrategy expects every partition's table \
+                             provider to be a CayenneTableProvider"
+                                .to_string(),
+                        )
+                    })?;
+                    let cayenne_owned = cayenne.clone_for_write_operations();
+                    let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
+                        PARTITION_WRITER_CHANNEL_DEPTH,
+                    );
+                    let schema_clone = Arc::clone(&self.schema);
+                    let handle: JoinHandle<cayenne::provider::Result<PreparedStagedAppend>> =
+                        tokio::spawn(async move {
+                            let stream: SendableRecordBatchStream =
+                                Box::pin(RecordBatchStreamAdapter::new(
+                                    schema_clone,
+                                    ReceiverStream::new(rx),
+                                ));
+                            let staged = cayenne_owned.begin_staged_append(stream).await?;
+                            staged.prepare().await
+                        });
+                    senders.insert(key.clone(), tx.clone());
+                    handles.push(handle);
+                    tx
+                };
+
+                if sender.send(Ok(batch_part)).await.is_err() {
+                    upstream_err = Some(DataFusionError::Execution(
+                        "partition writer task terminated before stream end".to_string(),
+                    ));
+                    break 'outer;
+                }
+            }
+        }
+
+        if let Some(ref err) = upstream_err {
+            let err_msg = err.to_string();
+            for sender in senders.values() {
+                let _ = sender
+                    .send(Err(DataFusionError::Execution(format!(
+                        "upstream stream terminated with error: {err_msg}"
+                    ))))
+                    .await;
+            }
+        }
+        drop(senders);
+
+        // Join all writer tasks.
+        let mut prepared: Vec<PreparedStagedAppend> = Vec::with_capacity(handles.len());
+        let mut task_err: Option<DataFusionError> = None;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(prep)) => prepared.push(prep),
+                Ok(Err(e)) => {
+                    if task_err.is_none() {
+                        task_err = Some(DataFusionError::from(e));
+                    }
+                }
+                Err(panic_err) => {
+                    if task_err.is_none() {
+                        task_err = Some(DataFusionError::Execution(format!(
+                            "partition writer task panicked: {panic_err}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = upstream_err.or(task_err) {
+            for prep in prepared {
+                if let Err(rollback_err) = prep.rollback().await {
+                    tracing::warn!("rollback after stream/writer error failed: {rollback_err}");
+                }
+            }
+            return Err(err);
+        }
+
+        if prepared.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 2: cross-partition barrier.
+        //
+        // (a) Sort prepared by table_id so all coordinators acquire fences in
+        //     the same total order. (We already serialize coordinators via
+        //     coordinator_lock, but sorting keeps the invariant defensible if
+        //     the outer lock is ever relaxed.)
+        // (b) Acquire every participating partition's listing fence for write.
+        //     Held for the duration of the file-move + listing-swap loop.
+        // (c) Write the top-level partitioned WAL before any file move.
+        // (d) For each partition: move staged files into the snapshot dir,
+        //     remove the per-partition WAL, swap the in-memory ListingTable.
+        // (e) Remove the top-level WAL.
+        // (f) Drop fence guards.
+        prepared.sort_by(|a, b| a.table_id().cmp(b.table_id()));
+
+        let mut fence_guards: Vec<tokio::sync::OwnedRwLockWriteGuard<()>> =
+            Vec::with_capacity(prepared.len());
+        for p in &prepared {
+            fence_guards.push(p.lock_listing_fence_write_owned().await);
+        }
+
+        let commit_id = uuid::Uuid::now_v7().to_string();
+        let wal_entries: Vec<PartitionedWalEntry> = prepared
+            .iter()
+            .map(|p| PartitionedWalEntry {
+                table_id: p.table_id().to_string(),
+                staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
+            })
+            .collect();
+        let top_level_wal = PartitionedWal::new(
+            commit_id.clone(),
+            self.table_root.to_string_lossy().to_string(),
+            wal_entries,
+        );
+        if let Err(e) = top_level_wal.write_to(&self.table_root).await {
+            // Failed to even record the intent. Roll back every prepared
+            // append. Fences will be released when fence_guards drops.
+            drop(fence_guards);
+            for prep in prepared {
+                if let Err(rb) = prep.rollback().await {
+                    tracing::warn!("rollback after top-level WAL write failure: {rb}");
+                }
+            }
+            return Err(DataFusionError::from(e));
+        }
+
+        // Apply the barrier on every partition. If any fails partway, the
+        // top-level WAL stays on disk so the next process restart can
+        // recover the set; we surface the error and stop. We do NOT attempt
+        // automated mid-barrier rollback because already-applied partitions
+        // have moved their files and removed their per-partition WALs —
+        // reverting that without coordination is unsafe.
+        for p in &prepared {
+            if let Err(e) = p.apply_under_held_barrier().await {
+                drop(fence_guards);
+                return Err(DataFusionError::from(e));
+            }
+        }
+
+        // Success path: remove top-level WAL, then release the fences. The
+        // top-level WAL absence is what recovery uses to skip clean commits.
+        if let Err(e) = PartitionedWal::remove(&self.table_root, &commit_id).await {
+            // Visibility has already flipped on every partition; surface the
+            // cleanup failure as a warning rather than rolling back. The
+            // next coordinator's recovery sweep will treat the dangling WAL
+            // as a no-op if every partition's per-partition WAL is absent.
+            tracing::warn!(
+                "Failed to remove top-level partitioned WAL after successful barrier: {e}"
+            );
+        }
+
+        drop(fence_guards);
+
+        // Phase 3: per-partition finish (drops the per-partition write guard,
+        // returns row count).
+        let mut total_rows: u64 = 0;
+        for prep in prepared {
+            match prep.finish().await {
+                Ok(rows) => total_rows = total_rows.saturating_add(rows),
+                Err(e) => {
+                    tracing::warn!(
+                        "finish() for prepared append failed after barrier: {e}; \
+                         in-memory state will reconcile on next scan"
+                    );
+                }
+            }
+        }
+        Ok(total_rows)
+    }
+}
+
+impl CayennePartitionedAppendSink {
+    /// Identical to [`CayennePartitionedOverwriteSink::get_or_create_partition_provider`].
+    /// Duplicated here rather than abstracted so each sink remains
+    /// independently readable; if a third coordinator joins, lift into a
+    /// shared helper.
+    async fn get_or_create_partition_provider(
+        &self,
+        partition_values: Vec<datafusion::scalar::ScalarValue>,
+    ) -> Result<Arc<dyn datafusion::catalog::TableProvider>, DataFusionError> {
+        let partition_key = encode_composite_key(&partition_values).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
+        })?;
+
+        let mut partitions_lock = self.partitions.write().await;
+        if let Some(partition) = partitions_lock.get(&partition_key) {
+            return Ok(Arc::clone(&partition.table_provider));
+        }
+        let partition = self
+            .creator
+            .create_partition(partition_values)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let provider = Arc::clone(&partition.table_provider);
+        partitions_lock.insert(partition_key, partition);
+        Ok(provider)
+    }
 }

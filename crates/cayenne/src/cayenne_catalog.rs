@@ -3387,10 +3387,7 @@ mod tests {
     /// `commit_compaction`: snapshot pointer advances, delete files cleared.
     #[tokio::test]
     async fn test_commit_compaction_in_txn_single_partition_parity() {
-        let test_db = format!(
-            "sqlite://./.test_in_txn_parity_{}.db",
-            uuid::Uuid::now_v7()
-        );
+        let test_db = format!("sqlite://./.test_in_txn_parity_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 

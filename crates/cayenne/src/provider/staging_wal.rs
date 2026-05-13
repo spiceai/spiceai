@@ -267,13 +267,10 @@ impl PreparedStagedAppend {
     /// the data on disk and is self-healing on the next listing refresh
     /// trigger.
     ///
-    /// For single-partition use the listing-table write lock is acquired
-    /// internally by [`CayenneTableProvider::refresh_listing_table`]. The
-    /// cross-partition coordinator (future work for issue #10125) will hold
-    /// the listing-table write locks on every participating partition before
-    /// calling this method on each prepared receipt; that variant will be
-    /// added as a sibling method (`apply_under_held_barrier`) when the
-    /// coordinator lands.
+    /// Single-partition path. Acquires this partition's `listing_fence` for
+    /// write internally. The cross-partition append coordinator (#10125 step
+    /// 6) uses [`Self::apply_under_held_barrier`] instead so it can hold the
+    /// fences on every participating partition for one shared barrier window.
     ///
     /// # Errors
     ///
@@ -284,6 +281,50 @@ impl PreparedStagedAppend {
         self.table.remove_staging_wal().await?;
         self.table.refresh_listing_table().await?;
         Ok(())
+    }
+
+    /// Apply the staged write ASSUMING the caller already holds this
+    /// partition's `listing_fence` for write.
+    ///
+    /// Same observable effect as [`Self::apply_under_barrier`] but skips the
+    /// internal fence acquisition. Used by the cross-partition append
+    /// coordinator (#10125 step 6), which locks fences on every participating
+    /// partition (sorted to keep concurrent coordinators deadlock-free) for
+    /// the duration of one barrier window, calls this method on each, and
+    /// releases the fences together. Readers going through `scan()` either
+    /// see the pre-barrier state on every partition or the post-barrier
+    /// state on every partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if moving the staged files, removing the WAL, or
+    /// reconstructing the listing table fails.
+    pub async fn apply_under_held_barrier(&self) -> Result<()> {
+        self.table.move_files_to_current_snapshot().await?;
+        self.table.remove_staging_wal().await?;
+        self.table.refresh_listing_table_under_held_fence()?;
+        Ok(())
+    }
+
+    /// Returns the partition's catalog `table_id`. Used by the cross-partition
+    /// coordinator to populate the top-level WAL.
+    #[must_use]
+    pub fn table_id(&self) -> &str {
+        self.table.table_id()
+    }
+
+    /// Returns this partition's absolute staging-WAL path, used by the
+    /// cross-partition coordinator to record what the top-level WAL refers
+    /// to.
+    #[must_use]
+    pub fn staging_wal_path(&self) -> std::path::PathBuf {
+        self.table.staging_wal_path_for_recovery()
+    }
+
+    /// Acquire this partition's listing fence for write, returning an owned
+    /// guard the coordinator holds across the cross-partition barrier.
+    pub async fn lock_listing_fence_write_owned(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.table.lock_listing_fence_write_owned().await
     }
 
     /// Apply the staged write inside the caller's metastore transaction.
@@ -299,7 +340,14 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if the catalog mutation fails. The append-mode
     /// implementation never returns an error.
+    #[expect(
+        clippy::unused_async,
+        reason = "API symmetry / forward-compat — see body"
+    )]
     pub async fn apply_in_txn(&self, _txn: &mut dyn MetastoreTransaction) -> Result<()> {
+        // Async kept for API symmetry with `PreparedOverwrite::apply_in_txn`
+        // and for forward-compat: any future append-mode catalog mutation
+        // would live here and need `.await`.
         Ok(())
     }
 
@@ -316,7 +364,14 @@ impl PreparedStagedAppend {
     /// Currently infallible. Returns a `Result` for symmetry with future
     /// extensions (e.g. publishing per-partition statistics inside `finish`)
     /// and for forward-compatibility with the cross-partition coordinator.
+    #[expect(
+        clippy::unused_async,
+        reason = "API symmetry / forward-compat — see body"
+    )]
     pub async fn finish(self) -> Result<u64> {
+        // Async kept so a future cross-partition coordinator can call
+        // `prep.finish().await` uniformly without callers having to know
+        // whether finish is sync or async for this mode.
         let _ = self.write_guard;
         Ok(self.row_count)
     }

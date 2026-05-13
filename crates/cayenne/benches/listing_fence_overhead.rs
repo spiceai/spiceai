@@ -50,8 +50,7 @@ fn make_inner() -> Arc<Inner> {
 
 fn bench_uncontended_old_pattern(c: &mut Criterion) {
     let rt = Runtime::new().expect("runtime");
-    let lock: Arc<std::sync::RwLock<Arc<Inner>>> =
-        Arc::new(std::sync::RwLock::new(make_inner()));
+    let lock: Arc<std::sync::RwLock<Arc<Inner>>> = Arc::new(std::sync::RwLock::new(make_inner()));
 
     c.bench_function("uncontended/old_sync_rwlock_then_arc_clone", |b| {
         b.to_async(&rt).iter(|| async {
@@ -87,8 +86,7 @@ fn bench_uncontended_new_pattern(c: &mut Criterion) {
 
 fn bench_concurrent_readers_old_pattern(c: &mut Criterion) {
     let rt = Runtime::new().expect("runtime");
-    let lock: Arc<std::sync::RwLock<Arc<Inner>>> =
-        Arc::new(std::sync::RwLock::new(make_inner()));
+    let lock: Arc<std::sync::RwLock<Arc<Inner>>> = Arc::new(std::sync::RwLock::new(make_inner()));
 
     // Background reader that keeps a read guard outstanding most of the time.
     let bg_lock = Arc::clone(&lock);
