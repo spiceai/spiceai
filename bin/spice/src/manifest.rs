@@ -22,12 +22,15 @@ use spicepod::spec::SpicepodDefinition;
 use std::path::{Path, PathBuf};
 use yaml::{Mapping, Value};
 
+/// Canonical Spicepod manifest filename written by the CLI.
 pub const SPICEPOD_YAML: &str = "spicepod.yaml";
+/// Alternate Spicepod manifest filename accepted by CLI commands.
 pub const SPICEPOD_YML: &str = "spicepod.yml";
 
 const SPICEPOD_FILENAMES: [&str; 2] = [SPICEPOD_YAML, SPICEPOD_YML];
 const SCHEMA_DIRECTIVE: &str = "# yaml-language-server: $schema=https://raw.githubusercontent.com/spiceai/spiceai/trunk/.schema/spicepod.schema.json";
 
+/// Returns the first existing root Spicepod manifest path, preferring `spicepod.yaml` over `spicepod.yml`.
 #[must_use]
 pub fn existing_spicepod_path(base_dir: &Path) -> Option<PathBuf> {
     SPICEPOD_FILENAMES
@@ -36,16 +39,19 @@ pub fn existing_spicepod_path(base_dir: &Path) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+/// Returns the default manifest path for new Spice apps.
 #[must_use]
 pub fn default_spicepod_path(base_dir: &Path) -> PathBuf {
     base_dir.join(SPICEPOD_YAML)
 }
 
+/// Builds the default Spicepod YAML content for a new app.
 #[must_use]
 pub fn create_spicepod_yaml(name: &str) -> String {
     format!("{SCHEMA_DIRECTIVE}\nversion: v2\nkind: Spicepod\nname: {name}\n")
 }
 
+/// Reads a Spicepod manifest as YAML while validating it against `SpicepodDefinition`.
 pub fn read_spicepod_value(path: &Path) -> Result<Value> {
     let content = std::fs::read_to_string(path).context(ConfigIoSnafu {
         operation: "read",
@@ -61,6 +67,7 @@ pub fn read_spicepod_value(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
+/// Loads an existing root manifest, or returns a new default manifest value and path.
 pub fn load_or_create_spicepod_value(
     base_dir: &Path,
     name: &str,
@@ -79,6 +86,7 @@ pub fn load_or_create_spicepod_value(
     Ok((path, value, true))
 }
 
+/// Validates and writes a Spicepod manifest value to disk.
 pub fn write_spicepod_value(path: &Path, value: &Value) -> Result<()> {
     validate_spicepod_value(value, path)?;
 
@@ -90,6 +98,7 @@ pub fn write_spicepod_value(path: &Path, value: &Value) -> Result<()> {
     write_secure_file(path, updated_yaml.as_bytes())
 }
 
+/// Writes a file and restricts permissions to the owner on Unix platforms.
 pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::write(path, contents).context(ConfigIoSnafu {
         operation: "write",
@@ -109,6 +118,7 @@ pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Ensures a YAML sequence field contains a string item, returning whether it changed the value.
 pub fn ensure_string_sequence_item(value: &mut Value, field: &str, item: &str) -> Result<bool> {
     let sequence = ensure_sequence_field(value, field)?;
 
@@ -123,6 +133,7 @@ pub fn ensure_string_sequence_item(value: &mut Value, field: &str, item: &str) -
     Ok(true)
 }
 
+/// Ensures a component reference sequence contains a `ref` entry, returning whether it changed the value.
 pub fn ensure_component_reference(value: &mut Value, field: &str, reference: &str) -> Result<bool> {
     let sequence = ensure_sequence_field(value, field)?;
 
@@ -144,12 +155,14 @@ pub fn ensure_component_reference(value: &mut Value, field: &str, reference: &st
     Ok(true)
 }
 
+/// Formats a path as a portable Spicepod reference using `/` separators.
 #[must_use]
 pub fn path_to_spicepod_ref(path: &Path) -> String {
     path.to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
+/// Returns a mutable YAML sequence field, creating an empty sequence when the field is absent.
 fn ensure_sequence_field<'value>(
     value: &'value mut Value,
     field: &str,
@@ -172,6 +185,7 @@ fn ensure_sequence_field<'value>(
         })
 }
 
+/// Validates that a YAML value can deserialize as a Spicepod definition.
 fn validate_spicepod_value(value: &Value, path: &Path) -> Result<()> {
     yaml::from_value::<SpicepodDefinition>(value.clone()).map_err(|source| {
         crate::error::Error::ConfigParse {

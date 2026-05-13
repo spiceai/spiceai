@@ -63,15 +63,11 @@ impl LocalFileRegistry {
             });
         }
 
-        // Get absolute path
-        let source_path = if source_path.is_absolute() {
-            source_path.to_path_buf()
-        } else {
-            std::fs::canonicalize(source_path).context(IoSnafu {
-                operation: "canonicalize",
-                path: pod_path,
-            })?
-        };
+        // Get canonical path for safe source/destination comparisons.
+        let source_path = std::fs::canonicalize(source_path).context(IoSnafu {
+            operation: "canonicalize",
+            path: path_str,
+        })?;
 
         // Get pod name from directory name
         let pod_name = source_path
@@ -87,6 +83,25 @@ impl LocalFileRegistry {
 
         let destination_dir = pods_dir.join(&pod_name);
 
+        std::fs::create_dir_all(pods_dir).context(IoSnafu {
+            operation: "create directory",
+            path: pods_dir.display().to_string(),
+        })?;
+        let canonical_pods_dir = std::fs::canonicalize(pods_dir).context(IoSnafu {
+            operation: "canonicalize",
+            path: pods_dir.display().to_string(),
+        })?;
+        let canonical_destination_dir = canonical_pods_dir.join(&pod_name);
+
+        if source_path != canonical_destination_dir
+            && canonical_destination_dir.starts_with(&source_path)
+        {
+            return Err(Error::NestedLocalInstall {
+                source_path: source_path.display().to_string(),
+                destination_path: destination_dir.display().to_string(),
+            });
+        }
+
         // Create destination directory
         std::fs::create_dir_all(&destination_dir).context(IoSnafu {
             operation: "create directory",
@@ -94,7 +109,7 @@ impl LocalFileRegistry {
         })?;
 
         // Copy all files from source to the installed dependency directory.
-        if source_path != destination_dir {
+        if source_path != canonical_destination_dir {
             copy_dir_recursive(&source_path, &destination_dir)?;
         }
 
@@ -237,6 +252,38 @@ mod tests {
         assert!(
             pods_dir.join("namedpod").join("spicepod.yaml").exists(),
             "pod-named yml manifest should be normalized to spicepod.yaml"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_copying_source_into_nested_destination() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let source_dir = temp_dir.path().join("app");
+        let pods_dir = source_dir.join("spicepods");
+        std::fs::create_dir_all(&source_dir).expect("source directory should be created");
+        std::fs::write(
+            source_dir.join("spicepod.yaml"),
+            "version: v2\nkind: Spicepod\nname: app\n",
+        )
+        .expect("spicepod.yaml should be written");
+
+        let error = LocalFileRegistry
+            .get_pod(
+                source_dir.to_str().expect("source path should be utf-8"),
+                &pods_dir,
+                &HashMap::new(),
+                &reqwest::Client::new(),
+            )
+            .await
+            .expect_err("nested destination should be rejected");
+
+        assert!(
+            matches!(error, Error::NestedLocalInstall { .. }),
+            "expected nested local install error"
+        );
+        assert!(
+            !pods_dir.join("app").exists(),
+            "destination directory should not be created"
         );
     }
 }

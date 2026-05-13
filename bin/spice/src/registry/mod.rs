@@ -47,9 +47,18 @@ pub enum Error {
 
     /// Not a valid Spicepod directory
     #[snafu(display(
-        "The directory '{path}' does not contain a spicepod.yaml or spicepod.yml. Is it a valid Spicepod?"
+        "The directory '{path}' does not contain a Spicepod manifest. Expected one of spicepod.yaml, spicepod.yml, <directory-name>.yaml, <directory-name>.yml, or lowercase directory-name variants."
     ))]
     InvalidSpicepod { path: String },
+
+    /// Local Spicepod install would recursively copy its destination
+    #[snafu(display(
+        "Failed to install local Spicepod from '{source_path}' into '{destination_path}': destination is inside the source directory"
+    ))]
+    NestedLocalInstall {
+        source_path: String,
+        destination_path: String,
+    },
 
     /// IO error during registry operations
     #[snafu(display("Failed to {operation} '{path}': {source}"))]
