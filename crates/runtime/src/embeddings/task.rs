@@ -192,6 +192,33 @@ impl Embed for TaskEmbed {
         handle_metrics(start.elapsed(), result.is_err(), &metric_labels);
         result
     }
+
+    fn cache(
+        &self,
+    ) -> Option<
+        std::sync::Arc<
+            dyn cache::CacheProvider<cache::result::embeddings::CachedEmbeddingResult>
+                + Send
+                + Sync,
+        >,
+    > {
+        self.inner.cache()
+    }
+
+    async fn get_cached_embed(
+        &self,
+        key: CacheKey<'_>,
+    ) -> Option<cache::result::embeddings::CachedEmbeddingResult> {
+        self.inner.get_cached_embed(key).await
+    }
+
+    async fn put_cached_embed(
+        &self,
+        key: CacheKey<'_>,
+        value: cache::result::embeddings::CachedEmbeddingResult,
+    ) {
+        self.inner.put_cached_embed(key, value).await;
+    }
 }
 
 fn add_request_labels_to_span(req: &CreateEmbeddingRequest, span: &Span) {

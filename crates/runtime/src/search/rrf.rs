@@ -1229,6 +1229,73 @@ impl TableProvider for ReciprocalRankFusion {
 
         df.limit(0, limit)?.create_physical_plan().await
     }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        None
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        None
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        None
+    }
+
+    fn get_column_default(&self, _column: &str) -> Option<&datafusion::prelude::Expr> {
+        None
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> Result<datafusion::catalog::ScanResult> {
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let limit = args.limit();
+        let plan = self.scan(state, projection.as_ref(), filters, limit).await?;
+        Ok(datafusion::catalog::ScanResult::new(plan))
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        None
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        not_impl_err!("ReciprocalRankFusion does not support insert_into")
+    }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _filters: Vec<datafusion::prelude::Expr>,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        not_impl_err!("ReciprocalRankFusion does not support delete_from")
+    }
+
+    async fn update(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _assignments: Vec<(String, datafusion::prelude::Expr)>,
+        _filters: Vec<datafusion::prelude::Expr>,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        not_impl_err!("ReciprocalRankFusion does not support update")
+    }
+
+    async fn truncate(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        not_impl_err!("ReciprocalRankFusion does not support truncate")
+    }
 }
 
 #[cfg(test)]

@@ -307,6 +307,48 @@ impl TableProvider for LocationPruningListingTable {
             .create_physical_plan(state, config)
             .await
     }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(
+        &self,
+        column: &str,
+    ) -> Option<&datafusion_expr::Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> datafusion::error::Result<datafusion::catalog::ScanResult> {
+        self.inner.scan_with_args(state, args).await
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.insert_into(state, input, insert_op).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.delete_from(state, filters).await
+    }
 }
 
 /// Extracts literal locations from `location = 'literal'` and `location IN (...)`

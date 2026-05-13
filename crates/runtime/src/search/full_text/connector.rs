@@ -196,4 +196,11 @@ impl DataConnector for FullTextConnector {
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| inner.append_stream(ft))
     }
+
+    fn initialization_for_dataset(
+        &self,
+        dataset: &crate::component::dataset::Dataset,
+    ) -> crate::component::ComponentInitialization {
+        self.inner_connector.initialization_for_dataset(dataset)
+    }
 }

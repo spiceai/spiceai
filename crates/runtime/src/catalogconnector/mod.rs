@@ -434,6 +434,22 @@ impl CatalogProvider for RefreshingCatalogProvider {
     fn schema(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::SchemaProvider>> {
         self.inner.schema(name)
     }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn datafusion::catalog::SchemaProvider>,
+    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
+        self.inner.register_schema(name, schema)
+    }
+
+    fn deregister_schema(
+        &self,
+        name: &str,
+        cascade: bool,
+    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
+        self.inner.deregister_schema(name, cascade)
+    }
 }
 
 impl Drop for RefreshingCatalogProvider {

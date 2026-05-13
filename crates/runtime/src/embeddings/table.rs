@@ -1010,6 +1010,18 @@ impl TableProvider for EmbeddingTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.update(state, assignments, filters).await
     }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        self.base_table.scan_with_args(state, args).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.base_table.truncate(state).await
+    }
 }
 
 #[cfg(test)]

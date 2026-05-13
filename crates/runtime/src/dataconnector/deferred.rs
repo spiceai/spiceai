@@ -66,6 +66,13 @@ impl DataConnector for DeferredConnector {
         Ok(Arc::new(self.clone()))
     }
 
+    async fn read_write_provider(
+        &self,
+        _dataset: &Dataset,
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        None
+    }
+
     async fn register_object_stores(
         &self,
         dataset: &Dataset,
@@ -76,7 +83,75 @@ impl DataConnector for DeferredConnector {
             .await
     }
 
+    fn resolve_refresh_mode(
+        &self,
+        refresh_mode: Option<crate::component::dataset::acceleration::RefreshMode>,
+    ) -> crate::component::dataset::acceleration::RefreshMode {
+        self.inner.resolve_refresh_mode(refresh_mode)
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        false
+    }
+
+    fn changes_stream(
+        &self,
+        _federated_table: Arc<crate::federated_table::FederatedTable>,
+        _dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
+    ) -> Option<data_components::cdc::ChangesStream> {
+        None
+    }
+
+    fn supports_append_stream(&self) -> bool {
+        false
+    }
+
+    fn append_stream(
+        &self,
+        _federated_table: Arc<crate::federated_table::FederatedTable>,
+    ) -> Option<data_components::cdc::ChangesStream> {
+        None
+    }
+
+    async fn metadata_provider(
+        &self,
+        _dataset: &Dataset,
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        None
+    }
+
+    async fn on_accelerator_setup(
+        &self,
+        dataset: &Dataset,
+        builder: &mut crate::accelerated_table::Builder,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.on_accelerator_setup(dataset, builder).await
+    }
+
+    async fn on_accelerated_table_registration(
+        &self,
+        dataset: &Dataset,
+        accelerated_table: &mut crate::accelerated_table::AcceleratedTable,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner
+            .on_accelerated_table_registration(dataset, accelerated_table)
+            .await
+    }
+
+    fn metrics_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::component::metrics::MetricsProvider>> {
+        self.inner.metrics_provider()
+    }
+
     fn initialization(&self) -> ComponentInitialization {
+        ComponentInitialization::OnTrigger
+    }
+
+    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
         ComponentInitialization::OnTrigger
     }
 }

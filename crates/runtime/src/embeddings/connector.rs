@@ -463,6 +463,20 @@ impl DataConnector for EmbeddingConnector {
 
         Some(stream)
     }
+
+    fn resolve_refresh_mode(
+        &self,
+        refresh_mode: Option<crate::component::dataset::acceleration::RefreshMode>,
+    ) -> crate::component::dataset::acceleration::RefreshMode {
+        self.inner_connector.resolve_refresh_mode(refresh_mode)
+    }
+
+    fn initialization_for_dataset(
+        &self,
+        dataset: &crate::component::dataset::Dataset,
+    ) -> crate::component::ComponentInitialization {
+        self.inner_connector.initialization_for_dataset(dataset)
+    }
 }
 
 #[cfg(feature = "duckdb")]
