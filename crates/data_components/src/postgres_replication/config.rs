@@ -42,6 +42,8 @@ pub struct ReplicationParams {
     pub initial_snapshot: bool,
     pub temporary_slot: bool,
     pub status_interval: Duration,
+    /// Rows per emitted snapshot batch during initial bootstrap.
+    pub bootstrap_batch_size: usize,
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -58,6 +60,7 @@ impl std::fmt::Debug for ReplicationParams {
             .field("initial_snapshot", &self.initial_snapshot)
             .field("temporary_slot", &self.temporary_slot)
             .field("status_interval", &self.status_interval)
+            .field("bootstrap_batch_size", &self.bootstrap_batch_size)
             .finish_non_exhaustive()
     }
 }

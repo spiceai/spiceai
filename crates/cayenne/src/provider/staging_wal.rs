@@ -218,10 +218,21 @@ impl CayenneTableProvider {
             });
         }
 
-        let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
-            self.prepare_stream_for_insert(data).await?;
+        let (
+            prepared_stream,
+            delete_specs,
+            deleted_pk_i64,
+            deleted_row_keys,
+            deleted_inlined_pk_i64,
+            deleted_inlined_row_keys,
+        ) = self.prepare_stream_for_insert(data).await?;
 
-        if !delete_specs.is_empty() || !deleted_pk_i64.is_empty() || !deleted_row_keys.is_empty() {
+        if !delete_specs.is_empty()
+            || !deleted_pk_i64.is_empty()
+            || !deleted_row_keys.is_empty()
+            || !deleted_inlined_pk_i64.is_empty()
+            || !deleted_inlined_row_keys.is_empty()
+        {
             return Err(Error::Unsupported {
                 operation: "staged append for Cayenne upsert or on-conflict writes",
             });
