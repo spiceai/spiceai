@@ -1,0 +1,110 @@
+name: HTAP(CH-benCHmark) tests
+run-name: htap - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with (relative to test/spicepods/chbench/sf{scale_factor}/)'
+        required: true
+        type: string
+      scale_factor:
+        description: 'Scale factor (warehouses). Terminals = scale_factor * 10.'
+        required: false
+        type: string
+        default: '1'
+      duration:
+        description: 'Duration of the HTAP workload in seconds'
+        required: false
+        type: string
+        default: '300'
+      ready_wait:
+        description: 'How long (in seconds) to wait for spiced to start'
+        required: true
+        default: '60'
+        type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-dev-runners'
+        type: choice
+        options:
+          - 'spiceai-dev-runners'
+          - 'spiceai-dev-large-runners'
+jobs:
+  run-htap:
+    name: Run HTAP(CH-benCHmark)
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          SPICEPOD_PATH="./test/spicepods/chbench/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+
+      - name: Start PostgreSQL for CH-benCH
+        run: |
+          docker run -d --name chbench-pg \
+            -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=chbench \
+            -p 5432:5432 postgres:16 \
+            -c wal_level=logical \
+            -c max_replication_slots=20 \
+            -c max_wal_senders=20
+
+      - name: Wait for CH-benCH PostgreSQL
+        run: |
+          for _ in {1..30}; do
+            if docker exec chbench-pg pg_isready -U bench > /dev/null 2>&1; then
+              echo "PostgreSQL is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready in time."
+          docker logs chbench-pg
+          exit 1
+
+      - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
+        run: |
+          testoperator run htap \
+            -s /usr/local/bin/spiced \
+            -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
+            --query-set chbench \
+            --scale-factor ${{ github.event.inputs.scale_factor }} \
+            --duration ${{ github.event.inputs.duration }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --disable-progress-bars \
+            --metrics
+        env:
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
