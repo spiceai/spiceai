@@ -118,7 +118,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     };
 
     // 3b. Start staleness probe alongside the OLTP workload.
-    let staleness_spice_client = spiced_instance.spice_client(None, false).await?;
+    // Disable caching so MAX(_bench_ts) always reflects the latest replicated data.
+    let staleness_spice_client = spiced_instance.spice_client(None, true).await?;
     let staleness_handle = staleness::spawn_staleness_probe(
         Arc::clone(&driver),
         staleness_spice_client,
@@ -168,7 +169,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let mut spiced_instance = test.end()?;
     let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
 
-    // 6. Report analytical query metrics.
+    // 7. Report analytical query metrics.
     let mut failures: Vec<String> = Vec::new();
     for query in &metrics.metrics {
         let query_name = &query.query_name;
@@ -206,7 +207,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     println!("\n=== Analytical Queries ===");
     print_batches(&records)?;
 
-    // 7. Report OLTP results.
+    // 8. Report OLTP results.
     println!("\n=== TPC-C OLTP ===");
     match oltp_result {
         Ok(Ok(report)) => {
@@ -220,7 +221,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
-    // 8. Report data freshness and replication metrics.
+    // 9. Report data freshness and replication metrics.
     match staleness_result {
         Ok(Ok(report)) => {
             report.emit();

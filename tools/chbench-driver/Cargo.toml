@@ -9,7 +9,7 @@ license-file.workspace = true
 async-trait = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
-snafu = "0.8"
+snafu = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tokio-postgres = { workspace = true }
 tokio-util = { workspace = true }

@@ -2,12 +2,6 @@ version: v1
 kind: Spicepod
 name: postgres-cayenne[file]
 
-runtime:
-  caching:
-    sql_results:
-      enabled: false
-
-
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
 

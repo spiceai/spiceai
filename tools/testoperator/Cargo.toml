@@ -32,7 +32,6 @@ spicepod = { path = "../../crates/spicepod" }
 test-framework = { path = "../../crates/test-framework" }
 rand.workspace = true
 tokio.workspace = true
-tokio-postgres = { workspace = true }
 tokio-util.workspace = true
 
 [features]

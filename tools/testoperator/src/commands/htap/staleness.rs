@@ -221,14 +221,20 @@ fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -
 
         gaps.sort_unstable();
         let n = gaps.len();
-        let p50 = Duration::from_micros(gaps[n / 2].cast_unsigned());
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let p99_idx = (n as f64 * 0.99).ceil() as usize;
-        let p99 = Duration::from_micros(gaps[p99_idx.min(n - 1)].cast_unsigned());
+
+        // Use the same nearest-rank percentile formula as `QueryLiveness::percentile`.
+        let pct = |p: f64| -> usize {
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let idx = (p * (n - 1) as f64).round() as usize;
+            idx.min(n - 1)
+        };
+
+        let p50 = Duration::from_micros(gaps[pct(0.50)].cast_unsigned());
+        let p99 = Duration::from_micros(gaps[pct(0.99)].cast_unsigned());
         let max = Duration::from_micros(gaps[n - 1].cast_unsigned());
 
         if p99 > worst_p99 {

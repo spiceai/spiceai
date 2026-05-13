@@ -33,7 +33,7 @@ pub use txn::TxnType;
 use ::rand::SeedableRng;
 use ::rand::rngs::StdRng;
 use async_trait::async_trait;
-use snafu::Snafu;
+use snafu::{Snafu, ensure};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Snafu)]
@@ -43,6 +43,11 @@ pub enum Error {
         action: String,
         source: tokio_postgres::Error,
     },
+
+    #[snafu(display(
+        "{failed}/{total} OLTP terminal(s) failed — benchmark results are unreliable"
+    ))]
+    OltpTerminalFailures { failed: usize, total: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -163,6 +168,7 @@ impl ChBenchDriver for PostgresChBenchDriver {
 
         // Collect results from all terminals
         let mut combined = metrics::OltpMetrics::new();
+        let mut failed_terminals: usize = 0;
         for handle in handles {
             match handle.await {
                 Ok(Ok(terminal_metrics)) => {
@@ -170,12 +176,22 @@ impl ChBenchDriver for PostgresChBenchDriver {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Terminal error: {e}");
+                    failed_terminals += 1;
                 }
                 Err(e) => {
                     eprintln!("Terminal join error: {e}");
+                    failed_terminals += 1;
                 }
             }
         }
+
+        ensure!(
+            failed_terminals == 0,
+            OltpTerminalFailuresSnafu {
+                failed: failed_terminals,
+                total: terminals,
+            }
+        );
 
         let report = combined.finish();
         Ok(report)

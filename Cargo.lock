@@ -18983,7 +18983,6 @@ dependencies = [
  "spicepod",
  "test-framework",
  "tokio",
- "tokio-postgres",
  "tokio-util",
  "yaml",
 ]
