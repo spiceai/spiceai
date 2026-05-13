@@ -1,0 +1,8 @@
+tests:
+  bench:
+    spicepod_path: accelerated/s3[parquet]-duckdb[file].yaml
+    query_set: tpcds
+    query_overrides: duckdb
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 6000
+    scale_factor: 100
