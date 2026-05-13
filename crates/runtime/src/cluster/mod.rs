@@ -30,7 +30,7 @@ use crate::{
 };
 use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
-use ::datafusion::sql::TableReference;
+use ::datafusion::sql::ResolvedTableReference;
 use app::App;
 use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
@@ -112,7 +112,7 @@ pub enum DistributedNode {
         ///
         /// This is populated during startup when the executor registers with the scheduler.
         /// It contains the list of partition filters (expressions) that this executor is responsible for.
-        partition_assignments: Arc<RwLock<HashMap<TableReference, Vec<Expr>>>>,
+        partition_assignments: Arc<RwLock<HashMap<ResolvedTableReference, Vec<Expr>>>>,
     },
 }
 
@@ -1253,6 +1253,14 @@ pub async fn initialize_cluster_executor(
         });
     };
 
+    let executor_target_partitions = app_def
+        .runtime
+        .query
+        .as_ref()
+        .and_then(|query| query.target_partitions)
+        .filter(|target_partitions| *target_partitions > 0)
+        .unwrap_or(concurrent_tasks as usize);
+
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service - use advertise address for scheduler to contact this executor
@@ -1275,6 +1283,7 @@ pub async fn initialize_cluster_executor(
     let config_producer_node_id = metrics_node_id.clone();
     let config_producer: ConfigProducer = Arc::new(move || {
         let mut config = SessionConfig::new_with_ballista()
+            .with_target_partitions(executor_target_partitions)
             .with_option_extension(SpiceClusterConfig::default())
             .with_ballista_use_tls(tls_enabled)
             // Use 100MB max message size to match other gRPC configurations in the codebase.

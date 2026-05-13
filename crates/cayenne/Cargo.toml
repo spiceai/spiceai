@@ -92,3 +92,7 @@ name = "deletion_strategies"
 [[bench]]
 harness = false
 name = "deletion_index_probe"
+
+[[bench]]
+harness = false
+name = "mutation_writer"

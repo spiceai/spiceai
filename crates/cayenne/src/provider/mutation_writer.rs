@@ -1,0 +1,533 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::sync::Arc;
+
+use arrow::array::RecordBatch;
+use arrow_schema::SchemaRef;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::TaskContext;
+use datafusion_physical_plan::{SendableRecordBatchStream, execute_stream};
+use futures::StreamExt;
+
+use super::Result;
+use super::constants::STAGING_DIR_NAME;
+use super::context::CayenneContext;
+use super::table::{
+    CayenneTableProvider, ColumnStatsAccumulator, INLINE_MAX_BUFFER_BYTES, INLINE_MAX_ROWS,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InlineMutationPolicy {
+    pub(crate) pending_pk_deletions: bool,
+    pub(crate) file_on_conflict_deletions: bool,
+    pub(crate) has_sort_columns: bool,
+    pub(crate) is_partitioned: bool,
+    pub(crate) has_retention_filters: bool,
+}
+
+impl InlineMutationPolicy {
+    #[must_use]
+    pub(crate) fn can_inline(self) -> bool {
+        !self.pending_pk_deletions
+            && !self.file_on_conflict_deletions
+            && !self.has_sort_columns
+            && !self.is_partitioned
+            && !self.has_retention_filters
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InlineBatchBuffer {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    total_rows: usize,
+    total_bytes: usize,
+    exceeded: bool,
+}
+
+impl InlineBatchBuffer {
+    #[must_use]
+    pub(crate) fn new(schema: SchemaRef) -> Self {
+        Self {
+            schema,
+            batches: Vec::new(),
+            total_rows: 0,
+            total_bytes: 0,
+            exceeded: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, batch: RecordBatch) {
+        self.total_rows = self.total_rows.saturating_add(batch.num_rows());
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(batch.get_array_memory_size());
+        self.batches.push(batch);
+        self.exceeded =
+            self.total_rows > INLINE_MAX_ROWS || self.total_bytes > INLINE_MAX_BUFFER_BYTES;
+    }
+
+    #[must_use]
+    pub(crate) fn should_continue_buffering(&self) -> bool {
+        !self.exceeded
+    }
+
+    #[must_use]
+    pub(crate) fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    #[must_use]
+    pub(crate) fn batches(&self) -> &[RecordBatch] {
+        &self.batches
+    }
+
+    pub(crate) fn into_chained_stream(
+        self,
+        remaining_stream: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let buffered_exec =
+            MemorySourceConfig::try_new_exec(&[self.batches], Arc::clone(&self.schema), None)?;
+        let buffered_stream = execute_stream(buffered_exec, Arc::clone(context))?;
+        let chained_stream = Box::pin(StreamExt::chain(buffered_stream, remaining_stream));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema,
+            chained_stream,
+        )))
+    }
+}
+
+enum InlineMutationOutcome {
+    Inlined(u64),
+    Fallback(SendableRecordBatchStream),
+}
+
+pub(super) struct AppendMutationWriter<'a> {
+    table: &'a CayenneTableProvider,
+    context: &'a Arc<CayenneContext>,
+    task_context: &'a Arc<TaskContext>,
+}
+
+impl<'a> AppendMutationWriter<'a> {
+    #[must_use]
+    pub(super) fn new(
+        table: &'a CayenneTableProvider,
+        context: &'a Arc<CayenneContext>,
+        task_context: &'a Arc<TaskContext>,
+    ) -> Self {
+        Self {
+            table,
+            context,
+            task_context,
+        }
+    }
+
+    pub(super) async fn write(&self, data: SendableRecordBatchStream) -> Result<u64> {
+        self.table.ensure_no_incomplete_write().await?;
+
+        let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
+            && self.table.has_pending_deletions();
+
+        if pending_pk_deletions {
+            tracing::debug!(
+                "Table {} has pending PK-based deletions, will write to new snapshot",
+                self.table.table_name()
+            );
+        }
+
+        let (
+            mut prepared_stream,
+            delete_specs,
+            deleted_pk_i64,
+            deleted_row_keys,
+            deleted_inlined_pk_i64,
+            deleted_inlined_row_keys,
+        ) = self.table.prepare_stream_for_insert(data).await?;
+
+        let has_file_on_conflict_deletions = !delete_specs.is_empty();
+        let has_inlined_on_conflict_deletions =
+            !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty();
+        let has_on_conflict_deletions =
+            has_file_on_conflict_deletions || has_inlined_on_conflict_deletions;
+
+        tracing::debug!(
+            "write_all_append: delete_specs={} files, deleted_pk_i64={} keys, pending_deletions={}, on_conflict_deletions={}",
+            delete_specs.len(),
+            deleted_pk_i64.len() + deleted_inlined_pk_i64.len(),
+            pending_pk_deletions,
+            has_on_conflict_deletions
+        );
+
+        let needs_new_snapshot = pending_pk_deletions || has_file_on_conflict_deletions;
+
+        self.table.clear_staging_dir().await?;
+
+        let inline_policy = InlineMutationPolicy {
+            pending_pk_deletions,
+            file_on_conflict_deletions: has_file_on_conflict_deletions,
+            has_sort_columns: self.context.has_sort_columns(),
+            is_partitioned: self.table.metadata().partition_column.is_some(),
+            has_retention_filters: self.table.has_retention_filters(),
+        };
+
+        if inline_policy.can_inline() {
+            match self
+                .try_inline_or_restream(
+                    prepared_stream,
+                    &deleted_inlined_pk_i64,
+                    &deleted_inlined_row_keys,
+                )
+                .await?
+            {
+                InlineMutationOutcome::Inlined(rows) => return Ok(rows),
+                InlineMutationOutcome::Fallback(re_stream) => {
+                    prepared_stream = re_stream;
+                    let target_size_bytes = self.context.target_file_size_bytes();
+                    let (rows, _writer_ops, stats_acc) = self
+                        .write_staged_append(prepared_stream, target_size_bytes)
+                        .await?;
+
+                    self.table
+                        .apply_on_conflict_deletions(
+                            delete_specs,
+                            deleted_pk_i64,
+                            deleted_row_keys,
+                            deleted_inlined_pk_i64,
+                            deleted_inlined_row_keys,
+                        )
+                        .await?;
+
+                    let retention_deleted_rows = self.apply_retention_if_configured().await?;
+                    let sorted = self.sort_if_configured().await?;
+                    if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted)
+                    {
+                        self.table.refresh_listing_table()?;
+                    }
+                    self.table.persist_table_stats(&stats_acc).await;
+
+                    return Ok(rows);
+                }
+            }
+        }
+
+        let (total_rows, write_stats_acc) = if needs_new_snapshot {
+            self.table
+                .apply_on_conflict_deletions(
+                    delete_specs,
+                    deleted_pk_i64,
+                    deleted_row_keys,
+                    deleted_inlined_pk_i64,
+                    deleted_inlined_row_keys,
+                )
+                .await?;
+
+            let new_sequence = self
+                .table
+                .catalog()
+                .increment_sequence_number(self.table.table_id())
+                .await?;
+
+            self.table
+                .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
+                .await?
+        } else {
+            let target_size_bytes = self.context.target_file_size_bytes();
+            let (rows, writer_ops, stats_acc) = self
+                .write_staged_append(prepared_stream, target_size_bytes)
+                .await?;
+
+            tracing::debug!(
+                "Insert completed, wrote {} rows to Vortex in {} writer operation(s)",
+                rows,
+                writer_ops
+            );
+
+            self.table
+                .apply_on_conflict_deletions(
+                    delete_specs,
+                    deleted_pk_i64,
+                    deleted_row_keys,
+                    deleted_inlined_pk_i64,
+                    deleted_inlined_row_keys,
+                )
+                .await?;
+
+            (rows, stats_acc)
+        };
+
+        if needs_new_snapshot {
+            self.table.refresh_listing_table()?;
+        }
+
+        let retention_deleted_rows = self.apply_retention_if_configured().await?;
+        let sorted = self.sort_if_configured().await?;
+
+        if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted) {
+            self.table.refresh_listing_table()?;
+        }
+
+        self.table.persist_table_stats(&write_stats_acc).await;
+
+        Ok(total_rows)
+    }
+
+    async fn try_inline_or_restream(
+        &self,
+        mut prepared_stream: SendableRecordBatchStream,
+        deleted_inlined_pk_i64: &[i64],
+        deleted_inlined_row_keys: &[Box<[u8]>],
+    ) -> Result<InlineMutationOutcome> {
+        let schema = prepared_stream.schema();
+        let mut buffer = InlineBatchBuffer::new(Arc::clone(&schema));
+
+        while let Some(batch) = StreamExt::next(&mut prepared_stream).await {
+            buffer.push(batch?);
+            if !buffer.should_continue_buffering() {
+                break;
+            }
+        }
+
+        if buffer.should_continue_buffering() && buffer.total_rows() == 0 {
+            return Ok(InlineMutationOutcome::Inlined(0));
+        }
+
+        if buffer.should_continue_buffering()
+            && self
+                .table
+                .try_inline_batches_with_inlined_deletions(
+                    buffer.batches(),
+                    deleted_inlined_pk_i64,
+                    deleted_inlined_row_keys,
+                )
+                .await?
+        {
+            let stats_acc = ColumnStatsAccumulator::new(&schema);
+            for batch in buffer.batches() {
+                stats_acc.update(batch);
+            }
+
+            self.table.persist_table_stats(&stats_acc).await;
+
+            let inlined_count = self.table.cached_inlined_row_count();
+            if inlined_count >= 10_000
+                && let Err(e) = self.table.checkpoint_inlined_data().await
+            {
+                tracing::warn!(
+                    "Auto-checkpoint of inlined data failed for {}: {e}",
+                    self.table.table_name(),
+                );
+            }
+
+            return Ok(InlineMutationOutcome::Inlined(
+                u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
+            ));
+        }
+
+        let re_stream = buffer.into_chained_stream(prepared_stream, self.task_context)?;
+        Ok(InlineMutationOutcome::Fallback(re_stream))
+    }
+
+    async fn write_staged_append(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+        let result = match self
+            .table
+            .write_to_snapshot(stream, target_size_bytes, STAGING_DIR_NAME)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                if let Err(cleanup_err) = self.table.clear_staging_dir().await {
+                    tracing::warn!(
+                        "Failed to clean staging dir after write error for table {}: {cleanup_err}",
+                        self.table.table_name(),
+                    );
+                }
+                return Err(e);
+            }
+        };
+
+        let staged_append = self.table.staged_append_for_existing_staging();
+        staged_append.finalize_staged_write().await?;
+
+        Ok(result)
+    }
+
+    async fn apply_retention_if_configured(&self) -> Result<u64> {
+        if !self.table.has_retention_filters() {
+            return Ok(0);
+        }
+
+        let deleted = self.table.apply_retention_filters().await?;
+        if deleted > 0 {
+            tracing::info!(
+                "Retention filters deleted {} row(s) for table {}",
+                deleted,
+                self.table.table_name()
+            );
+        } else {
+            tracing::debug!(
+                "Retention filters found no rows to delete for table {}",
+                self.table.table_name()
+            );
+        }
+        Ok(deleted)
+    }
+
+    async fn sort_if_configured(&self) -> Result<bool> {
+        if !self.context.has_sort_columns() {
+            return Ok(false);
+        }
+
+        let target_size_bytes = self.context.target_file_size_bytes();
+        self.table.sort_and_rewrite_data(target_size_bytes).await?;
+        Ok(true)
+    }
+}
+
+fn should_refresh_listing_table_after_post_write(
+    retention_deleted_rows: u64,
+    sorted: bool,
+) -> bool {
+    retention_deleted_rows > 0 || sorted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{BinaryArray, Int64Array};
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn base_policy() -> InlineMutationPolicy {
+        InlineMutationPolicy {
+            pending_pk_deletions: false,
+            file_on_conflict_deletions: false,
+            has_sort_columns: false,
+            is_partitioned: false,
+            has_retention_filters: false,
+        }
+    }
+
+    #[test]
+    fn inline_policy_requires_simple_append_shape() {
+        assert!(base_policy().can_inline());
+
+        assert!(
+            !InlineMutationPolicy {
+                pending_pk_deletions: true,
+                ..base_policy()
+            }
+            .can_inline()
+        );
+        assert!(
+            !InlineMutationPolicy {
+                file_on_conflict_deletions: true,
+                ..base_policy()
+            }
+            .can_inline()
+        );
+        assert!(
+            !InlineMutationPolicy {
+                has_sort_columns: true,
+                ..base_policy()
+            }
+            .can_inline()
+        );
+        assert!(
+            !InlineMutationPolicy {
+                is_partitioned: true,
+                ..base_policy()
+            }
+            .can_inline()
+        );
+        assert!(
+            !InlineMutationPolicy {
+                has_retention_filters: true,
+                ..base_policy()
+            }
+            .can_inline()
+        );
+    }
+
+    #[test]
+    fn inline_buffer_allows_boundary_row_count() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(
+                0..INLINE_MAX_ROWS as i64,
+            ))],
+        )
+        .expect("batch should be valid");
+
+        let mut buffer = InlineBatchBuffer::new(schema);
+        buffer.push(batch);
+
+        assert_eq!(buffer.total_rows(), INLINE_MAX_ROWS);
+        assert!(buffer.should_continue_buffering());
+    }
+
+    #[test]
+    fn inline_buffer_exceeds_after_row_limit() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(
+                0..(INLINE_MAX_ROWS as i64 + 1),
+            ))],
+        )
+        .expect("batch should be valid");
+
+        let mut buffer = InlineBatchBuffer::new(schema);
+        buffer.push(batch);
+
+        assert_eq!(buffer.total_rows(), INLINE_MAX_ROWS + 1);
+        assert!(!buffer.should_continue_buffering());
+    }
+
+    #[test]
+    fn inline_buffer_exceeds_after_byte_limit() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            false,
+        )]));
+        let payload = vec![7_u8; INLINE_MAX_BUFFER_BYTES + 1];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(BinaryArray::from_vec(vec![payload.as_slice()]))],
+        )
+        .expect("batch should be valid");
+
+        let mut buffer = InlineBatchBuffer::new(schema);
+        buffer.push(batch);
+
+        assert!(!buffer.should_continue_buffering());
+    }
+
+    #[test]
+    fn refresh_listing_table_only_when_post_write_steps_changed_files() {
+        assert!(!should_refresh_listing_table_after_post_write(0, false));
+        assert!(should_refresh_listing_table_after_post_write(1, false));
+        assert!(should_refresh_listing_table_after_post_write(0, true));
+        assert!(should_refresh_listing_table_after_post_write(1, true));
+    }
+}

@@ -46,6 +46,7 @@ pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
+pub(crate) mod mutation_writer;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
@@ -1094,5 +1095,97 @@ mod tests {
             .expect("items_bought should be Int64")
             .value(0);
         assert_eq!(value, 101, "Latest upserted value should be visible");
+    }
+
+    /// Verifies that `CayenneDataSink::write_all` normalizes incoming batch schemas
+    /// to match the table schema. CDC (Debezium) batches can arrive with `NonNullable`
+    /// columns when the table schema declares them as `Nullable`, which would cause a
+    /// Vortex assertion failure without normalization.
+    #[tokio::test]
+    async fn test_insert_normalizes_nullable_schema_mismatch() {
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for schema normalization test");
+        let db_path = temp_dir.path().join("cayenne_schema_norm_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+
+        let catalog = Arc::new(
+            CayenneCatalog::new(&connection_string)
+                .expect("Failed to create CayenneCatalog instance"),
+        );
+        catalog.init().await.expect("to initialize catalog");
+
+        // Table schema: id NOT NULL, name NULLABLE
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let table_options = CreateTableOptions {
+            table_name: "schema_norm_test".to_string(),
+            schema: Arc::clone(&table_schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: temp_dir.path().to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider =
+            CayenneTableProvider::create_table(catalog_trait, table_options, ctx.runtime_env())
+                .await
+                .expect("to create Cayenne table");
+
+        // Input schema: id NULLABLE (mismatches table's NOT NULL), name NULLABLE
+        // This simulates what CDC/Debezium sends — all columns as nullable.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let input_batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")])),
+            ],
+        )
+        .expect("to create input batch");
+
+        // Insert with mismatched nullability — should succeed after normalization
+        let input_exec =
+            MemorySourceConfig::try_new_exec(&[vec![input_batch]], Arc::clone(&input_schema), None)
+                .expect("to create MemorySourceConfig");
+
+        let insert_plan = provider
+            .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+            .await
+            .expect("to insert into table with mismatched nullability");
+
+        collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("to execute insert");
+        // Verify the data is readable and the output schema matches the table schema
+        let scan_plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("to create scan plan after normalized insert");
+
+        let result = collect(scan_plan, ctx.task_ctx())
+            .await
+            .expect("to collect scan results");
+
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2, "Expected 2 rows after insert");
+
+        // The output schema must match the table schema (Nullable for name),
+        // not the input schema
+        assert_eq!(
+            result[0].schema(),
+            table_schema,
+            "Output schema should match the table schema, not the input schema"
+        );
     }
 }

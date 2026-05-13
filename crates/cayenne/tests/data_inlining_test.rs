@@ -49,6 +49,62 @@ test_with_backends!(test_roundtrip_exceeds_byte_threshold);
 test_with_backends!(test_pk_upsert_inline_mutation);
 test_with_backends!(test_pk_delete_inline_mutation);
 test_with_backends!(test_pk_auto_checkpoint_preserves_rows);
+test_with_backends!(test_inline_writer_fallback_preserves_buffered_and_remaining_batches);
+
+#[tokio::test]
+#[ignore = "performance regression coverage; run explicitly with --ignored"]
+async fn performance_many_small_inline_appends_preserve_results_sqlite()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
+    let (table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_writer_perf").await?;
+    let schema = table.schema();
+
+    for chunk in 0..64_i64 {
+        let start = chunk * 128;
+        let ids = (start..start + 128).collect::<Vec<_>>();
+        let names = ids
+            .iter()
+            .map(|id| format!("name_{id}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )?;
+        common::insert_batch(&table, batch).await?;
+    }
+
+    assert_eq!(
+        fixture.catalog.get_inlined_data_count(&table_id).await?,
+        8_192
+    );
+
+    let got = collect_sorted(
+        &ctx,
+        "SELECT id, name FROM inline_writer_perf WHERE id IN (0, 4096, 8191) ORDER BY id",
+    )
+    .await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 3);
+    assert_eq!(ids.values(), &[0_i64, 4_096, 8_191]);
+    assert_eq!(names.value(0), "name_0");
+    assert_eq!(names.value(1), "name_4096");
+    assert_eq!(names.value(2), "name_8191");
+
+    Ok(())
+}
 
 /// Test basic CRUD for inlined data via the catalog API.
 async fn test_inlined_data_crud(
@@ -502,6 +558,82 @@ async fn test_pk_auto_checkpoint_preserves_rows(
     assert_eq!(names.value(0), "name_0");
     assert_eq!(names.value(1), "name_5120");
     assert_eq!(names.value(2), "name_10239");
+
+    Ok(())
+}
+
+async fn test_inline_writer_fallback_preserves_buffered_and_remaining_batches(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let (table, ctx) = create_table(
+        &fixture,
+        "inline_writer_fallback_preserves_stream",
+        Arc::clone(&schema),
+    )
+    .await?;
+    let table = Arc::new(table);
+    ctx.register_table(
+        "inline_writer_fallback_preserves_stream",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+    let table_id = fixture
+        .catalog
+        .get_table("inline_writer_fallback_preserves_stream")
+        .await?
+        .table_id;
+
+    let make_batch = |start: i64, rows: i64| -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        let ids = (start..start + rows).collect::<Vec<_>>();
+        let names = ids
+            .iter()
+            .map(|id| format!("name_{id}"))
+            .collect::<Vec<_>>();
+        Ok(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )?)
+    };
+
+    common::insert_batches(
+        &table,
+        vec![
+            make_batch(0, 1_024)?,
+            make_batch(1_024, 2)?,
+            make_batch(1_026, 3)?,
+        ],
+    )
+    .await?;
+
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 0);
+
+    let got = collect_sorted(
+        &ctx,
+        "SELECT id, name FROM inline_writer_fallback_preserves_stream ORDER BY id",
+    )
+    .await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 1_029);
+    assert_eq!(ids.value(0), 0);
+    assert_eq!(ids.value(1_024), 1_024);
+    assert_eq!(ids.value(1_028), 1_028);
+    assert_eq!(names.value(1_028), "name_1028");
 
     Ok(())
 }

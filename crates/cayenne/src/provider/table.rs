@@ -30,7 +30,7 @@ use super::delete::{
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::metadata::{CreateTableOptions, InlinedData, TableMetadata};
-use crate::provider::scan::CayenneAccelerationExec;
+use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
 use arrow::array::Array;
@@ -1010,9 +1010,25 @@ impl CayenneTableProvider {
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
     ) -> Result<Arc<ListingTable>> {
+        Self::create_listing_table_with_config(
+            snapshot_dir_url,
+            schema,
+            vortex_format,
+            strategy,
+            &SessionConfig::default(),
+        )
+    }
+
+    fn create_listing_table_with_config(
+        snapshot_dir_url: &str,
+        schema: SchemaRef,
+        vortex_format: &Arc<VortexFormat>,
+        strategy: &PkDeletionStrategyWithCache,
+        session_config: &SessionConfig,
+    ) -> Result<Arc<ListingTable>> {
         let table_url = ListingTableUrl::parse(snapshot_dir_url)?;
 
-        let listing_options = Self::create_listing_options(vortex_format, strategy);
+        let listing_options = Self::create_listing_options(vortex_format, strategy, session_config);
 
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
@@ -1031,6 +1047,7 @@ impl CayenneTableProvider {
     fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
+        session_config: &SessionConfig,
     ) -> ListingOptions {
         let file_format: Arc<dyn FileFormat> = match strategy {
             PkDeletionStrategyWithCache::PositionBased {
@@ -1044,7 +1061,7 @@ impl CayenneTableProvider {
                 Arc::clone(vortex_format) as Arc<dyn FileFormat>
             }
         };
-        ListingOptions::new(file_format).with_session_config_options(&SessionConfig::default())
+        ListingOptions::new(file_format).with_session_config_options(session_config)
     }
 
     /// Construct the snapshot directory URL string.
@@ -4675,11 +4692,12 @@ impl CayenneTableProvider {
                 &snapshot_id,
             );
 
-            let listing_table = Self::create_listing_table(
+            let listing_table = Self::create_listing_table_with_config(
                 &snapshot_url,
                 Arc::clone(&self.table_metadata.schema),
                 self.context.file_format(),
                 &self.pk_deletion_strategy,
+                state.config(),
             )
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -5056,16 +5074,20 @@ impl TableProvider for CayenneTableProvider {
             filters
         };
 
-        // Delegate to the underlying listing table
-        // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    LISTING_TABLE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            Arc::clone(&guard)
-        };
+        let target_partitions = state.config().target_partitions();
+
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            &self.get_current_snapshot_id()?,
+        );
+        let listing_table = Self::create_listing_table_with_config(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        )?;
         let main_plan = listing_table
             .scan(state, effective_projection.as_ref(), scan_filters, limit)
             .await?;
@@ -5163,7 +5185,7 @@ impl TableProvider for CayenneTableProvider {
             plan
         };
 
-        let plan: Arc<dyn ExecutionPlan> = if let Some(limit) = limit {
+        let mut plan: Arc<dyn ExecutionPlan> = if let Some(limit) = limit {
             let local_limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(plan, limit));
             let single_partition: Arc<dyn ExecutionPlan> =
                 Arc::new(CoalescePartitionsExec::new(local_limit));
@@ -5171,6 +5193,12 @@ impl TableProvider for CayenneTableProvider {
         } else {
             plan
         };
+
+        if let Some(repartitioned_plan) =
+            round_robin_repartition_if_needed(Arc::clone(&plan), target_partitions)?
+        {
+            plan = repartitioned_plan;
+        }
 
         // Strip extra columns (PK or retention time column) added to the projection
         // but not originally requested by the query.
