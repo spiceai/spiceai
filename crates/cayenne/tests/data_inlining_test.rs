@@ -738,6 +738,40 @@ async fn test_inline_memtable_pressure_clears_fully_deleted_entries(
         .value(0);
     assert_eq!(count, 0);
 
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![65_i64])),
+            Arc::new(StringArray::from(vec!["name_65_visible"])),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+
+    let stats = fixture.catalog.get_inlined_data_stats(&table_id).await?;
+    assert_eq!(stats.record_count, 1);
+    assert_eq!(stats.entry_count, 1);
+    assert!(stats.ipc_bytes > 0);
+
+    let got = collect_sorted(
+        &ctx,
+        "SELECT id, name FROM inline_memtable_fully_deleted ORDER BY id",
+    )
+    .await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 1);
+    assert_eq!(ids.value(0), 65);
+    assert_eq!(names.value(0), "name_65_visible");
+
     Ok(())
 }
 
