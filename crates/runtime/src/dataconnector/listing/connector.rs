@@ -1406,7 +1406,7 @@ fn listing_extension(
     }
 
     if let Some(extension) = path_extension
-        && extension.compression.is_some()
+        && extension.format_extension.as_deref() == Some(default_extension.trim_start_matches('.'))
     {
         return extension.file_extension.clone();
     }
@@ -1925,6 +1925,27 @@ mod tests {
             connector.get_file_format_and_extension(&dataset).await
         {
             assert_eq!(extension, ".csv.gz");
+            assert_eq!(
+                file_format.compression_type(),
+                Some(FileCompressionType::GZIP)
+            );
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_preserves_explicit_file_extension_with_compression_type()
+     {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        params.insert("file_compression_type".to_string(), "GZIP".to_string());
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params).await;
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".csv");
             assert_eq!(
                 file_format.compression_type(),
                 Some(FileCompressionType::GZIP)
