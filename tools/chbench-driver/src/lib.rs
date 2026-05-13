@@ -140,10 +140,8 @@ impl ChBenchDriver for PostgresChBenchDriver {
         let base_seed = self.config.seed.unwrap_or(42);
 
         println!(
-            "Starting OLTP workload: {} terminals, {}s duration, mix={:?}",
-            terminals,
-            duration.as_secs(),
-            mix,
+            "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, {duration}s duration, mix={mix:?}",
+            duration = duration.as_secs()
         );
 
         // Spawn a task that cancels after the configured duration
