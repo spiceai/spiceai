@@ -491,8 +491,12 @@ pub(crate) fn get_partitions_from_store(
         .filter_map(|executor_id| {
             let (_, client) = executors.get(&executor_id)?;
             let partition_values = executor_partition_map.remove(&executor_id)?;
-            let provider =
-                flight_sql_table_provider(&executor_id, (*client).clone(), table, Arc::clone(schema));
+            let provider = flight_sql_table_provider(
+                &executor_id,
+                (*client).clone(),
+                table,
+                Arc::clone(schema),
+            );
             Some((provider, partition_values))
         })
         .collect()
