@@ -30,7 +30,7 @@ use crate::{
 };
 use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
-use ::datafusion::sql::TableReference;
+use ::datafusion::sql::ResolvedTableReference;
 use app::App;
 use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
@@ -112,7 +112,7 @@ pub enum DistributedNode {
         ///
         /// This is populated during startup when the executor registers with the scheduler.
         /// It contains the list of partition filters (expressions) that this executor is responsible for.
-        partition_assignments: Arc<RwLock<HashMap<TableReference, Vec<Expr>>>>,
+        partition_assignments: Arc<RwLock<HashMap<ResolvedTableReference, Vec<Expr>>>>,
     },
 }
 
