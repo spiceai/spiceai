@@ -21,6 +21,78 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
+// Common enums
+// ============================================================================
+
+/// Runtime update channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    Stable,
+    Preview,
+    Nightly,
+    Internal,
+}
+
+impl std::fmt::Display for UpdateChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stable => write!(f, "stable"),
+            Self::Preview => write!(f, "preview"),
+            Self::Nightly => write!(f, "nightly"),
+            Self::Internal => write!(f, "internal"),
+        }
+    }
+}
+
+impl std::str::FromStr for UpdateChannel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "stable" => Ok(Self::Stable),
+            "preview" => Ok(Self::Preview),
+            "nightly" => Ok(Self::Nightly),
+            "internal" => Ok(Self::Internal),
+            _ => Err(format!(
+                "invalid channel '{s}'. Expected one of: stable, preview, nightly, internal"
+            )),
+        }
+    }
+}
+
+/// App kind — determines whether the app is a SpicepodSet or SpicepodCluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppKind {
+    /// Standard scheduler-only deployment.
+    Set,
+    /// Distributed deployment with separate scheduler and executor pods.
+    Cluster,
+}
+
+impl std::fmt::Display for AppKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Set => write!(f, "set"),
+            Self::Cluster => write!(f, "cluster"),
+        }
+    }
+}
+
+impl std::str::FromStr for AppKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "set" | "spicepodset" => Ok(Self::Set),
+            "cluster" | "spicepodcluster" => Ok(Self::Cluster),
+            _ => Err(format!("invalid kind '{s}'. Expected one of: set, cluster")),
+        }
+    }
+}
+
+// ============================================================================
 // Apps
 // ============================================================================
 
@@ -67,7 +139,7 @@ pub struct AppConfig {
     pub registry: Option<String>,
     pub image: Option<String>,
     pub image_tag: Option<String>,
-    pub update_channel: Option<String>,
+    pub update_channel: Option<UpdateChannel>,
     pub replicas: Option<i32>,
     pub resources: Option<AppResources>,
     pub executor: Option<AppExecutor>,
@@ -131,7 +203,7 @@ pub struct UpdateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub update_channel: Option<String>,
+    pub update_channel: Option<UpdateChannel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,7 +260,7 @@ pub struct CreateDeploymentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub channel: Option<String>,
+    pub channel: Option<UpdateChannel>,
     pub debug: bool,
 }
 

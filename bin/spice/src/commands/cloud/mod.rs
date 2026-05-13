@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Cloud commands for managing Spice Cloud resources.
 
+mod bytes;
 mod client;
 mod config;
 
@@ -29,7 +30,7 @@ use std::{fmt, io::IsTerminal};
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
-use spice_cloud_client::types::IngestionMetrics;
+use spice_cloud_client::types::{AppKind, IngestionMetrics, UpdateChannel};
 
 /// Arguments for the cloud command.
 #[derive(Args, Debug)]
@@ -463,6 +464,14 @@ pub struct CreateAppArgs {
     /// App name
     pub name: String,
 
+    /// Deployment region (e.g. us-east-1-prod-aws-data)
+    #[arg(long)]
+    pub region: String,
+
+    /// App kind (set or cluster)
+    #[arg(long, value_parser = clap::value_parser!(AppKind), default_value = "set")]
+    pub kind: AppKind,
+
     /// App description
     #[arg(long)]
     pub description: Option<String>,
@@ -470,6 +479,42 @@ pub struct CreateAppArgs {
     /// App visibility (public or private)
     #[arg(long, default_value = "private")]
     pub visibility: String,
+
+    /// Number of scheduler replicas
+    #[arg(long)]
+    pub replicas: Option<i32>,
+
+    /// Scheduler CPU limit in vCPUs (e.g. 4)
+    #[arg(long)]
+    pub cpu: Option<i32>,
+
+    /// Scheduler memory limit (e.g. 16Gi, 16GiB)
+    #[arg(long)]
+    pub memory: Option<String>,
+
+    /// Block storage size in GB
+    #[arg(long)]
+    pub storage_size_gb: Option<f64>,
+
+    /// Number of executor replicas
+    #[arg(long)]
+    pub executor_replicas: Option<i32>,
+
+    /// Executor CPU limit in vCPUs (e.g. 8)
+    #[arg(long)]
+    pub executor_cpu: Option<i32>,
+
+    /// Executor memory limit (e.g. 32Gi, 32GiB)
+    #[arg(long)]
+    pub executor_memory: Option<String>,
+
+    /// Path to a spicepod.yaml file
+    #[arg(long)]
+    pub spicepod: Option<String>,
+
+    /// Update channel (stable, preview, nightly, internal)
+    #[arg(long, value_parser = clap::value_parser!(UpdateChannel))]
+    pub channel: Option<UpdateChannel>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -543,7 +588,7 @@ pub struct UpdateAppArgs {
     #[arg(long)]
     pub visibility: Option<String>,
 
-    /// Number of replicas
+    /// Number of scheduler replicas
     #[arg(long)]
     pub replicas: Option<i32>,
 
@@ -554,6 +599,38 @@ pub struct UpdateAppArgs {
     /// Deployment region
     #[arg(long)]
     pub region: Option<String>,
+
+    /// Scheduler CPU limit in vCPUs (e.g. 4)
+    #[arg(long)]
+    pub cpu: Option<i32>,
+
+    /// Scheduler memory limit (e.g. 16Gi, 16GiB)
+    #[arg(long)]
+    pub memory: Option<String>,
+
+    /// Block storage size in GB
+    #[arg(long)]
+    pub storage_size_gb: Option<f64>,
+
+    /// Number of executor replicas
+    #[arg(long)]
+    pub executor_replicas: Option<i32>,
+
+    /// Executor CPU limit in vCPUs (e.g. 8)
+    #[arg(long)]
+    pub executor_cpu: Option<i32>,
+
+    /// Executor memory limit (e.g. 32Gi, 32GiB)
+    #[arg(long)]
+    pub executor_memory: Option<String>,
+
+    /// Path to a spicepod.yaml file
+    #[arg(long)]
+    pub spicepod: Option<String>,
+
+    /// Update channel (stable, preview, nightly, internal)
+    #[arg(long, value_parser = clap::value_parser!(UpdateChannel))]
+    pub channel: Option<UpdateChannel>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -1225,15 +1302,64 @@ async fn execute_logs(args: &LogsArgs) -> Result<()> {
 async fn execute_create(cmd: &CreateCommands) -> Result<()> {
     match cmd {
         CreateCommands::App(args) => {
+            if args.kind == AppKind::Cluster && args.replicas.is_some_and(|r| r != 1) {
+                return Err(crate::error::Error::InvalidArgument {
+                    message: "SpicepodCluster requires --replicas 1".to_string(),
+                });
+            }
+
             let client = CloudClient::new()?;
+            let spicepod_content = args
+                .spicepod
+                .as_deref()
+                .map(read_spicepod_file)
+                .transpose()?;
+
             let app = client
-                .create_app(&args.name, args.description.as_deref(), &args.visibility)
+                .create_app(
+                    &args.name,
+                    &args.region,
+                    args.kind,
+                    args.description.as_deref(),
+                    &args.visibility,
+                    args.replicas,
+                    args.cpu,
+                    args.memory.as_deref(),
+                    args.storage_size_gb,
+                    args.executor_replicas,
+                    args.executor_cpu,
+                    args.executor_memory.as_deref(),
+                )
                 .await?;
+
+            let org_app = app.full_name();
+
+            // Spicepod and channel are set via update (not supported on create)
+            if spicepod_content.is_some() || args.channel.is_some() {
+                client
+                    .update_app(
+                        &org_app,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        spicepod_content,
+                        args.channel,
+                    )
+                    .await?;
+            }
+
             if args.output == OutputFormat::Json {
                 return write_json(&app);
             }
-            println!("\x1b[32m✓ Created app {}\x1b[0m", app.full_name());
-            let org_app = app.full_name();
+            println!("\x1b[32m✓ Created app {org_app}\x1b[0m");
             if let Ok(api_keys) = client.get_api_keys(&org_app).await
                 && let Some(api_key) = api_keys.api_key
             {
@@ -1292,6 +1418,11 @@ async fn execute_update(cmd: &UpdateCommands) -> Result<()> {
         UpdateCommands::App(args) => {
             let client = CloudClient::new()?;
             let app_name = require_app(args.app.as_deref())?;
+            let spicepod_content = args
+                .spicepod
+                .as_deref()
+                .map(read_spicepod_file)
+                .transpose()?;
 
             let app = client
                 .update_app(
@@ -1301,6 +1432,14 @@ async fn execute_update(cmd: &UpdateCommands) -> Result<()> {
                     args.replicas,
                     args.image.as_deref(),
                     args.region.as_deref(),
+                    args.cpu,
+                    args.memory.as_deref(),
+                    args.storage_size_gb,
+                    args.executor_replicas,
+                    args.executor_cpu,
+                    args.executor_memory.as_deref(),
+                    spicepod_content,
+                    args.channel,
                 )
                 .await?;
 
@@ -1503,8 +1642,6 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
         println!("No metrics available for {app_name}");
         return Ok(());
     }
-    let has_window = args.window.is_some();
-
     let mut table = TableOutput::new(vec![
         "POD",
         "CPU %",
@@ -1518,14 +1655,16 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
             pod.clone(),
             m.cpu_usage_percent
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-            m.memory_usage_bytes
-                .map_or_else(|| "-".to_string(), format_bytes),
+            m.memory_usage_bytes.map_or_else(
+                || "-".to_string(),
+                |v| bytes::NumBytes::from_bytes(v).to_string(),
+            ),
             m.disk_read_bytes
-                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
+                .map_or_else(|| "-".to_string(), bytes::format_bytes_f64),
             m.disk_read_operations
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
             m.disk_write_bytes
-                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
+                .map_or_else(|| "-".to_string(), bytes::format_bytes_f64),
             m.disk_write_operations
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
         ]);
@@ -1538,7 +1677,10 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
             rows_ingested: Some(rows),
             bytes_ingested: Some(bytes),
         }) => {
-            println!("Ingestion: {rows} rows, {}", format_bytes(*bytes));
+            println!(
+                "Ingestion: {rows} rows, {}",
+                bytes::NumBytes::from_bytes(*bytes)
+            );
         }
         Some(IngestionMetrics {
             rows_ingested: Some(rows),
@@ -1550,7 +1692,7 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
             rows_ingested: None,
             bytes_ingested: Some(bytes),
         }) => {
-            println!("Ingestion: {}", format_bytes(*bytes));
+            println!("Ingestion: {}", bytes::NumBytes::from_bytes(*bytes));
         }
         Some(IngestionMetrics {
             rows_ingested: None,
@@ -1562,55 +1704,16 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     Ok(())
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_bytes_f64(bytes: f64, is_windowed: bool) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-
-    if is_windowed {
-        // increase() over window — show as a delta amount
-        if bytes >= GIB {
-            format!("{:.1} GiB", bytes / GIB)
-        } else if bytes >= MIB {
-            format!("{:.1} MiB", bytes / MIB)
-        } else if bytes >= KIB {
-            format!("{:.1} KiB", bytes / KIB)
-        } else {
-            format!("{bytes:.0} B")
-        }
-    } else {
-        // Raw cumulative counter — show total bytes
-        if bytes >= GIB {
-            format!("{:.1} GiB", bytes / GIB)
-        } else if bytes >= MIB {
-            format!("{:.1} MiB", bytes / MIB)
-        } else if bytes >= KIB {
-            format!("{:.1} KiB", bytes / KIB)
-        } else {
-            format!("{bytes:.0} B")
-        }
-    }
-}
-
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+/// Read a spicepod YAML file from disk and return its contents as a string.
+fn read_spicepod_file(path: &str) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|e| crate::error::Error::InvalidArgument {
+        message: format!("Failed to read spicepod file '{path}': {e}"),
+    })
+}
 
 /// Validate that `--window` parses as a duration via `fundu`.
 fn parse_window(s: &str) -> std::result::Result<String, String> {
