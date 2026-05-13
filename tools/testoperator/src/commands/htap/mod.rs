@@ -99,6 +99,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             KeyValue::new("spiced_commit_sha", spiced_commit_sha),
             KeyValue::new("branch_name", branch_name),
             KeyValue::new("scale_factor", scale_factor.to_string()),
+            KeyValue::new("duration_secs", duration.as_secs().to_string()),
         ])
         .build();
 
