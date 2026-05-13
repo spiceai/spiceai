@@ -27,7 +27,7 @@ use crate::txn::TxnType;
 /// Collected OLTP metrics from a benchmark run.
 #[derive(Debug)]
 pub struct OltpReport {
-    /// NewOrder committed transactions per minute.
+    /// `NewOrder` committed transactions per minute.
     pub tpmc: f64,
     /// Total committed transactions.
     pub total_committed: u64,
@@ -47,7 +47,14 @@ pub struct OltpMetrics {
     aborted: u64,
 }
 
+impl Default for OltpMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OltpMetrics {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             start: Instant::now(),
@@ -71,26 +78,33 @@ impl OltpMetrics {
     }
 
     /// Merge another terminal's metrics into this one.
-    pub fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: &Self) {
         self.new_order_committed += other.new_order_committed;
         self.committed += other.committed;
         self.aborted += other.aborted;
     }
 
     /// Finalize and produce the report.
+    #[must_use]
     pub fn finish(self) -> OltpReport {
         let duration = self.start.elapsed();
         let minutes = duration.as_secs_f64() / 60.0;
 
         let tpmc = if minutes > 0.0 {
-            self.new_order_committed as f64 / minutes
+            #[expect(clippy::cast_precision_loss)]
+            {
+                self.new_order_committed as f64 / minutes
+            }
         } else {
             0.0
         };
 
         let total = self.committed + self.aborted;
         let abort_rate = if total > 0 {
-            self.aborted as f64 / total as f64
+            #[expect(clippy::cast_precision_loss)]
+            {
+                self.aborted as f64 / total as f64
+            }
         } else {
             0.0
         };

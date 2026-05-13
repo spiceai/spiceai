@@ -245,7 +245,7 @@ fn snapshot_predicate(query_name: &str) -> bool {
         && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
 }
 
-/// Build CH-benCH PostgreSQL source config from environment variables.
+/// Build CH-benCH Postgres source config from environment variables.
 ///
 /// | Variable | Default |
 /// |----------|---------|
@@ -277,7 +277,7 @@ fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceCon
 }
 
 /// Validate scale factor, build the CH-benCH config, connect to the source
-/// PostgreSQL, create the schema and load seed data.
+/// Postgres, create the schema and load seed data.
 ///
 /// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
 /// `duration` overrides the default OLTP workload duration when set.
@@ -292,6 +292,8 @@ pub(crate) async fn prepare_chbench_source(
         );
     }
 
+    // Scale factor is validated >= 1.0 and integer above, so the cast is safe.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let warehouses = scale_factor as usize;
     let terminals = warehouses * 10;
     let mut config = chbench_driver::ChBenchConfig {
@@ -303,7 +305,9 @@ pub(crate) async fn prepare_chbench_source(
         config.duration = d;
     }
 
-    println!("Preparing chbench source (SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s))...");
+    println!(
+        "Preparing chbench source (SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s))..."
+    );
 
     let source = chbench_source_from_env()?;
     let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;

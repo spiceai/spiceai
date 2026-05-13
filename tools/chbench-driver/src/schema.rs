@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! TPC-C + CH-benCH DDL for PostgreSQL.
+//! TPC-C + CH-benCH DDL for Postgres.
 
 use tokio_postgres::Client;
 
@@ -37,6 +37,10 @@ pub const ALL_TABLES: &[&str] = &[
 ];
 
 /// Drop stale Spice replication slots and publications left from previous runs (if any).
+///
+/// # Errors
+///
+/// Returns an error if querying or dropping replication artifacts fails.
 pub async fn drop_replication_artifacts(client: &Client) -> Result<()> {
     // Drop replication slots named spice_*
     let slot_rows = client
@@ -86,6 +90,10 @@ pub async fn drop_replication_artifacts(client: &Client) -> Result<()> {
 }
 
 /// Drop all CH-benCH tables (reverse order).
+///
+/// # Errors
+///
+/// Returns an error if any table cannot be dropped.
 pub async fn drop_tables(client: &Client) -> Result<()> {
     drop_replication_artifacts(client).await?;
     println!("  dropping {} tables", ALL_TABLES.len());
@@ -103,6 +111,11 @@ pub async fn drop_tables(client: &Client) -> Result<()> {
 }
 
 /// Create all 12 CH-benCH tables (9 TPC-C + 3 supplemental).
+///
+/// # Errors
+///
+/// Returns an error if any table or index cannot be created.
+#[expect(clippy::too_many_lines)]
 pub async fn create_tables(client: &Client) -> Result<()> {
     let ddl_statements: &[(&str, &str)] = &[
         (
@@ -347,8 +360,8 @@ const MUTATED_TABLES: &[&str] = &[
 ];
 
 /// Tables probed for staleness gap measurement.
-/// Selected for diversity: district (small, baseline), order_line (high volume),
-/// new_order (DELETE path).
+/// Selected for diversity: district (small, baseline), `order_line` (high volume),
+/// `new_order` (DELETE path).
 pub const STALENESS_PROBE_TABLES: &[&str] = &["district", "order_line", "new_order"];
 
 /// Add `_bench_ts TIMESTAMPTZ` column with `clock_timestamp()` default and

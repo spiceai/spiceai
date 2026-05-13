@@ -84,6 +84,7 @@ pub fn rand_original_string(rng: &mut impl Rng) -> String {
 }
 
 /// Generate a C-Last name from syllables (spec §4.3.2.3).
+#[must_use]
 pub fn c_last_syllables(n: usize) -> String {
     let mut s = String::with_capacity(15);
     s.push_str(C_LAST_TOKENS[n / 100]);
@@ -92,7 +93,7 @@ pub fn c_last_syllables(n: usize) -> String {
     s
 }
 
-/// Generate a random C-Last name using NURand (spec §2.1.6).
+/// Generate a random C-Last name using `NURand` (spec §2.1.6).
 pub fn rand_c_last(rng: &mut impl Rng, c_load: usize) -> String {
     let a = rng.random_range(0..256);
     let x = rng.random_range(0..1000);

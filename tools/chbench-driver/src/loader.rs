@@ -124,6 +124,10 @@ fn sql_opt_i32(v: Option<i32>) -> String {
 ///
 /// When `seed` is `Some`, a deterministic RNG is used so that the same seed
 /// always produces the same dataset.
+///
+/// # Errors
+///
+/// Returns an error if any database operation fails.
 pub async fn load_all(client: &Client, warehouses: usize, seed: Option<u64>) -> Result<()> {
     let mut rng: StdRng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -473,7 +477,7 @@ async fn load_order_line(
 // ─── CH-benCH supplemental tables (static data) ──────────────────────────────
 
 /// TPC-H nation data. 25 nations with region keys.
-/// Column order: (n_nationkey, n_name, n_regionkey).
+/// Column order: (`n_nationkey`, `n_name`, `n_regionkey`).
 const NATIONS: &[(i64, &str, i64)] = &[
     (0, "ALGERIA", 0),
     (1, "ARGENTINA", 1),

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! TPC-C StockLevel transaction (4% default mix).
+//! TPC-C `StockLevel` transaction (4% default mix).
 //!
 //! Read-only: count distinct items in recent orders with stock below threshold.
 //! No WAL events — included for spec-compliant tpmC measurement.
@@ -24,6 +24,9 @@ use tokio_postgres::Client;
 
 use crate::Result;
 
+/// # Errors
+///
+/// Returns an error if any database operation fails.
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.random_range(1..=warehouses);
     let d_id = rng.random_range(1..=10);

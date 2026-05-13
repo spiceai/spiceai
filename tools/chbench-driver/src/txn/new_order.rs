@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! TPC-C NewOrder transaction (45% default mix).
+//! TPC-C `NewOrder` transaction (45% default mix).
 //!
-//! Inserts an order with 5-15 line items. Updates district.d_next_o_id and stock quantities.
+//! Inserts an order with 5-15 line items. Updates `district.d_next_o_id` and stock quantities.
 //! CDC impact: ~15-35 rows per transaction.
 
 use std::time::SystemTime;
@@ -27,6 +27,9 @@ use tokio_postgres::Client;
 use crate::Result;
 use crate::rand as tpcc_rand;
 
+/// # Errors
+///
+/// Returns an error if any database operation fails.
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.random_range(1..=warehouses);
     let d_id = rng.random_range(1..=10);
@@ -35,6 +38,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     let rbk = rng.random_range(1..=100);
 
     // Generate order items
+    #[expect(clippy::cast_sign_loss)]
     let mut items: Vec<(i32, i32, i32, i32)> = Vec::with_capacity(ol_cnt as usize); // (ol_i_id, ol_supply_w_id, ol_quantity, remote)
     let mut all_local = 1i32;
 
@@ -70,7 +74,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
         })?;
 
     // 1. SELECT customer + warehouse info
-    let _customer_row = tx
+    let customer_row = tx
         .query_one(
             "SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = $1 AND c_w_id = w_id AND c_d_id = $2 AND c_id = $3",
             &[&w_id, &d_id, &c_id],
@@ -81,8 +85,8 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
             source,
         })?;
 
-    let c_discount: f64 = _customer_row.get(0);
-    let w_tax: f64 = _customer_row.get(3);
+    let c_discount: f64 = customer_row.get(0);
+    let w_tax: f64 = customer_row.get(3);
 
     // 2. SELECT district FOR UPDATE
     let district_row = tx

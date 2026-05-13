@@ -27,6 +27,9 @@ use tokio_postgres::Client;
 use crate::Result;
 use crate::rand as tpcc_rand;
 
+/// # Errors
+///
+/// Returns an error if any database operation fails.
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.random_range(1..=warehouses);
     let d_id = rng.random_range(1..=10);
@@ -47,7 +50,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     };
 
     // 85% local, 15% remote (spec 2.5.1.2)
-    let (c_w_id, c_d_id) = if warehouses == 1 || rng.random_range(0..100) < 85 {
+    let (customer_wh, customer_dist) = if warehouses == 1 || rng.random_range(0..100) < 85 {
         (w_id, d_id)
     } else {
         let mut other = rng.random_range(1..=warehouses);
@@ -120,7 +123,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
         let rows = tx
             .query(
                 "SELECT c_id FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3 ORDER BY c_first",
-                &[&c_w_id, &c_d_id, &c_last.as_deref().unwrap_or("")],
+                &[&customer_wh, &customer_dist, &c_last.as_deref().unwrap_or("")],
             )
             .await
             .map_err(|source| crate::Error::Sql {
@@ -138,7 +141,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
         }
 
         // Pick the middle customer (spec 2.5.2.2)
-        let idx = (rows.len() + 1) / 2 - 1;
+        let idx = rows.len().div_ceil(2) - 1;
         c_id = rows[idx].get(0);
     }
 
@@ -146,7 +149,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     let c_row = tx
         .query_one(
             "SELECT c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3 FOR UPDATE",
-            &[&c_w_id, &c_d_id, &c_id],
+            &[&customer_wh, &customer_dist, &c_id],
         )
         .await
         .map_err(|source| crate::Error::Sql {
@@ -161,7 +164,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
         let c_data_row = tx
             .query_one(
                 "SELECT c_data FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3",
-                &[&c_w_id, &c_d_id, &c_id],
+                &[&customer_wh, &customer_dist, &c_id],
             )
             .await
             .map_err(|source| crate::Error::Sql {
@@ -175,7 +178,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
             .unwrap_or_default()
             .as_secs();
         let new_prefix = format!(
-            "| {c_id:4} {c_d_id:2} {c_w_id:4} {d_id:2} {w_id:4} ${h_amount:7.2} {now_secs}"
+            "| {c_id:4} {customer_dist:2} {customer_wh:4} {d_id:2} {w_id:4} ${h_amount:7.2} {now_secs}"
         );
         let mut new_data = new_prefix;
         let remaining = 500 - new_data.len().min(500);
@@ -186,7 +189,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
 
         tx.execute(
             "UPDATE customer SET c_balance = c_balance - $1, c_ytd_payment = c_ytd_payment + $2, c_payment_cnt = c_payment_cnt + 1, c_data = $3 WHERE c_w_id = $4 AND c_d_id = $5 AND c_id = $6",
-            &[&h_amount, &h_amount, &new_data, &c_w_id, &c_d_id, &c_id],
+            &[&h_amount, &h_amount, &new_data, &customer_wh, &customer_dist, &c_id],
         )
         .await
         .map_err(|source| crate::Error::Sql {
@@ -196,7 +199,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     } else {
         tx.execute(
             "UPDATE customer SET c_balance = c_balance - $1, c_ytd_payment = c_ytd_payment + $2, c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = $3 AND c_d_id = $4 AND c_id = $5",
-            &[&h_amount, &h_amount, &c_w_id, &c_d_id, &c_id],
+            &[&h_amount, &h_amount, &customer_wh, &customer_dist, &c_id],
         )
         .await
         .map_err(|source| crate::Error::Sql {
@@ -206,11 +209,11 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     }
 
     // 9. INSERT history
-    let h_data = format!("{w_name:>10}    {d_name:>10}");
-    let h_date = SystemTime::now();
+    let history_data = format!("{w_name:>10}    {d_name:>10}");
+    let history_ts = SystemTime::now();
     tx.execute(
         "INSERT INTO history (h_c_d_id, h_c_w_id, h_c_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        &[&c_d_id, &c_w_id, &c_id, &d_id, &w_id, &h_date, &h_amount, &h_data],
+        &[&customer_dist, &customer_wh, &c_id, &d_id, &w_id, &history_ts, &h_amount, &history_data],
     )
     .await
     .map_err(|source| crate::Error::Sql {

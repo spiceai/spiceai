@@ -17,11 +17,11 @@ limitations under the License.
 //! TPC-C transaction implementations for the CH-benCH OLTP driver.
 //!
 //! Five transaction types with standard 45/43/4/4/4 mix:
-//! - **NewOrder** (45%): Insert an order with 5-15 line items, update stock and district.
+//! - **`NewOrder`** (45%): Insert an order with 5-15 line items, update stock and district.
 //! - **Payment** (43%): Update warehouse/district/customer balances, insert history.
 //! - **Delivery** (4%): Deliver oldest pending order for each of 10 districts.
-//! - **OrderStatus** (4%): Read-only — look up latest order for a customer.
-//! - **StockLevel** (4%): Read-only — count low-stock items in recent orders.
+//! - **`OrderStatus`** (4%): Read-only — look up latest order for a customer.
+//! - **`StockLevel`** (4%): Read-only — count low-stock items in recent orders.
 
 pub mod delivery;
 pub mod new_order;
@@ -59,7 +59,7 @@ impl fmt::Display for TxnType {
 }
 
 /// Standard TPC-C transaction mix weights (must sum to 100).
-/// Index order: NewOrder, Payment, Delivery, OrderStatus, StockLevel.
+/// Index order: `NewOrder`, Payment, Delivery, `OrderStatus`, `StockLevel`.
 pub const DEFAULT_MIX: [u32; 5] = [45, 43, 4, 4, 4];
 
 /// All transaction types in mix-weight index order.
@@ -86,6 +86,10 @@ pub fn pick_txn_type(rng: &mut impl Rng, mix: &[u32; 5]) -> TxnType {
 }
 
 /// Execute one TPC-C transaction of the given type.
+///
+/// # Errors
+///
+/// Returns an error if the transaction fails.
 pub async fn execute(
     client: &mut Client,
     rng: &mut impl Rng,

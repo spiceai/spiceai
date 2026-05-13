@@ -69,15 +69,17 @@ impl StalenessReport {
                     stats.max.as_millis(),
                     stats.samples,
                 );
-                crate::metrics::DATA_FRESHNESS_P99.record(
-                    stats.p99.as_millis() as f64,
-                    &[KeyValue::new("table", table.clone())],
-                );
+                #[expect(clippy::cast_precision_loss)]
+                let p99_ms = stats.p99.as_millis() as f64;
+                crate::metrics::DATA_FRESHNESS_P99
+                    .record(p99_ms, &[KeyValue::new("table", table.clone())]);
             }
         }
         println!("  ─────────────────");
         println!("  worst P99:     {}ms", self.worst_p99.as_millis());
-        crate::metrics::DATA_FRESHNESS_P99.record(self.worst_p99.as_millis() as f64, &[]);
+        #[expect(clippy::cast_precision_loss)]
+        let worst_ms = self.worst_p99.as_millis() as f64;
+        crate::metrics::DATA_FRESHNESS_P99.record(worst_ms, &[]);
     }
 }
 
@@ -221,10 +223,15 @@ fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -
 
         gaps.sort_unstable();
         let n = gaps.len();
-        let p50 = Duration::from_micros(gaps[n / 2] as u64);
+        let p50 = Duration::from_micros(gaps[n / 2].cast_unsigned());
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
         let p99_idx = (n as f64 * 0.99).ceil() as usize;
-        let p99 = Duration::from_micros(gaps[p99_idx.min(n - 1)] as u64);
-        let max = Duration::from_micros(gaps[n - 1] as u64);
+        let p99 = Duration::from_micros(gaps[p99_idx.min(n - 1)].cast_unsigned());
+        let max = Duration::from_micros(gaps[n - 1].cast_unsigned());
 
         if p99 > worst_p99 {
             worst_p99 = p99;

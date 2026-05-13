@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! HTAP test command — runs concurrent TPC-C OLTP workload against the source
-//! PostgreSQL database while executing CH-benCH analytical queries through spiced.
+//! Postgres database while executing CH-benCH analytical queries through spiced.
 
 mod staleness;
 
@@ -265,7 +265,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
 /// Print per-dataset Postgres replication metrics scraped from spiced's `/metrics` endpoint.
 fn print_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     // Collect replication metrics per dataset from scraped samples.
     // Gauges (lag_ms, lag_bytes): use the last observed value — represents the
@@ -332,21 +332,16 @@ fn print_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
         "dataset", "lag_ms", "lag_bytes", "inserts", "updates", "deletes"
     );
 
-    let all_datasets: BTreeMap<&String, ()> = lag_ms
-        .keys()
-        .chain(inserts.keys())
-        .map(|k| (k, ()))
-        .collect();
+    let all_datasets: BTreeSet<&String> = lag_ms.keys().chain(inserts.keys()).collect();
 
-    for dataset in all_datasets.keys() {
+    for dataset in &all_datasets {
         let l_ms = lag_ms.get(*dataset).copied().unwrap_or(0.0);
         let l_bytes = lag_bytes.get(*dataset).copied().unwrap_or(0.0);
         let ins = inserts.get(*dataset).copied().unwrap_or(0.0);
         let upd = updates.get(*dataset).copied().unwrap_or(0.0);
         let del = deletes.get(*dataset).copied().unwrap_or(0.0);
         println!(
-            "  {:<14} {:>10.0} {:>12.0} {:>10.0} {:>10.0} {:>10.0}",
-            dataset, l_ms, l_bytes, ins, upd, del
+            "  {dataset:<14} {l_ms:>10.0} {l_bytes:>12.0} {ins:>10.0} {upd:>10.0} {del:>10.0}",
         );
     }
 }

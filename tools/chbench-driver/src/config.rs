@@ -29,7 +29,7 @@ pub struct ChBenchConfig {
     /// Duration of the OLTP workload.
     pub duration: std::time::Duration,
 
-    /// Transaction mix weights: [NewOrder, Payment, Delivery, OrderStatus, StockLevel].
+    /// Transaction mix weights: \[`NewOrder`, Payment, Delivery, `OrderStatus`, `StockLevel`\].
     /// Must sum to 100.
     pub mix: [u32; 5],
 }
@@ -49,21 +49,21 @@ impl Default for ChBenchConfig {
     }
 }
 
-/// PostgreSQL-specific connection configuration.
+/// Postgres-specific connection configuration.
 pub struct PostgresSourceConfig {
-    /// PostgreSQL host.
+    /// Postgres host.
     pub host: String,
 
-    /// PostgreSQL port.
+    /// Postgres port.
     pub port: u16,
 
-    /// PostgreSQL database name.
+    /// Postgres database name.
     pub db: String,
 
-    /// PostgreSQL user (must have REPLICATION privilege for Spice CDC).
+    /// Postgres user (must have REPLICATION privilege for Spice CDC).
     pub user: String,
 
-    /// PostgreSQL password.
+    /// Postgres password.
     pub pass: String,
 }
 
@@ -81,6 +81,7 @@ impl Default for PostgresSourceConfig {
 
 impl PostgresSourceConfig {
     /// Build a `tokio-postgres` connection string from this config.
+    #[must_use]
     pub fn connection_string(&self) -> String {
         format!(
             "host={} port={} dbname={} user={} password={}",

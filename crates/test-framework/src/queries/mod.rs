@@ -387,7 +387,6 @@ impl QuerySet {
     #[must_use]
     pub fn row_counts(&self) -> Vec<TableWithRowCount> {
         match self {
-            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", 150_000),
                 ("lineitem", 6_001_215),
@@ -434,14 +433,13 @@ impl QuerySet {
                 .iter()
                 .map(TableWithRowCount::from)
                 .collect(),
-            QuerySet::ChBench => vec![],
+            QuerySet::Scenario { .. } | QuerySet::ChBench => vec![],
         }
     }
 
     #[must_use]
     pub fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
         match self {
-            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", "c_created_at"),
                 ("lineitem", "l_created_at"),
@@ -488,7 +486,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithTimeColumn::from)
                 .collect(),
-            QuerySet::ChBench => vec![],
+            QuerySet::Scenario { .. } | QuerySet::ChBench => vec![],
         }
     }
 

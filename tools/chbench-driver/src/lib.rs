@@ -49,7 +49,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Source-agnostic interface for CH-benCH benchmarks.
 ///
-/// Each source (Postgres, MySQL, DynamoDB, etc.) implements this trait to
+/// Each source (Postgres, `MySQL`, `DynamoDB`, etc.) implements this trait to
 /// provide schema setup, OLTP workload execution, and staleness probing.
 #[async_trait]
 pub trait ChBenchDriver: Send + Sync {
@@ -82,7 +82,11 @@ pub struct PostgresChBenchDriver {
 }
 
 impl PostgresChBenchDriver {
-    /// Connect to PostgreSQL using the provided configuration.
+    /// Connect to Postgres using the provided configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection cannot be established.
     pub async fn connect(config: ChBenchConfig, source: PostgresSourceConfig) -> Result<Self> {
         let conn_str = source.connection_string();
         let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
@@ -164,7 +168,7 @@ impl ChBenchDriver for PostgresChBenchDriver {
         for handle in handles {
             match handle.await {
                 Ok(Ok(terminal_metrics)) => {
-                    combined.merge(terminal_metrics);
+                    combined.merge(&terminal_metrics);
                 }
                 Ok(Err(e)) => {
                     eprintln!("Terminal error: {e}");

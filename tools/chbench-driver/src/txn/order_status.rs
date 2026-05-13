@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! TPC-C OrderStatus transaction (4% default mix).
+//! TPC-C `OrderStatus` transaction (4% default mix).
 //!
 //! Read-only: look up the most recent order for a customer.
 //! No WAL events — included for spec-compliant tpmC measurement.
@@ -25,6 +25,9 @@ use tokio_postgres::Client;
 use crate::Result;
 use crate::rand as tpcc_rand;
 
+/// # Errors
+///
+/// Returns an error if any database operation fails.
 pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.random_range(1..=warehouses);
     let d_id = rng.random_range(1..=10);
@@ -81,6 +84,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
             return Ok(());
         }
 
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let idx = ((target / 2) as usize).min(rows.len()) - 1;
         rows[idx.min(rows.len().saturating_sub(1))].get(3)
     } else {
