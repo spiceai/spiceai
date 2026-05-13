@@ -63,7 +63,9 @@ async fn setup_table_with_options(
 ) -> BenchTable {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path).expect("data dir");
+    tokio::fs::create_dir_all(&data_path)
+        .await
+        .expect("data dir");
     let db_path = temp_dir.path().join("bench.db");
     let catalog = Arc::new(
         CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy())).expect("catalog"),
