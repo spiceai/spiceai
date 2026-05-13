@@ -28,10 +28,13 @@ serde_json.workspace = true
 yaml = { path = "../../crates/yaml" }
 spiceai.workspace = true
 spicepod = { path = "../../crates/spicepod" }
+system-adapter-protocol.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 rand.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
 
 [features]
 default = ["append"]

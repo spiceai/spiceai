@@ -135,24 +135,90 @@ pub(crate) async fn run_or_connect_spiced(
     Ok((app, instance))
 }
 
+/// Load the test [`App`] from the configured spicepod (and its declared
+/// dependencies). Shared by both the local-spawn and system-adapter SUT paths,
+/// since testoperator always needs the spicepod-derived dataset info for query
+/// construction regardless of where the SUT actually runs.
+/// Build resource attributes that describe how this run acquired its SUT and
+/// which query transport it exercised. Lets downstream dashboards distinguish
+/// cluster benchmarks (via a system adapter) from the traditional single-node
+/// `spiced` runs, and split the cluster results by query path (Flight SQL for
+/// distributed accelerations vs HTTP `/v1/queries` for Ballista).
+pub(crate) fn run_mode_attributes(
+    common: &CommonArgs,
+    dataset_args: &DatasetTestArgs,
+) -> Vec<test_framework::opentelemetry::KeyValue> {
+    use test_framework::opentelemetry::KeyValue;
+
+    let mut attrs = Vec::with_capacity(4);
+
+    let (mode, transport) = if common.is_system_adapter() {
+        let transport = if dataset_args.distributed {
+            "http_v1_queries"
+        } else if dataset_args.http_clients {
+            "http_v1_sql"
+        } else {
+            "flightsql"
+        };
+        ("cluster", transport)
+    } else if common.is_external_instance() {
+        ("external", "flightsql")
+    } else {
+        ("single_node", "flightsql")
+    };
+
+    attrs.push(KeyValue::new("mode", mode));
+    attrs.push(KeyValue::new("query_transport", transport));
+
+    if common.is_system_adapter() {
+        attrs.push(KeyValue::new(
+            "system_adapter_name",
+            common.system_adapter_name.clone(),
+        ));
+        // Mirror any executor-count hint the user passed via
+        // --system-adapter-param so dashboards can group runs by cluster size
+        // without inspecting the spicepod or the adapter's reply.
+        if let Some(replicas) = common
+            .system_adapter_param
+            .iter()
+            .find(|(k, _)| k == "executor_replicas")
+            .map(|(_, v)| v.clone())
+        {
+            attrs.push(KeyValue::new("cluster_executor_replicas", replicas));
+        }
+    }
+
+    attrs
+}
+
+pub(crate) async fn load_app(args: &CommonArgs) -> anyhow::Result<App> {
+    let mut spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
+
+    // Resolve dependencies up-front from the original list, then strip them
+    // before handing the spicepod to the builder — otherwise the App carries a
+    // dangling `dependencies:` list that no longer matches what got loaded.
+    let mut dependencies = Vec::new();
+    if let Some(dependencies_root) = &args.spicepod_dependencies {
+        for dependency in &spicepod.dependencies {
+            dependencies.push(Spicepod::load(&dependencies_root.join(dependency)).await?);
+        }
+    }
+    spicepod.dependencies = vec![];
+
+    let mut app_builder = AppBuilder::new(spicepod.name.clone()).with_spicepod(spicepod);
+    for dependent_spicepod in dependencies {
+        app_builder = app_builder.with_spicepod_dependency(dependent_spicepod);
+    }
+    Ok(app_builder.build())
+}
+
 pub(crate) async fn get_app_and_start_request(
     args: &CommonArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
     // When metrics are disabled, no Telemetry is created, so METER_PROVIDER_ONCE
     // remains unset and all metric operations are no-ops.
 
-    let mut spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
-    let mut app_builder = AppBuilder::new(spicepod.name.clone()).with_spicepod(spicepod.clone());
-
-    if let Some(dependencies_root) = &args.spicepod_dependencies {
-        for dependency in &spicepod.dependencies {
-            let dependent_spicepod = Spicepod::load(&dependencies_root.join(dependency)).await?;
-            app_builder = app_builder.with_spicepod_dependency(dependent_spicepod);
-        }
-    }
-    // After we've loaded dependencies, remove.
-    spicepod.dependencies = vec![];
-    let app = app_builder.build();
+    let app = load_app(args).await?;
 
     let mut start_request = StartRequest::new(args.spiced_path_buf(), from_app(app.clone()))?;
 

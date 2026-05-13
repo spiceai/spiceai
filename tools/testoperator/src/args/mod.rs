@@ -128,6 +128,40 @@ pub struct CommonArgs {
     /// Additional OTLP headers in key=value form. Can be repeated.
     #[arg(long, value_parser = parse_key_val, action = ArgAction::Append, requires = "otlp_endpoint", value_name = "KEY=VALUE")]
     pub(crate) otlp_header: Vec<(String, String)>,
+
+    /// Logical name for the system adapter connection. Surfaced as a metric
+    /// attribute and to the adapter via setup metadata.
+    #[arg(long, default_value = "system_adapter", env = "SYSTEM_ADAPTER")]
+    pub(crate) system_adapter_name: String,
+
+    /// Command to run for a stdio JSON-RPC system adapter. When set, testoperator
+    /// acquires its SUT through the adapter's `setup()` response instead of spawning
+    /// a local spiced or connecting via `--spiced-path`. Mutually exclusive with
+    /// `--system-adapter-http-url`.
+    #[arg(long, group = "system_adapter_option")]
+    pub(crate) system_adapter_stdio_cmd: Option<String>,
+
+    /// Space-delimited argument string passed to the stdio system adapter command.
+    #[arg(long, requires = "system_adapter_stdio_cmd")]
+    pub(crate) system_adapter_stdio_args: Option<String>,
+
+    /// HTTP URL for a remote JSON-RPC system adapter.
+    #[arg(
+        long,
+        conflicts_with = "system_adapter_stdio_cmd",
+        group = "system_adapter_option"
+    )]
+    pub(crate) system_adapter_http_url: Option<String>,
+
+    /// Additional system adapter parameters in key=value form. Forwarded to the
+    /// adapter inside the `setup()` metadata map. Can be repeated.
+    #[arg(long, value_parser = parse_key_val, action = ArgAction::Append, value_name = "KEY=VALUE", requires = "system_adapter_option")]
+    pub(crate) system_adapter_param: Vec<(String, String)>,
+
+    /// Environment variables for stdio system adapter in key=value form. Can be
+    /// repeated. Only applies when --system-adapter-stdio-cmd is set.
+    #[arg(long, value_parser = parse_key_val, action = ArgAction::Append, value_name = "KEY=VALUE", requires = "system_adapter_stdio_cmd")]
+    pub(crate) system_adapter_env: Vec<(String, String)>,
 }
 
 impl CommonArgs {
@@ -135,6 +169,16 @@ impl CommonArgs {
     #[must_use]
     pub fn is_external_instance(&self) -> bool {
         self.spiced_path.starts_with("http://") || self.spiced_path.starts_with("https://")
+    }
+
+    /// Check whether a system adapter has been configured to acquire the SUT.
+    ///
+    /// When true, testoperator drives `setup()` / `teardown()` over JSON-RPC and
+    /// uses the returned Flight URL instead of spawning a local spiced or honoring
+    /// `--spiced-path`.
+    #[must_use]
+    pub fn is_system_adapter(&self) -> bool {
+        self.system_adapter_stdio_cmd.is_some() || self.system_adapter_http_url.is_some()
     }
 
     /// Get the spiced path as a `PathBuf` (only valid when not an external instance)
