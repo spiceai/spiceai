@@ -375,7 +375,7 @@ impl ExecutorRegistry {
     }
 }
 
-/// Returns executors that have both an active connection and a FlightSQL client.
+/// Returns executors that have both an active connection and a `FlightSQL` client.
 fn ready_executors<'a>(
     connections: &'a HashMap<String, ExecutorConnection>,
     flight_sql_clients: &'a HashMap<String, FlightSqlClient>,
@@ -417,7 +417,7 @@ pub(crate) fn get_partitions_from_store(
 ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
     let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
         // No partition metadata — route to a single live executor to avoid duplicate results.
-        let Some((executor_id, (_, client))) = executors.iter().min_by_key(|(id, _)| id.clone())
+        let Some((executor_id, (_, client))) = executors.iter().min_by_key(|(id, _)| id.as_str())
         else {
             tracing::warn!(
                 "No partition assignments for table {table:?} and no connected executors with FlightSQL clients"
