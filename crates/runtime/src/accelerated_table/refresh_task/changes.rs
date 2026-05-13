@@ -1781,7 +1781,7 @@ mod tests {
     // Postgres CDC produces ChangeBatches whose `data` struct has all fields
     // promoted to nullable (so DELETE rows with absent non-PK columns can be
     // written without Arrow rejecting nulls in non-nullable fields).
-    // `coerce_batch_nullability` in `process_upsert_batch` restores the
+    // `try_cast_to` in `process_upsert_batch` restores the
     // accelerator's original nullability before the write.
     // ---------------------------------------------------------------------
 
@@ -1839,7 +1839,7 @@ mod tests {
         ChangeBatch::try_new(record).expect("change batch")
     }
 
-    /// `coerce_batch_nullability` promotes nullable fields to non-nullable
+    /// `try_cast_to` promotes nullable fields to non-nullable
     /// when the target schema declares them as such, and leaves already-
     /// matching fields untouched.
     #[test]
@@ -1864,7 +1864,7 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        let coerced = coerce_batch_nullability(batch, &target_schema).expect("coerce");
+        let coerced = try_cast_to(batch, Arc::clone(&target_schema)).expect("coerce");
 
         assert!(
             !coerced
@@ -1885,7 +1885,7 @@ mod tests {
         assert_eq!(coerced.num_rows(), 2, "row count unchanged");
     }
 
-    /// `coerce_batch_nullability` is a no-op when the batch schema already
+    /// `try_cast_to` is a no-op when the batch schema already
     /// matches the target nullability.
     #[test]
     fn test_coerce_batch_nullability_no_op_when_already_matches() {
@@ -1899,7 +1899,7 @@ mod tests {
         )
         .expect("batch");
 
-        let coerced = coerce_batch_nullability(batch.clone(), &schema).expect("coerce");
+        let coerced = try_cast_to(batch.clone(), Arc::clone(&schema)).expect("coerce");
         assert_eq!(
             coerced.schema(),
             batch.schema(),
@@ -1912,7 +1912,7 @@ mod tests {
     /// accelerator whose schema declares `id` as NOT NULL.
     ///
     /// Before the fix this would have caused a Vortex dtype mismatch that
-    /// silently killed the write task. The `coerce_batch_nullability` step in
+    /// silently killed the write task. The `try_cast_to` step in
     /// `process_upsert_batch` makes the write succeed.
     #[tokio::test]
     async fn test_write_change_nullable_batch_against_non_nullable_accelerator() {
