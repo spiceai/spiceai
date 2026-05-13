@@ -34,7 +34,7 @@ Examples:
   show tables;  -- list available tables
 
   $ spice sql --expanded
-  -- start the REPL in expanded view (column-per-line); toggle at runtime with `.expanded`.
+  # Starts the REPL in expanded view (column-per-line). Toggle at runtime with `.expanded`.
 
 See more at: https://spiceai.org/docs/"#
 )]

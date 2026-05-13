@@ -492,7 +492,15 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         if line.is_empty() {
             continue;
         }
-        let line = match line {
+        // Normalise once so every meta-command arm matches case-insensitively
+        // (the multi-line read loop already breaks out on lower-cased
+        // SPECIAL_COMMANDS, so the dispatch here should agree).  `lower` and
+        // `line` have identical byte lengths because `to_ascii_lowercase`
+        // only touches ASCII bytes, so we can safely index into `line` using
+        // offsets derived from `lower` where we need the original-case input
+        // (e.g., for `describe <Table>` identifiers or `nql <Question>`).
+        let lower = line.to_ascii_lowercase();
+        let line = match lower.as_str() {
             ".exit" | "exit" | "quit" | "q" => break,
             ".error" => {
                 match last_error {
@@ -532,10 +540,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let _ = std::io::stdout().flush();
                 continue;
             }
-            // Match meta-commands case-insensitively: the multi-line read loop already
-            // breaks out on lower-cased SPECIAL_COMMANDS, so `.EXPANDED` should be
-            // recognised here as well rather than fall through to the SQL path.
-            line if line.eq_ignore_ascii_case(".expanded") => {
+            ".expanded" => {
                 expanded = !expanded;
                 println!(
                     "Expanded display is {}.",
@@ -544,13 +549,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let _ = std::io::stdout().flush();
                 continue;
             }
-            line if line.eq_ignore_ascii_case(".expanded on") => {
+            ".expanded on" => {
                 expanded = true;
                 println!("Expanded display is on.");
                 let _ = std::io::stdout().flush();
                 continue;
             }
-            line if line.eq_ignore_ascii_case(".expanded off") => {
+            ".expanded off" => {
                 expanded = false;
                 println!("Expanded display is off.");
                 let _ = std::io::stdout().flush();
@@ -613,15 +618,15 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             "show schemas" | "show schemas;" | "show databases" | "show databases;" => {
                 "select catalog_name, schema_name from information_schema.schemata where schema_name != 'information_schema';"
             }
-            line if {
-                // Match the `describe`/`desc` keyword case-insensitively but keep
-                // the identifier token in its original case.
-                let without_semi = line.trim_end_matches(';').trim();
+            _ if {
+                // `describe`/`desc` is matched case-insensitively via `lower`;
+                // the identifier token is read from the outer `line` so quoted
+                // or mixed-case table names are preserved.
+                let without_semi = lower.trim_end_matches(';').trim();
                 let mut parts = without_semi.splitn(2, char::is_whitespace);
                 let first = parts.next().unwrap_or_default();
                 let rest = parts.next().unwrap_or_default().trim();
-                let kw =
-                    first.eq_ignore_ascii_case("describe") || first.eq_ignore_ascii_case("desc");
+                let kw = first == "describe" || first == "desc";
                 kw && !rest.is_empty() && !rest.contains(char::is_whitespace)
             } =>
             {
@@ -686,13 +691,15 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 }
                 continue;
             }
-            line if line.to_lowercase().starts_with(NQL_LINE_PREFIX) => {
+            _ if lower.starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);
+                // `lower` and `line` have the same byte length, so slicing
+                // off the prefix on the original line yields the user's
+                // original-case question.
+                let question = line[NQL_LINE_PREFIX.len()..].to_string();
                 if let Err(e) = get_and_display_nql_records(
                     repl_config.http_endpoint.clone(),
-                    line.strip_prefix(NQL_LINE_PREFIX)
-                        .unwrap_or(line)
-                        .to_string(),
+                    question,
                     &user_agent,
                     expanded,
                 )
