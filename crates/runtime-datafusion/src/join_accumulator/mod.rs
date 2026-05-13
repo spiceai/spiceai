@@ -258,13 +258,15 @@ impl RangeBounds {
             return Ok(());
         }
 
+        if array.null_count() > 0 {
+            // Short-circuit: physical_expr() returns a no-op when contains_null is true,
+            // so skip the O(n) per-row loop for this and all future batches.
+            self.contains_null = true;
+            return Ok(());
+        }
+
         for row_index in 0..array.len() {
             let value = ScalarValue::try_from_array(array, row_index)?;
-
-            if value.is_null() {
-                self.contains_null = true;
-                continue;
-            }
 
             if !supports_range_comparison(&value) {
                 self.supports_range_filter = false;
