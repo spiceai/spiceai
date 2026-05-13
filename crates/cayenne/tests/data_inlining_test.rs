@@ -22,7 +22,7 @@ mod common;
 
 use arrow::array::{
     Array, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMillisecondArray,
+    TimestampMillisecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -30,11 +30,15 @@ use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, on_conflict::OnConflict,
+};
 use std::sync::Arc;
 
 test_with_backends!(test_inlined_data_crud);
 test_with_backends!(test_small_insert_inlined);
 test_with_backends!(test_inlined_data_visible_in_scan);
+test_with_backends!(test_limit_on_inlined_scan);
 test_with_backends!(test_roundtrip_preserves_values);
 test_with_backends!(test_roundtrip_preserves_nulls);
 test_with_backends!(test_roundtrip_mixed_types);
@@ -42,6 +46,9 @@ test_with_backends!(test_roundtrip_many_small_batches);
 test_with_backends!(test_roundtrip_mixed_inline_and_vortex);
 test_with_backends!(test_roundtrip_across_reopen);
 test_with_backends!(test_roundtrip_exceeds_byte_threshold);
+test_with_backends!(test_pk_upsert_inline_mutation);
+test_with_backends!(test_pk_delete_inline_mutation);
+test_with_backends!(test_pk_auto_checkpoint_preserves_rows);
 
 /// Test basic CRUD for inlined data via the catalog API.
 async fn test_inlined_data_crud(
@@ -225,6 +232,44 @@ async fn test_inlined_data_visible_in_scan(
     Ok(())
 }
 
+async fn test_limit_on_inlined_scan(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let (table, ctx) = create_table(&fixture, "inline_limit", Arc::clone(&schema)).await?;
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+
+    ctx.register_table("inline_limit", Arc::new(table))?;
+    let results = ctx
+        .sql("SELECT id FROM inline_limit ORDER BY id LIMIT 2")
+        .await?
+        .collect()
+        .await?;
+    assert!(!results.is_empty(), "no result batches for LIMIT query");
+    let got = arrow::compute::concat_batches(&results[0].schema(), &results)?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+
+    assert_eq!(got.num_rows(), 2);
+    assert_eq!(ids.values(), &[1_i64, 2]);
+
+    Ok(())
+}
+
 // ============================================================================
 // Round-trip value-level tests
 //
@@ -255,6 +300,210 @@ async fn create_table(
     )
     .await?;
     Ok((table, ctx))
+}
+
+async fn create_pk_upsert_table(
+    fixture: &common::TestFixture,
+    name: &str,
+) -> Result<(Arc<CayenneTableProvider>, SessionContext, String), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            CreateTableOptions {
+                table_name: name.to_string(),
+                schema,
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let table_id = fixture.catalog.get_table(name).await?.table_id;
+
+    Ok((table, ctx, table_id))
+}
+
+async fn collect_delete_count(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let results = ctx.sql(sql).await?.collect().await?;
+    let batch = results.first().ok_or("delete returned no batches")?;
+    let count = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or("delete count should be UInt64")?
+        .value(0);
+    Ok(count)
+}
+
+async fn test_pk_upsert_inline_mutation(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_pk_upsert").await?;
+
+    ctx.sql("INSERT INTO inline_pk_upsert VALUES (1, 'Alice'), (2, 'Bob')")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+
+    ctx.sql("INSERT INTO inline_pk_upsert VALUES (1, 'Alicia')")
+        .await?
+        .collect()
+        .await?;
+
+    let got = collect_sorted(&ctx, "SELECT id, name FROM inline_pk_upsert ORDER BY id").await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 2);
+    assert_eq!(ids.values(), &[1_i64, 2]);
+    assert_eq!(names.value(0), "Alicia");
+    assert_eq!(names.value(1), "Bob");
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+    let mut inlined_record_counts = fixture
+        .catalog
+        .get_inlined_data(&table_id)
+        .await?
+        .into_iter()
+        .map(|entry| entry.record_count)
+        .collect::<Vec<_>>();
+    inlined_record_counts.sort_unstable();
+    assert_eq!(inlined_record_counts, vec![1_i64, 1]);
+    assert_eq!(
+        fixture.catalog.get_inlined_deletes(&table_id).await?.len(),
+        0
+    );
+    assert!(
+        fixture
+            .catalog
+            .get_table_delete_files(&table_id)
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+async fn test_pk_delete_inline_mutation(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_pk_delete").await?;
+
+    ctx.sql("INSERT INTO inline_pk_delete VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Cara')")
+        .await?
+        .collect()
+        .await?;
+
+    let deleted = collect_delete_count(&ctx, "DELETE FROM inline_pk_delete WHERE id = 2").await?;
+    assert_eq!(deleted, 1);
+
+    let got = collect_sorted(&ctx, "SELECT id, name FROM inline_pk_delete ORDER BY id").await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 2);
+    assert_eq!(ids.values(), &[1_i64, 3]);
+    assert_eq!(names.value(0), "Alice");
+    assert_eq!(names.value(1), "Cara");
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+    let inlined_data = fixture.catalog.get_inlined_data(&table_id).await?;
+    assert_eq!(inlined_data.len(), 1);
+    assert_eq!(inlined_data[0].record_count, 2);
+    assert_eq!(
+        fixture.catalog.get_inlined_deletes(&table_id).await?.len(),
+        0
+    );
+    assert!(
+        fixture
+            .catalog
+            .get_table_delete_files(&table_id)
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+async fn test_pk_auto_checkpoint_preserves_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_pk_checkpoint").await?;
+    let schema = table.schema();
+
+    for chunk in 0..10_i64 {
+        let start = chunk * 1_024;
+        let ids = (start..start + 1_024).collect::<Vec<_>>();
+        let names = ids
+            .iter()
+            .map(|id| format!("name_{id}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )?;
+        common::insert_batch(&table, batch).await?;
+    }
+
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 0);
+
+    let got = collect_sorted(
+        &ctx,
+        "SELECT id, name FROM inline_pk_checkpoint WHERE id IN (0, 5120, 10239) ORDER BY id",
+    )
+    .await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+
+    assert_eq!(got.num_rows(), 3);
+    assert_eq!(ids.values(), &[0_i64, 5_120, 10_239]);
+    assert_eq!(names.value(0), "name_0");
+    assert_eq!(names.value(1), "name_5120");
+    assert_eq!(names.value(2), "name_10239");
+
+    Ok(())
 }
 
 /// Collect all rows from `SELECT * FROM t ORDER BY <key>` into a single batch.
