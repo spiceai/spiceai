@@ -17,12 +17,15 @@ limitations under the License.
 //! HTAP test command — runs concurrent TPC-C OLTP workload against the source
 //! PostgreSQL database while executing CH-benCH analytical queries through spiced.
 
+mod staleness;
+
 use std::time::{Duration, Instant};
 
 use test_framework::{
     TestType, anyhow,
+    arrow::util::pretty::print_batches,
     git,
-    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
     spiced::SpicedInstance,
@@ -44,7 +47,13 @@ use crate::{
 
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let test_args = &args.test_args;
-    let (app, start_request) = super::get_app_and_start_request(&test_args.common).await?;
+    let (app, mut start_request) = super::get_app_and_start_request(&test_args.common).await?;
+
+    // Always enable the metrics endpoint in HTAP mode for replication metrics.
+    if !test_args.common.scrape_spiced_metrics {
+        start_request = start_request
+            .with_additional_args(vec!["--metrics".to_string(), "127.0.0.1:9090".to_string()]);
+    }
 
     // 1. Prepare the source (schema + seed data).
     println!("Preparing chbench source...");
@@ -52,6 +61,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     config.warehouses = args.warehouses;
     config.terminals = args.terminals;
     config.duration = Duration::from_secs(test_args.common.duration);
+    let pg_connection_string = config.pg_connection_string();
     let driver = chbench_driver::ChBenchDriver::connect(config).await?;
     driver.prepare().await?;
     println!("chbench source is ready");
@@ -67,7 +77,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         .wait_for_ready(Duration::from_secs(test_args.common.ready_wait))
         .await?;
 
-    let _ready_wait_duration = ready_wait_start.elapsed();
+    let ready_wait_duration = ready_wait_start.elapsed();
 
     // Build telemetry resource.
     let spiced_version = spiced_instance.version().to_string();
@@ -95,11 +105,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     let health_monitor = HealthMonitor::spawn()?;
 
-    let metrics_scraper = if test_args.common.scrape_spiced_metrics {
-        Some(MetricsScraper::spawn()?)
-    } else {
-        None
-    };
+    // Always scrape spiced metrics in HTAP mode — replication metrics are essential.
+    let metrics_scraper = Some(MetricsScraper::spawn()?);
 
     // 3. Start the OLTP workload in the background.
     let oltp_cancel = CancellationToken::new();
@@ -107,6 +114,14 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         let cancel = oltp_cancel.clone();
         tokio::spawn(async move { driver.run(cancel).await })
     };
+
+    // 3b. Start staleness probe alongside the OLTP workload.
+    let staleness_spice_client = spiced_instance.spice_client(None, false).await?;
+    let staleness_handle = staleness::spawn_staleness_probe(
+        pg_connection_string,
+        staleness_spice_client,
+        oltp_cancel.clone(),
+    );
 
     // 4. Run analytical queries through spiced concurrently with the OLTP load.
     println!("Running HTAP analytical queries under OLTP load");
@@ -134,56 +149,59 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
 
-    // 5. Stop OLTP and collect results.
+    // 5. Capture replication metrics while OLTP is still running.
+    //    lag_ms = now() − commit_time(last_processed_txn), so it inflates with idle time
+    //    after OLTP stops. Stopping the scraper here gives accurate under-load values.
+    let spiced_metrics =
+        super::process_spiced_metrics(metrics_scraper, test_args.common.metrics, &[]).await;
+
+    // 6. Stop OLTP and collect results.
     oltp_cancel.cancel();
     let oltp_result = oltp_handle.await;
+    let staleness_result = staleness_handle.await;
 
     // Skip row count consistency validation — OLTP mutations cause row counts to vary between iterations.
-    let _metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
+    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
-    let (_max_memory, _median_memory) = observe_memory(memory_token, memory_readings).await?;
+    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
 
     // 6. Report analytical query metrics.
-    // TODO: Re-enable metrics reporting after reviewing/adjusting for HTAP workload.
-    let failures: Vec<String> = Vec::new();
-    // for query in &metrics.metrics {
-    //     let query_name = &query.query_name;
-    //     let row_count = row_counts.get(query_name).unwrap_or(&0);
-    //     let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
+    let mut failures: Vec<String> = Vec::new();
+    for query in &metrics.metrics {
+        let query_name = &query.query_name;
+        let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
 
-    //     let status: u64 = u64::from(match &query.query_status {
-    //         QueryStatus::Passed => true,
-    //         QueryStatus::Failed(reason) => {
-    //             if let Some(reason) = reason {
-    //                 failures.push(format!("{query_name}: {reason}"));
-    //             } else {
-    //                 failures.push(format!("{query_name}: failed with an undetermined error"));
-    //             }
-    //             false
-    //         }
-    //     });
+        let status: u64 = u64::from(match &query.query_status {
+            QueryStatus::Passed => true,
+            QueryStatus::Failed(reason) => {
+                if let Some(reason) = reason {
+                    failures.push(format!("{query_name}: {reason}"));
+                } else {
+                    failures.push(format!("{query_name}: failed with an undetermined error"));
+                }
+                false
+            }
+        });
 
-    //     crate::metrics::QUERY_STATUS.record(status, &attributes);
-    //     crate::metrics::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
-    //     crate::metrics::MIN_DURATION.record(query.min_duration_ms, &attributes);
-    //     crate::metrics::MAX_DURATION.record(query.max_duration_ms, &attributes);
-    //     crate::metrics::ITERATIONS.record(query.iterations.try_into()?, &attributes);
-    //     crate::metrics::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
-    //     crate::metrics::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
-    //     crate::metrics::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
-    // }
+        crate::metrics::QUERY_STATUS.record(status, &attributes);
+        crate::metrics::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
+        crate::metrics::MIN_DURATION.record(query.min_duration_ms, &attributes);
+        crate::metrics::MAX_DURATION.record(query.max_duration_ms, &attributes);
+        crate::metrics::ITERATIONS.record(query.iterations.try_into()?, &attributes);
+        crate::metrics::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
+        crate::metrics::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
+        crate::metrics::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
+    }
 
-    // crate::metrics::READY_DURATION.record(ready_wait_duration.as_millis().try_into()?, &[]);
-    // crate::metrics::TEST_DURATION
-    //     .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
-    // crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
-    // crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    crate::metrics::READY_DURATION.record(ready_wait_duration.as_millis().try_into()?, &[]);
+    crate::metrics::TEST_DURATION
+        .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
+    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
-    // super::bench::emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path()?)?;
-
-    // let records = metrics.with_memory_usage(max_memory).build_records()?;
-    // print_batches(&records)?;
+    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    print_batches(&records)?;
 
     // 7. Report OLTP results.
     match oltp_result {
@@ -199,8 +217,26 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
+    // 8. Report staleness gap.
+    match staleness_result {
+        Ok(Ok(report)) => {
+            report.print_summary();
+        }
+        Ok(Err(e)) => {
+            eprintln!("Staleness probe error: {e}");
+        }
+        Err(e) => {
+            eprintln!("Staleness probe join error: {e}");
+        }
+    }
+
     let health_report = health_monitor.stop().await;
-    super::process_spiced_metrics(metrics_scraper, test_args.common.metrics, &[]).await;
+
+    // 10. Report native replication metrics from spiced /metrics endpoint.
+    if let Some(ref metrics) = spiced_metrics {
+        print_replication_metrics(metrics);
+    }
+
     telemetry.emit().await?;
     spiced_instance.stop()?;
 
@@ -223,4 +259,86 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Print per-dataset Postgres replication metrics scraped from spiced's `/metrics` endpoint.
+fn print_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
+    use std::collections::BTreeMap;
+
+    // Collect replication metrics per dataset from scraped samples.
+    // Gauges (lag_ms, lag_bytes): use the last observed value — represents the
+    // pipeline state when the scraper stopped (while OLTP was still active).
+    // Counters (inserts, updates, deletes): use the last value (monotonic total).
+    let mut lag_ms: BTreeMap<String, f64> = BTreeMap::new();
+    let mut lag_bytes: BTreeMap<String, f64> = BTreeMap::new();
+    let mut inserts: BTreeMap<String, f64> = BTreeMap::new();
+    let mut updates: BTreeMap<String, f64> = BTreeMap::new();
+    let mut deletes: BTreeMap<String, f64> = BTreeMap::new();
+
+    let gauge_metrics = [
+        ("dataset_postgres_replication_lag_ms", &mut lag_ms as &mut BTreeMap<String, f64>),
+        ("dataset_postgres_replication_lag_bytes", &mut lag_bytes),
+    ];
+    let counter_metrics = [
+        ("dataset_postgres_replication_inserts_total", &mut inserts as &mut BTreeMap<String, f64>),
+        ("dataset_postgres_replication_updates_total", &mut updates),
+        ("dataset_postgres_replication_deletes_total", &mut deletes),
+    ];
+
+    for (metric_name, map) in gauge_metrics {
+        if let Some(samples) = metrics.samples.get(metric_name) {
+            for sample in samples {
+                let dataset = sample
+                    .labels
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                // Gauge: last value wins (overwrites previous).
+                map.insert(dataset, sample.value);
+            }
+        }
+    }
+
+    for (metric_name, map) in counter_metrics {
+        if let Some(samples) = metrics.samples.get(metric_name) {
+            for sample in samples {
+                let dataset = sample
+                    .labels
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                // Counter: last observed value is the total.
+                map.insert(dataset, sample.value);
+            }
+        }
+    }
+
+    if lag_ms.is_empty() && inserts.is_empty() {
+        return;
+    }
+
+    println!("\n--- Replication Metrics (from spiced /metrics) ---");
+    // Header
+    println!(
+        "  {:<14} {:>10} {:>12} {:>10} {:>10} {:>10}",
+        "dataset", "lag_ms", "lag_bytes", "inserts", "updates", "deletes"
+    );
+
+    let all_datasets: BTreeMap<&String, ()> = lag_ms
+        .keys()
+        .chain(inserts.keys())
+        .map(|k| (k, ()))
+        .collect();
+
+    for dataset in all_datasets.keys() {
+        let l_ms = lag_ms.get(*dataset).copied().unwrap_or(0.0);
+        let l_bytes = lag_bytes.get(*dataset).copied().unwrap_or(0.0);
+        let ins = inserts.get(*dataset).copied().unwrap_or(0.0);
+        let upd = updates.get(*dataset).copied().unwrap_or(0.0);
+        let del = deletes.get(*dataset).copied().unwrap_or(0.0);
+        println!(
+            "  {:<14} {:>10.0} {:>12.0} {:>10.0} {:>10.0} {:>10.0}",
+            dataset, l_ms, l_bytes, ins, upd, del
+        );
+    }
 }

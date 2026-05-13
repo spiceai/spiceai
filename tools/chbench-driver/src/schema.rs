@@ -323,5 +323,92 @@ pub async fn create_tables(client: &Client) -> Result<()> {
         })?;
     }
 
+    // Add _bench_ts column and trigger to all mutated TPC-C tables.
+    // Used for staleness gap measurement between Postgres and Spice accelerated copy.
+    add_bench_ts_column_and_triggers(client).await?;
+
+    Ok(())
+}
+
+/// Tables mutated by TPC-C transactions. `_bench_ts` is added only to these.
+/// `item`, `nation`, `region`, `supplier` are static reference tables.
+const MUTATED_TABLES: &[&str] = &[
+    "warehouse",
+    "district",
+    "customer",
+    "history",
+    "new_order",
+    "orders",
+    "order_line",
+    "stock",
+];
+
+/// Tables probed for staleness gap measurement.
+/// Selected for diversity: district (small, baseline), order_line (high volume),
+/// new_order (DELETE path), history (append-only, no PK).
+pub const STALENESS_PROBE_TABLES: &[&str] = &["district", "order_line", "new_order"];
+
+/// Add `_bench_ts TIMESTAMPTZ` column with `clock_timestamp()` default and
+/// a `BEFORE INSERT OR UPDATE` trigger to all mutated TPC-C tables.
+///
+/// Uses `clock_timestamp()` (wall-clock time per statement) instead of `now()`
+/// (transaction-start time) for accurate per-row timing.
+async fn add_bench_ts_column_and_triggers(client: &Client) -> Result<()> {
+    // Create the shared trigger function once.
+    client
+        .execute(
+            "CREATE OR REPLACE FUNCTION bench_ts_trigger()
+             RETURNS TRIGGER AS $$
+             BEGIN
+                 NEW._bench_ts := clock_timestamp();
+                 RETURN NEW;
+             END;
+             $$ LANGUAGE plpgsql",
+            &[],
+        )
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "create bench_ts_trigger function".into(),
+            source,
+        })?;
+
+    for table in MUTATED_TABLES {
+        // Add column with default for seed data rows.
+        let add_col = format!(
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS _bench_ts TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()"
+        );
+        client.execute(&add_col, &[]).await.map_err(|source| {
+            crate::Error::Sql {
+                action: format!("add _bench_ts column to {table}"),
+                source,
+            }
+        })?;
+
+        // Attach the trigger (idempotent via DROP IF EXISTS + CREATE).
+        let trigger_name = format!("trg_bench_ts_{table}");
+        let drop_trg = format!("DROP TRIGGER IF EXISTS {trigger_name} ON {table}");
+        client.execute(&drop_trg, &[]).await.map_err(|source| {
+            crate::Error::Sql {
+                action: format!("drop trigger {trigger_name}"),
+                source,
+            }
+        })?;
+
+        let create_trg = format!(
+            "CREATE TRIGGER {trigger_name} BEFORE INSERT OR UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION bench_ts_trigger()"
+        );
+        client
+            .execute(&create_trg, &[])
+            .await
+            .map_err(|source| crate::Error::Sql {
+                action: format!("create trigger {trigger_name}"),
+                source,
+            })?;
+    }
+
+    println!(
+        "  added _bench_ts column + trigger to {} tables",
+        MUTATED_TABLES.len()
+    );
     Ok(())
 }
