@@ -690,18 +690,58 @@ struct BatchValidationResult {
     deleted_inlined_row_keys: Vec<Box<[u8]>>,
 }
 
+pub(crate) struct PreparedInsertStream {
+    pub(crate) stream: SendableRecordBatchStream,
+    pub(crate) on_conflict_deletions: OnConflictDeletions,
+}
+
+#[derive(Default)]
+pub(crate) struct OnConflictDeletions {
+    pub(crate) delete_specs: HashMap<i64, Vec<i64>>,
+    /// Deleted file-backed Int64 PK values (for `Int64Pk` strategy).
+    pub(crate) deleted_pk_i64: Vec<i64>,
+    /// Deleted file-backed row keys (for `RowConverterBased` strategy).
+    pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
+    /// Deleted inlined Int64 PK values.
+    pub(crate) deleted_inlined_pk_i64: Vec<i64>,
+    /// Deleted inlined row keys.
+    pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+}
+
+impl OnConflictDeletions {
+    #[must_use]
+    pub(crate) fn has_file_deletions(&self) -> bool {
+        !self.delete_specs.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn has_inlined_deletions(&self) -> bool {
+        !self.deleted_inlined_pk_i64.is_empty() || !self.deleted_inlined_row_keys.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.has_file_deletions() && !self.has_inlined_deletions()
+    }
+
+    #[must_use]
+    pub(crate) fn file_delete_specs_count(&self) -> usize {
+        self.delete_specs.len()
+    }
+
+    #[must_use]
+    pub(crate) fn deleted_key_count(&self) -> usize {
+        self.deleted_pk_i64.len()
+            + self.deleted_row_keys.len()
+            + self.deleted_inlined_pk_i64.len()
+            + self.deleted_inlined_row_keys.len()
+    }
+}
+
 /// Result of on-conflict validation containing deleted PK information.
 struct OnConflictValidationResult {
     filtered_batches: Vec<RecordBatch>,
-    delete_specs: HashMap<i64, Vec<i64>>,
-    /// Deleted file-backed Int64 PK values (for `Int64Pk` strategy).
-    deleted_pk_i64: Vec<i64>,
-    /// Deleted file-backed row keys (for `RowConverterBased` strategy).
-    deleted_row_keys: Vec<Box<[u8]>>,
-    /// Deleted inlined Int64 PK values.
-    deleted_inlined_pk_i64: Vec<i64>,
-    /// Deleted inlined row keys.
-    deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    on_conflict_deletions: OnConflictDeletions,
 }
 
 struct OnConflictContext<'a> {
@@ -2324,23 +2364,12 @@ impl CayenneTableProvider {
     pub(crate) async fn prepare_stream_for_insert(
         &self,
         stream: SendableRecordBatchStream,
-    ) -> Result<(
-        SendableRecordBatchStream,
-        HashMap<i64, Vec<i64>>,
-        Vec<i64>,
-        Vec<Box<[u8]>>,
-        Vec<i64>,
-        Vec<Box<[u8]>>,
-    )> {
+    ) -> Result<PreparedInsertStream> {
         let Some(pk_indices) = self.primary_key_indices()? else {
-            return Ok((
+            return Ok(PreparedInsertStream {
                 stream,
-                HashMap::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ));
+                on_conflict_deletions: OnConflictDeletions::default(),
+            });
         };
 
         let converter = self.build_pk_converter(&pk_indices)?;
@@ -2365,14 +2394,10 @@ impl CayenneTableProvider {
             futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok)),
         );
 
-        Ok((
-            Box::pin(validated_stream) as SendableRecordBatchStream,
-            validation_result.delete_specs,
-            validation_result.deleted_pk_i64,
-            validation_result.deleted_row_keys,
-            validation_result.deleted_inlined_pk_i64,
-            validation_result.deleted_inlined_row_keys,
-        ))
+        Ok(PreparedInsertStream {
+            stream: Box::pin(validated_stream) as SendableRecordBatchStream,
+            on_conflict_deletions: validation_result.on_conflict_deletions,
+        })
     }
 
     /// Validate incoming batches against primary key uniqueness and configured on-conflict behavior.
@@ -2448,11 +2473,13 @@ impl CayenneTableProvider {
 
         Ok(OnConflictValidationResult {
             filtered_batches,
-            delete_specs,
-            deleted_pk_i64: all_deleted_pk_i64,
-            deleted_row_keys: all_deleted_row_keys,
-            deleted_inlined_pk_i64: all_deleted_inlined_pk_i64,
-            deleted_inlined_row_keys: all_deleted_inlined_row_keys,
+            on_conflict_deletions: OnConflictDeletions {
+                delete_specs,
+                deleted_pk_i64: all_deleted_pk_i64,
+                deleted_row_keys: all_deleted_row_keys,
+                deleted_inlined_pk_i64: all_deleted_inlined_pk_i64,
+                deleted_inlined_row_keys: all_deleted_inlined_row_keys,
+            },
         })
     }
 
@@ -2856,12 +2883,16 @@ impl CayenneTableProvider {
     /// PK value + sequence number for proper ordering of concurrent operations.
     pub(crate) async fn apply_on_conflict_deletions(
         &self,
-        delete_specs: HashMap<i64, Vec<i64>>,
-        deleted_pk_i64: Vec<i64>,
-        deleted_row_keys: Vec<Box<[u8]>>,
-        deleted_inlined_pk_i64: Vec<i64>,
-        deleted_inlined_row_keys: Vec<Box<[u8]>>,
+        on_conflict_deletions: OnConflictDeletions,
     ) -> CatalogResult<()> {
+        let OnConflictDeletions {
+            delete_specs,
+            deleted_pk_i64,
+            deleted_row_keys,
+            deleted_inlined_pk_i64,
+            deleted_inlined_row_keys,
+        } = on_conflict_deletions;
+
         let has_file_deletions = !delete_specs.is_empty();
         let has_inlined_deletions =
             !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty();
@@ -5252,7 +5283,13 @@ impl TableProvider for CayenneTableProvider {
             plan
         };
 
-        let mut plan: Arc<dyn ExecutionPlan> = if let Some(limit) = limit {
+        let mut plan: Arc<dyn ExecutionPlan> = if limit.is_none() {
+            round_robin_repartition_if_needed(Arc::clone(&plan), target_partitions)?.unwrap_or(plan)
+        } else {
+            plan
+        };
+
+        plan = if let Some(limit) = limit {
             let local_limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(plan, limit));
             let single_partition: Arc<dyn ExecutionPlan> =
                 Arc::new(CoalescePartitionsExec::new(local_limit));
@@ -5260,12 +5297,6 @@ impl TableProvider for CayenneTableProvider {
         } else {
             plan
         };
-
-        if let Some(repartitioned_plan) =
-            round_robin_repartition_if_needed(Arc::clone(&plan), target_partitions)?
-        {
-            plan = repartitioned_plan;
-        }
 
         // Strip extra columns (PK or retention time column) added to the projection
         // but not originally requested by the query.

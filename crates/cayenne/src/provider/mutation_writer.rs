@@ -29,6 +29,7 @@ use super::constants::STAGING_DIR_NAME;
 use super::context::CayenneContext;
 use super::table::{
     CayenneTableProvider, ColumnStatsAccumulator, INLINE_MAX_BUFFER_BYTES, INLINE_MAX_ROWS,
+    PreparedInsertStream,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,25 +152,18 @@ impl<'a> AppendMutationWriter<'a> {
             );
         }
 
-        let (
-            mut prepared_stream,
-            delete_specs,
-            deleted_pk_i64,
-            deleted_row_keys,
-            deleted_inlined_pk_i64,
-            deleted_inlined_row_keys,
-        ) = self.table.prepare_stream_for_insert(data).await?;
+        let PreparedInsertStream {
+            stream: mut prepared_stream,
+            on_conflict_deletions,
+        } = self.table.prepare_stream_for_insert(data).await?;
 
-        let has_file_on_conflict_deletions = !delete_specs.is_empty();
-        let has_inlined_on_conflict_deletions =
-            !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty();
-        let has_on_conflict_deletions =
-            has_file_on_conflict_deletions || has_inlined_on_conflict_deletions;
+        let has_file_on_conflict_deletions = on_conflict_deletions.has_file_deletions();
+        let has_on_conflict_deletions = !on_conflict_deletions.is_empty();
 
         tracing::debug!(
-            "write_all_append: delete_specs={} files, deleted_pk_i64={} keys, pending_deletions={}, on_conflict_deletions={}",
-            delete_specs.len(),
-            deleted_pk_i64.len() + deleted_inlined_pk_i64.len(),
+            "write_all_append: delete_specs={} files, deleted_keys={} keys, pending_deletions={}, on_conflict_deletions={}",
+            on_conflict_deletions.file_delete_specs_count(),
+            on_conflict_deletions.deleted_key_count(),
             pending_pk_deletions,
             has_on_conflict_deletions
         );
@@ -190,8 +184,8 @@ impl<'a> AppendMutationWriter<'a> {
             match self
                 .try_inline_or_restream(
                     prepared_stream,
-                    &deleted_inlined_pk_i64,
-                    &deleted_inlined_row_keys,
+                    &on_conflict_deletions.deleted_inlined_pk_i64,
+                    &on_conflict_deletions.deleted_inlined_row_keys,
                 )
                 .await?
             {
@@ -204,13 +198,7 @@ impl<'a> AppendMutationWriter<'a> {
                         .await?;
 
                     self.table
-                        .apply_on_conflict_deletions(
-                            delete_specs,
-                            deleted_pk_i64,
-                            deleted_row_keys,
-                            deleted_inlined_pk_i64,
-                            deleted_inlined_row_keys,
-                        )
+                        .apply_on_conflict_deletions(on_conflict_deletions)
                         .await?;
 
                     let retention_deleted_rows = self.apply_retention_if_configured().await?;
@@ -228,13 +216,7 @@ impl<'a> AppendMutationWriter<'a> {
 
         let (total_rows, write_stats_acc) = if needs_new_snapshot {
             self.table
-                .apply_on_conflict_deletions(
-                    delete_specs,
-                    deleted_pk_i64,
-                    deleted_row_keys,
-                    deleted_inlined_pk_i64,
-                    deleted_inlined_row_keys,
-                )
+                .apply_on_conflict_deletions(on_conflict_deletions)
                 .await?;
 
             let new_sequence = self
@@ -259,13 +241,7 @@ impl<'a> AppendMutationWriter<'a> {
             );
 
             self.table
-                .apply_on_conflict_deletions(
-                    delete_specs,
-                    deleted_pk_i64,
-                    deleted_row_keys,
-                    deleted_inlined_pk_i64,
-                    deleted_inlined_row_keys,
-                )
+                .apply_on_conflict_deletions(on_conflict_deletions)
                 .await?;
 
             (rows, stats_acc)
