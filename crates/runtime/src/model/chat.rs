@@ -564,6 +564,13 @@ async fn file(
         });
     }
 
+    let trust_pickle = parse_trust_pickle(params)?;
+    llms::chat::reject_unsafe_weight_formats(model_weights.as_slice(), trust_pickle).map_err(
+        |source| LlmError::FailedToLoadModel {
+            source: Box::new(source),
+        },
+    )?;
+
     let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
     let tokenizer_config_path = component.find_any_file_path(ModelFileType::TokenizerConfig);
     let config_path = component.find_any_file_path(ModelFileType::Config);
@@ -580,6 +587,27 @@ async fn file(
         chat_template_literal,
     )
     .await
+}
+
+/// Parse the boolean `trust_pickle` model parameter. Defaults to `false`
+/// — pickle weight files (.pt / .pth / .ckpt / .bin) execute arbitrary
+/// code on load, so the runtime refuses them unless the operator opts
+/// in for a fully trusted source.
+#[cfg(feature = "models")]
+fn parse_trust_pickle(params: &Parameters) -> Result<bool, LlmError> {
+    let Some(raw) = params.get("trust_pickle").expose().ok() else {
+        return Ok(false);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" => Ok(true),
+        "false" | "no" | "0" | "" => Ok(false),
+        other => Err(LlmError::InvalidParamValueError {
+            param: "trust_pickle".to_string(),
+            message: format!(
+                "Must be one of 'true', 'false', 'yes', 'no', '1', or '0', got '{other}'"
+            ),
+        }),
+    }
 }
 
 // Get OpenAI compatible request parameter overrides.

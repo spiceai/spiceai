@@ -27,7 +27,7 @@ use aws_sdk_dynamodb::types::AttributeValue as DynamoDbAttributeValue;
 use aws_sdk_dynamodbstreams::types::AttributeValue as StreamsAttributeValue;
 use aws_sdk_dynamodbstreams::types::OperationType;
 use datafusion::error::DataFusionError;
-use dynamodb_streams::StreamResult;
+use dynamodb_streams::DynamoDBStreamBatch;
 use dynamodb_streams::checkpoint::Checkpoint;
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -119,14 +119,13 @@ fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArra
 // This function is used for processing stream batches which have checkpoints.
 // Incoming batches are from DynamoDB Streams.
 pub fn process_batch(
-    batch: StreamResult,
+    batch: DynamoDBStreamBatch,
     table_schema: &Arc<Schema>,
     primary_keys: &[String],
     unnest_depth: Option<usize>,
     time_format: &str,
     json_nesting: Option<&JsonNesting>,
 ) -> Result<(ChangeBatch, Checkpoint, Option<SystemTime>), StreamError> {
-    let batch = batch.context(FailedToReceiveMessageSnafu)?;
     let records = batch.records;
 
     let changes_schema = changes_schema(table_schema);
@@ -304,15 +303,14 @@ mod tests {
             .build()
     }
 
-    #[expect(clippy::unnecessary_wraps)]
-    fn create_stream_result(records: Vec<Record>) -> StreamResult {
-        Ok(DynamoDBStreamBatch {
+    fn create_stream_result(records: Vec<Record>) -> DynamoDBStreamBatch {
+        DynamoDBStreamBatch {
             records,
             checkpoint: Checkpoint {
                 shards: HashMap::default(),
             },
             watermark: None,
-        })
+        }
     }
 
     mod process_batch {
