@@ -282,7 +282,56 @@ impl PartitionService {
             .await
             .context(PartitionStoreRefreshSnafu)?;
 
-        self.discover_and_apply_blocking(table, &partition_by, ops, &config)
+        // Submit a partition discovery job and poll synchronously until it
+        // completes or the discovery timeout is reached.  This preserves the
+        // on-demand semantics of reconcile_table (caller expects partitions to
+        // be up-to-date before returning) while routing discovery through the
+        // same Ballista job machinery used by the periodic scheduler tick.
+        let partition_expressions: Vec<String> =
+            partition_by.iter().map(|p| p.expression.clone()).collect();
+        let job_id = ops
+            .submit_discovery_job(table, &partition_by)
+            .await
+            .map_err(|e| Error::DiscoveryFailed {
+                table: table.to_string(),
+                source: e,
+            })?;
+        tracing::info!(table = %table, job_id = %job_id, "Submitted on-demand partition discovery job");
+
+        let deadline = tokio::time::Instant::now() + config.discovery_timeout;
+        let values = loop {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    table = %table,
+                    job_id = %job_id,
+                    timeout = ?config.discovery_timeout,
+                    "On-demand partition discovery timed out; skipping diff"
+                );
+                return Ok(());
+            }
+            match ops.poll_discovery_job(&job_id, &partition_expressions).await {
+                Ok(crate::context::DiscoveryJobPollResult::Completed(values)) => {
+                    break values;
+                }
+                Ok(crate::context::DiscoveryJobPollResult::Failed(msg)) => {
+                    return Err(Error::DiscoveryFailed {
+                        table: table.to_string(),
+                        source: msg.into(),
+                    });
+                }
+                Ok(crate::context::DiscoveryJobPollResult::StillRunning) => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    return Err(Error::DiscoveryFailed {
+                        table: table.to_string(),
+                        source: e,
+                    });
+                }
+            }
+        };
+
+        self.diff_and_apply(table, &partition_by, values, ops)
             .await?;
 
         self.partition_store

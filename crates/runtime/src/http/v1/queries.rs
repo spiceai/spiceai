@@ -334,6 +334,13 @@ pub(crate) async fn submit(
         Ok(e) => e,
         Err(resp) => return resp,
     };
+    // `allow_accelerated_tables` is an internal flag for partition-discovery
+    // jobs submitted programmatically. Ignore it from external API callers to
+    // prevent bypassing the accelerated-table restriction in distributed queries.
+    let request = SubmitQueryRequest {
+        allow_accelerated_tables: false,
+        ..request
+    };
     let result = executor.submit(request, read_only).await;
 
     match result {

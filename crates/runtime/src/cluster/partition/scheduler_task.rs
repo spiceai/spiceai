@@ -116,7 +116,7 @@ impl PartitionAssignmentTask {
                 _ = interval.tick() => {
                     let cycle_start = Instant::now();
 
-                    match self.run_assignment_cycle().await {
+                    match self.run_management_cycle().await {
                         Ok(()) => {
                             self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
                         }

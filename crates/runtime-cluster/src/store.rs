@@ -551,7 +551,9 @@ impl PartitionStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the table metadata doesn't exist or if the OCC mutation fails.
+    /// Returns an error if the OCC mutation fails. When table metadata does not
+    /// exist yet the call is a no-op (returns `Ok(())`); callers that need the
+    /// metadata to exist first should call `initialize_metadata` beforehand.
     pub async fn set_discovery_job_id(
         &self,
         table: &TableReference,

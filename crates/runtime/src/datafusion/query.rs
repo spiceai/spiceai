@@ -464,26 +464,30 @@ impl Query {
         // or Cayenne catalog tables. Internal callers (e.g. partition discovery) set
         // `allow_accelerated` to bypass the accelerated-table check — they query the
         // federated source through the scheduler's AcceleratedTable wrapper.
-        if !self.allow_accelerated {
-            for tr in &input_tables {
-                if self.df.is_accelerated(tr).await {
-                    return Err(Error::AcceleratedTableNotSupportedInDistributedQuery {
-                        table: tr.to_string(),
-                    });
-                }
-                if self.df.is_cayenne_catalog(tr) {
-                    return Err(Error::CayenneCatalogTableNotSupportedInDistributedQuery {
-                        table: tr.to_string(),
-                    });
-                }
+        // Cayenne is always blocked regardless of allow_accelerated, as distributed
+        // Cayenne catalog queries are not yet supported.
+        for tr in &input_tables {
+            if self.df.is_cayenne_catalog(tr) {
+                return Err(Error::CayenneCatalogTableNotSupportedInDistributedQuery {
+                    table: tr.to_string(),
+                });
+            }
+            if !self.allow_accelerated && self.df.is_accelerated(tr).await {
+                return Err(Error::AcceleratedTableNotSupportedInDistributedQuery {
+                    table: tr.to_string(),
+                });
             }
         }
 
-        // All tables verified non-accelerated above
-        tracker = tracker.map(|mut t| {
-            t.is_accelerated = Some(false);
-            t
-        });
+        // Tables verified non-accelerated above (unless allow_accelerated was set by
+        // an internal caller, in which case they are intentionally querying through
+        // the AcceleratedTable wrapper and we leave is_accelerated unset).
+        if !self.allow_accelerated {
+            tracker = tracker.map(|mut t| {
+                t.is_accelerated = Some(false);
+                t
+            });
+        }
 
         let datasets = Arc::new(input_tables);
         let tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));

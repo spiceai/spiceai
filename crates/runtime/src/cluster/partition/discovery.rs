@@ -233,6 +233,15 @@ pub fn batches_to_partition_values(
         let num_rows = batch.num_rows();
         let num_cols = batch.num_columns();
 
+        if num_cols != partition_expressions.len() {
+            return Err(format!(
+                "partition discovery result has {num_cols} column(s) but expected {} \
+                 (one per partition expression: {partition_expressions:?})",
+                partition_expressions.len()
+            )
+            .into());
+        }
+
         for row_idx in 0..num_rows {
             let mut value_parts = HashMap::new();
             for col_idx in 0..num_cols {
