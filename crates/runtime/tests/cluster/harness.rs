@@ -140,6 +140,14 @@ pub struct ClusterHarness {
     executor_manager: ExecutorManager,
     /// Executor registry for checking flight SQL client readiness.
     executor_registry: Option<Arc<ExecutorRegistry>>,
+    /// PKI infrastructure for creating new executor certs (late-join support).
+    pki: test_framework::pki::PkiConfig,
+    /// Scheduler's cluster advertise address.
+    scheduler_cluster_addr: String,
+    /// Keep the temp directory alive for the harness lifetime.
+    _tempdir: Arc<tempfile::TempDir>,
+    /// Counter for naming dynamically added executors.
+    next_executor_index: usize,
 }
 
 impl Drop for ClusterHarness {
@@ -219,6 +227,34 @@ impl ClusterHarness {
     /// Run `EXPLAIN <sql>` through the scheduler and collect all result batches.
     pub async fn explain(&self, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
         self.query(&format!("EXPLAIN {sql}")).await
+    }
+
+    /// Start and register a new executor after the cluster is already running.
+    ///
+    /// This is used to test late-join scenarios (e.g. DDL replay on join).
+    /// The executor is added to `self.executors` and its server handle to `self.handles`.
+    pub async fn add_executor(
+        &mut self,
+        app: Option<App>,
+    ) -> Result<(), anyhow::Error> {
+        let i = self.next_executor_index;
+        self.next_executor_index += 1;
+        let label = format!("executor{i}");
+
+        let executor_app =
+            app.unwrap_or_else(|| AppBuilder::new(format!("test_{label}")).build());
+
+        let (executor_rt, executor_handle) = start_executor(
+            &label,
+            executor_app,
+            &self.pki,
+            &self.scheduler_cluster_addr,
+        )
+        .await?;
+
+        self.executors.push(executor_rt);
+        self.handles.push(executor_handle);
+        Ok(())
     }
 
     /// Orderly shutdown: shut down every runtime then abort server handles.
@@ -361,71 +397,11 @@ impl ClusterHarnessBuilder {
 
         for (i, maybe_app) in self.executor_apps.into_iter().enumerate() {
             let label = format!("executor{i}");
-
-            let executor_ports = NodePorts::allocate();
-
-            let executor_cert = pki.create_client_cert(&label).map_err(anyhow::Error::msg)?;
-
             let executor_app =
                 maybe_app.unwrap_or_else(|| AppBuilder::new(format!("test_{label}")).build());
 
-            tracing::warn!(
-                "Executor {i}: Ports: {executor_ports:?}. Scheduler: {scheduler_cluster_addr}",
-            );
-            let executor_config = Config {
-                http_bind_address: executor_ports.http_addr(),
-                flight_bind_address: executor_ports.flight_addr(),
-                cluster: ClusterConfig {
-                    role: Some(ClusterRole::Executor),
-                    node_bind_address: executor_ports.cluster_addr(),
-                    scheduler_address: Some(scheduler_cluster_addr.clone()),
-                    node_advertise_address: Some("127.0.0.1".to_string()),
-                    node_mtls_ca_certificate_file: Some(
-                        pki.ca_cert_path.to_string_lossy().to_string(),
-                    ),
-                    node_mtls_certificate_file: Some(
-                        executor_cert.cert_path.to_string_lossy().to_string(),
-                    ),
-                    node_mtls_key_file: Some(executor_cert.key_path.to_string_lossy().to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-
-            let executor_rt = Arc::new(
-                Runtime::builder()
-                    .with_runtime_config(executor_config.clone())
-                    .with_resolved_cluster_config(
-                        ResolvedClusterConfig::try_new(executor_config.cluster.clone())
-                            .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
-                    )
-                    .with_app(executor_app)
-                    .build()
-                    .await,
-            );
-
-            let cloned = Arc::clone(&executor_rt);
-            let mut executor_handle = tokio::spawn(async move {
-                Box::pin(cloned.start_servers(executor_config, None, EndpointAuth::no_auth())).await
-            });
-
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
-                    return Err(anyhow::Error::msg(format!(
-                        "Timed out waiting for {label} to start"
-                    )));
-                }
-                result = &mut executor_handle => {
-                    return Err(anyhow::Error::msg(match result {
-                        Ok(Ok(())) => format!("{label} server thread finished unexpectedly"),
-                        Ok(Err(e)) => format!("{label} server failed to start: {e}"),
-                        Err(e)    => format!("{label} server thread panicked: {e}"),
-                    }));
-                }
-                () = Arc::clone(&executor_rt).load_components() => {}
-            }
-
-            runtime_ready_check(&executor_rt).await;
+            let (executor_rt, executor_handle) =
+                start_executor(&label, executor_app, &pki, &scheduler_cluster_addr).await?;
 
             executor_rts.push(executor_rt);
             handles.push(executor_handle);
@@ -451,6 +427,10 @@ impl ClusterHarnessBuilder {
             handles,
             executor_manager,
             executor_registry,
+            pki,
+            scheduler_cluster_addr,
+            _tempdir: tempdir,
+            next_executor_index: n_executors,
         })
     }
 }
@@ -458,6 +438,80 @@ impl ClusterHarnessBuilder {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build, start, and wait for one executor node.
+///
+/// Shared by [`ClusterHarnessBuilder::start`] (initial executors) and
+/// [`ClusterHarness::add_executor`] (late-joining executors).
+async fn start_executor(
+    label: &str,
+    app: App,
+    pki: &test_framework::pki::PkiConfig,
+    scheduler_cluster_addr: &str,
+) -> Result<(Arc<Runtime>, JoinHandle<RuntimeResult<()>>), anyhow::Error> {
+    let executor_ports = NodePorts::allocate();
+    let executor_cert = pki
+        .create_client_cert(label)
+        .map_err(anyhow::Error::msg)?;
+
+    tracing::warn!("{label}: Ports: {executor_ports:?}. Scheduler: {scheduler_cluster_addr}");
+    let executor_config = Config {
+        http_bind_address: executor_ports.http_addr(),
+        flight_bind_address: executor_ports.flight_addr(),
+        cluster: ClusterConfig {
+            role: Some(ClusterRole::Executor),
+            node_bind_address: executor_ports.cluster_addr(),
+            scheduler_address: Some(scheduler_cluster_addr.to_string()),
+            node_advertise_address: Some("127.0.0.1".to_string()),
+            node_mtls_ca_certificate_file: Some(
+                pki.ca_cert_path.to_string_lossy().to_string(),
+            ),
+            node_mtls_certificate_file: Some(
+                executor_cert.cert_path.to_string_lossy().to_string(),
+            ),
+            node_mtls_key_file: Some(executor_cert.key_path.to_string_lossy().to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let executor_rt = Arc::new(
+        Runtime::builder()
+            .with_runtime_config(executor_config.clone())
+            .with_resolved_cluster_config(
+                ResolvedClusterConfig::try_new(executor_config.cluster.clone())
+                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
+            )
+            .with_app(app)
+            .build()
+            .await,
+    );
+
+    let cloned = Arc::clone(&executor_rt);
+    let mut executor_handle = tokio::spawn(async move {
+        Box::pin(cloned.start_servers(executor_config, None, EndpointAuth::no_auth())).await
+    });
+
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_secs(60)) => {
+            return Err(anyhow::Error::msg(format!(
+                "Timed out waiting for {label} to start"
+            )));
+        }
+        result = &mut executor_handle => {
+            return Err(anyhow::Error::msg(match result {
+                Ok(Ok(())) => format!("{label} server thread finished unexpectedly"),
+                Ok(Err(e)) => format!("{label} server failed to start: {e}"),
+                Err(e)    => format!("{label} server thread panicked: {e}"),
+            }));
+        }
+        () = Arc::clone(&executor_rt).load_components() => {}
+    }
+
+    runtime_ready_check(&executor_rt).await;
+
+    Ok((executor_rt, executor_handle))
+}
 
 async fn wait_for_tcp(addr: &str, timeout: Duration) {
     let start = Instant::now();
