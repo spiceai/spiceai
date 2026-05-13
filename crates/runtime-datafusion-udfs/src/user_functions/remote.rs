@@ -1182,7 +1182,7 @@ fn ipv4_addr_is_global_endpoint(ip: Ipv4Addr) -> bool {
         || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000)
         || ip.is_loopback()
         || ip.is_link_local()
-        || (matches!(octets, [192, 0, 0, d] if d != 9 && d != 10))
+        || matches!(octets, [192, 0, 0, _])
         || ip.is_documentation()
         || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
         || ip.is_multicast()
@@ -2136,6 +2136,8 @@ mod tests {
             "http://172.16.0.1/udf",
             "http://0.0.0.0/udf",
             "http://0.0.0.1/udf",
+            "http://192.0.0.9/udf",
+            "http://192.0.0.10/udf",
             "http://192.0.2.1/udf",
             "http://198.18.0.1/udf",
             "http://localhost/udf",
