@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::{
+    any::type_name,
     cmp::Ordering,
     collections::HashSet,
     sync::{
@@ -24,10 +25,20 @@ use std::{
 };
 
 use arrow::{
-    array::{Array, RecordBatch},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    array::{
+        Array, GenericStringArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringViewArray,
+    },
+    compute::{max, max_string, max_string_view, min, min_string, min_string_view},
+    datatypes::{
+        ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal32Type, Decimal64Type,
+        Decimal128Type, Decimal256Type, Field, Float16Type, Float32Type, Float64Type, Int8Type,
+        Int16Type, Int32Type, Int64Type, Schema, SchemaRef, Time32MillisecondType,
+        Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimeUnit,
+        TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    },
 };
-use datafusion::error::Result as DataFusionResult;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::{
     logical_expr::Operator,
     physical_plan::{
@@ -278,24 +289,28 @@ impl RangeBounds {
 
         if array.null_count() > 0 {
             // Short-circuit: physical_expr() returns a no-op when contains_null is true,
-            // so skip the O(n) per-row loop for this and all future batches.
+            // so skip bound calculation for this and all future batches.
             self.contains_null = true;
             return Ok(());
         }
 
-        for row_index in 0..array.len() {
-            let value = ScalarValue::try_from_array(array, row_index)?;
+        let RangeBatchBounds::Values {
+            min_value,
+            max_value,
+        } = min_max_values(array)?
+        else {
+            self.supports_range_filter = false;
+            return Ok(());
+        };
 
-            if !supports_range_comparison(&value) {
-                self.supports_range_filter = false;
-                return Ok(());
-            }
+        if !supports_range_comparison(&min_value) || !supports_range_comparison(&max_value) {
+            self.supports_range_filter = false;
+            return Ok(());
+        }
 
-            self.update_value(value);
-
-            if !self.supports_range_filter {
-                return Ok(());
-            }
+        self.update_value(min_value);
+        if self.supports_range_filter {
+            self.update_value(max_value);
         }
 
         Ok(())
@@ -358,6 +373,156 @@ impl RangeBounds {
 
         Arc::new(BinaryExpr::new(lower_bound, Operator::And, upper_bound))
     }
+}
+
+enum RangeBatchBounds {
+    Values {
+        min_value: ScalarValue,
+        max_value: ScalarValue,
+    },
+    Unsupported,
+}
+
+fn min_max_values(array: &dyn Array) -> DataFusionResult<RangeBatchBounds> {
+    match array.data_type() {
+        DataType::Int8 => primitive_min_max::<Int8Type, _>(array, ScalarValue::Int8),
+        DataType::Int16 => primitive_min_max::<Int16Type, _>(array, ScalarValue::Int16),
+        DataType::Int32 => primitive_min_max::<Int32Type, _>(array, ScalarValue::Int32),
+        DataType::Int64 => primitive_min_max::<Int64Type, _>(array, ScalarValue::Int64),
+        DataType::UInt8 => primitive_min_max::<UInt8Type, _>(array, ScalarValue::UInt8),
+        DataType::UInt16 => primitive_min_max::<UInt16Type, _>(array, ScalarValue::UInt16),
+        DataType::UInt32 => primitive_min_max::<UInt32Type, _>(array, ScalarValue::UInt32),
+        DataType::UInt64 => primitive_min_max::<UInt64Type, _>(array, ScalarValue::UInt64),
+        DataType::Float16 => primitive_min_max::<Float16Type, _>(array, ScalarValue::Float16),
+        DataType::Float32 => primitive_min_max::<Float32Type, _>(array, ScalarValue::Float32),
+        DataType::Float64 => primitive_min_max::<Float64Type, _>(array, ScalarValue::Float64),
+        DataType::Decimal32(precision, scale) => {
+            let precision = *precision;
+            let scale = *scale;
+            primitive_min_max::<Decimal32Type, _>(array, |value| {
+                ScalarValue::Decimal32(value, precision, scale)
+            })
+        }
+        DataType::Decimal64(precision, scale) => {
+            let precision = *precision;
+            let scale = *scale;
+            primitive_min_max::<Decimal64Type, _>(array, |value| {
+                ScalarValue::Decimal64(value, precision, scale)
+            })
+        }
+        DataType::Decimal128(precision, scale) => {
+            let precision = *precision;
+            let scale = *scale;
+            primitive_min_max::<Decimal128Type, _>(array, |value| {
+                ScalarValue::Decimal128(value, precision, scale)
+            })
+        }
+        DataType::Decimal256(precision, scale) => {
+            let precision = *precision;
+            let scale = *scale;
+            primitive_min_max::<Decimal256Type, _>(array, |value| {
+                ScalarValue::Decimal256(value, precision, scale)
+            })
+        }
+        DataType::Date32 => primitive_min_max::<Date32Type, _>(array, ScalarValue::Date32),
+        DataType::Date64 => primitive_min_max::<Date64Type, _>(array, ScalarValue::Date64),
+        DataType::Time32(TimeUnit::Second) => {
+            primitive_min_max::<Time32SecondType, _>(array, ScalarValue::Time32Second)
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            primitive_min_max::<Time32MillisecondType, _>(array, ScalarValue::Time32Millisecond)
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            primitive_min_max::<Time64MicrosecondType, _>(array, ScalarValue::Time64Microsecond)
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            primitive_min_max::<Time64NanosecondType, _>(array, ScalarValue::Time64Nanosecond)
+        }
+        DataType::Timestamp(TimeUnit::Second, timezone) => {
+            let timezone = timezone.clone();
+            primitive_min_max::<TimestampSecondType, _>(array, |value| {
+                ScalarValue::TimestampSecond(value, timezone.clone())
+            })
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, timezone) => {
+            let timezone = timezone.clone();
+            primitive_min_max::<TimestampMillisecondType, _>(array, |value| {
+                ScalarValue::TimestampMillisecond(value, timezone.clone())
+            })
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
+            let timezone = timezone.clone();
+            primitive_min_max::<TimestampMicrosecondType, _>(array, |value| {
+                ScalarValue::TimestampMicrosecond(value, timezone.clone())
+            })
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => {
+            let timezone = timezone.clone();
+            primitive_min_max::<TimestampNanosecondType, _>(array, |value| {
+                ScalarValue::TimestampNanosecond(value, timezone.clone())
+            })
+        }
+        DataType::Utf8 => string_min_max::<i32, _>(array, ScalarValue::Utf8),
+        DataType::LargeUtf8 => string_min_max::<i64, _>(array, ScalarValue::LargeUtf8),
+        DataType::Utf8View => string_view_min_max(array),
+        _ => Ok(RangeBatchBounds::Unsupported),
+    }
+}
+
+fn primitive_min_max<T, F>(array: &dyn Array, scalar_value: F) -> DataFusionResult<RangeBatchBounds>
+where
+    T: ArrowPrimitiveType,
+    T::Native: PartialOrd,
+    F: Fn(Option<T::Native>) -> ScalarValue,
+{
+    let array = downcast_array::<PrimitiveArray<T>>(array)?;
+    let (Some(min_value), Some(max_value)) = (min::<T>(array), max::<T>(array)) else {
+        return Ok(RangeBatchBounds::Unsupported);
+    };
+
+    Ok(RangeBatchBounds::Values {
+        min_value: scalar_value(Some(min_value)),
+        max_value: scalar_value(Some(max_value)),
+    })
+}
+
+fn string_min_max<T, F>(array: &dyn Array, scalar_value: F) -> DataFusionResult<RangeBatchBounds>
+where
+    T: OffsetSizeTrait,
+    F: Fn(Option<String>) -> ScalarValue,
+{
+    let array = downcast_array::<GenericStringArray<T>>(array)?;
+    let (Some(min_value), Some(max_value)) = (min_string(array), max_string(array)) else {
+        return Ok(RangeBatchBounds::Unsupported);
+    };
+
+    Ok(RangeBatchBounds::Values {
+        min_value: scalar_value(Some(min_value.to_string())),
+        max_value: scalar_value(Some(max_value.to_string())),
+    })
+}
+
+fn string_view_min_max(array: &dyn Array) -> DataFusionResult<RangeBatchBounds> {
+    let array = downcast_array::<StringViewArray>(array)?;
+    let (Some(min_value), Some(max_value)) = (min_string_view(array), max_string_view(array))
+    else {
+        return Ok(RangeBatchBounds::Unsupported);
+    };
+
+    Ok(RangeBatchBounds::Values {
+        min_value: ScalarValue::Utf8View(Some(min_value.to_string())),
+        max_value: ScalarValue::Utf8View(Some(max_value.to_string())),
+    })
+}
+
+fn downcast_array<T: 'static>(array: &dyn Array) -> DataFusionResult<&T> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "Failed to downcast join filter array with type {} to {}",
+            array.data_type(),
+            type_name::<T>()
+        ))
+    })
 }
 
 fn supports_range_comparison(value: &ScalarValue) -> bool {
