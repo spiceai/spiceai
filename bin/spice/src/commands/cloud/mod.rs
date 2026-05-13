@@ -1309,11 +1309,11 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
             }
 
             let client = CloudClient::new()?;
-            let spicepod_content = args
-                .spicepod
-                .as_deref()
-                .map(read_spicepod_file)
-                .transpose()?;
+            let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
+                Some(read_spicepod_file(path).await?)
+            } else {
+                None
+            };
 
             let app = client
                 .create_app(
@@ -1418,11 +1418,11 @@ async fn execute_update(cmd: &UpdateCommands) -> Result<()> {
         UpdateCommands::App(args) => {
             let client = CloudClient::new()?;
             let app_name = require_app(args.app.as_deref())?;
-            let spicepod_content = args
-                .spicepod
-                .as_deref()
-                .map(read_spicepod_file)
-                .transpose()?;
+            let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
+                Some(read_spicepod_file(path).await?)
+            } else {
+                None
+            };
 
             let app = client
                 .update_app(
@@ -1709,8 +1709,8 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
 // ============================================================================
 
 /// Read a spicepod YAML file from disk and return its contents as a string.
-fn read_spicepod_file(path: &str) -> Result<String> {
-    std::fs::read_to_string(path).map_err(|e| crate::error::Error::InvalidArgument {
+async fn read_spicepod_file(path: &str) -> Result<String> {
+    tokio::fs::read_to_string(path).await.map_err(|e| crate::error::Error::InvalidArgument {
         message: format!("Failed to read spicepod file '{path}': {e}"),
     })
 }

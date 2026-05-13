@@ -323,7 +323,7 @@ pub(crate) async fn create_deployment(
                 branch: None,
                 commit_sha: None,
                 commit_message: None,
-                channel: channel.cloned(),
+                channel: channel.copied(),
                 debug: false,
             },
         )
