@@ -725,12 +725,18 @@ async fn test_inline_memtable_pressure_clears_fully_deleted_entries(
             .is_empty()
     );
 
-    let got = collect_sorted(
-        &ctx,
-        "SELECT id, name FROM inline_memtable_fully_deleted ORDER BY id",
-    )
-    .await?;
-    assert_eq!(got.num_rows(), 0);
+    let count_batches = ctx
+        .sql("SELECT COUNT(*) FROM inline_memtable_fully_deleted")
+        .await?
+        .collect()
+        .await?;
+    let count = count_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT(*) should be Int64")
+        .value(0);
+    assert_eq!(count, 0);
 
     Ok(())
 }
