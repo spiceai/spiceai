@@ -4096,15 +4096,21 @@ dependencies = [
 name = "connector-mongodb"
 version = "2.0.0-unstable"
 dependencies = [
+ "async-stream",
  "async-trait",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
+ "fundu",
+ "futures",
  "linkme",
+ "mongodb",
  "paste",
  "runtime",
  "secrecy",
  "snafu",
+ "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -5366,6 +5372,7 @@ dependencies = [
  "insta",
  "logos",
  "mailparse",
+ "mongodb",
  "mysql_async",
  "native-tls",
  "num_cpus",

@@ -23,6 +23,8 @@ limitations under the License.
 //! incremental builds - changes to this connector only require rebuilding
 //! this crate, not the entire runtime.
 
+mod changes;
+
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -30,11 +32,13 @@ use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
 };
 use runtime::component::dataset::Dataset;
+use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
-use runtime::parameters::ParameterSpec;
+use runtime::federated_table::FederatedTable;
+use runtime::parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -45,6 +49,8 @@ use std::sync::Arc;
 /// `MongoDB` data connector.
 pub struct MongoDB {
     mongodb_factory: MongoDBTableFactory,
+    pool: Arc<MongoDBConnectionPool>,
+    params: Parameters,
 }
 
 impl std::fmt::Debug for MongoDB {
@@ -115,6 +121,18 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("pool_max")
         .description("The maximum number of connections created in the connection pool.")
         .default(DEFAULT_CONNECTION_POOL_MAX_STR),
+    ParameterSpec::runtime("change_stream_batch_max_size")
+        .description("Maximum number of MongoDB Change Stream events to batch together before processing.")
+        .default("1000"),
+    ParameterSpec::runtime("change_stream_batch_max_duration")
+        .description("Maximum time to wait for a MongoDB Change Stream batch to fill before processing.")
+        .default("1s"),
+    ParameterSpec::runtime("change_stream_max_await_time")
+        .description("Maximum time MongoDB should wait for new Change Stream events before returning an empty batch.")
+        .default("1s"),
+    ParameterSpec::runtime("change_stream_batch_size")
+        .description("Number of Change Stream events MongoDB should request from the server per batch.")
+        .default("1000"),
 ];
 
 const IGNORED_IF_URI: &[&str] = &[
@@ -257,9 +275,13 @@ impl DataConnectorFactory for MongoDBFactory {
                 },
             };
 
-            let mongodb_factory = MongoDBTableFactory::new(pool);
+            let mongodb_factory = MongoDBTableFactory::new(Arc::clone(&pool));
 
-            Ok(Arc::new(MongoDB { mongodb_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(MongoDB {
+                mongodb_factory,
+                pool,
+                params: params.parameters,
+            }) as Arc<dyn DataConnector>)
         })
     }
 
@@ -325,6 +347,30 @@ impl DataConnector for MongoDB {
                     connector_component: ConnectorComponent::from(dataset),
                 })?,
         )
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        true
+    }
+
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
+    ) -> Option<data_components::cdc::ChangesStream> {
+        Some(changes::build_changes_stream(
+            Arc::clone(&self.pool),
+            self.params.clone(),
+            dataset.clone(),
+            federated_table,
+        ))
+    }
+
+    fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
+        refresh_mode.unwrap_or(RefreshMode::Full)
     }
 }
 
