@@ -56,9 +56,8 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
 #[cfg(feature = "duckdb")]
 pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
-    let connection_string = format!(
-        "mongodb://root:{MONGODB_ROOT_PASSWORD}@localhost:{port}/testdb?authSource=admin&directConnection=true&replicaSet=rs0"
-    );
+    let connection_string =
+        format!("mongodb://localhost:{port}/testdb?directConnection=true&replicaSet=rs0&tls=false");
     let params = HashMap::from([
         ("mongodb_connection_string".to_string(), connection_string),
         (
@@ -127,9 +126,6 @@ pub async fn start_mongodb_replica_set_docker_container(
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image(MONGODB_IMAGE.to_string())
         .add_port_binding(27017, port)
-        .add_env_var("MONGO_INITDB_ROOT_USERNAME", "root")
-        .add_env_var("MONGO_INITDB_ROOT_PASSWORD", MONGODB_ROOT_PASSWORD)
-        .add_env_var("MONGO_INITDB_DATABASE", "testdb")
         .command(["mongod", "--replSet", "rs0", "--bind_ip_all"])
         .healthcheck(HealthConfig {
             test: Some(vec![
@@ -149,7 +145,7 @@ pub async fn start_mongodb_replica_set_docker_container(
         .run(Some(MONGODB_CONTAINER_START_TIMEOUT))
         .await?;
 
-    wait_for_mongodb_host_port(port).await?;
+    wait_for_mongodb_rs_node_port(port).await?;
     initiate_mongodb_replica_set(&running_container).await?;
     Ok(running_container)
 }
@@ -158,16 +154,14 @@ pub async fn start_mongodb_replica_set_docker_container(
 async fn initiate_mongodb_replica_set(
     running_container: &RunningContainer<'_>,
 ) -> Result<(), anyhow::Error> {
-    let initiate = format!(
-        "mongosh --quiet -u root -p {MONGODB_ROOT_PASSWORD} --authenticationDatabase admin --eval rs.initiate({{_id:'rs0',members:[{{_id:0,host:'localhost:27017'}}]}})"
-    );
+    let initiate =
+        "mongosh --quiet --eval \"rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]})\""
+            .to_string();
     let _ = running_container.exec_cmd(&initiate).await?;
 
     let start_time = std::time::Instant::now();
     let mut last_output = None;
-    let status_command = format!(
-        "mongosh --quiet -u root -p {MONGODB_ROOT_PASSWORD} --authenticationDatabase admin --eval rs.status().myState"
-    );
+    let status_command = "mongosh --quiet --eval rs.status().myState".to_string();
 
     while start_time.elapsed() <= MONGODB_HOST_PORT_READY_TIMEOUT {
         match running_container.exec_cmd(&status_command).await {
@@ -183,6 +177,35 @@ async fn initiate_mongodb_replica_set(
         "MongoDB replica set did not become primary within {}s. Last output: {}",
         MONGODB_HOST_PORT_READY_TIMEOUT.as_secs(),
         last_output.unwrap_or_else(|| "none".to_string())
+    ))
+}
+
+#[cfg(feature = "duckdb")]
+async fn wait_for_mongodb_rs_node_port(port: u16) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let mut last_error = None;
+    let uri = format!("mongodb://localhost:{port}/?directConnection=true");
+
+    while start_time.elapsed() <= MONGODB_HOST_PORT_READY_TIMEOUT {
+        match mongodb::Client::with_uri_str(&uri).await {
+            Ok(client) => match client
+                .database("admin")
+                .run_command(mongodb::bson::doc! { "ping": 1 })
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = Some(error.to_string()),
+            },
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "MongoDB replica set node at port {port} was not ready within {}s. Last error: {}",
+        MONGODB_HOST_PORT_READY_TIMEOUT.as_secs(),
+        last_error.unwrap_or_else(|| "none".to_string())
     ))
 }
 
@@ -225,9 +248,7 @@ pub async fn get_mongodb_client(port: u16) -> Result<mongodb::Client, anyhow::Er
 #[cfg(feature = "duckdb")]
 #[instrument]
 pub async fn get_mongodb_replica_set_client(port: u16) -> Result<mongodb::Client, anyhow::Error> {
-    let uri = format!(
-        "mongodb://root:{MONGODB_ROOT_PASSWORD}@localhost:{port}/testdb?authSource=admin&directConnection=true&replicaSet=rs0"
-    );
+    let uri = format!("mongodb://localhost:{port}/testdb?directConnection=true&replicaSet=rs0");
     tracing::debug!("Connecting to MongoDB replica set at localhost:{port}/testdb");
     let client = mongodb::Client::with_uri_str(&uri).await?;
     Ok(client)
