@@ -66,8 +66,11 @@ pub fn format_batches_expanded(batches: &[RecordBatch]) -> Result<String, ArrowE
     let schema = batches[0].schema();
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     // Label column width is the widest column name in the (first) batch schema.
-    // Use `chars().count()` so multi-byte (non-ASCII) names still line up — the
-    // `{name:<name_width$}` format specifier pads in characters, not bytes.
+    // The `{name:<name_width$}` format specifier pads in Unicode scalars
+    // (chars), not bytes, so `name_width` must use `chars().count()`.
+    // This does not account for terminal display width (e.g. CJK wide
+    // glyphs, combining marks, zero-width joiners can still misalign);
+    // computing true display width would require a unicode-width helper.
     let name_width = field_names
         .iter()
         .map(|n| n.chars().count())
