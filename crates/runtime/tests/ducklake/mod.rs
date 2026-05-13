@@ -24,10 +24,26 @@ use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
+use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use tempfile::TempDir;
+
+/// Run `EXPLAIN` and return pretty-formatted output for snapshot comparison.
+async fn explain_plan(rt: &Runtime, sql: &str) -> String {
+    let result = rt
+        .datafusion()
+        .query_builder(&format!("EXPLAIN {sql}"))
+        .build()
+        .run()
+        .await
+        .expect("EXPLAIN should succeed");
+    let batches: Vec<RecordBatch> = result.data.try_collect().await.expect("collect");
+    arrow::util::pretty::pretty_format_batches(&batches)
+        .expect("format")
+        .to_string()
+}
 
 /// Bootstrap a `DuckLake` catalog at the given metadata path with test tables.
 ///
@@ -267,6 +283,17 @@ async fn ducklake_catalog_no_filter() -> Result<(), anyhow::Error> {
                 &results
             );
 
+            // Verify single-table query is federated
+            let plan = explain_plan(&rt, "SELECT id, total FROM all_tables.main.orders WHERE id > 1").await;
+            insta::assert_snapshot!("read_only_catalog_single_table", plan);
+
+            // Verify cross-table JOIN is federated
+            let plan = explain_plan(
+                &rt,
+                "SELECT o.id, c.name, o.total FROM all_tables.main.orders o JOIN all_tables.main.customers c ON o.customer_id = c.id",
+            ).await;
+            insta::assert_snapshot!("read_only_catalog_cross_table_join", plan);
+
             Ok(())
         })
         .await
@@ -406,6 +433,221 @@ async fn ducklake_standalone_dataset() -> Result<(), anyhow::Error> {
                     "| 1  | Widget | 9.99  |",
                     "| 2  | Gadget | 19.99 |",
                     "+----+--------+-------+",
+                ],
+                &results
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Tests that INSERT works on a standalone `DuckLake` dataset when `access: read_write` is set.
+#[tokio::test]
+async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));
+    register_test_connectors().await;
+
+    let tmp_dir = TempDir::new()?;
+    let metadata_path = tmp_dir
+        .path()
+        .join("test_standalone_rw.ducklake")
+        .display()
+        .to_string();
+    let data_path = tmp_dir
+        .path()
+        .join("data_standalone_rw")
+        .display()
+        .to_string();
+    std::fs::create_dir_all(&data_path)?;
+
+    bootstrap_ducklake(&metadata_path, &data_path);
+
+    test_request_context()
+        .scope(async {
+            let mut dataset =
+                Dataset::new("ducklake:main.orders".to_string(), "my_orders".to_string());
+            dataset.params = Some(Params::from_string_map(HashMap::from([(
+                "ducklake_connection_string".to_string(),
+                metadata_path.clone(),
+            )])));
+            dataset.access = AccessMode::ReadWrite;
+
+            let app = AppBuilder::new("ducklake_standalone_rw_test")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Verify standalone dataset query is federated with read_write access
+            let plan = explain_plan(&rt, "SELECT id, total FROM my_orders WHERE id > 1").await;
+            insta::assert_snapshot!("read_write_standalone_single_table", plan);
+
+            // Verify initial data
+            let result = rt
+                .datafusion()
+                .query_builder("SELECT COUNT(*) AS cnt FROM my_orders")
+                .build()
+                .run()
+                .await?;
+            let results: Vec<RecordBatch> = result.data.try_collect().await?;
+            assert_batches_eq!(
+                &["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+",],
+                &results
+            );
+
+            // INSERT a new row
+            let insert_result = rt
+                .datafusion()
+                .query_builder(
+                    "INSERT INTO my_orders (id, customer_id, total) VALUES (4, 30, 75.25)",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("INSERT failed: {e}"))?;
+            let _: Vec<RecordBatch> = insert_result.data.try_collect().await?;
+
+            // Verify the row was inserted
+            let result = rt
+                .datafusion()
+                .query_builder("SELECT id, customer_id, total FROM my_orders ORDER BY id")
+                .build()
+                .run()
+                .await?;
+            let results: Vec<RecordBatch> = result.data.try_collect().await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------------+-------+",
+                    "| id | customer_id | total |",
+                    "+----+-------------+-------+",
+                    "| 1  | 10          | 99.99 |",
+                    "| 2  | 20          | 149.5 |",
+                    "| 3  | 10          | 25.0  |",
+                    "| 4  | 30          | 75.25 |",
+                    "+----+-------------+-------+",
+                ],
+                &results
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Tests that INSERT works on a `DuckLake` catalog table when `access: read_write` is set.
+#[tokio::test]
+async fn ducklake_catalog_read_write_insert() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));
+    register_test_connectors().await;
+
+    let tmp_dir = TempDir::new()?;
+    let metadata_path = tmp_dir
+        .path()
+        .join("test_rw.ducklake")
+        .display()
+        .to_string();
+    let data_path = tmp_dir.path().join("data_rw").display().to_string();
+    std::fs::create_dir_all(&data_path)?;
+
+    bootstrap_ducklake(&metadata_path, &data_path);
+
+    test_request_context()
+        .scope(async {
+            let mut catalog = Catalog::new("ducklake".to_string(), "rw_lake".to_string())
+                .with_access(AccessMode::ReadWrite);
+            catalog.params = Some(make_ducklake_catalog_params(&metadata_path));
+
+            let app = AppBuilder::new("ducklake_rw_test")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Verify initial data
+            let result = rt
+                .datafusion()
+                .query_builder("SELECT COUNT(*) AS cnt FROM rw_lake.main.orders")
+                .build()
+                .run()
+                .await?;
+            let results: Vec<RecordBatch> = result.data.try_collect().await?;
+            assert_batches_eq!(
+                &[
+                    "+-----+",
+                    "| cnt |",
+                    "+-----+",
+                    "| 3   |",
+                    "+-----+",
+                ],
+                &results
+            );
+
+            // Verify single-table query is federated even with read_write access
+            let plan = explain_plan(&rt, "SELECT id, total FROM rw_lake.main.orders WHERE id > 1").await;
+            insta::assert_snapshot!("read_write_catalog_single_table", plan);
+
+            // Verify cross-table JOIN is federated as a single pushed-down query
+            let plan = explain_plan(
+                &rt,
+                "SELECT o.id, c.name, o.total FROM rw_lake.main.orders o JOIN rw_lake.main.customers c ON o.customer_id = c.id",
+            ).await;
+            insta::assert_snapshot!("read_write_catalog_cross_table_join", plan);
+
+            // INSERT a new row (drain the stream to ensure the INSERT completes)
+            let insert_result = rt
+                .datafusion()
+                .query_builder(
+                    "INSERT INTO rw_lake.main.orders (id, customer_id, total) VALUES (4, 30, 75.25)",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("INSERT failed: {e}"))?;
+            let _: Vec<RecordBatch> = insert_result.data.try_collect().await?;
+
+            // Verify the row was inserted
+            let result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT id, customer_id, total FROM rw_lake.main.orders ORDER BY id",
+                )
+                .build()
+                .run()
+                .await?;
+            let results: Vec<RecordBatch> = result.data.try_collect().await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------------+-------+",
+                    "| id | customer_id | total |",
+                    "+----+-------------+-------+",
+                    "| 1  | 10          | 99.99 |",
+                    "| 2  | 20          | 149.5 |",
+                    "| 3  | 10          | 25.0  |",
+                    "| 4  | 30          | 75.25 |",
+                    "+----+-------------+-------+",
                 ],
                 &results
             );

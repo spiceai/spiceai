@@ -37,7 +37,7 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use async_stream::try_stream;
 use bytes::Bytes;
-use cache::result::CacheStatus;
+use cache::result::{CacheStatus, query::QueryResult};
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
@@ -69,6 +69,7 @@ mod get_schema;
 mod handshake;
 mod metrics;
 pub mod middleware;
+mod mtls;
 mod session;
 pub(crate) mod session_auth;
 mod util;
@@ -266,6 +267,35 @@ impl Service {
                 .map_err(handle_query_error)?
         };
 
+        Ok(Self::query_result_to_flight_stream(query_result))
+    }
+
+    /// Run a pre-built [`LogicalPlan`] and stream results as Flight data.
+    ///
+    /// Used by surfaces that produce a logical plan outside the SQL parser
+    /// (e.g. `FlightSQL` `CommandStatementSubstraitPlan`). The `cache_key`
+    /// identifies the plan in the results cache; callers should derive it
+    /// from the plan source so that semantically identical inputs hit the
+    /// same cache entry.
+    pub(crate) async fn plan_to_flight_stream(
+        datafusion: Arc<DataFusion>,
+        plan: LogicalPlan,
+        cache_key: impl Into<Arc<str>>,
+    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+        let query_result = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
+            .read_only(read_only)
+            .build()
+            .run()
+            .await
+            .map_err(handle_query_error)?;
+
+        Ok(Self::query_result_to_flight_stream(query_result))
+    }
+
+    fn query_result_to_flight_stream(
+        query_result: QueryResult,
+    ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema = query_result.data.schema();
@@ -319,7 +349,7 @@ impl Service {
             }
         };
 
-        Ok((flights_stream.boxed(), cache_status))
+        (flights_stream.boxed(), cache_status)
     }
 
     async fn wrap_response_stream_with_scope<S>(
@@ -422,7 +452,7 @@ fn handle_query_error(e: query::Error) -> Status {
     }
 }
 
-fn handle_datafusion_error(e: DataFusionError) -> Status {
+pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
     if query::is_cancellation_error(&e) {
         return Status::cancelled(e.to_string());
     }
@@ -614,6 +644,7 @@ pub async fn start(
         endpoint_auth.flight_basic_auth,
         session_store.clone(),
     );
+    let identity_source = endpoint_auth.identity_source;
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(session_aware_auth))
         .into_inner();
@@ -630,6 +661,11 @@ pub async fn start(
             RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
                 .with_job_executor(job_executor),
         )
+        // mTLS principal injection runs *after* RequestContextLayer
+        // (which sets up the AuthRequestContext extension) and
+        // *before* BasicAuthLayer (which short-circuits when a
+        // principal is already present).
+        .layer(mtls::MtlsLayer::new(identity_source))
         .layer(auth_layer)
         .layer(WriteRateLimitLayer::new(
             RateLimiter::direct(rate_limits.flight_write_limit),
@@ -663,7 +699,7 @@ pub async fn start(
         runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         let incoming = crate::tls::flight_incoming::tls_incoming(
             listener,
-            Arc::clone(&tls_config.server_config),
+            Arc::clone(&tls_config.flight_server_config),
         );
         if let Some(token) = shutdown_signal {
             server

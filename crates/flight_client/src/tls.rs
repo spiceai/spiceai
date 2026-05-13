@@ -17,9 +17,9 @@ limitations under the License.
 use base64::{Engine as _, engine::general_purpose};
 use snafu::prelude::*;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
 
 #[derive(Debug, Snafu)]
@@ -43,6 +43,24 @@ pub enum Error {
 
     #[snafu(display("Failed to read CA certificate file '{path}': {source}"))]
     FailedToReadCaCertificate {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Client certificate file not found: {path}"))]
+    ClientCertificateFileNotFound { path: String },
+
+    #[snafu(display("Failed to read client certificate file '{path}': {source}"))]
+    FailedToReadClientCertificate {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Client key file not found: {path}"))]
+    ClientKeyFileNotFound { path: String },
+
+    #[snafu(display("Failed to read client key file '{path}': {source}"))]
+    FailedToReadClientKey {
         path: String,
         source: std::io::Error,
     },
@@ -143,6 +161,98 @@ fn extract_tls_endpoint_info(endpoint_str: &str) -> Option<TlsEndpointInfo> {
     None
 }
 
+/// Source material for a client TLS identity (cert + key pair).
+///
+/// File-based identities are read from disk at channel-creation time.
+/// Inline identities carry the PEM bytes directly — useful when the
+/// material comes from a secret store or environment variable rather
+/// than from on-disk files.
+#[derive(Debug, Clone)]
+pub enum ClientIdentity {
+    /// Load the cert chain and private key from PEM files on disk.
+    FromFiles {
+        /// Path to the PEM-encoded client certificate chain.
+        cert_path: PathBuf,
+        /// Path to the PEM-encoded private key.
+        key_path: PathBuf,
+    },
+    /// Use inline PEM bytes directly.
+    FromPem {
+        /// PEM-encoded client certificate chain.
+        cert_pem: Vec<u8>,
+        /// PEM-encoded private key.
+        key_pem: Vec<u8>,
+    },
+}
+
+/// TLS configuration options for an outbound Flight channel.
+///
+/// All fields are optional. When all are `None`, the channel uses system
+/// roots for server verification and presents no client certificate.
+#[derive(Debug, Clone, Default)]
+pub struct ClientTlsOptions {
+    /// Path to a PEM CA bundle used to verify the upstream server
+    /// certificate. When `None`, falls back to the platform native trust
+    /// store via [`system_tls_certificate`].
+    pub ca_certificate_path: Option<PathBuf>,
+    /// Optional client identity (cert + key) to present during the TLS
+    /// handshake for mutual TLS.
+    pub client_identity: Option<ClientIdentity>,
+}
+
+impl ClientTlsOptions {
+    /// Convenience constructor that mirrors the legacy
+    /// [`new_tls_flight_channel`] entry point.
+    #[must_use]
+    pub fn ca_only(ca_certificate_path: Option<PathBuf>) -> Self {
+        Self {
+            ca_certificate_path,
+            client_identity: None,
+        }
+    }
+
+    /// Returns true when a client identity (cert + key) has been set.
+    #[must_use]
+    pub fn has_client_identity(&self) -> bool {
+        self.client_identity.is_some()
+    }
+}
+
+async fn resolve_client_identity(identity: &ClientIdentity) -> Result<Identity> {
+    match identity {
+        ClientIdentity::FromFiles {
+            cert_path,
+            key_path,
+        } => {
+            if !cert_path.exists() {
+                return Err(Error::ClientCertificateFileNotFound {
+                    path: cert_path.display().to_string(),
+                });
+            }
+            if !key_path.exists() {
+                return Err(Error::ClientKeyFileNotFound {
+                    path: key_path.display().to_string(),
+                });
+            }
+            let cert =
+                tokio::fs::read(cert_path)
+                    .await
+                    .context(FailedToReadClientCertificateSnafu {
+                        path: cert_path.display().to_string(),
+                    })?;
+            let key = tokio::fs::read(key_path)
+                .await
+                .context(FailedToReadClientKeySnafu {
+                    path: key_path.display().to_string(),
+                })?;
+            Ok(Identity::from_pem(cert, key))
+        }
+        ClientIdentity::FromPem { cert_pem, key_pem } => {
+            Ok(Identity::from_pem(cert_pem.clone(), key_pem.clone()))
+        }
+    }
+}
+
 /// Creates a new TLS-enabled Flight channel.
 ///
 /// If `ca_certificate_path` is provided, the certificate from that file will be used
@@ -157,20 +267,45 @@ pub async fn new_tls_flight_channel(
     endpoint_str: &str,
     ca_certificate_path: Option<&Path>,
 ) -> Result<Channel> {
+    let opts = ClientTlsOptions::ca_only(ca_certificate_path.map(PathBuf::from));
+    new_tls_flight_channel_with_options(endpoint_str, &opts).await
+}
+
+/// Creates a new TLS-enabled Flight channel with full mTLS options.
+///
+/// Behaves like [`new_tls_flight_channel`] but additionally accepts a
+/// client certificate + key for mutual TLS. When the endpoint scheme is
+/// not TLS (`http://`, `grpc://`), all TLS options are ignored.
+///
+/// # Errors
+///
+/// Will return `Err` if:
+///    - It couldn't connect to the endpoint.
+///    - It couldn't load any of the configured certificate or key files.
+pub async fn new_tls_flight_channel_with_options(
+    endpoint_str: &str,
+    opts: &ClientTlsOptions,
+) -> Result<Channel> {
     if let Some(tls_info) = extract_tls_endpoint_info(endpoint_str) {
         // Use the normalized URL (https://) for tonic compatibility
         let mut endpoint =
             Endpoint::from_str(&tls_info.normalized_url).context(UnableToConnectToEndpointSnafu)?;
 
-        let cert = if let Some(ca_path) = ca_certificate_path {
+        let cert = if let Some(ca_path) = opts.ca_certificate_path.as_deref() {
             load_ca_certificate_from_file(ca_path).await?
         } else {
             system_tls_certificate()?
         };
 
-        let tls_config = ClientTlsConfig::new()
+        let mut tls_config = ClientTlsConfig::new()
             .ca_certificate(cert)
             .domain_name(tls_info.domain_name);
+
+        if let Some(identity) = &opts.client_identity {
+            let resolved = resolve_client_identity(identity).await?;
+            tls_config = tls_config.identity(resolved);
+        }
+
         endpoint = endpoint
             .tls_config(tls_config)
             .context(UnableToConnectToEndpointSnafu)?;

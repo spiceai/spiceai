@@ -295,6 +295,12 @@ impl RuntimeStatus {
         self.get_statuses_of_prefix("model:")
     }
 
+    /// Returns the status of all registered catalogs.
+    #[must_use]
+    pub fn get_catalog_statuses(&self) -> HashMap<String, ComponentStatus> {
+        self.get_statuses_of_prefix("catalog:")
+    }
+
     /// Returns the status of all registered datasets.
     #[must_use]
     pub fn get_dataset_statuses(&self) -> HashMap<TableReference, ComponentStatus> {

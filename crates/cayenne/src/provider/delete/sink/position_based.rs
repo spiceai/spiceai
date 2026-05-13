@@ -23,7 +23,6 @@ limitations under the License.
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::CayenneDeletionSink;
 use crate::provider::Error;
-use crate::provider::constants::DELETION_CACHE_LOCK_POISONED;
 use crate::provider::utils::convert_to_u64_box;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::context::SessionContext;
@@ -358,23 +357,16 @@ impl CayenneDeletionSink {
                 message: "scan_file_for_deletions called with incompatible PkDeletionStrategy"
                     .to_string(),
             })?;
+        // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
         let already_deleted = {
-            let guard = cached_deleted_row_ids
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-
-            if let Some(existing_bitmap) = guard.get(file_path) {
+            let current = cached_deleted_row_ids.load();
+            current.get(file_path).map(|existing_bitmap| {
                 // ExcludeRoaring is preferred over ExcludeByIndex: less memory (~2 bits vs 8 bytes/row)
                 // and enables native bitmap operations in Vortex (intersection, is_disjoint) which is faster
                 let excluded_indices: RoaringTreemap =
                     existing_bitmap.iter().map(u64::from).collect();
-                Some(vortex::scan::Selection::ExcludeRoaring(excluded_indices))
-            } else {
-                None
-            }
+                vortex::scan::Selection::ExcludeRoaring(excluded_indices)
+            })
         };
 
         // Open the Vortex file directly using the session
@@ -487,11 +479,7 @@ impl CayenneDeletionSink {
                         "scan_file_for_key_matches called with incompatible PkDeletionStrategy"
                             .to_string(),
                 })?;
-            let guard = cache.read().map_err(|_| Error::LockPoisoned {
-                table: table_name.clone(),
-                lock: DELETION_CACHE_LOCK_POISONED,
-            })?;
-            guard.get(file_path).cloned()
+            cache.load().get(file_path).cloned()
         };
 
         // Open the Vortex file directly.
@@ -633,16 +621,9 @@ impl CayenneDeletionSink {
                         .to_string(),
             })?;
 
-        // Read existing deletions to merge with new ones
-        let existing_deletions: Arc<HashMap<String, RoaringBitmap>> = {
-            let guard = cached_deleted_row_ids
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-            Arc::clone(&*guard)
-        };
+        // Read existing deletions to merge with new ones (wait-free).
+        let existing_deletions: Arc<HashMap<String, RoaringBitmap>> =
+            cached_deleted_row_ids.load_full();
 
         let writer = DeletionVectorWriter::new(&self.table_metadata);
 
@@ -711,18 +692,13 @@ impl CayenneDeletionSink {
             }
         }
 
-        // Quick write lock - just insert pre-built entries
-        {
-            let mut guard = cached_deleted_row_ids
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-
-            let map: &mut HashMap<String, RoaringBitmap> = Arc::make_mut(&mut *guard);
-            map.extend(cache_updates);
-        }
+        // Build a fresh snapshot with the new per-file bitmaps and publish atomically.
+        // Writers are serialised by the per-table write lock so the load+rebuild+store
+        // sequence is race-free.
+        let mut updated_map: HashMap<String, RoaringBitmap> =
+            (*cached_deleted_row_ids.load_full()).clone();
+        updated_map.extend(cache_updates);
+        cached_deleted_row_ids.store(Arc::new(updated_map));
 
         // Return count of NEW deletions
         convert_to_u64_box(new_deletion_count, "new deletion count").map_err(|e| Error::Internal {

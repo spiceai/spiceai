@@ -25,9 +25,11 @@ use std::time::Duration;
 
 use tokio::sync::SetOnce;
 
-use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryConfig};
+use app::spicepod::component::runtime::{
+    ClientAuthMode as SpicepodClientAuthMode, Runtime as SpicepodRuntime, TelemetryConfig,
+};
 use app::{App, AppBuilder};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -259,6 +261,49 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Clap mirror of [`SpicepodClientAuthMode`]. Defined here so we can
+/// derive `ValueEnum` for the `--tls-client-auth-mode` CLI flag
+/// without pulling clap into the `spicepod` crate. The two enums
+/// are trivially convertible via [`ClientAuthMode::into_spicepod`]
+/// and [`ClientAuthMode::from_spicepod`].
+#[derive(ValueEnum, Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[clap(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    /// No client-cert authentication. The server runs
+    /// `with_no_client_auth()` at the rustls layer and never sends a
+    /// `CertificateRequest`. This is the out-of-the-box default.
+    #[default]
+    None,
+    /// Request but do not require a client cert. The server sends a
+    /// `CertificateRequest`; presented certs must be signed by the
+    /// configured client CA, but no-cert handshakes are admitted.
+    /// Useful for migration windows and audit-only deployments.
+    Request,
+    /// Require every connection to present a valid X.509 client cert
+    /// signed by the configured client CA.
+    Required,
+}
+
+impl ClientAuthMode {
+    #[must_use]
+    pub fn into_spicepod(self) -> SpicepodClientAuthMode {
+        match self {
+            ClientAuthMode::None => SpicepodClientAuthMode::None,
+            ClientAuthMode::Request => SpicepodClientAuthMode::Request,
+            ClientAuthMode::Required => SpicepodClientAuthMode::Required,
+        }
+    }
+
+    #[must_use]
+    pub fn from_spicepod(value: SpicepodClientAuthMode) -> Self {
+        match value {
+            SpicepodClientAuthMode::None => ClientAuthMode::None,
+            SpicepodClientAuthMode::Request => ClientAuthMode::Request,
+            SpicepodClientAuthMode::Required => ClientAuthMode::Required,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai OSS Runtime")]
 #[clap(rename_all = "kebab-case")]
@@ -311,6 +356,29 @@ pub struct Args {
     /// Path to the TLS PEM-encoded private key file.
     #[arg(long, value_name = "key.pem")]
     pub tls_key_file: Option<String>,
+
+    /// Path to a PEM-encoded CA bundle used to verify client certificates
+    /// when `--tls-client-auth-mode request` or `required` (or the
+    /// equivalent spicepod `runtime.tls.client_auth_mode`) is set.
+    /// Eligible for hot-reload via the same watcher that picks up
+    /// server cert / key rotations.
+    #[arg(long, value_name = "client-ca.pem")]
+    pub tls_client_auth_ca_file: Option<String>,
+
+    /// Inline PEM-encoded CA bundle used to verify client certificates.
+    /// Mutually exclusive with `--tls-client-auth-ca-file`. Inline material
+    /// is not hot-reloaded.
+    #[arg(long, value_name = "-----BEGIN CERTIFICATE-----...")]
+    pub tls_client_auth_ca: Option<String>,
+
+    /// How the runtime treats client certificates on the public TLS
+    /// endpoints. `none` disables client-cert authentication (default).
+    /// `request` sends `CertificateRequest` but accepts no-cert
+    /// handshakes; presented certs must be signed by the client CA.
+    /// `required` enables strict mTLS — the server demands a valid
+    /// cert signed by `--tls-client-auth-ca` / `--tls-client-auth-ca-file`.
+    #[arg(long, value_enum)]
+    pub tls_client_auth_mode: Option<ClientAuthMode>,
 
     /// Enable anonymous telemetry collection. In Open Source builds that include anonymous telemetry,
     /// `false` is ignored; build without the `anonymous_telemetry` feature to remove anonymous usage telemetry.
@@ -660,7 +728,7 @@ pub async fn run(args: Args) -> Result<()> {
         .context(UnableToInitializeMetricsSnafu)?;
     }
 
-    let tls_config = tls::load_tls_config(
+    let (tls_config, client_auth_mode) = tls::load_tls_config(
         &args,
         spicepod_tls_config.as_ref(),
         rt.secrets(),
@@ -697,6 +765,37 @@ pub async fn run(args: Args) -> Result<()> {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,
         None => EndpointAuth::no_auth(),
     };
+
+    // Compute the process-wide IdentitySource from the combination of
+    // `runtime.auth` (recorded by `EndpointAuth::new`) and the
+    // resolved public TLS `client_auth_mode`:
+    //
+    // | runtime.auth | client_auth_mode | IdentitySource |
+    // |--------------|------------------|----------------|
+    // | unset        | none             | Anonymous      |
+    // | unset        | request          | Channel        |
+    // | unset        | required         | Channel        |
+    // | set          | none             | RuntimeAuth    |
+    // | set          | request          | RuntimeAuth    |
+    // | set          | required         | RuntimeAuth    | ("mTLS-as-channel")
+    let runtime_auth_configured = endpoint_auth.http_auth.is_some();
+    let identity_source = match (runtime_auth_configured, client_auth_mode) {
+        (true, _) => runtime_auth::IdentitySource::RuntimeAuth,
+        (false, ClientAuthMode::Request | ClientAuthMode::Required) => {
+            runtime_auth::IdentitySource::Channel
+        }
+        (false, ClientAuthMode::None) => runtime_auth::IdentitySource::Anonymous,
+    };
+    if matches!(
+        (runtime_auth_configured, client_auth_mode),
+        (true, ClientAuthMode::Required)
+    ) {
+        tracing::info!(
+            "mTLS-as-channel mode active: client cert AND `runtime.auth` credentials \
+             are both required"
+        );
+    }
+    let endpoint_auth = endpoint_auth.with_identity_source(identity_source);
 
     let server_thread = tokio::spawn(async move {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await

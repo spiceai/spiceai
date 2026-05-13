@@ -79,6 +79,9 @@ pub enum Error {
     #[snafu(display("Failed to process Debezium data: internal type conversion error"))]
     DowncastBuilder,
 
+    #[snafu(display("Invalid Debezium change event schema: {reason}"))]
+    InvalidChangeEventSchema { reason: &'static str },
+
     #[snafu(display("Failed to decode base64-encoded column value: {source}"))]
     UnableToDecodeBase64 { source: base64::DecodeError },
 
@@ -111,6 +114,11 @@ pub enum Error {
 
     #[snafu(display("A deletion change was received without a 'before' field."))]
     DeleteOpWithoutBeforeField,
+
+    #[snafu(display(
+        "An update change without primary keys was received without a 'before' field. Configure Debezium to include the full before image for keyless updates."
+    ))]
+    UpdateOpWithoutBeforeField,
 
     #[snafu(display("Invalid decimal JSON: {reason}"))]
     InvalidDecimalJson { reason: String },

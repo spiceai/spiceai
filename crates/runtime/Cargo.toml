@@ -55,6 +55,7 @@ datafusion-dml = { path = "../datafusion-dml" }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true }
 datafusion-spark.workspace = true
+datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
@@ -357,6 +358,7 @@ scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
 sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint"]
 smb = ["runtime-object-store/smb"]
+client_tls = []
 snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [
     "dep:snowflake-api",

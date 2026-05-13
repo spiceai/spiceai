@@ -203,7 +203,7 @@ impl CayenneDataSink {
         // new data from existing deletion vectors.
         let needs_new_snapshot_for_pending_deletions =
             !self.table.pk_deletion_strategy().is_position_based()
-                && self.table.has_pending_deletions()?;
+                && self.table.has_pending_deletions();
 
         if needs_new_snapshot_for_pending_deletions {
             tracing::debug!(
