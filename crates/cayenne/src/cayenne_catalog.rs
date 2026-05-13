@@ -18,8 +18,8 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
-    TableStatistics,
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    PartitionMetadata, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -1407,6 +1407,31 @@ impl MetadataCatalog for CayenneCatalog {
                     params: vec![MetastoreValue::Text(table_id.to_string())],
                 },
                 |row| row.get_i64(0),
+            )
+            .await
+    }
+
+    async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats> {
+        self.metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: r"
+                    SELECT
+                        COALESCE(SUM(record_count), 0),
+                        COUNT(*),
+                        COALESCE(SUM(LENGTH(data_ipc)), 0)
+                    FROM cayenne_inlined_data
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(InlinedDataStats {
+                        record_count: row.get_i64(0)?,
+                        entry_count: row.get_i64(1)?,
+                        ipc_bytes: row.get_i64(2)?,
+                    })
+                },
             )
             .await
     }

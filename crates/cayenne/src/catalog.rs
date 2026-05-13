@@ -21,8 +21,8 @@ limitations under the License.
 //! (`SQLite`, `PostgreSQL`, etc.).
 
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
-    TableStatistics,
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    PartitionMetadata, TableMetadata, TableStatistics,
 };
 use async_trait::async_trait;
 use snafu::Snafu;
@@ -379,6 +379,9 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get the total number of inlined rows for a table.
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64>;
+
+    /// Get aggregate inline data size information for a table.
+    async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats>;
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;
