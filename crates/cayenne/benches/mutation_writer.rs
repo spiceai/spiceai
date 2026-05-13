@@ -28,6 +28,9 @@ use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::dml::InsertOp;
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, on_conflict::OnConflict,
+};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -38,6 +41,25 @@ struct BenchTable {
 }
 
 async fn setup_table(table_name: &str) -> BenchTable {
+    setup_table_with_options(table_name, vec![], None).await
+}
+
+async fn setup_pk_upsert_table(table_name: &str) -> BenchTable {
+    setup_table_with_options(
+        table_name,
+        vec!["id".to_string()],
+        Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+    )
+    .await
+}
+
+async fn setup_table_with_options(
+    table_name: &str,
+    primary_key: Vec<String>,
+    on_conflict: Option<OnConflict>,
+) -> BenchTable {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let data_path = temp_dir.path().join("data");
     std::fs::create_dir_all(&data_path).expect("data dir");
@@ -58,8 +80,8 @@ async fn setup_table(table_name: &str) -> BenchTable {
             CreateTableOptions {
                 table_name: table_name.to_string(),
                 schema: Arc::clone(&schema),
-                primary_key: vec![],
-                on_conflict: None,
+                primary_key,
+                on_conflict,
                 base_path: data_path.to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -75,6 +97,24 @@ async fn setup_table(table_name: &str) -> BenchTable {
         table,
         schema,
     }
+}
+
+async fn setup_table_with_inline_segments(table_name: &str, segments: usize) -> BenchTable {
+    let bench_table = setup_table(table_name).await;
+    for segment in 0..segments {
+        let batch = make_batch(Arc::clone(&bench_table.schema), segment as i64, 1);
+        let written = append_batch(&bench_table.table, batch).await;
+        assert_eq!(written, 1);
+    }
+    bench_table
+}
+
+async fn setup_pk_upsert_table_with_seed(table_name: &str) -> BenchTable {
+    let bench_table = setup_pk_upsert_table(table_name).await;
+    let batch = make_batch(Arc::clone(&bench_table.schema), 0, 1);
+    let written = append_batch(&bench_table.table, batch).await;
+    assert_eq!(written, 1);
+    bench_table
 }
 
 fn make_batch(schema: Arc<Schema>, start: i64, rows: usize) -> RecordBatch {
@@ -160,5 +200,63 @@ fn bench_append_roundtrip(c: &mut Criterion) {
     fallback.finish();
 }
 
-criterion_group!(benches, bench_append_roundtrip);
+fn bench_inline_mutation_paths(c: &mut Criterion) {
+    let rt = Runtime::new().expect("runtime");
+
+    let mut upsert = c.benchmark_group("mutation_writer_inline_pk_upsert_roundtrip");
+    upsert.sample_size(10);
+    upsert.throughput(Throughput::Elements(1));
+    upsert.bench_function("single_row_inline_rewrite", |b| {
+        b.iter_batched(
+            || rt.block_on(setup_pk_upsert_table_with_seed("bench_inline_pk_upsert")),
+            |bench_table| {
+                rt.block_on(async move {
+                    let batch = make_batch(Arc::clone(&bench_table.schema), 0, 1);
+                    let written = append_batch(&bench_table.table, batch).await;
+                    black_box((bench_table, written));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    upsert.finish();
+
+    let mut pressure = c.benchmark_group("mutation_writer_inline_memtable_pressure_append");
+    pressure.sample_size(10);
+    pressure.throughput(Throughput::Elements(1));
+    for (case, preexisting_segments) in [
+        ("below_segment_threshold", 63_usize),
+        ("segment_pressure_checkpoint", 64_usize),
+    ] {
+        pressure.bench_with_input(
+            BenchmarkId::from_parameter(case),
+            &preexisting_segments,
+            |b, &preexisting_segments| {
+                b.iter_batched(
+                    || {
+                        rt.block_on(setup_table_with_inline_segments(
+                            "bench_inline_memtable_pressure",
+                            preexisting_segments,
+                        ))
+                    },
+                    |bench_table| {
+                        rt.block_on(async move {
+                            let batch = make_batch(
+                                Arc::clone(&bench_table.schema),
+                                preexisting_segments as i64,
+                                1,
+                            );
+                            let written = append_batch(&bench_table.table, batch).await;
+                            black_box((bench_table, written));
+                        });
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    pressure.finish();
+}
+
+criterion_group!(benches, bench_append_roundtrip, bench_inline_mutation_paths);
 criterion_main!(benches);
