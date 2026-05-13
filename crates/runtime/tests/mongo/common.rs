@@ -155,17 +155,19 @@ pub async fn start_mongodb_replica_set_docker_container(
 async fn initiate_mongodb_replica_set(
     running_container: &RunningContainer<'_>,
 ) -> Result<(), anyhow::Error> {
-    let initiate = "mongosh --quiet -u root -p integration-test-pw --authenticationDatabase admin --eval rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]})";
-    let _ = running_container.exec_cmd(initiate).await?;
+    let initiate = format!(
+        "mongosh --quiet -u root -p {MONGODB_ROOT_PASSWORD} --authenticationDatabase admin --eval rs.initiate({{_id:'rs0',members:[{{_id:0,host:'localhost:27017'}}]}})"
+    );
+    let _ = running_container.exec_cmd(&initiate).await?;
 
     let start_time = std::time::Instant::now();
     let mut last_output = None;
+    let status_command = format!(
+        "mongosh --quiet -u root -p {MONGODB_ROOT_PASSWORD} --authenticationDatabase admin --eval rs.status().myState"
+    );
 
     while start_time.elapsed() <= MONGODB_HOST_PORT_READY_TIMEOUT {
-        match running_container
-            .exec_cmd("mongosh --quiet -u root -p integration-test-pw --authenticationDatabase admin --eval rs.status().myState")
-            .await
-        {
+        match running_container.exec_cmd(&status_command).await {
             Ok(output) if output.trim() == "1" => return Ok(()),
             Ok(output) => last_output = Some(output),
             Err(error) => last_output = Some(error.to_string()),
@@ -212,7 +214,7 @@ async fn wait_for_mongodb_host_port(port: u16) -> Result<(), anyhow::Error> {
 pub async fn get_mongodb_client(port: u16) -> Result<mongodb::Client, anyhow::Error> {
     let uri =
         format!("mongodb://root:{MONGODB_ROOT_PASSWORD}@localhost:{port}/testdb?authSource=admin");
-    tracing::debug!("Connecting to MongoDB at {}", uri);
+    tracing::debug!("Connecting to MongoDB at localhost:{port}/testdb");
     let client = mongodb::Client::with_uri_str(&uri).await?;
     Ok(client)
 }
@@ -222,7 +224,7 @@ pub async fn get_mongodb_replica_set_client(port: u16) -> Result<mongodb::Client
     let uri = format!(
         "mongodb://root:{MONGODB_ROOT_PASSWORD}@localhost:{port}/testdb?authSource=admin&directConnection=true&replicaSet=rs0"
     );
-    tracing::debug!("Connecting to MongoDB replica set at {}", uri);
+    tracing::debug!("Connecting to MongoDB replica set at localhost:{port}/testdb");
     let client = mongodb::Client::with_uri_str(&uri).await?;
     Ok(client)
 }

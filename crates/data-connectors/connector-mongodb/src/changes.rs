@@ -63,9 +63,10 @@ pub fn build_changes_stream(
         let connection = pool
             .connect()
             .await
-            .map_err(|error| data_components::cdc::StreamError::MongoDB(
-                data_components::mongodb::stream::StreamError::Conversion { source: error }
-            ))?;
+            .map_err(|error| data_components::cdc::StreamError::External(format!(
+                "Failed to connect to MongoDB Change Stream for dataset `{}` collection `{collection_name}`: {error}",
+                dataset.name
+            )))?;
         let collection = connection
             .client
             .database(&connection.db_name)
@@ -78,7 +79,7 @@ pub fn build_changes_stream(
             .batch_size(config.server_batch_size)
             .await
             .map_err(|error| data_components::cdc::StreamError::External(format!(
-                "Failed to start MongoDB Change Stream for dataset `{}`: {error}",
+                "Failed to start MongoDB Change Stream for dataset `{}` collection `{collection_name}`: {error}",
                 dataset.name
             )))?;
 
