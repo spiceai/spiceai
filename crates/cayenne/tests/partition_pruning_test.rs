@@ -400,7 +400,7 @@ async fn test_cayenne_scan_uses_target_partitions_impl(
         )
         .await?,
     );
-    let registered_table: Arc<dyn TableProvider> = table.clone();
+    let registered_table = Arc::clone(&table) as Arc<dyn TableProvider>;
     ctx.register_table("target_partitioned_table", registered_table)?;
 
     ctx.sql(
