@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_url_uses_dashboard_path() {
+    fn auth_url_uses_oauth_token_path() {
         let client = CloudClient::new("https://api.spice.ai").expect("cloud client should build");
         assert_eq!(
             client.get_auth_url("ABCD1234"),
