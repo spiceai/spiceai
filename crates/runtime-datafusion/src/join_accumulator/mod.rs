@@ -14,7 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cmp::Ordering, collections::HashSet, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+};
 
 use arrow::{
     array::{Array, RecordBatch},
@@ -31,9 +38,20 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-const MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys per partition
+pub const DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys per partition
+static MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION: AtomicUsize =
+    AtomicUsize::new(DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION);
 // bounds are calculated per-partition, so total memory usage for bounds calculation is potentially num_partitions * MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION
 // similarly, because rows are distributed across partitions the rows per partition is total_rows / num_partitions
+
+#[must_use]
+pub fn maximum_inlist_memory_bytes_per_partition() -> usize {
+    MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION.load(AtomicOrdering::Relaxed)
+}
+
+pub fn set_maximum_inlist_memory_bytes_per_partition(limit: usize) {
+    MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION.store(limit, AtomicOrdering::Relaxed);
+}
 
 /// A simple implementation of a `CollectLeftAccumulator` that collects exact values for dynamic filtering.
 /// Performs no approximation or range merging, simply storing all values seen.
@@ -64,7 +82,7 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
     fn try_new(expr: Arc<dyn PhysicalExpr>, _schema: &SchemaRef) -> DataFusionResult<Self> {
         Ok(Self::new_with_memory_limit(
             expr,
-            MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION,
+            maximum_inlist_memory_bytes_per_partition(),
         ))
     }
 

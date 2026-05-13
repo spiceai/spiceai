@@ -73,11 +73,14 @@ use datafusion_optimizer_rules::{
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
     },
 };
+#[cfg(not(windows))]
+use runtime_datafusion::join_accumulator::set_maximum_inlist_memory_bytes_per_partition;
 use runtime_datafusion::{
     extension::{
         ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
         data_source_tree_display::DataSourceTreeDisplayOptimizer,
     },
+    join_accumulator::DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION,
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
@@ -311,6 +314,7 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
+        let effective_memory_limit = effective_query_memory_limit(self.memory_limit);
 
         if let Some(spill_compression) = self.spill_compression {
             config = config.with_spill_compression(spill_compression);
@@ -326,6 +330,9 @@ impl DataFusionBuilder {
             }
         }
 
+        let exact_join_filter_memory_limit =
+            configure_hash_join_memory_limits(&mut config, effective_memory_limit);
+
         let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
 
         let mut state = SessionStateBuilder::new()
@@ -339,8 +346,8 @@ impl DataFusionBuilder {
                     self.io_runtime.clone(),
                 )),
             ))
-            .with_runtime_env(runtime_env(
-                self.memory_limit,
+            .with_runtime_env(runtime_env_with_effective_memory_limit(
+                effective_memory_limit,
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
             ));
@@ -372,7 +379,12 @@ impl DataFusionBuilder {
 
         #[cfg(not(windows))]
         {
+            set_maximum_inlist_memory_bytes_per_partition(exact_join_filter_memory_limit);
             state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+        }
+        #[cfg(windows)]
+        {
+            let _ = exact_join_filter_memory_limit;
         }
 
         state = state
@@ -645,15 +657,15 @@ pub(crate) fn runtime_env(
     temp_directory: Option<String>,
     io_runtime: Handle,
 ) -> Arc<RuntimeEnv> {
-    let disk_manager_builder = if let Some(directory) = temp_directory {
-        let mode = DiskManagerMode::Directories(vec![directory.into()]);
-        DiskManager::builder().with_mode(mode)
-    } else {
-        DiskManager::builder()
-    };
+    runtime_env_with_effective_memory_limit(
+        effective_query_memory_limit(memory_limit),
+        temp_directory,
+        io_runtime,
+    )
+}
 
-    // If no memory limit is specified, default to 90% of total memory (container-aware)
-    let effective_memory_limit = memory_limit.unwrap_or_else(|| {
+fn effective_query_memory_limit(memory_limit: Option<u64>) -> u64 {
+    memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
         let default_limit = total_memory.saturating_mul(90) / 100;
 
@@ -663,7 +675,60 @@ pub(crate) fn runtime_env(
         );
 
         default_limit
-    });
+    })
+}
+
+fn exact_join_filter_memory_limit_per_partition(
+    effective_memory_limit: u64,
+    target_partitions: usize,
+) -> usize {
+    let target_partitions = target_partitions.max(1);
+    let target_partitions = match u64::try_from(target_partitions) {
+        Ok(target_partitions) => target_partitions,
+        Err(_) => u64::MAX,
+    };
+    let default_limit = match u64::try_from(DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION) {
+        Ok(default_limit) => default_limit,
+        Err(_) => u64::MAX,
+    };
+    let memory_per_partition = effective_memory_limit / target_partitions;
+    let limit = memory_per_partition.min(default_limit);
+
+    match usize::try_from(limit) {
+        Ok(limit) => limit,
+        Err(_) => usize::MAX,
+    }
+}
+
+fn configure_hash_join_memory_limits(
+    config: &mut SessionConfig,
+    effective_memory_limit: u64,
+) -> usize {
+    let runtime_memory_limit_per_partition = exact_join_filter_memory_limit_per_partition(
+        effective_memory_limit,
+        config.options().execution.target_partitions,
+    );
+
+    let optimizer = &mut config.options_mut().optimizer;
+    let exact_join_filter_memory_limit = optimizer
+        .hash_join_inlist_pushdown_max_size
+        .min(runtime_memory_limit_per_partition);
+    optimizer.hash_join_inlist_pushdown_max_size = exact_join_filter_memory_limit;
+
+    exact_join_filter_memory_limit
+}
+
+fn runtime_env_with_effective_memory_limit(
+    effective_memory_limit: u64,
+    temp_directory: Option<String>,
+    io_runtime: Handle,
+) -> Arc<RuntimeEnv> {
+    let disk_manager_builder = if let Some(directory) = temp_directory {
+        let mode = DiskManagerMode::Directories(vec![directory.into()]);
+        DiskManager::builder().with_mode(mode)
+    } else {
+        DiskManager::builder()
+    };
 
     let Some(topn) = NonZeroUsize::new(5) else {
         unreachable!("Memory pool TopN must be greater than 0");
@@ -713,9 +778,23 @@ pub(crate) fn default_extension_planners(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
+    use arrow::datatypes::{DataType, Field, Schema};
+    #[cfg(not(windows))]
+    use cayenne::provider::CayenneAccelerationExec;
     use datafusion::optimizer::Analyzer;
+    #[cfg(not(windows))]
+    use datafusion::{
+        common::{JoinType, NullEquality},
+        datasource::memory::MemorySourceConfig,
+        physical_expr::expressions::col,
+        physical_plan::{ExecutionPlan, displayable, joins::HashJoinExec, joins::PartitionMode},
+    };
 
-    use super::DataFusionBuilder;
+    use super::{
+        DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION, DataFusionBuilder,
+        configure_hash_join_memory_limits, exact_join_filter_memory_limit_per_partition,
+    };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
     use std::sync::Arc;
@@ -739,6 +818,60 @@ mod tests {
                 "Default analyzer rule order has changed"
             );
         }
+    }
+
+    #[test]
+    fn test_exact_join_filter_memory_limit_respects_runtime_query_memory_limit() {
+        assert_eq!(
+            256,
+            exact_join_filter_memory_limit_per_partition(1_024, 4),
+            "Exact dynamic join filters should divide the runtime query memory limit across target partitions"
+        );
+        assert_eq!(
+            DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION,
+            exact_join_filter_memory_limit_per_partition(u64::MAX, 1),
+            "Exact dynamic join filters should keep the existing hard cap when the query memory limit is larger"
+        );
+        assert_eq!(
+            0,
+            exact_join_filter_memory_limit_per_partition(1, 4),
+            "Very small memory limits should disable retained exact in-list arrays and force range fallback"
+        );
+    }
+
+    #[test]
+    fn test_hash_join_inlist_pushdown_limit_respects_runtime_query_memory_limit() {
+        let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_inlist_pushdown_max_size = 1_000;
+
+        let exact_join_filter_memory_limit = configure_hash_join_memory_limits(&mut config, 2_048);
+
+        assert_eq!(512, exact_join_filter_memory_limit);
+        assert_eq!(
+            512,
+            config
+                .options()
+                .optimizer
+                .hash_join_inlist_pushdown_max_size,
+            "DataFusion's built-in hash join in-list pushdown should also stay within the query memory limit"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_inlist_pushdown_max_size = 1_000;
+
+        let exact_join_filter_memory_limit =
+            configure_hash_join_memory_limits(&mut config, 1_000_000);
+
+        assert_eq!(
+            1_000, exact_join_filter_memory_limit,
+            "A larger runtime query memory limit should not raise DataFusion's configured hash join in-list cap"
+        );
     }
 
     /// Builds a full `DataFusion` instance and verifies the analyzer rules on
@@ -815,6 +948,73 @@ mod tests {
         assert!(
             sanity_check_position < cayenne_rewriter_position,
             "CayenneJoinRewriter must run after DataFusion's built-in physical optimizer rules"
+        );
+    }
+
+    #[cfg(not(windows))]
+    fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            column_name,
+            DataType::Int32,
+            false,
+        )]));
+        MemorySourceConfig::try_new_exec(&[vec![]], schema, None)
+            .expect("memory exec should be valid")
+    }
+
+    #[cfg(not(windows))]
+    fn cayenne_backed_join() -> Arc<dyn ExecutionPlan> {
+        let left = memory_exec("left_id");
+        let right: Arc<dyn ExecutionPlan> =
+            Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+
+        Arc::new(
+            HashJoinExec::try_new(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                vec![(
+                    col("left_id", &left.schema()).expect("left join key should exist"),
+                    col("right_id", &right.schema()).expect("right join key should exist"),
+                )],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+            )
+            .expect("hash join should be valid"),
+        )
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_applies_cayenne_join_rewriter_to_physical_plan() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        let state = df.ctx.state();
+        let mut plan = cayenne_backed_join();
+        for optimizer in state.physical_optimizers() {
+            plan = optimizer
+                .optimize(plan, state.config_options())
+                .expect("physical optimizer should succeed");
+        }
+
+        let plan = displayable(plan.as_ref()).indent(true).to_string();
+
+        assert!(
+            plan.contains("accumulator=ExactLeftAccumulator"),
+            "Runtime physical optimizer stack should rewrite Cayenne-backed joins: {plan}"
         );
     }
 }
