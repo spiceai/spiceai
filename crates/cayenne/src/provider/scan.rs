@@ -159,14 +159,9 @@ impl ExecutionPlan for CayenneAccelerationExec {
         target_partitions: usize,
         config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if let Some(plan) = self.inner.repartitioned(target_partitions, config)? {
-            return Ok(Some(Arc::new(CayenneAccelerationExec::new(plan))));
-        }
-
-        Ok(
-            round_robin_repartition_if_needed(Arc::clone(&self.inner), target_partitions)?
-                .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>),
-        )
+        let repartitioned = self.inner.repartitioned(target_partitions, config)?;
+        Ok(repartitioned
+            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>))
     }
 
     fn execute(

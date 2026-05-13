@@ -5305,7 +5305,7 @@ impl TableProvider for CayenneTableProvider {
             plan
         };
 
-        let mut plan: Arc<dyn ExecutionPlan> = if limit.is_none() {
+        let mut plan: Arc<dyn ExecutionPlan> = if scan_filters.is_empty() && limit.is_none() {
             round_robin_repartition_if_needed(Arc::clone(&plan), target_partitions)?.unwrap_or(plan)
         } else {
             plan
