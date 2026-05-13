@@ -489,7 +489,7 @@ impl TableProvider for PartitionTableProvider {
         args: datafusion::catalog::ScanArgs<'a>,
     ) -> datafusion::error::Result<datafusion::catalog::ScanResult> {
         let filters = args.filters().unwrap_or(&[]);
-        let projection = args.projection().map(|p| p.to_vec());
+        let projection = args.projection().map(<[usize]>::to_vec);
         let limit = args.limit();
         let plan = self
             .scan(state, projection.as_ref(), filters, limit)
