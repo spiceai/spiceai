@@ -670,8 +670,7 @@ mod tests {
     }
 
     fn dummy_flight_sql_client() -> FlightSqlClient {
-        let channel = tonic::transport::Channel::from_static("http://[::1]:50051")
-            .connect_lazy();
+        let channel = tonic::transport::Channel::from_static("http://[::1]:50051").connect_lazy();
         let cookie_channel = flight_client::cookie::CookieService::new(
             channel,
             Arc::new(flight_client::cookie::CookieStore::new()),
