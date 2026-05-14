@@ -29,9 +29,11 @@ use spice::{Result, RuntimeContext};
 use std::ffi::{OsStr, OsString};
 use tracing_subscriber::EnvFilter;
 
+const DEFAULT_CLOUD_REGION: &str = "us-east-1";
+const CLOUD_REGION_VALUES: &[&str] = &["us-east-1", "us-west-2"];
 const GLOBAL_VALUE_FLAGS: &[&str] = &[
     "--api-key",
-    "--cloud",
+    "--cloud-region",
     "--http-endpoint",
     "--tls-root-certificate-file",
 ];
@@ -81,9 +83,13 @@ struct Cli {
     #[arg(long, global = true, env = "SPICE_API_KEY")]
     api_key: Option<String>,
 
-    /// Target Spice.ai Cloud in the given region instead of a local runtime (requires --api-key).
-    #[arg(long, global = true, value_parser = ["us-east-1", "us-west-2"])]
-    cloud: Option<String>,
+    /// Target Spice.ai Cloud instead of a local runtime (requires --api-key).
+    #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
+    cloud: bool,
+
+    /// Spice.ai Cloud runtime endpoint region used with --cloud.
+    #[arg(long, global = true, value_parser = ["us-east-1", "us-west-2"], default_value = DEFAULT_CLOUD_REGION, requires = "cloud")]
+    cloud_region: String,
 
     /// HTTP endpoint of the Spice runtime to talk to.
     #[arg(long, global = true, default_value = "http://127.0.0.1:8090")]
@@ -277,7 +283,7 @@ fn main() {
 
 fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     let mut normalized = Vec::new();
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
 
     if let Some(program_name) = args.next() {
         normalized.push(program_name);
@@ -304,6 +310,27 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
             break;
         }
 
+        if let Some(region) = cloud_region_from_equals(&arg) {
+            normalized.push(OsString::from("--cloud"));
+            normalized.push(OsString::from("--cloud-region"));
+            normalized.push(OsString::from(region));
+            continue;
+        }
+
+        if arg == OsStr::new("--cloud") {
+            normalized.push(arg);
+            if args
+                .peek()
+                .is_some_and(|value| is_cloud_region_os(value.as_os_str()))
+            {
+                normalized.push(OsString::from("--cloud-region"));
+                if let Some(region) = args.next() {
+                    normalized.push(region);
+                }
+            }
+            continue;
+        }
+
         let arg_text = arg.to_string_lossy();
         let consumes_value = GLOBAL_VALUE_FLAGS.contains(&arg_text.as_ref());
         let is_subcommand = !arg_text.starts_with('-');
@@ -325,13 +352,34 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
     normalized
 }
 
+fn is_cloud_region(value: &str) -> bool {
+    CLOUD_REGION_VALUES.contains(&value)
+}
+
+fn is_cloud_region_os(value: &OsStr) -> bool {
+    value.to_str().is_some_and(is_cloud_region)
+}
+
+fn cloud_region_from_equals(value: &OsStr) -> Option<&str> {
+    let value = value.to_str()?;
+    value
+        .strip_prefix("--cloud=")
+        .filter(|region| is_cloud_region(region))
+}
+
 fn raw_args_enable_machine_mode() -> bool {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--machine" | "--programmatic" => return true,
             "--" => return false,
+            "--cloud" => {
+                if args.peek().is_some_and(|value| is_cloud_region(value)) {
+                    let _ = args.next();
+                }
+            }
+            value if value.strip_prefix("--cloud=").is_some_and(is_cloud_region) => {}
             value if GLOBAL_VALUE_FLAGS.contains(&value) => {
                 let _ = args.next();
             }
@@ -590,10 +638,11 @@ fn is_json_output(cmd: &Commands) -> bool {
 
 fn run_cli(cli: Cli) -> Result<()> {
     // Create runtime context from CLI args
+    let cloud_region = cli.cloud.then_some(cli.cloud_region.as_str());
     let ctx = RuntimeContext::with_args(
         Some(cli.http_endpoint),
         cli.api_key,
-        cli.cloud.as_deref(),
+        cloud_region,
         cli.tls_root_certificate_file,
     )?;
 
@@ -862,6 +911,39 @@ mod tests {
             panic!("expected sql command");
         };
         assert_eq!(args.query.as_deref(), Some("show tables"));
+    }
+
+    #[test]
+    fn cloud_flag_defaults_region_without_consuming_command() {
+        let cli = parse_normalized(&["spice", "--cloud", "status"]);
+        assert!(cli.cloud);
+        assert_eq!(cli.cloud_region, DEFAULT_CLOUD_REGION);
+
+        let Commands::Status(_) = cli.command else {
+            panic!("expected status command");
+        };
+    }
+
+    #[test]
+    fn cloud_flag_accepts_legacy_region_value() {
+        let cli = parse_normalized(&["spice", "--cloud", "us-west-2", "status"]);
+        assert!(cli.cloud);
+        assert_eq!(cli.cloud_region, "us-west-2");
+
+        let Commands::Status(_) = cli.command else {
+            panic!("expected status command");
+        };
+    }
+
+    #[test]
+    fn cloud_flag_accepts_equals_region_value() {
+        let cli = parse_normalized(&["spice", "--cloud=us-west-2", "status"]);
+        assert!(cli.cloud);
+        assert_eq!(cli.cloud_region, "us-west-2");
+
+        let Commands::Status(_) = cli.command else {
+            panic!("expected status command");
+        };
     }
 
     #[test]
