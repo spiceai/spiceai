@@ -156,7 +156,25 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         );
     }
 
+    #[cfg(feature = "geo")]
+    if geo_enabled(runtime).await {
+        geodatafusion::register(ctx);
+        tracing::info!(
+            "Registered geodatafusion spatial UDFs (runtime.params.geo=enabled)"
+        );
+    }
+
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
+}
+
+/// `runtime.params.geo=enabled` opts in to registering the spatial UDFs
+/// provided by the `geodatafusion` crate (PostGIS-style `ST_*` functions).
+#[cfg(feature = "geo")]
+async fn geo_enabled(runtime: &crate::Runtime) -> bool {
+    let Some(app) = runtime.read_app().await else {
+        return false;
+    };
+    app.runtime.params.get("geo").map(String::as_str) == Some("enabled")
 }
 
 /// Emits the user-defined functions BETA warning at most once per

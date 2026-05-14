@@ -191,6 +191,7 @@ duckdb = "1.10502" # 1.10502.x corresponds to DuckDB v1.5.2
 dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.32"
+geodatafusion = { version = "0.3", default-features = false }
 gethostname = "1.1.0"
 git2 = { version = "0.20", default-features = false, features = [
     "https",
