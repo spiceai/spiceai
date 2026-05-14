@@ -29,8 +29,8 @@ use std::{
 
 use arrow::{
     array::{
-        Array, ArrayRef, BooleanArray, GenericStringArray, OffsetSizeTrait, PrimitiveArray,
-        RecordBatch, StringViewArray,
+        Array, ArrayRef, BooleanArray, BooleanBuilder, GenericStringArray, OffsetSizeTrait,
+        PrimitiveArray, RecordBatch, StringViewArray,
     },
     compute::{max, max_string, max_string_view, min, min_string, min_string_view},
     datatypes::{
@@ -53,23 +53,24 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-pub const DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys per partition
+pub const DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys.
 const DEFAULT_MAXIMUM_BLOOM_FILTER_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 const MAXIMUM_RANGE_INTERVALS: usize = 64;
 
-static MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION: AtomicUsize =
-    AtomicUsize::new(DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION);
+static MAXIMUM_SHARED_INLIST_MEMORY_BYTES: AtomicUsize =
+    AtomicUsize::new(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES);
 static CURRENT_INLIST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
-// bounds are calculated per-partition, so total memory usage for bounds calculation is potentially num_partitions * MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION
-// similarly, because rows are distributed across partitions the rows per partition is total_rows / num_partitions
+// The exact in-list path reserves against one process-wide budget shared across
+// all accumulator instances. This keeps dynamic join filters bounded under query
+// concurrency; individual accumulators still keep their own local cap.
 
 #[must_use]
-pub fn maximum_inlist_memory_bytes_per_partition() -> usize {
-    MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION.load(AtomicOrdering::Relaxed)
+pub fn maximum_shared_inlist_memory_bytes() -> usize {
+    MAXIMUM_SHARED_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed)
 }
 
-pub fn set_maximum_inlist_memory_bytes_per_partition(limit: usize) {
-    MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION.store(limit, AtomicOrdering::Relaxed);
+pub fn set_maximum_shared_inlist_memory_bytes(limit: usize) {
+    MAXIMUM_SHARED_INLIST_MEMORY_BYTES.store(limit, AtomicOrdering::Relaxed);
 }
 
 #[derive(Debug)]
@@ -99,7 +100,7 @@ impl Drop for InListMemoryReservation {
 }
 
 fn reserve_inlist_memory(bytes: usize) -> bool {
-    reserve_inlist_memory_with_limit(bytes, maximum_inlist_memory_bytes_per_partition())
+    reserve_inlist_memory_with_limit(bytes, maximum_shared_inlist_memory_bytes())
 }
 
 fn reserve_inlist_memory_with_limit(bytes: usize, limit: usize) -> bool {
@@ -159,7 +160,7 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
     fn try_new(expr: Arc<dyn PhysicalExpr>, _schema: &SchemaRef) -> DataFusionResult<Self> {
         Ok(Self::new_with_memory_limit(
             expr,
-            maximum_inlist_memory_bytes_per_partition(),
+            maximum_shared_inlist_memory_bytes(),
         ))
     }
 

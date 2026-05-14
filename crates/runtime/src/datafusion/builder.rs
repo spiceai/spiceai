@@ -74,13 +74,13 @@ use datafusion_optimizer_rules::{
     },
 };
 #[cfg(not(windows))]
-use runtime_datafusion::join_accumulator::set_maximum_inlist_memory_bytes_per_partition;
+use runtime_datafusion::join_accumulator::set_maximum_shared_inlist_memory_bytes;
 use runtime_datafusion::{
     extension::{
         ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
         data_source_tree_display::DataSourceTreeDisplayOptimizer,
     },
-    join_accumulator::DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION,
+    join_accumulator::DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES,
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
@@ -379,7 +379,7 @@ impl DataFusionBuilder {
 
         #[cfg(not(windows))]
         {
-            set_maximum_inlist_memory_bytes_per_partition(exact_join_filter_memory_limit);
+            set_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
             state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
         }
         #[cfg(windows)]
@@ -679,7 +679,7 @@ fn effective_query_memory_limit(memory_limit: Option<u64>) -> u64 {
 }
 
 fn exact_join_filter_memory_limit(effective_memory_limit: u64) -> usize {
-    let default_limit = match u64::try_from(DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION) {
+    let default_limit = match u64::try_from(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES) {
         Ok(default_limit) => default_limit,
         Err(_) => u64::MAX,
     };
@@ -799,7 +799,7 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION, DataFusionBuilder,
+        DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES, DataFusionBuilder,
         configure_hash_join_memory_limits, exact_join_filter_memory_limit,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
@@ -835,7 +835,7 @@ mod tests {
             "Exact dynamic join filters should use one shared runtime query memory budget"
         );
         assert_eq!(
-            DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION,
+            DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES,
             exact_join_filter_memory_limit(u64::MAX),
             "Exact dynamic join filters should keep the existing hard cap when the query memory limit is larger"
         );
