@@ -163,11 +163,8 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                     left_col,
                     config.alias_generator(),
                 )?;
-                let wrapped = wrap_with_in_subquery_filter(
-                    Arc::clone(&new_right),
-                    right_col,
-                    subquery_plan,
-                )?;
+                let wrapped =
+                    wrap_with_in_subquery_filter(Arc::clone(&new_right), right_col, subquery_plan)?;
                 new_right = Arc::new(wrapped);
                 changed = true;
             }
@@ -315,7 +312,10 @@ fn subtree_has_propagated_filter(plan: &LogicalPlan) -> bool {
     let mut found = false;
     let _ = plan.apply(|node| {
         if let LogicalPlan::SubqueryAlias(alias) = node
-            && alias.alias.table().starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
+            && alias
+                .alias
+                .table()
+                .starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
         {
             found = true;
             return Ok(TreeNodeRecursion::Stop);
@@ -354,7 +354,10 @@ pub fn expr_has_propagated_filter(expr: &Expr) -> bool {
     let _ = expr.apply(|e| {
         if let Expr::InSubquery(InSubquery { subquery, .. }) = e
             && let LogicalPlan::SubqueryAlias(alias) = subquery.subquery.as_ref()
-            && alias.alias.table().starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
+            && alias
+                .alias
+                .table()
+                .starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
         {
             found = true;
             return Ok(TreeNodeRecursion::Stop);
@@ -370,7 +373,10 @@ fn expr_has_propagated_filter_on_key(expr: &Expr, key_col: &Column) -> bool {
         if let Expr::InSubquery(InSubquery { expr, subquery, .. }) = e
             && expr_targets_column(expr, key_col)
             && let LogicalPlan::SubqueryAlias(alias) = subquery.subquery.as_ref()
-            && alias.alias.table().starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
+            && alias
+                .alias
+                .table()
+                .starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
         {
             found = true;
             return Ok(TreeNodeRecursion::Stop);
@@ -491,7 +497,10 @@ mod tests {
                 let _ = f.predicate.apply(|expr| {
                     if let Expr::InSubquery(InSubquery { subquery, .. }) = expr
                         && let LogicalPlan::SubqueryAlias(alias) = subquery.subquery.as_ref()
-                        && alias.alias.table().starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
+                        && alias
+                            .alias
+                            .table()
+                            .starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
                     {
                         count += 1;
                     }
@@ -602,8 +611,7 @@ mod tests {
 
         // Cycle prevention: running the rule a second time on the
         // already-transformed plan must be a no-op.
-        let (second_plan, changed2) =
-            apply_rule_to_all_joins(&r, transformed_plan.clone(), &cfg)?;
+        let (second_plan, changed2) = apply_rule_to_all_joins(&r, transformed_plan.clone(), &cfg)?;
         assert!(
             !changed2,
             "second pass must not re-propagate (cycle guard); plan was:\n{second_plan}"
