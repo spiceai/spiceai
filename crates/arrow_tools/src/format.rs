@@ -235,7 +235,9 @@ fn truncate_fixed_size_list_array(
     let new_child_array = Arc::new(concat(
         &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
     )?);
-    let nulls = new_child_array.nulls().cloned();
+    // Parent list-level nulls (which slots are NULL lists) are preserved as-is;
+    // they live separately from the child array's element-level null bitmap.
+    let nulls = list_array.nulls().cloned();
 
     FixedSizeListArray::try_new(
         Arc::new(Field::new(
@@ -272,7 +274,7 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
         &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
     )?);
 
-    let nulls = new_child_array.nulls().cloned();
+    let nulls = list_array.nulls().cloned();
 
     ListArray::try_new(
         Arc::new(Field::new(
@@ -312,7 +314,7 @@ fn truncate_large_list_array(
         &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
     )?);
 
-    let nulls = new_child_array.nulls().cloned();
+    let nulls = list_array.nulls().cloned();
 
     LargeListArray::try_new(
         Arc::new(Field::new(
@@ -354,12 +356,17 @@ fn truncate_list_view_array(
     let nulls = list_array.nulls().cloned();
 
     // After concat, the new values buffer is laid out contiguously, so we
-    // re-derive offsets from the truncated sizes.
+    // re-derive offsets from the truncated sizes. Bail on overflow rather
+    // than silently producing misaligned offsets.
     let mut new_offsets: Vec<i32> = Vec::with_capacity(new_sizes.len());
     let mut running: i32 = 0;
     for &s in &new_sizes {
         new_offsets.push(running);
-        running = running.saturating_add(s);
+        running = running.checked_add(s).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(
+                "ListViewArray cumulative size overflowed i32".into(),
+            )
+        })?;
     }
 
     ListViewArray::try_new(
@@ -408,7 +415,11 @@ fn truncate_large_list_view_array(
     let mut running: i64 = 0;
     for &s in &new_sizes {
         new_offsets.push(running);
-        running = running.saturating_add(s);
+        running = running.checked_add(s).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(
+                "LargeListViewArray cumulative size overflowed i64".into(),
+            )
+        })?;
     }
 
     LargeListViewArray::try_new(
@@ -850,6 +861,75 @@ Cras venenatis euismod malesuada.",
             })
             .collect();
         assert_eq!(observed_lengths, vec![2, 2, 2]);
+    }
+
+    /// Parent list-level nulls (which slots are NULL lists) must survive
+    /// truncation. The bug we're guarding against: pulling the child array's
+    /// null bitmap and stuffing it into the parent's `nulls` slot, which can
+    /// flip valid slots to NULL or vice versa.
+    #[test]
+    fn test_truncate_list_array_preserves_parent_nulls() {
+        let input = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(0), Some(1), Some(2), Some(3)]),
+            None,
+            Some(vec![Some(4), Some(5)]),
+        ]);
+        let parent_nulls_before: Vec<bool> =
+            (0..input.len()).map(|i| input.is_null(i)).collect();
+
+        let output =
+            truncate_list_array(&input, 2).expect("truncate_list_array failed");
+        let parent_nulls_after: Vec<bool> =
+            (0..output.len()).map(|i| output.is_null(i)).collect();
+
+        assert_eq!(parent_nulls_before, parent_nulls_after);
+        assert_eq!(parent_nulls_after, vec![false, true, false]);
+    }
+
+    #[test]
+    fn test_truncate_large_list_array_preserves_parent_nulls() {
+        use arrow::array::{Int32Array, LargeListArray as LargeListArrayAlias};
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5]);
+        let offsets = OffsetBuffer::<i64>::new(vec![0_i64, 3, 3, 6].into());
+        // Mark the middle slot as a NULL list.
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let input = LargeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            Arc::new(values),
+            Some(nulls),
+        );
+
+        let output = truncate_large_list_array(&input, 2)
+            .expect("truncate_large_list_array failed");
+
+        assert!(!output.is_null(0));
+        assert!(output.is_null(1));
+        assert!(!output.is_null(2));
+    }
+
+    #[test]
+    fn test_truncate_fixed_size_list_array_preserves_parent_nulls() {
+        use arrow::array::{FixedSizeListArray as FixedSizeListArrayAlias, Int32Array};
+        use arrow::buffer::NullBuffer;
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let input = FixedSizeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            3,
+            Arc::new(values),
+            Some(nulls),
+        );
+
+        let output = truncate_fixed_size_list_array(&input, 2)
+            .expect("truncate_fixed_size_list_array failed");
+
+        assert!(!output.is_null(0));
+        assert!(output.is_null(1));
+        assert!(!output.is_null(2));
     }
 
     #[test]
