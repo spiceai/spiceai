@@ -136,7 +136,7 @@ impl CloudClient {
 
         let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;
         // Pending: the server returned 200 but the code is not yet authorized.
-        if !body.access_denied && body.access_token.as_deref().is_none_or(|t| t.is_empty()) {
+        if !body.access_denied && body.access_token.as_deref().is_none_or(str::is_empty) {
             return Ok(None);
         }
         Ok(Some(body))

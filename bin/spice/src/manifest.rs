@@ -248,7 +248,7 @@ fn validate_spicepod_value(value: &Value, path: &Path) -> Result<()> {
 
 fn required_header_field<'a>(mapping: &'a Mapping, field: &str, path: &Path) -> Result<&'a Value> {
     mapping
-        .get(Value::String(field.to_string()))
+        .get(&Value::String(field.to_string()))
         .ok_or_else(|| crate::error::Error::ConfigParse {
             message: format!(
                 "Failed to parse {}: missing field '{field}'",
