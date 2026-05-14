@@ -85,133 +85,117 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     // ── Lifecycle ────────────────────────────────────────────────────────────
-    /// Print the Spice CLI and runtime versions and check for updates.
     Version(version::VersionArgs),
 
-    /// Install or reinstall the Spice runtime binary (`spiced`).
     #[command(alias = "i")]
     Install(install::InstallArgs),
 
-    /// Upgrade the Spice CLI and runtime to the latest or a specific version.
     Upgrade(upgrade::UpgradeArgs),
 
-    /// Start the Spice runtime, installing it on demand if missing.
     Run(run::RunArgs),
 
-    /// Show component status reported by a running Spice runtime.
     Status(status::StatusArgs),
 
     // ── Spicepod scaffolding & dependencies ──────────────────────────────────
-    /// Scaffold a new Spice app by creating a `spicepod.yaml`.
     Init(init::InitArgs),
 
-    /// Add a Spicepod dependency (local path or registry reference) to the project.
     Add(add::AddArgs),
 
-    /// Add a Spicepod hosted on Spice.ai Cloud, including auth headers.
     Connect(connect::ConnectArgs),
 
-    /// Validate a `spicepod.yaml` or `spicepod.yml` without starting the runtime.
     Validate(validate::ValidateArgs),
 
     // ── Spicepod manifest editing ────────────────────────────────────────────
-    /// Add or configure dataset entries in `spicepod.yaml`.
     Dataset(dataset::DatasetArgs),
 
     /// Add or configure catalog entries in `spicepod.yaml`.
+    #[command(long_about = component::COMPONENT_LONG_ABOUT)]
     Catalog(component::ComponentArgs),
 
     /// Add or configure model entries in `spicepod.yaml`.
+    #[command(long_about = component::COMPONENT_LONG_ABOUT)]
     Model(component::ComponentArgs),
 
     /// Add or configure view entries in `spicepod.yaml`.
+    #[command(long_about = component::COMPONENT_LONG_ABOUT)]
     View(component::ComponentArgs),
 
     /// Add or configure embedding entries in `spicepod.yaml`.
+    #[command(long_about = component::COMPONENT_LONG_ABOUT)]
     Embedding(component::ComponentArgs),
 
     /// Add or configure reranker entries in `spicepod.yaml`.
+    #[command(long_about = component::COMPONENT_LONG_ABOUT)]
     Reranker(component::ComponentArgs),
 
     /// Add or configure tool entries in `spicepod.yaml`.
+    #[command(long_about = component::COMPONENT_LONG_ABOUT)]
     Tool(component::ComponentArgs),
 
     /// Add or configure worker entries in `spicepod.yaml`.
+    #[command(long_about = component::COMPONENT_LONG_ABOUT)]
     Worker(component::ComponentArgs),
 
     /// Add or configure function entries in `spicepod.yaml`.
+    #[command(long_about = component::COMPONENT_LONG_ABOUT)]
     Function(component::ComponentArgs),
 
     /// Add or configure secret entries in `spicepod.yaml`.
+    #[command(long_about = component::COMPONENT_LONG_ABOUT)]
     Secret(component::ComponentArgs),
 
     /// Configure the `runtime:` section of `spicepod.yaml`.
+    #[command(long_about = component::SINGLETON_LONG_ABOUT)]
     Runtime(component::SingletonArgs),
 
     /// Configure the `management:` section of `spicepod.yaml`.
+    #[command(long_about = component::SINGLETON_LONG_ABOUT)]
     Management(component::SingletonArgs),
 
     /// Configure the `snapshots:` section of `spicepod.yaml`.
+    #[command(long_about = component::SINGLETON_LONG_ABOUT)]
     Snapshots(component::SingletonArgs),
 
-    /// Add or configure entries under `extensions:` in `spicepod.yaml`.
     Extension(component::ExtensionArgs),
 
-    /// Add or configure key/value entries under `metadata:` in `spicepod.yaml`.
     Metadata(component::MetadataArgs),
 
     // ── Listing & inspection (talk to a running runtime) ─────────────────────
-    /// List Spicepods loaded by the runtime.
     Pods(pods::PodsArgs),
 
-    /// List datasets loaded by the runtime.
     Datasets(datasets::DatasetsArgs),
 
-    /// List catalogs configured by the runtime.
     Catalogs(catalogs::CatalogsArgs),
 
-    /// List models loaded by the runtime.
     Models(models::ModelsArgs),
 
-    /// List workers loaded by the runtime.
     Workers(workers::WorkersArgs),
 
-    /// Trace operations (queries, AI calls, refreshes, ...) executed by the runtime.
     Trace(trace::TraceArgs),
 
     // ── Querying & AI ────────────────────────────────────────────────────────
-    /// Open an interactive SQL REPL against the runtime.
     Sql(sql::SqlArgs),
 
-    /// Submit an async SQL query or open the async query REPL.
     Query(query::QueryArgs),
 
-    /// Translate natural language into SQL via a configured LLM.
     Nsql(nsql::NsqlArgs),
 
-    /// Run vector / hybrid search across embedded datasets.
     Search(search::SearchArgs),
 
     Chat(chat::ChatArgs),
 
-    /// Trigger a refresh of an accelerated dataset.
     Refresh(refresh::RefreshArgs),
 
-    /// Manage acceleration snapshots (list, inspect, rollback).
     Acceleration(acceleration::AccelerationArgs),
 
     // ── Auth, cluster, and Spice Cloud ───────────────────────────────────────
-    /// Authenticate with Spice.ai or configure credentials for data sources.
     Login(login::LoginArgs),
 
-    /// Manage Spice Cloud resources (apps, deployments, secrets, ...).
     Cloud(cloud::CloudArgs),
 
-    /// Cluster mode utilities (TLS PKI for clustered runtimes).
     Cluster(cluster::ClusterArgs),
 
     // ── Tooling ──────────────────────────────────────────────────────────────
-    /// Generate shell completions for bash, zsh, fish, elvish, or powershell.
     Completions(completions::CompletionsArgs),
 }
 
