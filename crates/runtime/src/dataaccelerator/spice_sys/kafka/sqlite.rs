@@ -203,7 +203,9 @@ mod tests {
             .expect("to create dataset");
 
         let temp_dir = TempDir::new().expect("to create temp dir");
-        let db_path = temp_dir.path().join(format!("kafka_sqlite_test_{ds_name}.db"));
+        let db_path = temp_dir
+            .path()
+            .join(format!("kafka_sqlite_test_{ds_name}.db"));
         dataset.acceleration = Some(Acceleration {
             engine: Engine::Sqlite,
             mode: Mode::File,
