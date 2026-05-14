@@ -361,6 +361,8 @@ mod tests {
                     segment_cache_mb: None,
                     target_file_size_mb: None,
                     compression_strategy: None,
+                    upload_concurrency: None,
+                    write_concurrency: None,
                 },
                 ctx.runtime_env(),
             )
