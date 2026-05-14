@@ -21,7 +21,7 @@ limitations under the License.
 //! `crates/cayenne/src/optimizer_rules.rs` module docs for the broader
 //! no-spill strategy this fits into).
 //!
-//! DataFusion's stock `infer_join_predicates` (in `push_down_filter`) already
+//! `DataFusion`'s stock `infer_join_predicates` (in `push_down_filter`) already
 //! propagates predicates that *directly* reference a join-key column:
 //! `WHERE nation.n_nationkey = 5 AND nation.n_nationkey = supplier.s_nationkey`
 //! is transformed into `WHERE supplier.s_nationkey = 5 AND ...`. That covers
@@ -45,7 +45,7 @@ limitations under the License.
 //! ```
 //!
 //! The inserted subquery re-projects the join key through whatever filters
-//! already exist on the original side, so DataFusion's
+//! already exist on the original side, so `DataFusion`'s
 //! `decorrelate_predicate_subquery` and `push_down_filter` can then plant a
 //! `LeftSemi` join (or, after pushdown, a partition-pruning predicate) on
 //! the fact-table scan. For q21 this turns
@@ -67,7 +67,7 @@ limitations under the License.
 //! The rule only fires when the side providing the filter terminates in a
 //! single `TableScan` (possibly behind `SubqueryAlias`, `Projection`,
 //! `Filter`, `Limit`). Joining a non-trivial subtree would risk
-//! duplicate-executing a large plan inside the subquery, since DataFusion
+//! duplicate-executing a large plan inside the subquery, since `DataFusion`
 //! does not currently de-duplicate plan-level common subexpressions across
 //! the outer plan and an `InSubquery`. The dim-table-filter shape
 //! (`Filter(n_name='CHINA') → TableScan(nation)`) is the q21 case and is
@@ -117,7 +117,7 @@ impl std::fmt::Debug for CayennePropagateFilterAcrossEquiJoinKeys {
 }
 
 impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "cayenne_propagate_filter_across_equi_join_keys"
     }
 
@@ -243,7 +243,7 @@ fn join_key_types_match(
 /// it bottoms out in a single `TableScan` with no `Join`, `Aggregate`,
 /// `Distinct`, `Union`, or `Window` in between.
 ///
-/// The conservatism here keeps the duplicated subquery cheap: DataFusion will
+/// The conservatism here keeps the duplicated subquery cheap: `DataFusion` will
 /// execute it independently of the outer join, so we only fire on subtrees
 /// where re-running the scan + filter is cheap.
 fn is_dim_like_subtree(plan: &LogicalPlan) -> bool {
@@ -549,7 +549,7 @@ mod tests {
     /// returning the transformed plan and a flag indicating whether at least
     /// one invocation made a change.
     ///
-    /// Mirrors what DataFusion's optimizer driver does for an
+    /// Mirrors what `DataFusion`'s optimizer driver does for an
     /// `ApplyOrder::TopDown` rule, but without spinning up the rest of the
     /// rule pipeline — keeps the tests focused on this rule's behavior in
     /// isolation.
@@ -596,7 +596,7 @@ mod tests {
         let cfg = datafusion::optimizer::OptimizerContext::new();
         let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
 
-        // Depending on DataFusion's planner the join's `left`/`right` may be
+        // Depending on `DataFusion`'s planner the join's `left`/`right` may be
         // either order. We don't care which side gets the InSubquery, only
         // that exactly one of them does, and that it carries the marker.
         let propagated = find_propagated_side(&transformed_plan);
@@ -643,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn inner_join_with_key_only_filter_is_noop() -> Result<()> {
-        // `n_nationkey = 22` references only the join key — DataFusion's
+        // `n_nationkey = 22` references only the join key — `DataFusion`'s
         // stock `infer_join_predicates` already handles this case, so our
         // rule must NOT fire and create a redundant subquery.
         let ctx = make_ctx()?;

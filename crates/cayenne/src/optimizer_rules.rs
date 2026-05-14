@@ -18,19 +18,19 @@ limitations under the License.
 //!
 //! # No-spill build-side memory strategy (q21 / chbench multi-way joins)
 //!
-//! DataFusion's `HashJoinExec` build side is non-spillable. Under the runtime
+//! `DataFusion`'s `HashJoinExec` build side is non-spillable. Under the runtime
 //! memory pool (`GreedyMemoryPool` wrapped in `TrackConsumersPool`), wide chbench
 //! shapes such as q21 (a 5-way join feeding a correlated `NOT EXISTS` self-join
 //! over `order_line`) exhaust the `HashJoinInput[N]` reservations because each
 //! build-side hash table independently materializes its full keyspace.
 //!
-//! The q21 fix is layered so each optimizer rule handles the part DataFusion
+//! The q21 fix is layered so each optimizer rule handles the part `DataFusion`
 //! cannot currently spill or infer on its own:
 //!
 //! 1. **Logical predicate propagation.**
 //!    [`crate::logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys`]
 //!    introduces explicit `InSubquery` filters for equi-join keys when the
-//!    selective predicate is on a non-key column. DataFusion's stock
+//!    selective predicate is on a non-key column. `DataFusion`'s stock
 //!    `infer_join_predicates` only fires when the predicate already references
 //!    a join key (`WHERE n_nationkey = 5` → `WHERE s_nationkey = 5`). For q21
 //!    the filter is `n_name = 'CHINA'`, so the Cayenne rule exposes the
@@ -45,7 +45,7 @@ limitations under the License.
 //!    same `Arc<RwLock<Inner>>` state, so all sibling scans observe the exact
 //!    filter values as soon as the producing join accumulates them.
 //!
-//! 3. **Same-source anti-join sort-merge rewrite.** DataFusion does not create
+//! 3. **Same-source anti-join sort-merge rewrite.** `DataFusion` does not create
 //!    dynamic filters for anti joins, and q21's `NOT EXISTS` self-join can leave
 //!    large `HashJoinInput[N]` reservations behind. [`CayenneAntiJoinSortMergeRewriter`]
 //!    rewrites same-source Cayenne `LeftAnti` / `RightAnti` `HashJoinExec`
@@ -56,7 +56,7 @@ limitations under the License.
 //! [`CayenneJoinRewriter`] still handles the ordinary inner-join probe side by
 //! swapping the default in-list accumulator for [`ExactLeftAccumulator`], which
 //! produces a precise dynamic filter (or falls back to `RangeBounds` +
-//! `BloomFilter`) that DataFusion's filter-pushdown phase plants into the
+//! `BloomFilter`) that `DataFusion`'s filter-pushdown phase plants into the
 //! right-side `CayenneAccelerationExec`'s `FileSource`.
 //!
 //! ## Audit notes (verified 2026-05-14 against the q21 explain snapshot at
@@ -81,7 +81,7 @@ limitations under the License.
 //! * **Build-side projections are minimal.** Every `CayenneAccelerationExec`
 //!   in the snapshot terminates in a `DataSourceExec` whose `projection=[...]`
 //!   lists only the join keys and the columns referenced above the join.
-//!   DataFusion's stock projection pushdown already prunes wider scans down to
+//!   `DataFusion`'s stock projection pushdown already prunes wider scans down to
 //!   `[s_suppkey, s_name, s_nationkey]`, `[o_orderkey, o_orderstatus]`,
 //!   `[l_orderkey, l_suppkey]`, etc. No additional `ProjectionExec` insertion
 //!   above the build side is required.
@@ -147,7 +147,7 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
 
 /// Rewrites same-source Cayenne anti joins from hash join to sort-merge join.
 ///
-/// DataFusion's `HashJoinExec` always materializes its left input as the
+/// `DataFusion`'s `HashJoinExec` always materializes its left input as the
 /// non-spillable build side. For q21's correlated `NOT EXISTS` self-join, that
 /// preserved side can be a large multi-way `order_line` result. Sort-merge join
 /// keeps anti-join semantics without allocating a full hash table for that side.
@@ -438,7 +438,7 @@ fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<Ca
             .schema()
             .fields()
             .iter()
-            .map(|field| field.name().to_string())
+            .map(|field| field.name().clone())
             .collect();
         scans.push(CayenneScanSummary {
             identity,

@@ -80,7 +80,7 @@ impl CayenneAccelerationExec {
         let mut paths: Vec<String> = file_scan_config
             .file_groups
             .iter()
-            .flat_map(|fg| fg.iter())
+            .flat_map(datafusion_datasource::file_groups::FileGroup::iter)
             .map(|pf| pf.object_meta.location.to_string())
             .collect();
 
@@ -127,6 +127,11 @@ impl CayenneAccelerationExec {
     ///
     /// Returns `Ok(None)` when the scan source declined all filters or the inner
     /// plan is not a simple file scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when rebuilding the underlying `DataSourceExec` with the
+    /// additional filters fails.
     pub fn with_additional_dynamic_filters(
         &self,
         filters: &[Arc<dyn PhysicalExpr>],
