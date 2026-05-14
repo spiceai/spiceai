@@ -3440,10 +3440,6 @@ impl CayenneTableProvider {
         )
     }
 
-    pub(crate) fn internal_target_partitions(&self) -> usize {
-        self.context.session_config().target_partitions()
-    }
-
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
     ///
     /// `ListingTable::scan()` drops non-partition filters — they only influence

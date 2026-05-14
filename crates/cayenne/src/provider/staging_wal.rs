@@ -201,6 +201,7 @@ impl CayenneTableProvider {
     pub async fn begin_staged_append(
         &self,
         data: SendableRecordBatchStream,
+        target_partitions: usize,
     ) -> Result<CayenneStagedAppend> {
         let write_guard = self.write_lock_arc().lock_owned().await;
 
@@ -233,7 +234,7 @@ impl CayenneTableProvider {
                 prepared_insert.stream,
                 self.target_file_size_bytes(),
                 STAGING_DIR_NAME,
-                self.internal_target_partitions(),
+                target_partitions,
             )
             .await?;
 

@@ -162,15 +162,18 @@ fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize 
         })
 }
 
-fn parse_optional_usize(acceleration: &Acceleration, keys: &[&str]) -> Option<usize> {
-    keys.iter().find_map(|key| {
-        acceleration.params.get(*key).and_then(|v| {
+fn parse_optional_usize<'a>(
+    acceleration: &Acceleration,
+    keys: &'a [&'a str],
+) -> Option<(&'a str, usize)> {
+    keys.iter().find_map(|&key| {
+        acceleration.params.get(key).and_then(|v| {
             v.parse::<usize>().map_or_else(|_| {
                 tracing::warn!(
                     "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
                 );
                 None
-            }, Some)
+            }, |value| Some((key, value)))
             })
     })
 }
@@ -436,13 +439,13 @@ impl CayenneAccelerator {
                     .collect();
             }
 
-            if let Some(parsed_upload_concurrency) = parse_optional_usize(
+            if let Some((upload_concurrency_key, parsed_upload_concurrency)) = parse_optional_usize(
                 acceleration,
                 &["cayenne_upload_concurrency", "upload_concurrency"],
             ) {
                 if parsed_upload_concurrency == 0 {
                     tracing::warn!(
-                        "Invalid cayenne_upload_concurrency value of 0. Using minimum value of 1."
+                        "Invalid {upload_concurrency_key} value of 0. Using minimum value of 1."
                     );
                     config.upload_concurrency = 1;
                 } else {
@@ -450,13 +453,13 @@ impl CayenneAccelerator {
                 }
             }
 
-            if let Some(parsed_write_concurrency) = parse_optional_usize(
+            if let Some((write_concurrency_key, parsed_write_concurrency)) = parse_optional_usize(
                 acceleration,
                 &["cayenne_write_concurrency", "write_concurrency"],
             ) {
                 if parsed_write_concurrency == 0 {
                     tracing::warn!(
-                        "Invalid cayenne_write_concurrency value of 0. Using minimum value of 1."
+                        "Invalid {write_concurrency_key} value of 0. Using minimum value of 1."
                     );
                     config.write_concurrency = Some(1);
                 } else {
