@@ -770,7 +770,11 @@ pub(crate) fn default_extension_planners(
 #[cfg(test)]
 mod tests {
     #[cfg(not(windows))]
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::{
+        array::{ArrayRef, Int32Array},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
     #[cfg(not(windows))]
     use cayenne::provider::CayenneAccelerationExec;
     use datafusion::optimizer::Analyzer;
@@ -957,7 +961,10 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        MemorySourceConfig::try_new_exec(&[vec![]], schema, None)
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values])
+            .expect("memory exec batch should be valid");
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
             .expect("memory exec should be valid")
     }
 
