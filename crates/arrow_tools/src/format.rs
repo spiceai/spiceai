@@ -138,7 +138,7 @@ pub(crate) fn format_column_data(
         (FormatOperation::TruncateUtf8Length(max_characters), (DataType::List(field), _)) => {
             let list_array = column
                 .as_any()
-                .downcast_ref::<arrow::array::ListArray>()
+                .downcast_ref::<ListArray>()
                 .ok_or_else(|| ArrowError::CastError("Failed to downcast to ListArray".into()))?;
 
             let truncated_values = format_column_data(
@@ -149,14 +149,104 @@ pub(crate) fn format_column_data(
 
             let list = ListArray::new(
                 Arc::clone(&field),
-                arrow::buffer::OffsetBuffer::new(
-                    arrow::buffer::Buffer::from_slice_ref(list_array.value_offsets()).into(),
-                ),
+                list_array.offsets().clone(),
                 truncated_values,
-                list_array.logical_nulls(),
+                list_array.nulls().cloned(),
             );
 
             Ok(Arc::new(list) as ArrayRef)
+        }
+        (FormatOperation::TruncateUtf8Length(max_characters), (DataType::LargeList(field), _)) => {
+            let list_array =
+                column.as_any().downcast_ref::<LargeListArray>().ok_or_else(|| {
+                    ArrowError::CastError("Failed to downcast to LargeListArray".into())
+                })?;
+
+            let truncated_values = format_column_data(
+                Arc::clone(list_array.values()),
+                &field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )?;
+
+            let list = LargeListArray::new(
+                Arc::clone(&field),
+                list_array.offsets().clone(),
+                truncated_values,
+                list_array.nulls().cloned(),
+            );
+
+            Ok(Arc::new(list) as ArrayRef)
+        }
+        (
+            FormatOperation::TruncateUtf8Length(max_characters),
+            (DataType::FixedSizeList(field, size), _),
+        ) => {
+            let list_array =
+                column.as_any().downcast_ref::<FixedSizeListArray>().ok_or_else(|| {
+                    ArrowError::CastError("Failed to downcast to FixedSizeListArray".into())
+                })?;
+
+            let truncated_values = format_column_data(
+                Arc::clone(list_array.values()),
+                &field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )?;
+
+            let list = FixedSizeListArray::new(
+                Arc::clone(&field),
+                size,
+                truncated_values,
+                list_array.nulls().cloned(),
+            );
+
+            Ok(Arc::new(list) as ArrayRef)
+        }
+        (FormatOperation::TruncateUtf8Length(max_characters), (DataType::ListView(field), _)) => {
+            let list_array =
+                column.as_any().downcast_ref::<ListViewArray>().ok_or_else(|| {
+                    ArrowError::CastError("Failed to downcast to ListViewArray".into())
+                })?;
+
+            let truncated_values = format_column_data(
+                Arc::clone(list_array.values()),
+                &field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )?;
+
+            ListViewArray::try_new(
+                Arc::clone(&field),
+                list_array.offsets().clone(),
+                list_array.sizes().clone(),
+                truncated_values,
+                list_array.nulls().cloned(),
+            )
+            .map(|list| Arc::new(list) as ArrayRef)
+        }
+        (
+            FormatOperation::TruncateUtf8Length(max_characters),
+            (DataType::LargeListView(field), _),
+        ) => {
+            let list_array = column
+                .as_any()
+                .downcast_ref::<LargeListViewArray>()
+                .ok_or_else(|| {
+                    ArrowError::CastError("Failed to downcast to LargeListViewArray".into())
+                })?;
+
+            let truncated_values = format_column_data(
+                Arc::clone(list_array.values()),
+                &field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )?;
+
+            LargeListViewArray::try_new(
+                Arc::clone(&field),
+                list_array.offsets().clone(),
+                list_array.sizes().clone(),
+                truncated_values,
+                list_array.nulls().cloned(),
+            )
+            .map(|list| Arc::new(list) as ArrayRef)
         }
         (FormatOperation::TruncateUtf8Length(max_characters), (DataType::Struct(fields), _)) => {
             let struct_array = column
@@ -923,6 +1013,168 @@ Cras venenatis euismod malesuada.",
         assert!(!output.is_null(0));
         assert!(output.is_null(1));
         assert!(!output.is_null(2));
+    }
+
+    /// `TruncateUtf8Length` must recurse into every list-like variant, not
+    /// just `List`. Otherwise strings nested under `LargeList` /
+    /// `FixedSizeList` / `ListView` / `LargeListView` silently skip
+    /// truncation when callers run `truncate_string_columns` over a record
+    /// batch.
+    #[test]
+    fn test_truncate_utf8_recurses_into_all_list_variants() {
+        use arrow::array::{
+            FixedSizeListArray as FixedSizeListArrayAlias,
+            LargeListArray as LargeListArrayAlias,
+            LargeListViewArray as LargeListViewArrayAlias,
+            ListViewArray as ListViewArrayAlias, StringArray,
+        };
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+
+        fn assert_first_string_truncated(arr: &ArrayRef, expected_first_char: &str) {
+            // Each variant stores its UTF8 elements contiguously in the child
+            // array; inspecting element 0 is enough to prove truncation ran.
+            let dt = arr.data_type().clone();
+            let child: ArrayRef = match &dt {
+                DataType::List(_) => arr
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("ListArray")
+                    .values()
+                    .clone(),
+                DataType::LargeList(_) => arr
+                    .as_any()
+                    .downcast_ref::<LargeListArrayAlias>()
+                    .expect("LargeListArray")
+                    .values()
+                    .clone(),
+                DataType::FixedSizeList(_, _) => arr
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArrayAlias>()
+                    .expect("FixedSizeListArray")
+                    .values()
+                    .clone(),
+                DataType::ListView(_) => arr
+                    .as_any()
+                    .downcast_ref::<ListViewArrayAlias>()
+                    .expect("ListViewArray")
+                    .values()
+                    .clone(),
+                DataType::LargeListView(_) => arr
+                    .as_any()
+                    .downcast_ref::<LargeListViewArrayAlias>()
+                    .expect("LargeListViewArray")
+                    .values()
+                    .clone(),
+                other => panic!("unexpected outer type {other:?}"),
+            };
+            let strings = child
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("StringArray child");
+            assert_eq!(strings.value(0), expected_first_char);
+        }
+
+        let inner_field = Arc::new(Field::new("item", DataType::Utf8, true));
+        let strings = || StringArray::from(vec!["abcdef", "ghijkl"]);
+
+        // List<Utf8>
+        let list = ListArray::new(
+            Arc::clone(&inner_field),
+            OffsetBuffer::<i32>::new(vec![0_i32, 1, 2].into()),
+            Arc::new(strings()),
+            None,
+        );
+        let truncated = format_column_data(
+            Arc::new(list) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::List(Arc::clone(&inner_field)),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("List Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
+
+        // LargeList<Utf8>
+        let large_list = LargeListArrayAlias::new(
+            Arc::clone(&inner_field),
+            OffsetBuffer::<i64>::new(vec![0_i64, 1, 2].into()),
+            Arc::new(strings()),
+            None,
+        );
+        let truncated = format_column_data(
+            Arc::new(large_list) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::LargeList(Arc::clone(&inner_field)),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("LargeList Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
+
+        // FixedSizeList<Utf8>[1]
+        let fsl = FixedSizeListArrayAlias::new(
+            Arc::clone(&inner_field),
+            1,
+            Arc::new(strings()),
+            None,
+        );
+        let truncated = format_column_data(
+            Arc::new(fsl) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::FixedSizeList(Arc::clone(&inner_field), 1),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("FixedSizeList Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
+
+        // ListView<Utf8>
+        let list_view = ListViewArrayAlias::try_new(
+            Arc::clone(&inner_field),
+            ScalarBuffer::<i32>::from(vec![0_i32, 1]),
+            ScalarBuffer::<i32>::from(vec![1_i32, 1]),
+            Arc::new(strings()),
+            None,
+        )
+        .expect("ListViewArray construction");
+        let truncated = format_column_data(
+            Arc::new(list_view) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::ListView(Arc::clone(&inner_field)),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("ListView Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
+
+        // LargeListView<Utf8>
+        let large_list_view = LargeListViewArrayAlias::try_new(
+            Arc::clone(&inner_field),
+            ScalarBuffer::<i64>::from(vec![0_i64, 1]),
+            ScalarBuffer::<i64>::from(vec![1_i64, 1]),
+            Arc::new(strings()),
+            None,
+        )
+        .expect("LargeListViewArray construction");
+        let truncated = format_column_data(
+            Arc::new(large_list_view) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::LargeListView(Arc::clone(&inner_field)),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("LargeListView Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
     }
 
     /// `arrow::compute::concat` errors when given an empty slice of arrays.
