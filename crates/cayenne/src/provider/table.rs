@@ -753,6 +753,53 @@ impl OnConflictDeletions {
     }
 }
 
+#[derive(Clone)]
+enum PkDeletionSnapshot {
+    PositionBased,
+    Int64Pk {
+        deleted_pk_values: Arc<DeletionIndex>,
+        insert_records: Arc<DeletionIndex>,
+    },
+    RowConverterBased {
+        deleted_row_keys: Arc<KeyDeletionIndex>,
+        insert_records: Arc<KeyDeletionIndex>,
+    },
+}
+
+impl PkDeletionSnapshot {
+    fn has_deletions(&self) -> bool {
+        match self {
+            Self::PositionBased => false,
+            Self::Int64Pk {
+                deleted_pk_values, ..
+            } => !deleted_pk_values.is_empty(),
+            Self::RowConverterBased {
+                deleted_row_keys, ..
+            } => !deleted_row_keys.is_empty(),
+        }
+    }
+}
+
+fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> PkDeletionSnapshot {
+    match strategy {
+        PkDeletionStrategyWithCache::PositionBased { .. } => PkDeletionSnapshot::PositionBased,
+        PkDeletionStrategyWithCache::Int64Pk {
+            cached_deleted_pk,
+            cached_insert_records,
+        } => PkDeletionSnapshot::Int64Pk {
+            deleted_pk_values: cached_deleted_pk.load_full(),
+            insert_records: cached_insert_records.load_full(),
+        },
+        PkDeletionStrategyWithCache::RowConverterBased {
+            cached_deleted_row_keys,
+            cached_insert_records,
+        } => PkDeletionSnapshot::RowConverterBased {
+            deleted_row_keys: cached_deleted_row_keys.load_full(),
+            insert_records: cached_insert_records.load_full(),
+        },
+    }
+}
+
 /// Result of on-conflict validation containing deleted PK information.
 struct OnConflictValidationResult {
     filtered_batches: Vec<RecordBatch>,
@@ -1841,6 +1888,10 @@ impl CayenneTableProvider {
                 .unwrap_or(0),
             PkDeletionStrategyWithCache::PositionBased { .. } => 0,
         }
+    }
+
+    fn pk_deletion_snapshot(&self) -> PkDeletionSnapshot {
+        pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy)
     }
 
     /// Write a stream of record batches to a specific snapshot directory.
@@ -4929,6 +4980,7 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         pk_indices_in_projection: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
         let protected_snapshots = {
             let guard = self.protected_snapshots.read().map_err(|_| {
@@ -4975,6 +5027,7 @@ impl CayenneTableProvider {
                 plan,
                 pk_indices_in_projection,
                 max_delete_seq_at_creation,
+                deletion_snapshot,
             )?;
 
             plans.push(filtered_plan);
@@ -4992,15 +5045,14 @@ impl CayenneTableProvider {
         plan: Arc<dyn ExecutionPlan>,
         pk_indices_in_projection: &[usize],
         min_delete_seq_to_apply: i64,
+        deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
+        match deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk {
+                deleted_pk_values, ..
             } => {
-                let all_deleted_pks = cached_deleted_pk.load_full();
-
                 // Filter to only include deletions with seq > min_delete_seq_to_apply.
-                let filtered_deletions: HashMap<i64, i64> = all_deleted_pks
+                let filtered_deletions: HashMap<i64, i64> = deleted_pk_values
                     .entries()
                     .iter()
                     .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
@@ -5027,16 +5079,13 @@ impl CayenneTableProvider {
                     pk_column_index,
                 )))
             }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
+            PkDeletionSnapshot::RowConverterBased {
+                deleted_row_keys, ..
             } => {
                 // Similar logic for RowConverter-based strategy
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    let all_deleted_keys = cached_deleted_row_keys.load_full();
-
                     // Filter to only include deletions with seq > min_delete_seq_to_apply.
-                    let filtered_deletions: HashMap<Box<[u8]>, i64> = all_deleted_keys
+                    let filtered_deletions: HashMap<Box<[u8]>, i64> = deleted_row_keys
                         .entries()
                         .iter()
                         .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
@@ -5059,7 +5108,7 @@ impl CayenneTableProvider {
                     Ok(Arc::new(CayenneAccelerationExec::new(plan)))
                 }
             }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
+            PkDeletionSnapshot::PositionBased => {
                 // Position-based doesn't use protected snapshots
                 Ok(Arc::new(CayenneAccelerationExec::new(plan)))
             }
@@ -5071,12 +5120,12 @@ impl CayenneTableProvider {
         &self,
         plan: Arc<dyn ExecutionPlan>,
         pk_indices_in_projection: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
+        match deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk {
+                deleted_pk_values, ..
             } => {
-                let deleted_pk_values = cached_deleted_pk.load_full();
                 // Don't use insert_records for protected snapshot approach
                 // The protected snapshots already handle new data without filtering
                 let empty_insert_records = Arc::new(DeletionIndex::empty());
@@ -5092,25 +5141,23 @@ impl CayenneTableProvider {
 
                     return Ok(Arc::new(Int64PkDeletionFilterExec::new(
                         plan,
-                        deleted_pk_values,
+                        Arc::clone(deleted_pk_values),
                         empty_insert_records,
                         pk_column_index,
                     )));
                 }
             }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
+            PkDeletionSnapshot::RowConverterBased {
+                deleted_row_keys, ..
             } => {
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    let deleted_row_keys = cached_deleted_row_keys.load_full();
                     // Don't use insert_records for protected snapshot approach
                     let empty_insert_records = Arc::new(KeyDeletionIndex::empty());
 
                     if !deleted_row_keys.is_empty() {
                         return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                             plan,
-                            deleted_row_keys,
+                            Arc::clone(deleted_row_keys),
                             empty_insert_records,
                             pk_indices_in_projection.to_vec(),
                             Arc::clone(row_converter),
@@ -5118,7 +5165,7 @@ impl CayenneTableProvider {
                     }
                 }
             }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
+            PkDeletionSnapshot::PositionBased => {
                 // Position-based deletions are handled at the Vortex scan level; no manual filtering is needed
             }
         }
@@ -5134,20 +5181,18 @@ impl CayenneTableProvider {
         &self,
         plan: Arc<dyn ExecutionPlan>,
         pk_indices_in_projection: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk,
-                cached_insert_records,
+        match deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk {
+                deleted_pk_values,
+                insert_records,
             } => {
-                let deleted_pk_values = cached_deleted_pk.load_full();
-                let insert_records_pk_values = cached_insert_records.load_full();
-
                 if !deleted_pk_values.is_empty() {
                     tracing::debug!(
                         "Applying Int64 PK deletion filter ({} deleted keys, {} insert records) to scan of table {}",
                         deleted_pk_values.len(),
-                        insert_records_pk_values.len(),
+                        insert_records.len(),
                         self.table_metadata.table_name
                     );
 
@@ -5161,39 +5206,36 @@ impl CayenneTableProvider {
 
                     return Ok(Arc::new(Int64PkDeletionFilterExec::new(
                         plan,
-                        deleted_pk_values,
-                        insert_records_pk_values,
+                        Arc::clone(deleted_pk_values),
+                        Arc::clone(insert_records),
                         pk_column_index,
                     )));
                 }
             }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                cached_insert_records,
+            PkDeletionSnapshot::RowConverterBased {
+                deleted_row_keys,
+                insert_records,
             } => {
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    let deleted_row_keys = cached_deleted_row_keys.load_full();
-                    let insert_records_row_keys = cached_insert_records.load_full();
-
                     if !deleted_row_keys.is_empty() {
                         tracing::debug!(
                             "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
                             deleted_row_keys.len(),
-                            insert_records_row_keys.len(),
+                            insert_records.len(),
                             self.table_metadata.table_name
                         );
 
                         return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                             plan,
-                            deleted_row_keys,
-                            insert_records_row_keys,
+                            Arc::clone(deleted_row_keys),
+                            Arc::clone(insert_records),
                             pk_indices_in_projection.to_vec(),
                             Arc::clone(row_converter),
                         )));
                     }
                 }
             }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
+            PkDeletionSnapshot::PositionBased => {
                 // Position-based deletions are handled at the Vortex scan level
             }
         }
@@ -5233,17 +5275,12 @@ impl TableProvider for CayenneTableProvider {
             Self::register_object_store_if_needed(state.runtime_env(), config);
         }
 
-        // Determine if we need PK-based deletion (Int64 or RowConverter based)
-        let need_pk_deletion = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
-            } => !cached_deleted_pk.load().is_empty(),
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
-            } => !cached_deleted_row_keys.load().is_empty(),
-            PkDeletionStrategyWithCache::PositionBased { .. } => false,
-        };
+        // Capture one immutable deletion snapshot for this scan and use it for
+        // both projection planning and filter construction. This avoids racing a
+        // later cache publish between the decision to include PK columns and the
+        // decision to wrap the plan with a PK deletion filter.
+        let deletion_snapshot = self.pk_deletion_snapshot();
+        let need_pk_deletion = deletion_snapshot.has_deletions();
 
         // For PK-based deletion, we need to ensure PK columns are included in the projection
         // so we can filter by key. We may need to strip them out afterward if they weren't
@@ -5361,6 +5398,7 @@ impl TableProvider for CayenneTableProvider {
                 scan_filters,
                 limit,
                 &pk_indices_in_projection,
+                &deletion_snapshot,
             )
             .await?;
 
@@ -5419,10 +5457,17 @@ impl TableProvider for CayenneTableProvider {
         // - Otherwise: apply deletion filter directly to main plan
         // - If inlined data exists: UNION with inlined data plan
         let plan = if protected_snapshot_plans.is_empty() {
-            self.apply_deletion_filter_with_insert_records(main_plan, &pk_indices_in_projection)?
+            self.apply_deletion_filter_with_insert_records(
+                main_plan,
+                &pk_indices_in_projection,
+                &deletion_snapshot,
+            )?
         } else {
-            let filtered_main_plan =
-                self.apply_deletion_filter(main_plan, &pk_indices_in_projection)?;
+            let filtered_main_plan = self.apply_deletion_filter(
+                main_plan,
+                &pk_indices_in_projection,
+                &deletion_snapshot,
+            )?;
 
             let mut all_plans = vec![filtered_main_plan];
             all_plans.extend(protected_snapshot_plans);
@@ -5938,6 +5983,27 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use test_framework::arrow_record_batch_gen::*;
+
+    #[test]
+    fn pk_deletion_snapshot_is_stable_after_cache_publish() {
+        let cached_deleted_row_keys = Arc::new(ArcSwap::from_pointee(KeyDeletionIndex::empty()));
+        let cached_insert_records = Arc::new(ArcSwap::from_pointee(KeyDeletionIndex::empty()));
+        let strategy = PkDeletionStrategyWithCache::RowConverterBased {
+            cached_deleted_row_keys: Arc::clone(&cached_deleted_row_keys),
+            cached_insert_records,
+        };
+
+        let scan_snapshot = pk_deletion_snapshot_for_strategy(&strategy);
+        assert!(!scan_snapshot.has_deletions());
+
+        cached_deleted_row_keys.store(Arc::new(KeyDeletionIndex::from_map(HashMap::from([(
+            Box::<[u8]>::from([42_u8].as_slice()),
+            1_i64,
+        )]))));
+
+        assert!(!cached_deleted_row_keys.load().is_empty());
+        assert!(!scan_snapshot.has_deletions());
+    }
 
     #[test]
     fn table_statistics_to_df_uses_persisted_vortex_stats() {
