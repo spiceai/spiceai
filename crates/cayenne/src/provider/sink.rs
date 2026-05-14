@@ -242,4 +242,3 @@ impl CayenneDataSink {
         prepared.finish().await
     }
 }
-

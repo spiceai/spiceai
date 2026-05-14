@@ -319,7 +319,9 @@ impl DataSink for CayennePartitionedOverwriteSink {
                         let stream: SendableRecordBatchStream = Box::pin(
                             RecordBatchStreamAdapter::new(schema_clone, ReceiverStream::new(rx)),
                         );
-                        cayenne_owned.begin_overwrite(stream, target_partitions).await
+                        cayenne_owned
+                            .begin_overwrite(stream, target_partitions)
+                            .await
                     });
                     senders.insert(key.clone(), tx.clone());
                     handles.push(handle);
@@ -525,6 +527,13 @@ impl CayennePartitionedOverwriteSink {
 
 /// Compile every partition-by expression into a physical expression that can
 /// be evaluated against incoming `RecordBatch`es.
+///
+/// For bare `Expr::Column` partitions, the column is resolved unqualified
+/// against the input schema. All other expressions (derived/computed
+/// partitions) are compiled as-is — never via stringified column-name lookup,
+/// because the debug form of a non-Column expression could spuriously match
+/// an unrelated column name and route data through the wrong physical
+/// expression.
 fn create_partition_physical_exprs(
     partition_by: &[PartitionedBy],
     schema: SchemaRef,
@@ -533,24 +542,13 @@ fn create_partition_physical_exprs(
     let execution_props = ExecutionProps::new();
     partition_by
         .iter()
-        .map(|partitioned_by| {
-            create_physical_expr(
-                &Expr::Column(Column::new_unqualified(match &partitioned_by.expression {
-                    Expr::Column(c) => c.name.clone(),
-                    other => other.to_string(),
-                })),
+        .map(|partitioned_by| match &partitioned_by.expression {
+            Expr::Column(c) => create_physical_expr(
+                &Expr::Column(Column::new_unqualified(c.name.clone())),
                 &input_dfschema,
                 &execution_props,
-            )
-            // Fall through with the actual expression if the simple Column
-            // shortcut fails (e.g. a derived partition expression).
-            .or_else(|_| {
-                create_physical_expr(
-                    &partitioned_by.expression,
-                    &input_dfschema,
-                    &execution_props,
-                )
-            })
+            ),
+            other => create_physical_expr(other, &input_dfschema, &execution_props),
         })
         .collect()
 }

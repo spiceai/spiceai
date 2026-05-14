@@ -428,7 +428,10 @@ async fn cross_partition_append_commits_atomically_under_barrier() {
     // visible as additions.
     for (i, table) in setup.tables.iter().enumerate() {
         let stream = batch_to_stream(make_batch(&[i as i64 * 10], &["seed"]));
-        let prep = table.begin_overwrite(stream, 1).await.expect("seed overwrite");
+        let prep = table
+            .begin_overwrite(stream, 1)
+            .await
+            .expect("seed overwrite");
         prep.apply_owned_txn().await.expect("apply seed");
         prep.finish().await.expect("finish seed");
     }
