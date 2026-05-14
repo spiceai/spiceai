@@ -401,7 +401,7 @@ impl KafkaConsumer {
 
     pub fn commit_stored_offsets(&self) -> Result<()> {
         self.consumer
-            .commit_consumer_state(CommitMode::Sync)
+            .commit_consumer_state(CommitMode::Async)
             .context(UnableToCommitConsumerStateSnafu)
     }
 
