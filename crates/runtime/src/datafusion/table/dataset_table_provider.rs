@@ -234,7 +234,9 @@ impl TableProvider for DatasetTableProvider {
         let filters = args.filters().unwrap_or(&[]);
         let projection = args.projection().map(<[usize]>::to_vec);
         let limit = args.limit();
-        let plan = self.scan(state, projection.as_ref(), filters, limit).await?;
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
         Ok(datafusion::catalog::ScanResult::new(plan))
     }
 
@@ -287,7 +289,10 @@ impl TableProvider for DatasetTableProvider {
         )))
     }
 
-    async fn truncate(&self, _state: &dyn Session) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    async fn truncate(
+        &self,
+        _state: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         Err(DataFusionError::Internal(format!(
             "DatasetTableProvider for `{}` does not support truncate before initialization.",
             self.name

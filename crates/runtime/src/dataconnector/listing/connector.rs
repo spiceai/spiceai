@@ -314,10 +314,7 @@ impl TableProvider for LocationPruningListingTable {
         self.inner.get_logical_plan()
     }
 
-    fn get_column_default(
-        &self,
-        column: &str,
-    ) -> Option<&datafusion_expr::Expr> {
+    fn get_column_default(&self, column: &str) -> Option<&datafusion_expr::Expr> {
         self.inner.get_column_default(column)
     }
 
