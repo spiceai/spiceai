@@ -63,6 +63,7 @@ jobs:
 
       - name: Validate spicepods - TPCH - SF1
         run: |
+          shopt -s globstar nullglob
           for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
@@ -70,6 +71,7 @@ jobs:
 
       - name: Validate spicepods - TPCDS - SF1
         run: |
+          shopt -s globstar nullglob
           for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
@@ -77,6 +79,7 @@ jobs:
 
       - name: Validate spicepods - ClickBench - SF1
         run: |
+          shopt -s globstar nullglob
           for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
@@ -84,7 +87,16 @@ jobs:
 
       - name: Validate spicepods - TPCH - SF100
         run: |
+          shopt -s globstar nullglob
           for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF100
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
           done
@@ -124,6 +136,14 @@ jobs:
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF100
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Bench - TPCDS - SF100
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 --workflow bench
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -194,6 +214,7 @@ jobs:
 
       - name: Validate spicepods - TPCH - SF1
         run: |
+          shopt -s globstar nullglob
           for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
@@ -201,6 +222,7 @@ jobs:
 
       - name: Validate spicepods - TPCDS - SF1
         run: |
+          shopt -s globstar nullglob
           for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
@@ -208,6 +230,7 @@ jobs:
 
       - name: Validate spicepods - ClickBench - SF1
         run: |
+          shopt -s globstar nullglob
           for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
@@ -215,7 +238,16 @@ jobs:
 
       - name: Validate spicepods - TPCH - SF100
         run: |
+          shopt -s globstar nullglob
           for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF100
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
           done
@@ -253,6 +285,16 @@ jobs:
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF100
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCDS - SF100
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:

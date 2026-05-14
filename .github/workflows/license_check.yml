@@ -52,7 +52,10 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny || true
+        run: cargo install cargo-deny --version 0.19.6 --locked --force
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
+
+      - name: Check Rust Advisories
+        run: cargo deny check advisories

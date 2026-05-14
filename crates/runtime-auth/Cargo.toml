@@ -25,3 +25,4 @@ tonic.workspace = true
 tower.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+x509-certificate.workspace = true

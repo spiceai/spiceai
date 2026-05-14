@@ -25,6 +25,7 @@ use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
 use futures::TryStreamExt;
 
+use datafusion_physical_expr::Partitioning;
 use datafusion_physical_plan::{
     DisplayAs, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
     execution_plan::{CardinalityEffect, InvariantLevel, check_default_invariants},
@@ -34,6 +35,7 @@ use datafusion_physical_plan::{
     },
     metrics::MetricsSet,
     projection::ProjectionExec,
+    repartition::RepartitionExec,
 };
 
 /// Wrapper for Cayenne acceleration execution plans.
@@ -49,6 +51,24 @@ impl CayenneAccelerationExec {
     pub fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
         Self { inner }
     }
+}
+
+pub(crate) fn round_robin_repartition_if_needed(
+    plan: Arc<dyn ExecutionPlan>,
+    target_partitions: usize,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let current_partitions = plan.properties().output_partitioning().partition_count();
+    if target_partitions <= 1
+        || current_partitions >= target_partitions
+        || plan.properties().output_ordering().is_some()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(Arc::new(RepartitionExec::try_new(
+        plan,
+        Partitioning::RoundRobinBatch(target_partitions),
+    )?)))
 }
 
 impl DisplayAs for CayenneAccelerationExec {
@@ -102,8 +122,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
         vec![true; self.children().len()]
     }
 
-    /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
-    /// This guarantees that the input is processed as a single stream, preserving the order of the data.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
     }
@@ -138,11 +156,10 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
     fn repartitioned(
         &self,
-        target_partitions: usize,
-        config: &ConfigOptions,
+        _target_partitions: usize,
+        _config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let r = self.inner.repartitioned(target_partitions, config)?;
-        Ok(r.map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>))
+        Ok(None)
     }
 
     fn execute(
@@ -254,5 +271,60 @@ impl IsCayenneAccelerationExec for Arc<dyn ExecutionPlan> {
         self.as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+
+    fn one_partition_plan() -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("test batch should be valid");
+
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+            .expect("memory exec should be created")
+    }
+
+    #[test]
+    fn repartitions_unordered_plan_to_target_partitions() {
+        let plan = one_partition_plan();
+        let repartitioned_plan = round_robin_repartition_if_needed(plan, 4)
+            .expect("repartition check should succeed")
+            .expect("plan should be repartitioned");
+
+        assert_eq!(
+            repartitioned_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            4
+        );
+        assert!(
+            repartitioned_plan
+                .as_any()
+                .downcast_ref::<RepartitionExec>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cayenne_exec_does_not_request_input_repartitioning() {
+        let exec = CayenneAccelerationExec::new(one_partition_plan());
+
+        assert_eq!(exec.benefits_from_input_partitioning(), vec![false]);
+        assert!(
+            exec.repartitioned(4, &ConfigOptions::default())
+                .expect("repartition check should succeed")
+                .is_none()
+        );
     }
 }

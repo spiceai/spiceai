@@ -19,7 +19,9 @@ pub mod composite;
 pub mod error;
 pub mod identity;
 pub mod layer;
+pub mod mtls;
 pub mod oidc;
 mod traits;
 
+pub use mtls::{ChannelIdentity, IdentitySource, MtlsPrincipal};
 pub use traits::*;

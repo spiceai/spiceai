@@ -1625,9 +1625,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-glue"
-version = "1.144.0"
+version = "1.145.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24165072a1fd89118365d686e569b96b8376a1abfb2f312bd6755fbe3e74b9dc"
+checksum = "95190a2c2e0be9088d0f26ad4931d91defed3a5f584559ecb71189de6d4bc238"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1649,9 +1649,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.131.0"
+version = "1.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe1b8c5282bf859170836045296b3cd710b7573aceb909498366bb508a41058e"
+checksum = "5575840a3a6b11f6011463ebe359320dfe5b67babb5e9b06fed6ddf809a9ab40"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -5358,6 +5358,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-flight",
+ "arrow-row",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -6290,7 +6291,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be#81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b798c391b6566c172d44361f8acc8472c958ca75#b798c391b6566c172d44361f8acc8472c958ca75"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6910,12 +6911,13 @@ checksum = "ab23e69df104e2fd85ee63a533a22d2132ef5975dc6b36f9f3e5a7305e4a8ed7"
 
 [[package]]
 name = "duckdb"
-version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=f4096c7592ed46b9e68755a49252d69783dece96#f4096c7592ed46b9e68755a49252d69783dece96"
+version = "1.10502.0"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=119fc5df0568fa165154697eb9c6a302938fe848#119fc5df0568fa165154697eb9c6a302938fe848"
 dependencies = [
  "arrow",
  "calamine",
  "cast",
+ "comfy-table",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink 0.10.0",
@@ -8312,7 +8314,7 @@ dependencies = [
  "log",
  "rustversion",
  "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -9254,9 +9256,9 @@ checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.11"
+version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d46837a0ed51fe95bd3b05de33cd64a1ee88fc797477ca48446872504507c5"
+checksum = "9155a582abd142abc056962c29e3ce5ff2ad5469f4246b537ed42c5deba857da"
 dependencies = [
  "typenum",
 ]
@@ -10567,8 +10569,8 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libduckdb-sys"
-version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=f4096c7592ed46b9e68755a49252d69783dece96#f4096c7592ed46b9e68755a49252d69783dece96"
+version = "1.10502.0"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=119fc5df0568fa165154697eb9c6a302938fe848#119fc5df0568fa165154697eb9c6a302938fe848"
 dependencies = [
  "cc",
  "flate2",
@@ -12172,9 +12174,9 @@ dependencies = [
 
 [[package]]
 name = "no_std_io2"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b51ed7824b6e07d354605f4abb3d9d300350701299da96642ee084f5ce631550"
+checksum = "418abd1b6d34fbf6cae440dc874771b0525a604428704c76e48b29a5e67b8003"
 dependencies = [
  "memchr",
 ]
@@ -14425,7 +14427,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -16147,6 +16149,7 @@ dependencies = [
  "tonic",
  "tower 0.5.3",
  "tracing",
+ "x509-certificate",
 ]
 
 [[package]]
@@ -16198,6 +16201,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "chrono",
+ "criterion 0.7.0",
  "dashmap",
  "datafusion",
  "datafusion-catalog",
@@ -16230,6 +16234,7 @@ dependencies = [
 name = "runtime-datafusion-index"
 version = "2.0.0-enterprise-beta"
 dependencies = [
+ "arrow_tools",
  "async-trait",
  "datafusion",
  "futures",
@@ -18196,6 +18201,7 @@ dependencies = [
  "reqwest 0.12.24",
  "runtime",
  "runtime-async",
+ "runtime-auth",
  "rustls 0.23.40",
  "snafu",
  "snmalloc-rs",
@@ -18229,6 +18235,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "subtle",
+ "tempfile",
  "tokio",
  "tracing",
  "url",
@@ -19413,7 +19420,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.17.0",
+ "hashbrown 0.16.1",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",

@@ -22,15 +22,19 @@ use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::datatypes::DataType;
+use arrow_tools::record_batch::try_cast_to;
 use cache::Caching;
+use data_components::arrow::{IndexedMemTable, write::MemTable};
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 #[cfg(feature = "dynamodb")]
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
+use data_components::index_maintenance::perform_index_maintenance;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+use datafusion::datasource::TableProvider;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
@@ -41,6 +45,8 @@ use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_datafusion_index::IndexedTableProvider;
+use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
@@ -122,11 +128,11 @@ pub struct CdcConfig {
     pub commit_timeout: Duration,
 }
 
-const CDC_PREFETCH_BUFFER_DEFAULT: usize = 32;
+const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
 const CDC_PREFETCH_BUFFER_MAX: usize = 1024;
-const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 64;
+const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 256;
 const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 4096;
-const CDC_MAX_COALESCED_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+const CDC_MAX_COALESCED_BYTES_DEFAULT: usize = 128 * 1024 * 1024;
 const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
 const CDC_COMMIT_TIMEOUT_MS_DEFAULT: usize = 30_000;
 const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
@@ -725,7 +731,20 @@ impl RefreshTask {
             );
         }
 
+        let target_schema = self.accelerator.schema();
+
         let selected_batch = select_rows(&data_batch, row_indices)?;
+        // CDC sources may produce a nullable schema even for fields declared NOT NULL in the
+        // accelerator (e.g. Postgres DELETE rows where non-PK columns are absent from the WAL
+        // old-tuple). Promote those fields to non-nullable so the batch dtype matches
+        // acceleration schema. SchemaCastScanExec handles type coercion;
+        // this step only adjusts nullability metadata.
+        let selected_batch =
+            try_cast_to(selected_batch, Arc::clone(&target_schema)).map_err(|e| {
+                crate::accelerated_table::Error::FailedToBuildRecordBatch {
+                    source: arrow::error::ArrowError::SchemaError(e.to_string()),
+                }
+            })?;
 
         let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
             selected_batch.schema(),
@@ -736,7 +755,6 @@ impl RefreshTask {
 
         // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
         // (e.g., timestamp precision conversion from Millisecond to Microsecond for Cayenne)
-        let target_schema = self.accelerator.schema();
         let streaming_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream));
         let cast_plan: Arc<dyn ExecutionPlan> =
@@ -752,6 +770,7 @@ impl RefreshTask {
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        perform_change_write_maintenance(&self.accelerator).await?;
 
         self.update_last_updated_at();
 
@@ -782,6 +801,7 @@ impl RefreshTask {
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        perform_change_write_maintenance(&self.accelerator).await?;
 
         self.update_last_updated_at();
         Ok(())
@@ -801,14 +821,35 @@ impl RefreshTask {
             row_indices.len()
         );
 
+        let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
+            .iter()
+            .copied()
+            .partition(|row| change_batch.primary_keys(*row).is_empty());
+
+        let mut wrote = false;
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
+
+        if !keyless_rows.is_empty() {
+            let selected_batch = select_rows(&change_batch.data_batch(), &keyless_rows)?;
+            if delete_matching_rows_from_arrow_provider(&self.accelerator, &selected_batch)
+                .await?
+                .is_some()
+            {
+                wrote = true;
+            } else {
+                return Err(crate::accelerated_table::Error::NoPrimaryKeysDefined {
+                    dataset_name: dataset_name.to_string(),
+                });
+            }
+        }
+
         let combined = build_batch_delete_expr_from_change_batch(
             change_batch,
-            row_indices,
+            &keyed_rows,
             dataset_name.to_string().as_str(),
         )?;
 
         if let Some(combined) = combined {
-            let _lock_guard = self.accelerator_write_mutex.lock().await;
             let delete_plan = self
                 .accelerator
                 .delete_from(session_state, vec![combined])
@@ -819,9 +860,13 @@ impl RefreshTask {
                 .await
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            wrote = true;
         }
 
-        self.update_last_updated_at();
+        if wrote {
+            perform_change_write_maintenance(&self.accelerator).await?;
+            self.update_last_updated_at();
+        }
 
         Ok(())
     }
@@ -889,6 +934,102 @@ fn select_rows(
 
     RecordBatch::try_new(data_batch.schema(), selected_columns)
         .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)
+}
+
+async fn delete_matching_rows_from_arrow_provider(
+    provider: &Arc<dyn TableProvider>,
+    rows: &RecordBatch,
+) -> crate::accelerated_table::Result<Option<u64>> {
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        return Box::pin(delete_matching_rows_from_arrow_provider(
+            indexed.get_underlying_ref(),
+            rows,
+        ))
+        .await;
+    }
+
+    if let Some(embedding_table) = provider
+        .as_any()
+        .downcast_ref::<crate::embeddings::table::EmbeddingTable>()
+    {
+        return Box::pin(delete_matching_rows_from_arrow_provider(
+            embedding_table.get_underlying_ref(),
+            rows,
+        ))
+        .await;
+    }
+
+    if let Some(table) = provider.as_any().downcast_ref::<MemTable>() {
+        return table
+            .delete_matching_rows(rows)
+            .await
+            .map(Some)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu);
+    }
+
+    if let Some(table) = provider.as_any().downcast_ref::<IndexedMemTable>() {
+        return table
+            .delete_matching_rows(rows)
+            .await
+            .map(Some)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu);
+    }
+
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+        let mut deleted = 0_u64;
+        let mut matched_arrow_provider = false;
+        for partition_provider in partitioned.partition_table_providers().await {
+            if let Some(partition_deleted) = Box::pin(delete_matching_rows_from_arrow_provider(
+                &partition_provider,
+                rows,
+            ))
+            .await?
+            {
+                deleted += partition_deleted;
+                matched_arrow_provider = true;
+            }
+        }
+
+        return Ok(matched_arrow_provider.then_some(deleted));
+    }
+
+    Ok(None)
+}
+
+async fn perform_change_write_maintenance(
+    provider: &Arc<dyn TableProvider>,
+) -> crate::accelerated_table::Result<()> {
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        return Box::pin(perform_change_write_maintenance(
+            indexed.get_underlying_ref(),
+        ))
+        .await;
+    }
+
+    if let Some(embedding_table) = provider
+        .as_any()
+        .downcast_ref::<crate::embeddings::table::EmbeddingTable>()
+    {
+        return Box::pin(perform_change_write_maintenance(
+            embedding_table.get_underlying_ref(),
+        ))
+        .await;
+    }
+
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+        for partition_provider in partitioned.partition_table_providers().await {
+            Box::pin(perform_change_write_maintenance(&partition_provider)).await?;
+        }
+        return Ok(());
+    }
+
+    perform_index_maintenance(provider.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(find_datafusion_root)
+        .context(crate::accelerated_table::FailedToWriteDataSnafu)
 }
 
 fn contiguous_row_span(row_indices: &[usize]) -> Option<(usize, usize)> {
@@ -1716,6 +1857,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_write_change_mixed_keyed_and_keyless_deletes() {
+        let schema = Arc::new(create_test_data_schema());
+        let initial = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("keyed"), Some("keyless")])) as ArrayRef,
+            ],
+        )
+        .expect("initial batch should be created");
+        let table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![initial]])
+                .expect("mem table should be created"),
+        );
+        let task = make_refresh_task(Arc::clone(&table) as Arc<dyn TableProvider>);
+
+        let change_batch = create_test_change_batch(
+            vec!["d", "d"],
+            &[vec![], vec!["id"]],
+            vec![2, 1],
+            vec![Some("keyless"), Some("changed")],
+        );
+
+        assert_eq!(
+            task.write_change(change_batch)
+                .await
+                .expect("mixed delete should succeed"),
+            WriteChangeResult::DataWritten
+        );
+
+        let ctx = SessionContext::new();
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let remaining = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+        let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(remaining_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_keyless_delete_unwraps_indexed_provider() {
+        let schema = Arc::new(create_test_data_schema());
+        let initial = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("row")])) as ArrayRef,
+            ],
+        )
+        .expect("initial batch should be created");
+        let table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![initial.clone()]])
+                .expect("mem table should be created"),
+        );
+        let wrapped = Arc::new(IndexedTableProvider::new(
+            Arc::clone(&table) as Arc<dyn TableProvider>
+        )) as Arc<dyn TableProvider>;
+
+        let deleted = delete_matching_rows_from_arrow_provider(&wrapped, &initial)
+            .await
+            .expect("delete should succeed through wrapper");
+        assert_eq!(deleted, Some(1));
+
+        let ctx = SessionContext::new();
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let remaining = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+        let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(remaining_rows, 0);
+    }
+
     #[test]
     fn test_group_into_sub_batches_no_pks_single_batch() {
         let batch = create_test_change_batch(
@@ -1760,6 +1980,166 @@ mod tests {
         assert_eq!(result[1].1.len(), 2);
         assert_eq!(result[2].0, ChangeOperationType::Upsert);
         assert_eq!(result[2].1.len(), 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // Tests for nullable-schema ChangeBatch handling.
+    //
+    // Postgres CDC produces ChangeBatches whose `data` struct has all fields
+    // promoted to nullable (so DELETE rows with absent non-PK columns can be
+    // written without Arrow rejecting nulls in non-nullable fields).
+    // `try_cast_to` in `process_upsert_batch` restores the
+    // accelerator's original nullability before the write.
+    // ---------------------------------------------------------------------
+
+    /// Build a `ChangeBatch` where every field in the `data` struct is
+    /// nullable — matching what `build_change_batch` now produces for
+    /// Postgres native CDC.
+    fn create_nullable_change_batch(
+        ops: Vec<&str>,
+        primary_keys: &[Vec<&str>],
+        ids: Vec<i32>,
+        names: Vec<Option<&str>>,
+    ) -> ChangeBatch {
+        let nullable_data_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let schema = changes_schema(&nullable_data_schema);
+
+        let op_array: ArrayRef = Arc::new(StringArray::from(ops));
+
+        let mut pk_offsets = vec![0i32];
+        let mut pk_values: Vec<&str> = vec![];
+        for pk_vec in primary_keys {
+            for &pk in pk_vec {
+                pk_values.push(pk);
+            }
+            pk_offsets.push(
+                pk_offsets.last().copied().unwrap_or(0)
+                    + i32::try_from(pk_vec.len()).expect("fits in i32"),
+            );
+        }
+        let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
+        let pk_array: ArrayRef = Arc::new(
+            ListArray::try_new(
+                pk_field,
+                arrow::buffer::OffsetBuffer::new(pk_offsets.into()),
+                Arc::new(StringArray::from(pk_values)),
+                None,
+            )
+            .expect("pk list"),
+        );
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(ids));
+        let name_array: ArrayRef = Arc::new(StringArray::from(names));
+        let data_array: ArrayRef = Arc::new(StructArray::from(vec![
+            (Arc::new(Field::new("id", DataType::Int32, true)), id_array),
+            (
+                Arc::new(Field::new("name", DataType::Utf8, true)),
+                name_array,
+            ),
+        ]));
+
+        let record = RecordBatch::try_new(Arc::new(schema), vec![op_array, pk_array, data_array])
+            .expect("record batch");
+        ChangeBatch::try_new(record).expect("change batch")
+    }
+
+    /// `try_cast_to` promotes nullable fields to non-nullable
+    /// when the target schema declares them as such, and leaves already-
+    /// matching fields untouched.
+    #[test]
+    fn test_coerce_batch_nullability_promotes_fields() {
+        // All-nullable source batch (Postgres CDC output style).
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&src_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("Alice"), None])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        // Target: `id` is NOT NULL, `name` is nullable.
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let coerced = try_cast_to(batch, Arc::clone(&target_schema)).expect("coerce");
+
+        assert!(
+            !coerced
+                .schema()
+                .field_with_name("id")
+                .expect("id field exists")
+                .is_nullable(),
+            "id should be promoted to non-nullable"
+        );
+        assert!(
+            coerced
+                .schema()
+                .field_with_name("name")
+                .expect("name field exists")
+                .is_nullable(),
+            "name should remain nullable"
+        );
+        assert_eq!(coerced.num_rows(), 2, "row count unchanged");
+    }
+
+    /// `try_cast_to` is a no-op when the batch schema already
+    /// matches the target nullability.
+    #[test]
+    fn test_coerce_batch_nullability_no_op_when_already_matches() {
+        let schema = Arc::new(create_test_data_schema());
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("Alice")])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        let coerced = try_cast_to(batch.clone(), Arc::clone(&schema)).expect("coerce");
+        assert_eq!(
+            coerced.schema(),
+            batch.schema(),
+            "schema should be identical when already matching"
+        );
+    }
+
+    /// A `ChangeBatch` whose `data` struct uses all-nullable fields (as
+    /// Postgres native CDC produces) must be successfully written to an
+    /// accelerator whose schema declares `id` as NOT NULL.
+    ///
+    /// Before the fix this would have caused a Vortex dtype mismatch that
+    /// silently killed the write task. The `try_cast_to` step in
+    /// `process_upsert_batch` makes the write succeed.
+    #[tokio::test]
+    async fn test_write_change_nullable_batch_against_non_nullable_accelerator() {
+        // Accelerator schema: `id` is NOT NULL (create_test_data_schema).
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+
+        // ChangeBatch schema: all fields nullable (Postgres CDC style).
+        let change_batch = create_nullable_change_batch(
+            vec!["c", "c"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 2],
+            vec![Some("Alice"), Some("Bob")],
+        );
+
+        assert_eq!(
+            task.write_change(change_batch)
+                .await
+                .expect("write must succeed with nullable batch against non-nullable accelerator"),
+            WriteChangeResult::DataWritten,
+        );
     }
 
     // ---------------------------------------------------------------------

@@ -19,7 +19,7 @@ use crate::{
     secrets::{ParamStr, Secrets},
 };
 use runtime_auth::{
-    FlightBasicAuth, GrpcAuth, HttpAuth,
+    FlightBasicAuth, GrpcAuth, HttpAuth, IdentitySource,
     api_key::ApiKeyAuth,
     composite::CompositeAuth,
     oidc::{ClaimMappings, OidcAuth},
@@ -37,6 +37,17 @@ pub struct EndpointAuth {
     pub http_auth: Option<Arc<dyn HttpAuth + Send + Sync>>,
     pub flight_basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     pub grpc_auth: Option<Arc<dyn GrpcAuth + Send + Sync>>,
+    /// Where the request's auth principal originates. Computed once
+    /// at startup by the binary entrypoint from the combination of
+    /// `runtime.auth` and `runtime.tls.client_auth`. Threaded into
+    /// the per-protocol mTLS layers so HTTP and Flight know whether
+    /// to promote a verified client cert to the request's auth
+    /// principal (`Channel`) or just record it as a
+    /// `ChannelIdentity` for audit (`RuntimeAuth`).
+    /// Defaults to [`IdentitySource::Anonymous`] so existing tests
+    /// and callers that don't set it explicitly preserve today's
+    /// behavior.
+    pub identity_source: IdentitySource,
 }
 
 impl EndpointAuth {
@@ -117,6 +128,7 @@ impl EndpointAuth {
             http_auth: Some(Arc::clone(&provider) as Arc<dyn HttpAuth + Send + Sync>),
             flight_basic_auth: Some(Arc::clone(&provider) as Arc<dyn FlightBasicAuth + Send + Sync>),
             grpc_auth: Some(provider as Arc<dyn GrpcAuth + Send + Sync>),
+            identity_source: IdentitySource::RuntimeAuth,
         }
     }
 
@@ -126,7 +138,22 @@ impl EndpointAuth {
             http_auth: None,
             flight_basic_auth: None,
             grpc_auth: None,
+            identity_source: IdentitySource::Anonymous,
         }
+    }
+
+    /// Override the [`IdentitySource`] decided by [`Self::new`]. The
+    /// binary entrypoint calls this after computing the effective
+    /// `client_auth` mode: `client_auth: required` with no
+    /// `runtime.auth` flips an `Anonymous` posture into
+    /// [`IdentitySource::Channel`] (mTLS-as-identity).
+    /// `runtime.auth` plus `client_auth: required` stays
+    /// [`IdentitySource::RuntimeAuth`] (mTLS-as-channel) — the cert
+    /// only contributes a `ChannelIdentity` for audit.
+    #[must_use]
+    pub fn with_identity_source(mut self, source: IdentitySource) -> Self {
+        self.identity_source = source;
+        self
     }
 
     #[must_use]
@@ -196,6 +223,7 @@ impl std::fmt::Debug for EndpointAuth {
         } else {
             builder.field("grpc_auth", &ABSENT);
         }
+        builder.field("identity_source", &self.identity_source);
         builder.finish()
     }
 }

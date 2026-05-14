@@ -72,7 +72,10 @@ use datafusion_optimizer_rules::{
     },
 };
 use runtime_datafusion::{
-    extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
+    extension::{
+        ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
+        data_source_tree_display::DataSourceTreeDisplayOptimizer,
+    },
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
@@ -123,6 +126,7 @@ pub struct DataFusionBuilder {
     status: Arc<status::RuntimeStatus>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
+    target_partitions: Option<usize>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
@@ -170,6 +174,7 @@ impl DataFusionBuilder {
             status,
             accelerator_engine_registry,
             memory_limit: None,
+            target_partitions: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             task_history_enabled: true,
@@ -207,6 +212,12 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn memory_limit(mut self, memory_limit: Option<u64>) -> Self {
         self.memory_limit = memory_limit;
+        self
+    }
+
+    #[must_use]
+    pub fn target_partitions(mut self, target_partitions: Option<usize>) -> Self {
+        self.target_partitions = target_partitions;
         self
     }
 
@@ -303,6 +314,16 @@ impl DataFusionBuilder {
             config = config.with_spill_compression(spill_compression);
         }
 
+        if let Some(target_partitions) = self.target_partitions {
+            if target_partitions > 0 {
+                config = config.with_target_partitions(target_partitions);
+            } else {
+                tracing::warn!(
+                    "Ignoring runtime.query.target_partitions=0; value must be greater than 0"
+                );
+            }
+        }
+
         let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
 
         let mut state = SessionStateBuilder::new()
@@ -346,9 +367,10 @@ impl DataFusionBuilder {
         state = state
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
-                Arc::new(Box::new(track_bytes_processed)),
-            )));
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
+                Box::new(track_bytes_processed),
+            ))))
+            .with_physical_optimizer_rule(Arc::new(DataSourceTreeDisplayOptimizer::new()));
 
         if matches!(
             self.cluster_config.as_ref().and_then(|cfg| cfg.role()),

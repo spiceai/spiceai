@@ -76,8 +76,8 @@ pub use catalog_provider::{
 };
 pub use cayenne_catalog::CayenneCatalog;
 pub use metadata::{
-    DataFile, DeleteFile, InlinedData, InlinedDelete, ObjectStoreConfig, PartitionMetadata,
-    TableMetadata, TableStatistics,
+    DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete, ObjectStoreConfig,
+    PartitionMetadata, TableMetadata, TableStatistics,
 };
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 pub use provider::{
