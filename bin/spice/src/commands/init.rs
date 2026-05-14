@@ -53,7 +53,7 @@ pub fn execute(args: &InitArgs) -> Result<()> {
     // Check if spicepod.yaml already exists
     if spicepod_path.exists() {
         print!(
-            "{} already exists. Replace (y/n)? ",
+            "{} already exists. Replace this manifest in place (y/n)? ",
             spicepod_path.display()
         );
         io::stdout().flush().ok();

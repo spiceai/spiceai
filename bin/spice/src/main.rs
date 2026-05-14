@@ -865,6 +865,22 @@ mod tests {
     }
 
     #[test]
+    fn direct_sql_flag_keeps_trailing_global_options() {
+        let cli = parse_normalized(&[
+            "spice",
+            "-sql",
+            "show tables",
+            "--http-endpoint",
+            "http://127.0.0.1:8090",
+        ]);
+        assert_eq!(cli.http_endpoint, "http://127.0.0.1:8090");
+        let Commands::Sql(args) = cli.command else {
+            panic!("expected sql command");
+        };
+        assert_eq!(args.query.as_deref(), Some("show tables"));
+    }
+
+    #[test]
     fn direct_sql_flag_is_not_normalized_inside_subcommands() {
         let args = normalize_direct_command_args(
             ["spice", "sql", "-sql", "select 1"]
@@ -894,6 +910,26 @@ mod tests {
     #[test]
     fn direct_prompt_flag_keeps_model_option() {
         let cli = parse_normalized(&["spice", "-p", "--model", "llm", "Summarize loaded datasets"]);
+        let Commands::Chat(args) = cli.command else {
+            panic!("expected chat command");
+        };
+        assert!(args.direct_prompt);
+        assert_eq!(args.model.as_deref(), Some("llm"));
+        assert_eq!(args.message.as_deref(), Some("Summarize loaded datasets"));
+    }
+
+    #[test]
+    fn direct_prompt_flag_keeps_trailing_global_options() {
+        let cli = parse_normalized(&[
+            "spice",
+            "-p",
+            "--model",
+            "llm",
+            "Summarize loaded datasets",
+            "--api-key",
+            "secret",
+        ]);
+        assert_eq!(cli.api_key.as_deref(), Some("secret"));
         let Commands::Chat(args) = cli.command else {
             panic!("expected chat command");
         };

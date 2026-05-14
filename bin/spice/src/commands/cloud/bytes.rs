@@ -39,9 +39,9 @@ impl NumBytes {
         Self(bytes)
     }
 
-    /// Parse a human-readable byte string (e.g. `"16Gi"`, `"32GiB"`).
+    /// Parse a human-readable byte string (e.g. `"16Gi"`, `"32GiB"`, or raw bytes like `"512"`).
     ///
-    /// Accepted suffixes (case-insensitive): `Gi`, `GiB`, `Mi`, `MiB`, `Ki`, `KiB`.
+    /// Accepted suffixes (case-insensitive): `Gi`, `GiB`, `Mi`, `MiB`, `Ki`, `KiB`, or no suffix for bytes.
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
         let digits_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -63,13 +63,14 @@ impl NumBytes {
 
         let suffix = &s[digits_end..];
         let multiplier = match suffix.to_ascii_lowercase().as_str() {
+            "" => 1,
             "gi" | "gib" => GIB,
             "mi" | "mib" => MIB,
             "ki" | "kib" => KIB,
             _ => {
                 return InvalidArgumentSnafu {
                     message: format!(
-                        "Invalid byte suffix '{suffix}'. Expected one of: Gi, GiB, Mi, MiB, Ki, KiB"
+                        "Invalid byte suffix '{suffix}'. Expected one of: Gi, GiB, Mi, MiB, Ki, KiB, or no suffix for bytes"
                     ),
                 }
                 .fail();
@@ -94,26 +95,21 @@ impl NumBytes {
     ///
     /// This is the format expected by the Spice Cloud API for memory/storage fields.
     pub fn to_resource_string(self) -> Result<String> {
-        self.to_parse_string()
+        Ok(self.to_parse_string())
     }
 
     /// Format as the most compact lossless string accepted by [`NumBytes::parse`].
     ///
     /// Picks the largest unit (Gi > Mi > Ki) for which the value is exactly divisible.
-    fn to_parse_string(self) -> Result<String> {
+    fn to_parse_string(self) -> String {
         if self.0.is_multiple_of(GIB) {
-            Ok(format!("{}Gi", self.0 / GIB))
+            format!("{}Gi", self.0 / GIB)
         } else if self.0.is_multiple_of(MIB) {
-            Ok(format!("{}Mi", self.0 / MIB))
+            format!("{}Mi", self.0 / MIB)
         } else if self.0.is_multiple_of(KIB) {
-            Ok(format!("{}Ki", self.0 / KIB))
+            format!("{}Ki", self.0 / KIB)
         } else {
-            Err(crate::error::Error::InvalidArgument {
-                message: format!(
-                    "Byte value {} cannot be serialized losslessly with Gi, Mi, or Ki units",
-                    self.0
-                ),
-            })
+            self.0.to_string()
         }
     }
 }
@@ -128,7 +124,7 @@ impl std::str::FromStr for NumBytes {
 
 impl Serialize for NumBytes {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let value = self.to_parse_string().map_err(serde::ser::Error::custom)?;
+        let value = self.to_parse_string();
         serializer.serialize_str(&value)
     }
 }
@@ -205,8 +201,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_no_suffix() {
-        assert!(NumBytes::parse("16").is_err());
+    fn parse_raw_bytes_without_suffix() {
+        let nb = NumBytes::parse("16").unwrap();
+        assert_eq!(nb.as_bytes(), 16);
+        assert_eq!(nb.to_resource_string().unwrap(), "16");
     }
 
     #[test]
@@ -270,10 +268,12 @@ mod tests {
     }
 
     #[test]
-    fn serde_rejects_sub_kib_values() {
+    fn serde_roundtrip_sub_kib_values() {
         let nb = NumBytes::from_bytes(512);
+        let json = serde_json::to_string(&nb).unwrap();
 
-        assert!(serde_json::to_string(&nb).is_err());
+        assert_eq!(json, r#""512""#);
+        assert_eq!(serde_json::from_str::<NumBytes>(&json).unwrap(), nb);
     }
 
     #[test]

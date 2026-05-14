@@ -107,7 +107,7 @@ pub async fn execute_add_or_connect(
         println!("\x1b[32m{} initialized!\x1b[0m", spicepod_path.display());
     }
 
-    let dependency_path = get_relative_path(ctx.app_dir(), &download_path);
+    let dependency_path = get_relative_dependency_path(ctx.app_dir(), &download_path)?;
     if manifest::ensure_string_sequence_item(&mut spicepod, "dependencies", &dependency_path)? {
         manifest::write_spicepod_value(&spicepod_path, &spicepod)?;
     }
@@ -123,4 +123,15 @@ fn get_relative_path(base: &Path, path: &Path) -> String {
         |_| manifest::path_to_spicepod_ref(path),
         manifest::path_to_spicepod_ref,
     )
+}
+
+fn get_relative_dependency_path(base: &Path, path: &Path) -> Result<String> {
+    let relative_path = path.strip_prefix(base).map_err(|_| crate::error::Error::InvalidArgument {
+        message: format!(
+            "Downloaded Spicepod path '{}' is outside the app directory '{}'. Dependencies must be stored relative to the app manifest.",
+            path.display(),
+            base.display()
+        ),
+    })?;
+    Ok(manifest::path_to_spicepod_ref(relative_path))
 }

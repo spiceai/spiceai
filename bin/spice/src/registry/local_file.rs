@@ -93,10 +93,12 @@ impl LocalFileRegistry {
             operation: "canonicalize",
             path: pods_dir.display().to_string(),
         })?;
-        let canonical_destination_dir = canonical_pods_dir.join(&pod_name);
+        // The destination directory may not exist yet, so canonicalize the parent and join
+        // the normalized pod directory name for stable source/destination comparisons.
+        let comparable_destination_dir = canonical_pods_dir.join(&pod_name);
 
-        if source_path != canonical_destination_dir
-            && canonical_destination_dir.starts_with(&source_path)
+        if source_path != comparable_destination_dir
+            && comparable_destination_dir.starts_with(&source_path)
         {
             return Err(Error::NestedLocalInstall {
                 source_path: source_path.display().to_string(),
@@ -111,7 +113,7 @@ impl LocalFileRegistry {
         })?;
 
         // Copy all files from source to the installed dependency directory.
-        if source_path != canonical_destination_dir {
+        if source_path != comparable_destination_dir {
             copy_dir_recursive(&source_path, &destination_dir)?;
         }
 

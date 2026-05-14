@@ -825,15 +825,13 @@ fn mutate_component_reference(
             .is_some_and(|existing_ref| existing_ref == normalized_reference)
         {
             if mode == MutationMode::Add {
-                ensure!(
-                    entry == &reference_value,
-                    InvalidArgumentSnafu {
+                return InvalidArgumentSnafu {
                         message: format!(
                             "{} reference '{normalized_reference}' already exists. Use configure to update it.",
                             section.label()
                         ),
                     }
-                );
+                    .fail();
             } else {
                 *entry = reference_value;
             }
@@ -1428,6 +1426,25 @@ mod tests {
             MutationMode::Add,
         )
         .expect_err("duplicate model should fail");
+
+        assert!(error.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn add_component_reference_rejects_duplicate_ref_even_when_identical() {
+        let mut spicepod: Value = yaml::from_str(
+            "version: v2\nkind: Spicepod\nname: test\nmodels:\n  - ref: models/llm.yaml\n",
+        )
+        .expect("spicepod should parse");
+
+        let error = mutate_component_reference(
+            &mut spicepod,
+            ComponentSection::Model,
+            "models/llm.yaml",
+            &[],
+            MutationMode::Add,
+        )
+        .expect_err("duplicate reference should fail");
 
         assert!(error.to_string().contains("already exists"));
     }

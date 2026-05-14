@@ -90,7 +90,7 @@ fn default_resources() -> AppResources {
     AppResources {
         limits: AppResourceLimits {
             cpu: None,
-            memory: Some("16Gi".to_string()),
+            memory: "16Gi".to_string(),
             ephemeral_storage: None,
         },
         requests: Some(AppResourceRequests {
@@ -113,7 +113,9 @@ fn resources_over(
     memory_request: Option<&str>,
     ephemeral_storage_limit: Option<&str>,
 ) -> AppResources {
-    let memory_limit_val = memory_limit.map(ToString::to_string).or(base.limits.memory);
+    let memory_limit_val = memory_limit
+        .map(ToString::to_string)
+        .unwrap_or(base.limits.memory);
     let cpu_limit_val = cpu_limit.map(ToString::to_string).or(base.limits.cpu);
     let cpu_request_val = cpu_request
         .map(ToString::to_string)

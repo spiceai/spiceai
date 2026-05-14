@@ -472,7 +472,10 @@ fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Result<Option<
     Ok(Some(AppResources {
         limits: AppResourceLimits {
             cpu: cpu.map(|v| v.to_string()),
-            memory: memory.map(NumBytes::to_resource_string).transpose()?,
+            memory: memory
+                .map(NumBytes::to_resource_string)
+                .transpose()?
+                .unwrap_or_default(),
             ephemeral_storage: None,
         },
         requests: None,
@@ -535,7 +538,7 @@ mod tests {
             .expect("cpu should create resources");
 
         assert_eq!(resources.limits.cpu.as_deref(), Some("4"));
-        assert_eq!(resources.limits.memory, None);
+        assert!(resources.limits.memory.is_empty());
     }
 
     #[test]
@@ -546,7 +549,7 @@ mod tests {
             .expect("resources should build")
             .expect("memory should create resources");
 
-        assert_eq!(resources.limits.memory.as_deref(), Some("3500Mi"));
+        assert_eq!(resources.limits.memory, "3500Mi");
     }
 
     #[test]
@@ -557,6 +560,6 @@ mod tests {
 
         let resources = executor.resources.expect("executor resources should exist");
         assert_eq!(resources.limits.cpu.as_deref(), Some("2"));
-        assert_eq!(resources.limits.memory, None);
+        assert!(resources.limits.memory.is_empty());
     }
 }

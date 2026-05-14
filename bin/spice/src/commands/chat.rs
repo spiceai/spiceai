@@ -291,7 +291,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
 
     if args.direct_prompt && message.is_none() {
         return InvalidArgumentSnafu {
-            message: "A prompt is required. Pass one after -p or pipe prompt text on stdin.",
+            message: "A prompt is required. Pass one after -p or -chat, or pipe prompt text on stdin.",
         }
         .fail();
     }

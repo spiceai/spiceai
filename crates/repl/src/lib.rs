@@ -759,46 +759,33 @@ async fn connect_flight_client(
         None
     };
 
-    let channel = if let Some(tls_root_certificate_file) = &repl_config.tls_root_certificate_file {
+    let mut client_tls_config = if let Some(tls_root_certificate_file) =
+        &repl_config.tls_root_certificate_file
+    {
         let tls_root_certificate = tokio::fs::read(tls_root_certificate_file)
             .await
             .map_err(|e| {
                 format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
             })?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
-        let mut client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
-        if let Some(identity) = client_identity {
-            client_tls_config = client_tls_config.identity(identity);
-        }
-        if repl_flight_endpoint.starts_with("http://") {
-            repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
-        }
-        Channel::from_shared(repl_flight_endpoint.clone())?
-            .user_agent(user_agent.to_string())?
-            .tls_config(client_tls_config)?
-            .connect()
-            .await
+        Some(ClientTlsConfig::new().ca_certificate(tls_root_certificate))
     } else if client_identity.is_some() || repl_flight_endpoint.starts_with("https://") {
-        let mut client_tls_config = ClientTlsConfig::new().with_native_roots();
-        if let Some(identity) = client_identity {
-            client_tls_config = client_tls_config.identity(identity);
-        }
-        if repl_flight_endpoint.starts_with("http://") {
-            repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
-        }
-        Channel::from_shared(repl_flight_endpoint.clone())?
-            .user_agent(user_agent.to_string())?
-            .tls_config(client_tls_config)?
-            .connect()
-            .await
+        Some(ClientTlsConfig::new().with_native_roots())
     } else {
-        Channel::from_shared(repl_flight_endpoint.clone())?
-            .user_agent(user_agent.to_string())?
-            .connect()
-            .await
+        None
     };
 
-    let channel = channel.map_err(|e| {
+    if let (Some(tls_config), Some(identity)) = (client_tls_config.take(), client_identity) {
+        client_tls_config = Some(tls_config.identity(identity));
+    }
+
+    if client_tls_config.is_some() && repl_flight_endpoint.starts_with("http://") {
+        repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
+    }
+
+    let channel = connect_channel(repl_flight_endpoint.clone(), user_agent, client_tls_config)
+        .await
+        .map_err(|e| {
         Box::<dyn Error>::from(format!(
             "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
         ))
@@ -807,6 +794,19 @@ async fn connect_flight_client(
     Ok(FlightServiceClient::new(channel)
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
         .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE))
+}
+
+async fn connect_channel(
+    endpoint: String,
+    user_agent: &str,
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<Channel, Box<dyn std::error::Error>> {
+    let mut endpoint = Channel::from_shared(endpoint)?.user_agent(user_agent.to_string())?;
+    if let Some(tls_config) = tls_config {
+        endpoint = endpoint.tls_config(tls_config)?;
+    }
+
+    Ok(endpoint.connect().await?)
 }
 
 /// Send a SQL query to the Flight service and return the resulting record batches.
