@@ -17,8 +17,7 @@ limitations under the License.
 //! CH-benCH driver — TPC-C schema + seed data loader and OLTP workload driver.
 //!
 //! Creates 12 tables (9 TPC-C + 3 CH supplemental), loads seed data,
-//! and runs a TPC-C OLTP workload with configurable terminals and duration.
-
+/// and runs a TPC-C OLTP workload with configurable terminals.
 pub mod config;
 pub mod loader;
 pub mod metrics;
@@ -62,9 +61,10 @@ pub trait ChBenchDriver: Send + Sync {
     /// (e.g. `_bench_ts` triggers).
     async fn prepare(&self) -> Result<()>;
 
-    /// Run the TPC-C OLTP workload until `cancel` fires or the configured
-    /// duration elapses.
-    async fn run(&self, cancel: CancellationToken) -> Result<OltpReport>;
+    /// Run the TPC-C OLTP workload until `stop` is triggered.
+    ///
+    /// The caller controls lifetime — trigger the token to stop the workload.
+    async fn run(&self, stop: CancellationToken) -> Result<OltpReport>;
 
     /// Tables to probe for staleness measurement.
     ///
@@ -132,37 +132,28 @@ impl ChBenchDriver for PostgresChBenchDriver {
         Ok(())
     }
 
-    /// Run the TPC-C OLTP workload until the cancellation token is triggered
-    /// or `config.duration` elapses.
+    /// Run the TPC-C OLTP workload until `stop` is triggered.
     ///
     /// Each terminal opens its own Postgres connection and runs transactions
-    /// in a tight loop with the configured mix weights.
-    async fn run(&self, cancel: CancellationToken) -> Result<OltpReport> {
+    /// in a tight loop with the configured mix weights. The caller controls
+    /// lifetime by triggering the token.
+    async fn run(&self, stop: CancellationToken) -> Result<OltpReport> {
         let terminals = self.config.terminals;
-        let duration = self.config.duration;
         let mix = self.config.mix;
         let warehouses = i32::try_from(self.config.warehouses).unwrap_or(1);
         let base_seed = self.config.seed.unwrap_or(42);
 
         println!(
-            "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, {duration}s duration, mix={mix:?}",
-            duration = duration.as_secs()
+            "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}",
         );
-
-        // Spawn a task that cancels after the configured duration
-        let duration_cancel = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
-            duration_cancel.cancel();
-        });
 
         let mut handles = Vec::with_capacity(terminals);
         for terminal_id in 0..terminals {
             let conn_str = self.source.connection_string();
-            let cancel = cancel.clone();
+            let stop = stop.clone();
 
             handles.push(tokio::spawn(async move {
-                run_terminal(terminal_id, &conn_str, cancel, warehouses, mix, base_seed).await
+                run_terminal(terminal_id, &conn_str, stop, warehouses, mix, base_seed).await
             }));
         }
 
@@ -223,7 +214,7 @@ impl ChBenchDriver for PostgresChBenchDriver {
 async fn run_terminal(
     terminal_id: usize,
     conn_str: &str,
-    cancel: CancellationToken,
+    stop: CancellationToken,
     warehouses: i32,
     mix: [u32; 5],
     base_seed: u64,
@@ -235,7 +226,7 @@ async fn run_terminal(
             source,
         })?;
 
-    let cancel_conn = cancel.clone();
+    let stop_conn = stop.clone();
     tokio::spawn(async move {
         tokio::select! {
             result = connection => {
@@ -243,7 +234,7 @@ async fn run_terminal(
                     eprintln!("Terminal {terminal_id} connection error: {e}");
                 }
             }
-            () = cancel_conn.cancelled() => {}
+            () = stop_conn.cancelled() => {}
         }
     });
 
@@ -251,7 +242,7 @@ async fn run_terminal(
     let mut metrics = metrics::OltpMetrics::new();
 
     loop {
-        if cancel.is_cancelled() {
+        if stop.is_cancelled() {
             break;
         }
 
@@ -263,9 +254,9 @@ async fn run_terminal(
             }
             Err(e) => {
                 metrics.record_abort();
-                if !cancel.is_cancelled() {
+                if !stop.is_cancelled() {
                     // Log only if not shutting down — connection-closed errors
-                    // during cancellation are expected and noisy.
+                    // during shutdown are expected and noisy.
                     eprintln!("Terminal {terminal_id} {txn_type} error: {e}");
                 }
             }
