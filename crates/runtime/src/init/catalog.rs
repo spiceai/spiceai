@@ -74,6 +74,12 @@ impl Runtime {
                         if source.downcast_ref::<catalogconnector::Error>()
                             .is_some_and(catalogconnector::Error::is_configuration_error)
                 ) {
+                    let catalog_name = &catalog.name;
+                    self.status.update_catalog(
+                        catalog_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
+                    metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     return Err(RetryError::permanent(err));
                 }
                 return Err(RetryError::transient(err));

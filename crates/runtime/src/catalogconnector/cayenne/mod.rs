@@ -152,7 +152,7 @@ impl CatalogConnector for CayenneCatalogConnector {
             return Err(super::Error::InvalidConfigurationNoSource {
                 connector: PREFIX.to_string(),
                 connector_component: ConnectorComponent::from(catalog),
-                message: "Cayenne catalog is only supported in distributed Spice (scheduler/executor) mode. See https://spiceai.org/docs for distributed setup.".to_string(),
+                message: "Cayenne catalog is only supported in distributed Spice mode. Start Spice with `--role scheduler` or `--role executor` (with `--scheduler-address`). See https://spiceai.org/docs/features/federated-queries/distributed".to_string(),
             });
         }
 
