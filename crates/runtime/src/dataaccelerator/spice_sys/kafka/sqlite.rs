@@ -158,9 +158,9 @@ fn ensure_kafka_table(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
 
     let table_info = format!("PRAGMA table_info({KAFKA_TABLE_NAME})");
     let mut stmt = conn.prepare(&table_info)?;
-    let mut columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
     let mut has_offsets_json = false;
-    while let Some(column) = columns.next() {
+    for column in columns {
         if column? == "offsets_json" {
             has_offsets_json = true;
             break;
