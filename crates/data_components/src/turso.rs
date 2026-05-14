@@ -242,7 +242,6 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// Turso dialect wrapping `SqliteDialect` with Turso-specific overrides.
 ///
 /// Differences from plain `SqliteDialect`:
-/// - `supports_nulls_first_in_sort` returns `false` (libSQL/Turso does not support it)
 /// - `now()` is rewritten to `datetime('now')` (libSQL has no `now()` function)
 struct TursoDialect {
     inner: SqliteDialect,
@@ -261,10 +260,8 @@ impl Dialect for TursoDialect {
         self.inner.identifier_quote_style(identifier)
     }
 
-    // Override: libSQL/Turso does not support NULLS FIRST/LAST in ORDER BY
-    // (SqliteDialect returns true)
     fn supports_nulls_first_in_sort(&self) -> bool {
-        false
+        true
     }
 
     fn supports_qualify(&self) -> bool {
