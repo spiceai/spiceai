@@ -47,6 +47,7 @@ Quick start:
   cd my_app
   spice run                  # Install (if needed) and start the runtime
     spice -sql \"show tables\"   # Run a single SQL query and exit
+    spice -p \"Summarize loaded datasets\"  # Prompt the configured LLM and exit
   spice sql                  # Open an interactive SQL REPL
 
 Common workflows:
@@ -209,7 +210,7 @@ enum Commands {
 fn main() {
     use std::io::IsTerminal;
 
-    let args = normalize_direct_sql_args(std::env::args_os());
+    let args = normalize_direct_command_args(std::env::args_os());
     let mut cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
@@ -267,7 +268,7 @@ fn main() {
     }
 }
 
-fn normalize_direct_sql_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     let mut normalized = Vec::new();
     let mut args = args.into_iter();
 
@@ -279,6 +280,13 @@ fn normalize_direct_sql_args(args: impl IntoIterator<Item = OsString>) -> Vec<Os
         if arg == OsStr::new("-sql") {
             normalized.push(OsString::from("sql"));
             normalized.push(OsString::from("--query"));
+            normalized.extend(args);
+            break;
+        }
+
+        if arg == OsStr::new("-p") {
+            normalized.push(OsString::from("chat"));
+            normalized.push(OsString::from("--direct-prompt"));
             normalized.extend(args);
             break;
         }
@@ -770,7 +778,7 @@ mod tests {
     }
 
     fn parse_normalized(args: &[&str]) -> Cli {
-        let args = normalize_direct_sql_args(args.iter().map(OsString::from));
+        let args = normalize_direct_command_args(args.iter().map(OsString::from));
         Cli::try_parse_from(args).expect("failed to parse CLI args")
     }
 
@@ -854,7 +862,7 @@ mod tests {
 
     #[test]
     fn direct_sql_flag_is_not_normalized_inside_subcommands() {
-        let args = normalize_direct_sql_args(
+        let args = normalize_direct_command_args(
             ["spice", "sql", "-sql", "select 1"]
                 .into_iter()
                 .map(OsString::from),
@@ -863,6 +871,44 @@ mod tests {
         assert_eq!(
             args,
             ["spice", "sql", "-sql", "select 1"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn direct_prompt_flag_normalizes_to_chat_message() {
+        let cli = parse_normalized(&["spice", "-p", "Summarize loaded datasets"]);
+        let Commands::Chat(args) = cli.command else {
+            panic!("expected chat command");
+        };
+        assert!(args.direct_prompt);
+        assert_eq!(args.message.as_deref(), Some("Summarize loaded datasets"));
+    }
+
+    #[test]
+    fn direct_prompt_flag_keeps_model_option() {
+        let cli = parse_normalized(&["spice", "-p", "--model", "llm", "Summarize loaded datasets"]);
+        let Commands::Chat(args) = cli.command else {
+            panic!("expected chat command");
+        };
+        assert!(args.direct_prompt);
+        assert_eq!(args.model.as_deref(), Some("llm"));
+        assert_eq!(args.message.as_deref(), Some("Summarize loaded datasets"));
+    }
+
+    #[test]
+    fn direct_prompt_flag_is_not_normalized_inside_subcommands() {
+        let args = normalize_direct_command_args(
+            ["spice", "chat", "-p", "Summarize loaded datasets"]
+                .into_iter()
+                .map(OsString::from),
+        );
+
+        assert_eq!(
+            args,
+            ["spice", "chat", "-p", "Summarize loaded datasets"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
