@@ -404,7 +404,7 @@ async fn test_cayenne_scan_uses_target_partitions_impl(
     ctx.register_table("target_partitioned_table", registered_table)?;
 
     ctx.sql(
-        "INSERT INTO target_partitioned_table VALUES \
+        "INSERT INTO target_partitioned_ta`ble VALUES \
          (1, 'a', 100), \
          (2, 'a', 200), \
          (3, 'b', 300), \

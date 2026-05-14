@@ -161,8 +161,9 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+    use tempfile::TempDir;
 
-    async fn create_test_dataset(ds_name: &str) -> Dataset {
+    async fn create_test_dataset(ds_name: &str) -> (Dataset, TempDir) {
         let app = app::AppBuilder::new("test").build();
         let runtime = RuntimeBuilder::new().build().await;
 
@@ -173,15 +174,24 @@ mod tests {
             .build()
             .expect("to create dataset");
 
-        let db_file = format!(".spice/data/mongodb_sqlite_test_{ds_name}.db");
+        let temp_dir = TempDir::new().expect("to create temp dir");
+        let db_path = temp_dir
+            .path()
+            .join(format!("mongodb_sqlite_test_{ds_name}.db"));
+
         dataset.acceleration = Some(Acceleration {
             engine: Engine::Sqlite,
             mode: Mode::File,
-            params: [("sqlite_file".to_string(), db_file)].into_iter().collect(),
+            params: [(
+                "sqlite_file".to_string(),
+                db_path.to_string_lossy().to_string(),
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         });
 
-        dataset
+        (dataset, temp_dir)
     }
 
     fn create_test_metadata() -> MongoCheckpointMetadata {
@@ -200,8 +210,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_roundtrip() {
-        let ds = create_test_dataset("test_mongodb_sqlite_roundtrip").await;
-        let mongo_sys = MongoSys::try_new(&ds, OpenOption::CreateIfNotExists)
+        let (dataset, _temp_dir) = create_test_dataset("test_mongodb_sqlite_roundtrip").await;
+        let mongo_sys = MongoSys::try_new(&dataset, OpenOption::CreateIfNotExists)
             .await
             .expect("to create MongoSys");
 
@@ -219,8 +229,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_metadata_overwrite() {
-        let ds = create_test_dataset("test_mongodb_sqlite_overwrite").await;
-        let mongo_sys = MongoSys::try_new(&ds, OpenOption::CreateIfNotExists)
+        let (dataset, _temp_dir) = create_test_dataset("test_mongodb_sqlite_overwrite").await;
+        let mongo_sys = MongoSys::try_new(&dataset, OpenOption::CreateIfNotExists)
             .await
             .expect("to create MongoSys");
 
@@ -244,8 +254,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_get_nonexistent() {
-        let ds = create_test_dataset("test_mongodb_sqlite_get_nonexistent").await;
-        let mongo_sys = MongoSys::try_new(&ds, OpenOption::CreateIfNotExists)
+        let (dataset, _temp_dir) = create_test_dataset("test_mongodb_sqlite_get_nonexistent").await;
+        let mongo_sys = MongoSys::try_new(&dataset, OpenOption::CreateIfNotExists)
             .await
             .expect("to create MongoSys");
 
@@ -254,8 +264,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_delete() {
-        let ds = create_test_dataset("test_mongodb_sqlite_delete").await;
-        let mongo_sys = MongoSys::try_new(&ds, OpenOption::CreateIfNotExists)
+        let (dataset, _temp_dir) = create_test_dataset("test_mongodb_sqlite_delete").await;
+        let mongo_sys = MongoSys::try_new(&dataset, OpenOption::CreateIfNotExists)
             .await
             .expect("to create MongoSys");
 
@@ -271,8 +281,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_null_optional_columns() {
-        let ds = create_test_dataset("test_mongodb_sqlite_null_optional").await;
-        let mongo_sys = MongoSys::try_new(&ds, OpenOption::CreateIfNotExists)
+        let (dataset, _temp_dir) = create_test_dataset("test_mongodb_sqlite_null_optional").await;
+        let mongo_sys = MongoSys::try_new(&dataset, OpenOption::CreateIfNotExists)
             .await
             .expect("to create MongoSys");
 

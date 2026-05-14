@@ -83,7 +83,7 @@ impl MongoSys {
             .get_underlying_conn_mut();
 
         let query = format!(
-            "SELECT resume_token_json, cluster_time_ts, schema_json, epoch(updated_at) FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?"
+            "SELECT resume_token_json, cluster_time_ts, schema_json, CAST(epoch(updated_at) AS DOUBLE) FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).ok()?;
         let mut rows = stmt.query([&self.dataset_name]).ok()?;

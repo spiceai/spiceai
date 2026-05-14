@@ -354,12 +354,14 @@ impl Acceleration {
         self
     }
 
-    /// Returns whether Arrow `hash_index` is enabled for primary key upserts or indexes.
+    /// Returns whether `hash_index` is explicitly enabled in the acceleration params.
     #[must_use]
     pub fn is_hash_index_enabled(&self) -> bool {
         matches!(self.engine, Engine::Arrow | Engine::PartitionedArrow)
-            && self.enabled
-            && (!self.indexes.is_empty()
+            && (self
+                .params
+                .get("hash_index")
+                .is_some_and(|v| v.eq_ignore_ascii_case("enabled"))
                 || (self.primary_key.is_some()
                     && !matches!(self.refresh_mode, Some(RefreshMode::Caching))))
     }
@@ -432,12 +434,25 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             engine => engine,
         };
 
+        // Arrow acceleration automatically enables hash_index when primary_key is supplied.
+        let hash_index_enabled = params
+            .as_ref()
+            .and_then(|p| p.data.get("hash_index"))
+            .is_some_and(|v| v.as_string().eq_ignore_ascii_case("enabled"))
+            || (matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
+                && primary_key.is_some()
+                && !matches!(
+                    acceleration.refresh_mode,
+                    Some(spicepod_acceleration::RefreshMode::Caching)
+                ));
+
+        // Indexes require hash_index to be enabled for Arrow engine
         if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
-            && let Some(params) = &mut params
-            && params.data.remove("hash_index").is_some()
+            && !indexes.is_empty()
+            && !hash_index_enabled
         {
             tracing::warn!(
-                "The hash_index acceleration parameter is ignored for Arrow acceleration; hash_index alone no longer enables indexing. Hash indexes are automatically enabled only when primary_key or indexes are configured."
+                "Indexes specified but hash_index is not enabled for Arrow engine. Add 'hash_index: enabled' to use indexes for fast lookups."
             );
         }
         // Note: The warning for hash_index being experimental is logged once
@@ -739,20 +754,5 @@ mod tests {
         // Test missing parameter (default)
         let result = parse_caching_stale_if_error(&mut None).expect("to parse");
         assert_eq!(result, StaleIfError::Disabled);
-    }
-
-    #[test]
-    fn test_hash_index_param_is_ignored() {
-        let acceleration = spicepod_acceleration::Acceleration {
-            params: Some(Params::from_string_map(HashMap::from([(
-                "hash_index".to_string(),
-                "enabled".to_string(),
-            )]))),
-            ..Default::default()
-        };
-
-        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
-        assert!(!parsed.params.contains_key("hash_index"));
-        assert!(!parsed.is_hash_index_enabled());
     }
 }

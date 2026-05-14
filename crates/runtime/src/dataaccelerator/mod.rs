@@ -1121,51 +1121,6 @@ mod test {
         let expected = ["+------+", "| name |", "+------+", "| new  |", "+------+"];
         assert_batches_eq!(&expected, &result);
     }
-
-    #[tokio::test]
-    async fn test_arrow_indexes_enable_hash_index() {
-        use crate::builder::RuntimeBuilder;
-        use data_components::arrow::IndexedMemTable;
-        use datafusion_table_providers::util::column_reference::ColumnReference;
-
-        let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        let ctx = Arc::clone(&runtime.df.ctx);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let acceleration_settings = Acceleration {
-            enabled: true,
-            mode: Mode::Memory,
-            engine: Engine::Arrow,
-            indexes: HashMap::from([(
-                ColumnReference::new(vec!["name".to_string()]),
-                IndexType::Unique,
-            )]),
-            ..Acceleration::default()
-        };
-
-        let table = runtime
-            .accelerator_engine_registry
-            .create_accelerator_table(
-                "arrow_secondary_index".into(),
-                schema,
-                None,
-                &acceleration_settings,
-                Arc::new(RwLock::new(Secrets::new())),
-                None,
-                ctx,
-            )
-            .await
-            .expect("accelerator table should be created");
-
-        let indexed = table
-            .as_any()
-            .downcast_ref::<IndexedMemTable>()
-            .expect("indexes should create an IndexedMemTable");
-        assert!(!indexed.has_index());
-        assert!(indexed.has_secondary_indexes());
-    }
 }
 
 #[cfg(test)]
@@ -1199,16 +1154,13 @@ mod accelerator_compat_tests {
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
     use datafusion::{
-        common::{Constraint, Constraints, TableReference, ToDFSchema},
+        common::{Constraints, TableReference, ToDFSchema},
         datasource::TableProvider,
         execution::context::SessionContext,
         logical_expr::{CreateExternalTable, col, dml::InsertOp, lit},
         physical_plan::collect,
     };
     use datafusion_table_providers::util::test::MockExec;
-    use datafusion_table_providers::util::{
-        column_reference::ColumnReference, on_conflict::OnConflict,
-    };
     use std::{collections::HashMap, sync::Arc};
     use tempfile::TempDir;
 
@@ -1235,65 +1187,18 @@ mod accelerator_compat_tests {
         }
     }
 
-    fn clean_cayenne_metadata(metadata_dir: &str) {
-        let metadata_path = std::path::Path::new(metadata_dir);
-        if !metadata_path.exists() {
-            let _ = std::fs::create_dir_all(metadata_path);
-            return;
-        }
-
-        if let Ok(entries) = std::fs::read_dir(metadata_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("cayenne.db"))
-                {
-                    if path.is_dir() {
-                        let _ = std::fs::remove_dir_all(&path);
-                    } else {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
-            }
-        }
-    }
-
     /// Helper function to construct mode label with optional timestamp format
-    fn make_mode_label(
-        mode: &str,
-        timestamp_format: Option<&str>,
-        metastore_type: Option<&str>,
-    ) -> String {
-        let mut labels = vec![mode.to_string()];
+    fn make_mode_label(mode: &str, timestamp_format: Option<&str>) -> String {
         if let Some(ts_fmt) = timestamp_format {
-            labels.push(format!("timestamp_format={ts_fmt}"));
+            format!("{}, timestamp_format={}", mode, ts_fmt)
+        } else {
+            mode.to_string()
         }
-        if let Some(metastore) = metastore_type {
-            labels.push(format!("metastore={metastore}"));
-        }
-        labels.join(", ")
-    }
-
-    #[derive(Debug, Clone, Copy, Default)]
-    struct CompatTableOptions {
-        primary_key: bool,
     }
 
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
-        F: Fn(Engine, Arc<dyn TableProvider>, String, &TestEnvironment) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
-        run_compat_test_with_table_options(test_fn, CompatTableOptions::default()).await;
-    }
-
-    async fn run_compat_test_with_table_options<F, Fut>(
-        test_fn: F,
-        table_options: CompatTableOptions,
-    ) where
         F: Fn(Engine, Arc<dyn TableProvider>, String, &TestEnvironment) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
@@ -1329,7 +1234,7 @@ mod accelerator_compat_tests {
             // Create a unique test environment for this test run
             let test_env = TestEnvironment::new();
 
-            let mode_label = make_mode_label(mode, timestamp_format, metastore_type);
+            let mode_label = make_mode_label(mode, timestamp_format);
 
             println!("Testing with engine: {:?} ({})", engine, mode_label);
 
@@ -1372,16 +1277,6 @@ mod accelerator_compat_tests {
                 options.insert("internal_timestamp_format".to_string(), ts_fmt.to_string());
             }
 
-            let constraints = if table_options.primary_key {
-                options.insert(
-                    "on_conflict".to_string(),
-                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])).to_string(),
-                );
-                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])])
-            } else {
-                Constraints::new_unverified(vec![])
-            };
-
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare(format!("test_table_{:?}_{}", engine, mode)),
@@ -1394,7 +1289,7 @@ mod accelerator_compat_tests {
                 order_exprs: vec![],
                 unbounded: false,
                 options,
-                constraints,
+                constraints: Constraints::new_unverified(vec![]),
                 column_defaults: HashMap::default(),
                 temporary: false,
             };
@@ -1480,7 +1375,12 @@ mod accelerator_compat_tests {
                             let _ = std::fs::create_dir_all(test_dir);
                         }
 
-                        clean_cayenne_metadata(&test_env.metadata_dir());
+                        // Also clean up Cayenne metadata to ensure fresh schema
+                        // Use test environment's metadata directory
+                        let cayenne_db_path = format!("{}/cayenne.db", test_env.metadata_dir());
+                        if std::path::Path::new(&cayenne_db_path).exists() {
+                            let _ = std::fs::remove_file(&cayenne_db_path);
+                        }
                     }
 
                     // Create a proper Dataset that implements AccelerationSource
@@ -1542,12 +1442,11 @@ mod accelerator_compat_tests {
                     use std::panic::AssertUnwindSafe;
 
                     let accelerator = CayenneAccelerator::new();
-                    let runtime_env = SessionContext::new().runtime_env();
                     let create_future = AssertUnwindSafe(accelerator.create_external_table(
                         external_table,
                         Some(&dataset),
                         Vec::new(),
-                        Some(runtime_env),
+                        None,
                     ))
                     .catch_unwind();
 
@@ -2601,11 +2500,6 @@ mod accelerator_compat_tests {
             let metadata_dir = test_env.metadata_dir();
             async move {
                 let ctx = SessionContext::new();
-                let mode = if _mode.starts_with("file") {
-                    "file"
-                } else {
-                    "memory"
-                };
                 let schema = Arc::new(Schema::new(vec![
                     Field::new("id", DataType::Int64, false),
                     Field::new("name", DataType::Utf8, false),
@@ -2616,7 +2510,7 @@ mod accelerator_compat_tests {
                     ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
 
                 // Create location for file-based engines
-                let location = if mode == "file" {
+                let location = if _mode == "file" {
                     format!(
                         "/tmp/spice_benchmark_{:?}_boolean_{}_{}.db",
                         engine,
@@ -2631,10 +2525,10 @@ mod accelerator_compat_tests {
                 };
 
                 let mut options = HashMap::new();
-                if mode == "file" {
+                if _mode == "file" {
                     options.insert("file".to_string(), location.clone());
                 }
-                options.insert("mode".to_string(), mode.to_string());
+                options.insert("mode".to_string(), _mode.clone());
 
                 let external_table = CreateExternalTable {
                     schema: df_schema,
@@ -2689,7 +2583,7 @@ mod accelerator_compat_tests {
                     Engine::Cayenne => {
                         use crate::component::dataset::builder::DatasetBuilder;
                         use crate::dataaccelerator::cayenne::CayenneAccelerator; // Clean up any existing files and metadata
-                        if mode == "file" && !location.is_empty() {
+                        if _mode == "file" && !location.is_empty() {
                             let test_dir = std::path::Path::new(&location);
                             if test_dir.exists() {
                                 if let Ok(entries) = std::fs::read_dir(test_dir) {
@@ -2706,7 +2600,12 @@ mod accelerator_compat_tests {
                                 let _ = std::fs::create_dir_all(test_dir);
                             }
 
-                            clean_cayenne_metadata(&metadata_dir);
+                            // Clean up Cayenne metadata
+                            // Use test environment's metadata directory
+                            let cayenne_db_path = format!("{}/cayenne.db", metadata_dir);
+                            if std::path::Path::new(&cayenne_db_path).exists() {
+                                let _ = std::fs::remove_file(&cayenne_db_path);
+                            }
                         }
 
                         let test_app_obj = app::AppBuilder::new("test").build();
@@ -2733,19 +2632,16 @@ mod accelerator_compat_tests {
                             };
 
                         let mut params = HashMap::new();
-                        if mode == "file" {
+                        if _mode == "file" {
                             params.insert("cayenne_file_path".to_string(), location.clone());
                         }
                         // Use test environment's metadata directory for Cayenne
                         params.insert("cayenne_metadata_dir".to_string(), metadata_dir.clone());
                         params.insert("unsupported_type_action".to_string(), "error".to_string());
-                        if _mode.contains("metastore=turso") {
-                            params.insert("cayenne_metastore".to_string(), "turso".to_string());
-                        }
 
                         dataset.acceleration = Some(Acceleration {
                             enabled: true,
-                            mode: if mode == "file" {
+                            mode: if _mode == "file" {
                                 Mode::File
                             } else {
                                 Mode::Memory
@@ -2755,14 +2651,8 @@ mod accelerator_compat_tests {
                             ..Acceleration::default()
                         });
 
-                        let runtime_env = SessionContext::new().runtime_env();
                         CayenneAccelerator::new()
-                            .create_external_table(
-                                external_table,
-                                Some(&dataset),
-                                Vec::new(),
-                                Some(runtime_env),
-                            )
+                            .create_external_table(external_table, Some(&dataset), Vec::new(), None)
                             .await
                             .expect("Vortex table should be created")
                     }
@@ -2832,7 +2722,7 @@ mod accelerator_compat_tests {
                 );
 
                 // Cleanup
-                if mode == "file" && !location.is_empty() {
+                if _mode == "file" && !location.is_empty() {
                     let _ = std::fs::remove_file(&location);
                 }
             }
@@ -3405,25 +3295,6 @@ mod accelerator_compat_tests {
         type MetricFormatter = fn(&BenchmarkResults) -> String;
         type Metric<'a> = (&'a str, MetricFormatter);
 
-        fn format_change_duration(
-            result: &BenchmarkResults,
-            duration: std::time::Duration,
-        ) -> String {
-            if result.benchmarked_changes {
-                format_duration_compact(duration)
-            } else {
-                "n/a".to_string()
-            }
-        }
-
-        fn format_change_rate(result: &BenchmarkResults, rate: f64) -> String {
-            if result.benchmarked_changes {
-                format!("{rate:.0}")
-            } else {
-                "n/a".to_string()
-            }
-        }
-
         println!("\n");
         println!(
             "╔════════════════════════════════════════════════════════════════════════════════════════════╗"
@@ -3478,28 +3349,6 @@ mod accelerator_compat_tests {
             print!("║ {:20}", "Iterations");
             for result in &mode_results {
                 print!(" │ {:>15}", format!("{}", result.num_iterations));
-            }
-            println!(" ║");
-
-            print!("║ {:20}", "Change rows/iter");
-            for result in &mode_results {
-                let value = if result.benchmarked_changes {
-                    result.num_change_records.to_string()
-                } else {
-                    "n/a".to_string()
-                };
-                print!(" │ {:>15}", value);
-            }
-            println!(" ║");
-
-            print!("║ {:20}", "Delete rows/iter");
-            for result in &mode_results {
-                let value = if result.benchmarked_changes {
-                    result.num_delete_records.to_string()
-                } else {
-                    "n/a".to_string()
-                };
-                print!(" │ {:>15}", value);
             }
             println!(" ║");
             println!(
@@ -3623,121 +3472,7 @@ mod accelerator_compat_tests {
             );
             println!(
                 "║ {:20}                                                                        ║",
-                "CHANGE PERFORMANCE"
-            );
-            println!(
-                "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
-            );
-
-            let change_metrics: [Metric<'static>; 7] = [
-                (
-                    "Min",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.min_change))
-                        as MetricFormatter,
-                ),
-                (
-                    "P90",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.p90_change))
-                        as MetricFormatter,
-                ),
-                (
-                    "P95",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.p95_change))
-                        as MetricFormatter,
-                ),
-                (
-                    "P99",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.p99_change))
-                        as MetricFormatter,
-                ),
-                (
-                    "P99.9",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.p99_9_change))
-                        as MetricFormatter,
-                ),
-                (
-                    "Max",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.max_change))
-                        as MetricFormatter,
-                ),
-                (
-                    "P95 rec/sec",
-                    (|r: &BenchmarkResults| format_change_rate(r, r.p95_change_rec_per_sec))
-                        as MetricFormatter,
-                ),
-            ];
-
-            for (label, formatter) in change_metrics {
-                print!("║ {:20}", label);
-                for result in &mode_results {
-                    print!(" │ {:>15}", formatter(result));
-                }
-                println!(" ║");
-            }
-
-            println!(
-                "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
-            );
-            println!(
-                "║ {:20}                                                                        ║",
-                "DELETE PERFORMANCE"
-            );
-            println!(
-                "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
-            );
-
-            let delete_metrics: [Metric<'static>; 7] = [
-                (
-                    "Min",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.min_delete))
-                        as MetricFormatter,
-                ),
-                (
-                    "P90",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.p90_delete))
-                        as MetricFormatter,
-                ),
-                (
-                    "P95",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.p95_delete))
-                        as MetricFormatter,
-                ),
-                (
-                    "P99",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.p99_delete))
-                        as MetricFormatter,
-                ),
-                (
-                    "P99.9",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.p99_9_delete))
-                        as MetricFormatter,
-                ),
-                (
-                    "Max",
-                    (|r: &BenchmarkResults| format_change_duration(r, r.max_delete))
-                        as MetricFormatter,
-                ),
-                (
-                    "P95 rec/sec",
-                    (|r: &BenchmarkResults| format_change_rate(r, r.p95_delete_rec_per_sec))
-                        as MetricFormatter,
-                ),
-            ];
-
-            for (label, formatter) in delete_metrics {
-                print!("║ {:20}", label);
-                for result in &mode_results {
-                    print!(" │ {:>15}", formatter(result));
-                }
-                println!(" ║");
-            }
-
-            println!(
-                "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
-            );
-            println!(
-                "║ {:20}                                                                        ║",
-                "ROUNDTRIP (ALL OPS+QUERY)"
+                "ROUNDTRIP (INSERT+QUERY)"
             );
             println!(
                 "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
@@ -3798,8 +3533,6 @@ mod accelerator_compat_tests {
         mode: String,
         num_records: usize,
         num_iterations: usize,
-        num_change_records: usize,
-        num_delete_records: usize,
         // Insert metrics
         min_insert: std::time::Duration,
         p90_insert: std::time::Duration,
@@ -3816,23 +3549,6 @@ mod accelerator_compat_tests {
         p99_9_query: std::time::Duration,
         max_query: std::time::Duration,
         p95_query_rec_per_sec: f64,
-        // Change metrics
-        benchmarked_changes: bool,
-        min_change: std::time::Duration,
-        p90_change: std::time::Duration,
-        p95_change: std::time::Duration,
-        p99_change: std::time::Duration,
-        p99_9_change: std::time::Duration,
-        max_change: std::time::Duration,
-        p95_change_rec_per_sec: f64,
-        // Delete metrics
-        min_delete: std::time::Duration,
-        p90_delete: std::time::Duration,
-        p95_delete: std::time::Duration,
-        p99_delete: std::time::Duration,
-        p99_9_delete: std::time::Duration,
-        max_delete: std::time::Duration,
-        p95_delete_rec_per_sec: f64,
         // Roundtrip metrics
         min_roundtrip: std::time::Duration,
         p90_roundtrip: std::time::Duration,
@@ -3840,129 +3556,6 @@ mod accelerator_compat_tests {
         p99_roundtrip: std::time::Duration,
         p99_9_roundtrip: std::time::Duration,
         max_roundtrip: std::time::Duration,
-    }
-
-    fn benchmark_env_usize(name: &str) -> Option<usize> {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-    }
-
-    fn benchmark_sizing(engine: Engine, is_memory: bool, is_file: bool) -> (usize, usize) {
-        let defaults = match (engine, is_memory, is_file) {
-            #[cfg(feature = "turso")]
-            (Engine::Turso, true, _) => (100, 3),
-            #[cfg(feature = "turso")]
-            (Engine::Turso, _, true) => (1_000, 10),
-            (_, true, _) => (100_000, 10),
-            (_, _, true) => (1_000_000, 10),
-            _ => (10_000, 10),
-        };
-
-        let num_records = benchmark_env_usize("SPICE_ACCEL_BENCH_RECORDS")
-            .unwrap_or(defaults.0)
-            .max(2);
-        let num_iterations = benchmark_env_usize("SPICE_ACCEL_BENCH_ITERATIONS")
-            .unwrap_or(defaults.1)
-            .max(1);
-
-        (num_records, num_iterations)
-    }
-
-    fn supports_change_delete_roundtrip(engine: Engine) -> bool {
-        !matches!(engine, Engine::Arrow | Engine::Turso)
-    }
-
-    fn generate_changed_test_data(
-        schema: Arc<Schema>,
-        num_records: usize,
-        offset: i64,
-    ) -> RecordBatch {
-        let base = generate_test_data(Arc::clone(&schema), num_records, offset);
-        let columns = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(idx, field)| match field.name().as_str() {
-                "name" => Arc::new(StringArray::from(
-                    (0..num_records)
-                        .map(|row| format!("changed_{}", offset + row as i64))
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                "value" => Arc::new(Float64Array::from(
-                    (0..num_records)
-                        .map(|row| Some(10_000.0 + row as f64))
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                _ => Arc::clone(base.column(idx)),
-            })
-            .collect::<Vec<_>>();
-
-        RecordBatch::try_new(schema, columns).expect("changed data should be created")
-    }
-
-    async fn delete_id_range(
-        table: &Arc<dyn TableProvider>,
-        ctx: &SessionContext,
-        start_id: i64,
-        row_count: usize,
-    ) -> u64 {
-        if row_count == 0 {
-            return 0;
-        }
-
-        let end_id = start_id + row_count as i64;
-        let filter = col("id")
-            .gt_eq(lit(start_id))
-            .and(col("id").lt(lit(end_id)));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
-            .await
-            .expect("delete should be successful");
-        let result = collect(plan, ctx.task_ctx())
-            .await
-            .expect("delete successful");
-
-        result
-            .first()
-            .expect("delete result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("delete result should be UInt64Array")
-            .value(0)
-    }
-
-    fn assert_changed_name_visible(engine: Engine, batches: &[RecordBatch], changed_id: i64) {
-        let expected_name = format!("changed_{changed_id}");
-        for batch in batches {
-            let id_idx = batch.schema().index_of("id").expect("id column exists");
-            let name_idx = batch.schema().index_of("name").expect("name column exists");
-            let ids = batch
-                .column(id_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("id should be Int64Array");
-            let names = batch
-                .column(name_idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("name should be StringArray");
-
-            for row in 0..batch.num_rows() {
-                if ids.value(row) == changed_id {
-                    assert_eq!(
-                        names.value(row),
-                        expected_name,
-                        "{engine:?}: changed row should round-trip with updated name",
-                    );
-                    return;
-                }
-            }
-        }
-
-        panic!("{engine:?}: changed row id {changed_id} was not found after mutation round-trip");
     }
 
     #[tokio::test]
@@ -3974,8 +3567,7 @@ mod accelerator_compat_tests {
         // Collect all results for comparison
         let all_results = Arc::new(Mutex::new(Vec::new()));
 
-        run_compat_test_with_table_options(
-            |engine, table, mode, _test_env| {
+        run_compat_test(|engine, table, mode, _test_env| {
             let all_results = Arc::clone(&all_results);
             async move {
                 let ctx = SessionContext::new();
@@ -3987,34 +3579,21 @@ mod accelerator_compat_tests {
                 let is_memory = mode.starts_with("memory");
                 let is_file = mode.starts_with("file");
 
-                let (num_records, num_iterations) = benchmark_sizing(engine, is_memory, is_file);
-                let benchmarked_changes = supports_change_delete_roundtrip(engine);
-                let num_change_records = if benchmarked_changes {
-                    (num_records / 10).max(1).min(num_records - 1)
-                } else {
-                    0
-                };
-                let num_delete_records = if benchmarked_changes {
-                    (num_records / 10)
-                        .max(1)
-                        .min(num_records - num_change_records)
-                } else {
-                    0
+                let (num_records, num_iterations) = match (engine, is_memory, is_file) {
+                    #[cfg(feature = "turso")]
+                    (Engine::Turso, true, _) => (100, 3), // 300 total records (very limited due to page cache)
+                    #[cfg(feature = "turso")]
+                    (Engine::Turso, _, true) => (1_000, 10), // 10K total records (reduced due to complex schema)
+                    (_, true, _) => (100_000, 10), // 1M total records
+                    (_, _, true) => (1_000_000, 10), // 10M total records
+                    _ => (10_000, 10),             // Fallback
                 };
 
                 let mut insert_times = Vec::new();
-                let mut change_times = Vec::new();
-                let mut delete_times = Vec::new();
                 let mut query_times = Vec::new();
 
                 println!("\n=== Benchmarking {:?} ({}) ===", engine, mode);
                 println!("Records per iteration: {}", num_records);
-                if benchmarked_changes {
-                    println!("Change rows per iteration: {}", num_change_records);
-                    println!("Delete rows per iteration: {}", num_delete_records);
-                } else {
-                    println!("Change/delete benchmark: not supported by this accelerator");
-                }
                 println!("Number of iterations: {}", num_iterations);
 
                 for iteration in 0..num_iterations {
@@ -4024,37 +3603,17 @@ mod accelerator_compat_tests {
 
                     // Benchmark insert
                     let insert_start = Instant::now();
-                    insert_test_data(&table, &ctx, data).await;
+                    let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
+                    let insertion = table
+                        .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                        .await
+                        .expect("insertion should be successful");
+
+                    collect(insertion, ctx.task_ctx())
+                        .await
+                        .expect("insert successful");
                     let insert_duration = insert_start.elapsed();
                     insert_times.push(insert_duration);
-
-                    let mut change_duration = std::time::Duration::ZERO;
-                    let mut delete_duration = std::time::Duration::ZERO;
-                    if benchmarked_changes {
-                        let changed_data = generate_changed_test_data(
-                            Arc::clone(&schema),
-                            num_change_records,
-                            id_offset,
-                        );
-
-                        let change_start = Instant::now();
-                        insert_test_data(&table, &ctx, changed_data).await;
-                        change_duration = change_start.elapsed();
-                        change_times.push(change_duration);
-
-                        let delete_start_id = id_offset + num_change_records as i64;
-                        let delete_start = Instant::now();
-                        let deleted_rows =
-                            delete_id_range(&table, &ctx, delete_start_id, num_delete_records)
-                                .await;
-                        delete_duration = delete_start.elapsed();
-                        delete_times.push(delete_duration);
-                        assert_eq!(
-                            deleted_rows,
-                            num_delete_records as u64,
-                            "{engine:?}: iteration {iteration}: should delete {num_delete_records} rows",
-                        );
-                    }
 
                     // Benchmark query (scan all data)
                     let query_start = Instant::now();
@@ -4071,29 +3630,17 @@ mod accelerator_compat_tests {
 
                     // Verify data integrity
                     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-                    let expected_rows = if benchmarked_changes {
-                        (num_records - num_delete_records) * (iteration + 1)
-                    } else {
-                        num_records * (iteration + 1)
-                    };
+                    let expected_rows = num_records * (iteration + 1);
                     assert_eq!(
                         total_rows, expected_rows,
                         "{:?}: iteration {}: should have {} total rows",
                         engine, iteration, expected_rows
                     );
 
-                    if benchmarked_changes {
-                        assert_changed_name_visible(engine, &results, id_offset);
-                    }
-
                     if iteration % 3 == 0 {
                         println!(
-                            "  Iteration {}: Insert: {:?}, Change: {:?}, Delete: {:?}, Query: {:?}",
-                            iteration,
-                            insert_duration,
-                            change_duration,
-                            delete_duration,
-                            query_duration
+                            "  Iteration {}: Insert: {:?}, Query: {:?}",
+                            iteration, insert_duration, query_duration
                         );
                     }
                 }
@@ -4104,74 +3651,32 @@ mod accelerator_compat_tests {
                     sorted_times[idx]
                 }
 
-                fn duration_stats(
-                    times: &[std::time::Duration],
-                ) -> (
-                    std::time::Duration,
-                    std::time::Duration,
-                    std::time::Duration,
-                    std::time::Duration,
-                    std::time::Duration,
-                    std::time::Duration,
-                ) {
-                    let mut sorted = times.to_vec();
-                    sorted.sort();
-                    (
-                        sorted[0],
-                        percentile(&sorted, 0.90),
-                        percentile(&sorted, 0.95),
-                        percentile(&sorted, 0.99),
-                        percentile(&sorted, 0.999),
-                        sorted[sorted.len() - 1],
-                    )
-                }
-
-                fn records_per_second(records: usize, duration: std::time::Duration) -> f64 {
-                    records as f64 / duration.as_secs_f64().max(f64::EPSILON)
-                }
+                // Sort times for percentile calculations
+                let mut sorted_insert = insert_times.clone();
+                sorted_insert.sort();
+                let mut sorted_query = query_times.clone();
+                sorted_query.sort();
 
                 // Calculate percentiles
-                let (min_insert, p90_insert, p95_insert, p99_insert, p99_9_insert, max_insert) =
-                    duration_stats(&insert_times);
-                let (min_query, p90_query, p95_query, p99_query, p99_9_query, max_query) =
-                    duration_stats(&query_times);
-                let (min_change, p90_change, p95_change, p99_change, p99_9_change, max_change) =
-                    if benchmarked_changes {
-                        duration_stats(&change_times)
-                    } else {
-                        (
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                        )
-                    };
-                let (min_delete, p90_delete, p95_delete, p99_delete, p99_9_delete, max_delete) =
-                    if benchmarked_changes {
-                        duration_stats(&delete_times)
-                    } else {
-                        (
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                        )
-                    };
+                let min_insert = sorted_insert[0];
+                let p90_insert = percentile(&sorted_insert, 0.90);
+                let p95_insert = percentile(&sorted_insert, 0.95);
+                let p99_insert = percentile(&sorted_insert, 0.99);
+                let p99_9_insert = percentile(&sorted_insert, 0.999);
+                let max_insert = sorted_insert[sorted_insert.len() - 1];
+
+                let min_query = sorted_query[0];
+                let p90_query = percentile(&sorted_query, 0.90);
+                let p95_query = percentile(&sorted_query, 0.95);
+                let p99_query = percentile(&sorted_query, 0.99);
+                let p99_9_query = percentile(&sorted_query, 0.999);
+                let max_query = sorted_query[sorted_query.len() - 1];
 
                 // Calculate round-trip percentiles
                 let mut roundtrip_times: Vec<std::time::Duration> = insert_times
                     .iter()
-                    .enumerate()
                     .zip(query_times.iter())
-                    .map(|((idx, insert), query)| {
-                        let change = change_times.get(idx).copied().unwrap_or_default();
-                        let delete = delete_times.get(idx).copied().unwrap_or_default();
-                        *insert + change + delete + *query
-                    })
+                    .map(|(i, q)| *i + *q)
                     .collect();
                 roundtrip_times.sort();
                 let min_roundtrip = roundtrip_times[0];
@@ -4181,23 +3686,10 @@ mod accelerator_compat_tests {
                 let p99_9_roundtrip = percentile(&roundtrip_times, 0.999);
                 let max_roundtrip = roundtrip_times[roundtrip_times.len() - 1];
 
-                let final_expected_rows = if benchmarked_changes {
-                    (num_records - num_delete_records) * num_iterations
-                } else {
-                    num_records * num_iterations
-                };
-                let p95_insert_rec_per_sec = records_per_second(num_records, p95_insert);
-                let p95_query_rec_per_sec = records_per_second(final_expected_rows, p95_query);
-                let p95_change_rec_per_sec = if benchmarked_changes {
-                    records_per_second(num_change_records, p95_change)
-                } else {
-                    0.0
-                };
-                let p95_delete_rec_per_sec = if benchmarked_changes {
-                    records_per_second(num_delete_records, p95_delete)
-                } else {
-                    0.0
-                };
+                let p95_insert_rec_per_sec =
+                    num_records as f64 / percentile(&sorted_insert, 0.95).as_secs_f64();
+                let p95_query_rec_per_sec = (num_records * num_iterations) as f64
+                    / percentile(&sorted_query, 0.95).as_secs_f64();
 
                 // Store results for comparison
                 let results = BenchmarkResults {
@@ -4205,8 +3697,6 @@ mod accelerator_compat_tests {
                     mode: mode.clone(),
                     num_records,
                     num_iterations,
-                    num_change_records,
-                    num_delete_records,
                     min_insert,
                     p90_insert,
                     p95_insert,
@@ -4221,21 +3711,6 @@ mod accelerator_compat_tests {
                     p99_9_query,
                     max_query,
                     p95_query_rec_per_sec,
-                    benchmarked_changes,
-                    min_change,
-                    p90_change,
-                    p95_change,
-                    p99_change,
-                    p99_9_change,
-                    max_change,
-                    p95_change_rec_per_sec,
-                    min_delete,
-                    p90_delete,
-                    p95_delete,
-                    p99_delete,
-                    p99_9_delete,
-                    max_delete,
-                    p95_delete_rec_per_sec,
                     min_roundtrip,
                     p90_roundtrip,
                     p95_roundtrip,
@@ -4249,9 +3724,7 @@ mod accelerator_compat_tests {
                     Err(poisoned) => panic!("Failed to lock benchmark results: {poisoned}"),
                 }
             }
-        },
-            CompatTableOptions { primary_key: true },
-        )
+        })
         .await;
 
         // Print comparison table

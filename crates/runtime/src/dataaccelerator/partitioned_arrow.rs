@@ -130,6 +130,8 @@ impl Default for PartitionedArrowAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
+    ParameterSpec::runtime("hash_index")
+        .description("Enable hash index for fast primary key lookups and upserts. Automatically enabled when primary_key is supplied."),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
@@ -158,25 +160,32 @@ impl DataAccelerator for PartitionedArrowAccelerator {
             }
         );
 
-        let acceleration = source.as_ref().and_then(|s| s.acceleration());
-        let is_caching_mode = acceleration.is_some_and(|acceleration| {
-            matches!(acceleration.refresh_mode, Some(RefreshMode::Caching))
-        });
-
-        if let Some(acceleration) = acceleration {
+        if let Some(acceleration) = source.as_ref().and_then(|s| s.acceleration()) {
             if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
                 cmd.options
                     .insert("sort_columns".to_string(), sort_cols_str.clone());
             }
-            // Caching mode uses InsertOp::Replace to overwrite the entire table. Strip primary
-            // key constraints so repeated cache refreshes do not fail uniqueness validation while
-            // replacing existing rows.
-            if is_caching_mode {
+            if let Some(hash_index_str) = acceleration.params.get("hash_index") {
+                cmd.options
+                    .insert("hash_index".to_string(), hash_index_str.clone());
+            }
+            // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
+            // which overwrites the entire table. Primary key constraints cause uniqueness validation
+            // errors during inserts because Arrow doesn't support upsert operations.
+            if matches!(acceleration.refresh_mode, Some(RefreshMode::Caching)) {
                 cmd.constraints = Constraints::new_unverified(vec![]);
             }
         }
 
-        super::arrow::enable_hash_index_for_primary_key_or_indexes(&mut cmd);
+        if !source
+            .as_ref()
+            .and_then(|s| s.acceleration())
+            .is_some_and(|acceleration| {
+                matches!(acceleration.refresh_mode, Some(RefreshMode::Caching))
+            })
+        {
+            super::arrow::enable_hash_index_for_primary_key(&mut cmd);
+        }
 
         let schema = Arc::new(cmd.schema.as_arrow().clone());
         let creator = Arc::new(ArrowPartitionCreator::new(cmd, partition_by.clone()));

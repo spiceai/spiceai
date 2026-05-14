@@ -63,6 +63,9 @@ pub fn build_changes_stream(
     dataset: Dataset,
     federated_table: Arc<FederatedTable>,
 ) -> ChangesStream {
+    // `try_stream!` keeps MongoDB cursor polling, snapshot reads, and commit-aware
+    // CDC yields in one backpressured stream; a spawned channel would risk buffering
+    // checkpoints ahead of downstream accelerator commits.
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
@@ -258,14 +261,14 @@ pub fn build_changes_stream(
                     &current_schema_json,
                     &dataset.name,
                 );
-                yield ChangeEnvelope::new(committer, change_batch, true);
+                yield ChangeEnvelope::new(committer, change_batch, false);
             }
         }
     })
 }
 
 async fn initialize_mongo_sys(dataset: &Dataset) -> Option<MongoSys> {
-    match MongoSys::try_new(dataset, OpenOption::OpenExisting).await {
+    match MongoSys::try_new(dataset, OpenOption::CreateIfNotExists).await {
         Ok(sys) => Some(sys),
         Err(error) => {
             tracing::error!(
@@ -552,19 +555,6 @@ fn resolve_primary_keys(
         ))
     })?;
 
-    if !matches!(
-        acceleration.on_conflict.get(primary_key),
-        Some(OnConflictBehavior::Upsert(_))
-    ) {
-        let pk_hint = primary_key
-            .iter()
-            .next()
-            .map_or_else(|| "_id".to_string(), ToString::to_string);
-        return Err(data_components::cdc::StreamError::External(format!(
-            "mongodb change streams for dataset `{dataset_name}` require `acceleration.on_conflict` keyed on `primary_key` with `upsert` behavior so UPDATE events replace existing rows. Add: `on_conflict: {{ {pk_hint}: upsert }}`."
-        )));
-    }
-
     let primary_keys = primary_key
         .iter()
         .map(ToString::to_string)
@@ -572,6 +562,15 @@ fn resolve_primary_keys(
     if primary_keys.as_slice() != ["_id"] {
         return Err(data_components::cdc::StreamError::External(format!(
             "mongodb change streams for dataset `{dataset_name}` require `acceleration.primary_key: _id` because MongoDB delete events only include the document key"
+        )));
+    }
+
+    if !matches!(
+        acceleration.on_conflict.get(primary_key),
+        Some(OnConflictBehavior::Upsert(_))
+    ) {
+        return Err(data_components::cdc::StreamError::External(format!(
+            "mongodb change streams for dataset `{dataset_name}` require `acceleration.on_conflict` keyed on `primary_key` with `upsert` behavior so UPDATE events replace existing rows. Add: `on_conflict: {{ _id: upsert }}`."
         )));
     }
 
@@ -873,6 +872,26 @@ mod tests {
         let dataset_name = datafusion::sql::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("non-_id primary key should fail");
+        assert!(error.to_string().contains("primary_key: _id"));
+    }
+
+    #[test]
+    fn rejects_composite_primary_key_before_missing_upsert() {
+        let acceleration = Acceleration {
+            enabled: true,
+            engine: Engine::DuckDB,
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key: Some(ColumnReference::new(vec![
+                "_id".to_string(),
+                "other".to_string(),
+            ])),
+            ..Default::default()
+        };
+
+        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
+            .expect_err("composite primary key should fail before on_conflict hint");
+
         assert!(error.to_string().contains("primary_key: _id"));
     }
 

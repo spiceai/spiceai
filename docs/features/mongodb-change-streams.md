@@ -12,7 +12,7 @@ On startup, Spice:
 4. Emits the CDC ready signal required by the runtime.
 5. Processes Change Stream events in batches and applies them to the accelerator.
 
-Opening the Change Stream before the snapshot prevents gaps between the snapshot and live stream. Change Stream resume tokens are not currently persisted, so restarts rebootstrap the accelerator from a fresh collection snapshot.
+Opening the Change Stream before the snapshot prevents gaps between the snapshot and live stream. File-accelerated datasets persist Change Stream resume tokens and resume from the last committed token on restart; in-memory accelerators rebootstrap from a fresh collection snapshot.
 
 ## Prerequisites
 
@@ -44,7 +44,7 @@ datasets:
 
 ## Change Stream parameters
 
-These optional parameters live under dataset `params:` and are not prefixed with `mongodb_`:
+These optional runtime parameters live under dataset `params:`; most are not prefixed with `mongodb_`:
 
 - `change_stream_batch_max_size` (default `1000`): Maximum number of Change Stream events to group into one CDC batch before applying it. Must be greater than 0.
 - `change_stream_batch_max_duration` (default `1s`): Maximum time to wait for a Change Stream batch to fill before applying it. Accepts [fundu](https://docs.rs/fundu) duration strings and must be greater than 0.

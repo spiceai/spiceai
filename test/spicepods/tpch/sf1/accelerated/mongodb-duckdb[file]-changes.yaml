@@ -4,8 +4,11 @@ name: mongodb-duckdb[file]-changes
 
 definitions:
   - &mongodb_params
+    # MongoDB Change Streams require MONGODB_HOST/MONGODB_PORT to point at a replica set or sharded cluster.
+    # For a single-node replica set, direct connection avoids topology discovery delays.
     mongodb_host: ${env:MONGODB_HOST}
     mongodb_port: 27017
+    mongodb_direct_connection: true
     mongodb_auth_source: admin
     mongodb_db: tpch_sf1
     mongodb_user: root
