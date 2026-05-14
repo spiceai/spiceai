@@ -68,7 +68,7 @@ impl CayenneContext {
             vortex_format,
             config: config.clone(),
             session_config: SessionConfig::default(),
-            upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency)),
+            upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             runtime_env,
         })
     }
@@ -121,6 +121,12 @@ impl CayenneContext {
     #[must_use]
     pub fn upload_concurrency(&self) -> usize {
         self.config.upload_concurrency.max(1)
+    }
+
+    /// Get the configured writer partition override for unsorted snapshot writes.
+    #[must_use]
+    pub fn write_concurrency(&self) -> Option<usize> {
+        self.config.write_concurrency.map(|v| v.max(1))
     }
 
     /// Get the shared semaphore for limiting concurrent file writes / uploads.

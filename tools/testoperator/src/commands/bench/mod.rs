@@ -78,7 +78,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let query_set = args.load_query_set()?;
     if query_set == test_framework::queries::QuerySet::ChBench {
         let scale_factor = args.scale_factor.unwrap_or(1.0);
-        prepare_chbench_source(scale_factor, None).await?;
+        prepare_chbench_source(scale_factor).await?;
     }
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -280,10 +280,8 @@ fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceCon
 /// Postgres, create the schema and load seed data.
 ///
 /// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
-/// `duration` overrides the default OLTP workload duration when set.
 pub(crate) async fn prepare_chbench_source(
     scale_factor: f64,
-    duration: Option<Duration>,
 ) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
     if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
         anyhow::bail!(
@@ -296,14 +294,11 @@ pub(crate) async fn prepare_chbench_source(
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let warehouses = scale_factor as usize;
     let terminals = warehouses * 10;
-    let mut config = chbench_driver::ChBenchConfig {
+    let config = chbench_driver::ChBenchConfig {
         warehouses,
         terminals,
         ..Default::default()
     };
-    if let Some(d) = duration {
-        config.duration = d;
-    }
 
     println!(
         "Preparing chbench source (SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s))..."
