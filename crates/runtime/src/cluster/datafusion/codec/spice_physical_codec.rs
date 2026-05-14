@@ -256,12 +256,12 @@ impl SpicePhysicalCodec {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::common::{JoinType, NullEquality};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::context::SessionContext;
     use datafusion::physical_expr::expressions::col;
     use datafusion::physical_plan::displayable;
     use datafusion::physical_plan::joins::PartitionMode;
-    use datafusion_common::{JoinType, NullEquality};
 
     fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new(

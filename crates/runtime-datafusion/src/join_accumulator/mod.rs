@@ -187,13 +187,27 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
         let array_memory_size = array.get_array_memory_size();
         let total_memory_size = self.total_memory_size.saturating_add(array_memory_size);
 
-        if total_memory_size > self.max_inlist_memory_size
-            || !self.try_reserve_inlist_memory(array_memory_size)
-        {
+        if total_memory_size > self.max_inlist_memory_size {
             tracing::debug!(
-                "ExactLeftAccumulator exceeded maximum in-list memory size or shared budget ({} bytes > {} bytes); using range fallback.",
                 total_memory_size,
-                self.max_inlist_memory_size
+                max_inlist_memory_size = self.max_inlist_memory_size,
+                "ExactLeftAccumulator exceeded its local in-list memory limit; using range fallback."
+            );
+            self.inlist_memory_reservation = None;
+            self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
+            self.arrays.clear();
+            self.total_memory_size = total_memory_size;
+            self.exact_values_exceeded_memory_limit = true;
+            return Ok(());
+        }
+
+        if !self.try_reserve_inlist_memory(array_memory_size) {
+            tracing::debug!(
+                requested_bytes = array_memory_size,
+                current_shared_inlist_memory_bytes =
+                    CURRENT_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed),
+                maximum_shared_inlist_memory_bytes = maximum_shared_inlist_memory_bytes(),
+                "ExactLeftAccumulator shared in-list memory budget is exhausted; using range fallback."
             );
             self.inlist_memory_reservation = None;
             self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
@@ -377,8 +391,6 @@ impl RangeBounds {
             return Ok(());
         }
 
-        self.update_bloom_filter(array)?;
-
         let batch_bounds = min_max_values(array)?;
         let RangeBatchBounds::Values {
             min_value,
@@ -396,7 +408,10 @@ impl RangeBounds {
             return Ok(());
         }
 
-        self.add_interval(RangeInterval::new(min_value, max_value));
+        self.update_bloom_filter(array)?;
+        if !self.add_interval(RangeInterval::new(min_value, max_value)) {
+            self.supports_range_filter = false;
+        }
 
         Ok(())
     }
@@ -406,18 +421,10 @@ impl RangeBounds {
             return Ok(());
         };
 
-        for row_index in 0..array.len() {
-            if array.is_null(row_index) {
-                continue;
-            }
-            let value = ScalarValue::try_from_array(array, row_index)?;
-            bloom_filter.insert(&value);
-        }
-
-        Ok(())
+        bloom_filter.insert_array(array)
     }
 
-    fn add_interval(&mut self, interval: RangeInterval) {
+    fn add_interval(&mut self, interval: RangeInterval) -> bool {
         self.intervals.push(interval);
         self.intervals.sort_by(|left, right| {
             left.min_value
@@ -433,24 +440,32 @@ impl RangeBounds {
             };
 
             if previous.overlaps(&interval) {
-                previous.merge(interval);
+                if !previous.merge(interval) {
+                    return false;
+                }
             } else {
                 merged_intervals.push(interval);
             }
         }
 
         if merged_intervals.len() > MAXIMUM_RANGE_INTERVALS {
-            let Some(global_range) = merged_intervals.into_iter().reduce(|mut global, interval| {
-                global.merge(interval);
-                global
-            }) else {
+            let Some(mut global_range) = merged_intervals.first().cloned() else {
                 self.intervals.clear();
-                return;
+                return true;
             };
+
+            for interval in merged_intervals.into_iter().skip(1) {
+                if !global_range.merge(interval) {
+                    return false;
+                }
+            }
+
             self.intervals.push(global_range);
         } else {
             self.intervals = merged_intervals;
         }
+
+        true
     }
 
     fn physical_expr(&self, left_expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
@@ -520,21 +535,21 @@ impl RangeInterval {
         )
     }
 
-    fn merge(&mut self, other: Self) {
-        match other.min_value.partial_cmp(&self.min_value) {
-            Some(Ordering::Less) => self.min_value = other.min_value,
-            Some(_) => {}
-            None => {
-                return;
-            }
-        }
+    fn merge(&mut self, other: Self) -> bool {
+        let min_value = match other.min_value.partial_cmp(&self.min_value) {
+            Some(Ordering::Less) => other.min_value,
+            Some(_) => self.min_value.clone(),
+            None => return false,
+        };
+        let max_value = match other.max_value.partial_cmp(&self.max_value) {
+            Some(Ordering::Greater) => other.max_value,
+            Some(_) => self.max_value.clone(),
+            None => return false,
+        };
 
-        if matches!(
-            other.max_value.partial_cmp(&self.max_value),
-            Some(Ordering::Greater)
-        ) {
-            self.max_value = other.max_value;
-        }
+        self.min_value = min_value;
+        self.max_value = max_value;
+        true
     }
 
     fn physical_expr(&self, left_expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
@@ -576,8 +591,12 @@ impl BloomFilter {
         })
     }
 
-    fn insert(&mut self, value: &ScalarValue) {
+    fn insert<T: Hash + ?Sized>(&mut self, value: &T) {
         let (hash_one, hash_two) = bloom_hashes(value);
+        self.insert_hashes(hash_one, hash_two);
+    }
+
+    fn insert_hashes(&mut self, hash_one: u64, hash_two: u64) {
         for hash_index in 0..Self::HASH_COUNT {
             let bit_index = self.bit_index(hash_one, hash_two, hash_index);
             self.bits[bit_index / u64::BITS as usize] |= 1 << (bit_index % u64::BITS as usize);
@@ -585,13 +604,239 @@ impl BloomFilter {
         self.inserted_values = self.inserted_values.saturating_add(1);
     }
 
-    fn might_contain(&self, value: &ScalarValue) -> bool {
+    fn might_contain<T: Hash + ?Sized>(&self, value: &T) -> bool {
         let (hash_one, hash_two) = bloom_hashes(value);
+        self.might_contain_hashes(hash_one, hash_two)
+    }
+
+    fn might_contain_hashes(&self, hash_one: u64, hash_two: u64) -> bool {
         (0..Self::HASH_COUNT).all(|hash_index| {
             let bit_index = self.bit_index(hash_one, hash_two, hash_index);
             let word = self.bits[bit_index / u64::BITS as usize];
             (word & (1 << (bit_index % u64::BITS as usize))) != 0
         })
+    }
+
+    fn insert_array(&mut self, array: &dyn Array) -> DataFusionResult<()> {
+        match array.data_type() {
+            DataType::Int8 => self.insert_primitive_array::<Int8Type>(array),
+            DataType::Int16 => self.insert_primitive_array::<Int16Type>(array),
+            DataType::Int32 => self.insert_primitive_array::<Int32Type>(array),
+            DataType::Int64 => self.insert_primitive_array::<Int64Type>(array),
+            DataType::UInt8 => self.insert_primitive_array::<UInt8Type>(array),
+            DataType::UInt16 => self.insert_primitive_array::<UInt16Type>(array),
+            DataType::UInt32 => self.insert_primitive_array::<UInt32Type>(array),
+            DataType::UInt64 => self.insert_primitive_array::<UInt64Type>(array),
+            DataType::Float16 => self.insert_float_array::<Float16Type>(array),
+            DataType::Float32 => self.insert_float_array::<Float32Type>(array),
+            DataType::Float64 => self.insert_float_array::<Float64Type>(array),
+            DataType::Decimal32(_, _) => self.insert_primitive_array::<Decimal32Type>(array),
+            DataType::Decimal64(_, _) => self.insert_primitive_array::<Decimal64Type>(array),
+            DataType::Decimal128(_, _) => self.insert_primitive_array::<Decimal128Type>(array),
+            DataType::Decimal256(_, _) => self.insert_primitive_array::<Decimal256Type>(array),
+            DataType::Date32 => self.insert_primitive_array::<Date32Type>(array),
+            DataType::Date64 => self.insert_primitive_array::<Date64Type>(array),
+            DataType::Time32(TimeUnit::Second) => {
+                self.insert_primitive_array::<Time32SecondType>(array)
+            }
+            DataType::Time32(TimeUnit::Millisecond) => {
+                self.insert_primitive_array::<Time32MillisecondType>(array)
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                self.insert_primitive_array::<Time64MicrosecondType>(array)
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                self.insert_primitive_array::<Time64NanosecondType>(array)
+            }
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                self.insert_primitive_array::<TimestampSecondType>(array)
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                self.insert_primitive_array::<TimestampMillisecondType>(array)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                self.insert_primitive_array::<TimestampMicrosecondType>(array)
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                self.insert_primitive_array::<TimestampNanosecondType>(array)
+            }
+            DataType::Utf8 => self.insert_string_array::<i32>(array),
+            DataType::LargeUtf8 => self.insert_string_array::<i64>(array),
+            DataType::Utf8View => self.insert_string_view_array(array),
+            _ => self.insert_scalar_array(array),
+        }
+    }
+
+    fn evaluate_array(&self, array: &dyn Array) -> DataFusionResult<BooleanArray> {
+        match array.data_type() {
+            DataType::Int8 => self.evaluate_primitive_array::<Int8Type>(array),
+            DataType::Int16 => self.evaluate_primitive_array::<Int16Type>(array),
+            DataType::Int32 => self.evaluate_primitive_array::<Int32Type>(array),
+            DataType::Int64 => self.evaluate_primitive_array::<Int64Type>(array),
+            DataType::UInt8 => self.evaluate_primitive_array::<UInt8Type>(array),
+            DataType::UInt16 => self.evaluate_primitive_array::<UInt16Type>(array),
+            DataType::UInt32 => self.evaluate_primitive_array::<UInt32Type>(array),
+            DataType::UInt64 => self.evaluate_primitive_array::<UInt64Type>(array),
+            DataType::Float16 => self.evaluate_float_array::<Float16Type>(array),
+            DataType::Float32 => self.evaluate_float_array::<Float32Type>(array),
+            DataType::Float64 => self.evaluate_float_array::<Float64Type>(array),
+            DataType::Decimal32(_, _) => self.evaluate_primitive_array::<Decimal32Type>(array),
+            DataType::Decimal64(_, _) => self.evaluate_primitive_array::<Decimal64Type>(array),
+            DataType::Decimal128(_, _) => self.evaluate_primitive_array::<Decimal128Type>(array),
+            DataType::Decimal256(_, _) => self.evaluate_primitive_array::<Decimal256Type>(array),
+            DataType::Date32 => self.evaluate_primitive_array::<Date32Type>(array),
+            DataType::Date64 => self.evaluate_primitive_array::<Date64Type>(array),
+            DataType::Time32(TimeUnit::Second) => {
+                self.evaluate_primitive_array::<Time32SecondType>(array)
+            }
+            DataType::Time32(TimeUnit::Millisecond) => {
+                self.evaluate_primitive_array::<Time32MillisecondType>(array)
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                self.evaluate_primitive_array::<Time64MicrosecondType>(array)
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                self.evaluate_primitive_array::<Time64NanosecondType>(array)
+            }
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                self.evaluate_primitive_array::<TimestampSecondType>(array)
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                self.evaluate_primitive_array::<TimestampMillisecondType>(array)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                self.evaluate_primitive_array::<TimestampMicrosecondType>(array)
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                self.evaluate_primitive_array::<TimestampNanosecondType>(array)
+            }
+            DataType::Utf8 => self.evaluate_string_array::<i32>(array),
+            DataType::LargeUtf8 => self.evaluate_string_array::<i64>(array),
+            DataType::Utf8View => self.evaluate_string_view_array(array),
+            _ => self.evaluate_scalar_array(array),
+        }
+    }
+
+    fn insert_primitive_array<T>(&mut self, array: &dyn Array) -> DataFusionResult<()>
+    where
+        T: ArrowPrimitiveType,
+        T::Native: Hash,
+    {
+        let array = downcast_array::<PrimitiveArray<T>>(array)?;
+        for value in array.iter().flatten() {
+            self.insert(&value);
+        }
+        Ok(())
+    }
+
+    fn evaluate_primitive_array<T>(&self, array: &dyn Array) -> DataFusionResult<BooleanArray>
+    where
+        T: ArrowPrimitiveType,
+        T::Native: Hash,
+    {
+        let array = downcast_array::<PrimitiveArray<T>>(array)?;
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for value in array.iter() {
+            builder.append_value(value.is_some_and(|value| self.might_contain(&value)));
+        }
+        Ok(builder.finish())
+    }
+
+    fn insert_float_array<T>(&mut self, array: &dyn Array) -> DataFusionResult<()>
+    where
+        T: BloomFloatType,
+    {
+        let array = downcast_array::<PrimitiveArray<T>>(array)?;
+        for value in array.iter().flatten() {
+            self.insert(&T::hashable(value));
+        }
+        Ok(())
+    }
+
+    fn evaluate_float_array<T>(&self, array: &dyn Array) -> DataFusionResult<BooleanArray>
+    where
+        T: BloomFloatType,
+    {
+        let array = downcast_array::<PrimitiveArray<T>>(array)?;
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for value in array.iter() {
+            builder
+                .append_value(value.is_some_and(|value| self.might_contain(&T::hashable(value))));
+        }
+        Ok(builder.finish())
+    }
+
+    fn insert_string_array<T>(&mut self, array: &dyn Array) -> DataFusionResult<()>
+    where
+        T: OffsetSizeTrait,
+    {
+        let array = downcast_array::<GenericStringArray<T>>(array)?;
+        for row_index in 0..array.len() {
+            if array.is_valid(row_index) {
+                self.insert(array.value(row_index));
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate_string_array<T>(&self, array: &dyn Array) -> DataFusionResult<BooleanArray>
+    where
+        T: OffsetSizeTrait,
+    {
+        let array = downcast_array::<GenericStringArray<T>>(array)?;
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for row_index in 0..array.len() {
+            builder.append_value(
+                array.is_valid(row_index) && self.might_contain(array.value(row_index)),
+            );
+        }
+        Ok(builder.finish())
+    }
+
+    fn insert_string_view_array(&mut self, array: &dyn Array) -> DataFusionResult<()> {
+        let array = downcast_array::<StringViewArray>(array)?;
+        for row_index in 0..array.len() {
+            if array.is_valid(row_index) {
+                self.insert(array.value(row_index));
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate_string_view_array(&self, array: &dyn Array) -> DataFusionResult<BooleanArray> {
+        let array = downcast_array::<StringViewArray>(array)?;
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for row_index in 0..array.len() {
+            builder.append_value(
+                array.is_valid(row_index) && self.might_contain(array.value(row_index)),
+            );
+        }
+        Ok(builder.finish())
+    }
+
+    fn insert_scalar_array(&mut self, array: &dyn Array) -> DataFusionResult<()> {
+        for row_index in 0..array.len() {
+            if array.is_null(row_index) {
+                continue;
+            }
+            let value = ScalarValue::try_from_array(array, row_index)?;
+            self.insert(&value);
+        }
+        Ok(())
+    }
+
+    fn evaluate_scalar_array(&self, array: &dyn Array) -> DataFusionResult<BooleanArray> {
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for row_index in 0..array.len() {
+            if array.is_null(row_index) {
+                builder.append_value(false);
+                continue;
+            }
+
+            let value = ScalarValue::try_from_array(array, row_index)?;
+            builder.append_value(self.might_contain(&value));
+        }
+        Ok(builder.finish())
     }
 
     fn has_values(&self) -> bool {
@@ -604,24 +849,55 @@ impl BloomFilter {
     }
 }
 
-fn bloom_hashes(value: &ScalarValue) -> (u64, u64) {
-    #[derive(Hash)]
-    enum BloomHashStream {
-        Primary,
-        Secondary,
+fn bloom_hashes<T: Hash + ?Sized>(value: &T) -> (u64, u64) {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    let hash_one = hasher.finish();
+    (hash_one, hash_one.rotate_left(32) ^ hash_one.reverse_bits())
+}
+
+trait BloomFloatType: ArrowPrimitiveType {
+    type Hashable: Hash;
+
+    fn hashable(value: Self::Native) -> Self::Hashable;
+
+    fn is_nan(value: Self::Native) -> bool;
+}
+
+impl BloomFloatType for Float16Type {
+    type Hashable = u16;
+
+    fn hashable(value: Self::Native) -> Self::Hashable {
+        value.to_bits()
     }
 
-    fn hash_with_stream(value: &ScalarValue, stream: BloomHashStream) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        stream.hash(&mut hasher);
-        value.hash(&mut hasher);
-        hasher.finish()
+    fn is_nan(value: Self::Native) -> bool {
+        value.is_nan()
+    }
+}
+
+impl BloomFloatType for Float32Type {
+    type Hashable = u32;
+
+    fn hashable(value: Self::Native) -> Self::Hashable {
+        value.to_bits()
     }
 
-    (
-        hash_with_stream(value, BloomHashStream::Primary),
-        hash_with_stream(value, BloomHashStream::Secondary),
-    )
+    fn is_nan(value: Self::Native) -> bool {
+        value.is_nan()
+    }
+}
+
+impl BloomFloatType for Float64Type {
+    type Hashable = u64;
+
+    fn hashable(value: Self::Native) -> Self::Hashable {
+        value.to_bits()
+    }
+
+    fn is_nan(value: Self::Native) -> bool {
+        value.is_nan()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -672,20 +948,8 @@ impl PhysicalExpr for BloomFilterExpr {
 
     fn evaluate(&self, batch: &RecordBatch) -> DataFusionResult<ColumnarValue> {
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
-        let mut values = Vec::with_capacity(array.len());
-
-        for row_index in 0..array.len() {
-            if array.is_null(row_index) {
-                values.push(false);
-                continue;
-            }
-
-            let value = ScalarValue::try_from_array(array.as_ref(), row_index)?;
-            values.push(self.bloom_filter.might_contain(&value));
-        }
-
         Ok(ColumnarValue::Array(
-            Arc::new(BooleanArray::from(values)) as ArrayRef
+            Arc::new(self.bloom_filter.evaluate_array(array.as_ref())?) as ArrayRef,
         ))
     }
 
@@ -730,9 +994,9 @@ fn min_max_values(array: &dyn Array) -> DataFusionResult<RangeBatchBounds> {
         DataType::UInt16 => primitive_min_max::<UInt16Type, _>(array, ScalarValue::UInt16),
         DataType::UInt32 => primitive_min_max::<UInt32Type, _>(array, ScalarValue::UInt32),
         DataType::UInt64 => primitive_min_max::<UInt64Type, _>(array, ScalarValue::UInt64),
-        DataType::Float16 => primitive_min_max::<Float16Type, _>(array, ScalarValue::Float16),
-        DataType::Float32 => primitive_min_max::<Float32Type, _>(array, ScalarValue::Float32),
-        DataType::Float64 => primitive_min_max::<Float64Type, _>(array, ScalarValue::Float64),
+        DataType::Float16 => float_min_max::<Float16Type, _>(array, ScalarValue::Float16),
+        DataType::Float32 => float_min_max::<Float32Type, _>(array, ScalarValue::Float32),
+        DataType::Float64 => float_min_max::<Float64Type, _>(array, ScalarValue::Float64),
         DataType::Decimal32(precision, scale) => {
             let precision = *precision;
             let scale = *scale;
@@ -813,6 +1077,27 @@ where
     F: Fn(Option<T::Native>) -> ScalarValue,
 {
     let array = downcast_array::<PrimitiveArray<T>>(array)?;
+    let (Some(min_value), Some(max_value)) = (min::<T>(array), max::<T>(array)) else {
+        return Ok(RangeBatchBounds::NoValues);
+    };
+
+    Ok(RangeBatchBounds::Values {
+        min_value: scalar_value(Some(min_value)),
+        max_value: scalar_value(Some(max_value)),
+    })
+}
+
+fn float_min_max<T, F>(array: &dyn Array, scalar_value: F) -> DataFusionResult<RangeBatchBounds>
+where
+    T: BloomFloatType,
+    T::Native: PartialOrd,
+    F: Fn(Option<T::Native>) -> ScalarValue,
+{
+    let array = downcast_array::<PrimitiveArray<T>>(array)?;
+    if array.iter().flatten().any(T::is_nan) {
+        return Ok(RangeBatchBounds::Unsupported);
+    }
+
     let (Some(min_value), Some(max_value)) = (min::<T>(array), max::<T>(array)) else {
         return Ok(RangeBatchBounds::NoValues);
     };
@@ -1264,8 +1549,8 @@ mod tests {
         let left_expr = col("a", &schema).expect("Should create column expr");
 
         let mut bloom_filter = BloomFilter::try_new(1_024).expect("Bloom filter should be created");
-        bloom_filter.insert(&ScalarValue::UInt64(Some(1)));
-        bloom_filter.insert(&ScalarValue::UInt64(Some(5)));
+        bloom_filter.insert(&1_u64);
+        bloom_filter.insert(&5_u64);
 
         let physical_expr = Arc::new(BloomFilterExpr::new(left_expr, Arc::new(bloom_filter)))
             as Arc<dyn PhysicalExpr>;
@@ -1275,6 +1560,20 @@ mod tests {
             vec![Some(true), Some(false), Some(false), Some(true)],
             actual_values
         );
+    }
+
+    #[test]
+    fn range_interval_merge_rejects_incomparable_bounds() {
+        let mut interval =
+            RangeInterval::new(ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(2)));
+        let incomparable = RangeInterval::new(
+            ScalarValue::Utf8(Some("a".to_string())),
+            ScalarValue::Utf8(Some("z".to_string())),
+        );
+
+        assert!(!interval.merge(incomparable));
+        assert_eq!(interval.min_value, ScalarValue::Int64(Some(1)));
+        assert_eq!(interval.max_value, ScalarValue::Int64(Some(2)));
     }
 
     #[test]
