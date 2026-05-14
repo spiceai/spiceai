@@ -165,7 +165,7 @@ EXAMPLES
 Docs: https://spiceai.org/docs"#;
 
 /// Long help text shared by `spice <singleton>` commands (runtime, management, snapshots).
-pub const SINGLETON_LONG_ABOUT: &str = r#"Configure a singleton (one-of) section of `spicepod.yaml` such as
+pub const SINGLETON_LONG_ABOUT: &str = r"Configure a singleton (one-of) section of `spicepod.yaml` such as
 `runtime:`, `management:`, or `snapshots:`.
 
 USAGE
@@ -190,10 +190,10 @@ EXAMPLES
   # Tweak runtime parameters
   spice runtime configure --set telemetry.enabled=true
 
-Docs: https://spiceai.org/docs"#;
+Docs: https://spiceai.org/docs";
 
 /// Long help text for `spice extension`.
-pub const EXTENSION_LONG_ABOUT: &str = r#"Add or configure entries under the `extensions:` section of `spicepod.yaml`.
+pub const EXTENSION_LONG_ABOUT: &str = r"Add or configure entries under the `extensions:` section of `spicepod.yaml`.
 
 USAGE
   spice extension add <name>       [body flags]   # add a new extension entry; fails if it exists
@@ -210,10 +210,10 @@ EXAMPLES
   spice extension add memory --param store=redis --param ttl=3600
   spice extension configure memory --enable
 
-Docs: https://spiceai.org/docs"#;
+Docs: https://spiceai.org/docs";
 
 /// Long help text for `spice metadata`.
-pub const METADATA_LONG_ABOUT: &str = r#"Add, update, or set entries under the `metadata:` section of `spicepod.yaml`.
+pub const METADATA_LONG_ABOUT: &str = r"Add, update, or set entries under the `metadata:` section of `spicepod.yaml`.
 
 USAGE
   spice metadata add KEY=VALUE [KEY=VALUE ...]    # add entries; fails if a key already exists
@@ -228,7 +228,7 @@ EXAMPLES
   spice metadata set replicas yaml:3
   spice metadata configure tags='yaml:[ai, search]'
 
-Docs: https://spiceai.org/docs"#;
+Docs: https://spiceai.org/docs";
 
 #[derive(Args, Debug)]
 #[command(
