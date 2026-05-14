@@ -26,6 +26,7 @@ use spice::commands::{
 };
 use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};
+use std::ffi::{OsStr, OsString};
 use tracing_subscriber::EnvFilter;
 
 /// Spice.ai CLI - Interact with the Spice.ai runtime, edit Spicepod manifests, and manage Spice Cloud.
@@ -45,6 +46,7 @@ Quick start:
   spice init my_app          # Scaffold a new Spicepod in ./my_app/
   cd my_app
   spice run                  # Install (if needed) and start the runtime
+    spice -sql \"show tables\"   # Run a single SQL query and exit
   spice sql                  # Open an interactive SQL REPL
 
 Common workflows:
@@ -63,9 +65,9 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// Programmatic mode for LLMs and automation: prefer JSON output and structured JSON errors.
-    #[arg(short = 'p', long)]
-    programmatic: bool,
+    /// Machine-readable mode for LLMs and automation: prefer JSON output and structured JSON errors.
+    #[arg(long, alias = "programmatic")]
+    machine: bool,
 
     /// API key used to authenticate with the runtime or Spice.ai Cloud.
     #[arg(long, global = true, env = "SPICE_API_KEY")]
@@ -207,20 +209,21 @@ enum Commands {
 fn main() {
     use std::io::IsTerminal;
 
-    let mut cli = match Cli::try_parse() {
+    let args = normalize_direct_sql_args(std::env::args_os());
+    let mut cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
-            if raw_args_enable_programmatic_mode() {
+            if raw_args_enable_machine_mode() {
                 let exit_code = error.exit_code();
-                write_programmatic_clap_error(&error);
+                write_machine_clap_error(&error);
                 std::process::exit(exit_code);
             }
             error.exit();
         }
     };
 
-    if cli.programmatic {
-        apply_programmatic_mode(&mut cli.command);
+    if cli.machine {
+        apply_machine_mode(&mut cli.command);
     }
 
     // Verbosity flag wins; otherwise honour RUST_LOG; otherwise default to info.
@@ -230,7 +233,7 @@ fn main() {
         } else {
             EnvFilter::new("trace")
         }
-    } else if cli.programmatic {
+    } else if cli.machine {
         EnvFilter::new("off")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
@@ -245,7 +248,7 @@ fn main() {
     // Version banner: stderr-only so it doesn't foul pipes, and only for interactive stderr.
     // Suppressed for commands that produce JSON (scripting) or where it's just noise.
     if std::io::stderr().is_terminal()
-        && !cli.programmatic
+        && !cli.machine
         && !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
         && !is_json_output(&cli.command)
     {
@@ -253,10 +256,10 @@ fn main() {
     }
 
     // Run the CLI
-    let programmatic = cli.programmatic;
+    let machine = cli.machine;
     if let Err(e) = run_cli(cli) {
-        if programmatic {
-            write_programmatic_error(&e);
+        if machine {
+            write_machine_error(&e);
         } else {
             tracing::error!("{e}");
         }
@@ -264,12 +267,58 @@ fn main() {
     }
 }
 
-fn raw_args_enable_programmatic_mode() -> bool {
+fn normalize_direct_sql_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut normalized = Vec::new();
+    let mut args = args.into_iter();
+
+    if let Some(program_name) = args.next() {
+        normalized.push(program_name);
+    }
+
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new("-sql") {
+            normalized.push(OsString::from("sql"));
+            normalized.push(OsString::from("--query"));
+            normalized.extend(args);
+            break;
+        }
+
+        if arg == OsStr::new("--") {
+            normalized.push(arg);
+            normalized.extend(args);
+            break;
+        }
+
+        let arg_text = arg.to_string_lossy();
+        let consumes_value = matches!(
+            arg_text.as_ref(),
+            "--api-key" | "--cloud" | "--http-endpoint" | "--tls-root-certificate-file"
+        );
+        let is_subcommand = !arg_text.starts_with('-');
+        normalized.push(arg);
+
+        if consumes_value {
+            if let Some(value) = args.next() {
+                normalized.push(value);
+            }
+            continue;
+        }
+
+        if is_subcommand {
+            normalized.extend(args);
+            break;
+        }
+    }
+
+    normalized
+}
+
+fn raw_args_enable_machine_mode() -> bool {
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-p" | "--programmatic" => return true,
+            "--machine" | "--programmatic" => return true,
             "--" => return false,
             "--api-key" | "--cloud" | "--http-endpoint" | "--tls-root-certificate-file" => {
                 let _ = args.next();
@@ -280,11 +329,7 @@ fn raw_args_enable_programmatic_mode() -> bool {
                     || value.starts_with("--http-endpoint=")
                     || value.starts_with("--tls-root-certificate-file=") => {}
             value if value.starts_with("--") => {}
-            value if value.starts_with('-') => {
-                if value.chars().skip(1).any(|flag| flag == 'p') {
-                    return true;
-                }
-            }
+            value if value.starts_with('-') => {}
             _ => return false,
         }
     }
@@ -292,7 +337,7 @@ fn raw_args_enable_programmatic_mode() -> bool {
     false
 }
 
-fn apply_programmatic_mode(command: &mut Commands) {
+fn apply_machine_mode(command: &mut Commands) {
     match command {
         Commands::Version(args) => args.output = OutputFormat::Json,
         Commands::Status(args) => args.output = OutputFormat::Json,
@@ -303,9 +348,9 @@ fn apply_programmatic_mode(command: &mut Commands) {
         Commands::Workers(args) => args.output = OutputFormat::Json,
         Commands::Trace(args) => args.output = trace::OutputFormat::Json,
         Commands::Search(args) => args.output = OutputFormat::Json,
-        Commands::Query(args) => apply_programmatic_query_mode(args),
-        Commands::Acceleration(args) => apply_programmatic_acceleration_mode(args),
-        Commands::Cloud(args) => apply_programmatic_cloud_mode(&mut args.command),
+        Commands::Query(args) => apply_machine_query_mode(args),
+        Commands::Acceleration(args) => apply_machine_acceleration_mode(args),
+        Commands::Cloud(args) => apply_machine_cloud_mode(&mut args.command),
         Commands::Init(_)
         | Commands::Install(_)
         | Commands::Upgrade(_)
@@ -338,7 +383,7 @@ fn apply_programmatic_mode(command: &mut Commands) {
     }
 }
 
-fn apply_programmatic_query_mode(args: &mut query::QueryArgs) {
+fn apply_machine_query_mode(args: &mut query::QueryArgs) {
     args.output = OutputFormat::Json;
 
     let Some(command) = &mut args.command else {
@@ -355,7 +400,7 @@ fn apply_programmatic_query_mode(args: &mut query::QueryArgs) {
     }
 }
 
-fn apply_programmatic_acceleration_mode(args: &mut AccelerationArgs) {
+fn apply_machine_acceleration_mode(args: &mut AccelerationArgs) {
     match &mut args.command {
         acceleration::AccelerationCommand::Snapshots(args) => args.output = OutputFormat::Json,
         acceleration::AccelerationCommand::Snapshot(args) => args.output = OutputFormat::Json,
@@ -363,7 +408,7 @@ fn apply_programmatic_acceleration_mode(args: &mut AccelerationArgs) {
     }
 }
 
-fn apply_programmatic_cloud_mode(command: &mut cloud::CloudCommands) {
+fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
     match command {
         cloud::CloudCommands::Whoami(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Apps(args) => args.output = OutputFormat::Json,
@@ -402,7 +447,7 @@ fn apply_programmatic_cloud_mode(command: &mut cloud::CloudCommands) {
     }
 }
 
-fn write_programmatic_clap_error(error: &clap::Error) {
+fn write_machine_clap_error(error: &clap::Error) {
     let body = serde_json::json!({
         "status": "error",
         "error": {
@@ -421,11 +466,11 @@ fn write_programmatic_clap_error(error: &clap::Error) {
     }
 }
 
-fn write_programmatic_error(error: &spice::error::Error) {
+fn write_machine_error(error: &spice::error::Error) {
     let body = serde_json::json!({
         "status": "error",
         "error": {
-            "code": programmatic_error_code(error),
+            "code": machine_error_code(error),
             "message": error.to_string(),
         }
     });
@@ -439,7 +484,7 @@ fn write_programmatic_error(error: &spice::error::Error) {
     }
 }
 
-fn programmatic_error_code(error: &spice::error::Error) -> &'static str {
+fn machine_error_code(error: &spice::error::Error) -> &'static str {
     match error {
         spice::error::Error::RuntimeNotInstalled => "runtime_not_installed",
         spice::error::Error::WindowsNativeRuntimeUnsupported => {
@@ -724,22 +769,27 @@ mod tests {
         Cli::try_parse_from(args).expect("failed to parse CLI args")
     }
 
+    fn parse_normalized(args: &[&str]) -> Cli {
+        let args = normalize_direct_sql_args(args.iter().map(OsString::from));
+        Cli::try_parse_from(args).expect("failed to parse CLI args")
+    }
+
     fn is_json(args: &[&str]) -> bool {
         is_json_output(&parse(args).command)
     }
 
-    fn parse_with_programmatic_mode(args: &[&str]) -> Cli {
+    fn parse_with_machine_mode(args: &[&str]) -> Cli {
         let mut cli = parse(args);
-        if cli.programmatic {
-            apply_programmatic_mode(&mut cli.command);
+        if cli.machine {
+            apply_machine_mode(&mut cli.command);
         }
         cli
     }
 
     #[test]
-    fn programmatic_flag_defaults_version_to_json() {
-        let cli = parse_with_programmatic_mode(&["spice", "-p", "version"]);
-        assert!(cli.programmatic);
+    fn machine_flag_defaults_version_to_json() {
+        let cli = parse_with_machine_mode(&["spice", "--machine", "version"]);
+        assert!(cli.machine);
 
         let Commands::Version(args) = cli.command else {
             panic!("expected version command");
@@ -748,8 +798,8 @@ mod tests {
     }
 
     #[test]
-    fn programmatic_flag_defaults_nested_outputs_to_json() {
-        let cli = parse_with_programmatic_mode(&["spice", "-p", "query", "list"]);
+    fn machine_flag_defaults_nested_outputs_to_json() {
+        let cli = parse_with_machine_mode(&["spice", "--machine", "query", "list"]);
         let Commands::Query(args) = cli.command else {
             panic!("expected query command");
         };
@@ -758,7 +808,7 @@ mod tests {
         };
         assert_eq!(output, OutputFormat::Json);
 
-        let cli = parse_with_programmatic_mode(&["spice", "-p", "cloud", "secrets", "list"]);
+        let cli = parse_with_machine_mode(&["spice", "--machine", "cloud", "secrets", "list"]);
         let Commands::Cloud(cloud::CloudArgs {
             command: cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(args)),
         }) = cli.command
@@ -769,12 +819,54 @@ mod tests {
     }
 
     #[test]
-    fn programmatic_error_codes_are_stable() {
+    fn machine_error_codes_are_stable() {
         let error = spice::error::Error::InvalidArgument {
             message: "bad input".to_string(),
         };
 
-        assert_eq!(programmatic_error_code(&error), "invalid_argument");
+        assert_eq!(machine_error_code(&error), "invalid_argument");
+    }
+
+    #[test]
+    fn direct_sql_flag_normalizes_to_sql_query() {
+        let cli = parse_normalized(&["spice", "-sql", "select 1"]);
+        let Commands::Sql(args) = cli.command else {
+            panic!("expected sql command");
+        };
+        assert_eq!(args.query.as_deref(), Some("select 1"));
+    }
+
+    #[test]
+    fn direct_sql_flag_normalizes_after_global_options() {
+        let cli = parse_normalized(&[
+            "spice",
+            "--http-endpoint",
+            "http://127.0.0.1:8090",
+            "-sql",
+            "show tables",
+        ]);
+        assert_eq!(cli.http_endpoint, "http://127.0.0.1:8090");
+        let Commands::Sql(args) = cli.command else {
+            panic!("expected sql command");
+        };
+        assert_eq!(args.query.as_deref(), Some("show tables"));
+    }
+
+    #[test]
+    fn direct_sql_flag_is_not_normalized_inside_subcommands() {
+        let args = normalize_direct_sql_args(
+            ["spice", "sql", "-sql", "select 1"]
+                .into_iter()
+                .map(OsString::from),
+        );
+
+        assert_eq!(
+            args,
+            ["spice", "sql", "-sql", "select 1"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -863,7 +955,15 @@ mod tests {
                 "spice", "cloud", "secrets", "delete", "name", "--output", "json",
             ],
             &[
-                "spice", "cloud", "create", "app", "name", "--output", "json",
+                "spice",
+                "cloud",
+                "create",
+                "app",
+                "name",
+                "--region",
+                "us-east-1",
+                "--output",
+                "json",
             ],
             &["spice", "cloud", "create", "deployment", "--output", "json"],
             &[

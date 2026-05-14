@@ -74,10 +74,10 @@ mod version {
     }
 
     #[test]
-    fn test_programmatic_version_outputs_json() {
+    fn test_machine_version_outputs_json() {
         let mut cmd = spice_cmd();
         let output = cmd
-            .arg("-p")
+            .arg("--machine")
             .arg("version")
             .arg("--cli-only")
             .assert()
@@ -87,21 +87,21 @@ mod version {
 
         assert!(
             output.stderr.is_empty(),
-            "programmatic version should not write human logs to stderr: {}",
+            "machine version should not write human logs to stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .expect("programmatic version output should be valid JSON");
+            .expect("machine version output should be valid JSON");
         assert!(json.get("cli").is_some(), "JSON should include cli version");
     }
 
     #[test]
-    fn test_programmatic_errors_are_json() {
+    fn test_machine_errors_are_json() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let missing = temp_dir.path().join("missing-spicepod.yaml");
         let mut cmd = spice_cmd();
         let output = cmd
-            .arg("-p")
+            .arg("--machine")
             .arg("validate")
             .arg(&missing)
             .assert()
@@ -111,11 +111,11 @@ mod version {
 
         assert!(
             output.stdout.is_empty(),
-            "programmatic errors should not write to stdout: {}",
+            "machine errors should not write to stdout: {}",
             String::from_utf8_lossy(&output.stdout)
         );
         let json: serde_json::Value = serde_json::from_slice(&output.stderr)
-            .expect("programmatic error output should be valid JSON");
+            .expect("machine error output should be valid JSON");
         assert_eq!(json["status"], "error");
         assert_eq!(json["error"]["code"], "invalid_argument");
     }
@@ -339,7 +339,8 @@ mod sql {
             .assert()
             .success()
             .stdout(predicate::str::contains("SQL"))
-            .stdout(predicate::str::contains("query"));
+            .stdout(predicate::str::contains("query"))
+            .stdout(predicate::str::contains("--query"));
     }
 
     #[test]
