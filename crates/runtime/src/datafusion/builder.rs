@@ -379,6 +379,9 @@ impl DataFusionBuilder {
 
         #[cfg(not(windows))]
         {
+            // Cayenne is not built on Windows, so its exact join-filter rewrite
+            // and accumulator budget are only configured for supported targets.
+            // Windows keeps DataFusion's standard hash-join dynamic filters.
             set_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
             state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
         }

@@ -69,6 +69,12 @@ pub fn maximum_shared_inlist_memory_bytes() -> usize {
     MAXIMUM_SHARED_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed)
 }
 
+/// Sets the process-wide exact in-list reservation budget.
+///
+/// DataFusion constructs `CollectLeftAccumulator` instances without session
+/// state, so the Cayenne join rewriter cannot attach a per-session limit at
+/// accumulator construction time. Spice builds one DataFusion runtime for the
+/// process and configures this shared budget from `runtime.query.memory_limit`.
 pub fn set_maximum_shared_inlist_memory_bytes(limit: usize) {
     MAXIMUM_SHARED_INLIST_MEMORY_BYTES.store(limit, AtomicOrdering::Relaxed);
 }
@@ -421,6 +427,8 @@ impl RangeBounds {
             return Ok(());
         };
 
+        // The Cayenne rewriter only enables this accumulator for
+        // `NullEqualsNothing`, so build-side NULL keys cannot match probe keys.
         bloom_filter.insert_array(array)
     }
 
