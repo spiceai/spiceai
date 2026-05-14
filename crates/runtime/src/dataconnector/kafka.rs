@@ -303,18 +303,27 @@ impl DataConnector for Kafka {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        if let Some(ref acceleration) = dataset.acceleration
-            && acceleration.enabled
-        {
-            ensure!(
-                acceleration.refresh_mode == Some(RefreshMode::Append),
-                super::InvalidConfigurationNoSourceSnafu {
-                    dataconnector: "kafka",
-                    message: "The Kafka connector is only compatible with refresh mode 'append'. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
-                    connector_component: ConnectorComponent::from(dataset),
-                }
-            );
-        }
+        let Some(acceleration) = dataset
+            .acceleration
+            .as_ref()
+            .filter(|acceleration| acceleration.enabled)
+        else {
+            return super::InvalidConfigurationNoSourceSnafu {
+                dataconnector: "kafka",
+                message: "The Kafka data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
+                connector_component: ConnectorComponent::from(dataset),
+            }
+            .fail();
+        };
+
+        ensure!(
+            acceleration.refresh_mode == Some(RefreshMode::Append),
+            super::InvalidConfigurationNoSourceSnafu {
+                dataconnector: "kafka",
+                message: "The Kafka connector is only compatible with refresh mode 'append'. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
+                connector_component: ConnectorComponent::from(dataset),
+            }
+        );
 
         let kafka_sys = if dataset.is_file_accelerated() {
             Some(Arc::new(

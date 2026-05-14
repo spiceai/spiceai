@@ -155,22 +155,30 @@ async fn ensure_kafka_table(conn: &turso::Connection) -> Result<()> {
         .await
         .map_err(Error::external)?;
 
-    let table_info = format!("PRAGMA table_info({KAFKA_TABLE_NAME})");
-    let mut rows = conn.query(&table_info, ()).await.map_err(Error::external)?;
-    let mut has_offsets_json = false;
-    while let Some(row) = rows.next().await.map_err(Error::external)? {
-        if row.get::<String>(1).ok().as_deref() == Some("offsets_json") {
-            has_offsets_json = true;
-            break;
+    if !has_offsets_json_column(conn).await? {
+        let add_offsets = format!("ALTER TABLE {KAFKA_TABLE_NAME} ADD COLUMN offsets_json TEXT");
+        match conn.execute(&add_offsets, ()).await {
+            Ok(_) => {}
+            Err(err) if is_duplicate_offsets_column_error(&err) => {}
+            Err(err) => return Err(Error::external(err)),
         }
     }
 
-    if !has_offsets_json {
-        let add_offsets = format!("ALTER TABLE {KAFKA_TABLE_NAME} ADD COLUMN offsets_json TEXT");
-        conn.execute(&add_offsets, ())
-            .await
-            .map_err(Error::external)?;
-    }
-
     Ok(())
+}
+
+async fn has_offsets_json_column(conn: &turso::Connection) -> Result<bool> {
+    let table_info = format!("PRAGMA table_info({KAFKA_TABLE_NAME})");
+    let mut rows = conn.query(&table_info, ()).await.map_err(Error::external)?;
+    while let Some(row) = rows.next().await.map_err(Error::external)? {
+        if row.get::<String>(1).ok().as_deref() == Some("offsets_json") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_duplicate_offsets_column_error(err: &turso::Error) -> bool {
+    let message = err.to_string();
+    message.contains("duplicate column name") && message.contains("offsets_json")
 }

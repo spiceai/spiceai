@@ -210,22 +210,31 @@ fn ensure_debezium_kafka_table(conn: &rusqlite::Connection) -> rusqlite::Result<
     );
     conn.execute(&create_table, [])?;
 
-    let table_info = format!("PRAGMA table_info({DEBEZIUM_KAFKA_TABLE_NAME})");
-    let mut stmt = conn.prepare(&table_info)?;
-    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    let mut has_offsets_json = false;
-    for column in columns {
-        if column? == "offsets_json" {
-            has_offsets_json = true;
-            break;
+    if !has_offsets_json_column(conn)? {
+        let add_offsets =
+            format!("ALTER TABLE {DEBEZIUM_KAFKA_TABLE_NAME} ADD COLUMN offsets_json TEXT");
+        match conn.execute(&add_offsets, []) {
+            Ok(_) => {}
+            Err(err) if is_duplicate_offsets_column_error(&err) => {}
+            Err(err) => return Err(err),
         }
     }
 
-    if !has_offsets_json {
-        let add_offsets =
-            format!("ALTER TABLE {DEBEZIUM_KAFKA_TABLE_NAME} ADD COLUMN offsets_json TEXT");
-        conn.execute(&add_offsets, [])?;
-    }
-
     Ok(())
+}
+
+fn has_offsets_json_column(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    let table_info = format!("PRAGMA table_info({DEBEZIUM_KAFKA_TABLE_NAME})");
+    let mut stmt = conn.prepare(&table_info)?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "offsets_json" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_duplicate_offsets_column_error(err: &rusqlite::Error) -> bool {
+    matches!(err, rusqlite::Error::SqliteFailure(_, Some(message)) if message.contains("duplicate column name") && message.contains("offsets_json"))
 }

@@ -288,21 +288,27 @@ impl DataConnector for Debezium {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let acceleration = dataset
+        let Some(acceleration) = dataset
             .acceleration
             .as_ref()
-            .filter(|acceleration| acceleration.enabled);
+            .filter(|acceleration| acceleration.enabled)
+        else {
+            return super::InvalidConfigurationNoSourceSnafu {
+                dataconnector: "debezium",
+                message: "The Debezium data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                connector_component: ConnectorComponent::from(dataset),
+            }
+            .fail();
+        };
 
-        if let Some(acceleration) = acceleration {
-            ensure!(
-                self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
-                super::InvalidConfigurationNoSourceSnafu {
-                    dataconnector: "debezium",
-                    message: "The Debezium connector is only compatible with refresh mode 'changes'. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                }
-            );
-        }
+        ensure!(
+            self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
+            super::InvalidConfigurationNoSourceSnafu {
+                dataconnector: "debezium",
+                message: "The Debezium connector is only compatible with refresh mode 'changes'. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                connector_component: ConnectorComponent::from(dataset),
+            }
+        );
 
         let dataset_name = dataset.name.to_string();
 
@@ -421,17 +427,15 @@ impl DataConnector for Debezium {
             }
         };
 
-        if let Some(acceleration) = acceleration {
-            ensure!(
-                !metadata.primary_keys.is_empty()
-                    || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
-                super::InvalidConfigurationNoSourceSnafu {
-                    dataconnector: "debezium",
-                    message: "The Debezium data connector requires Kafka message keys for accelerators other than Arrow. Configure a primary key or message.key.columns in Debezium, or use the Arrow acceleration engine for full-row CDC matching with full before images for keyless updates and deletes. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                }
-            );
-        }
+        ensure!(
+            !metadata.primary_keys.is_empty()
+                || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
+            super::InvalidConfigurationNoSourceSnafu {
+                dataconnector: "debezium",
+                message: "The Debezium data connector requires Kafka message keys for accelerators other than Arrow. Configure a primary key or message.key.columns in Debezium, or use the Arrow acceleration engine for full-row CDC matching with full before images for keyless updates and deletes. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                connector_component: ConnectorComponent::from(dataset),
+            }
+        );
 
         if metadata.primary_keys.is_empty() {
             tracing::warn!(
