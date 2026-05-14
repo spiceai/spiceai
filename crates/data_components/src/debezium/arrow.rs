@@ -169,14 +169,21 @@ pub fn append_value_to_struct_builder(
     builder: &mut StructBuilder,
 ) -> Result<()> {
     builder.append(true);
+    let null_value = serde_json::Value::Null;
 
     for (idx, field) in builder.fields().iter().enumerate() {
-        let Some(field_value) = value.get(field.name()) else {
-            return MissingFieldInValueSnafu {
-                field_name: field.name().clone(),
-                value,
+        // If the field is missing from the message (e.g. due to schema evolution),
+        // append null for nullable fields instead of failing.
+        let field_value = match value.get(field.name()) {
+            Some(v) => v,
+            None if field.is_nullable() => &null_value,
+            None => {
+                return MissingFieldInValueSnafu {
+                    field_name: field.name().clone(),
+                    value,
+                }
+                .fail();
             }
-            .fail();
         };
 
         let field_builder = builder.field_builder_array(idx);
@@ -697,5 +704,136 @@ mod tests {
         let input = json!(n); // Not a string or object
         let result = convert_json_to_decimal(&input, 2);
         result.expect_err("Should fail for wrong JSON type");
+    }
+
+    #[test]
+    fn test_append_value_missing_nullable_field_fills_null() {
+        use crate::arrow::struct_builder::StructBuilder;
+        use arrow::array::Array;
+
+        // Schema with one required and one nullable field
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+
+        // Message is missing the nullable "name" field
+        let value = json!({"id": 42});
+        let result = append_value_to_struct_builder(value, &mut builder);
+        assert!(
+            result.is_ok(),
+            "Should succeed when nullable field is missing"
+        );
+
+        let struct_array = builder.finish();
+        let record_batch: RecordBatch = struct_array.into();
+        assert_eq!(record_batch.num_rows(), 1);
+
+        let id_col = record_batch
+            .column_by_name("id")
+            .expect("id column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("id column should be Int32Array");
+        assert_eq!(id_col.value(0), 42);
+
+        let name_col = record_batch
+            .column_by_name("name")
+            .expect("name column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("name column should be StringArray");
+        assert!(name_col.is_null(0));
+    }
+
+    #[test]
+    fn test_append_value_missing_required_field_fails() {
+        use crate::arrow::struct_builder::StructBuilder;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("status", DataType::Utf8, false), // not nullable
+        ]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+
+        // Message is missing the required "status" field
+        let value = json!({"id": 42});
+        let result = append_value_to_struct_builder(value, &mut builder);
+        assert!(
+            result.is_err(),
+            "Should fail when required field is missing"
+        );
+    }
+
+    #[test]
+    fn test_append_value_extra_fields_ignored() {
+        use crate::arrow::struct_builder::StructBuilder;
+
+        // Schema only has "id"
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+
+        // Message has extra field "removed_column" not in schema
+        let value = json!({"id": 42, "removed_column": "old_value"});
+        let result = append_value_to_struct_builder(value, &mut builder);
+        assert!(result.is_ok(), "Extra fields in message should be ignored");
+
+        let struct_array = builder.finish();
+        let record_batch: RecordBatch = struct_array.into();
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn test_append_value_multiple_missing_nullable_fields() {
+        use crate::arrow::struct_builder::StructBuilder;
+        use arrow::array::Array;
+
+        // Schema with multiple nullable fields added via schema evolution
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 2);
+
+        // Old message with only "id" (before schema evolution)
+        let old_value = json!({"id": 1});
+        append_value_to_struct_builder(old_value, &mut builder)
+            .expect("old message should process successfully");
+
+        // New message with all fields
+        let new_value = json!({"id": 2, "name": "Alice", "age": 30, "active": true});
+        append_value_to_struct_builder(new_value, &mut builder)
+            .expect("new message should process successfully");
+
+        let struct_array = builder.finish();
+        let record_batch: RecordBatch = struct_array.into();
+        assert_eq!(record_batch.num_rows(), 2);
+
+        // First row: id=1, rest null
+        let id_col = record_batch
+            .column_by_name("id")
+            .expect("id column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("id column should be Int32Array");
+        assert_eq!(id_col.value(0), 1);
+        assert_eq!(id_col.value(1), 2);
+
+        let name_col = record_batch
+            .column_by_name("name")
+            .expect("name column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("name column should be StringArray");
+        assert!(name_col.is_null(0));
+        assert_eq!(name_col.value(1), "Alice");
     }
 }
