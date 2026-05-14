@@ -192,7 +192,6 @@ enum Commands {
     /// Run vector / hybrid search across embedded datasets.
     Search(search::SearchArgs),
 
-    /// Chat with a configured LLM through the runtime's OpenAI-compatible API.
     Chat(chat::ChatArgs),
 
     /// Trigger a refresh of an accelerated dataset.
