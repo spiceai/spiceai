@@ -17,23 +17,35 @@ limitations under the License.
 //! Cross-partition atomic commit coordinator for Cayenne.
 //!
 //! Implements [`InsertStrategy`] for partitioned Cayenne tables (issue
-//! #10125). For overwrite-mode inserts, every participating partition's
-//! catalog mutation is batched into a single [`MetastoreTransaction`] so the
-//! `current_snapshot_id` pointer flips happen atomically — either every
-//! partition advances or none do. Append-mode inserts fall through to
-//! [`DefaultInsertStrategy`] (handled by the per-partition write path).
+//! #10125). Both `InsertOp::Overwrite` and `InsertOp::Append`/`Replace` are
+//! coordinated — the per-partition `PartitionerExec` fan-out is replaced by
+//! a single sink per insert mode that holds every participating partition
+//! to one shared commit boundary:
+//!
+//! - **Overwrite** ([`CayennePartitionedOverwriteSink`]): every participating
+//!   partition's catalog mutation is batched into a single
+//!   [`MetastoreTransaction`] so the `current_snapshot_id` pointer flips
+//!   happen atomically — either every partition advances or none do.
+//! - **Append / Replace** ([`CayennePartitionedAppendSink`]): every
+//!   participating partition's `listing_fence.write()` is held for one
+//!   shared barrier window while files move into the current snapshot dir
+//!   and the in-memory `ListingTable` Arcs swap, anchored by a top-level
+//!   [`cayenne::PartitionedWal`] for crash recovery (local-FS only —
+//!   S3-backed tables skip the top-level WAL and rely on the per-partition
+//!   staging WAL for crash safety).
 //!
 //! ## Overwrite coordination flow
 //!
 //! 1. **Stage** (parallel-safe per partition): partition the input stream by
-//!    partition key. For each unique key seen, call
-//!    [`CayenneTableProvider::begin_overwrite`] which writes data into a
-//!    fresh `<table_id>/<new_snapshot>/` directory and returns a
-//!    [`PreparedOverwrite`] receipt.
+//!    partition key. For each unique key seen, spawn a writer task that
+//!    streams batches into [`CayenneTableProvider::begin_overwrite`], which
+//!    writes data into a fresh `<table_id>/<new_snapshot>/` directory and
+//!    returns a [`PreparedOverwrite`] receipt.
 //! 2. **Apply** (single shared transaction): open one transaction on the
-//!    shared `CayenneCatalog`. For every receipt, call
-//!    [`PreparedOverwrite::apply_in_txn`] inside that transaction.
-//!    Commit the transaction once.
+//!    shared [`CayenneCatalog`]. For every receipt, call
+//!    [`PreparedOverwrite::apply_in_txn`] inside that transaction. Commit
+//!    once. Retries on transient `SQLITE_BUSY` / Turso `BEGIN CONCURRENT`
+//!    conflicts with bounded backoff.
 //! 3. **Finish** (parallel-safe per partition): for every receipt, run
 //!    [`PreparedOverwrite::finish`] to publish the new snapshot in-memory and
 //!    trigger old-snapshot GC.
@@ -42,6 +54,26 @@ limitations under the License.
 //! of the staged snapshot directories). Failure at step 3 is logged but does
 //! not roll back — the catalog has already committed, so readers see the new
 //! state via the next scan.
+//!
+//! ## Append coordination flow
+//!
+//! Mirrors the overwrite flow up to the commit boundary. After every
+//! partition's writer task returns a [`PreparedStagedAppend`]:
+//!
+//! 1. Sort the receipts by `table_id` for deterministic fence-acquisition
+//!    order across concurrent coordinators.
+//! 2. Acquire every partition's `listing_fence.write()` (held until the
+//!    barrier closes).
+//! 3. On local FS, write a top-level [`cayenne::PartitionedWal`] anchor at
+//!    `<table_root>/_partitioned_wal/<commit_id>.json` before any file move.
+//!    On S3, skip the WAL — the per-partition staging WAL still anchors
+//!    single-partition recovery.
+//! 4. For each receipt, call `apply_under_held_barrier`: move staged files
+//!    into the snapshot directory, remove the per-partition WAL, swap the
+//!    in-memory `ListingTable`.
+//! 5. Remove the top-level WAL.
+//! 6. Release fences (drop guards together).
+//! 7. Run [`PreparedStagedAppend::finish`] on each receipt.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -541,13 +573,24 @@ fn downcast_to_cayenne(
 // happen, so any reader going through `CayenneTableProvider::scan()`
 // resolves either before or after the whole barrier, never in the middle.
 //
-// Crash safety: the top-level `PartitionedWal` written at
-// `<table_root>/_partitioned_wal/<commit_id>.json` records every partition
-// participating in this barrier. If the writer crashes mid-barrier, the WAL
-// survives and the per-partition staging WALs that exist correspond to
-// partitions in the top-level WAL. Operator/recovery uses this to decide
+// Crash safety: on local-filesystem tables, the top-level `PartitionedWal`
+// written at `<table_root>/_partitioned_wal/<commit_id>.json` records every
+// partition participating in this barrier. If the writer crashes mid-barrier,
+// the WAL survives and the per-partition staging WALs that exist correspond
+// to partitions in the top-level WAL. Operator/recovery uses this to decide
 // whether to replay or roll back the set. Auto-recovery is a follow-up; the
 // MVP keeps the WAL as a diagnostic anchor + a clean removal on success.
+//
+// S3-backed tables: `PartitionedWal::write_to` uses `tokio::fs` and would
+// fail on an `s3://...` `table_root`. Until the WAL grows an object-store IO
+// path, the append coordinator skips the top-level WAL for S3 tables and
+// relies on each partition's staging WAL for single-partition recovery. The
+// cross-partition barrier (fence + ordered fence acquisition) still holds —
+// what is lost is the *set anchor* needed to atomically replay or roll back
+// a crash that interrupted the apply loop across partitions. For the MVP
+// that gap is acceptable: the per-partition `ensure_no_incomplete_write`
+// check still blocks any partition whose staging WAL survives, so no
+// half-applied state becomes silently visible to readers.
 // ============================================================================
 
 /// `DataSink` that fans the input stream out by partition key, stages every
@@ -731,28 +774,34 @@ impl DataSink for CayennePartitionedAppendSink {
         }
 
         let commit_id = uuid::Uuid::now_v7().to_string();
-        let wal_entries: Vec<PartitionedWalEntry> = prepared
-            .iter()
-            .map(|p| PartitionedWalEntry {
-                table_id: p.table_id().to_string(),
-                staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
-            })
-            .collect();
-        let top_level_wal = PartitionedWal::new(
-            commit_id.clone(),
-            self.table_root.to_string_lossy().to_string(),
-            wal_entries,
-        );
-        if let Err(e) = top_level_wal.write_to(&self.table_root).await {
-            // Failed to even record the intent. Roll back every prepared
-            // append. Fences will be released when fence_guards drops.
-            drop(fence_guards);
-            for prep in prepared {
-                if let Err(rb) = prep.rollback().await {
-                    tracing::warn!("rollback after top-level WAL write failure: {rb}");
+        // The top-level partitioned WAL uses `tokio::fs` and only works for
+        // local-filesystem table roots. For S3-backed tables we skip it and
+        // rely on each partition's staging WAL for crash recovery (see the
+        // S3 note in the module-level crash-safety comment). When the WAL
+        // grows object-store IO, drop this branch.
+        let table_root_str = self.table_root.to_string_lossy();
+        let write_top_level_wal = !table_root_str.starts_with("s3://");
+        if write_top_level_wal {
+            let wal_entries: Vec<PartitionedWalEntry> = prepared
+                .iter()
+                .map(|p| PartitionedWalEntry {
+                    table_id: p.table_id().to_string(),
+                    staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
+                })
+                .collect();
+            let top_level_wal =
+                PartitionedWal::new(commit_id.clone(), table_root_str.to_string(), wal_entries);
+            if let Err(e) = top_level_wal.write_to(&self.table_root).await {
+                // Failed to even record the intent. Roll back every prepared
+                // append. Fences will be released when fence_guards drops.
+                drop(fence_guards);
+                for prep in prepared {
+                    if let Err(rb) = prep.rollback().await {
+                        tracing::warn!("rollback after top-level WAL write failure: {rb}");
+                    }
                 }
+                return Err(DataFusionError::from(e));
             }
-            return Err(DataFusionError::from(e));
         }
 
         // Apply the barrier on every partition. If any fails partway, the
@@ -770,7 +819,11 @@ impl DataSink for CayennePartitionedAppendSink {
 
         // Success path: remove top-level WAL, then release the fences. The
         // top-level WAL absence is what recovery uses to skip clean commits.
-        if let Err(e) = PartitionedWal::remove(&self.table_root, &commit_id).await {
+        // Mirrors the S3 skip on the write side — nothing to clean up if we
+        // never wrote it.
+        if write_top_level_wal
+            && let Err(e) = PartitionedWal::remove(&self.table_root, &commit_id).await
+        {
             // Visibility has already flipped on every partition; surface the
             // cleanup failure as a warning rather than rolling back. The
             // next coordinator's recovery sweep will treat the dangling WAL

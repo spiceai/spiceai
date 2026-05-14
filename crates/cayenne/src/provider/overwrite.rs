@@ -247,7 +247,10 @@ impl PreparedOverwrite {
     /// a warning) — the orphan directory will be cleaned by the next
     /// `trigger_old_snapshot_cleanup` cycle on a successful overwrite.
     pub async fn rollback(self) -> Result<()> {
-        let _ = self.write_guard;
+        // Hold the per-table write guard for the whole cleanup so another
+        // writer can't acquire the lock and start a new commit while the
+        // staged snapshot directory is mid-deletion.
+        let _write_guard = self.write_guard;
 
         // Best-effort cleanup of the new snapshot directory. Object stores
         // (S3) don't have a single "remove dir" call; we leave object-store

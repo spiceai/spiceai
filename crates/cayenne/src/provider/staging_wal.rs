@@ -216,8 +216,13 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if clearing the staging directory fails.
     pub async fn rollback(self) -> Result<()> {
-        let _ = self.write_guard;
+        // Hold the per-table write guard until after the staging directory is
+        // cleared. Dropping the guard first would let another writer acquire
+        // the lock mid-cleanup and transiently observe an `IncompleteWrite`
+        // or leftover WAL.
+        let _write_guard = self.write_guard;
         self.table.clear_staging_dir().await
+        // _write_guard drops here, after cleanup completes.
     }
 }
 
@@ -392,8 +397,13 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if clearing the staging directory fails.
     pub async fn rollback(self) -> Result<()> {
-        let _ = self.write_guard;
+        // Same ordering rationale as `CayenneStagedAppend::rollback`: hold
+        // the write guard until after the staging directory is cleared so
+        // other writers can't transiently observe a leftover WAL between
+        // guard release and cleanup.
+        let _write_guard = self.write_guard;
         self.table.clear_staging_dir().await
+        // _write_guard drops here.
     }
 }
 

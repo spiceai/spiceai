@@ -116,28 +116,60 @@ impl PartitionedWal {
     /// `<table_root>/_partitioned_wal/<commit_id>.json`, creating the
     /// `_partitioned_wal/` directory if needed.
     ///
-    /// Fsyncs the file before returning so the WAL is durable before the
-    /// coordinator starts moving any files.
+    /// Write is atomic and crash-safe:
+    /// 1. Serialize to memory.
+    /// 2. Write to `<commit_id>.json.tmp` and fsync the file.
+    /// 3. `rename` the tmp file to the final path (atomic on POSIX local FS).
+    /// 4. Fsync the parent directory so the rename itself is durable.
+    ///
+    /// A crash at any point either leaves no WAL (steps 1–3 incomplete) or
+    /// a complete, parseable WAL — never a partial file that `read_all_in`
+    /// would skip as unparseable and lose the recovery anchor for an
+    /// in-flight barrier.
     ///
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created, the file cannot
-    /// be written, or serialization fails.
+    /// be written, serialization fails, or the atomic rename / fsync fails.
     pub async fn write_to(&self, table_root: &Path) -> Result<PathBuf> {
         let wal_dir = table_root.join(PARTITIONED_WAL_DIR);
         tokio::fs::create_dir_all(&wal_dir).await?;
 
         let wal_path = wal_dir.join(format!("{}.json", self.commit_id));
+        let tmp_path = wal_dir.join(format!("{}.json.tmp", self.commit_id));
+
         let content = serde_json::to_string_pretty(self).map_err(|e| Error::Internal {
             table: self.table_root.clone(),
             message: format!("Failed to serialize partitioned WAL: {e}"),
         })?;
 
-        tokio::fs::write(&wal_path, content.as_bytes()).await?;
+        // Step 1: write to tmp file + fsync.
+        tokio::fs::write(&tmp_path, content.as_bytes()).await?;
+        let tmp_file = tokio::fs::File::open(&tmp_path).await?;
+        tmp_file.sync_all().await?;
+        drop(tmp_file);
 
-        // fsync the file so the WAL is durable before any file moves begin.
-        let file = tokio::fs::File::open(&wal_path).await?;
-        file.sync_all().await?;
+        // Step 2: atomic rename. POSIX rename within the same directory is
+        // atomic and replaces any existing target. If the rename fails, do a
+        // best-effort cleanup of the tmp file so we don't leave junk behind.
+        if let Err(e) = tokio::fs::rename(&tmp_path, &wal_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(Error::IoError { source: e });
+        }
+
+        // Step 3: fsync the parent dir so the rename is durable across a
+        // power-loss restart.
+        if let Ok(dir) = tokio::fs::File::open(&wal_dir).await
+            && let Err(e) = dir.sync_all().await
+        {
+            // Directory fsync is best-effort: on some filesystems / OSes it
+            // is a no-op anyway. Log the failure but don't abort — the WAL
+            // file itself is already fsync'd and renamed.
+            tracing::warn!(
+                "Failed to fsync partitioned WAL parent dir {}: {e}",
+                wal_dir.display(),
+            );
+        }
 
         tracing::debug!(
             "Wrote partitioned WAL at {} for {} partition(s)",
