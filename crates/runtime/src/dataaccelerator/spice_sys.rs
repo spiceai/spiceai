@@ -81,6 +81,9 @@ pub mod kafka;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
+
 pub mod caching_engine;
 
 enum AccelerationConnection {
@@ -201,7 +204,8 @@ impl Error {
         feature = "duckdb",
         feature = "postgres",
         feature = "turso",
-        feature = "kafka"
+        feature = "kafka",
+        feature = "mongodb"
     ))]
     fn external(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self::External { source: err.into() }
