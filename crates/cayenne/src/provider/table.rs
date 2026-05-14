@@ -29,7 +29,9 @@ use super::delete::{
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use crate::metadata::{CreateTableOptions, InlinedData, InlinedDataStats, TableMetadata};
+use crate::metadata::{
+    CreateTableOptions, InlinedData, InlinedDataStats, TableMetadata, TableStatistics,
+};
 use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
@@ -263,7 +265,13 @@ impl ColumnStatsAccumulator {
     ///
     /// Returns `None` if no rows were accumulated or serialization fails.
     pub(crate) fn to_file_statistics_blob(&self) -> Option<Vec<u8>> {
-        if self.row_count() == 0 {
+        let (blob, _row_count) = self.to_file_statistics_blob_with_row_count()?;
+        Some(blob)
+    }
+
+    pub(crate) fn to_file_statistics_blob_with_row_count(&self) -> Option<(Vec<u8>, i64)> {
+        let row_count = self.row_count();
+        if row_count == 0 {
             return None;
         }
         let Ok(cols) = self.columns.lock() else {
@@ -275,12 +283,23 @@ impl ColumnStatsAccumulator {
 
         let file_stats = crate::stats::build_file_statistics(cols.clone(), &self.schema);
         match crate::stats::serialize_file_statistics(&file_stats) {
-            Ok(bytes) => Some(bytes),
+            Ok(bytes) => Some((bytes, row_count)),
             Err(e) => {
                 tracing::warn!("Failed to serialize file statistics: {e}");
                 None
             }
         }
+    }
+
+    fn merged_file_statistics_blob(&self, existing_blob: &[u8]) -> Option<Vec<u8>> {
+        let Ok(cols) = self.columns.lock() else {
+            tracing::warn!(
+                "ColumnStatsAccumulator: mutex poisoned in merged_file_statistics_blob(), returning None"
+            );
+            return None;
+        };
+
+        crate::stats::merge_serialized_stats(existing_blob, &cols, &self.dtypes, &self.schema)
     }
 }
 
@@ -3826,26 +3845,51 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Persist statistics for the most recent write.
-    ///
-    /// The accumulator contains stats for the rows written by the current
-    /// operation only. The metastore row is keyed by `table_id` and upserted,
-    /// so this overwrites any previous entry (last-write-wins) — it does not
-    /// merge with stats from earlier writes yet. Treating these values as
-    /// table-wide stats is unsafe; consumers must read them as optimization
-    /// hints until cross-write merging lands.
+    /// Persist table-level statistics by merging the current write with the
+    /// existing metastore aggregate when possible.
     ///
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
     pub(crate) async fn persist_table_stats(&self, accumulator: &ColumnStatsAccumulator) {
-        let Some(blob) = accumulator.to_file_statistics_blob() else {
+        let Some((new_blob, new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
+        else {
             return;
         };
 
-        let stats = crate::metadata::TableStatistics {
+        let existing_stats = match self
+            .catalog
+            .get_table_statistics(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(stats) => stats,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load existing table stats for {} before merge: {e}",
+                    self.table_metadata.table_name
+                );
+                None
+            }
+        };
+
+        let (statistics_blob, num_rows) = if let Some(existing) = existing_stats {
+            let Some(merged_blob) =
+                accumulator.merged_file_statistics_blob(&existing.statistics_blob)
+            else {
+                tracing::warn!(
+                    "Failed to merge table stats for {}; leaving previous aggregate stats unchanged",
+                    self.table_metadata.table_name
+                );
+                return;
+            };
+            (merged_blob, existing.num_rows.saturating_add(new_rows))
+        } else {
+            (new_blob, new_rows)
+        };
+
+        let stats = TableStatistics {
             table_id: self.table_metadata.table_id.clone(),
-            statistics_blob: blob,
-            num_rows: accumulator.row_count(),
+            statistics_blob,
+            num_rows,
         };
 
         if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
