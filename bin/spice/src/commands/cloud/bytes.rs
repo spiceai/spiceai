@@ -33,7 +33,6 @@ const GIB: u64 = MIB * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NumBytes(u64);
 
-#[expect(dead_code)]
 impl NumBytes {
     /// Create a `NumBytes` from a raw byte count.
     pub fn from_bytes(bytes: u64) -> Self {

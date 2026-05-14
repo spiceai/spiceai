@@ -1730,9 +1730,11 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
 
 /// Read a spicepod YAML file from disk and return its contents as a string.
 async fn read_spicepod_file(path: &str) -> Result<String> {
-    tokio::fs::read_to_string(path).await.map_err(|e| crate::error::Error::InvalidArgument {
-        message: format!("Failed to read spicepod file '{path}': {e}"),
-    })
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| crate::error::Error::InvalidArgument {
+            message: format!("Failed to read spicepod file '{path}': {e}"),
+        })
 }
 
 /// Validate that `--window` parses as a duration via `fundu`.
