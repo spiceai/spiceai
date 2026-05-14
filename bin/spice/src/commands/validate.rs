@@ -55,8 +55,23 @@ pub struct ValidateArgs {
 pub async fn execute(args: &ValidateArgs) -> Result<()> {
     match load_pod(&args.path).await {
         Ok(pod) => {
+            let runtime = if pod.runtime == spicepod::component::runtime::Runtime::default() {
+                "default"
+            } else {
+                "configured"
+            };
+            let management = if pod.management.is_some() {
+                "configured"
+            } else {
+                "none"
+            };
+            let snapshots = if pod.snapshots.is_some() {
+                "configured"
+            } else {
+                "none"
+            };
             println!(
-                "{} {} (catalogs: {}, datasets: {}, views: {}, models: {}, embeddings: {}, rerankers: {}, tools: {}, workers: {}, functions: {}, secrets: {}, dependencies: {}, extensions: {}, runtime: {}, management: {}, snapshots: {})",
+                "{} {}\n  components: catalogs={}, datasets={}, views={}, models={}, embeddings={}, rerankers={}, tools={}, workers={}, functions={}\n  resources: secrets={}, dependencies={}, extensions={}\n  configuration: runtime={runtime}, management={management}, snapshots={snapshots}",
                 Color::Green.paint("OK"),
                 pod.name,
                 pod.catalogs.len(),
@@ -71,21 +86,6 @@ pub async fn execute(args: &ValidateArgs) -> Result<()> {
                 pod.secrets.len(),
                 pod.dependencies.len(),
                 pod.extensions.len(),
-                if pod.runtime == spicepod::component::runtime::Runtime::default() {
-                    "default"
-                } else {
-                    "configured"
-                },
-                if pod.management.is_some() {
-                    "configured"
-                } else {
-                    "none"
-                },
-                if pod.snapshots.is_some() {
-                    "configured"
-                } else {
-                    "none"
-                },
             );
             Ok(())
         }

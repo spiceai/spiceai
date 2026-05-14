@@ -128,8 +128,6 @@ impl LocalFileRegistry {
 fn find_manifest(source_path: &Path, pod_name: &str) -> Option<PathBuf> {
     let lowercase_pod_name = pod_name.to_lowercase();
     let mut candidate_names = vec![
-        GENERIC_MANIFEST.to_string(),
-        "spicepod.yml".to_string(),
         format!("{pod_name}.yaml"),
         format!("{pod_name}.yml"),
     ];
@@ -138,6 +136,9 @@ fn find_manifest(source_path: &Path, pod_name: &str) -> Option<PathBuf> {
         candidate_names.push(format!("{lowercase_pod_name}.yaml"));
         candidate_names.push(format!("{lowercase_pod_name}.yml"));
     }
+
+    candidate_names.push(GENERIC_MANIFEST.to_string());
+    candidate_names.push("spicepod.yml".to_string());
 
     candidate_names
         .into_iter()
@@ -252,6 +253,43 @@ mod tests {
         assert!(
             pods_dir.join("namedpod").join("spicepod.yaml").exists(),
             "pod-named yml manifest should be normalized to spicepod.yaml"
+        );
+    }
+
+    #[tokio::test]
+    async fn pod_named_manifest_takes_precedence_over_generic_manifest() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let source_dir = temp_dir.path().join("namedpod");
+        let pods_dir = temp_dir.path().join("spicepods");
+        std::fs::create_dir_all(&source_dir).expect("source directory should be created");
+        std::fs::write(
+            source_dir.join("spicepod.yaml"),
+            "version: v2\nkind: Spicepod\nname: generic\n",
+        )
+        .expect("generic manifest should be written");
+        std::fs::write(
+            source_dir.join("namedpod.yaml"),
+            "version: v2\nkind: Spicepod\nname: named\n",
+        )
+        .expect("pod-named manifest should be written");
+
+        LocalFileRegistry
+            .get_pod(
+                source_dir.to_str().expect("source path should be utf-8"),
+                &pods_dir,
+                &HashMap::new(),
+                &reqwest::Client::new(),
+            )
+            .await
+            .expect("local pod should be installed");
+
+        let installed_manifest = std::fs::read_to_string(
+            pods_dir.join("namedpod").join("spicepod.yaml"),
+        )
+        .expect("installed manifest should be readable");
+        assert!(
+            installed_manifest.contains("name: named"),
+            "pod-named manifest should be used over generic manifest"
         );
     }
 

@@ -126,7 +126,7 @@ Examples:
   spice tool add lookup --from mcp:server --env TOKEN='${ secrets:TOKEN }'
   spice model add --ref models/llm.yaml
 
-Use --set path=value for schema fields. Values are parsed as YAML, so quote strings when needed."#
+Use --set path=value for schema fields. Values are parsed as YAML. Values passed with --param or metadata commands are stored as strings unless prefixed with yaml:."#
 )]
 pub struct ComponentArgs {
     #[command(subcommand)]
@@ -413,7 +413,7 @@ pub enum MetadataCommand {
 
 #[derive(Args, Debug, Default)]
 pub struct MetadataEditArgs {
-    /// Metadata entries as KEY=VALUE. Values are parsed as YAML.
+    /// Metadata entries as KEY=VALUE. Values are stored as strings unless prefixed with yaml:.
     #[arg(value_name = "KEY=VALUE")]
     pub entries: Vec<String>,
 
@@ -421,7 +421,7 @@ pub struct MetadataEditArgs {
     #[arg(long, value_hint = ValueHint::FilePath)]
     pub manifest: Option<PathBuf>,
 
-    /// Set metadata entries as KEY=VALUE. Values are parsed as YAML.
+    /// Set metadata entries as KEY=VALUE. Values are stored as strings unless prefixed with yaml:.
     #[arg(long = "set", value_name = "KEY=VALUE")]
     pub set: Vec<String>,
 }
@@ -431,7 +431,7 @@ pub struct MetadataSetArgs {
     /// Metadata key
     pub key: String,
 
-    /// Metadata value, parsed as YAML
+    /// Metadata value. Stored as a string unless prefixed with yaml:.
     pub value: String,
 
     /// Path to the Spicepod manifest to edit
@@ -595,7 +595,7 @@ fn build_component_value(
         )?;
     }
     for pair in &options.params {
-        let (key, param_value) = parse_key_value(pair)?;
+        let (key, param_value) = parse_string_or_yaml_prefixed_pair(pair)?;
         set_path(&mut value, &format!("params.{key}"), param_value)?;
     }
     for pair in &options.env {
@@ -774,7 +774,7 @@ fn configure_singleton(section: SingletonSection, args: &SingletonConfigureArgs)
         set_path(&mut value, "location", Value::String(location.clone()))?;
     }
     for pair in &args.params {
-        let (key, param_value) = parse_key_value(pair)?;
+        let (key, param_value) = parse_string_or_yaml_prefixed_pair(pair)?;
         set_path(&mut value, &format!("params.{key}"), param_value)?;
     }
     for pair in &args.set {
@@ -856,7 +856,7 @@ fn mutate_metadata(args: &MetadataEditArgs, mode: MutationMode) -> Result<()> {
     let metadata = ensure_mapping_field(&mut spicepod, "metadata")?;
 
     for pair in args.entries.iter().chain(args.set.iter()) {
-        let (key, metadata_value) = parse_key_value(pair)?;
+        let (key, metadata_value) = parse_string_or_yaml_prefixed_pair(pair)?;
         let metadata_key = Value::String(key.clone());
         if mode == MutationMode::Add {
             ensure!(
@@ -980,6 +980,18 @@ fn parse_key_value(pair: &str) -> Result<(String, Value)> {
         yaml::from_str(raw_value).unwrap_or_else(|_| Value::String(raw_value.to_string()))
     };
     Ok((key.to_string(), value))
+}
+
+fn parse_string_or_yaml_prefixed_pair(pair: &str) -> Result<(String, Value)> {
+    let (key, raw_value) = split_pair(pair)?;
+    if let Some(yaml_value) = raw_value.strip_prefix("yaml:") {
+        let value = yaml::from_str(yaml_value).map_err(|source| crate::error::Error::ConfigParse {
+            message: format!("Failed to parse YAML value for '{key}': {source}"),
+        })?;
+        return Ok((key.to_string(), value));
+    }
+
+    Ok((key.to_string(), Value::String(raw_value.to_string())))
 }
 
 fn parse_string_pair(pair: &str) -> Result<(String, String)> {

@@ -102,7 +102,7 @@ pub async fn execute_add_or_connect(
 /// Get a relative path from a base directory.
 fn get_relative_path(base: &Path, path: &Path) -> String {
     path.strip_prefix(base).map_or_else(
-        |_| path.display().to_string(),
+        |_| manifest::path_to_spicepod_ref(path),
         manifest::path_to_spicepod_ref,
     )
 }

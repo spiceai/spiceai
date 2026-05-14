@@ -17,8 +17,9 @@ limitations under the License.
 //! Helpers for reading and editing the root Spicepod manifest.
 
 use crate::error::{ConfigIoSnafu, Result};
+use serde::Deserialize;
 use snafu::ResultExt;
-use spicepod::spec::SpicepodDefinition;
+use spicepod::spec::{SpicepodKind, SpicepodVersion};
 use std::path::{Path, PathBuf};
 use yaml::{Mapping, Value};
 
@@ -29,6 +30,13 @@ pub const SPICEPOD_YML: &str = "spicepod.yml";
 
 const SPICEPOD_FILENAMES: [&str; 2] = [SPICEPOD_YAML, SPICEPOD_YML];
 const SCHEMA_DIRECTIVE: &str = "# yaml-language-server: $schema=https://raw.githubusercontent.com/spiceai/spiceai/trunk/.schema/spicepod.schema.json";
+
+#[derive(Deserialize)]
+struct SpicepodManifestHeader {
+    name: String,
+    version: SpicepodVersion,
+    kind: SpicepodKind,
+}
 
 /// Returns the first existing root Spicepod manifest path, preferring `spicepod.yaml` over `spicepod.yml`.
 #[must_use]
@@ -95,7 +103,25 @@ pub fn write_spicepod_value(path: &Path, value: &Value) -> Result<()> {
             message: format!("Failed to serialize {}: {source}", path.display()),
         })?;
 
-    write_secure_file(path, updated_yaml.as_bytes())
+    ensure_parent_dir(path)?;
+    std::fs::write(path, updated_yaml.as_bytes()).context(ConfigIoSnafu {
+        operation: "write",
+        path: path.to_path_buf(),
+    })
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(parent).context(ConfigIoSnafu {
+        operation: "create directory",
+        path: parent.to_path_buf(),
+    })
 }
 
 /// Writes a file and restricts permissions to the owner on Unix platforms.
@@ -185,13 +211,18 @@ fn ensure_sequence_field<'value>(
         })
 }
 
-/// Validates that a YAML value can deserialize as a Spicepod definition.
+/// Validates the root manifest header without rejecting newer fields this CLI does not edit.
 fn validate_spicepod_value(value: &Value, path: &Path) -> Result<()> {
-    yaml::from_value::<SpicepodDefinition>(value.clone()).map_err(|source| {
+    let header = yaml::from_value::<SpicepodManifestHeader>(value.clone()).map_err(|source| {
         crate::error::Error::ConfigParse {
             message: format!("Failed to parse {}: {source}", path.display()),
         }
     })?;
+    let SpicepodManifestHeader {
+        name: _,
+        version: _,
+        kind: _,
+    } = header;
 
     Ok(())
 }
@@ -319,5 +350,48 @@ future_primitive:
                 .and_then(Value::as_str),
             Some("datasets/orders")
         );
+    }
+
+    #[test]
+    fn validates_header_without_rejecting_newer_fields() {
+        let value: Value = yaml::from_str(
+            r#"version: v2
+kind: Spicepod
+name: future_manifest
+runtime:
+  future_runtime_field: keep
+future_primitive:
+  keep: true
+"#,
+        )
+        .expect("future manifest should parse as YAML");
+
+        validate_spicepod_value(&value, Path::new("spicepod.yaml"))
+            .expect("newer fields should not block manifest edits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_spicepod_value_preserves_existing_manifest_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let spicepod_path = temp_dir.path().join(SPICEPOD_YAML);
+        std::fs::write(&spicepod_path, "version: v2\nkind: Spicepod\nname: perms\n")
+            .expect("spicepod.yaml should be written");
+        std::fs::set_permissions(&spicepod_path, std::fs::Permissions::from_mode(0o644))
+            .expect("permissions should be set");
+
+        let mut value = read_spicepod_value(&spicepod_path).expect("manifest should load");
+        ensure_string_sequence_item(&mut value, "dependencies", "spiceai/quickstart")
+            .expect("dependency should be added");
+        write_spicepod_value(&spicepod_path, &value).expect("manifest should be written");
+
+        let mode = std::fs::metadata(&spicepod_path)
+            .expect("metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
     }
 }
