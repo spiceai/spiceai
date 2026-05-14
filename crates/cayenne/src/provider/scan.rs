@@ -224,9 +224,15 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
     fn try_swapping_with_projection(
         &self,
-        _projection: &ProjectionExec,
+        projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(None)
+        self.inner
+            .try_swapping_with_projection(projection)
+            .map(|plan| {
+                plan.map(|plan| {
+                    Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>
+                })
+            })
     }
 
     fn gather_filters_for_pushdown(
@@ -281,6 +287,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::expressions::col;
 
     fn one_partition_plan() -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -325,6 +332,29 @@ mod tests {
             exec.repartitioned(4, &ConfigOptions::default())
                 .expect("repartition check should succeed")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn cayenne_exec_delegates_projection_swapping_to_inner_plan() {
+        let plan = one_partition_plan();
+        let projection_expr = col("id", &plan.schema()).expect("id column should exist");
+        let projection =
+            ProjectionExec::try_new(vec![(projection_expr, "id".to_string())], Arc::clone(&plan))
+                .expect("projection exec should be created");
+        let exec = CayenneAccelerationExec::new(plan);
+
+        let swapped = exec
+            .try_swapping_with_projection(&projection)
+            .expect("projection swap should be attempted")
+            .expect("inner plan should support projection swapping");
+
+        assert!(
+            swapped
+                .as_any()
+                .downcast_ref::<CayenneAccelerationExec>()
+                .is_some(),
+            "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
     }
 }

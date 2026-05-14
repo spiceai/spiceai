@@ -75,6 +75,7 @@ members = [
     "tools/spicepod-validator",
     "tools/spidapter",
     "tools/testoperator",
+    "tools/chbench-driver",
     "tools/parsley",
     "tools/pr-builds"
 ]

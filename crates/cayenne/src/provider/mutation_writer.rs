@@ -228,7 +228,11 @@ impl<'a> AppendMutationWriter<'a> {
                 .await?;
 
             self.table
-                .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
+                .insert_to_new_snapshot_with_sequence(
+                    prepared_stream,
+                    new_sequence,
+                    self.task_context.session_config().target_partitions(),
+                )
                 .await?
         } else {
             let target_size_bytes = self.context.target_file_size_bytes();
@@ -329,7 +333,12 @@ impl<'a> AppendMutationWriter<'a> {
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         let result = match self
             .table
-            .write_to_snapshot(stream, target_size_bytes, STAGING_DIR_NAME)
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                STAGING_DIR_NAME,
+                self.task_context.session_config().target_partitions(),
+            )
             .await
         {
             Ok(result) => result,

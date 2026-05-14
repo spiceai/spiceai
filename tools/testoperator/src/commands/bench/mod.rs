@@ -19,6 +19,7 @@ use crate::{
     args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper,
     wait_test_and_memory,
 };
+use chbench_driver::ChBenchDriver as _;
 use std::{
     path::Path,
     time::{Duration, Instant},
@@ -41,7 +42,10 @@ use test_framework::{
     utils::{observe_memory, recursively_get_dir_size},
 };
 
-fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::Result<()> {
+pub(crate) fn emit_acceleration_size_if_applicable(
+    app: &App,
+    app_path: &Path,
+) -> anyhow::Result<()> {
     // determine if any dataset has acceleration enabled with a file mode engine
     if !app.datasets.iter().any(|ds| {
         ds.acceleration.as_ref().is_some_and(|accel| {
@@ -69,6 +73,14 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
+
+    // For chbench, prepare the Postgres source database (schema + seed data) before starting spiced.
+    let query_set = args.load_query_set()?;
+    if query_set == test_framework::queries::QuerySet::ChBench {
+        let scale_factor = args.scale_factor.unwrap_or(1.0);
+        prepare_chbench_source(scale_factor, None).await?;
+    }
+
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let ready_wait_start = Instant::now();
 
@@ -90,7 +102,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let testoperator_commit_sha = git::get_commit_sha();
     let branch_name = git::get_branch_name();
 
-    let query_set = args.load_query_set()?;
     let benchmark_resource = Resource::builder_empty()
         .with_attributes(vec![
             KeyValue::new("service.name", "testoperator"),
@@ -134,12 +145,17 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     )
     .await?;
 
-    let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
+    let mut benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
-        .with_explain_plan_snapshot()
         .with_results_snapshot(snapshot_predicate)
-        .with_progress_bars(!args.common.disable_progress_bars)
-        .start()?;
+        .with_progress_bars(!args.common.disable_progress_bars);
+
+    if query_set != test_framework::queries::QuerySet::ChBench {
+        // Skip explain plan snapshot for CH-benCH
+        benchmark_test = benchmark_test.with_explain_plan_snapshot();
+    }
+
+    let benchmark_test = benchmark_test.start()?;
 
     let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
 
@@ -227,4 +243,76 @@ const DISABLED_SNAPSHOT_QUERIES: &[&str] = &[
 fn snapshot_predicate(query_name: &str) -> bool {
     (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q"))
         && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
+}
+
+/// Build CH-benCH Postgres source config from environment variables.
+///
+/// | Variable | Default |
+/// |----------|---------|
+/// | `CHBENCH_PG_HOST` | `127.0.0.1` |
+/// | `CHBENCH_PG_PORT` | `5432` |
+/// | `CHBENCH_PG_DB` | `chbench` |
+/// | `CHBENCH_PG_USER` | `bench` |
+/// | `CHBENCH_PG_PASS` | `bench` |
+fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceConfig> {
+    let mut source = chbench_driver::PostgresSourceConfig::default();
+    if let Ok(v) = std::env::var("CHBENCH_PG_HOST") {
+        source.host = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_PG_PORT") {
+        source.port = v.parse().map_err(|e| {
+            anyhow::anyhow!("CHBENCH_PG_PORT={v:?} is not a valid port number: {e}")
+        })?;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_PG_DB") {
+        source.db = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_PG_USER") {
+        source.user = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_PG_PASS") {
+        source.pass = v;
+    }
+    Ok(source)
+}
+
+/// Validate scale factor, build the CH-benCH config, connect to the source
+/// Postgres, create the schema and load seed data.
+///
+/// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
+/// `duration` overrides the default OLTP workload duration when set.
+pub(crate) async fn prepare_chbench_source(
+    scale_factor: f64,
+    duration: Option<Duration>,
+) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
+    if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
+        anyhow::bail!(
+            "CH-benCH --scale-factor must be a positive integer (>= 1), got {scale_factor}. \
+             Scale factor maps directly to TPC-C warehouse count."
+        );
+    }
+
+    // Scale factor is validated >= 1.0 and integer above, so the cast is safe.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let warehouses = scale_factor as usize;
+    let terminals = warehouses * 10;
+    let mut config = chbench_driver::ChBenchConfig {
+        warehouses,
+        terminals,
+        ..Default::default()
+    };
+    if let Some(d) = duration {
+        config.duration = d;
+    }
+
+    println!(
+        "Preparing chbench source (SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s))..."
+    );
+
+    let source = chbench_source_from_env()?;
+    let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
+    driver.prepare().await?;
+
+    println!("chbench source is ready");
+    Ok(driver)
 }

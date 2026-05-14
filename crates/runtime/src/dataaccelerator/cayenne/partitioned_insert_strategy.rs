@@ -259,13 +259,18 @@ impl DataSink for CayennePartitionedOverwriteSink {
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
         // Serialize cross-partition coordinators on this table so concurrent
         // coordinators on overlapping partition sets can't deadlock on
         // per-partition lock-acquisition order. Within this coordinator,
         // per-partition writer tasks run in parallel.
         let _coordinator_guard = self.coordinator_lock.lock().await;
+
+        // Each per-partition writer fan-outs across `target_partitions` Vortex
+        // file writers; the session config drives that count to match the
+        // rest of the query (see PR #10822).
+        let target_partitions = context.session_config().target_partitions();
 
         // Step 1: route each input batch to its partition's writer task.
         // On first-seen partition, spawn a `tokio::task` that calls
@@ -314,7 +319,7 @@ impl DataSink for CayennePartitionedOverwriteSink {
                         let stream: SendableRecordBatchStream = Box::pin(
                             RecordBatchStreamAdapter::new(schema_clone, ReceiverStream::new(rx)),
                         );
-                        cayenne_owned.begin_overwrite(stream).await
+                        cayenne_owned.begin_overwrite(stream, target_partitions).await
                     });
                     senders.insert(key.clone(), tx.clone());
                     handles.push(handle);
@@ -640,9 +645,11 @@ impl DataSink for CayennePartitionedAppendSink {
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
         let _coordinator_guard = self.coordinator_lock.lock().await;
+
+        let target_partitions = context.session_config().target_partitions();
 
         // Phase 1: fan input out to per-partition writer tasks that each call
         // begin_staged_append → prepare (writes the per-partition staging
@@ -689,7 +696,9 @@ impl DataSink for CayennePartitionedAppendSink {
                                     schema_clone,
                                     ReceiverStream::new(rx),
                                 ));
-                            let staged = cayenne_owned.begin_staged_append(stream).await?;
+                            let staged = cayenne_owned
+                                .begin_staged_append(stream, target_partitions)
+                                .await?;
                             staged.prepare().await
                         });
                     senders.insert(key.clone(), tx.clone());

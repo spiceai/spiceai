@@ -3565,6 +3565,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "chbench-driver"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "rand 0.10.1",
+ "snafu",
+ "tokio",
+ "tokio-postgres",
+ "tokio-util",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4097,15 +4110,22 @@ dependencies = [
 name = "connector-mongodb"
 version = "2.0.0-unstable"
 dependencies = [
+ "async-stream",
  "async-trait",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
+ "fundu",
+ "futures",
  "linkme",
+ "mongodb",
  "paste",
  "runtime",
  "secrecy",
+ "serde_json",
  "snafu",
+ "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -5364,6 +5384,7 @@ dependencies = [
  "insta",
  "logos",
  "mailparse",
+ "mongodb",
  "mysql_async",
  "native-tls",
  "num_cpus",
@@ -15924,6 +15945,7 @@ dependencies = [
  "datafusion-datasource",
  "datafusion-federation",
  "datafusion-optimizer-rules",
+ "datafusion-pruning",
  "datafusion-table-providers",
  "futures",
  "globset",
@@ -18957,6 +18979,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-dynamodb",
  "bollard",
+ "chbench-driver",
  "clap",
  "duckdb",
  "futures",

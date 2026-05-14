@@ -157,7 +157,7 @@ async fn cross_partition_overwrite_commits_atomically() {
             &["a", "b"],
         ));
         let prep = table
-            .begin_overwrite(stream)
+            .begin_overwrite(stream, 1)
             .await
             .expect("begin_overwrite");
         prepared.push(prep);
@@ -208,7 +208,7 @@ async fn cross_partition_overwrite_rolls_back_atomically() {
             &["x", "y"],
         ));
         let prep = table
-            .begin_overwrite(stream)
+            .begin_overwrite(stream, 1)
             .await
             .expect("begin_overwrite");
         prepared.push(prep);
@@ -261,7 +261,7 @@ async fn cross_partition_overwrite_aborts_on_apply_failure() {
             &["p", "q"],
         ));
         let prep = table
-            .begin_overwrite(stream)
+            .begin_overwrite(stream, 1)
             .await
             .expect("begin_overwrite");
         prepared.push(prep);
@@ -349,7 +349,7 @@ async fn streaming_overwrite_handles_many_batches_per_partition() {
                 schema,
                 ReceiverStream::new(rx),
             ));
-            table_clone.begin_overwrite(stream).await
+            table_clone.begin_overwrite(stream, 1).await
         });
 
         // Producer: push many batches, one at a time. The `.await` here is
@@ -428,7 +428,7 @@ async fn cross_partition_append_commits_atomically_under_barrier() {
     // visible as additions.
     for (i, table) in setup.tables.iter().enumerate() {
         let stream = batch_to_stream(make_batch(&[i as i64 * 10], &["seed"]));
-        let prep = table.begin_overwrite(stream).await.expect("seed overwrite");
+        let prep = table.begin_overwrite(stream, 1).await.expect("seed overwrite");
         prep.apply_owned_txn().await.expect("apply seed");
         prep.finish().await.expect("finish seed");
     }
@@ -444,7 +444,7 @@ async fn cross_partition_append_commits_atomically_under_barrier() {
                 schema,
                 ReceiverStream::new(rx),
             ));
-            let staged = table_clone.begin_staged_append(stream).await?;
+            let staged = table_clone.begin_staged_append(stream, 1).await?;
             staged.prepare().await
         });
 
@@ -549,7 +549,7 @@ async fn mid_barrier_failure_leaves_top_level_wal() {
                 schema,
                 ReceiverStream::new(rx),
             ));
-            let staged = table_clone.begin_staged_append(stream).await?;
+            let staged = table_clone.begin_staged_append(stream, 1).await?;
             staged.prepare().await
         });
         let base = (i * 100) as i64;

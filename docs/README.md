@@ -98,15 +98,16 @@ The project docs for contributors and community. For user documentation of the S
 - [DuckDB Index Scan Settings](features/duckdb_index_scan_settings.md)
 - [GCS Connector](features/gcs-connector.md)
 - [Git Connector](features/git-connector.md)
+- [MongoDB Change Streams](features/mongodb-change-streams.md)
 - [Postgres Replication](features/postgres-replication.md)
 - [Schema Decomposition](features/schema-decomposition.md)
 
 ## Threat Models
 
-- [v1.9.2](threat_models/v1.9.2.md)
-- [v2.0.0](threat_models/v2.0.0.md)
 - [v0.17.4-beta JSON](threat_models/v0.17.4-beta.json)
 - [v1.9.1 JSON](threat_models/v1.9.1.json)
+- [v1.9.2](threat_models/v1.9.2.md)
+- [v2.0.0](threat_models/v2.0.0.md)
 
 ## Release Notes
 

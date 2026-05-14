@@ -163,7 +163,7 @@ impl DataSink for CayenneDataSink {
             // table write lock internally and the lock is held inside the
             // returned `PreparedOverwrite` until `finish`/`rollback`. Acquiring
             // it again here would deadlock.
-            self.write_all_overwrite(normalized)
+            self.write_all_overwrite(normalized, context)
                 .await
                 .map_err(Into::into)
         } else {
@@ -214,7 +214,8 @@ impl CayenneDataSink {
     ///
     /// 1. [`begin_overwrite`] writes the input stream to a fresh
     ///    `<table_id>/<new_snapshot>/` directory and acquires the table write
-    ///    lock.
+    ///    lock. `target_partitions` is sourced from the session config so the
+    ///    underlying parallel-writer fan-out matches the rest of the query.
     /// 2. [`PreparedOverwrite::apply_owned_txn`] flips the catalog pointer
     ///    via the trait-based `commit_compaction` (own transaction, with
     ///    retry-on-conflict), preserving exact pre-issue-#10125 retry
@@ -227,8 +228,13 @@ impl CayenneDataSink {
     /// `PreparedOverwrite` handle and call
     /// [`PreparedOverwrite::apply_in_txn`] inside one shared transaction
     /// so every participating partition's pointer flip is atomic.
-    async fn write_all_overwrite(&self, data: SendableRecordBatchStream) -> super::Result<u64> {
-        let prepared = self.table.begin_overwrite(data).await?;
+    async fn write_all_overwrite(
+        &self,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> super::Result<u64> {
+        let target_partitions = context.session_config().target_partitions();
+        let prepared = self.table.begin_overwrite(data, target_partitions).await?;
         prepared
             .apply_owned_txn()
             .await
@@ -236,3 +242,4 @@ impl CayenneDataSink {
         prepared.finish().await
     }
 }
+

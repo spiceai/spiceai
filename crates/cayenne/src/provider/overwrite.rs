@@ -226,6 +226,12 @@ impl PreparedOverwrite {
                 "Failed to clear table statistics after overwrite for table {}: {e}",
                 self.table.table_name()
             );
+        } else {
+            // Invalidate the in-memory optimizer cache before persisting new
+            // stats so a zero-row overwrite leaves the cache empty rather
+            // than stale; `persist_table_stats` repopulates it when the
+            // accumulator has rows.
+            self.table.clear_cached_table_statistics();
         }
         self.table.persist_table_stats(&self.write_stats_acc).await;
 
@@ -297,6 +303,7 @@ impl CayenneTableProvider {
     pub async fn begin_overwrite(
         &self,
         data: SendableRecordBatchStream,
+        target_partitions: usize,
     ) -> Result<PreparedOverwrite> {
         let write_guard = self.write_lock_arc().lock_owned().await;
 
@@ -310,7 +317,7 @@ impl CayenneTableProvider {
 
         let target_size_bytes = self.target_file_size_bytes();
         let (row_count, _files_written, write_stats_acc) = self
-            .write_to_snapshot(data, target_size_bytes, &new_snapshot_id)
+            .write_to_snapshot(data, target_size_bytes, &new_snapshot_id, target_partitions)
             .await?;
 
         if !is_s3 {

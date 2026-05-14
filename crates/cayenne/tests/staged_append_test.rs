@@ -736,5 +736,5 @@ async fn begin_staged_append_with_rows(
         schema,
         futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
     ));
-    Ok(table.begin_staged_append(stream).await?)
+    Ok(table.begin_staged_append(stream, 1).await?)
 }
