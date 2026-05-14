@@ -367,6 +367,7 @@ scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
 sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint"]
 smb = ["runtime-object-store/smb"]
+client_tls = []
 snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [
     "dep:snowflake-api",

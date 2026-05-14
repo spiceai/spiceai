@@ -498,6 +498,15 @@ pub(crate) fn routes(
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 
+    // mTLS route gate. Wired onto the authenticated router *before* the
+    // unauthenticated `/health` and `/v1/ready` are merged in, so probe
+    // routes bypass the gate by construction. Under `client_auth: required`
+    // the HTTP listener admits no-cert handshakes (so probes work over
+    // TLS without mounting a probe certificate); this layer 401s any
+    // non-probe request whose connection presented no verified peer cert.
+    authenticated_router = authenticated_router
+        .route_layer(middleware::from_fn(super::mtls::require_channel_identity));
+
     let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/ready", get(v1::ready::get))
@@ -506,6 +515,7 @@ pub(crate) fn routes(
 
     unauthenticated_router
         .merge(authenticated_router)
+        .route_layer(middleware::from_fn(super::mtls::mtls_request_layer))
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&rt.df),

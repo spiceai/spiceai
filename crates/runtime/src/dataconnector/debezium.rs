@@ -284,14 +284,6 @@ impl DataConnector for Debezium {
             unreachable!("Dataset acceleration already verified. This should never be None here.");
         };
         ensure!(
-            acceleration.engine != Engine::Arrow,
-            super::InvalidConfigurationNoSourceSnafu {
-                dataconnector: "debezium",
-                message: "The Debezium data connector does not support the Arrow acceleration engine. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
-                connector_component: ConnectorComponent::from(dataset),
-            }
-        );
-        ensure!(
             self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
@@ -369,6 +361,23 @@ impl DataConnector for Debezium {
             }
             None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
         };
+
+        ensure!(
+            !metadata.primary_keys.is_empty()
+                || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
+            super::InvalidConfigurationNoSourceSnafu {
+                dataconnector: "debezium",
+                message: "The Debezium data connector requires Kafka message keys for accelerators other than Arrow. Configure a primary key or message.key.columns in Debezium, or use the Arrow acceleration engine for full-row CDC matching with full before images for keyless updates and deletes. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                connector_component: ConnectorComponent::from(dataset),
+            }
+        );
+
+        if metadata.primary_keys.is_empty() {
+            tracing::warn!(
+                dataset = %dataset_name,
+                "Debezium messages do not include primary keys; Arrow acceleration will apply deletes and updates by matching full row values, which requires Debezium full before images for keyless updates and deletes"
+            );
+        }
 
         let refresh_sql = dataset.refresh_sql();
         let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
@@ -501,23 +510,10 @@ async fn get_metadata_from_kafka(
         }
     };
 
-    let Some(key) = msg.key() else {
-        let src = &msg.value().payload.source;
-        let table_name = format!("{}.{}", src.db, src.table);
-
-        return Err(super::DataConnectorError::UnableToGetReadProvider {
-            dataconnector: "debezium".to_string(),
-            source: format!(
-                "CDC message key is missing. \
-         Most likely, table \"{table_name}\" doesn't have a configured primary key. \
-         Verify Debezium CDC configuration and try again."
-            )
-            .into(),
-            connector_component: ConnectorComponent::from(dataset),
-        });
-    };
-
-    let primary_keys = key.get_primary_key();
+    let primary_keys = msg
+        .key()
+        .map(ChangeEventKey::get_primary_key)
+        .unwrap_or_default();
 
     let Some(schema_fields) = msg.value().get_schema_fields() else {
         return Err(super::DataConnectorError::UnableToGetReadProvider {

@@ -215,6 +215,7 @@ impl RuntimeBuilder {
         let query = spicepod_rt.query.clone().unwrap_or_default();
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
+        let target_partitions = query.target_partitions;
 
         let metrics = spicepod_rt.metrics.clone();
 
@@ -373,6 +374,7 @@ impl RuntimeBuilder {
             io_runtime.clone(),
         )
         .memory_limit(memory_limit)
+        .target_partitions(target_partitions)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)

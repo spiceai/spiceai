@@ -28,6 +28,7 @@ url.workspace = true
 yaml = { path = "../yaml" }
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio.workspace = true
 
 [features]

@@ -1975,7 +1975,13 @@ jobs:
           killall spice || true
           pkill -f simulate_append_data || true
           cat spice.log
-          if grep -iE "(failed|error)" spice.log; then
+          # `simulate_append_data.sh` rewrites `.spice/service_data.parquet`
+          # every 3s; a refresh tick that races the rename observes a
+          # half-published file and the runtime logs a WARN before
+          # retrying on the next tick. Tolerate that specific transient.
+          if grep -iE "(failed|error)" spice.log \
+             | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
+             | grep -vE "^Invalid Error: TProtocolException: Invalid data$"; then
             echo "Failures detected in spice.log"
             exit 1
           fi
@@ -2009,7 +2015,11 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
-          if grep -iE "(failed|error)" spice.log; then
+          # See note above: tolerate transient parquet-rename races emitted
+          # at WARN level by the refresh task.
+          if grep -iE "(failed|error)" spice.log \
+             | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
+             | grep -vE "^Invalid Error: TProtocolException: Invalid data$"; then
             echo "Failures detected in spice.log"
             exit 1
           fi

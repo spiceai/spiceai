@@ -121,18 +121,18 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "8dbb88b
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.89"
-aws-config = "1.8.15"
+aws-config = "1.8.16"
 aws-credential-types = "1.2.13"
 aws-runtime = "1.7.1"
-aws-sdk-bedrockruntime = "1.129.0"
-aws-sdk-cognitoidentity = "1.98.0"
-aws-sdk-cognitoidentityprovider = "1.114.0"
-aws-sdk-dynamodb = "1.110.0"
-aws-sdk-dynamodbstreams = "1.98.0"
-aws-sdk-glue = "1.142.1"
-aws-sdk-s3 = "1.129.0"
-aws-sdk-s3vectors = "1.23.0"
-aws-sdk-secretsmanager = "1.103.0"
+aws-sdk-bedrockruntime = "1.130.0"
+aws-sdk-cognitoidentity = "1.99.0"
+aws-sdk-cognitoidentityprovider = "1.116.0"
+aws-sdk-dynamodb = "1.111.0"
+aws-sdk-dynamodbstreams = "1.99.0"
+aws-sdk-glue = "1.145.0"
+aws-sdk-s3 = "1.132.0"
+aws-sdk-s3vectors = "1.24.0"
+aws-sdk-secretsmanager = "1.104.0"
 aws-sdk-sts = "1.102.0"
 aws-smithy-async = "1.2.14"
 aws-smithy-runtime = "1.11.1"
@@ -193,7 +193,7 @@ delta_kernel = { version = "0.18.2", features = [
 derive_builder = "0.20.2"
 dotenvy = "0.15"
 duration-parse = { path = "crates/duration-parse" }
-duckdb = "1.4.4"
+duckdb = "1.10502" # 1.10502.x corresponds to DuckDB v1.5.2
 dyn-hash = "1.0.0"
 fallible-iterator = "0.3.0"
 fundu = "2.0.1"
@@ -344,6 +344,7 @@ tonic = { version = "0.14", features = [
     "gzip",
     "tls-ring",
     "tls-native-roots",
+    "tls-connect-info",
 ] }
 tonic-health = { version = "0.14" }
 tower = "0.5.2"
@@ -444,7 +445,7 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "81e86bbc1588dc53d0ee7b29bccf8f7a5ac009be" } # spiceai-52
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b798c391b6566c172d44361f8acc8472c958ca75" } # spiceai-52
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "383e165a080d648c313a2530a3a53eae6077fdba" }      # spiceai-52.5
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "383e165a080d648c313a2530a3a53eae6077fdba" } # spiceai-52.5
@@ -453,7 +454,7 @@ ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # spiceai-0.18.2
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f4096c7592ed46b9e68755a49252d69783dece96" } # spiceai-1.4.4
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "119fc5df0568fa165154697eb9c6a302938fe848" } # spiceai-1.5.2
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113

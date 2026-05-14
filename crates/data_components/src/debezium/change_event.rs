@@ -94,7 +94,7 @@ impl ChangeEvent {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum Op {
     #[serde(rename = "c")]
     Create,
