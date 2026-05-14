@@ -240,17 +240,6 @@ impl RuntimeBuilder {
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
-        // Resolve CDC tunables once at startup so the per-envelope hot path
-        // doesn't pay map lookup or spicepod-traversal cost. Reads
-        // `cdc_*` knobs from `runtime.params`; missing or rejected values
-        // fall back to the matching `SPICE_CDC_*` env var, then to defaults,
-        // with a warning for rejected explicit values.
-        crate::accelerated_table::refresh_task::changes::set_cdc_config(
-            crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
-                &spicepod_rt.params,
-            ),
-        );
-
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
         let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));

@@ -65,7 +65,7 @@ use tokio::sync::{Notify, RwLock};
 /// }
 /// ```
 macro_rules! extract_primary_key {
-    ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr) => {{
+    ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr, $row:expr) => {{
         let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
             crate::accelerated_table::PrimaryKeyArrayDataTypeMismatchSnafu {
                 field_name: $key.to_string(),
@@ -73,13 +73,13 @@ macro_rules! extract_primary_key {
                 schema: Arc::clone(&$data_schema),
             },
         )?;
-        if key_col.is_null(0) {
+        if key_col.is_null($row) {
             return crate::accelerated_table::PrimaryKeyNullValueSnafu {
                 field_name: $key.to_string(),
             }
             .fail();
         }
-        Ok((key_col.value(0).to_string(), lit(key_col.value(0))))
+        Ok((key_col.value($row).to_string(), lit(key_col.value($row))))
     }};
 }
 
@@ -532,8 +532,17 @@ async fn perform_change_write_maintenance(
         .context(crate::accelerated_table::FailedToWriteDataSnafu)
 }
 
+#[cfg(test)]
 pub(crate) fn get_primary_key_value(
     data: &RecordBatch,
+    key: &str,
+) -> crate::accelerated_table::Result<(String, Expr)> {
+    get_primary_key_value_at_row(data, 0, key)
+}
+
+pub(crate) fn get_primary_key_value_at_row(
+    data: &RecordBatch,
+    row: usize,
     key: &str,
 ) -> crate::accelerated_table::Result<(String, Expr)> {
     let data_schema = data.schema();
@@ -548,13 +557,13 @@ pub(crate) fn get_primary_key_value(
     let key_col = data.column(primary_key_idx);
     match field.data_type() {
         DataType::Int32 => {
-            extract_primary_key!(key_col, key, data_schema, Int32Array, "Int32")
+            extract_primary_key!(key_col, key, data_schema, Int32Array, "Int32", row)
         }
         DataType::Int64 => {
-            extract_primary_key!(key_col, key, data_schema, Int64Array, "Int64")
+            extract_primary_key!(key_col, key, data_schema, Int64Array, "Int64", row)
         }
         DataType::Utf8 => {
-            extract_primary_key!(key_col, key, data_schema, StringArray, "String")
+            extract_primary_key!(key_col, key, data_schema, StringArray, "String", row)
         }
         _ => crate::accelerated_table::PrimaryKeyTypeNotYetSupportedSnafu {
             data_type: field.data_type().to_string(),
