@@ -269,14 +269,6 @@ impl CloudClient {
             .map_err(into_cli)
     }
 
-    pub async fn rollback(&self, org_app: &str, target_deployment_id: i64) -> Result<Deployment> {
-        let app = self.get_app(org_app).await?;
-        self.inner
-            .rollback(app.id, target_deployment_id)
-            .await
-            .map_err(into_cli)
-    }
-
     // ========================================================================
     // Regions & Images
     // ========================================================================
@@ -374,12 +366,12 @@ fn get_auth_token() -> Result<String> {
     }
 
     // 2. Try platform keychain
-    if let Ok(entry) = keyring::Entry::new("SPICE_SPICEAI_TOKEN", "spice")
-        && let Ok(token) = entry.get_password()
-        && !token.is_empty()
-    {
-        return Ok(token);
-    }
+    // if let Ok(entry) = keyring::Entry::new("SPICE_SPICEAI_TOKEN", "spice")
+    //     && let Ok(token) = entry.get_password()
+    //     && !token.is_empty()
+    // {
+    //     return Ok(token);
+    // }
 
     // 3. Try .env.local first, then .env
     let env_file = if std::path::Path::new(".env.local").exists() {
