@@ -1,0 +1,15 @@
+[package]
+name = "chbench-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio-postgres = { workspace = true }
+tokio-util = { workspace = true }
