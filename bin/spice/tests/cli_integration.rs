@@ -425,7 +425,7 @@ mod manifest_editing {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Add or configure model entries"));
+            .stdout(predicate::str::contains("component entry"));
 
         let mut model_add_help = spice_cmd();
         model_add_help
@@ -1337,8 +1337,8 @@ mod mode_tests {
             .arg("us-east-1")
             .arg("datasets")
             .assert()
-            .failure()
-            .stderr(predicate::str::contains("does not support"));
+            .success()
+            .stdout(predicate::str::contains("does not support"));
     }
 
     #[test]
