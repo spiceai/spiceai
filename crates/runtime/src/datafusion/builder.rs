@@ -633,8 +633,13 @@ fn insert_cayenne_logical_optimizer_rule(rules: &mut Vec<Arc<dyn OptimizerRule +
 
     let insert_at = rules
         .iter()
-        .position(|rule| rule.name() == "push_down_filter")
-        .unwrap_or(rules.len());
+        .position(|rule| rule.name() == "decorrelate_predicate_subquery")
+        .unwrap_or_else(|| {
+            rules
+                .iter()
+                .position(|rule| rule.name() == "push_down_filter")
+                .unwrap_or(rules.len())
+        });
     rules.insert(
         insert_at,
         Arc::new(CayennePropagateFilterAcrossEquiJoinKeys::new()),
@@ -819,6 +824,8 @@ mod tests {
     };
     #[cfg(not(windows))]
     use cayenne::provider::CayenneAccelerationExec;
+    #[cfg(not(windows))]
+    use datafusion::catalog::MemTable;
     use datafusion::optimizer::Analyzer;
     #[cfg(not(windows))]
     use datafusion::{
@@ -958,7 +965,7 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn test_built_datafusion_registers_cayenne_logical_rule_before_push_down_filter() {
+    fn test_built_datafusion_registers_cayenne_logical_rule_before_subquery_decorrelation() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -978,14 +985,22 @@ mod tests {
             .iter()
             .position(|name| *name == "cayenne_propagate_filter_across_equi_join_keys")
             .expect("Cayenne logical filter propagation rule should be registered");
+        let decorrelate_position = rule_names
+            .iter()
+            .position(|name| *name == "decorrelate_predicate_subquery")
+            .expect("DataFusion decorrelate_predicate_subquery rule should be registered");
         let push_down_position = rule_names
             .iter()
             .position(|name| *name == "push_down_filter")
             .expect("DataFusion push_down_filter rule should be registered");
 
         assert!(
-            cayenne_position < push_down_position,
-            "Cayenne logical filter propagation must run before push_down_filter so derived predicates can be pushed into scans"
+            cayenne_position < decorrelate_position,
+            "Cayenne logical filter propagation must run before decorrelate_predicate_subquery so generated InSubquery predicates cannot reach physical planning"
+        );
+        assert!(
+            decorrelate_position < push_down_position,
+            "DataFusion decorrelate_predicate_subquery must run before push_down_filter"
         );
         assert_eq!(
             rule_names
@@ -995,6 +1010,77 @@ mod tests {
             1,
             "Cayenne logical filter propagation rule should be registered exactly once"
         );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_decorrelates_cayenne_propagated_subquery() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        rt.block_on(async {
+            let nation_schema = Arc::new(Schema::new(vec![
+                Field::new("n_nationkey", DataType::Int64, false),
+                Field::new("n_name", DataType::Utf8, true),
+            ]));
+            let supplier_schema = Arc::new(Schema::new(vec![
+                Field::new("s_suppkey", DataType::Int64, false),
+                Field::new("s_nationkey", DataType::Int64, false),
+            ]));
+
+            df.ctx
+                .register_table(
+                    "nation",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&nation_schema), vec![vec![]])
+                            .expect("nation mem table should be valid"),
+                    ),
+                )
+                .expect("nation table should register");
+            df.ctx
+                .register_table(
+                    "supplier",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&supplier_schema), vec![vec![]])
+                            .expect("supplier mem table should be valid"),
+                    ),
+                )
+                .expect("supplier table should register");
+
+            let dataframe = df
+                .ctx
+                .sql(
+                    "SELECT s_suppkey FROM supplier, nation \
+                     WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+                )
+                .await
+                .expect("q21-shaped query should create a dataframe");
+            let optimized_plan = dataframe
+                .clone()
+                .into_optimized_plan()
+                .expect("q21-shaped query should optimize");
+            let optimized_plan = optimized_plan.to_string();
+
+            assert!(
+                !optimized_plan.contains("InSubquery"),
+                "Cayenne propagated subqueries must be decorrelated before physical planning: {optimized_plan}"
+            );
+
+            dataframe
+                .create_physical_plan()
+                .await
+                .expect("q21-shaped query should create a physical plan");
+        });
     }
 
     /// Cayenne rewrites `HashJoinExec` to use a custom accumulator type, so it
