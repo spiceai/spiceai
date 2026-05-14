@@ -45,6 +45,7 @@ use runtime_request_context::RequestContext;
 use snafu::Snafu;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, Span};
 
 /// Default max message size (16MB matches typical default).
 const MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -157,6 +158,25 @@ pub struct QueryHandle {
     tracker: Arc<Mutex<Option<QueryTracker>>>,
     /// Request context for tracking and metrics.
     request_context: Arc<RequestContext>,
+    /// `task_history` span covering the lifetime of this distributed query.
+    /// Created at submission and held in a slot shared by every clone so it
+    /// can be **taken** at finalization. The span moves into the spawned
+    /// finalize future via `.instrument(span)`; once that future ends the
+    /// span has no surviving clones and the OTel layer closes it, emitting
+    /// the `task_history` row.
+    ///
+    /// Storing the span behind an `Option` (rather than as a plain field)
+    /// is what keeps `execution_duration_ms` honest: if every clone of
+    /// `QueryHandle` retained its own clone of the span, the OTel span
+    /// would stay open until the *last* handle was dropped — which can be
+    /// long after the Ballista job finished — and the duration column
+    /// would include arbitrary post-completion handle lifetime. Taking
+    /// here means the span closes at finalization (success, failure, or
+    /// `Drop`-orphan), not at handle-drop.
+    ///
+    /// Mutex + `Option::take` also gives us idempotent finalization: only
+    /// the first call gets the span; later attempts see `None` and skip.
+    task_history_span: Arc<Mutex<Option<Span>>>,
 }
 
 impl std::fmt::Debug for QueryHandle {
@@ -188,6 +208,7 @@ impl QueryHandle {
         cache_key: Option<RawCacheKey>,
         tracker: Option<QueryTracker>,
         request_context: Arc<RequestContext>,
+        task_history_span: Span,
     ) -> Self {
         Self {
             ballista_job_id,
@@ -199,6 +220,7 @@ impl QueryHandle {
             cancel_token: CancellationToken::new(),
             tracker: Arc::new(Mutex::new(tracker)),
             request_context,
+            task_history_span: Arc::new(Mutex::new(Some(task_history_span))),
         }
     }
 
@@ -227,6 +249,7 @@ impl QueryHandle {
             cancel_token: CancellationToken::new(),
             tracker: Arc::new(Mutex::new(None)),
             request_context,
+            task_history_span: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -297,6 +320,14 @@ impl QueryHandle {
     ///
     /// Signals the cancellation token and requests cancellation from the Ballista scheduler.
     /// For cached results, this is a no-op since there's no job to cancel.
+    ///
+    /// Also finalizes the `task_history` row with `JobCancelled` error so
+    /// the recorded `error_message` reflects an explicit user cancel — not
+    /// the `Drop` guard's "client disconnected before completion" — when
+    /// callers `cancel()` and then drop the handle without ever draining
+    /// the result stream. `finish_tracker_with_error` is a no-op if some
+    /// other terminal path (e.g., `wait_for_complete` reacting to the
+    /// cancel token) raced ahead and already finalized.
     pub async fn cancel(&self) -> Result<()> {
         self.cancel_token.cancel();
 
@@ -308,6 +339,7 @@ impl QueryHandle {
                     message: format!("Failed to cancel job: {e}"),
                 })?;
         }
+        self.finish_tracker_with_error(&QueryHandleError::JobCancelled);
         Ok(())
     }
 
@@ -571,6 +603,12 @@ impl QueryHandle {
     }
 
     /// Finishes the query tracker with an error.
+    ///
+    /// Tracker `finish_with_error` emits `tracing::info!(target: "task_history",
+    /// ...)` events that attach to the *current* span. We enter
+    /// `task_history_span` first so the events land on the `sql_query` row for
+    /// this distributed job rather than whatever ambient span the polling
+    /// future happens to be running under.
     fn finish_tracker_with_error(&self, error: &QueryHandleError) {
         if let Some(tracker) = self.tracker.lock().take() {
             let error_code = match error {
@@ -581,15 +619,139 @@ impl QueryHandle {
                 | QueryHandleError::PartitionLocationError { .. }
                 | QueryHandleError::JobNotFound { .. } => ErrorCode::InternalError,
             };
-            tracker.finish_with_error(&self.request_context, error.to_string(), error_code);
+            self.spawn_finalize(tracker, Some((error.to_string(), error_code)), false);
         }
     }
 
     /// Finishes the query tracker successfully.
     fn finish_tracker_success(&self) {
         if let Some(tracker) = self.tracker.lock().take() {
-            tracker.finish(&self.request_context, &Arc::from(""));
+            self.spawn_finalize(tracker, None, false);
         }
+    }
+
+    /// Finalize the parent `sql_query` `task_history` row plus per-stage child
+    /// rows.
+    ///
+    /// **Span ownership**: the parent span is *taken* out of the shared
+    /// slot here, not cloned. The taken span moves into the spawned
+    /// finalize future via `.instrument(span)`; once that future ends and
+    /// any extra clones the future held drop, the OTel layer closes the
+    /// span. Because no surviving `QueryHandle` clone retains the span
+    /// after `spawn_finalize` runs, `execution_duration_ms` reflects the
+    /// query's runtime, not arbitrary post-completion handle lifetime.
+    /// `Option::take` also makes finalization idempotent.
+    ///
+    /// **Cancel-on-orphan**: `request_cancel = true` triggers
+    /// `scheduler.cancel_job(...)` from inside the spawned task before
+    /// recording the row. Set this from the `Drop` guard so a handle that
+    /// goes out of scope without the result stream being drained doesn't
+    /// leave the scheduler/executors running an unobserved job. Idempotent
+    /// w.r.t. the scheduler's own cancel handling.
+    ///
+    /// **No runtime fallback**: if `Drop` fires outside any tokio context,
+    /// finalize synchronously without stage detail — the parent row still
+    /// gets correct duration and error_message; stage children are skipped.
+    fn spawn_finalize(
+        &self,
+        tracker: QueryTracker,
+        error: Option<(String, ErrorCode)>,
+        request_cancel: bool,
+    ) {
+        // Take the span so the only surviving clones are inside the
+        // spawned future. When the future completes, those clones drop
+        // and the OTel span closes — capturing the *query* duration, not
+        // a handle-lifetime duration.
+        let Some(parent_span) = self.task_history_span.lock().take() else {
+            // Already finalized by an earlier path; nothing to do.
+            return;
+        };
+
+        let request_context = Arc::clone(&self.request_context);
+        let scheduler = match &self.state {
+            QueryHandleState::Running { scheduler } => Some(Arc::clone(scheduler)),
+            QueryHandleState::Cached { .. } => None,
+        };
+        let ballista_job_id = self.ballista_job_id.clone();
+
+        let Some(scheduler) = scheduler else {
+            // Cached path — nothing to walk. Synchronous finalize is fine
+            // because there's no async fetch to do. The span drops at
+            // end-of-scope here, closing the OTel span immediately.
+            parent_span.in_scope(|| match error {
+                Some((msg, code)) => tracker.finish_with_error(&request_context, msg, code),
+                None => tracker.finish(&request_context, &Arc::from("")),
+            });
+            return;
+        };
+
+        let job_id = self.ballista_job_id.clone();
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                // No tokio runtime here (likely Drop on a non-runtime
+                // thread). Finalize the parent without stage detail or
+                // job cancellation rather than `block_on`'ing into a
+                // private API.
+                parent_span.in_scope(|| match error {
+                    Some((msg, code)) => tracker.finish_with_error(&request_context, msg, code),
+                    None => tracker.finish(&request_context, &Arc::from("")),
+                });
+                return;
+            }
+        };
+
+        // `.instrument(parent_span)` enters the span on every poll of
+        // the spawned future. Production sets the OTel subscriber as
+        // the *global* default (`bin/spiced/src/tracing.rs`), so the
+        // spawned task — even on a fresh tokio worker thread — picks
+        // it up automatically and child `ballista_stage` spans created
+        // inside attribute to the correct subscriber. Integration
+        // tests that rely on `set_default` (thread-local) must
+        // explicitly propagate the dispatcher through the test future
+        // (see `crates/runtime/tests/cluster/distributed_task_history.rs`).
+        let span_for_record = parent_span.clone();
+        let scheduler_for_cancel = Arc::clone(&scheduler);
+        let cancel_job_id = job_id.clone();
+        handle.spawn(
+            async move {
+                if request_cancel {
+                    // Best-effort: tell the scheduler to stop running this
+                    // job. The scheduler treats `cancel_job` as idempotent
+                    // so a concurrent path (e.g. `wait_for_complete`
+                    // reacting to `cancel_token`) cancelling first is OK.
+                    if let Err(e) =
+                        scheduler_for_cancel.cancel_job(cancel_job_id.clone()).await
+                    {
+                        tracing::warn!(
+                            target: "task_history",
+                            "Failed to cancel Ballista job {cancel_job_id} during orphaned-handle finalize: {e}"
+                        );
+                    }
+                }
+                let graph = scheduler
+                    .state
+                    .task_manager
+                    .get_job_execution_graph(&job_id)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(graph) = graph.as_ref() {
+                    crate::datafusion::query::stage_history::record_stage_history(
+                        &span_for_record,
+                        &ballista_job_id,
+                        graph.as_ref(),
+                    );
+                }
+                match error {
+                    Some((msg, code)) => {
+                        tracker.finish_with_error(&request_context, msg, code)
+                    }
+                    None => tracker.finish(&request_context, &Arc::from("")),
+                }
+            }
+            .instrument(parent_span),
+        );
     }
 
     /// Waits for the job to complete and returns a stream of result batches.
@@ -660,6 +822,43 @@ impl QueryHandle {
         } else {
             Box::pin(stream)
         }
+    }
+}
+
+/// Finalizes an orphaned tracker when the last `QueryHandle` clone is dropped
+/// without the job having reached terminal state through the normal path
+/// (e.g., client disconnected before draining the result stream). Without
+/// this, the `task_history` row would have empty duration and no error,
+/// and the scheduler/executors would keep running an unobserved job.
+///
+/// The `Arc::strong_count == 1` check ensures only the *last* clone runs
+/// finalization — intermediate clones being dropped while other clones still
+/// hold the tracker must not finalize it. The `lock().take()` ensures
+/// finalization happens at most once even if a race were possible.
+///
+/// We trigger `cancel_token` synchronously so any in-flight
+/// `wait_for_complete` future bails out, *and* pass `request_cancel = true`
+/// to `spawn_finalize` so the spawned async task calls
+/// `scheduler.cancel_job(...)` directly — that covers the case where no
+/// `wait_for_complete` is running (e.g., the caller never started draining
+/// the result stream).
+impl Drop for QueryHandle {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.tracker) != 1 {
+            return;
+        }
+        let Some(tracker) = self.tracker.lock().take() else {
+            return;
+        };
+        self.cancel_token.cancel();
+        self.spawn_finalize(
+            tracker,
+            Some((
+                "client disconnected before completion".to_string(),
+                ErrorCode::QueryExecutionError,
+            )),
+            true,
+        );
     }
 }
 
