@@ -97,9 +97,6 @@ pub enum CloudCommands {
     /// Inspect current deployment status
     Inspect(InspectArgs),
 
-    /// Rollback to a previous deployment
-    Rollback(RollbackArgs),
-
     /// Show API keys for an app
     #[command(name = "api-keys")]
     ApiKeys(ApiKeysArgs),
@@ -318,21 +315,6 @@ pub struct InspectArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
-
-    /// Output format
-    #[arg(long, short = 'o', default_value = "table")]
-    pub output: OutputFormat,
-}
-
-#[derive(Args, Debug)]
-pub struct RollbackArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
-
-    /// Target deployment ID to rollback to
-    #[arg(long)]
-    pub target: Option<i64>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -612,7 +594,6 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Delete(delete_cmd) => execute_delete(delete_cmd).await,
         CloudCommands::Deploy(deploy_args) => execute_deploy(deploy_args).await,
         CloudCommands::Inspect(inspect_args) => execute_inspect(inspect_args).await,
-        CloudCommands::Rollback(rollback_args) => execute_rollback(rollback_args).await,
         CloudCommands::ApiKeys(api_keys_args) => execute_api_keys(api_keys_args).await,
         CloudCommands::Metrics(metrics_args) => execute_metrics(metrics_args).await,
     }
@@ -1412,38 +1393,6 @@ async fn execute_inspect(args: &InspectArgs) -> Result<()> {
     } else {
         println!("\nNo deployments found.");
     }
-
-    Ok(())
-}
-
-async fn execute_rollback(args: &RollbackArgs) -> Result<()> {
-    let client = CloudClient::new()?;
-    let app_name = require_app(args.app.as_deref())?;
-
-    let target_id = if let Some(id) = args.target {
-        id
-    } else {
-        // Get the second-to-last deployment
-        let deployments = client.list_deployments(&app_name, 2, None).await?;
-        if deployments.len() < 2 {
-            return InvalidArgumentSnafu {
-                message: "No previous deployment to rollback to",
-            }
-            .fail();
-        }
-        deployments[1].id
-    };
-
-    let deployment = client.rollback(&app_name, target_id).await?;
-
-    if args.output == OutputFormat::Json {
-        return write_json(&deployment);
-    }
-
-    println!(
-        "\x1b[32m✓ Rollback to deployment {} initiated (new deployment: {})\x1b[0m",
-        target_id, deployment.id
-    );
 
     Ok(())
 }

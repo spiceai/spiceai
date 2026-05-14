@@ -26,8 +26,8 @@ use crate::types::{
     ApiKeysResponse, App, AppsResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
     CreateAppRequest, CreateDeploymentRequest, Deployment, DeploymentsResponse, LogsResponse,
     MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, RegenerateApiKeyRequest,
-    RegenerateApiKeyResponse, RegionsResponse, Secret, SecretsResponse,
-    SetSecretRequest, UpdateAppRequest,
+    RegenerateApiKeyResponse, RegionsResponse, Secret, SecretsResponse, SetSecretRequest,
+    UpdateAppRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
