@@ -17,6 +17,7 @@ limitations under the License.
 //! Dataset command for configuring individual datasets.
 
 use crate::Result;
+use crate::commands::component::{self, ComponentSection};
 use crate::error::{ConfigIoSnafu, CreateDirectorySnafu, InvalidArgumentSnafu};
 use crate::manifest;
 use ansi_colors::Color;
@@ -47,8 +48,11 @@ pub struct DatasetArgs {
 /// Dataset subcommands.
 #[derive(Subcommand, Debug)]
 pub enum DatasetCommands {
-    /// Configure a new dataset interactively
-    Configure,
+    /// Add a dataset to spicepod.yaml
+    Add(component::ComponentAddArgs),
+
+    /// Create or update a dataset in spicepod.yaml, or run interactively with no arguments
+    Configure(component::ComponentConfigureArgs),
 }
 
 /// Execute the dataset command.
@@ -57,8 +61,17 @@ pub enum DatasetCommands {
 ///
 /// Returns an error if the dataset configuration fails.
 pub fn execute(args: &DatasetArgs) -> Result<()> {
-    match args.command {
-        DatasetCommands::Configure => configure_dataset(),
+    match &args.command {
+        DatasetCommands::Add(add_args) => {
+            component::add_component(ComponentSection::Dataset, add_args)
+        }
+        DatasetCommands::Configure(configure_args) => {
+            if configure_args.has_manifest_edits() {
+                component::configure_component(ComponentSection::Dataset, configure_args)
+            } else {
+                configure_dataset()
+            }
+        }
     }
 }
 

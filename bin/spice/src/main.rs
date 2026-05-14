@@ -18,10 +18,11 @@ limitations under the License.
 
 use clap::{CommandFactory, Parser, Subcommand};
 use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArgs};
+use spice::commands::component::{ComponentSection, SingletonSection};
 use spice::commands::{
-    acceleration, add, catalogs, chat, cloud, cluster, completions, connect, dataset, datasets,
-    init, install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace,
-    upgrade, validate, version, workers,
+    acceleration, add, catalogs, chat, cloud, cluster, completions, component, connect, dataset,
+    datasets, init, install, login, models, nsql, pods, query, refresh, run, search, sql, status,
+    trace, upgrade, validate, version, workers,
 };
 use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;
@@ -91,8 +92,14 @@ enum Commands {
     /// Lists catalogs configured by the Spice runtime
     Catalogs(catalogs::CatalogsArgs),
 
+    /// Add or configure catalog entries in spicepod.yaml
+    Catalog(component::ComponentArgs),
+
     /// Lists models loaded by the Spice runtime
     Models(models::ModelsArgs),
+
+    /// Add or configure model entries in spicepod.yaml
+    Model(component::ComponentArgs),
 
     /// Lists Spicepods loaded by the Spice runtime
     Pods(pods::PodsArgs),
@@ -106,11 +113,47 @@ enum Commands {
     /// Lists workers loaded by the Spice runtime
     Workers(workers::WorkersArgs),
 
+    /// Add or configure worker entries in spicepod.yaml
+    Worker(component::ComponentArgs),
+
     /// Manage dataset acceleration features
     Acceleration(acceleration::AccelerationArgs),
 
     /// Dataset operations (configure datasets)
     Dataset(dataset::DatasetArgs),
+
+    /// Add or configure view entries in spicepod.yaml
+    View(component::ComponentArgs),
+
+    /// Add or configure embedding entries in spicepod.yaml
+    Embedding(component::ComponentArgs),
+
+    /// Add or configure reranker entries in spicepod.yaml
+    Reranker(component::ComponentArgs),
+
+    /// Add or configure tool entries in spicepod.yaml
+    Tool(component::ComponentArgs),
+
+    /// Add or configure function entries in spicepod.yaml
+    Function(component::ComponentArgs),
+
+    /// Add or configure secret entries in spicepod.yaml
+    Secret(component::ComponentArgs),
+
+    /// Configure the runtime section in spicepod.yaml
+    Runtime(component::SingletonArgs),
+
+    /// Configure the management section in spicepod.yaml
+    Management(component::SingletonArgs),
+
+    /// Configure the snapshots section in spicepod.yaml
+    Snapshots(component::SingletonArgs),
+
+    /// Add or configure extension entries in spicepod.yaml
+    Extension(component::ExtensionArgs),
+
+    /// Add or configure metadata entries in spicepod.yaml
+    Metadata(component::MetadataArgs),
 
     /// Manage Spice Cloud resources
     Cloud(cloud::CloudArgs),
@@ -306,10 +349,16 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(catalogs::execute(&ctx, &args))?;
         }
+        Commands::Catalog(args) => {
+            component::execute_component(ComponentSection::Catalog, &args)?;
+        }
         Commands::Models(args) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(models::execute(&ctx, &args))?;
+        }
+        Commands::Model(args) => {
+            component::execute_component(ComponentSection::Model, &args)?;
         }
         Commands::Pods(args) => {
             let rt = tokio::runtime::Runtime::new()
@@ -331,6 +380,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(workers::execute(&ctx, &args))?;
         }
+        Commands::Worker(args) => {
+            component::execute_component(ComponentSection::Worker, &args)?;
+        }
         Commands::Acceleration(args) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
@@ -338,6 +390,39 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Commands::Dataset(args) => {
             dataset::execute(&args)?;
+        }
+        Commands::View(args) => {
+            component::execute_component(ComponentSection::View, &args)?;
+        }
+        Commands::Embedding(args) => {
+            component::execute_component(ComponentSection::Embedding, &args)?;
+        }
+        Commands::Reranker(args) => {
+            component::execute_component(ComponentSection::Reranker, &args)?;
+        }
+        Commands::Tool(args) => {
+            component::execute_component(ComponentSection::Tool, &args)?;
+        }
+        Commands::Function(args) => {
+            component::execute_component(ComponentSection::Function, &args)?;
+        }
+        Commands::Secret(args) => {
+            component::execute_component(ComponentSection::Secret, &args)?;
+        }
+        Commands::Runtime(args) => {
+            component::execute_singleton(SingletonSection::Runtime, &args)?;
+        }
+        Commands::Management(args) => {
+            component::execute_singleton(SingletonSection::Management, &args)?;
+        }
+        Commands::Snapshots(args) => {
+            component::execute_singleton(SingletonSection::Snapshots, &args)?;
+        }
+        Commands::Extension(args) => {
+            component::execute_extension(&args)?;
+        }
+        Commands::Metadata(args) => {
+            component::execute_metadata(&args)?;
         }
         Commands::Cloud(args) => {
             let rt = tokio::runtime::Runtime::new()

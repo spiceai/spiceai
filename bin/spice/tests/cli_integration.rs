@@ -186,7 +186,7 @@ mod dataset {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Configure"));
+            .stdout(predicate::str::contains("Create or update a dataset"));
     }
 }
 
@@ -397,6 +397,146 @@ mod catalogs {
             .assert()
             .success()
             .stdout(predicate::str::contains("catalogs"));
+    }
+}
+
+// ============================================================================
+// Manifest Editing Command Tests
+// ============================================================================
+
+mod manifest_editing {
+    use super::*;
+
+    fn write_base_yml(temp_dir: &TempDir) -> std::path::PathBuf {
+        let manifest_path = temp_dir.path().join("spicepod.yml");
+        fs::write(
+            &manifest_path,
+            "version: v2\nkind: Spicepod\nname: app\nmodels: []\nembeddings: []\nworkers: []\n",
+        )
+        .expect("base spicepod.yml should be written");
+        manifest_path
+    }
+
+    #[test]
+    fn test_manifest_command_help() {
+        let mut model_help = spice_cmd();
+        model_help
+            .arg("model")
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Add or configure model entries"));
+
+        let mut model_add_help = spice_cmd();
+        model_add_help
+            .arg("model")
+            .arg("add")
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Component name"));
+
+        let mut runtime_help = spice_cmd();
+        runtime_help
+            .arg("runtime")
+            .arg("configure")
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Set a schema field"));
+    }
+
+    #[test]
+    fn test_model_add_and_configure_preserves_yml_manifest() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manifest_path = write_base_yml(&temp_dir);
+
+        let mut add_cmd = spice_cmd();
+        add_cmd
+            .current_dir(temp_dir.path())
+            .arg("model")
+            .arg("add")
+            .arg("llm")
+            .arg("--from")
+            .arg("openai:gpt-4o-mini")
+            .arg("--param")
+            .arg("temperature=0.2")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Updated"));
+
+        let mut configure_cmd = spice_cmd();
+        configure_cmd
+            .current_dir(temp_dir.path())
+            .arg("model")
+            .arg("configure")
+            .arg("llm")
+            .arg("--set")
+            .arg("datasets=[documents]")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Updated"));
+
+        let updated_manifest =
+            fs::read_to_string(&manifest_path).expect("updated spicepod.yml should be readable");
+        assert!(updated_manifest.contains("models:"));
+        assert!(updated_manifest.contains("name: llm"));
+        assert!(updated_manifest.contains("openai:gpt-4o-mini"));
+        assert!(updated_manifest.contains("temperature: 0.2"));
+        assert!(updated_manifest.contains("datasets:"));
+        assert!(updated_manifest.contains("- documents"));
+        assert!(
+            !temp_dir.path().join("spicepod.yaml").exists(),
+            "manifest edits should preserve an existing spicepod.yml"
+        );
+    }
+
+    #[test]
+    fn test_runtime_configure_sets_nested_fields() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manifest_path = write_base_yml(&temp_dir);
+
+        let mut cmd = spice_cmd();
+        cmd.current_dir(temp_dir.path())
+            .arg("runtime")
+            .arg("configure")
+            .arg("--set")
+            .arg("functions.enabled=true")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Updated"));
+
+        let updated_manifest =
+            fs::read_to_string(&manifest_path).expect("updated spicepod.yml should be readable");
+        assert!(updated_manifest.contains("runtime:"));
+        assert!(updated_manifest.contains("functions:"));
+        assert!(updated_manifest.contains("enabled: true"));
+    }
+
+    #[test]
+    fn test_catalog_add_from_flags() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manifest_path = write_base_yml(&temp_dir);
+
+        let mut cmd = spice_cmd();
+        cmd.current_dir(temp_dir.path())
+            .arg("catalog")
+            .arg("add")
+            .arg("glue")
+            .arg("--from")
+            .arg("glue")
+            .arg("--param")
+            .arg("glue_region=us-east-1")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Updated"));
+
+        let updated_manifest =
+            fs::read_to_string(&manifest_path).expect("updated spicepod.yml should be readable");
+        assert!(updated_manifest.contains("catalogs:"));
+        assert!(updated_manifest.contains("name: glue"));
+        assert!(updated_manifest.contains("from: glue"));
+        assert!(updated_manifest.contains("glue_region: us-east-1"));
     }
 }
 
