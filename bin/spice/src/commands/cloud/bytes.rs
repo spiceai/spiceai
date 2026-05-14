@@ -176,50 +176,55 @@ mod tests {
 
     #[test]
     fn parse_gi_suffix() {
-        let nb = NumBytes::parse("16Gi").unwrap();
+        let nb = NumBytes::parse("16Gi").expect("16Gi should parse");
         assert_eq!(nb.as_bytes(), 16 * GIB);
         assert_eq!(nb.to_resource_string(), "16Gi");
     }
 
     #[test]
     fn parse_gib_suffix() {
-        let nb = NumBytes::parse("32GiB").unwrap();
+        let nb = NumBytes::parse("32GiB").expect("32GiB should parse");
         assert_eq!(nb.as_bytes(), 32 * GIB);
         assert_eq!(nb.to_resource_string(), "32Gi");
     }
 
     #[test]
     fn parse_mi_suffix() {
-        let nb = NumBytes::parse("512Mi").unwrap();
+        let nb = NumBytes::parse("512Mi").expect("512Mi should parse");
         assert_eq!(nb.as_bytes(), 512 * MIB);
     }
 
     #[test]
     fn parse_case_insensitive() {
-        let nb = NumBytes::parse("8gi").unwrap();
+        let nb = NumBytes::parse("8gi").expect("8gi should parse");
         assert_eq!(nb.as_bytes(), 8 * GIB);
     }
 
     #[test]
     fn parse_raw_bytes_without_suffix() {
-        let nb = NumBytes::parse("16").unwrap();
+        let nb = NumBytes::parse("16").expect("raw bytes should parse");
         assert_eq!(nb.as_bytes(), 16);
         assert_eq!(nb.to_resource_string(), "16");
     }
 
     #[test]
     fn parse_rejects_bad_suffix() {
-        assert!(NumBytes::parse("16GB").is_err());
+        NumBytes::parse("16GB").expect_err("GB suffix should be rejected");
     }
 
     #[test]
     fn parse_rejects_no_digits() {
-        assert!(NumBytes::parse("Gi").is_err());
+        NumBytes::parse("Gi").expect_err("missing digits should be rejected");
     }
 
     #[test]
     fn display_gib() {
-        assert_eq!(NumBytes::parse("16Gi").unwrap().to_string(), "16.0 GiB");
+        assert_eq!(
+            NumBytes::parse("16Gi")
+                .expect("16Gi should parse")
+                .to_string(),
+            "16.0 GiB"
+        );
     }
 
     #[test]
@@ -240,44 +245,57 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_gi() {
-        let nb = NumBytes::parse("16Gi").unwrap();
-        let json = serde_json::to_string(&nb).unwrap();
+        let nb = NumBytes::parse("16Gi").expect("16Gi should parse");
+        let json = serde_json::to_string(&nb).expect("NumBytes should serialize");
         assert_eq!(json, r#""16Gi""#);
-        assert_eq!(serde_json::from_str::<NumBytes>(&json).unwrap(), nb);
+        assert_eq!(
+            serde_json::from_str::<NumBytes>(&json).expect("NumBytes should deserialize"),
+            nb
+        );
     }
 
     #[test]
     fn serde_roundtrip_mi() {
-        let nb = NumBytes::parse("512Mi").unwrap();
-        let json = serde_json::to_string(&nb).unwrap();
+        let nb = NumBytes::parse("512Mi").expect("512Mi should parse");
+        let json = serde_json::to_string(&nb).expect("NumBytes should serialize");
         assert_eq!(json, r#""512Mi""#);
-        assert_eq!(serde_json::from_str::<NumBytes>(&json).unwrap(), nb);
+        assert_eq!(
+            serde_json::from_str::<NumBytes>(&json).expect("NumBytes should deserialize"),
+            nb
+        );
     }
 
     #[test]
     fn serde_roundtrip_ki() {
         let nb = NumBytes::from_bytes(4 * KIB);
-        let json = serde_json::to_string(&nb).unwrap();
+        let json = serde_json::to_string(&nb).expect("NumBytes should serialize");
         assert_eq!(json, r#""4Ki""#);
-        assert_eq!(serde_json::from_str::<NumBytes>(&json).unwrap(), nb);
+        assert_eq!(
+            serde_json::from_str::<NumBytes>(&json).expect("NumBytes should deserialize"),
+            nb
+        );
     }
 
     #[test]
     fn parse_rejects_overflow() {
-        assert!(NumBytes::parse("99999999999999999Gi").is_err());
+        NumBytes::parse("99999999999999999Gi").expect_err("overflow should be rejected");
     }
 
     #[test]
     fn serde_roundtrip_sub_kib_values() {
         let nb = NumBytes::from_bytes(512);
-        let json = serde_json::to_string(&nb).unwrap();
+        let json = serde_json::to_string(&nb).expect("NumBytes should serialize");
 
         assert_eq!(json, r#""512""#);
-        assert_eq!(serde_json::from_str::<NumBytes>(&json).unwrap(), nb);
+        assert_eq!(
+            serde_json::from_str::<NumBytes>(&json).expect("NumBytes should deserialize"),
+            nb
+        );
     }
 
     #[test]
     fn serde_deserialize_rejects_invalid() {
-        assert!(serde_json::from_str::<NumBytes>(r#""16GB""#).is_err());
+        serde_json::from_str::<NumBytes>(r#""16GB""#)
+            .expect_err("invalid NumBytes JSON should be rejected");
     }
 }

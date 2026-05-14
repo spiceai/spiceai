@@ -31,6 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CLOUD_REGION: &str = "us-east-1";
 const CLOUD_REGION_VALUES: &[&str] = &["us-east-1", "us-west-2"];
+const MACHINE_ERROR_SERIALIZATION_FAILED: &str = r#"{"status":"error","error":{"code":"error_serialization_failed","message":"Failed to serialize CLI error"}}"#;
 const GLOBAL_VALUE_FLAGS: &[&str] = &[
     "--api-key",
     "--cloud-region",
@@ -519,10 +520,7 @@ fn write_machine_clap_error(error: &clap::Error) {
 
     match serde_json::to_string(&body) {
         Ok(body) => eprintln!("{body}"),
-        Err(_) => eprintln!(
-            "{}",
-            r#"{"status":"error","error":{"code":"error_serialization_failed","message":"Failed to serialize CLI error"}}"#
-        ),
+        Err(_) => eprintln!("{MACHINE_ERROR_SERIALIZATION_FAILED}"),
     }
 }
 
@@ -537,10 +535,7 @@ fn write_machine_error(error: &spice::error::Error) {
 
     match serde_json::to_string(&body) {
         Ok(body) => eprintln!("{body}"),
-        Err(_) => eprintln!(
-            "{}",
-            r#"{"status":"error","error":{"code":"error_serialization_failed","message":"Failed to serialize CLI error"}}"#
-        ),
+        Err(_) => eprintln!("{MACHINE_ERROR_SERIALIZATION_FAILED}"),
     }
 }
 

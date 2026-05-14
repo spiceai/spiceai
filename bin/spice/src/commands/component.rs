@@ -832,9 +832,8 @@ fn mutate_component_reference(
                         ),
                     }
                     .fail();
-            } else {
-                *entry = reference_value;
             }
+            *entry = reference_value;
             return Ok(());
         }
     }
