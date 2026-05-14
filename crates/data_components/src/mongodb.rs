@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 use crate::Read;
 
+pub mod stream;
+
 #[async_trait]
 impl Read for MongoDBTableFactory {
     async fn table_provider(

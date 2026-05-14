@@ -68,7 +68,7 @@ impl CayenneContext {
             vortex_format,
             config: config.clone(),
             session_config: SessionConfig::default(),
-            upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency)),
+            upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             runtime_env,
         })
     }
@@ -123,6 +123,12 @@ impl CayenneContext {
         self.config.upload_concurrency.max(1)
     }
 
+    /// Get the configured writer partition override for unsorted snapshot writes.
+    #[must_use]
+    pub fn write_concurrency(&self) -> Option<usize> {
+        self.config.write_concurrency.map(|v| v.max(1))
+    }
+
     /// Get the shared semaphore for limiting concurrent file writes / uploads.
     #[must_use]
     pub fn upload_semaphore(&self) -> &Arc<Semaphore> {
@@ -156,9 +162,23 @@ impl CayenneContext {
 
         let vortex_opts = VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
+            projection_pushdown: true,
             ..VortexTableOptions::default()
         };
 
         Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cayenne_enables_vortex_projection_pushdown_by_default() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let context = CayenneContext::new(&VortexConfig::default(), runtime_env);
+
+        assert!(context.file_format().options().projection_pushdown);
     }
 }
