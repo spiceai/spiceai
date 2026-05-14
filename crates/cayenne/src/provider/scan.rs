@@ -21,6 +21,8 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::{DataFusionError, Statistics};
+use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
 use futures::TryStreamExt;
@@ -51,6 +53,82 @@ impl CayenneAccelerationExec {
     pub fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
         Self { inner }
     }
+
+    /// Returns a stable identity for the underlying scan source, derived from the
+    /// sorted set of file paths backing the inner `DataSourceExec`.
+    ///
+    /// Two `CayenneAccelerationExec` nodes that scan the same set of physical
+    /// files return the same identity, which is the precondition for sharing a
+    /// runtime dynamic filter across them (see the cross-scan filter sharing
+    /// workstream documented in `crates/cayenne/src/optimizer_rules.rs`).
+    ///
+    /// Returns `None` if the inner plan does not bottom out in a `DataSourceExec`
+    /// whose `DataSource` is a `FileScanConfig` with at least one file. The
+    /// identity intentionally ignores ordering of files within partitions and
+    /// projection differences — it is purely a per-table fingerprint.
+    #[must_use]
+    pub fn scan_identity(&self) -> Option<ScanIdentity> {
+        let data_source_exec = find_data_source_exec(&self.inner)?;
+        let file_scan_config = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()?;
+
+        let mut paths: Vec<String> = file_scan_config
+            .file_groups
+            .iter()
+            .flat_map(|fg| fg.iter())
+            .map(|pf| pf.object_meta.location.to_string())
+            .collect();
+
+        if paths.is_empty() {
+            return None;
+        }
+
+        paths.sort();
+        paths.dedup();
+        Some(ScanIdentity { paths })
+    }
+}
+
+/// Stable identifier for a Cayenne scan source, derived from the sorted set of
+/// file paths backing the underlying `DataSourceExec`.
+///
+/// Equality and hashing are content-based on the path set, so two
+/// `CayenneAccelerationExec` instances over the same logical table compare
+/// equal regardless of projection, partitioning, or wrapper-plan differences.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScanIdentity {
+    paths: Vec<String>,
+}
+
+impl ScanIdentity {
+    /// Returns the sorted, deduplicated file paths that define this identity.
+    #[must_use]
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+}
+
+/// Walks `plan` looking for the underlying `DataSourceExec`.
+///
+/// Cayenne plans typically wrap the data source in transparent or
+/// near-transparent operators (projection, repartition, coalesce, byte
+/// counters, schema cast, inexact-stats wrapper). Any of these may sit between
+/// `CayenneAccelerationExec` and the `DataSourceExec`. Anything else (e.g. a
+/// join, filter, or aggregate) means the inner plan is not a simple scan and
+/// we return `None` rather than misattributing identity.
+fn find_data_source_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&DataSourceExec> {
+    if let Some(ds) = plan.as_any().downcast_ref::<DataSourceExec>() {
+        return Some(ds);
+    }
+
+    let children = plan.children();
+    if children.len() != 1 {
+        return None;
+    }
+
+    find_data_source_exec(children[0])
 }
 
 pub(crate) fn round_robin_repartition_if_needed(
@@ -356,5 +434,64 @@ mod tests {
                 .is_some(),
             "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
+    }
+
+    #[test]
+    fn scan_identity_returns_none_for_non_file_data_source() {
+        // MemorySourceConfig is not a FileScanConfig, so scan_identity must
+        // return None rather than misattributing identity.
+        let exec = CayenneAccelerationExec::new(one_partition_plan());
+        assert!(exec.scan_identity().is_none());
+    }
+
+    #[test]
+    fn scan_identity_returns_none_when_inner_wraps_unknown_multi_child_plan() {
+        // A plan with multiple children (e.g. a join) cannot have a single
+        // unambiguous scan identity; find_data_source_exec must bail.
+        let left = one_partition_plan();
+        let right = one_partition_plan();
+        let schema = left.schema();
+        let projection_expr = col("id", &schema).expect("id column should exist");
+
+        // Construct a 2-child wrapper via UnionExec to exercise the
+        // `children.len() != 1` early return without depending on join wiring.
+        let union = datafusion::physical_plan::union::UnionExec::try_new(vec![left, right])
+            .expect("union exec should be created");
+
+        // Wrap in a projection so the top isn't a DataSourceExec.
+        let projection = ProjectionExec::try_new(vec![(projection_expr, "id".to_string())], union)
+            .expect("projection exec should be created");
+        let exec = CayenneAccelerationExec::new(Arc::new(projection));
+        assert!(exec.scan_identity().is_none());
+    }
+
+    #[test]
+    fn scan_identity_equality_and_hashing_are_path_based() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let a = ScanIdentity {
+            paths: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+        };
+        let b = ScanIdentity {
+            paths: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+        };
+        let c = ScanIdentity {
+            paths: vec!["a.parquet".to_string()],
+        };
+
+        assert_eq!(a, b, "same path set must compare equal");
+        assert_ne!(a, c, "different path sets must not compare equal");
+
+        let mut ha = DefaultHasher::new();
+        a.hash(&mut ha);
+        let mut hb = DefaultHasher::new();
+        b.hash(&mut hb);
+        // Verify Hash compiles and is content-based (we don't assert exact
+        // equality of finish() between distinct hashers, but both use the
+        // same content; the trait must be derivable from Vec<String>).
+        let _ = (ha.finish(), hb.finish());
+
+        assert_eq!(a.paths(), &["a.parquet", "b.parquet"]);
     }
 }

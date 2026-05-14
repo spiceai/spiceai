@@ -29,19 +29,30 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Formatter;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion_catalog::Session;
 use datafusion_common::Result as DFResult;
 use datafusion_common::Statistics;
+use datafusion_common::config::ConfigOptions;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::TableSchema;
+use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::file_stream::FileOpener;
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions as df_expr;
+use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
+use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use object_store::{ObjectMeta, ObjectStore};
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -198,7 +209,7 @@ impl DeletionFilteringVortexFormat {
 #[async_trait]
 impl FileFormat for DeletionFilteringVortexFormat {
     fn as_any(&self) -> &dyn Any {
-        self
+        self.inner.as_any()
     }
 
     fn compression_type(&self) -> Option<FileCompressionType> {
@@ -274,6 +285,7 @@ impl FileFormat for DeletionFilteringVortexFormat {
             .inner
             .create_physical_plan(state, modified_config)
             .await?;
+        let plan = wrap_vortex_file_sources(plan)?;
 
         // If there are deletions, wrap the plan to force inexact statistics.
         // This prevents AggregateStatistics optimizer from short-circuiting
@@ -304,6 +316,207 @@ impl FileFormat for DeletionFilteringVortexFormat {
     ) -> Arc<dyn datafusion_datasource::file::FileSource> {
         self.inner.file_source(table_schema)
     }
+}
+
+fn wrap_vortex_file_sources(plan: Arc<dyn ExecutionPlan>) -> DFResult<Arc<dyn ExecutionPlan>> {
+    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+        && let Some(file_scan_config) = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+    {
+        let mut wrapped_config = file_scan_config.clone();
+        wrapped_config.file_source = Arc::new(CayenneVortexFileSource::new(Arc::clone(
+            file_scan_config.file_source(),
+        )));
+
+        let new_exec = data_source_exec
+            .clone()
+            .with_data_source(Arc::new(wrapped_config));
+        return Ok(Arc::new(new_exec));
+    }
+
+    let children = plan.children();
+    if children.is_empty() {
+        return Ok(plan);
+    }
+
+    let new_children = children
+        .into_iter()
+        .map(|child| wrap_vortex_file_sources(Arc::clone(child)))
+        .collect::<DFResult<Vec<_>>>()?;
+
+    plan.with_new_children(new_children)
+}
+
+#[derive(Clone)]
+struct CayenneVortexFileSource {
+    inner: Arc<dyn FileSource>,
+}
+
+impl CayenneVortexFileSource {
+    fn new(inner: Arc<dyn FileSource>) -> Self {
+        Self { inner }
+    }
+}
+
+impl std::fmt::Debug for CayenneVortexFileSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayenneVortexFileSource")
+            .field("file_type", &self.inner.file_type())
+            .finish()
+    }
+}
+
+impl FileSource for CayenneVortexFileSource {
+    fn create_file_opener(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> DFResult<Arc<dyn FileOpener>> {
+        self.inner
+            .create_file_opener(object_store, base_config, partition)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_schema(&self) -> &TableSchema {
+        self.inner.table_schema()
+    }
+
+    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
+        Arc::new(Self::new(self.inner.with_batch_size(batch_size)))
+    }
+
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.inner.filter()
+    }
+
+    fn projection(&self) -> Option<&ProjectionExprs> {
+        self.inner.projection()
+    }
+
+    fn metrics(&self) -> &ExecutionPlanMetricsSet {
+        self.inner.metrics()
+    }
+
+    fn file_type(&self) -> &str {
+        self.inner.file_type()
+    }
+
+    fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt_extra(t, f)
+    }
+
+    fn supports_repartitioning(&self) -> bool {
+        self.inner.supports_repartitioning()
+    }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        repartition_file_min_size: usize,
+        output_ordering: Option<datafusion_physical_expr::LexOrdering>,
+        config: &FileScanConfig,
+    ) -> DFResult<Option<FileScanConfig>> {
+        self.inner.repartitioned(
+            target_partitions,
+            repartition_file_min_size,
+            output_ordering,
+            config,
+        )
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        let schema = self.inner.table_schema().file_schema();
+        let mut safe_filters = Vec::new();
+        let mut safe_filter_indexes = Vec::new();
+        let mut pushdown_results = vec![PushedDown::No; filters.len()];
+
+        for (index, filter) in filters.into_iter().enumerate() {
+            if contains_decimal_to_floating_cast(filter.as_ref(), schema) {
+                tracing::debug!(
+                    %filter,
+                    "Skipping Vortex predicate pushdown for decimal-to-floating cast"
+                );
+                continue;
+            }
+
+            safe_filter_indexes.push(index);
+            safe_filters.push(filter);
+        }
+
+        if safe_filters.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                pushdown_results,
+            ));
+        }
+
+        let inner_propagation = self.inner.try_pushdown_filters(safe_filters, config)?;
+
+        for (safe_index, result) in safe_filter_indexes
+            .into_iter()
+            .zip(inner_propagation.filters.into_iter())
+        {
+            pushdown_results[safe_index] = result;
+        }
+
+        let mut propagation =
+            FilterPushdownPropagation::with_parent_pushdown_result(pushdown_results);
+        if let Some(updated_node) = inner_propagation.updated_node {
+            propagation = propagation.with_updated_node(Arc::new(Self::new(updated_node)) as _);
+        }
+
+        Ok(propagation)
+    }
+
+    fn try_pushdown_projection(
+        &self,
+        projection: &ProjectionExprs,
+    ) -> DFResult<Option<Arc<dyn FileSource>>> {
+        self.inner
+            .try_pushdown_projection(projection)
+            .map(|source| source.map(|source| Arc::new(Self::new(source)) as _))
+    }
+}
+
+fn contains_decimal_to_floating_cast(expr: &dyn PhysicalExpr, schema: &Schema) -> bool {
+    if let Some(cast) = expr.as_any().downcast_ref::<df_expr::CastExpr>() {
+        let casts_to_floating = matches!(cast.cast_type(), DataType::Float32 | DataType::Float64);
+        let casts_from_decimal = cast.expr().data_type(schema).is_ok_and(|data_type| {
+            matches!(
+                data_type,
+                DataType::Decimal32(_, _)
+                    | DataType::Decimal64(_, _)
+                    | DataType::Decimal128(_, _)
+                    | DataType::Decimal256(_, _)
+            )
+        });
+
+        if casts_to_floating && casts_from_decimal {
+            return true;
+        }
+    }
+
+    if let Some(dynamic_filter) = expr
+        .as_any()
+        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        && let Ok(current) = dynamic_filter.current()
+        && contains_decimal_to_floating_cast(current.as_ref(), schema)
+    {
+        return true;
+    }
+
+    expr.children()
+        .into_iter()
+        .any(|child| contains_decimal_to_floating_cast(child.as_ref(), schema))
 }
 
 /// A wrapper execution plan that forces inexact row count statistics.
@@ -381,5 +594,55 @@ impl ExecutionPlan for InexactStatsExec {
             total_byte_size: stats.total_byte_size,
             column_statistics: stats.column_statistics,
         })
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        projection: &datafusion_physical_plan::projection::ProjectionExec,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        self.inner
+            .try_swapping_with_projection(projection)
+            .map(|plan| plan.map(|plan| Arc::new(Self::new(plan)) as _))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_common::ScalarValue;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr, Column, Literal};
+    use datafusion_physical_expr::expressions::{col, lit};
+
+    #[test]
+    fn detects_decimal_to_floating_cast_predicate() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let cast =
+            Arc::new(CastExpr::new(amount, DataType::Float64, None)) as Arc<dyn PhysicalExpr>;
+        let literal =
+            Arc::new(Literal::new(ScalarValue::Float64(Some(1.0)))) as Arc<dyn PhysicalExpr>;
+        let predicate = BinaryExpr::new(cast, Operator::Lt, literal);
+
+        assert!(contains_decimal_to_floating_cast(&predicate, &schema));
+    }
+
+    #[test]
+    fn allows_decimal_to_decimal_predicate() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = col("amount", &schema).expect("amount column should exist");
+        let literal = lit(ScalarValue::Decimal128(Some(100), 15, 2));
+        let predicate = BinaryExpr::new(amount, Operator::Lt, literal);
+
+        assert!(!contains_decimal_to_floating_cast(&predicate, &schema));
     }
 }
