@@ -28,6 +28,7 @@ impl DebeziumKafkaSys {
         let conn = pool.connect_direct().await.map_err(Error::external)?;
 
         ensure_debezium_kafka_table(pool).await?;
+        self.mark_schema_ensured();
 
         let upsert = format!(
             "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME}
@@ -71,6 +72,7 @@ impl DebeziumKafkaSys {
         pool: &PostgresConnectionPool,
     ) -> Option<DebeziumKafkaMetadata> {
         ensure_debezium_kafka_table(pool).await.ok()?;
+        self.mark_schema_ensured();
         let conn = pool.connect_direct().await.ok()?;
         let query = format!(
             "SELECT consumer_group_id, topic, primary_keys, schema_fields, offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = $1"
@@ -105,7 +107,10 @@ impl DebeziumKafkaSys {
         pool: &PostgresConnectionPool,
         offsets: &[KafkaOffset],
     ) -> Result<()> {
-        ensure_debezium_kafka_table(pool).await?;
+        if self.schema_needs_ensure() {
+            ensure_debezium_kafka_table(pool).await?;
+            self.mark_schema_ensured();
+        }
         let conn = pool.connect_direct().await.map_err(Error::external)?;
         let offsets_json = Self::serialize_offsets(offsets)?;
         let update = format!(

@@ -357,6 +357,13 @@ impl DataConnector for Debezium {
                     }
                 );
 
+                kafka_consumer.subscribe(topic).boxed().context(
+                    super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    },
+                )?;
+
                 kafka_consumer
                     .restore_offsets(&metadata.offsets)
                     .boxed()
@@ -373,13 +380,6 @@ impl DataConnector for Debezium {
                     dataconnector: "debezium",
                     connector_component: ConnectorComponent::from(dataset),
                 })?;
-
-                kafka_consumer.subscribe(topic).boxed().context(
-                    super::UnableToGetReadProviderSnafu {
-                        dataconnector: "debezium",
-                        connector_component: ConnectorComponent::from(dataset),
-                    },
-                )?;
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }

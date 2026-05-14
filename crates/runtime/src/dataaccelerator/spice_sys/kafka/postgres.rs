@@ -27,6 +27,7 @@ impl KafkaSys {
         let conn = pool.connect_direct().await.map_err(Error::external)?;
 
         ensure_kafka_table(pool).await?;
+        self.mark_schema_ensured();
 
         let upsert = format!(
             "INSERT INTO {KAFKA_TABLE_NAME}
@@ -65,6 +66,7 @@ impl KafkaSys {
         pool: &PostgresConnectionPool,
     ) -> Option<KafkaMetadata> {
         ensure_kafka_table(pool).await.ok()?;
+        self.mark_schema_ensured();
         let conn = pool.connect_direct().await.ok()?;
         let query = format!(
             "SELECT consumer_group_id, topic, schema_json, offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = $1"
@@ -94,7 +96,10 @@ impl KafkaSys {
         pool: &PostgresConnectionPool,
         offsets: &[KafkaOffset],
     ) -> Result<()> {
-        ensure_kafka_table(pool).await?;
+        if self.schema_needs_ensure() {
+            ensure_kafka_table(pool).await?;
+            self.mark_schema_ensured();
+        }
         let conn = pool.connect_direct().await.map_err(Error::external)?;
         let offsets_json = Self::serialize_offsets(offsets)?;
         let update = format!(

@@ -32,6 +32,7 @@ impl DebeziumKafkaSys {
             .get_underlying_conn_mut();
 
         ensure_debezium_kafka_table(duckdb_conn)?;
+        self.mark_schema_ensured();
 
         let upsert = format!(
             "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, primary_keys, schema_fields, offsets_json, created_at, updated_at)
@@ -78,6 +79,7 @@ impl DebeziumKafkaSys {
             .get_underlying_conn_mut();
 
         ensure_debezium_kafka_table(duckdb_conn).ok()?;
+        self.mark_schema_ensured();
 
         let query = format!(
             "SELECT consumer_group_id, topic, primary_keys, schema_fields, offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
@@ -118,7 +120,10 @@ impl DebeziumKafkaSys {
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        ensure_debezium_kafka_table(duckdb_conn)?;
+        if self.schema_needs_ensure() {
+            ensure_debezium_kafka_table(duckdb_conn)?;
+            self.mark_schema_ensured();
+        }
 
         let offsets_json = Self::serialize_offsets(offsets)?;
         let update = format!(

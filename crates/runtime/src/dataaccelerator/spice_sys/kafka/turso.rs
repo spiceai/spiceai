@@ -35,6 +35,7 @@ impl KafkaSys {
         let conn = pool.connect().await.map_err(Error::external)?;
 
         ensure_kafka_table(&conn).await?;
+        self.mark_schema_ensured();
 
         let upsert = format!(
             "INSERT INTO {KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, schema_json, offsets_json, created_at, updated_at)
@@ -66,6 +67,7 @@ impl KafkaSys {
         let dataset_name = self.dataset_name.clone();
         let conn = pool.connect().await.ok()?;
         ensure_kafka_table(&conn).await.ok()?;
+        self.mark_schema_ensured();
         let query = format!(
             "SELECT consumer_group_id, topic, schema_json, offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
@@ -99,7 +101,10 @@ impl KafkaSys {
         let dataset_name = self.dataset_name.clone();
         let offsets_json = Self::serialize_offsets(offsets)?;
         let conn = pool.connect().await.map_err(Error::external)?;
-        ensure_kafka_table(&conn).await?;
+        if self.schema_needs_ensure() {
+            ensure_kafka_table(&conn).await?;
+            self.mark_schema_ensured();
+        }
 
         let update = format!(
             "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"

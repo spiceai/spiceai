@@ -25,6 +25,7 @@ limitations under the License.
 //! );
 
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{
@@ -47,6 +48,7 @@ mod turso;
 pub struct KafkaSys {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
+    schema_ensured: AtomicBool,
 }
 
 impl KafkaSys {
@@ -54,6 +56,7 @@ impl KafkaSys {
         Ok(Self {
             dataset_name: dataset.name.to_string(),
             acceleration_connection: acceleration_connection(dataset, open_option).await?,
+            schema_ensured: AtomicBool::new(false),
         })
     }
 
@@ -145,5 +148,13 @@ impl KafkaSys {
             || Ok(Vec::new()),
             |offsets_json| serde_json::from_str(offsets_json).map_err(Error::external),
         )
+    }
+
+    fn schema_needs_ensure(&self) -> bool {
+        !self.schema_ensured.load(Ordering::Acquire)
+    }
+
+    fn mark_schema_ensured(&self) {
+        self.schema_ensured.store(true, Ordering::Release);
     }
 }

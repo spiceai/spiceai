@@ -609,16 +609,6 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
     }
 }
 
-#[async_trait]
-impl<K: Sync, V: Sync> CommitChange for KafkaMessage<'_, K, V> {
-    async fn commit(&self) -> Result<(), CommitError> {
-        self.mark_processed()
-            .boxed()
-            .map_err(|e| cdc::CommitError::UnableToCommitChange { source: e })?;
-        Ok(())
-    }
-}
-
 pub struct MessageBatchCommitter {
     consumer: &'static KafkaConsumer,
     offsets: Vec<KafkaOffset>,
@@ -708,15 +698,15 @@ impl MessageBatchCommitter {
 #[async_trait]
 impl CommitChange for MessageBatchCommitter {
     async fn commit(&self) -> Result<(), CommitError> {
+        if let Some(offset_commit_hook) = &self.offset_commit_hook {
+            offset_commit_hook.commit_offsets(&self.offsets).await?;
+        }
+
         for offset in &self.offsets {
             self.consumer
                 .store_offset(&offset.topic, offset.partition, offset.offset)
                 .boxed()
                 .map_err(|e| CommitError::UnableToCommitChange { source: e })?;
-        }
-
-        if let Some(offset_commit_hook) = &self.offset_commit_hook {
-            offset_commit_hook.commit_offsets(&self.offsets).await?;
         }
 
         self.consumer

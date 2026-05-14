@@ -31,6 +31,7 @@ impl KafkaSys {
             .get_underlying_conn_mut();
 
         ensure_kafka_table(duckdb_conn)?;
+        self.mark_schema_ensured();
 
         let schema_json = Self::serialize_schema(&metadata.schema)?;
         let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
@@ -69,6 +70,7 @@ impl KafkaSys {
             .get_underlying_conn_mut();
 
         ensure_kafka_table(duckdb_conn).ok()?;
+        self.mark_schema_ensured();
 
         let query = format!(
             "SELECT consumer_group_id, topic, schema_json, offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
@@ -103,7 +105,10 @@ impl KafkaSys {
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        ensure_kafka_table(duckdb_conn)?;
+        if self.schema_needs_ensure() {
+            ensure_kafka_table(duckdb_conn)?;
+            self.mark_schema_ensured();
+        }
 
         let offsets_json = Self::serialize_offsets(offsets)?;
         let update = format!(

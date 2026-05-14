@@ -489,7 +489,7 @@ async fn init_kafka_consumer(
             })?;
 
     kafka_consumer
-        .restore_offsets(&metadata.offsets)
+        .subscribe(topic)
         .boxed()
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "kafka",
@@ -497,7 +497,7 @@ async fn init_kafka_consumer(
         })?;
 
     kafka_consumer
-        .subscribe(topic)
+        .restore_offsets(&metadata.offsets)
         .boxed()
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "kafka",

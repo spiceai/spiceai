@@ -38,6 +38,7 @@ impl DebeziumKafkaSys {
         let conn = pool.connect().await.map_err(Error::external)?;
 
         ensure_debezium_kafka_table(&conn).await?;
+        self.mark_schema_ensured();
 
         let upsert = format!(
             "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME}
@@ -76,6 +77,7 @@ impl DebeziumKafkaSys {
         let dataset_name = self.dataset_name.clone();
         let conn = pool.connect().await.ok()?;
         ensure_debezium_kafka_table(&conn).await.ok()?;
+        self.mark_schema_ensured();
         let query = format!(
             "SELECT consumer_group_id, topic, primary_keys, schema_fields, offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
@@ -112,7 +114,10 @@ impl DebeziumKafkaSys {
         let dataset_name = self.dataset_name.clone();
         let offsets_json = Self::serialize_offsets(offsets)?;
         let conn = pool.connect().await.map_err(Error::external)?;
-        ensure_debezium_kafka_table(&conn).await?;
+        if self.schema_needs_ensure() {
+            ensure_debezium_kafka_table(&conn).await?;
+            self.mark_schema_ensured();
+        }
 
         let update = format!(
             "UPDATE {DEBEZIUM_KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"

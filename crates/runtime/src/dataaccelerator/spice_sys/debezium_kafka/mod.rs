@@ -31,6 +31,7 @@ use crate::{
     dataconnector::debezium::DebeziumKafkaMetadata,
 };
 use data_components::kafka::KafkaOffset;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
 
@@ -46,6 +47,7 @@ mod turso;
 pub struct DebeziumKafkaSys {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
+    schema_ensured: AtomicBool,
 }
 
 impl DebeziumKafkaSys {
@@ -53,6 +55,7 @@ impl DebeziumKafkaSys {
         Ok(Self {
             dataset_name: dataset.name.to_string(),
             acceleration_connection: acceleration_connection(dataset, open_option).await?,
+            schema_ensured: AtomicBool::new(false),
         })
     }
 
@@ -135,5 +138,13 @@ impl DebeziumKafkaSys {
             || Ok(Vec::new()),
             |offsets_json| serde_json::from_str(offsets_json).map_err(Error::external),
         )
+    }
+
+    fn schema_needs_ensure(&self) -> bool {
+        !self.schema_ensured.load(Ordering::Acquire)
+    }
+
+    fn mark_schema_ensured(&self) {
+        self.schema_ensured.store(true, Ordering::Release);
     }
 }

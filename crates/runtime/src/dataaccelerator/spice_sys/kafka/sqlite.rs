@@ -63,7 +63,10 @@ impl KafkaSys {
                 Ok::<(), rusqlite::Error>(())
             })
             .await
-            .map_err(Error::external)
+            .map_err(Error::external)?;
+
+        self.mark_schema_ensured();
+        Ok(())
     }
 
     pub(super) async fn get_sqlite(&self, pool: &SqliteConnectionPool) -> Option<KafkaMetadata> {
@@ -72,7 +75,8 @@ impl KafkaSys {
         let conn_sync = pool.connect_sync();
         let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
 
-        conn.conn
+        let metadata = conn
+            .conn
             .call(move |conn| {
                 ensure_kafka_table(conn)?;
 
@@ -107,7 +111,10 @@ impl KafkaSys {
                 }
             })
             .await
-            .ok()
+            .ok()?;
+
+        self.mark_schema_ensured();
+        Some(metadata)
     }
 
     pub(super) async fn upsert_offsets_sqlite(
@@ -117,6 +124,7 @@ impl KafkaSys {
     ) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
         let offsets_json = Self::serialize_offsets(offsets)?;
+        let schema_needs_ensure = self.schema_needs_ensure();
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -127,7 +135,9 @@ impl KafkaSys {
 
         conn.conn
             .call(move |conn| {
-                ensure_kafka_table(conn)?;
+                if schema_needs_ensure {
+                    ensure_kafka_table(conn)?;
+                }
                 let update = format!(
                     "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"
                 );
@@ -138,7 +148,13 @@ impl KafkaSys {
                 Ok::<(), rusqlite::Error>(())
             })
             .await
-            .map_err(Error::external)
+            .map_err(Error::external)?;
+
+        if schema_needs_ensure {
+            self.mark_schema_ensured();
+        }
+
+        Ok(())
     }
 }
 
