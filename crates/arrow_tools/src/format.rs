@@ -224,6 +224,9 @@ fn truncate_fixed_size_list_array(
     list_array: &FixedSizeListArray,
     max_len: usize,
 ) -> Result<FixedSizeListArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
     let child_array = list_array.values();
     let original_size = list_array.value_length() as usize;
     let truncated_size = max_len.min(original_size);
@@ -253,6 +256,9 @@ fn truncate_fixed_size_list_array(
 
 #[expect(clippy::cast_sign_loss)]
 fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
 
@@ -293,6 +299,9 @@ fn truncate_large_list_array(
     list_array: &LargeListArray,
     max_len: usize,
 ) -> Result<LargeListArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
 
@@ -337,6 +346,9 @@ fn truncate_list_view_array(
     list_array: &ListViewArray,
     max_len: usize,
 ) -> Result<ListViewArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
     let sizes = list_array.value_sizes();
@@ -387,6 +399,9 @@ fn truncate_large_list_view_array(
     list_array: &LargeListViewArray,
     max_len: usize,
 ) -> Result<LargeListViewArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
     let sizes = list_array.value_sizes();
@@ -908,6 +923,95 @@ Cras venenatis euismod malesuada.",
         assert!(!output.is_null(0));
         assert!(output.is_null(1));
         assert!(!output.is_null(2));
+    }
+
+    /// `arrow::compute::concat` errors when given an empty slice of arrays.
+    /// 0-row record batches are a realistic input (e.g. a sample query that
+    /// returns no rows), so each list truncation helper must short-circuit
+    /// before reaching `concat`.
+    #[test]
+    fn test_truncate_helpers_handle_empty_arrays() {
+        use arrow::array::{
+            FixedSizeListArray as FixedSizeListArrayAlias, Int32Array,
+            LargeListArray as LargeListArrayAlias,
+            LargeListViewArray as LargeListViewArrayAlias,
+            ListViewArray as ListViewArrayAlias,
+        };
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+
+        // Empty ListArray
+        let empty_list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::<i32>::new(vec![0_i32].into()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        );
+        assert_eq!(
+            truncate_list_array(&empty_list, 4)
+                .expect("empty ListArray must round-trip")
+                .len(),
+            0
+        );
+
+        // Empty LargeListArray
+        let empty_large_list = LargeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::<i64>::new(vec![0_i64].into()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        );
+        assert_eq!(
+            truncate_large_list_array(&empty_large_list, 4)
+                .expect("empty LargeListArray must round-trip")
+                .len(),
+            0
+        );
+
+        // Empty FixedSizeListArray
+        let empty_fsl = FixedSizeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            3,
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        );
+        assert_eq!(
+            truncate_fixed_size_list_array(&empty_fsl, 2)
+                .expect("empty FixedSizeListArray must round-trip")
+                .len(),
+            0
+        );
+
+        // Empty ListViewArray
+        let empty_list_view = ListViewArrayAlias::try_new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            ScalarBuffer::<i32>::from(Vec::<i32>::new()),
+            ScalarBuffer::<i32>::from(Vec::<i32>::new()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        )
+        .expect("empty ListViewArray construction");
+        assert_eq!(
+            truncate_list_view_array(&empty_list_view, 4)
+                .expect("empty ListViewArray must round-trip")
+                .len(),
+            0
+        );
+
+        // Empty LargeListViewArray
+        let empty_large_list_view = LargeListViewArrayAlias::try_new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            ScalarBuffer::<i64>::from(Vec::<i64>::new()),
+            ScalarBuffer::<i64>::from(Vec::<i64>::new()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        )
+        .expect("empty LargeListViewArray construction");
+        assert_eq!(
+            truncate_large_list_view_array(&empty_large_list_view, 4)
+                .expect("empty LargeListViewArray must round-trip")
+                .len(),
+            0
+        );
     }
 
     #[test]
