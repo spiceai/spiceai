@@ -38,6 +38,9 @@ pub use text_to_sql::TextToSqlArgs;
 mod schema;
 pub use schema::SchemaTestArgs;
 
+mod htap;
+pub use htap::HtapArgs;
+
 mod streaming;
 pub use streaming::{StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs};
 
@@ -76,6 +79,8 @@ pub enum TestCommands {
     StreamingDynamodbCorrectness(StreamingDynamodbCorrectnessArgs),
     /// Validate catalog connector schema discovery via `information_schema`
     Schema(SchemaTestArgs),
+    /// Run an HTAP test: concurrent TPC-C OLTP workload + CH-benCH analytical queries
+    Htap(HtapArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].
