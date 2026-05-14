@@ -443,7 +443,7 @@ pub struct CayenneTableProvider {
     /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     /// Table-level Vortex statistics loaded from the metastore and maintained
-    /// after writes. This gives DataFusion synchronous access to Cayenne stats
+    /// after writes. This gives `DataFusion` synchronous access to Cayenne stats
     /// without querying the async catalog from `TableProvider::statistics`.
     table_statistics: Arc<RwLock<Option<Statistics>>>,
     /// Optional retention filters that should be applied immediately after writes.
@@ -4014,15 +4014,16 @@ impl CayenneTableProvider {
         };
 
         let (statistics_blob, num_rows) = if let Some(existing) = existing_stats {
-            match accumulator.merged_file_statistics_blob(&existing.statistics_blob) {
-                Some(merged_blob) => (merged_blob, existing.num_rows.saturating_add(new_rows)),
-                None => {
-                    tracing::warn!(
-                        "Failed to merge table stats for {}; replacing aggregate stats with current write",
-                        self.table_metadata.table_name
-                    );
-                    (new_blob, new_rows)
-                }
+            if let Some(merged_blob) =
+                accumulator.merged_file_statistics_blob(&existing.statistics_blob)
+            {
+                (merged_blob, existing.num_rows.saturating_add(new_rows))
+            } else {
+                tracing::warn!(
+                    "Failed to merge table stats for {}; replacing aggregate stats with current write",
+                    self.table_metadata.table_name
+                );
+                (new_blob, new_rows)
             }
         } else {
             (new_blob, new_rows)
@@ -5216,23 +5217,23 @@ impl CayenneTableProvider {
                 deleted_row_keys,
                 insert_records,
             } => {
-                if let Some(ref row_converter) = self.pk_row_converter {
-                    if !deleted_row_keys.is_empty() {
-                        tracing::debug!(
-                            "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
-                            deleted_row_keys.len(),
-                            insert_records.len(),
-                            self.table_metadata.table_name
-                        );
+                if let Some(ref row_converter) = self.pk_row_converter
+                    && !deleted_row_keys.is_empty()
+                {
+                    tracing::debug!(
+                        "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
+                        deleted_row_keys.len(),
+                        insert_records.len(),
+                        self.table_metadata.table_name
+                    );
 
-                        return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
-                            plan,
-                            Arc::clone(deleted_row_keys),
-                            Arc::clone(insert_records),
-                            pk_indices_in_projection.to_vec(),
-                            Arc::clone(row_converter),
-                        )));
-                    }
+                    return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
+                        plan,
+                        Arc::clone(deleted_row_keys),
+                        Arc::clone(insert_records),
+                        pk_indices_in_projection.to_vec(),
+                        Arc::clone(row_converter),
+                    )));
                 }
             }
             PkDeletionSnapshot::PositionBased => {
