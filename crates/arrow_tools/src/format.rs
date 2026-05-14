@@ -15,8 +15,11 @@ limitations under the License.
 */
 
 use crate::schema::to_source_native_type_name;
-use arrow::array::{Array, ArrayRef, FixedSizeListArray, ListArray, RecordBatch, StructArray};
-use arrow::buffer::OffsetBuffer;
+use arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, LargeListArray, LargeListViewArray, ListArray,
+    ListViewArray, RecordBatch, StructArray,
+};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::concat;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
@@ -80,29 +83,55 @@ pub(crate) fn format_column_data(
                 DataType::List(_)
                 | DataType::LargeList(_)
                 | DataType::FixedSizeList(_, _)
-                | DataType::ListView(_),
+                | DataType::ListView(_)
+                | DataType::LargeListView(_),
                 Some(_),
             ),
         ) => {
-            let array_ref = if let DataType::FixedSizeList(_, _) = column.data_type() {
-                let fixed_list_array = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::FixedSizeListArray>()
-                    .ok_or_else(|| {
-                        ArrowError::CastError("Failed to downcast to FixedSizeListArray".into())
-                    })?;
-                Arc::new(truncate_fixed_size_list_array(
-                    fixed_list_array,
-                    num_elements,
-                )?) as ArrayRef
-            } else {
-                let list_array = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::ListArray>()
-                    .ok_or_else(|| {
-                        ArrowError::CastError("Failed to downcast to ListArray".into())
-                    })?;
-                Arc::new(truncate_list_array(list_array, num_elements)?) as ArrayRef
+            let array_ref = match column.data_type() {
+                DataType::FixedSizeList(_, _) => {
+                    let fixed_list_array = column
+                        .as_any()
+                        .downcast_ref::<FixedSizeListArray>()
+                        .ok_or_else(|| {
+                            ArrowError::CastError("Failed to downcast to FixedSizeListArray".into())
+                        })?;
+                    Arc::new(truncate_fixed_size_list_array(
+                        fixed_list_array,
+                        num_elements,
+                    )?) as ArrayRef
+                }
+                DataType::LargeList(_) => {
+                    let list_array =
+                        column.as_any().downcast_ref::<LargeListArray>().ok_or_else(|| {
+                            ArrowError::CastError("Failed to downcast to LargeListArray".into())
+                        })?;
+                    Arc::new(truncate_large_list_array(list_array, num_elements)?) as ArrayRef
+                }
+                DataType::ListView(_) => {
+                    let list_array =
+                        column.as_any().downcast_ref::<ListViewArray>().ok_or_else(|| {
+                            ArrowError::CastError("Failed to downcast to ListViewArray".into())
+                        })?;
+                    Arc::new(truncate_list_view_array(list_array, num_elements)?) as ArrayRef
+                }
+                DataType::LargeListView(_) => {
+                    let list_array = column
+                        .as_any()
+                        .downcast_ref::<LargeListViewArray>()
+                        .ok_or_else(|| {
+                            ArrowError::CastError(
+                                "Failed to downcast to LargeListViewArray".into(),
+                            )
+                        })?;
+                    Arc::new(truncate_large_list_view_array(list_array, num_elements)?) as ArrayRef
+                }
+                _ => {
+                    let list_array = column.as_any().downcast_ref::<ListArray>().ok_or_else(
+                        || ArrowError::CastError("Failed to downcast to ListArray".into()),
+                    )?;
+                    Arc::new(truncate_list_array(list_array, num_elements)?) as ArrayRef
+                }
             };
             Ok(array_ref)
         }
@@ -161,9 +190,11 @@ fn get_possible_nested_list_datatype(f: &Arc<Field>) -> (DataType, Option<DataTy
     (
         f.data_type().clone(),
         match f.data_type() {
-            DataType::List(f) | DataType::FixedSizeList(f, _) | DataType::LargeList(f) => {
-                Some(f.data_type().clone())
-            }
+            DataType::List(f)
+            | DataType::FixedSizeList(f, _)
+            | DataType::LargeList(f)
+            | DataType::ListView(f)
+            | DataType::LargeListView(f) => Some(f.data_type().clone()),
             _ => None,
         },
     )
@@ -250,6 +281,144 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
             child_array.is_nullable(),
         )),
         OffsetBuffer::from_lengths(new_lengths),
+        new_child_array,
+        nulls,
+    )
+}
+
+#[expect(clippy::cast_sign_loss)]
+fn truncate_large_list_array(
+    list_array: &LargeListArray,
+    max_len: usize,
+) -> Result<LargeListArray, ArrowError> {
+    let child_array = list_array.values();
+    let offsets = list_array.value_offsets();
+
+    let new_lengths: Vec<usize> = (0..list_array.len())
+        .map(|i| {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            max_len.min(end - start)
+        })
+        .collect();
+
+    let sliced_arrays: Vec<Arc<dyn Array>> = new_lengths
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| child_array.slice(offsets[i] as usize, len))
+        .collect();
+
+    let new_child_array = Arc::new(concat(
+        &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+    )?);
+
+    let nulls = new_child_array.nulls().cloned();
+
+    LargeListArray::try_new(
+        Arc::new(Field::new(
+            "item",
+            child_array.data_type().clone(),
+            child_array.is_nullable(),
+        )),
+        OffsetBuffer::from_lengths(new_lengths),
+        new_child_array,
+        nulls,
+    )
+}
+
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn truncate_list_view_array(
+    list_array: &ListViewArray,
+    max_len: usize,
+) -> Result<ListViewArray, ArrowError> {
+    let child_array = list_array.values();
+    let offsets = list_array.value_offsets();
+    let sizes = list_array.value_sizes();
+
+    let new_sizes: Vec<i32> = (0..list_array.len())
+        .map(|i| (sizes[i] as usize).min(max_len) as i32)
+        .collect();
+
+    let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
+        .map(|i| child_array.slice(offsets[i] as usize, new_sizes[i] as usize))
+        .collect();
+
+    let new_child_array = Arc::new(concat(
+        &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+    )?);
+
+    let nulls = list_array.nulls().cloned();
+
+    // After concat, the new values buffer is laid out contiguously, so we
+    // re-derive offsets from the truncated sizes.
+    let mut new_offsets: Vec<i32> = Vec::with_capacity(new_sizes.len());
+    let mut running: i32 = 0;
+    for &s in &new_sizes {
+        new_offsets.push(running);
+        running = running.saturating_add(s);
+    }
+
+    ListViewArray::try_new(
+        Arc::new(Field::new(
+            "item",
+            child_array.data_type().clone(),
+            child_array.is_nullable(),
+        )),
+        ScalarBuffer::from(new_offsets),
+        ScalarBuffer::from(new_sizes),
+        new_child_array,
+        nulls,
+    )
+}
+
+#[expect(clippy::cast_sign_loss)]
+fn truncate_large_list_view_array(
+    list_array: &LargeListViewArray,
+    max_len: usize,
+) -> Result<LargeListViewArray, ArrowError> {
+    let child_array = list_array.values();
+    let offsets = list_array.value_offsets();
+    let sizes = list_array.value_sizes();
+
+    let max_len_i64 = i64::try_from(max_len).map_err(|_| {
+        ArrowError::InvalidArgumentError(format!(
+            "max_len {max_len} cannot be represented as i64"
+        ))
+    })?;
+
+    let new_sizes: Vec<i64> = (0..list_array.len())
+        .map(|i| sizes[i].min(max_len_i64))
+        .collect();
+
+    let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
+        .map(|i| child_array.slice(offsets[i] as usize, new_sizes[i] as usize))
+        .collect();
+
+    let new_child_array = Arc::new(concat(
+        &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+    )?);
+
+    let nulls = list_array.nulls().cloned();
+
+    let mut new_offsets: Vec<i64> = Vec::with_capacity(new_sizes.len());
+    let mut running: i64 = 0;
+    for &s in &new_sizes {
+        new_offsets.push(running);
+        running = running.saturating_add(s);
+    }
+
+    LargeListViewArray::try_new(
+        Arc::new(Field::new(
+            "item",
+            child_array.data_type().clone(),
+            child_array.is_nullable(),
+        )),
+        ScalarBuffer::from(new_offsets),
+        ScalarBuffer::from(new_sizes),
         new_child_array,
         nulls,
     )
@@ -410,6 +579,26 @@ pub fn pretty_print_schema(
             }
             DataType::LargeList(field) => {
                 w.write_str("large_list<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                w.write_char('>')
+            }
+            DataType::FixedSizeList(field, size) => {
+                w.write_str("fixed_size_list<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                write!(w, ">[{size}]")
+            }
+            DataType::ListView(field) => {
+                w.write_str("list_view<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                w.write_char('>')
+            }
+            DataType::LargeListView(field) => {
+                w.write_str("large_list_view<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                w.write_char('>')
+            }
+            DataType::Map(field, _) => {
+                w.write_str("map<")?;
                 write_data_type(field.data_type(), w)?;
                 w.write_char('>')
             }
@@ -631,6 +820,105 @@ Cras venenatis euismod malesuada.",
                 test_name,
                 write_to_json_value(output).expect("could not write ListArray to JSON")
             );
+        }
+    }
+
+    #[test]
+    fn test_truncate_large_list_array() {
+        use arrow::array::{Int32Array, LargeListArray as LargeListArrayAlias};
+        use arrow::buffer::OffsetBuffer;
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let offsets = OffsetBuffer::<i64>::new(vec![0_i64, 3, 6, 8].into());
+        let input = LargeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            Arc::new(values),
+            None,
+        );
+
+        let output = truncate_large_list_array(&input, 2)
+            .expect("truncate_large_list_array failed");
+
+        assert_eq!(output.len(), 3);
+        // Each sublist should now have at most 2 elements.
+        let observed_lengths: Vec<usize> = (0..output.len())
+            .map(|i| {
+                let start = output.value_offsets()[i] as usize;
+                let end = output.value_offsets()[i + 1] as usize;
+                end - start
+            })
+            .collect();
+        assert_eq!(observed_lengths, vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn test_truncate_list_view_array() {
+        use arrow::array::{Int32Array, ListViewArray as ListViewArrayAlias};
+        use arrow::buffer::ScalarBuffer;
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0_i32, 3, 6]);
+        let sizes = ScalarBuffer::<i32>::from(vec![3_i32, 3, 2]);
+        let input = ListViewArrayAlias::try_new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            sizes,
+            Arc::new(values),
+            None,
+        )
+        .expect("ListViewArray::try_new");
+
+        let output =
+            truncate_list_view_array(&input, 2).expect("truncate_list_view_array failed");
+
+        assert_eq!(output.len(), 3);
+        // After truncation each entry has at most 2 elements.
+        for size in output.value_sizes().iter() {
+            assert!(*size <= 2, "size {size} exceeded max_len");
+        }
+    }
+
+    #[test]
+    fn test_truncate_large_list_view_array() {
+        use arrow::array::{Int32Array, LargeListViewArray as LargeListViewArrayAlias};
+        use arrow::buffer::ScalarBuffer;
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let offsets = ScalarBuffer::<i64>::from(vec![0_i64, 3, 6]);
+        let sizes = ScalarBuffer::<i64>::from(vec![3_i64, 3, 2]);
+        let input = LargeListViewArrayAlias::try_new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            sizes,
+            Arc::new(values),
+            None,
+        )
+        .expect("LargeListViewArray::try_new");
+
+        let output = truncate_large_list_view_array(&input, 2)
+            .expect("truncate_large_list_view_array failed");
+
+        assert_eq!(output.len(), 3);
+        for size in output.value_sizes().iter() {
+            assert!(*size <= 2, "size {size} exceeded max_len");
+        }
+    }
+
+    #[test]
+    fn test_get_possible_nested_list_datatype_view_variants() {
+        let inner = DataType::Int32;
+        let cases = vec![
+            DataType::List(Arc::new(Field::new("item", inner.clone(), true))),
+            DataType::LargeList(Arc::new(Field::new("item", inner.clone(), true))),
+            DataType::FixedSizeList(Arc::new(Field::new("item", inner.clone(), true)), 4),
+            DataType::ListView(Arc::new(Field::new("item", inner.clone(), true))),
+            DataType::LargeListView(Arc::new(Field::new("item", inner.clone(), true))),
+        ];
+        for dt in cases {
+            let f = Arc::new(Field::new("col", dt, true));
+            let (_, inner_dt) = get_possible_nested_list_datatype(&f);
+            assert_eq!(inner_dt.as_ref(), Some(&inner), "field {f:?}");
         }
     }
 
