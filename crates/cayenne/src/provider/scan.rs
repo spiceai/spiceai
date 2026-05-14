@@ -55,8 +55,9 @@ impl CayenneAccelerationExec {
         Self { inner }
     }
 
-    /// Returns a stable identity for the underlying scan source, derived from the
-    /// sorted set of file paths backing the inner `DataSourceExec`.
+    /// Returns a stable identity for the underlying scan source, derived from
+    /// the `FileScanConfig`'s `object_store_url` plus the sorted set of file
+    /// paths backing the inner `DataSourceExec`.
     ///
     /// Two `CayenneAccelerationExec` nodes that scan the same set of physical
     /// files return the same identity, which is the precondition for sharing a
@@ -67,6 +68,11 @@ impl CayenneAccelerationExec {
     /// whose `DataSource` is a `FileScanConfig` with at least one file. The
     /// identity intentionally ignores ordering of files within partitions and
     /// projection differences — it is purely a per-table fingerprint.
+    ///
+    /// The `object_store_url` is required to disambiguate two stores that
+    /// happen to contain the same relative paths (e.g. two different S3
+    /// buckets both with `part-000.vortex`). Without it the identity would
+    /// silently collide when paths are stored as relative locations.
     #[must_use]
     pub fn scan_identity(&self) -> Option<ScanIdentity> {
         let file_scan_config = find_file_scan_config(&self.inner)?;
@@ -84,7 +90,10 @@ impl CayenneAccelerationExec {
 
         paths.sort();
         paths.dedup();
-        Some(ScanIdentity { paths })
+        Some(ScanIdentity {
+            object_store_url: file_scan_config.object_store_url.as_str().to_string(),
+            paths,
+        })
     }
 
     /// Returns the dynamic filters currently pushed into this Cayenne scan.
@@ -133,18 +142,30 @@ impl CayenneAccelerationExec {
     }
 }
 
-/// Stable identifier for a Cayenne scan source, derived from the sorted set of
-/// file paths backing the underlying `DataSourceExec`.
+/// Stable identifier for a Cayenne scan source, derived from the
+/// `FileScanConfig`'s `object_store_url` plus the sorted set of file paths
+/// backing the underlying `DataSourceExec`.
 ///
-/// Equality and hashing are content-based on the path set, so two
-/// `CayenneAccelerationExec` instances over the same logical table compare
-/// equal regardless of projection, partitioning, or wrapper-plan differences.
+/// Equality and hashing are content-based on both the `object_store_url` and
+/// the path set, so two `CayenneAccelerationExec` instances over the same
+/// logical table compare equal regardless of projection, partitioning, or
+/// wrapper-plan differences — and two scans over different stores that happen
+/// to share a relative path (e.g. two S3 buckets each with `part-000.vortex`)
+/// do *not* collide.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScanIdentity {
+    object_store_url: String,
     paths: Vec<String>,
 }
 
 impl ScanIdentity {
+    /// Returns the `object_store_url` (e.g. `s3://bucket/`, `file:///`) that
+    /// scopes the file paths.
+    #[must_use]
+    pub fn object_store_url(&self) -> &str {
+        &self.object_store_url
+    }
+
     /// Returns the sorted, deduplicated file paths that define this identity.
     #[must_use]
     pub fn paths(&self) -> &[String] {
@@ -181,17 +202,29 @@ fn find_file_scan_config(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanConfi
         .downcast_ref::<FileScanConfig>()
 }
 
-/// Walks `plan` looking for the underlying `DataSourceExec`.
+/// Walks `plan` looking for the underlying `DataSourceExec`, descending only
+/// through a whitelist of operators that are known to preserve scan identity.
 ///
 /// Cayenne plans typically wrap the data source in transparent or
-/// near-transparent operators (projection, repartition, coalesce, byte
-/// counters, schema cast, inexact-stats wrapper). Any of these may sit between
-/// `CayenneAccelerationExec` and the `DataSourceExec`. Anything else (e.g. a
-/// join, filter, or aggregate) means the inner plan is not a simple scan and
-/// we return `None` rather than misattributing identity.
+/// near-transparent operators: `ProjectionExec`, `RepartitionExec`,
+/// `CoalesceBatchesExec`, `CoalescePartitionsExec`, plus the runtime's
+/// `BytesProcessedExec` / `SchemaCastScanExec` and the cayenne-internal
+/// `InexactStatsExec`. Any one of those may sit between
+/// `CayenneAccelerationExec` and the `DataSourceExec`.
+///
+/// Anything else with a single child (e.g. `FilterExec`, `SortExec`,
+/// `LimitExec`, an unfamiliar custom node) is *not* identity-preserving for
+/// our purposes — it may change cardinality, ordering, or the file-set
+/// semantics the identity relies on. Returning `None` is safer than
+/// misattributing identity: the worst that happens is dynamic-filter sharing
+/// is conservatively disabled.
 fn find_data_source_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&DataSourceExec> {
     if let Some(ds) = plan.as_any().downcast_ref::<DataSourceExec>() {
         return Some(ds);
+    }
+
+    if !is_identity_preserving_wrapper(plan) {
+        return None;
     }
 
     let children = plan.children();
@@ -200,6 +233,37 @@ fn find_data_source_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&DataSourceExe
     }
 
     find_data_source_exec(children[0])
+}
+
+/// Returns `true` if `plan` is a known transparent / near-transparent wrapper
+/// that preserves the underlying scan's identity (same file set, same logical
+/// rows, just resharded / renamed / instrumented).
+///
+/// The check is by-type for the wrappers we have in-scope, and by `name()` for
+/// the ones that live in other crates or are crate-private. Adding a new
+/// wrapper requires touching this function explicitly — that's intentional;
+/// it stops a future operator from silently being treated as transparent.
+fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let any = plan.as_any();
+    if any.downcast_ref::<ProjectionExec>().is_some()
+        || any.downcast_ref::<RepartitionExec>().is_some()
+        || any
+            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+            .is_some()
+        || any
+            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+            .is_some()
+        || any.downcast_ref::<CayenneAccelerationExec>().is_some()
+    {
+        return true;
+    }
+
+    // Cross-crate / crate-private wrappers we can't downcast to without
+    // pulling in their concrete types: match by the stable `name()` string.
+    matches!(
+        plan.name(),
+        "BytesProcessedExec" | "SchemaCastScanExec" | "InexactStatsExec"
+    )
 }
 
 fn collect_dynamic_filters(expr: &Arc<dyn PhysicalExpr>, filters: &mut Vec<ScanDynamicFilter>) {
@@ -624,12 +688,15 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let a = ScanIdentity {
+            object_store_url: "s3://bucket/".to_string(),
             paths: vec!["a.parquet".to_string(), "b.parquet".to_string()],
         };
         let b = ScanIdentity {
+            object_store_url: "s3://bucket/".to_string(),
             paths: vec!["a.parquet".to_string(), "b.parquet".to_string()],
         };
         let c = ScanIdentity {
+            object_store_url: "s3://bucket/".to_string(),
             paths: vec!["a.parquet".to_string()],
         };
 
@@ -642,9 +709,26 @@ mod tests {
         b.hash(&mut hb);
         // Verify Hash compiles and is content-based (we don't assert exact
         // equality of finish() between distinct hashers, but both use the
-        // same content; the trait must be derivable from Vec<String>).
+        // same content; the trait must be derivable from the inner fields).
         let _ = (ha.finish(), hb.finish());
 
+        assert_eq!(a.object_store_url(), "s3://bucket/");
         assert_eq!(a.paths(), &["a.parquet", "b.parquet"]);
+    }
+
+    #[test]
+    fn scan_identity_does_not_collide_across_object_stores() {
+        // Same relative paths across two different stores must produce
+        // distinct identities — otherwise cross-scan dynamic filters could
+        // mistakenly share state across unrelated tables.
+        let bucket_a = ScanIdentity {
+            object_store_url: "s3://bucket-a/".to_string(),
+            paths: vec!["part-000.vortex".to_string()],
+        };
+        let bucket_b = ScanIdentity {
+            object_store_url: "s3://bucket-b/".to_string(),
+            paths: vec!["part-000.vortex".to_string()],
+        };
+        assert_ne!(bucket_a, bucket_b);
     }
 }
