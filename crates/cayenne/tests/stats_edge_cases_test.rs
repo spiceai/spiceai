@@ -37,7 +37,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 // Column Statistics Edge Cases
 // ============================================================================
 
-test_with_backends!(test_stats_reflect_latest_write_only);
+test_with_backends!(test_stats_aggregate_across_writes);
 test_with_backends!(test_stats_correct_after_overwrite);
 test_with_backends!(test_stats_with_all_null_column);
 test_with_backends!(test_stats_with_mixed_types);
@@ -142,15 +142,9 @@ async fn query_count(ctx: &SessionContext, table_name: &str) -> usize {
 
 /// Stats are updated on each write and stored as a Vortex `FileStatistics` blob.
 ///
-/// NOTE: `persist_table_stats` currently performs an upsert keyed by `table_id`
-/// using only the stats from the *current* write's `ColumnStatsAccumulator`.
-/// That means each append overwrites the prior persisted stats rather than
-/// merging them across the full table. This is a known design limitation
-/// tracked separately (see PR #10314 design-level review threads); this test
-/// asserts the actual observed behavior with exact values so any regression
-/// (e.g. dropping a stat, mis-typing a precision, breaking
-/// `ColumnStatsAccumulator` seeding) fails loudly.
-async fn test_stats_reflect_latest_write_only(fixture: common::TestFixture) -> TestResult {
+/// `persist_table_stats` merges the current write's stats with existing
+/// persisted stats: `num_rows` is summed and `min`/`max` are widened.
+async fn test_stats_aggregate_across_writes(fixture: common::TestFixture) -> TestResult {
     use datafusion::common::ScalarValue;
     use datafusion::common::stats::Precision;
 
@@ -197,13 +191,11 @@ async fn test_stats_reflect_latest_write_only(fixture: common::TestFixture) -> T
         .get_table_statistics(&table_id)
         .await?
         .expect("stats present after second write");
-    // Current (non-aggregating) behavior: the second write's stats replace
-    // the first. Assert exactly what's stored so the upsert path is locked
-    // down. When per-table aggregation is implemented these expectations
-    // should change to (num_rows=5, min=5, max=50).
+    // Aggregating behavior: stats are merged across writes, so num_rows
+    // reflects the cumulative total and min/max span all appends.
     assert_eq!(
-        stats2.num_rows, 2,
-        "current implementation upserts per-write num_rows; aggregation TBD",
+        stats2.num_rows, 5,
+        "aggregated num_rows across both writes (3 + 2)",
     );
     let fs2 = cayenne::stats::deserialize_file_statistics(&stats2.statistics_blob, &schema)
         .expect("deserialize stats2");
