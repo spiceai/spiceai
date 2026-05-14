@@ -160,6 +160,8 @@ async fn main() -> Result<()> {
                 segment_cache_mb: args.cayenne_segment_cache_mb,
                 target_file_size_mb: args.cayenne_target_file_size_mb,
                 compression_strategy: None,
+                upload_concurrency: None,
+                write_concurrency: None,
             },
             ctx.runtime_env(),
         )
