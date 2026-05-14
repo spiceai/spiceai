@@ -224,13 +224,19 @@ fn validate_spicepod_value(value: &Value, path: &Path) -> Result<()> {
     let mapping = value
         .as_mapping()
         .ok_or_else(|| crate::error::Error::ConfigParse {
-            message: format!("Failed to parse {}: manifest must be a YAML mapping", path.display()),
+            message: format!(
+                "Failed to parse {}: manifest must be a YAML mapping",
+                path.display()
+            ),
         })?;
 
     let name = required_header_field(mapping, "name", path)?;
     if !name.is_string() {
         return Err(crate::error::Error::ConfigParse {
-            message: format!("Failed to parse {}: field 'name' must be a string", path.display()),
+            message: format!(
+                "Failed to parse {}: field 'name' must be a string",
+                path.display()
+            ),
         });
     }
 
@@ -240,15 +246,14 @@ fn validate_spicepod_value(value: &Value, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn required_header_field<'a>(
-    mapping: &'a Mapping,
-    field: &str,
-    path: &Path,
-) -> Result<&'a Value> {
+fn required_header_field<'a>(mapping: &'a Mapping, field: &str, path: &Path) -> Result<&'a Value> {
     mapping
         .get(Value::String(field.to_string()))
         .ok_or_else(|| crate::error::Error::ConfigParse {
-            message: format!("Failed to parse {}: missing field '{field}'", path.display()),
+            message: format!(
+                "Failed to parse {}: missing field '{field}'",
+                path.display()
+            ),
         })
 }
 
@@ -258,7 +263,10 @@ where
 {
     let value = required_header_field(mapping, field, path)?;
     yaml::from_value::<T>(value.clone()).map_err(|source| crate::error::Error::ConfigParse {
-        message: format!("Failed to parse {} field '{field}': {source}", path.display()),
+        message: format!(
+            "Failed to parse {} field '{field}': {source}",
+            path.display()
+        ),
     })?;
     Ok(())
 }
