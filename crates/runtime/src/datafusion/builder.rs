@@ -30,7 +30,7 @@ use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, stat
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 #[cfg(not(windows))]
-use cayenne::optimizer_rules::CayenneJoinRewriter;
+use cayenne::optimizer_rules::{CayenneDynamicFilterSharing, CayenneJoinRewriter};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -383,7 +383,9 @@ impl DataFusionBuilder {
             // and accumulator budget are only configured for supported targets.
             // Windows keeps DataFusion's standard hash-join dynamic filters.
             clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
-            state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+            state = state
+                .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
+                .with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
         }
         #[cfg(windows)]
         {
@@ -947,10 +949,22 @@ mod tests {
             .iter()
             .position(|name| *name == "CayenneJoinRewriter")
             .expect("Cayenne join rewriter should be registered");
+        let cayenne_filter_sharing_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneDynamicFilterSharing")
+            .expect("Cayenne dynamic filter sharing rule should be registered");
 
         assert!(
             sanity_check_position < cayenne_rewriter_position,
             "CayenneJoinRewriter must run after DataFusion's built-in physical optimizer rules"
+        );
+        assert!(
+            sanity_check_position < cayenne_filter_sharing_position,
+            "CayenneDynamicFilterSharing must run after DataFusion's built-in physical optimizer rules"
+        );
+        assert!(
+            cayenne_filter_sharing_position < cayenne_rewriter_position,
+            "CayenneDynamicFilterSharing must run before CayenneJoinRewriter so it can inspect DataFusion's default HashJoinExec nodes"
         );
     }
 

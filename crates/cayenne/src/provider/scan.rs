@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::BTreeSet, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
@@ -24,6 +24,7 @@ use datafusion_common::{DataFusionError, Statistics};
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
 use futures::TryStreamExt;
 
@@ -68,11 +69,7 @@ impl CayenneAccelerationExec {
     /// projection differences — it is purely a per-table fingerprint.
     #[must_use]
     pub fn scan_identity(&self) -> Option<ScanIdentity> {
-        let data_source_exec = find_data_source_exec(&self.inner)?;
-        let file_scan_config = data_source_exec
-            .data_source()
-            .as_any()
-            .downcast_ref::<FileScanConfig>()?;
+        let file_scan_config = find_file_scan_config(&self.inner)?;
 
         let mut paths: Vec<String> = file_scan_config
             .file_groups
@@ -88,6 +85,51 @@ impl CayenneAccelerationExec {
         paths.sort();
         paths.dedup();
         Some(ScanIdentity { paths })
+    }
+
+    /// Returns the dynamic filters currently pushed into this Cayenne scan.
+    ///
+    /// These filters originate from `DataFusion`'s hash-join dynamic-filter
+    /// pass. They are safe to share only when an optimizer has proven the target
+    /// scan is equi-joined on every referenced column.
+    #[must_use]
+    pub fn dynamic_filters(&self) -> Vec<ScanDynamicFilter> {
+        let Some(file_scan_config) = find_file_scan_config(&self.inner) else {
+            return Vec::new();
+        };
+        let Some(filter) = file_scan_config.file_source().filter() else {
+            return Vec::new();
+        };
+
+        let mut filters = Vec::new();
+        collect_dynamic_filters(&filter, &mut filters);
+        filters
+    }
+
+    /// Returns true if this scan already has the specified dynamic filter.
+    #[must_use]
+    pub fn has_dynamic_filter(&self, filter: &Arc<dyn PhysicalExpr>) -> bool {
+        self.dynamic_filters()
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate.filter(), filter))
+    }
+
+    /// Push additional dynamic filters into the underlying file source.
+    ///
+    /// Returns `Ok(None)` when the scan source declined all filters or the inner
+    /// plan is not a simple file scan.
+    pub fn with_additional_dynamic_filters(
+        &self,
+        filters: &[Arc<dyn PhysicalExpr>],
+        config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(inner) =
+            push_dynamic_filters_to_data_source(Arc::clone(&self.inner), filters, config)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(Arc::new(Self::new(inner))))
     }
 }
 
@@ -110,6 +152,35 @@ impl ScanIdentity {
     }
 }
 
+/// A dynamic filter currently attached to a Cayenne scan, plus the scan-local
+/// column names the filter references.
+#[derive(Clone)]
+pub struct ScanDynamicFilter {
+    filter: Arc<dyn PhysicalExpr>,
+    columns: BTreeSet<String>,
+}
+
+impl ScanDynamicFilter {
+    /// Returns the shared dynamic filter expression.
+    #[must_use]
+    pub fn filter(&self) -> &Arc<dyn PhysicalExpr> {
+        &self.filter
+    }
+
+    /// Returns the scan-local column names referenced by this filter.
+    #[must_use]
+    pub fn columns(&self) -> &BTreeSet<String> {
+        &self.columns
+    }
+}
+
+fn find_file_scan_config(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanConfig> {
+    find_data_source_exec(plan)?
+        .data_source()
+        .as_any()
+        .downcast_ref::<FileScanConfig>()
+}
+
 /// Walks `plan` looking for the underlying `DataSourceExec`.
 ///
 /// Cayenne plans typically wrap the data source in transparent or
@@ -129,6 +200,88 @@ fn find_data_source_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&DataSourceExe
     }
 
     find_data_source_exec(children[0])
+}
+
+fn collect_dynamic_filters(expr: &Arc<dyn PhysicalExpr>, filters: &mut Vec<ScanDynamicFilter>) {
+    if let Some(dynamic_filter) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+        if let Some(columns) = dynamic_filter_column_names(dynamic_filter) {
+            filters.push(ScanDynamicFilter {
+                filter: Arc::clone(expr),
+                columns,
+            });
+        }
+        return;
+    }
+
+    for child in expr.children() {
+        collect_dynamic_filters(child, filters);
+    }
+}
+
+fn dynamic_filter_column_names(
+    dynamic_filter: &DynamicFilterPhysicalExpr,
+) -> Option<BTreeSet<String>> {
+    let mut columns = BTreeSet::new();
+    for child in dynamic_filter.children() {
+        let column = child.as_any().downcast_ref::<Column>()?;
+        columns.insert(column.name().to_string());
+    }
+
+    if columns.is_empty() {
+        None
+    } else {
+        Some(columns)
+    }
+}
+
+fn push_dynamic_filters_to_data_source(
+    plan: Arc<dyn ExecutionPlan>,
+    filters: &[Arc<dyn PhysicalExpr>],
+    optimizer_config: &ConfigOptions,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+        && let Some(file_scan_config) = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+    {
+        let filters = filters.iter().map(Arc::clone).collect();
+        let propagation = file_scan_config
+            .file_source()
+            .try_pushdown_filters(filters, optimizer_config)?;
+
+        let Some(updated_source) = propagation.updated_node else {
+            return Ok(None);
+        };
+
+        let mut updated_config = file_scan_config.clone();
+        updated_config.file_source = updated_source;
+        let updated_exec = data_source_exec
+            .clone()
+            .with_data_source(Arc::new(updated_config));
+        return Ok(Some(Arc::new(updated_exec)));
+    }
+
+    let children = plan
+        .children()
+        .into_iter()
+        .map(Arc::clone)
+        .collect::<Vec<_>>();
+    if children.len() != 1 {
+        return Ok(None);
+    }
+
+    let Some(updated_child) =
+        push_dynamic_filters_to_data_source(Arc::clone(&children[0]), filters, optimizer_config)?
+    else {
+        return Ok(None);
+    };
+
+    plan.with_new_children(vec![updated_child]).map(Some)
 }
 
 pub(crate) fn round_robin_repartition_if_needed(
