@@ -56,6 +56,10 @@ pub struct CayenneCatalogProviderConfig {
     pub target_file_size_mb: Option<usize>,
     /// Compression strategy for generated Vortex files.
     pub compression_strategy: Option<CompressionStrategy>,
+    /// Maximum number of concurrent file uploads when writing multiple Vortex files.
+    pub upload_concurrency: Option<usize>,
+    /// Number of writer partitions to use when ingesting unsorted data.
+    pub write_concurrency: Option<usize>,
 }
 
 /// Errors that can occur when interacting with a Cayenne catalog.
@@ -263,6 +267,12 @@ impl CayenneCatalogProvider {
         }
         if let Some(v) = provider_config.compression_strategy.as_ref() {
             config.compression_strategy = v.clone();
+        }
+        if let Some(v) = provider_config.upload_concurrency {
+            config.upload_concurrency = v.max(1);
+        }
+        if let Some(v) = provider_config.write_concurrency {
+            config.write_concurrency = Some(v.max(1));
         }
         config
     }

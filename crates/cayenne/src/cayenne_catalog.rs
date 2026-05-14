@@ -1903,7 +1903,7 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
 ///
 /// Returns `true` if the configuration matches (no recreation needed).
 /// Only compares data-affecting fields; runtime tuning parameters like cache sizes
-/// and upload concurrency are excluded since they don't affect data correctness.
+/// and write/upload concurrency are excluded since they don't affect data correctness.
 fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
     // Compare primary keys
     if stored.primary_key != options.primary_key {
@@ -3149,6 +3149,7 @@ mod tests {
             footer_cache_mb: 512,
             segment_cache_mb: 1024,
             upload_concurrency: 8,
+            write_concurrency: Some(16),
             target_vortex_file_size_mb: 512,
             ..Default::default()
         };

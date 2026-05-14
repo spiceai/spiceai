@@ -1749,6 +1749,7 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
         sequence_number: i64,
+        target_partitions: usize,
     ) -> CatalogResult<(u64, Arc<ColumnStatsAccumulator>)> {
         let target_size_bytes = self.context.target_file_size_bytes();
 
@@ -1757,7 +1758,12 @@ impl CayenneTableProvider {
 
         // Write data to the new snapshot
         let (total_rows, chunk_count, stats_acc) = self
-            .write_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                target_partitions,
+            )
             .await?;
 
         tracing::debug!(
@@ -1849,6 +1855,7 @@ impl CayenneTableProvider {
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
         snapshot_id: &str,
+        target_partitions: usize,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
@@ -1936,16 +1943,22 @@ impl CayenneTableProvider {
 
         let tracked_stream =
             RecordBatchStreamAdapter::new(Arc::clone(&tracked_schema), tracked_stream);
-        let stream_exec = Arc::new(StreamingExec::new(tracked_schema, Box::pin(tracked_stream)));
+        let stream_exec: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingExec::new(tracked_schema, Box::pin(tracked_stream)));
+        let writer_input_plan = self.create_writer_input_plan(stream_exec, target_partitions)?;
+        let writer_partitions = writer_input_plan
+            .properties()
+            .output_partitioning()
+            .partition_count();
 
         let insert_plan = snapshot_listing_table
-            .insert_into(session_state.as_ref(), stream_exec, InsertOp::Append)
+            .insert_into(session_state.as_ref(), writer_input_plan, InsertOp::Append)
             .await?;
 
         collect(insert_plan, session_state.task_ctx()).await?;
 
         let total_rows = total_rows_written.load(Ordering::Relaxed);
-        let writer_ops = usize::from(total_rows > 0); // 1 writer op if we wrote any rows, otherwise 0
+        let writer_ops = if total_rows > 0 { writer_partitions } else { 0 };
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
@@ -1971,6 +1984,48 @@ impl CayenneTableProvider {
         }
 
         Ok((total_rows, writer_ops, stats_accumulator))
+    }
+
+    fn create_writer_input_plan(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        session_target_partitions: usize,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let target_partitions = self.snapshot_write_concurrency(session_target_partitions);
+        if let Some(repartitioned) =
+            round_robin_repartition_if_needed(Arc::clone(&plan), target_partitions)?
+        {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                target_partitions,
+                "Repartitioning Cayenne snapshot write input for parallel Vortex writers"
+            );
+            Ok(repartitioned)
+        } else {
+            Ok(plan)
+        }
+    }
+
+    fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
+        if self.context.has_sort_columns() {
+            let configured_concurrency = self
+                .context
+                .write_concurrency()
+                .unwrap_or(session_target_partitions.max(1));
+            if configured_concurrency > 1 {
+                tracing::debug!(
+                    table = self.table_metadata.table_name.as_str(),
+                    configured_concurrency,
+                    "Using one Cayenne writer partition because sort_columns are configured"
+                );
+            }
+            1
+        } else {
+            self.context
+                .write_concurrency()
+                .unwrap_or(session_target_partitions)
+                .max(1)
+        }
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -3284,7 +3339,12 @@ impl CayenneTableProvider {
         }
 
         let (total_rows, chunk_count, _stats_acc) = self
-            .write_to_snapshot(sorted_stream, target_size_bytes, &new_snapshot_id)
+            .write_to_snapshot(
+                sorted_stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                ctx.state().config().target_partitions(),
+            )
             .await?;
 
         if total_rows == 0 {
@@ -4149,7 +4209,12 @@ impl CayenneTableProvider {
         let stats = if self.pk_deletion_strategy.is_position_based() {
             let target_size_bytes = self.context.target_file_size_bytes();
             let (_rows, _ops, stats) = self
-                .write_to_snapshot(stream, target_size_bytes, &self.get_current_snapshot_id()?)
+                .write_to_snapshot(
+                    stream,
+                    target_size_bytes,
+                    &self.get_current_snapshot_id()?,
+                    ctx.state().config().target_partitions(),
+                )
                 .await?;
             stats
         } else {
@@ -4158,7 +4223,11 @@ impl CayenneTableProvider {
                 .increment_sequence_number(&self.table_metadata.table_id)
                 .await?;
             let (_rows, stats) = self
-                .insert_to_new_snapshot_with_sequence(stream, sequence_number)
+                .insert_to_new_snapshot_with_sequence(
+                    stream,
+                    sequence_number,
+                    ctx.state().config().target_partitions(),
+                )
                 .await?;
             stats
         };
@@ -5791,7 +5860,7 @@ mod tests {
     use super::*;
 
     use datafusion::arrow::array::RecordBatch;
-    use datafusion::arrow::datatypes::SchemaRef;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::TableProviderFactory;
     use datafusion::common::{Constraints, ToDFSchema};
     use datafusion::datasource::memory::MemorySourceConfig;
@@ -6240,6 +6309,111 @@ mod tests {
             .expect("table created");
 
         (provider, temp_dir)
+    }
+
+    fn empty_write_stream_plan(schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
+        let stream = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::empty::<datafusion_common::Result<RecordBatch>>(),
+        );
+        Arc::new(StreamingExec::new(schema, Box::pin(stream)))
+    }
+
+    #[tokio::test]
+    async fn test_writer_input_plan_repartitions_unsorted_writes() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "parallel_unsorted_write",
+            Arc::clone(&schema),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let write_plan = provider
+            .create_writer_input_plan(empty_write_stream_plan(schema), 4)
+            .expect("writer input plan should be created");
+
+        assert!(
+            write_plan
+                .as_any()
+                .downcast_ref::<datafusion_physical_plan::repartition::RepartitionExec>()
+                .is_some(),
+            "unsorted writes should be repartitioned for parallel writers"
+        );
+        assert_eq!(
+            write_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn test_writer_input_plan_uses_configured_write_concurrency_override() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (mut provider, _temp_dir) = create_sorted_cayenne_table(
+            "parallel_write_override",
+            Arc::clone(&schema),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        provider.context = CayenneContext::new(
+            &VortexConfig {
+                write_concurrency: Some(2),
+                ..VortexConfig::default()
+            },
+            ctx.runtime_env(),
+        );
+
+        let write_plan = provider
+            .create_writer_input_plan(empty_write_stream_plan(schema), 4)
+            .expect("writer input plan should be created");
+
+        assert_eq!(
+            write_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_writer_input_plan_keeps_sorted_writes_single_partition() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "parallel_sorted_write",
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let write_plan = provider
+            .create_writer_input_plan(empty_write_stream_plan(schema), 4)
+            .expect("writer input plan should be created");
+
+        assert!(
+            write_plan
+                .as_any()
+                .downcast_ref::<datafusion_physical_plan::repartition::RepartitionExec>()
+                .is_none(),
+            "sorted writes should preserve one writer partition"
+        );
+        assert_eq!(
+            write_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            1
+        );
     }
 
     /// Helper to insert a `RecordBatch` into a `CayenneTableProvider`.
