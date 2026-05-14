@@ -70,6 +70,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Debezium {
     kafka_config: KafkaConfig,
     batching: (usize, Duration),
+    schema_evolution: bool,
 }
 
 impl Debezium {
@@ -167,9 +168,19 @@ impl Debezium {
             .and_then(|v| fundu::parse_duration(v).ok())
             .unwrap_or(Duration::from_secs(1));
 
+        let schema_evolution = params
+            .get("schema_evolution")
+            .expose()
+            .ok()
+            .unwrap_or("false")
+            .to_string()
+            .parse()
+            .unwrap_or(false);
+
         Ok(Self {
             kafka_config,
             batching: (batch_max_size, batch_max_duration),
+            schema_evolution,
         })
     }
 }
@@ -232,6 +243,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("batch_max_duration")
         .description("Maximum time to wait for a batch to fill before processing")
         .default("1s"),
+    ParameterSpec::runtime("schema_evolution")
+        .default("false")
+        .description("Enable automatic schema evolution detection on reload. When true, the connector peeks at the latest Kafka message to detect schema changes. Default: false."),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -357,6 +371,28 @@ impl DataConnector for Debezium {
                     }
                 );
 
+                let (metadata, schema) = if self.schema_evolution {
+                    // Check for schema evolution by peeking at the latest Kafka message
+                    refresh_schema_if_evolved(
+                        metadata,
+                        dataset,
+                        topic,
+                        &self.kafka_config,
+                        debezium_kafka_sys.as_deref(),
+                    )
+                    .await?
+                } else {
+                    let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                        metadata.schema_fields.iter().collect(),
+                    )
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?;
+                    (metadata, Arc::new(schema))
+                };
+
                 kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
@@ -372,16 +408,7 @@ impl DataConnector for Debezium {
                         connector_component: ConnectorComponent::from(dataset),
                     })?;
 
-                let schema = debezium::arrow::convert_fields_to_arrow_schema(
-                    metadata.schema_fields.iter().collect(),
-                )
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
-
-                (kafka_consumer, metadata, Arc::new(schema))
+                (kafka_consumer, metadata, schema)
             }
             None => {
                 get_metadata_from_kafka(
@@ -613,4 +640,87 @@ async fn get_metadata_from_kafka(
         })?;
 
     Ok((kafka_consumer, metadata, Arc::new(schema)))
+}
+
+/// Peek at the latest Kafka message to detect schema evolution. If the schema has
+/// changed from the cached metadata, update the stored metadata and return the fresh
+/// schema. Falls back to the cached schema if the peek fails or no messages are available.
+async fn refresh_schema_if_evolved(
+    metadata: DebeziumKafkaMetadata,
+    dataset: &Dataset,
+    topic: &str,
+    kafka_config: &KafkaConfig,
+    debezium_kafka_sys: Option<&DebeziumKafkaSys>,
+) -> super::DataConnectorResult<(DebeziumKafkaMetadata, SchemaRef)> {
+    let dataset_name = dataset.name.to_string();
+
+    let cached_schema =
+        debezium::arrow::convert_fields_to_arrow_schema(metadata.schema_fields.iter().collect())
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "debezium",
+                connector_component: ConnectorComponent::from(dataset),
+            })?;
+
+    // Try to peek at the latest Kafka message for the current schema
+    let peek_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        topic,
+        kafka_config,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let value = match peek_result {
+        Ok(Some((_key, value))) => value,
+        Ok(None) => {
+            tracing::debug!(
+                "Could not peek at latest Kafka message for schema check on dataset {dataset_name}. Using cached schema."
+            );
+            return Ok((metadata, Arc::new(cached_schema)));
+        }
+        Err(e) => {
+            tracing::debug!(
+                "Failed to peek at latest Kafka message for schema check on dataset {dataset_name}: {e}. Using cached schema."
+            );
+            return Ok((metadata, Arc::new(cached_schema)));
+        }
+    };
+
+    let Some(fresh_fields) = value.get_schema_fields() else {
+        return Ok((metadata, Arc::new(cached_schema)));
+    };
+
+    let fresh_schema = match debezium::arrow::convert_fields_to_arrow_schema(fresh_fields.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to convert fresh schema from Kafka for {dataset_name}: {e}. Using cached schema."
+            );
+            return Ok((metadata, Arc::new(cached_schema)));
+        }
+    };
+
+    if fresh_schema == cached_schema {
+        return Ok((metadata, Arc::new(cached_schema)));
+    }
+
+    tracing::info!("Detected schema evolution for dataset {dataset_name}. Updating cached schema.");
+
+    let updated_metadata = DebeziumKafkaMetadata {
+        consumer_group_id: metadata.consumer_group_id,
+        topic: metadata.topic,
+        primary_keys: metadata.primary_keys,
+        schema_fields: fresh_fields.into_iter().cloned().collect(),
+        offsets: metadata.offsets,
+    };
+
+    if let Some(debezium_kafka_sys) = debezium_kafka_sys
+        && let Err(e) = set_metadata_to_accelerator(debezium_kafka_sys, &updated_metadata).await
+    {
+        tracing::warn!(
+            "Failed to persist updated schema for {dataset_name}: {e}. Using fresh schema in-memory only."
+        );
+    }
+
+    Ok((updated_metadata, Arc::new(fresh_schema)))
 }

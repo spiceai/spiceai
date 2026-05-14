@@ -555,6 +555,84 @@ impl KafkaConsumer {
         })
     }
 
+    /// Fetch the latest message from a Kafka topic without affecting any existing
+    /// consumer group state.
+    ///
+    /// Creates a temporary consumer, seeks to the latest available message across
+    /// all partitions, reads it, and returns the owned key/value pair.
+    pub async fn fetch_latest_message<K: DeserializeOwned, V: DeserializeOwned>(
+        topic: &str,
+        kafka_config: &KafkaConfig,
+        timeout: Duration,
+    ) -> Result<Option<(Option<K>, V)>> {
+        let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
+        let mut peek_config = kafka_config.clone();
+        peek_config.metrics_store = None; // Avoid skewing real consumer metrics
+        let temp_consumer = Self::create(temp_group_id, &peek_config)?;
+
+        // Fetch topic metadata to discover partitions
+        let metadata = temp_consumer
+            .consumer
+            .fetch_metadata(Some(topic), timeout)
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to fetch topic metadata".to_string(),
+            })?;
+
+        let topic_metadata = metadata
+            .topics()
+            .iter()
+            .find(|t| t.name() == topic)
+            .context(MetadataTopicNotFoundSnafu {
+                topic: topic.to_string(),
+            })?;
+
+        // Find the partition with the highest watermark (most recent data)
+        let mut best_partition: Option<(i32, i64)> = None;
+        for partition in topic_metadata.partitions() {
+            let (low, high) = temp_consumer
+                .consumer
+                .fetch_watermarks(topic, partition.id(), timeout)
+                .context(UnableToRestartTopicSnafu {
+                    message: format!(
+                        "Failed to fetch watermarks for partition {}",
+                        partition.id()
+                    ),
+                })?;
+
+            if high > low {
+                match &best_partition {
+                    Some((_, best_high)) if high <= *best_high => {}
+                    _ => best_partition = Some((partition.id(), high)),
+                }
+            }
+        }
+
+        let Some((partition_id, high_watermark)) = best_partition else {
+            return Ok(None); // No messages available
+        };
+
+        // Manually assign the consumer to read from the latest offset
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        tpl.add_partition_offset(topic, partition_id, Offset::Offset(high_watermark - 1))
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to configure partition offset".to_string(),
+            })?;
+
+        temp_consumer
+            .consumer
+            .assign(&tpl)
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to assign partition".to_string(),
+            })?;
+
+        // Read the message with a timeout
+        match tokio::time::timeout(timeout, temp_consumer.next_json::<K, V>()).await {
+            Ok(Ok(Some(msg))) => Ok(Some(msg.into_key_value())),
+            Ok(Ok(None)) | Err(_) => Ok(None),
+            Ok(Err(e)) => Err(e),
+        }
+    }
+
     fn generate_group_id(dataset: &str) -> String {
         format!("spice.ai-{dataset}-{}", uuid::Uuid::new_v4())
     }
@@ -606,6 +684,11 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
         self.consumer
             .store_offset_from_message(&self.msg)
             .context(UnableToCommitMessageSnafu)
+    }
+
+    /// Consume the message and return owned key/value data.
+    pub fn into_key_value(self) -> (Option<K>, V) {
+        (self.key, self.value)
     }
 }
 

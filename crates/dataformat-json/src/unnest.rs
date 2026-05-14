@@ -165,7 +165,7 @@ pub fn nest_struct_schema(flattened_schema: &Schema, separator: &str) -> Schema 
 ///
 /// // Find which column in the nested schema the flattened "person.name" field belongs to
 /// let person_name_field = flattened_schema.field(1); // "person.name"
-/// let col_index = find_col_index(person_name_field, &nested_schema).unwrap();
+/// let col_index = find_col_index(person_name_field, &nested_schema, ".").unwrap();
 /// assert_eq!(col_index, 1); // The "person" struct is at index 1
 /// ```
 #[must_use]
@@ -247,7 +247,7 @@ fn flatten_json(
 /// ];
 /// let filtered_flattened = Schema::new(subset_fields);
 ///
-/// let projected_nested = project_nested_schema(&filtered_flattened, &original_nested);
+/// let projected_nested = project_nested_schema(&filtered_flattened, &original_nested, ".");
 /// // Result: [person{name, age, email}, status] - complete original fields
 /// ```
 #[must_use]

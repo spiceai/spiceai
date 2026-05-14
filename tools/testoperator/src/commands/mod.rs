@@ -38,6 +38,7 @@ pub(crate) mod append;
 pub(crate) mod bench;
 pub(crate) mod data_consistency;
 pub(crate) mod dispatch;
+pub(crate) mod htap;
 pub(crate) mod load;
 pub(crate) mod query;
 pub(crate) mod schema;
