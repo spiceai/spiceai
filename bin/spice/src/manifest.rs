@@ -17,7 +17,6 @@ limitations under the License.
 //! Helpers for reading and editing the root Spicepod manifest.
 
 use crate::error::{ConfigIoSnafu, Result};
-use serde::Deserialize;
 use snafu::ResultExt;
 use spicepod::spec::{SpicepodKind, SpicepodVersion};
 use std::path::{Path, PathBuf};
@@ -30,13 +29,6 @@ pub const SPICEPOD_YML: &str = "spicepod.yml";
 
 const SPICEPOD_FILENAMES: [&str; 2] = [SPICEPOD_YAML, SPICEPOD_YML];
 const SCHEMA_DIRECTIVE: &str = "# yaml-language-server: $schema=https://raw.githubusercontent.com/spiceai/spiceai/trunk/.schema/spicepod.schema.json";
-
-#[derive(Deserialize)]
-struct SpicepodManifestHeader {
-    name: String,
-    version: SpicepodVersion,
-    kind: SpicepodKind,
-}
 
 /// Returns the first existing root Spicepod manifest path, preferring `spicepod.yaml` over `spicepod.yml`.
 #[must_use]
@@ -229,16 +221,45 @@ fn ensure_sequence_field<'value>(
 
 /// Validates the root manifest header without rejecting newer fields this CLI does not edit.
 fn validate_spicepod_value(value: &Value, path: &Path) -> Result<()> {
-    let SpicepodManifestHeader {
-        name: _,
-        version: _,
-        kind: _,
-    } = yaml::from_value::<SpicepodManifestHeader>(value.clone()).map_err(|source| {
-        crate::error::Error::ConfigParse {
-            message: format!("Failed to parse {}: {source}", path.display()),
-        }
-    })?;
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| crate::error::Error::ConfigParse {
+            message: format!("Failed to parse {}: manifest must be a YAML mapping", path.display()),
+        })?;
 
+    let name = required_header_field(mapping, "name", path)?;
+    if !name.is_string() {
+        return Err(crate::error::Error::ConfigParse {
+            message: format!("Failed to parse {}: field 'name' must be a string", path.display()),
+        });
+    }
+
+    parse_header_field::<SpicepodVersion>(mapping, "version", path)?;
+    parse_header_field::<SpicepodKind>(mapping, "kind", path)?;
+
+    Ok(())
+}
+
+fn required_header_field<'a>(
+    mapping: &'a Mapping,
+    field: &str,
+    path: &Path,
+) -> Result<&'a Value> {
+    mapping
+        .get(Value::String(field.to_string()))
+        .ok_or_else(|| crate::error::Error::ConfigParse {
+            message: format!("Failed to parse {}: missing field '{field}'", path.display()),
+        })
+}
+
+fn parse_header_field<T>(mapping: &Mapping, field: &str, path: &Path) -> Result<()>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let value = required_header_field(mapping, field, path)?;
+    yaml::from_value::<T>(value.clone()).map_err(|source| crate::error::Error::ConfigParse {
+        message: format!("Failed to parse {} field '{field}': {source}", path.display()),
+    })?;
     Ok(())
 }
 

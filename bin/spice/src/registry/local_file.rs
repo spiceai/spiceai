@@ -357,7 +357,17 @@ mod tests {
 
         assert_eq!(installed_path, pods_dir.join("localpod"));
         assert!(pods_dir.join("localpod").join("spicepod.yaml").exists());
-        assert!(!pods_dir.join("LocalPod").exists());
+        let installed_names = std::fs::read_dir(&pods_dir)
+            .expect("pods dir should be readable")
+            .map(|entry| {
+                entry
+                    .expect("pods dir entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(installed_names, vec!["localpod".to_string()]);
     }
 
     #[tokio::test]
