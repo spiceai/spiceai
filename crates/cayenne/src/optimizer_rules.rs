@@ -60,17 +60,58 @@ limitations under the License.
 //!    chains so that a selective filter on one table reaches every transitively
 //!    equi-joined column at plan time, not just at runtime.
 //!
-//! Until at least #1 lands, q21 remains disabled in the chbench query set.
-//! See the comment in `crates/test-framework/src/queries/mod.rs` next to
+//!    Scaffolded in [`crate::logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys`].
+//!    DataFusion's stock `infer_join_predicates` only fires when the predicate
+//!    *already* references a join-key column (`WHERE n_nationkey = 5` →
+//!    `WHERE s_nationkey = 5`). For chbench q21 the selective filter is on a
+//!    non-key column (`n_name = 'CHINA'`), so no inference happens and the
+//!    nation→supplier→stock→order_line cardinality bound never reaches the
+//!    fact-table scans. The new rule introduces explicit `InSubquery` filters
+//!    that re-project the filtered side through the join key, letting
+//!    DataFusion's existing `DecorrelatePredicateSubquery` and partition
+//!    pruning paths see the bound at plan time.
+//!
+//! ## Audit notes (verified 2026-05-14 against the q21 explain snapshot at
+//! `crates/test-framework/src/snapshot/snapshots/explain/test_framework__snapshot__file[parquet]-cayenne[file]-indexes_tpch_q21_explain.snap`)
+//!
+//! * **Cayenne table statistics are `Exact` at the physical-plan boundary.**
+//!   The chain `CayenneTableProvider::statistics`
+//!   → [`crate::stats::file_statistics_to_df`] returns
+//!   `Precision::Exact(num_rows)` whenever the persisted `i64` row count is
+//!   non-negative. Per-file `Statistics` are also `Exact` because
+//!   `VortexFormat::infer_stats` reads `row_count` from the file footer, and
+//!   `SessionConfig::default().collect_statistics()` is `true`, so
+//!   `ListingTable::do_collect_statistics` is exercised for every scan.
+//!   `CayenneAccelerationExec::partition_statistics` simply delegates to the
+//!   inner `DataSourceExec`, so the value reaches `JoinSelection`. The q21
+//!   explain plan confirms `should_swap_join_order` picks the smaller side as
+//!   build at every level (nation/supplier on the LEFT, lineitem on the
+//!   RIGHT), so the residual OOM is *not* attributable to fuzzy stats — it is
+//!   the **logical** join order locking in the SQL `FROM` order and applying
+//!   the nation filter last.
+//!
+//! * **Build-side projections are minimal.** Every `CayenneAccelerationExec`
+//!   in the snapshot terminates in a `DataSourceExec` whose `projection=[...]`
+//!   lists only the join keys and the columns referenced above the join.
+//!   DataFusion's stock projection pushdown already prunes wider scans down to
+//!   `[s_suppkey, s_name, s_nationkey]`, `[o_orderkey, o_orderstatus]`,
+//!   `[l_orderkey, l_suppkey]`, etc. No additional `ProjectionExec` insertion
+//!   above the build side is required.
+//!
+//! Until at least #1 or #3 lands, q21 remains disabled in the chbench query
+//! set. See the comment in `crates/test-framework/src/queries/mod.rs` next to
 //! `get_chbench_test_queries`.
 
-use datafusion::common::NullEquality;
+use arrow::compute::SortOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::{JoinType, NullEquality};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::{error::Result, physical_plan::projection::ProjectionExec};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
@@ -114,6 +155,58 @@ impl CayenneDynamicFilterSharing {
 impl std::fmt::Debug for CayenneDynamicFilterSharing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CayenneDynamicFilterSharing").finish()
+    }
+}
+
+/// Rewrites same-source Cayenne anti joins from hash join to sort-merge join.
+///
+/// DataFusion's `HashJoinExec` always materializes its left input as the
+/// non-spillable build side. For q21's correlated `NOT EXISTS` self-join, that
+/// preserved side can be a large multi-way `order_line` result. Sort-merge join
+/// keeps anti-join semantics without allocating a full hash table for that side.
+#[derive(Default)]
+pub struct CayenneAntiJoinSortMergeRewriter;
+
+impl CayenneAntiJoinSortMergeRewriter {
+    /// Create a new `CayenneAntiJoinSortMergeRewriter` optimizer rule.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl std::fmt::Debug for CayenneAntiJoinSortMergeRewriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayenneAntiJoinSortMergeRewriter").finish()
+    }
+}
+
+impl PhysicalOptimizerRule for CayenneAntiJoinSortMergeRewriter {
+    fn name(&self) -> &'static str {
+        "CayenneAntiJoinSortMergeRewriter"
+    }
+
+    fn schema_check(&self) -> bool {
+        false
+    }
+
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        plan.transform_down(|node| {
+            let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() else {
+                return Ok(Transformed::no(node));
+            };
+
+            let Some(sort_merge_join) = try_rewrite_same_source_anti_join(hash_join)? else {
+                return Ok(Transformed::no(node));
+            };
+
+            Ok(Transformed::yes(sort_merge_join))
+        })
+        .data()
     }
 }
 
@@ -233,6 +326,115 @@ fn filter_additions_for_join(
     }
 
     (left_additions, right_additions)
+}
+
+fn try_rewrite_same_source_anti_join(
+    hash_join: &HashJoinExec,
+) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+    if !matches!(
+        hash_join.join_type(),
+        JoinType::LeftAnti | JoinType::RightAnti
+    ) {
+        return Ok(None);
+    }
+
+    if hash_join.contains_projection() || hash_join.on().is_empty() {
+        return Ok(None);
+    }
+
+    if !has_single_same_source_pair_for_all_join_keys(hash_join) {
+        return Ok(None);
+    }
+
+    let sort_options = vec![SortOptions::default(); hash_join.on().len()];
+    let Some(left_ordering) = join_key_ordering(
+        hash_join
+            .on()
+            .iter()
+            .map(|(left_key, _)| Arc::clone(left_key)),
+        &sort_options,
+    ) else {
+        return Ok(None);
+    };
+    let Some(right_ordering) = join_key_ordering(
+        hash_join
+            .on()
+            .iter()
+            .map(|(_, right_key)| Arc::clone(right_key)),
+        &sort_options,
+    ) else {
+        return Ok(None);
+    };
+
+    let left: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(left_ordering, Arc::clone(hash_join.left())));
+    let right: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(right_ordering, Arc::clone(hash_join.right())));
+
+    let join = SortMergeJoinExec::try_new(
+        left,
+        right,
+        hash_join.on().to_vec(),
+        hash_join.filter().cloned(),
+        *hash_join.join_type(),
+        sort_options,
+        hash_join.null_equality(),
+    )?;
+
+    tracing::debug!(
+        join_type = ?hash_join.join_type(),
+        "Replacing same-source Cayenne anti HashJoinExec with SortMergeJoinExec"
+    );
+
+    Ok(Some(Arc::new(join)))
+}
+
+fn join_key_ordering(
+    keys: impl Iterator<Item = Arc<dyn PhysicalExpr>>,
+    sort_options: &[SortOptions],
+) -> Option<LexOrdering> {
+    let sort_exprs = keys
+        .zip(sort_options.iter().copied())
+        .map(|(expr, options)| PhysicalSortExpr { expr, options })
+        .collect::<Vec<_>>();
+
+    LexOrdering::new(sort_exprs)
+}
+
+fn has_single_same_source_pair_for_all_join_keys(hash_join: &HashJoinExec) -> bool {
+    let left_scans = collect_cayenne_scans(hash_join.left());
+    let right_scans = collect_cayenne_scans(hash_join.right());
+    if left_scans.is_empty() || right_scans.is_empty() {
+        return false;
+    }
+
+    let mut matched_pair = None;
+    for (left_key, right_key) in hash_join.on() {
+        let Some(left_column) = physical_column_name(left_key) else {
+            return false;
+        };
+        let Some(right_column) = physical_column_name(right_key) else {
+            return false;
+        };
+
+        if left_column != right_column {
+            return false;
+        }
+
+        let pairs =
+            same_source_pairs_for_column(&left_scans, &right_scans, left_column, right_column);
+        let [(left_index, right_index)] = pairs.as_slice() else {
+            return false;
+        };
+        let pair = (*left_index, *right_index);
+
+        if matched_pair.is_some_and(|previous_pair| previous_pair != pair) {
+            return false;
+        }
+        matched_pair = Some(pair);
+    }
+
+    matched_pair.is_some()
 }
 
 fn collect_cayenne_scans(plan: &Arc<dyn ExecutionPlan>) -> Vec<CayenneScanSummary> {
@@ -508,7 +710,9 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{CayenneDynamicFilterSharing, CayenneJoinRewriter};
+    use super::{
+        CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
+    };
     use crate::provider::CayenneAccelerationExec;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::{JoinType, NullEquality};
@@ -516,8 +720,9 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_optimizer::PhysicalOptimizerRule;
-    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
     use datafusion::physical_plan::projection::ProjectionExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
     use datafusion_common::{DataFusionError, Result as DFResult};
     use datafusion_datasource::file::FileSource;
@@ -711,6 +916,24 @@ mod tests {
         right_column: &str,
         null_equality: NullEquality,
     ) -> HashJoinExec {
+        hash_join_with_join_type(
+            left,
+            right,
+            left_column,
+            right_column,
+            JoinType::Inner,
+            null_equality,
+        )
+    }
+
+    fn hash_join_with_join_type(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        left_column: &str,
+        right_column: &str,
+        join_type: JoinType,
+        null_equality: NullEquality,
+    ) -> HashJoinExec {
         let left_key = col(left_column, &left.schema()).expect("left join key should exist");
         let right_key = col(right_column, &right.schema()).expect("right join key should exist");
 
@@ -719,7 +942,7 @@ mod tests {
             right,
             vec![(left_key, right_key)],
             None,
-            &JoinType::Inner,
+            &join_type,
             None,
             PartitionMode::Partitioned,
             null_equality,
@@ -741,6 +964,12 @@ mod tests {
         CayenneDynamicFilterSharing::new()
             .optimize(plan, &ConfigOptions::default())
             .expect("filter sharing optimizer should succeed")
+    }
+
+    fn optimize_anti_join_sort_merge(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        CayenneAntiJoinSortMergeRewriter::new()
+            .optimize(plan, &ConfigOptions::default())
+            .expect("anti join sort-merge optimizer should succeed")
     }
 
     fn plan_snapshot(plan: &Arc<dyn ExecutionPlan>) -> String {
@@ -902,6 +1131,67 @@ mod tests {
             .expect("right side should remain Cayenne");
 
         assert!(right.dynamic_filters().is_empty());
+    }
+
+    #[test]
+    fn rewrites_same_source_left_anti_hash_join_to_sort_merge() {
+        let schema = order_line_schema();
+        let left = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
+        let right = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+        let sort_merge = optimized
+            .as_any()
+            .downcast_ref::<SortMergeJoinExec>()
+            .expect("same-source Cayenne anti join should use sort-merge join");
+
+        assert_eq!(JoinType::LeftAnti, sort_merge.join_type());
+        assert!(
+            sort_merge
+                .left()
+                .as_any()
+                .downcast_ref::<SortExec>()
+                .is_some(),
+            "left anti-join input should be explicitly sorted"
+        );
+        assert!(
+            sort_merge
+                .right()
+                .as_any()
+                .downcast_ref::<SortExec>()
+                .is_some(),
+            "right anti-join input should be explicitly sorted"
+        );
+    }
+
+    #[test]
+    fn leaves_unrelated_left_anti_hash_join_unchanged() {
+        let schema = order_line_schema();
+        let left = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
+        let right = cayenne_file_exec(Arc::clone(&schema), "other_order_line.vortex", None);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "anti joins over unrelated sources should stay as hash joins"
+        );
     }
 
     #[test]

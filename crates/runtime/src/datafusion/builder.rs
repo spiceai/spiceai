@@ -30,7 +30,11 @@ use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, stat
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 #[cfg(not(windows))]
-use cayenne::optimizer_rules::{CayenneDynamicFilterSharing, CayenneJoinRewriter};
+use cayenne::logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys;
+#[cfg(not(windows))]
+use cayenne::optimizer_rules::{
+    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
+};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -383,8 +387,15 @@ impl DataFusionBuilder {
             // and accumulator budget are only configured for supported targets.
             // Windows keeps DataFusion's standard hash-join dynamic filters.
             clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
+            // Logical: plan-time predicate transitive closure across equi-join
+            // keys. Must run before `push_down_filter` (DataFusion's built-in
+            // logical pass that decorrelates `InSubquery` and pushes the
+            // derived predicate down to the fact-table scan).
+            state = state
+                .with_optimizer_rule(Arc::new(CayennePropagateFilterAcrossEquiJoinKeys::new()));
             state = state
                 .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
+                .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()))
                 .with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
         }
         #[cfg(windows)]
@@ -953,6 +964,10 @@ mod tests {
             .iter()
             .position(|name| *name == "CayenneDynamicFilterSharing")
             .expect("Cayenne dynamic filter sharing rule should be registered");
+        let cayenne_anti_sort_merge_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneAntiJoinSortMergeRewriter")
+            .expect("Cayenne anti join sort-merge rewriter should be registered");
 
         assert!(
             sanity_check_position < cayenne_rewriter_position,
@@ -965,6 +980,14 @@ mod tests {
         assert!(
             cayenne_filter_sharing_position < cayenne_rewriter_position,
             "CayenneDynamicFilterSharing must run before CayenneJoinRewriter so it can inspect DataFusion's default HashJoinExec nodes"
+        );
+        assert!(
+            cayenne_filter_sharing_position < cayenne_anti_sort_merge_position,
+            "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so anti joins can still receive shared scan filters"
+        );
+        assert!(
+            cayenne_anti_sort_merge_position < cayenne_rewriter_position,
+            "CayenneAntiJoinSortMergeRewriter must run before CayenneJoinRewriter so anti joins are not recreated with the hash-join accumulator"
         );
     }
 
