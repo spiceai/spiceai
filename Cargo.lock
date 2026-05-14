@@ -24,8 +24,8 @@ version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46b169525a7c41670fe95874103c7c6ce713ac699123f81a200bc31f9ad3b02e"
 dependencies = [
- "arrow-array",
- "arrow-schema",
+ "arrow-array 57.2.0",
+ "arrow-schema 57.2.0",
 ]
 
 [[package]]
@@ -36,8 +36,8 @@ checksum = "12aa1ae565ec6d45cfe71c20b5c2b3cbd6ba5d7176ecd0c0a448e970a93c35e4"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
- "arrow-array",
- "arrow-schema",
+ "arrow-array 57.2.0",
+ "arrow-schema 57.2.0",
  "libloading 0.8.9",
  "path-slash",
  "regex",
@@ -53,8 +53,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6851c2ab953511cf7a244aadcbc0586442fd3c67dfe371457369048880dd513"
 dependencies = [
  "adbc_core",
- "arrow-array",
- "arrow-schema",
+ "arrow-array 57.2.0",
+ "arrow-schema 57.2.0",
 ]
 
 [[package]]
@@ -444,7 +444,7 @@ checksum = "0ae92a5119aa49cdbcf6b9f893fe4e1d98b04ccbf82ee0584ad948a44a734dea"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -476,19 +476,19 @@ name = "arrow"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
+ "arrow-arith 57.2.0",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-cast 57.2.0",
  "arrow-csv",
- "arrow-data",
+ "arrow-data 57.2.0",
  "arrow-ipc",
  "arrow-json",
- "arrow-ord",
+ "arrow-ord 57.2.0",
  "arrow-row",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
+ "arrow-schema 57.2.0",
+ "arrow-select 57.2.0",
+ "arrow-string 57.2.0",
 ]
 
 [[package]]
@@ -496,10 +496,24 @@ name = "arrow-arith"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-schema 57.2.0",
+ "chrono",
+ "num-traits",
+]
+
+[[package]]
+name = "arrow-arith"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0ab212d2c1886e802f51c5212d78ebbcbb0bec980fff9dadc1eb8d45cd0b738"
+dependencies = [
+ "arrow-array 58.3.0",
+ "arrow-buffer 58.3.0",
+ "arrow-data 58.3.0",
+ "arrow-schema 58.3.0",
  "chrono",
  "num-traits",
 ]
@@ -510,13 +524,31 @@ version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "ahash 0.8.12",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-buffer 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-schema 57.2.0",
  "chrono",
  "chrono-tz 0.10.4",
  "half",
  "hashbrown 0.16.1",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "arrow-array"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfd33d3e92f207444098c75b42de99d329562be0cf686b307b097cc52b4e999e"
+dependencies = [
+ "ahash 0.8.12",
+ "arrow-buffer 58.3.0",
+ "arrow-data 58.3.0",
+ "arrow-schema 58.3.0",
+ "chrono",
+ "half",
+ "hashbrown 0.17.0",
  "num-complex",
  "num-integer",
  "num-traits",
@@ -534,16 +566,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-buffer"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c6cd424c2693bcdbc150d843dc9d4d137dd2de4782ce6df491ad11a3a0416c0"
+dependencies = [
+ "bytes",
+ "half",
+ "num-bigint",
+ "num-traits",
+]
+
+[[package]]
 name = "arrow-cast"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-ord 57.2.0",
+ "arrow-schema 57.2.0",
+ "arrow-select 57.2.0",
  "atoi",
  "base64 0.22.1",
  "chrono",
@@ -555,13 +599,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-cast"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c5aefb56a2c02e9e2b30746241058b85f8983f0fcff2ba0c6d09006e1cded7f"
+dependencies = [
+ "arrow-array 58.3.0",
+ "arrow-buffer 58.3.0",
+ "arrow-data 58.3.0",
+ "arrow-ord 58.3.0",
+ "arrow-schema 58.3.0",
+ "arrow-select 58.3.0",
+ "atoi",
+ "base64 0.22.1",
+ "chrono",
+ "half",
+ "lexical-core",
+ "num-traits",
+ "ryu",
+]
+
+[[package]]
 name = "arrow-csv"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-array",
- "arrow-cast",
- "arrow-schema",
+ "arrow-array 57.2.0",
+ "arrow-cast 57.2.0",
+ "arrow-schema 57.2.0",
  "chrono",
  "csv",
  "csv-core",
@@ -573,8 +638,21 @@ name = "arrow-data"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-buffer",
- "arrow-schema",
+ "arrow-buffer 57.2.0",
+ "arrow-schema 57.2.0",
+ "half",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "arrow-data"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c88210023a2bfee1896af366309a3028fc3bcbd6515fa29a7990ee1baa08ee0"
+dependencies = [
+ "arrow-buffer 58.3.0",
+ "arrow-schema 58.3.0",
  "half",
  "num-integer",
  "num-traits",
@@ -585,17 +663,17 @@ name = "arrow-flight"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
+ "arrow-arith 57.2.0",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-cast 57.2.0",
+ "arrow-data 57.2.0",
  "arrow-ipc",
- "arrow-ord",
+ "arrow-ord 57.2.0",
  "arrow-row",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
+ "arrow-schema 57.2.0",
+ "arrow-select 57.2.0",
+ "arrow-string 57.2.0",
  "base64 0.22.1",
  "bytes",
  "futures",
@@ -612,11 +690,11 @@ name = "arrow-ipc"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-schema 57.2.0",
+ "arrow-select 57.2.0",
  "flatbuffers",
  "lz4_flex 0.12.1",
  "zstd",
@@ -627,11 +705,11 @@ name = "arrow-json"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-cast 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-schema 57.2.0",
  "chrono",
  "half",
  "indexmap 2.14.0",
@@ -663,11 +741,24 @@ name = "arrow-ord"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-schema 57.2.0",
+ "arrow-select 57.2.0",
+]
+
+[[package]]
+name = "arrow-ord"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bffd8fd2579286a5d63bac898159873e5094a79009940bcb42bbfce4f19f1d0"
+dependencies = [
+ "arrow-array 58.3.0",
+ "arrow-buffer 58.3.0",
+ "arrow-data 58.3.0",
+ "arrow-schema 58.3.0",
+ "arrow-select 58.3.0",
 ]
 
 [[package]]
@@ -675,10 +766,10 @@ name = "arrow-row"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-schema 57.2.0",
  "half",
 ]
 
@@ -694,15 +785,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-schema"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
+dependencies = [
+ "bitflags 2.10.0",
+]
+
+[[package]]
 name = "arrow-select"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "ahash 0.8.12",
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-schema 57.2.0",
+ "num-traits",
+]
+
+[[package]]
+name = "arrow-select"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cd065c54172ac787cf3f2f8d4107e0d3fdc26edba76fdf4f4cc170258942222"
+dependencies = [
+ "ahash 0.8.12",
+ "arrow-array 58.3.0",
+ "arrow-buffer 58.3.0",
+ "arrow-data 58.3.0",
+ "arrow-schema 58.3.0",
  "num-traits",
 ]
 
@@ -711,11 +825,28 @@ name = "arrow-string"
 version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-schema 57.2.0",
+ "arrow-select 57.2.0",
+ "memchr",
+ "num-traits",
+ "regex",
+ "regex-syntax",
+]
+
+[[package]]
+name = "arrow-string"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29dd7cda3ab9692f43a2e4acc444d760cc17b12bb6d8232ddf64e9bab7c06b42"
+dependencies = [
+ "arrow-array 58.3.0",
+ "arrow-buffer 58.3.0",
+ "arrow-data 58.3.0",
+ "arrow-schema 58.3.0",
+ "arrow-select 58.3.0",
  "memchr",
  "num-traits",
  "regex",
@@ -741,9 +872,9 @@ name = "arrow_tools"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
- "arrow-cast",
+ "arrow-cast 57.2.0",
  "arrow-json",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "datafusion",
  "insta",
  "serde_json",
@@ -824,7 +955,7 @@ checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "synstructure 0.13.2",
 ]
 
@@ -847,7 +978,7 @@ checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1019,7 +1150,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strum 0.27.2",
- "syn 2.0.114",
+ "syn 2.0.117",
  "thiserror 2.0.18",
 ]
 
@@ -1122,7 +1253,7 @@ source = "git+https://github.com/spiceai/async-openai?rev=8dbb88bcd14b70dfd92ddd
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1151,7 +1282,7 @@ checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1217,7 +1348,7 @@ checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1234,7 +1365,7 @@ checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1302,7 +1433,7 @@ dependencies = [
  "derive_utils",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1980,7 +2111,7 @@ checksum = "8d7396fd9500589e62e460e987ecb671bad374934e55ec3b5f498cc7a8a8a7b7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2118,7 +2249,7 @@ checksum = "604fde5e028fea851ce1d8570bbdc034bec850d157f7569d10f347d06808c05c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2181,7 +2312,7 @@ checksum = "190d6e0622d17e2a28239b55d2829d98b348269adcd4ab86a21d3304aa3500cb"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "tracing",
 ]
 
@@ -2320,7 +2451,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=383e165a080d648c313a2530a3a53eae6077fdba#383e165a080d648c313a2530a3a53eae6077fdba"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=c14e3e7cda4f32fef9b283e5d21ee8de75443897#c14e3e7cda4f32fef9b283e5d21ee8de75443897"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2361,7 +2492,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=383e165a080d648c313a2530a3a53eae6077fdba#383e165a080d648c313a2530a3a53eae6077fdba"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=c14e3e7cda4f32fef9b283e5d21ee8de75443897#c14e3e7cda4f32fef9b283e5d21ee8de75443897"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2394,7 +2525,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=383e165a080d648c313a2530a3a53eae6077fdba#383e165a080d648c313a2530a3a53eae6077fdba"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=c14e3e7cda4f32fef9b283e5d21ee8de75443897#c14e3e7cda4f32fef9b283e5d21ee8de75443897"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2561,7 +2692,7 @@ dependencies = [
  "regex",
  "rustc-hash 1.1.0",
  "shlex",
- "syn 2.0.114",
+ "syn 2.0.117",
  "which 4.4.2",
 ]
 
@@ -2582,7 +2713,7 @@ dependencies = [
  "regex",
  "rustc-hash 2.1.1",
  "shlex",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2600,7 +2731,7 @@ dependencies = [
  "regex",
  "rustc-hash 2.1.1",
  "shlex",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2869,7 +3000,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2892,7 +3023,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3049,7 +3180,7 @@ checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3146,7 +3277,7 @@ dependencies = [
  "darling 0.20.11",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3393,7 +3524,7 @@ dependencies = [
  "arrow-flight",
  "arrow-ipc",
  "arrow-row",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -3732,7 +3863,7 @@ dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4941,7 +5072,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13b588ba4ac1a99f7f2964d24b3d896ddc6bf847ee3855dbd4366f058cfcd331"
 dependencies = [
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5080,7 +5211,7 @@ checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5184,7 +5315,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim 0.11.1",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5198,7 +5329,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim 0.11.1",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5211,7 +5342,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim 0.11.1",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5244,7 +5375,7 @@ checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
 dependencies = [
  "darling_core 0.20.11",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5255,7 +5386,7 @@ checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
 dependencies = [
  "darling_core 0.21.3",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5266,7 +5397,7 @@ checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
 dependencies = [
  "darling_core 0.23.0",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5304,8 +5435,8 @@ version = "2.0.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
- "arrow-array",
- "arrow-buffer",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
  "arrow-flight",
  "arrow-row",
  "arrow_tools",
@@ -5432,7 +5563,7 @@ version = "52.5.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=06e4b624c6073c40c7b2127ce620e281ec1979ae#06e4b624c6073c40c7b2127ce620e281ec1979ae"
 dependencies = [
  "arrow",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "async-trait",
  "bytes",
  "bzip2",
@@ -5790,7 +5921,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "arrow-ipc",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "arrow_tools",
  "async-stream",
  "bytes",
@@ -5817,7 +5948,7 @@ version = "52.5.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=06e4b624c6073c40c7b2127ce620e281ec1979ae#06e4b624c6073c40c7b2127ce620e281ec1979ae"
 dependencies = [
  "arrow",
- "arrow-buffer",
+ "arrow-buffer 57.2.0",
  "base64 0.22.1",
  "blake2",
  "blake3",
@@ -5891,7 +6022,7 @@ version = "52.5.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=06e4b624c6073c40c7b2127ce620e281ec1979ae#06e4b624c6073c40c7b2127ce620e281ec1979ae"
 dependencies = [
  "arrow",
- "arrow-ord",
+ "arrow-ord 57.2.0",
  "datafusion-common",
  "datafusion-doc",
  "datafusion-execution",
@@ -5955,7 +6086,7 @@ source = "git+https://github.com/spiceai/datafusion.git?rev=06e4b624c6073c40c7b2
 dependencies = [
  "datafusion-doc",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6086,8 +6217,8 @@ source = "git+https://github.com/spiceai/datafusion.git?rev=06e4b624c6073c40c7b2
 dependencies = [
  "ahash 0.8.12",
  "arrow",
- "arrow-ord",
- "arrow-schema",
+ "arrow-ord 57.2.0",
+ "arrow-schema 57.2.0",
  "async-trait",
  "datafusion-common",
  "datafusion-common-runtime",
@@ -6246,7 +6377,7 @@ dependencies = [
  "adbc_driver_manager",
  "arrow",
  "arrow-json",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "async-stream",
  "async-trait",
  "bb8",
@@ -6413,7 +6544,7 @@ source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=47034733a0477f7
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6494,7 +6625,7 @@ checksum = "2cdc8d50f426189eef89dac62fabfa0abb27d5cc008f25bf4156a0203325becc"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6505,7 +6636,7 @@ checksum = "d65d7ce8132b7c0e54497a4d9a55a1c2a0912a0d786cf894472ba818fba45762"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6516,7 +6647,7 @@ checksum = "ef941ded77d15ca19b40374869ac6000af1c9f2a4c0f3d4c70926287e6364a8f"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6527,7 +6658,7 @@ checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6548,7 +6679,7 @@ dependencies = [
  "darling 0.20.11",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6558,7 +6689,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
 dependencies = [
  "derive_builder_core",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6580,7 +6711,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustc_version",
- "syn 2.0.114",
+ "syn 2.0.117",
  "unicode-xid",
 ]
 
@@ -6592,7 +6723,7 @@ checksum = "ccfae181bab5ab6c5478b2ccb69e4c68a02f8c3ec72f6616bfec9dbc599d2ee0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6713,7 +6844,7 @@ checksum = "97369cbbc041bc366949bc74d34658d6cda5621039731c6310521892a3a20ae0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7095,7 +7226,7 @@ dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7115,7 +7246,7 @@ checksum = "685adfa4d6f3d765a26bc5dbc936577de9abf756c1feeb3089b01dd395034842"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7135,7 +7266,7 @@ checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7182,7 +7313,7 @@ checksum = "44f23cf4b44bfce11a86ace86f8a73ffdec849c9fd00a386a53d278bd9e81fb3"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7487,7 +7618,7 @@ checksum = "a0aca10fb742cb43f9e7bb8467c91aa9bcb8e3ffbc6a6f7389bb93ffc920577d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7585,9 +7716,9 @@ dependencies = [
 name = "flight-cookie-server"
 version = "2.0.0-unstable"
 dependencies = [
- "arrow-array",
+ "arrow-array 57.2.0",
  "arrow-flight",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "bytes",
  "clap",
  "futures",
@@ -7712,7 +7843,7 @@ checksum = "1a5c6c585bc94aaf2c7b51dd4c2ba22680844aba4c687be581871a6f518c5742"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7892,7 +8023,7 @@ checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -8214,7 +8345,7 @@ dependencies = [
  "log",
  "rustversion",
  "windows-link 0.1.3",
- "windows-result 0.4.1",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -8694,10 +8825,10 @@ name = "hash-index"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
- "arrow-array",
- "arrow-buffer",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
  "arrow-row",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "criterion 0.6.0",
  "parking_lot 0.12.5",
  "rand 0.10.1",
@@ -8774,6 +8905,8 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -9338,7 +9471,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -9358,14 +9491,14 @@ dependencies = [
  "anyhow",
  "apache-avro",
  "array-init",
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
+ "arrow-arith 57.2.0",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-cast 57.2.0",
+ "arrow-ord 57.2.0",
+ "arrow-schema 57.2.0",
+ "arrow-select 57.2.0",
+ "arrow-string 57.2.0",
  "as-any",
  "async-trait",
  "backon",
@@ -9772,7 +9905,7 @@ checksum = "c727f80bfa4a6c6e2508d2f05b6f4bfce242030bd88ed15ae5331c5b5d30fba7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -9847,7 +9980,7 @@ checksum = "c34819042dc3d3971c46c2190835914dfbe0c3c13f61449b2997f4e9722dfa60"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10021,7 +10154,7 @@ checksum = "e0c84ee7f197eca9a86c6fd6cb771e55eb991632f15f2bc3ca6ec838929e6e78"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10247,7 +10380,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10546,7 +10679,7 @@ checksum = "e5cec0ec4228b4853bb129c84dbf093a27e6c7a20526da046defc334a1b017f7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10608,7 +10741,7 @@ checksum = "de66c928222984aea59fcaed8ba627f388aaac3c1f57dcb05cc25495ef8faefe"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10743,7 +10876,7 @@ dependencies = [
  "quote",
  "regex-automata",
  "regex-syntax",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10909,7 +11042,7 @@ dependencies = [
  "macro_magic_core",
  "macro_magic_macros",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10923,7 +11056,7 @@ dependencies = [
  "macro_magic_core_macros",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10934,7 +11067,7 @@ checksum = "b02abfe41815b5bd98dbd4260173db2c116dda171dc0fe7838cb206333b83308"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10945,7 +11078,7 @@ checksum = "73ea28ee64b88876bf45277ed9a5817c1817df061a74f2b988971a12570e5869"
 dependencies = [
  "macro_magic_core",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -11191,7 +11324,7 @@ checksum = "db5b29714e950dbb20d5e6f74f9dcec4edbcc1067bb7f8ed198c097b8c1a818b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -11424,7 +11557,7 @@ dependencies = [
  "darling 0.23.0",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -11637,7 +11770,7 @@ dependencies = [
  "macro_magic",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -11659,7 +11792,7 @@ checksum = "e4db6d5580af57bf992f59068d4ea26fd518574ff48d7639b255a36f9de6e7e9"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -11713,7 +11846,7 @@ checksum = "b093064383341eb3271f42e381cb8f10a01459478446953953c75d24bd339fc0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "target-features",
 ]
 
@@ -11742,7 +11875,7 @@ dependencies = [
  "proc-macro-error2",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "termcolor",
  "thiserror 2.0.18",
 ]
@@ -12159,7 +12292,7 @@ checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -12247,7 +12380,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -12840,7 +12973,7 @@ checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -13067,7 +13200,7 @@ name = "otel-arrow"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
- "arrow-buffer",
+ "arrow-buffer 57.2.0",
  "async-trait",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -13105,7 +13238,7 @@ dependencies = [
  "proc-macro2",
  "proc-macro2-diagnostics",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -13257,13 +13390,13 @@ version = "57.2.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "ahash 0.8.12",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-cast 57.2.0",
+ "arrow-data 57.2.0",
  "arrow-ipc",
- "arrow-schema",
- "arrow-select",
+ "arrow-schema 57.2.0",
+ "arrow-select 57.2.0",
  "base64 0.22.1",
  "brotli",
  "bytes",
@@ -13470,7 +13603,7 @@ dependencies = [
  "pest_meta",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -13595,7 +13728,7 @@ dependencies = [
  "phf_shared 0.13.1",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -13642,7 +13775,7 @@ checksum = "6e918e4ff8c4549eb882f14b3a4bc8c8bc93de829416eacf579f1207a8fbf861"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -13665,7 +13798,7 @@ checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
  "arrayvec",
  "hashbrown 0.5.0",
- "parking_lot 0.12.5",
+ "parking_lot 0.11.2",
  "rand 0.8.5",
 ]
 
@@ -13986,7 +14119,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72dd2d6d381dfb73a193c7fca536518d7caee39fc8503f74e7dc0be0531b425c"
 dependencies = [
  "predicates-core",
- "termtree",
+ "termtree 0.5.1",
 ]
 
 [[package]]
@@ -14002,7 +14135,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -14051,7 +14184,7 @@ dependencies = [
  "proc-macro-error-attr2",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -14071,7 +14204,7 @@ checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "version_check",
  "yansi",
 ]
@@ -14106,7 +14239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52717f9a02b6965224f95ca2a81e2e0c5c43baacd28ca057577988930b6c3d5b"
 dependencies = [
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -14150,8 +14283,8 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.14.0",
+ "heck 0.5.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph",
@@ -14161,7 +14294,7 @@ dependencies = [
  "pulldown-cmark 0.13.0",
  "pulldown-cmark-to-cmark",
  "regex",
- "syn 2.0.114",
+ "syn 2.0.117",
  "tempfile",
 ]
 
@@ -14185,10 +14318,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -14301,7 +14434,7 @@ checksum = "00c6433917e3789605b1f4cd2a589f637ff17212344e7fa5ba99544625ba52c7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -14397,7 +14530,7 @@ dependencies = [
  "proc-macro2",
  "pyo3-macros-backend",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -14410,7 +14543,7 @@ dependencies = [
  "proc-macro2",
  "pyo3-build-config",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -14979,7 +15112,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76009fbe0614077fc1a2ce255e3a1881a2e3a3527097d5dc6d8212c585e7e38b"
 dependencies = [
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -15052,7 +15185,7 @@ checksum = "b7186006dcb21920990093f30e3dea63b7d6e977bf1256be20c3563a5db070da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -15128,7 +15261,7 @@ checksum = "d7ef12e84481ab4006cb942f8682bba28ece7270743e649442027c5db87df126"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -15530,7 +15663,7 @@ dependencies = [
  "regex",
  "relative-path",
  "rustc_version",
- "syn 2.0.114",
+ "syn 2.0.117",
  "unicode-ident",
 ]
 
@@ -15548,7 +15681,7 @@ dependencies = [
  "regex",
  "relative-path",
  "rustc_version",
- "syn 2.0.114",
+ "syn 2.0.117",
  "unicode-ident",
 ]
 
@@ -15578,7 +15711,7 @@ dependencies = [
  "arrow-flight",
  "arrow-ipc",
  "arrow-json",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "arrow_tools",
  "async-graphql",
  "async-graphql-axum",
@@ -15794,7 +15927,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "anyhow",
  "arrow",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "arrow_tools",
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -15874,7 +16007,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "arrow-ipc",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -15910,7 +16043,7 @@ name = "runtime-datafusion"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -15966,7 +16099,7 @@ dependencies = [
  "arrow",
  "arrow-ipc",
  "arrow-json",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "async-openai",
  "async-stream",
  "async-trait",
@@ -16138,7 +16271,7 @@ name = "runtime-table-partition"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "async-trait",
  "chrono",
  "criterion 0.5.1",
@@ -16191,7 +16324,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rust-embed-utils",
- "syn 2.0.114",
+ "syn 2.0.117",
  "walkdir",
 ]
 
@@ -16504,7 +16637,7 @@ checksum = "5d66de233f908aebf9cc30ac75ef9103185b4b715c6f2fb7a626aa5e5ede53ab"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -16710,7 +16843,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -16722,7 +16855,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -16827,7 +16960,7 @@ dependencies = [
  "darling 0.20.11",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -16851,7 +16984,7 @@ dependencies = [
  "heck 0.4.1",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "thiserror 1.0.69",
 ]
 
@@ -16867,7 +17000,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "async-stream",
  "async-trait",
  "chunking",
@@ -17042,7 +17175,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -17091,7 +17224,7 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -17102,7 +17235,7 @@ checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -17158,7 +17291,7 @@ checksum = "175ee3e80ae9982737ca543e96133087cbd9a485eecc3bc4de9c1a37b47ea59c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -17179,7 +17312,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -17222,7 +17355,7 @@ dependencies = [
  "darling 0.21.3",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -17559,10 +17692,10 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -17594,9 +17727,9 @@ name = "snowflake-api"
 version = "0.14.0"
 source = "git+https://github.com/spiceai/snowflake-rs.git?rev=3d2e6fb4290c751d07e62c5f18705b934ca182ee#3d2e6fb4290c751d07e62c5f18705b934ca182ee"
 dependencies = [
- "arrow-array",
+ "arrow-array 57.2.0",
  "arrow-ipc",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
@@ -18056,7 +18189,7 @@ checksum = "da5fc6819faabb412da764b99d3b713bb55083c11e7e0c00144d386cd6a1939c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -18237,7 +18370,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -18250,7 +18383,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -18262,7 +18395,7 @@ dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -18285,7 +18418,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "syn 2.0.114",
+ "syn 2.0.117",
  "typify",
  "walkdir",
 ]
@@ -18460,9 +18593,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "2.0.114"
+version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4d107df263a3013ef9b1879b0df87d706ff80f65a86ea879bd9c31f9b307c2a"
+checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -18498,7 +18631,7 @@ checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -18548,7 +18681,7 @@ name = "system-adapter-protocol"
 version = "0.1.0"
 source = "git+https://github.com/spiceai/spicebench.git?rev=6327983bc1a90123e0c754b79781b931c969831e#6327983bc1a90123e0c754b79781b931c969831e"
 dependencies = [
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "async-trait",
  "reqwest 0.12.24",
  "serde",
@@ -18871,6 +19004,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
+name = "termtree"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4d1330fe7f7f872cd05165130b10602d667b205fd85be09be2814b115d4ced9"
+
+[[package]]
 name = "test-framework"
 version = "2.0.0-unstable"
 dependencies = [
@@ -18878,7 +19017,7 @@ dependencies = [
  "app",
  "arrow",
  "arrow-json",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "arrow_tools",
  "async-channel 2.5.0",
  "async-openai",
@@ -18941,7 +19080,7 @@ checksum = "be35209fd0781c5401458ab66e4f98accf63553e8fae7425503e92fdd319783b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -19046,7 +19185,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",
@@ -19085,7 +19224,7 @@ checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -19096,7 +19235,7 @@ checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -19406,7 +19545,7 @@ checksum = "af407857209536a95c8e56f8231ef2c2e2aff839b22e07a1ffcbc617e9db9fa5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -19676,7 +19815,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -19714,7 +19853,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "tempfile",
  "tonic-build",
 ]
@@ -19850,7 +19989,7 @@ checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -19938,7 +20077,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04659ddb06c87d233c566112c1c9c5b9e98256d9af50ec3bc9c8327f873a7568"
 dependencies = [
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -20218,7 +20357,7 @@ checksum = "9c846c30c3cb085884a8bbaba7760bdcc406ff2176cbde1e51d41b6057171fd4"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -20260,7 +20399,7 @@ checksum = "4b90fe1bcada9dda8b8e20900f744bdd52f641cccc179f1507e83f8f2ec0b1dc"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -20348,7 +20487,7 @@ checksum = "3c36781cc0e46a83726d9879608e4cf6c2505237e263a8eb8c24502989cfdb28"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -20359,7 +20498,7 @@ checksum = "0e48cea23f68d1f78eb7bc092881b6bb88d3d6b5b7e6234f6f9c911da1ffb221"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -20428,7 +20567,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustc_version",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -20452,7 +20591,7 @@ checksum = "27a7a9b72ba121f6f1f6c3632b85604cac41aedb5ddc70accbebb6cac83de846"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -20480,7 +20619,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "syn 2.0.114",
+ "syn 2.0.117",
  "thiserror 2.0.18",
  "unicode-ident",
 ]
@@ -20498,7 +20637,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_tokenstream",
- "syn 2.0.114",
+ "syn 2.0.117",
  "typify-impl",
 ]
 
@@ -20757,7 +20896,7 @@ name = "util"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "backoff",
  "chrono",
  "ctrlc",
@@ -20796,7 +20935,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -20960,25 +21099,25 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
 dependencies = [
  "arcref",
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
+ "arrow-arith 58.3.0",
+ "arrow-array 58.3.0",
+ "arrow-buffer 58.3.0",
+ "arrow-cast 58.3.0",
+ "arrow-data 58.3.0",
+ "arrow-ord 58.3.0",
+ "arrow-schema 58.3.0",
+ "arrow-select 58.3.0",
+ "arrow-string 58.3.0",
  "async-lock",
  "bytes",
  "cfg-if",
  "enum-iterator",
  "flatbuffers",
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.1",
  "half",
  "humansize",
  "inventory",
@@ -20991,12 +21130,14 @@ dependencies = [
  "paste",
  "pin-project-lite",
  "prost 0.14.3",
- "rand 0.9.4",
+ "rand 0.10.1",
  "rustc-hash 2.1.1",
  "simdutf8",
  "static_assertions",
- "termtree",
+ "termtree 1.0.0",
  "tracing",
+ "uuid 1.21.0",
+ "vortex-array-macros",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
@@ -21012,15 +21153,15 @@ version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e#d694abda6cf4081a7a6e93b08da1bba28204f41e"
 dependencies = [
  "arcref",
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
+ "arrow-arith 57.2.0",
+ "arrow-array 57.2.0",
+ "arrow-buffer 57.2.0",
+ "arrow-cast 57.2.0",
+ "arrow-data 57.2.0",
+ "arrow-ord 57.2.0",
+ "arrow-schema 57.2.0",
+ "arrow-select 57.2.0",
+ "arrow-string 57.2.0",
  "async-lock",
  "bytes",
  "cfg-if",
@@ -21044,7 +21185,7 @@ dependencies = [
  "rustc-hash 2.1.1",
  "simdutf8",
  "static_assertions",
- "termtree",
+ "termtree 0.5.1",
  "tracing",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e)",
@@ -21053,6 +21194,16 @@ dependencies = [
  "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e)",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e)",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e)",
+]
+
+[[package]]
+name = "vortex-array-macros"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -21089,9 +21240,9 @@ dependencies = [
 [[package]]
 name = "vortex-buffer"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
 dependencies = [
- "arrow-buffer",
+ "arrow-buffer 58.3.0",
  "bitvec",
  "bytes",
  "itertools 0.14.0",
@@ -21104,7 +21255,7 @@ name = "vortex-buffer"
 version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e#d694abda6cf4081a7a6e93b08da1bba28204f41e"
 dependencies = [
- "arrow-buffer",
+ "arrow-buffer 57.2.0",
  "bitvec",
  "bytes",
  "itertools 0.14.0",
@@ -21129,7 +21280,7 @@ name = "vortex-datafusion"
 version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e#d694abda6cf4081a7a6e93b08da1bba28204f41e"
 dependencies = [
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "async-trait",
  "datafusion-catalog",
  "datafusion-common",
@@ -21185,9 +21336,9 @@ dependencies = [
 [[package]]
 name = "vortex-error"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
 dependencies = [
- "arrow-schema",
+ "arrow-schema 58.3.0",
  "flatbuffers",
  "jiff",
  "prost 0.14.3",
@@ -21198,7 +21349,7 @@ name = "vortex-error"
 version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e#d694abda6cf4081a7a6e93b08da1bba28204f41e"
 dependencies = [
- "arrow-schema",
+ "arrow-schema 57.2.0",
  "flatbuffers",
  "jiff",
  "object_store",
@@ -21273,7 +21424,7 @@ dependencies = [
 [[package]]
 name = "vortex-flatbuffers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
 dependencies = [
  "flatbuffers",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
@@ -21338,7 +21489,7 @@ dependencies = [
 [[package]]
 name = "vortex-ipc"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -21389,7 +21540,7 @@ dependencies = [
  "pin-project-lite",
  "prost 0.14.3",
  "rustc-hash 2.1.1",
- "termtree",
+ "termtree 0.5.1",
  "tokio",
  "tracing",
  "uuid 1.21.0",
@@ -21409,7 +21560,7 @@ dependencies = [
 [[package]]
 name = "vortex-mask"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
 dependencies = [
  "itertools 0.14.0",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
@@ -21453,7 +21604,7 @@ dependencies = [
 [[package]]
 name = "vortex-proto"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
 dependencies = [
  "prost 0.14.3",
  "prost-types",
@@ -21473,7 +21624,7 @@ name = "vortex-runend"
 version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e#d694abda6cf4081a7a6e93b08da1bba28204f41e"
 dependencies = [
- "arrow-array",
+ "arrow-array 57.2.0",
  "itertools 0.14.0",
  "num-traits",
  "prost 0.14.3",
@@ -21489,8 +21640,8 @@ name = "vortex-scan"
 version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e#d694abda6cf4081a7a6e93b08da1bba28204f41e"
 dependencies = [
- "arrow-array",
- "arrow-schema",
+ "arrow-array 57.2.0",
+ "arrow-schema 57.2.0",
  "async-trait",
  "bit-vec 0.8.0",
  "futures",
@@ -21527,7 +21678,7 @@ dependencies = [
 [[package]]
 name = "vortex-session"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
 dependencies = [
  "arcref",
  "dashmap",
@@ -21566,7 +21717,7 @@ dependencies = [
 [[package]]
 name = "vortex-utils"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#2ec7499c324e3c79413ca412a2dfa3098ff8adf9"
 dependencies = [
  "dashmap",
  "hashbrown 0.16.1",
@@ -21745,7 +21896,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "wasm-bindgen-shared",
 ]
 
@@ -22050,7 +22201,7 @@ checksum = "2a9b9165fc45d42c81edfe3e9cb458e58720594ad5db6553c4079ea041a4a581"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -22214,7 +22365,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -22331,7 +22482,7 @@ checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -22342,7 +22493,7 @@ checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -22872,7 +23023,7 @@ dependencies = [
  "heck 0.5.0",
  "indexmap 2.14.0",
  "prettyplease",
- "syn 2.0.114",
+ "syn 2.0.117",
  "wasm-metadata",
  "wit-bindgen-core",
  "wit-component",
@@ -22888,7 +23039,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "wit-bindgen-core",
  "wit-bindgen-rust",
 ]
@@ -23127,7 +23278,7 @@ checksum = "2380878cad4ac9aac1e2435f3eb4020e8374b5f13c296cb75b4620ff8e229154"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "synstructure 0.13.2",
 ]
 
@@ -23139,7 +23290,7 @@ checksum = "b659052874eb698efe5b9e8cf382204678a0086ebf46982b79d6ca3182927e5d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "synstructure 0.13.2",
 ]
 
@@ -23166,7 +23317,7 @@ checksum = "d8187381b52e32220d50b255276aa16a084ec0a9017a0ca2152a1f55c539758d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -23186,7 +23337,7 @@ checksum = "d71e5d6e06ab090c67b5e44993ec16b72dcbaabc526db883a360057678b48502"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
  "synstructure 0.13.2",
 ]
 
@@ -23207,7 +23358,7 @@ checksum = "85a5b4158499876c763cb03bc4e49185d3cccbabb15b33c627f7884f43db852e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -23240,7 +23391,7 @@ checksum = "eadce39539ca5cb3985590102671f2567e659fca9666581ad3411d59207951f3"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 2.0.117",
 ]
 
 [[package]]
