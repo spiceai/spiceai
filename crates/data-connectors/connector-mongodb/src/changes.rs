@@ -86,7 +86,7 @@ pub fn build_changes_stream(
             .database(&connection.db_name)
             .collection::<Document>(&collection_name);
 
-        let mongo_sys = Arc::new(if dataset.is_file_accelerated() {
+        let mongo_sys = if dataset.is_file_accelerated() {
             initialize_mongo_sys(&dataset).await
         } else {
             tracing::info!(
@@ -95,7 +95,7 @@ pub fn build_changes_stream(
                 "MongoDB Change Stream dataset is not file-accelerated; resume token will not be persisted across restarts"
             );
             None
-        });
+        };
 
         let current_schema_json = serialize_current_schema(&schema, &dataset.name);
         let persisted = persisted_checkpoint(&mongo_sys, &dataset, &current_schema_json).await;
@@ -201,8 +201,8 @@ pub fn build_changes_stream(
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
             let (_, batch, is_ready) = ready.into_parts();
             let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
-                Some(_) => Box::new(MongoResumeTokenCommitter::new(
-                    Arc::clone(&mongo_sys),
+                Some(sys) => Box::new(MongoResumeTokenCommitter::new(
+                    Arc::clone(sys),
                     initial_token_json,
                     None,
                     current_schema_json.clone(),
@@ -267,9 +267,9 @@ pub fn build_changes_stream(
     })
 }
 
-async fn initialize_mongo_sys(dataset: &Dataset) -> Option<MongoSys> {
+async fn initialize_mongo_sys(dataset: &Dataset) -> Option<Arc<MongoSys>> {
     match MongoSys::try_new(dataset, OpenOption::CreateIfNotExists).await {
-        Ok(sys) => Some(sys),
+        Ok(sys) => Some(Arc::new(sys)),
         Err(error) => {
             tracing::error!(
                 dataset = %dataset.name,
@@ -282,11 +282,11 @@ async fn initialize_mongo_sys(dataset: &Dataset) -> Option<MongoSys> {
 }
 
 async fn persisted_checkpoint(
-    mongo_sys: &Arc<Option<MongoSys>>,
+    mongo_sys: &Option<Arc<MongoSys>>,
     dataset: &Dataset,
     current_schema_json: &Option<String>,
 ) -> Option<MongoCheckpointMetadata> {
-    let sys = mongo_sys.as_ref().as_ref()?;
+    let sys = mongo_sys.as_ref()?;
     let metadata = sys.get().await?;
 
     // Warn (don't fail) on schema drift between runs. The connector schema is
@@ -306,8 +306,8 @@ async fn persisted_checkpoint(
     Some(metadata)
 }
 
-async fn clear_persisted_token(mongo_sys: &Arc<Option<MongoSys>>, dataset: &Dataset) {
-    if let Some(sys) = mongo_sys.as_ref()
+async fn clear_persisted_token(mongo_sys: &Option<Arc<MongoSys>>, dataset: &Dataset) {
+    if let Some(sys) = mongo_sys
         && let Err(error) = sys.delete().await
     {
         tracing::warn!(
@@ -355,15 +355,15 @@ fn resume_token_error_code(error: &mongodb::error::Error) -> Option<i32> {
 }
 
 fn build_batch_committer(
-    mongo_sys: &Arc<Option<MongoSys>>,
+    mongo_sys: &Option<Arc<MongoSys>>,
     tail_token: Option<ResumeToken>,
     tail_cluster_time: Option<i64>,
     schema_json: &Option<String>,
     dataset_name: &datafusion::sql::TableReference,
 ) -> Box<dyn CommitChange + Send + Sync> {
-    if mongo_sys.as_ref().is_none() {
+    let Some(sys) = mongo_sys.as_ref() else {
         return Box::new(NoOpCommitter);
-    }
+    };
 
     let Some(token) = tail_token else {
         return Box::new(NoOpCommitter);
@@ -371,7 +371,7 @@ fn build_batch_committer(
 
     match serialize_resume_token(&token) {
         Ok(token_json) => Box::new(MongoResumeTokenCommitter::new(
-            Arc::clone(mongo_sys),
+            Arc::clone(sys),
             token_json,
             tail_cluster_time,
             schema_json.clone(),
@@ -418,7 +418,7 @@ impl ResumeTokenInvalidBehavior {
 }
 
 pub(crate) struct MongoResumeTokenCommitter {
-    mongo_sys: Arc<Option<MongoSys>>,
+    mongo_sys: Arc<MongoSys>,
     resume_token_json: String,
     cluster_time_ts: Option<i64>,
     schema_json: Option<String>,
@@ -426,7 +426,7 @@ pub(crate) struct MongoResumeTokenCommitter {
 
 impl MongoResumeTokenCommitter {
     fn new(
-        mongo_sys: Arc<Option<MongoSys>>,
+        mongo_sys: Arc<MongoSys>,
         resume_token_json: String,
         cluster_time_ts: Option<i64>,
         schema_json: Option<String>,
@@ -443,20 +443,17 @@ impl MongoResumeTokenCommitter {
 #[async_trait]
 impl CommitChange for MongoResumeTokenCommitter {
     async fn commit(&self) -> Result<(), CommitError> {
-        let Some(sys) = self.mongo_sys.as_ref() else {
-            return Ok(());
-        };
-
-        sys.upsert(&MongoCheckpointMetadata {
-            resume_token_json: self.resume_token_json.clone(),
-            cluster_time_ts: self.cluster_time_ts,
-            schema_json: self.schema_json.clone(),
-            updated_at: None,
-        })
-        .await
-        .map_err(|error| CommitError::UnableToCommitChange {
-            source: Box::new(error),
-        })
+        self.mongo_sys
+            .upsert(&MongoCheckpointMetadata {
+                resume_token_json: self.resume_token_json.clone(),
+                cluster_time_ts: self.cluster_time_ts,
+                schema_json: self.schema_json.clone(),
+                updated_at: None,
+            })
+            .await
+            .map_err(|error| CommitError::UnableToCommitChange {
+                source: Box::new(error),
+            })
     }
 }
 

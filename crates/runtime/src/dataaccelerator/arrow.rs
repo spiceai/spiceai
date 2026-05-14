@@ -55,18 +55,20 @@ impl Default for ArrowAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
-    ParameterSpec::runtime("hash_index")
-        .description("Enable hash index for fast primary key lookups and upserts. Automatically enabled when primary_key is supplied."),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
 
-pub(crate) fn enable_hash_index_for_primary_key(cmd: &mut CreateExternalTable) {
+pub(crate) fn enable_hash_index_for_primary_key_or_indexes(cmd: &mut CreateExternalTable) {
     let has_primary_key = cmd.constraints.iter().any(
         |constraint| matches!(constraint, Constraint::PrimaryKey(columns) if !columns.is_empty()),
     );
+    let has_indexes = cmd
+        .options
+        .get("indexes")
+        .is_some_and(|indexes| !indexes.trim().is_empty());
 
-    if !has_primary_key {
+    if !has_primary_key && !has_indexes {
         return;
     }
 
@@ -75,7 +77,7 @@ pub(crate) fn enable_hash_index_for_primary_key(cmd: &mut CreateExternalTable) {
     {
         tracing::warn!(
             hash_index = %value,
-            "Arrow acceleration with primary_key requires hash_index; overriding hash_index to enabled"
+            "Arrow acceleration with primary_key or indexes requires hash_index; overriding hash_index to enabled"
         );
     }
 
@@ -122,18 +124,7 @@ impl DataAccelerator for ArrowAccelerator {
                 .insert("sort_columns".to_string(), sort_cols_str.clone());
         }
 
-        // Extract hash_index from acceleration params if provided
-        if let Some(source) = source
-            && let Some(acceleration) = source.acceleration()
-            && let Some(hash_index_str) = acceleration.params.get("hash_index")
-        {
-            cmd.options
-                .insert("hash_index".to_string(), hash_index_str.clone());
-        }
-
-        if !is_caching_mode {
-            enable_hash_index_for_primary_key(&mut cmd);
-        }
+        enable_hash_index_for_primary_key_or_indexes(&mut cmd);
 
         let ctx = SessionContext::new();
         let table_provider = TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
