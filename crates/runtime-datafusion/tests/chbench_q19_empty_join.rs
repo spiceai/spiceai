@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, ArrayRef, Float64Array, Int32Array, Int64Array, StringArray},
+    array::{Array, ArrayRef, Decimal128Array, Int32Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -25,92 +25,80 @@ use datafusion::{catalog::MemTable, prelude::SessionContext};
 
 #[tokio::test]
 async fn chbench_q19_empty_join_does_not_error() -> datafusion::error::Result<()> {
-    let lineitem_schema = Arc::new(Schema::new(vec![
-        Field::new("l_partkey", DataType::Int64, false),
-        Field::new("l_quantity", DataType::Int64, false),
-        Field::new("l_extendedprice", DataType::Float64, false),
-        Field::new("l_discount", DataType::Float64, false),
-        Field::new("l_shipmode", DataType::Utf8, false),
-        Field::new("l_shipinstruct", DataType::Utf8, false),
+    let order_line_schema = Arc::new(Schema::new(vec![
+        Field::new("ol_i_id", DataType::Int32, false),
+        Field::new("ol_quantity", DataType::Int32, false),
+        Field::new("ol_amount", DataType::Decimal128(38, 10), false),
+        Field::new("ol_w_id", DataType::Int32, false),
     ]));
-    let lineitem_batch = RecordBatch::try_new(
-        Arc::clone(&lineitem_schema),
+    let order_line_batch = RecordBatch::try_new(
+        Arc::clone(&order_line_schema),
         vec![
-            Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-            Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-            Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
-            Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
-            Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
-            Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+            Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef,
+            Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef,
+            Arc::new(Decimal128Array::from(Vec::<i128>::new()).with_precision_and_scale(38, 10)?)
+                as ArrayRef,
+            Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef,
         ],
     )?;
 
-    let part_schema = Arc::new(Schema::new(vec![
-        Field::new("p_partkey", DataType::Int64, false),
-        Field::new("p_brand", DataType::Utf8, false),
-        Field::new("p_container", DataType::Utf8, false),
-        Field::new("p_size", DataType::Int32, false),
+    let item_schema = Arc::new(Schema::new(vec![
+        Field::new("i_id", DataType::Int32, false),
+        Field::new("i_data", DataType::Utf8, false),
+        Field::new("i_price", DataType::Decimal128(38, 10), false),
     ]));
-    let part_batch = RecordBatch::try_new(
-        Arc::clone(&part_schema),
+    let item_batch = RecordBatch::try_new(
+        Arc::clone(&item_schema),
         vec![
-            Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-            Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
-            Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
             Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef,
+            Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+            Arc::new(Decimal128Array::from(Vec::<i128>::new()).with_precision_and_scale(38, 10)?)
+                as ArrayRef,
         ],
     )?;
 
     let ctx = SessionContext::new();
     ctx.register_table(
-        "lineitem",
+        "order_line",
         Arc::new(MemTable::try_new(
-            lineitem_schema,
-            vec![vec![lineitem_batch]],
+            order_line_schema,
+            vec![vec![order_line_batch]],
         )?),
     )?;
     ctx.register_table(
-        "part",
-        Arc::new(MemTable::try_new(part_schema, vec![vec![part_batch]])?),
+        "item",
+        Arc::new(MemTable::try_new(item_schema, vec![vec![item_batch]])?),
     )?;
 
     let result = ctx
         .sql(
             r#"select
-    sum(l_extendedprice * (1 - l_discount)) as revenue
+    sum(ol_amount) as revenue
 from
-    lineitem,
-    part
+    order_line, item
 where
     (
-                p_partkey = l_partkey
-            and p_brand = 'Brand#12'
-            and p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
-            and l_quantity >= 1 and l_quantity <= 1 + 10
-            and p_size between 1 and 5
-            and l_shipmode in ('AIR', 'AIR REG')
-            and l_shipinstruct = 'DELIVER IN PERSON'
-        )
-   or
-    (
-                p_partkey = l_partkey
-            and p_brand = 'Brand#23'
-            and p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
-            and l_quantity >= 10 and l_quantity <= 10 + 10
-            and p_size between 1 and 10
-            and l_shipmode in ('AIR', 'AIR REG')
-            and l_shipinstruct = 'DELIVER IN PERSON'
-        )
-   or
-    (
-                p_partkey = l_partkey
-            and p_brand = 'Brand#34'
-            and p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
-            and l_quantity >= 20 and l_quantity <= 20 + 10
-            and p_size between 1 and 15
-            and l_shipmode in ('AIR', 'AIR REG')
-            and l_shipinstruct = 'DELIVER IN PERSON'
-        )"#,
+        ol_i_id = i_id
+        and i_data like '%a'
+        and ol_quantity >= 1
+        and ol_quantity <= 10
+        and i_price between 1 and 400000
+        and ol_w_id in (1,2,3)
+    ) or (
+        ol_i_id = i_id
+        and i_data like '%b'
+        and ol_quantity >= 1
+        and ol_quantity <= 10
+        and i_price between 1 and 400000
+        and ol_w_id in (1,2,4)
+    ) or (
+        ol_i_id = i_id
+        and i_data like '%c'
+        and ol_quantity >= 1
+        and ol_quantity <= 10
+        and i_price between 1 and 400000
+        and ol_w_id in (1,5,3)
+    )"#,
         )
         .await?
         .collect()

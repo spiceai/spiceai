@@ -4014,16 +4014,16 @@ impl CayenneTableProvider {
         };
 
         let (statistics_blob, num_rows) = if let Some(existing) = existing_stats {
-            let Some(merged_blob) =
-                accumulator.merged_file_statistics_blob(&existing.statistics_blob)
-            else {
-                tracing::warn!(
-                    "Failed to merge table stats for {}; leaving previous aggregate stats unchanged",
-                    self.table_metadata.table_name
-                );
-                return;
-            };
-            (merged_blob, existing.num_rows.saturating_add(new_rows))
+            match accumulator.merged_file_statistics_blob(&existing.statistics_blob) {
+                Some(merged_blob) => (merged_blob, existing.num_rows.saturating_add(new_rows)),
+                None => {
+                    tracing::warn!(
+                        "Failed to merge table stats for {}; replacing aggregate stats with current write",
+                        self.table_metadata.table_name
+                    );
+                    (new_blob, new_rows)
+                }
+            }
         } else {
             (new_blob, new_rows)
         };
@@ -5993,16 +5993,29 @@ mod tests {
             cached_insert_records,
         };
 
-        let scan_snapshot = pk_deletion_snapshot_for_strategy(&strategy);
-        assert!(!scan_snapshot.has_deletions());
-
         cached_deleted_row_keys.store(Arc::new(KeyDeletionIndex::from_map(HashMap::from([(
             Box::<[u8]>::from([42_u8].as_slice()),
             1_i64,
         )]))));
 
-        assert!(!cached_deleted_row_keys.load().is_empty());
-        assert!(!scan_snapshot.has_deletions());
+        let scan_snapshot = pk_deletion_snapshot_for_strategy(&strategy);
+        assert!(scan_snapshot.has_deletions());
+
+        cached_deleted_row_keys.store(Arc::new(KeyDeletionIndex::from_map(HashMap::from([(
+            Box::<[u8]>::from([99_u8].as_slice()),
+            2_i64,
+        )]))));
+
+        let PkDeletionSnapshot::RowConverterBased {
+            deleted_row_keys, ..
+        } = scan_snapshot
+        else {
+            panic!("expected row-converter deletion snapshot");
+        };
+        assert_eq!(deleted_row_keys.get(&[42_u8]), Some(1_i64));
+        assert_eq!(deleted_row_keys.get(&[99_u8]), None);
+        assert_eq!(cached_deleted_row_keys.load().get(&[42_u8]), None);
+        assert_eq!(cached_deleted_row_keys.load().get(&[99_u8]), Some(2_i64));
     }
 
     #[test]

@@ -52,6 +52,7 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
+use twox_hash::XxHash3_64;
 
 pub const DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys.
 const DEFAULT_MAXIMUM_BLOOM_FILTER_MEMORY_BYTES: usize = 8 * 1024 * 1024;
@@ -756,6 +757,9 @@ impl BloomFilter {
     {
         let array = downcast_array::<PrimitiveArray<T>>(array)?;
         for value in array.iter().flatten() {
+            if T::is_nan(value) {
+                continue;
+            }
             self.insert(&T::hashable(value));
         }
         Ok(())
@@ -768,8 +772,11 @@ impl BloomFilter {
         let array = downcast_array::<PrimitiveArray<T>>(array)?;
         let mut builder = BooleanBuilder::with_capacity(array.len());
         for value in array.iter() {
-            builder
-                .append_value(value.is_some_and(|value| self.might_contain(&T::hashable(value))));
+            builder.append_value(
+                value.is_some_and(|value| {
+                    !T::is_nan(value) && self.might_contain(&T::hashable(value))
+                }),
+            );
         }
         Ok(builder.finish())
     }
@@ -858,7 +865,7 @@ impl BloomFilter {
 }
 
 fn bloom_hashes<T: Hash + ?Sized>(value: &T) -> (u64, u64) {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = XxHash3_64::default();
     value.hash(&mut hasher);
     let hash_one = hasher.finish();
     (hash_one, hash_one.rotate_left(32) ^ hash_one.reverse_bits())
@@ -876,7 +883,11 @@ impl BloomFloatType for Float16Type {
     type Hashable = u16;
 
     fn hashable(value: Self::Native) -> Self::Hashable {
-        value.to_bits()
+        if value == <Self as ArrowPrimitiveType>::Native::from_f32(0.0) {
+            0
+        } else {
+            value.to_bits()
+        }
     }
 
     fn is_nan(value: Self::Native) -> bool {
@@ -888,7 +899,7 @@ impl BloomFloatType for Float32Type {
     type Hashable = u32;
 
     fn hashable(value: Self::Native) -> Self::Hashable {
-        value.to_bits()
+        if value == 0.0 { 0 } else { value.to_bits() }
     }
 
     fn is_nan(value: Self::Native) -> bool {
@@ -900,7 +911,7 @@ impl BloomFloatType for Float64Type {
     type Hashable = u64;
 
     fn hashable(value: Self::Native) -> Self::Hashable {
-        value.to_bits()
+        if value == 0.0 { 0 } else { value.to_bits() }
     }
 
     fn is_nan(value: Self::Native) -> bool {
@@ -1568,6 +1579,40 @@ mod tests {
             vec![Some(true), Some(false), Some(false), Some(true)],
             actual_values
         );
+    }
+
+    #[test]
+    fn test_bloom_filter_normalizes_float_zero() {
+        let mut bloom_filter = BloomFilter::try_new(1_024).expect("Bloom filter should be created");
+        let build_array = Float64Array::from(vec![0.0]);
+        bloom_filter
+            .insert_array(&build_array)
+            .expect("Should insert float zero");
+
+        let probe_array = Float64Array::from(vec![-0.0, 1.0]);
+        let result = bloom_filter
+            .evaluate_array(&probe_array)
+            .expect("Should evaluate float bloom filter");
+
+        assert!(result.value(0));
+        assert!(!result.value(1));
+    }
+
+    #[test]
+    fn test_bloom_filter_skips_float_nan() {
+        let mut bloom_filter = BloomFilter::try_new(1_024).expect("Bloom filter should be created");
+        let build_array = Float64Array::from(vec![f64::NAN, 1.0]);
+        bloom_filter
+            .insert_array(&build_array)
+            .expect("Should insert non-NaN float values");
+
+        let probe_array = Float64Array::from(vec![f64::NAN, 1.0]);
+        let result = bloom_filter
+            .evaluate_array(&probe_array)
+            .expect("Should evaluate float bloom filter");
+
+        assert!(!result.value(0));
+        assert!(result.value(1));
     }
 
     #[test]
