@@ -29,7 +29,9 @@ use super::delete::{
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use crate::metadata::{CreateTableOptions, InlinedData, InlinedDataStats, TableMetadata};
+use crate::metadata::{
+    CreateTableOptions, InlinedData, InlinedDataStats, TableMetadata, TableStatistics,
+};
 use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
@@ -50,7 +52,7 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::{Constraints, DFSchema};
+use datafusion_common::{ColumnStatistics, Constraints, DFSchema, Statistics};
 use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
@@ -259,11 +261,9 @@ impl ColumnStatsAccumulator {
         self.row_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Convert accumulated stats to a serialized Vortex `FileStatistics` blob.
-    ///
-    /// Returns `None` if no rows were accumulated or serialization fails.
-    pub(crate) fn to_file_statistics_blob(&self) -> Option<Vec<u8>> {
-        if self.row_count() == 0 {
+    pub(crate) fn to_file_statistics_blob_with_row_count(&self) -> Option<(Vec<u8>, i64)> {
+        let row_count = self.row_count();
+        if row_count == 0 {
             return None;
         }
         let Ok(cols) = self.columns.lock() else {
@@ -275,12 +275,23 @@ impl ColumnStatsAccumulator {
 
         let file_stats = crate::stats::build_file_statistics(cols.clone(), &self.schema);
         match crate::stats::serialize_file_statistics(&file_stats) {
-            Ok(bytes) => Some(bytes),
+            Ok(bytes) => Some((bytes, row_count)),
             Err(e) => {
                 tracing::warn!("Failed to serialize file statistics: {e}");
                 None
             }
         }
+    }
+
+    fn merged_file_statistics_blob(&self, existing_blob: &[u8]) -> Option<Vec<u8>> {
+        let Ok(cols) = self.columns.lock() else {
+            tracing::warn!(
+                "ColumnStatsAccumulator: mutex poisoned in merged_file_statistics_blob(), returning None"
+            );
+            return None;
+        };
+
+        crate::stats::merge_serialized_stats(existing_blob, &cols, &self.dtypes, &self.schema)
     }
 }
 
@@ -431,6 +442,10 @@ pub struct CayenneTableProvider {
     /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
     /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    /// Table-level Vortex statistics loaded from the metastore and maintained
+    /// after writes. This gives `DataFusion` synchronous access to Cayenne stats
+    /// without querying the async catalog from `TableProvider::statistics`.
+    table_statistics: Arc<RwLock<Option<Statistics>>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
     /// Optional builder to construct time-based retention filter.
@@ -735,6 +750,53 @@ impl OnConflictDeletions {
             + self.deleted_row_keys.len()
             + self.deleted_inlined_pk_i64.len()
             + self.deleted_inlined_row_keys.len()
+    }
+}
+
+#[derive(Clone)]
+enum PkDeletionSnapshot {
+    PositionBased,
+    Int64Pk {
+        deleted_pk_values: Arc<DeletionIndex>,
+        insert_records: Arc<DeletionIndex>,
+    },
+    RowConverterBased {
+        deleted_row_keys: Arc<KeyDeletionIndex>,
+        insert_records: Arc<KeyDeletionIndex>,
+    },
+}
+
+impl PkDeletionSnapshot {
+    fn has_deletions(&self) -> bool {
+        match self {
+            Self::PositionBased => false,
+            Self::Int64Pk {
+                deleted_pk_values, ..
+            } => !deleted_pk_values.is_empty(),
+            Self::RowConverterBased {
+                deleted_row_keys, ..
+            } => !deleted_row_keys.is_empty(),
+        }
+    }
+}
+
+fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> PkDeletionSnapshot {
+    match strategy {
+        PkDeletionStrategyWithCache::PositionBased { .. } => PkDeletionSnapshot::PositionBased,
+        PkDeletionStrategyWithCache::Int64Pk {
+            cached_deleted_pk,
+            cached_insert_records,
+        } => PkDeletionSnapshot::Int64Pk {
+            deleted_pk_values: cached_deleted_pk.load_full(),
+            insert_records: cached_insert_records.load_full(),
+        },
+        PkDeletionStrategyWithCache::RowConverterBased {
+            cached_deleted_row_keys,
+            cached_insert_records,
+        } => PkDeletionSnapshot::RowConverterBased {
+            deleted_row_keys: cached_deleted_row_keys.load_full(),
+            insert_records: cached_insert_records.load_full(),
+        },
     }
 }
 
@@ -1644,6 +1706,7 @@ impl CayenneTableProvider {
             context.file_format(),
             &pk_deletion_strategy,
         )?;
+        let table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
 
         // Load protected snapshots from catalog.
         // Protected snapshots are those with sequence > max_delete_sequence.
@@ -1666,6 +1729,7 @@ impl CayenneTableProvider {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
+            table_statistics: Arc::new(RwLock::new(table_statistics)),
             retention_filters,
             time_retention_filter_builder,
             context,
@@ -1830,6 +1894,10 @@ impl CayenneTableProvider {
                 .unwrap_or(0),
             PkDeletionStrategyWithCache::PositionBased { .. } => 0,
         }
+    }
+
+    fn pk_deletion_snapshot(&self) -> PkDeletionSnapshot {
+        pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy)
     }
 
     /// Write a stream of record batches to a specific snapshot directory.
@@ -2049,6 +2117,7 @@ impl CayenneTableProvider {
             table_metadata: self.table_metadata.clone(),
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
+            table_statistics: Arc::clone(&self.table_statistics),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
@@ -2061,6 +2130,98 @@ impl CayenneTableProvider {
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
         }
+    }
+
+    async fn load_table_statistics(
+        catalog: &Arc<dyn MetadataCatalog>,
+        table_metadata: &TableMetadata,
+    ) -> Option<Statistics> {
+        let stats = match catalog.get_table_statistics(&table_metadata.table_id).await {
+            Ok(stats) => stats?,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load table stats for {}: {e}",
+                    table_metadata.table_name
+                );
+                return None;
+            }
+        };
+
+        Self::table_statistics_to_df(&table_metadata.schema, &stats).or_else(|| {
+            tracing::warn!(
+                "Failed to deserialize table stats for {}",
+                table_metadata.table_name
+            );
+            None
+        })
+    }
+
+    fn table_statistics_to_df(
+        schema: &arrow_schema::Schema,
+        stats: &TableStatistics,
+    ) -> Option<Statistics> {
+        let file_stats = crate::stats::deserialize_file_statistics(&stats.statistics_blob, schema)
+            .map_err(|e| {
+                tracing::warn!("Failed to deserialize serialized table statistics: {e}");
+                e
+            })
+            .ok()?;
+
+        Some(crate::stats::file_statistics_to_df(
+            &file_stats,
+            stats.num_rows,
+        ))
+    }
+
+    fn cached_table_statistics_for_optimizer(&self) -> Option<Statistics> {
+        let stats = {
+            let guard = self.table_statistics.read().ok()?;
+            guard.clone()?
+        };
+
+        if self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0 {
+            Some(Self::statistics_to_inexact(stats))
+        } else {
+            Some(stats)
+        }
+    }
+
+    fn statistics_to_inexact(stats: Statistics) -> Statistics {
+        Statistics {
+            num_rows: stats.num_rows.to_inexact(),
+            total_byte_size: stats.total_byte_size.to_inexact(),
+            column_statistics: stats
+                .column_statistics
+                .into_iter()
+                .map(Self::column_statistics_to_inexact)
+                .collect(),
+        }
+    }
+
+    fn column_statistics_to_inexact(stats: ColumnStatistics) -> ColumnStatistics {
+        ColumnStatistics {
+            null_count: stats.null_count.to_inexact(),
+            max_value: stats.max_value.to_inexact(),
+            min_value: stats.min_value.to_inexact(),
+            sum_value: stats.sum_value.to_inexact(),
+            distinct_count: stats.distinct_count.to_inexact(),
+            byte_size: stats.byte_size.to_inexact(),
+        }
+    }
+
+    fn set_cached_table_statistics(&self, stats: Option<Statistics>) {
+        let Ok(mut guard) = self.table_statistics.write() else {
+            tracing::warn!(
+                "Failed to update cached table stats for {} because the lock is poisoned",
+                self.table_metadata.table_name
+            );
+            return;
+        };
+        *guard = stats;
+    }
+
+    pub(crate) fn clear_cached_table_statistics(&self) {
+        self.set_cached_table_statistics(None);
     }
 
     /// Returns the column indices for the configured primary key, if any.
@@ -3886,26 +4047,52 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Persist statistics for the most recent write.
-    ///
-    /// The accumulator contains stats for the rows written by the current
-    /// operation only. The metastore row is keyed by `table_id` and upserted,
-    /// so this overwrites any previous entry (last-write-wins) — it does not
-    /// merge with stats from earlier writes yet. Treating these values as
-    /// table-wide stats is unsafe; consumers must read them as optimization
-    /// hints until cross-write merging lands.
+    /// Persist table-level statistics by merging the current write with the
+    /// existing metastore aggregate when possible.
     ///
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
     pub(crate) async fn persist_table_stats(&self, accumulator: &ColumnStatsAccumulator) {
-        let Some(blob) = accumulator.to_file_statistics_blob() else {
+        let Some((new_blob, new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
+        else {
             return;
         };
 
-        let stats = crate::metadata::TableStatistics {
+        let existing_stats = match self
+            .catalog
+            .get_table_statistics(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(stats) => stats,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load existing table stats for {} before merge: {e}",
+                    self.table_metadata.table_name
+                );
+                None
+            }
+        };
+
+        let (statistics_blob, num_rows) = if let Some(existing) = existing_stats {
+            if let Some(merged_blob) =
+                accumulator.merged_file_statistics_blob(&existing.statistics_blob)
+            {
+                (merged_blob, existing.num_rows.saturating_add(new_rows))
+            } else {
+                tracing::warn!(
+                    "Failed to merge table stats for {}; replacing aggregate stats with current write",
+                    self.table_metadata.table_name
+                );
+                (new_blob, new_rows)
+            }
+        } else {
+            (new_blob, new_rows)
+        };
+
+        let stats = TableStatistics {
             table_id: self.table_metadata.table_id.clone(),
-            statistics_blob: blob,
-            num_rows: accumulator.row_count(),
+            statistics_blob,
+            num_rows,
         };
 
         if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
@@ -3913,7 +4100,13 @@ impl CayenneTableProvider {
                 "Failed to persist table stats for {}: {e}",
                 self.table_metadata.table_name
             );
+            return;
         }
+
+        self.set_cached_table_statistics(Self::table_statistics_to_df(
+            &self.table_metadata.schema,
+            &stats,
+        ));
     }
 
     /// Write small batches directly to the metastore, optionally atomically
@@ -4857,6 +5050,7 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         pk_indices_in_projection: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
         let protected_snapshots = {
             let guard = self.protected_snapshots.read().map_err(|_| {
@@ -4903,6 +5097,7 @@ impl CayenneTableProvider {
                 plan,
                 pk_indices_in_projection,
                 max_delete_seq_at_creation,
+                deletion_snapshot,
             )?;
 
             plans.push(filtered_plan);
@@ -4920,15 +5115,14 @@ impl CayenneTableProvider {
         plan: Arc<dyn ExecutionPlan>,
         pk_indices_in_projection: &[usize],
         min_delete_seq_to_apply: i64,
+        deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
+        match deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk {
+                deleted_pk_values, ..
             } => {
-                let all_deleted_pks = cached_deleted_pk.load_full();
-
                 // Filter to only include deletions with seq > min_delete_seq_to_apply.
-                let filtered_deletions: HashMap<i64, i64> = all_deleted_pks
+                let filtered_deletions: HashMap<i64, i64> = deleted_pk_values
                     .entries()
                     .iter()
                     .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
@@ -4955,16 +5149,13 @@ impl CayenneTableProvider {
                     pk_column_index,
                 )))
             }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
+            PkDeletionSnapshot::RowConverterBased {
+                deleted_row_keys, ..
             } => {
                 // Similar logic for RowConverter-based strategy
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    let all_deleted_keys = cached_deleted_row_keys.load_full();
-
                     // Filter to only include deletions with seq > min_delete_seq_to_apply.
-                    let filtered_deletions: HashMap<Box<[u8]>, i64> = all_deleted_keys
+                    let filtered_deletions: HashMap<Box<[u8]>, i64> = deleted_row_keys
                         .entries()
                         .iter()
                         .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
@@ -4987,7 +5178,7 @@ impl CayenneTableProvider {
                     Ok(Arc::new(CayenneAccelerationExec::new(plan)))
                 }
             }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
+            PkDeletionSnapshot::PositionBased => {
                 // Position-based doesn't use protected snapshots
                 Ok(Arc::new(CayenneAccelerationExec::new(plan)))
             }
@@ -4999,12 +5190,12 @@ impl CayenneTableProvider {
         &self,
         plan: Arc<dyn ExecutionPlan>,
         pk_indices_in_projection: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
+        match deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk {
+                deleted_pk_values, ..
             } => {
-                let deleted_pk_values = cached_deleted_pk.load_full();
                 // Don't use insert_records for protected snapshot approach
                 // The protected snapshots already handle new data without filtering
                 let empty_insert_records = Arc::new(DeletionIndex::empty());
@@ -5020,25 +5211,23 @@ impl CayenneTableProvider {
 
                     return Ok(Arc::new(Int64PkDeletionFilterExec::new(
                         plan,
-                        deleted_pk_values,
+                        Arc::clone(deleted_pk_values),
                         empty_insert_records,
                         pk_column_index,
                     )));
                 }
             }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
+            PkDeletionSnapshot::RowConverterBased {
+                deleted_row_keys, ..
             } => {
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    let deleted_row_keys = cached_deleted_row_keys.load_full();
                     // Don't use insert_records for protected snapshot approach
                     let empty_insert_records = Arc::new(KeyDeletionIndex::empty());
 
                     if !deleted_row_keys.is_empty() {
                         return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                             plan,
-                            deleted_row_keys,
+                            Arc::clone(deleted_row_keys),
                             empty_insert_records,
                             pk_indices_in_projection.to_vec(),
                             Arc::clone(row_converter),
@@ -5046,7 +5235,7 @@ impl CayenneTableProvider {
                     }
                 }
             }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
+            PkDeletionSnapshot::PositionBased => {
                 // Position-based deletions are handled at the Vortex scan level; no manual filtering is needed
             }
         }
@@ -5062,20 +5251,18 @@ impl CayenneTableProvider {
         &self,
         plan: Arc<dyn ExecutionPlan>,
         pk_indices_in_projection: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk,
-                cached_insert_records,
+        match deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk {
+                deleted_pk_values,
+                insert_records,
             } => {
-                let deleted_pk_values = cached_deleted_pk.load_full();
-                let insert_records_pk_values = cached_insert_records.load_full();
-
                 if !deleted_pk_values.is_empty() {
                     tracing::debug!(
                         "Applying Int64 PK deletion filter ({} deleted keys, {} insert records) to scan of table {}",
                         deleted_pk_values.len(),
-                        insert_records_pk_values.len(),
+                        insert_records.len(),
                         self.table_metadata.table_name
                     );
 
@@ -5089,39 +5276,36 @@ impl CayenneTableProvider {
 
                     return Ok(Arc::new(Int64PkDeletionFilterExec::new(
                         plan,
-                        deleted_pk_values,
-                        insert_records_pk_values,
+                        Arc::clone(deleted_pk_values),
+                        Arc::clone(insert_records),
                         pk_column_index,
                     )));
                 }
             }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                cached_insert_records,
+            PkDeletionSnapshot::RowConverterBased {
+                deleted_row_keys,
+                insert_records,
             } => {
-                if let Some(ref row_converter) = self.pk_row_converter {
-                    let deleted_row_keys = cached_deleted_row_keys.load_full();
-                    let insert_records_row_keys = cached_insert_records.load_full();
+                if let Some(ref row_converter) = self.pk_row_converter
+                    && !deleted_row_keys.is_empty()
+                {
+                    tracing::debug!(
+                        "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
+                        deleted_row_keys.len(),
+                        insert_records.len(),
+                        self.table_metadata.table_name
+                    );
 
-                    if !deleted_row_keys.is_empty() {
-                        tracing::debug!(
-                            "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
-                            deleted_row_keys.len(),
-                            insert_records_row_keys.len(),
-                            self.table_metadata.table_name
-                        );
-
-                        return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
-                            plan,
-                            deleted_row_keys,
-                            insert_records_row_keys,
-                            pk_indices_in_projection.to_vec(),
-                            Arc::clone(row_converter),
-                        )));
-                    }
+                    return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
+                        plan,
+                        Arc::clone(deleted_row_keys),
+                        Arc::clone(insert_records),
+                        pk_indices_in_projection.to_vec(),
+                        Arc::clone(row_converter),
+                    )));
                 }
             }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
+            PkDeletionSnapshot::PositionBased => {
                 // Position-based deletions are handled at the Vortex scan level
             }
         }
@@ -5161,17 +5345,12 @@ impl TableProvider for CayenneTableProvider {
             Self::register_object_store_if_needed(state.runtime_env(), config);
         }
 
-        // Determine if we need PK-based deletion (Int64 or RowConverter based)
-        let need_pk_deletion = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
-            } => !cached_deleted_pk.load().is_empty(),
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
-            } => !cached_deleted_row_keys.load().is_empty(),
-            PkDeletionStrategyWithCache::PositionBased { .. } => false,
-        };
+        // Capture one immutable deletion snapshot for this scan and use it for
+        // both projection planning and filter construction. This avoids racing a
+        // later cache publish between the decision to include PK columns and the
+        // decision to wrap the plan with a PK deletion filter.
+        let deletion_snapshot = self.pk_deletion_snapshot();
+        let need_pk_deletion = deletion_snapshot.has_deletions();
 
         // For PK-based deletion, we need to ensure PK columns are included in the projection
         // so we can filter by key. We may need to strip them out afterward if they weren't
@@ -5289,6 +5468,7 @@ impl TableProvider for CayenneTableProvider {
                 scan_filters,
                 limit,
                 &pk_indices_in_projection,
+                &deletion_snapshot,
             )
             .await?;
 
@@ -5347,10 +5527,17 @@ impl TableProvider for CayenneTableProvider {
         // - Otherwise: apply deletion filter directly to main plan
         // - If inlined data exists: UNION with inlined data plan
         let plan = if protected_snapshot_plans.is_empty() {
-            self.apply_deletion_filter_with_insert_records(main_plan, &pk_indices_in_projection)?
+            self.apply_deletion_filter_with_insert_records(
+                main_plan,
+                &pk_indices_in_projection,
+                &deletion_snapshot,
+            )?
         } else {
-            let filtered_main_plan =
-                self.apply_deletion_filter(main_plan, &pk_indices_in_projection)?;
+            let filtered_main_plan = self.apply_deletion_filter(
+                main_plan,
+                &pk_indices_in_projection,
+                &deletion_snapshot,
+            )?;
 
             let mut all_plans = vec![filtered_main_plan];
             all_plans.extend(protected_snapshot_plans);
@@ -5415,22 +5602,14 @@ impl TableProvider for CayenneTableProvider {
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
-        // Delegate statistics tracking to the underlying Vortex ListingTable.
-        // The ListingTable aggregates statistics from all Vortex files in the table directory,
-        // providing metrics such as:
-        // - Total number of rows across all files
-        // - Total size in bytes
-        // - Column-level statistics (min, max, null count, distinct count if available)
-        //
-        // This allows the query optimizer to make informed decisions about:
-        // - Partition pruning
-        // - Join ordering
-        // - Aggregation strategies
-        //
-        // Note: Statistics are cached by the ListingTable and may not reflect
-        // very recent writes until the table metadata is refreshed.
-        //
-        // Clone Arc quickly and release lock immediately to minimize contention
+        if let Some(stats) = self.cached_table_statistics_for_optimizer() {
+            return Some(stats);
+        }
+
+        if self.inlined_row_count.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
+
         let listing_table = {
             let guard = self.listing_table.read().ok()?;
             Arc::clone(&guard)
@@ -5868,12 +6047,117 @@ mod tests {
     use datafusion::logical_expr::CreateExternalTable;
     use datafusion::logical_expr::dml::InsertOp;
     use datafusion::physical_plan::collect;
-    use datafusion_common::DataFusionError;
+    use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_federation::schema_cast::record_convert::try_cast_to;
     use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
     use test_framework::arrow_record_batch_gen::*;
+
+    #[test]
+    fn pk_deletion_snapshot_is_stable_after_cache_publish() {
+        let cached_deleted_row_keys = Arc::new(ArcSwap::from_pointee(KeyDeletionIndex::empty()));
+        let cached_insert_records = Arc::new(ArcSwap::from_pointee(KeyDeletionIndex::empty()));
+        let strategy = PkDeletionStrategyWithCache::RowConverterBased {
+            cached_deleted_row_keys: Arc::clone(&cached_deleted_row_keys),
+            cached_insert_records,
+        };
+
+        cached_deleted_row_keys.store(Arc::new(KeyDeletionIndex::from_map(HashMap::from([(
+            Box::<[u8]>::from([42_u8].as_slice()),
+            1_i64,
+        )]))));
+
+        let scan_snapshot = pk_deletion_snapshot_for_strategy(&strategy);
+        assert!(scan_snapshot.has_deletions());
+
+        cached_deleted_row_keys.store(Arc::new(KeyDeletionIndex::from_map(HashMap::from([(
+            Box::<[u8]>::from([99_u8].as_slice()),
+            2_i64,
+        )]))));
+
+        let PkDeletionSnapshot::RowConverterBased {
+            deleted_row_keys, ..
+        } = scan_snapshot
+        else {
+            panic!("expected row-converter deletion snapshot");
+        };
+        assert_eq!(deleted_row_keys.get(&[42_u8]), Some(1_i64));
+        assert_eq!(deleted_row_keys.get(&[99_u8]), None);
+        assert_eq!(cached_deleted_row_keys.load().get(&[42_u8]), None);
+        assert_eq!(cached_deleted_row_keys.load().get(&[99_u8]), Some(2_i64));
+    }
+
+    #[test]
+    fn table_statistics_to_df_uses_persisted_vortex_stats() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            true,
+        )]));
+        let column_stats = ColumnStatistics {
+            null_count: datafusion_common::stats::Precision::Exact(1),
+            min_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(10))),
+            max_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(20))),
+            sum_value: datafusion_common::stats::Precision::Absent,
+            distinct_count: datafusion_common::stats::Precision::Absent,
+            byte_size: datafusion_common::stats::Precision::Absent,
+        };
+        let stats_set = crate::stats::column_stats_to_stats_set(&column_stats);
+        let file_stats = crate::stats::build_file_statistics(vec![stats_set], &schema);
+        let statistics_blob =
+            crate::stats::serialize_file_statistics(&file_stats).expect("stats should serialize");
+        let table_stats = TableStatistics {
+            table_id: "table_id".to_string(),
+            statistics_blob,
+            num_rows: 3,
+        };
+
+        let stats = CayenneTableProvider::table_statistics_to_df(&schema, &table_stats)
+            .expect("table stats should deserialize");
+
+        assert_eq!(
+            stats.num_rows,
+            datafusion_common::stats::Precision::Exact(3)
+        );
+        assert_eq!(stats.column_statistics[0].min_value, column_stats.min_value);
+        assert_eq!(stats.column_statistics[0].max_value, column_stats.max_value);
+        assert_eq!(
+            stats.column_statistics[0].null_count,
+            column_stats.null_count
+        );
+    }
+
+    #[test]
+    fn statistics_to_inexact_downgrades_exact_values_for_mutable_overlays() {
+        let stats = Statistics {
+            num_rows: datafusion_common::stats::Precision::Exact(3),
+            total_byte_size: datafusion_common::stats::Precision::Exact(24),
+            column_statistics: vec![ColumnStatistics {
+                null_count: datafusion_common::stats::Precision::Exact(0),
+                min_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(1))),
+                max_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(3))),
+                sum_value: datafusion_common::stats::Precision::Absent,
+                distinct_count: datafusion_common::stats::Precision::Exact(3),
+                byte_size: datafusion_common::stats::Precision::Exact(24),
+            }],
+        };
+
+        let stats = CayenneTableProvider::statistics_to_inexact(stats);
+
+        assert_eq!(
+            stats.num_rows,
+            datafusion_common::stats::Precision::Inexact(3)
+        );
+        assert_eq!(
+            stats.column_statistics[0].min_value,
+            datafusion_common::stats::Precision::Inexact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            stats.column_statistics[0].distinct_count,
+            datafusion_common::stats::Precision::Inexact(3)
+        );
+    }
 
     #[test]
     fn inline_memtable_pressure_is_absent_below_thresholds() {

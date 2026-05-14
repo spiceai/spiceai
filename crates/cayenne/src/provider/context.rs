@@ -162,9 +162,23 @@ impl CayenneContext {
 
         let vortex_opts = VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
+            projection_pushdown: true,
             ..VortexTableOptions::default()
         };
 
         Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cayenne_enables_vortex_projection_pushdown_by_default() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let context = CayenneContext::new(&VortexConfig::default(), runtime_env);
+
+        assert!(context.file_format().options().projection_pushdown);
     }
 }
