@@ -229,7 +229,7 @@ fn validate_spicepod_value(value: &Value, path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    const ALL_PRIMITIVES_SPICEPOD: &str = r#"version: v2
+    const ALL_PRIMITIVES_SPICEPOD: &str = r"version: v2
 kind: Spicepod
 name: all_primitives
 runtime: {}
@@ -254,7 +254,7 @@ functions: []
 dependencies: []
 future_primitive:
   keep: true
-"#;
+";
 
     #[test]
     fn existing_spicepod_path_prefers_yaml() {
@@ -353,14 +353,14 @@ future_primitive:
     #[test]
     fn validates_header_without_rejecting_newer_fields() {
         let value: Value = yaml::from_str(
-            r#"version: v2
+            r"version: v2
 kind: Spicepod
 name: future_manifest
 runtime:
   future_runtime_field: keep
 future_primitive:
   keep: true
-"#,
+",
         )
         .expect("future manifest should parse as YAML");
 
