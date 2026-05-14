@@ -98,7 +98,9 @@ pub fn build_changes_stream(
         };
 
         let current_schema_json = serialize_current_schema(&schema, &dataset.name);
-        let persisted = persisted_checkpoint(&mongo_sys, &dataset, &current_schema_json).await;
+        let persisted =
+            persisted_checkpoint(mongo_sys.as_deref(), &dataset, current_schema_json.as_deref())
+                .await;
 
         let live_change_stream = if let Some(metadata) = persisted {
             let resume_token = deserialize_resume_token(&metadata.resume_token_json)
@@ -133,7 +135,7 @@ pub fn build_changes_stream(
                             error = %error,
                             "MongoDB Change Stream resume token is stale; rebootstrap behavior enabled, falling back to cold bootstrap"
                         );
-                        clear_persisted_token(&mongo_sys, &dataset).await;
+                        clear_persisted_token(mongo_sys.as_deref(), &dataset).await;
                         None
                     }
                 },
@@ -255,10 +257,10 @@ pub fn build_changes_stream(
             )
             .map_err(StreamError::MongoDB)? {
                 let committer = build_batch_committer(
-                    &mongo_sys,
+                    mongo_sys.as_ref(),
                     tail_token,
                     tail_cluster_time,
-                    &current_schema_json,
+                    current_schema_json.as_deref(),
                     &dataset.name,
                 );
                 yield ChangeEnvelope::new(committer, change_batch, false);
@@ -282,11 +284,11 @@ async fn initialize_mongo_sys(dataset: &Dataset) -> Option<Arc<MongoSys>> {
 }
 
 async fn persisted_checkpoint(
-    mongo_sys: &Option<Arc<MongoSys>>,
+    mongo_sys: Option<&MongoSys>,
     dataset: &Dataset,
-    current_schema_json: &Option<String>,
+    current_schema_json: Option<&str>,
 ) -> Option<MongoCheckpointMetadata> {
-    let sys = mongo_sys.as_ref()?;
+    let sys = mongo_sys?;
     let metadata = sys.get().await?;
 
     // Warn (don't fail) on schema drift between runs. The connector schema is
@@ -294,7 +296,7 @@ async fn persisted_checkpoint(
     // drift as a hard error here would surprise operators. Followup work can
     // make this behavior configurable.
     if let (Some(persisted_schema_json), Some(current_schema_json)) =
-        (metadata.schema_json.as_ref(), current_schema_json.as_ref())
+        (metadata.schema_json.as_deref(), current_schema_json)
         && persisted_schema_json != current_schema_json
     {
         tracing::warn!(
@@ -306,7 +308,7 @@ async fn persisted_checkpoint(
     Some(metadata)
 }
 
-async fn clear_persisted_token(mongo_sys: &Option<Arc<MongoSys>>, dataset: &Dataset) {
+async fn clear_persisted_token(mongo_sys: Option<&MongoSys>, dataset: &Dataset) {
     if let Some(sys) = mongo_sys
         && let Err(error) = sys.delete().await
     {
@@ -355,13 +357,13 @@ fn resume_token_error_code(error: &mongodb::error::Error) -> Option<i32> {
 }
 
 fn build_batch_committer(
-    mongo_sys: &Option<Arc<MongoSys>>,
+    mongo_sys: Option<&Arc<MongoSys>>,
     tail_token: Option<ResumeToken>,
     tail_cluster_time: Option<i64>,
-    schema_json: &Option<String>,
+    schema_json: Option<&str>,
     dataset_name: &datafusion::sql::TableReference,
 ) -> Box<dyn CommitChange + Send + Sync> {
-    let Some(sys) = mongo_sys.as_ref() else {
+    let Some(sys) = mongo_sys else {
         return Box::new(NoOpCommitter);
     };
 
@@ -374,7 +376,7 @@ fn build_batch_committer(
             Arc::clone(sys),
             token_json,
             tail_cluster_time,
-            schema_json.clone(),
+            schema_json.map(str::to_string),
         )),
         Err(error) => {
             tracing::warn!(
