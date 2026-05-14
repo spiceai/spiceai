@@ -309,12 +309,8 @@ fn filter_references_non_key_column(predicate: &Expr, key_col: &Column) -> bool 
     others
 }
 
-/// Returns `true` if `plan` already contains a `SubqueryAlias` (or an
-/// `InSubquery` whose subquery starts with one) whose name begins with
-/// [`PROPAGATED_FILTER_ALIAS_PREFIX`].
-///
-/// This is the cycle guard: once the rule has wrapped a side with the
-/// propagated `InSubquery`, a subsequent pass will see this marker and skip.
+/// Returns `true` if `plan` already contains a propagated-filter marker.
+#[cfg(test)]
 fn subtree_has_propagated_filter(plan: &LogicalPlan) -> bool {
     let mut found = false;
     let _ = plan.apply(|node| {
@@ -395,7 +391,7 @@ fn expr_targets_column(expr: &Expr, key_col: &Column) -> bool {
 /// The alias name uses [`PROPAGATED_FILTER_ALIAS_PREFIX`] plus a unique id
 /// from [`OptimizerConfig::alias_generator`], so each invocation produces a
 /// distinct marker. The marker doubles as the cycle-detection sentinel
-/// scanned by [`subtree_has_propagated_filter`] / [`expr_has_propagated_filter`].
+/// scanned by [`subtree_has_propagated_filter_on_key`] / [`expr_has_propagated_filter`].
 fn build_key_projection_subquery(
     subtree: Arc<LogicalPlan>,
     key_col: &Column,
