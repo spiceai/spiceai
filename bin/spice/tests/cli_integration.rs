@@ -520,7 +520,7 @@ mod manifest_editing {
             .arg("configure")
             .arg("llm")
             .arg("--set")
-            .arg("datasets=[documents]")
+            .arg("datasets=yaml:[documents]")
             .assert()
             .success()
             .stdout(predicate::str::contains("Updated"));
@@ -549,7 +549,7 @@ mod manifest_editing {
             .arg("runtime")
             .arg("configure")
             .arg("--set")
-            .arg("functions.enabled=true")
+            .arg("functions.enabled=yaml:true")
             .assert()
             .success()
             .stdout(predicate::str::contains("Updated"));

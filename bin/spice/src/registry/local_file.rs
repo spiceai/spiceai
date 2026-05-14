@@ -113,9 +113,14 @@ impl LocalFileRegistry {
         })?;
 
         // Copy all files from source to the installed dependency directory.
-        if source_path != comparable_destination_dir {
-            copy_dir_recursive(&source_path, &destination_dir)?;
+        // When the source path is identical to the destination (e.g. `spice add ./spicepods/<pod>`
+        // run from the app root, or re-adding an already-installed local pod), skip the copy
+        // *and* the manifest normalization to avoid mutating the user's source files in place.
+        if source_path == comparable_destination_dir {
+            return Ok(destination_dir);
         }
+
+        copy_dir_recursive(&source_path, &destination_dir)?;
 
         let destination_manifest = destination_dir.join(GENERIC_MANIFEST);
         if source_manifest.file_name().and_then(|name| name.to_str()) != Some(GENERIC_MANIFEST) {

@@ -94,8 +94,8 @@ impl NumBytes {
     /// Format as a Kubernetes-style resource string without losing precision.
     ///
     /// This is the format expected by the Spice Cloud API for memory/storage fields.
-    pub fn to_resource_string(self) -> Result<String> {
-        Ok(self.to_parse_string())
+    pub fn to_resource_string(self) -> String {
+        self.to_parse_string()
     }
 
     /// Format as the most compact lossless string accepted by [`NumBytes::parse`].
@@ -178,14 +178,14 @@ mod tests {
     fn parse_gi_suffix() {
         let nb = NumBytes::parse("16Gi").unwrap();
         assert_eq!(nb.as_bytes(), 16 * GIB);
-        assert_eq!(nb.to_resource_string().unwrap(), "16Gi");
+        assert_eq!(nb.to_resource_string(), "16Gi");
     }
 
     #[test]
     fn parse_gib_suffix() {
         let nb = NumBytes::parse("32GiB").unwrap();
         assert_eq!(nb.as_bytes(), 32 * GIB);
-        assert_eq!(nb.to_resource_string().unwrap(), "32Gi");
+        assert_eq!(nb.to_resource_string(), "32Gi");
     }
 
     #[test]
@@ -204,7 +204,7 @@ mod tests {
     fn parse_raw_bytes_without_suffix() {
         let nb = NumBytes::parse("16").unwrap();
         assert_eq!(nb.as_bytes(), 16);
-        assert_eq!(nb.to_resource_string().unwrap(), "16");
+        assert_eq!(nb.to_resource_string(), "16");
     }
 
     #[test]

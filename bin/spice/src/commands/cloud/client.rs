@@ -472,10 +472,7 @@ fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Result<Option<
     Ok(Some(AppResources {
         limits: AppResourceLimits {
             cpu: cpu.map(|v| v.to_string()),
-            memory: memory
-                .map(NumBytes::to_resource_string)
-                .transpose()?
-                .unwrap_or_default(),
+            memory: memory.map(NumBytes::to_resource_string).unwrap_or_default(),
             ephemeral_storage: None,
         },
         requests: None,

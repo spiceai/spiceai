@@ -53,8 +53,8 @@ Quick start:
   spice init my_app          # Scaffold a new Spicepod in ./my_app/
   cd my_app
   spice run                  # Install (if needed) and start the runtime
-    spice -sql \"show tables\"   # Run a single SQL query and exit
-    spice -chat \"Summarize loaded datasets\" # Prompt the configured LLM and exit
+  spice -sql \"show tables\"   # Run a single SQL query and exit
+  spice -chat \"Summarize loaded datasets\" # Prompt the configured LLM and exit
   spice sql                  # Open an interactive SQL REPL
 
 Common workflows:

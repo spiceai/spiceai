@@ -28,11 +28,11 @@ use spice_cloud_client::endpoints::flight_endpoint as spice_cloud_flight_endpoin
     long_about = r#"Run SQL queries against the Spice.ai runtime
 
 Examples:
-    $ spice -sql "show tables"
-    # Runs a single SQL query and exits.
+  $ spice -sql "show tables"
+  # Runs a single SQL query and exits.
 
-    $ spice sql --query "select * from taxi_trips limit 10"
-    # Runs a single SQL query through the sql command and exits.
+  $ spice sql --query "select * from taxi_trips limit 10"
+  # Runs a single SQL query through the sql command and exits.
 
   $ spice sql
   Welcome to the Spice.ai SQL REPL! Type 'help' for help.
