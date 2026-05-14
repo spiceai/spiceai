@@ -419,10 +419,19 @@ pub struct RollbackRequest {
 // Auth
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+// Debug is intentionally not derived: access_token must not appear in logs or error output.
+#[derive(Deserialize)]
 pub struct AuthExchangeResponse {
     pub access_token: Option<String>,
+    #[serde(default)]
     pub access_denied: bool,
+}
+
+// Debug is intentionally not derived: the device auth `code` is short-lived but
+// exchangeable for an access token, so treat it like a secret.
+#[derive(Serialize)]
+pub struct AuthExchangeRequest<'a> {
+    pub code: &'a str,
 }
 
 // Debug is intentionally not derived: client_secret must not appear in logs or error output.
@@ -447,4 +456,47 @@ pub struct AuthContext {
     pub org_name: String,
     pub app_name: Option<String>,
     pub app_api_key: Option<String>,
+}
+
+/// Wire format for the Spice Cloud auth context endpoint, which returns
+/// `org` and `app` as nested objects. Flattened into [`AuthContext`] for the
+/// rest of the CLI.
+#[derive(Debug, Deserialize)]
+pub struct AuthContextRaw {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub org: Option<AuthContextOrg>,
+    #[serde(default)]
+    pub app: Option<AuthContextApp>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthContextOrg {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthContextApp {
+    pub name: Option<String>,
+    pub api_key: Option<String>,
+}
+
+impl From<AuthContextRaw> for AuthContext {
+    fn from(raw: AuthContextRaw) -> Self {
+        let org_name = raw.org.and_then(|o| o.name).unwrap_or_default();
+        let (app_name, app_api_key) = match raw.app {
+            Some(app) => (app.name, app.api_key),
+            None => (None, None),
+        };
+        Self {
+            username: raw.username,
+            email: raw.email,
+            org_name,
+            app_name,
+            app_api_key,
+        }
+    }
 }

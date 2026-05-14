@@ -1121,11 +1121,7 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
         "CREATED",
     ]);
     for app in &apps {
-        let display_name = if app.org.is_empty() {
-            format!("{}/{}", context.org_name, app.name)
-        } else {
-            app.full_name()
-        };
+        let display_name = display_app_name(app, &context.org_name);
         table.add_row(vec![
             display_name,
             app.description.clone().unwrap_or_default(),
@@ -1139,6 +1135,23 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
     table.print();
 
     Ok(())
+}
+
+/// Format an app's display name as `org/name`, falling back to the auth
+/// context org when the app payload does not include one. The Spice Cloud
+/// `/v1/apps` endpoint does not currently populate `org` on each app, so the
+/// auth context provides the only source of truth for the user's org.
+fn display_app_name(app: &spice_cloud_client::types::App, context_org: &str) -> String {
+    let org = if !app.org.is_empty() {
+        app.org.as_str()
+    } else {
+        context_org
+    };
+    if org.is_empty() {
+        app.name.clone()
+    } else {
+        format!("{org}/{}", app.name)
+    }
 }
 
 async fn execute_deployments(args: &DeploymentsArgs) -> Result<()> {
@@ -1853,5 +1866,37 @@ mod tests {
         unsafe { std::env::remove_var(env_var) };
 
         assert_eq!(value, "from-env");
+    }
+
+    fn test_app(org: &str, name: &str) -> spice_cloud_client::types::App {
+        spice_cloud_client::types::App {
+            id: 1,
+            name: name.to_string(),
+            org: org.to_string(),
+            description: None,
+            visibility: None,
+            created_at: None,
+            region: None,
+            production_branch: None,
+            config: None,
+        }
+    }
+
+    #[test]
+    fn display_app_name_uses_app_org_when_present() {
+        let app = test_app("analytics", "dashboard");
+        assert_eq!(display_app_name(&app, "fallback"), "analytics/dashboard");
+    }
+
+    #[test]
+    fn display_app_name_falls_back_to_context_org_when_app_org_is_empty() {
+        let app = test_app("", "dashboard");
+        assert_eq!(display_app_name(&app, "analytics"), "analytics/dashboard");
+    }
+
+    #[test]
+    fn display_app_name_omits_leading_slash_when_org_unavailable() {
+        let app = test_app("", "dashboard");
+        assert_eq!(display_app_name(&app, ""), "dashboard");
     }
 }

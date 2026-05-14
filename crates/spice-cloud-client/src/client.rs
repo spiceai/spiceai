@@ -23,11 +23,11 @@ use snafu::ResultExt;
 
 use crate::error::{self, HttpRequestSnafu, Result};
 use crate::types::{
-    ApiKeysResponse, App, AppsResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
-    CreateAppRequest, CreateDeploymentRequest, Deployment, DeploymentsResponse, LogsResponse,
-    MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, RegenerateApiKeyRequest,
-    RegenerateApiKeyResponse, RegionsResponse, RollbackRequest, Secret, SecretsResponse,
-    SetSecretRequest, UpdateAppRequest,
+    ApiKeysResponse, App, AppsResponse, AuthContext, AuthContextRaw, AuthExchangeRequest,
+    AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
+    Deployment, DeploymentsResponse, LogsResponse, MetricsResponse, OAuthTokenRequest,
+    OAuthTokenResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse,
+    RollbackRequest, Secret, SecretsResponse, SetSecretRequest, UpdateAppRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -104,24 +104,19 @@ impl CloudClient {
     /// Build the browser auth URL for the device login flow.
     #[must_use]
     pub fn get_auth_url(&self, auth_code: &str) -> String {
-        format!(
-            "{}/v1/auth/device?code={}",
-            self.oauth_base_url(),
-            auth_code
-        )
+        format!("{}/auth/token?code={}", self.oauth_base_url(), auth_code)
     }
 
     /// Exchange a device auth code for an access token.
     ///
     /// Returns `Ok(None)` while the user has not yet completed the browser flow.
     pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
-        let url = format!(
-            "{}/v1/auth/device/exchange?code={}",
-            self.base_url, auth_code
-        );
+        let url = format!("{}/auth/token/exchange", self.oauth_base_url());
+        let request = AuthExchangeRequest { code: auth_code };
         let response = self
             .client
-            .get(&url)
+            .post(&url)
+            .json(&request)
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -140,6 +135,10 @@ impl CloudClient {
         }
 
         let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;
+        // Pending: the server returned 200 but the code is not yet authorized.
+        if !body.access_denied && body.access_token.as_deref().is_none_or(|t| t.is_empty()) {
+            return Ok(None);
+        }
         Ok(Some(body))
     }
 
@@ -192,7 +191,7 @@ impl CloudClient {
 
     /// Get the authentication context for the current token.
     pub async fn get_auth_context(&self) -> Result<AuthContext> {
-        let url = format!("{}/v1/auth/context", self.base_url);
+        let url = format!("{}/api/spice-cli/auth", self.oauth_base_url());
         let response = self
             .client
             .get(&url)
@@ -201,7 +200,8 @@ impl CloudClient {
             .await
             .context(HttpRequestSnafu)?;
 
-        self.handle_response(response).await
+        let raw: AuthContextRaw = self.handle_response(response).await?;
+        Ok(raw.into())
     }
 
     // ========================================================================
@@ -657,6 +657,7 @@ fn oauth_host(host: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::CloudClient;
+    use crate::types::{AuthContext, AuthContextApp, AuthContextOrg, AuthContextRaw};
 
     #[test]
     fn oauth_base_url_rewrites_api_hosts() {
@@ -677,5 +678,60 @@ mod tests {
     fn oauth_base_url_leaves_non_api_hosts_unchanged() {
         let client = CloudClient::new("https://localhost:8090").expect("cloud client should build");
         assert_eq!(client.oauth_base_url(), "https://localhost:8090");
+    }
+
+    #[test]
+    fn auth_url_uses_oauth_token_path() {
+        let client = CloudClient::new("https://api.spice.ai").expect("cloud client should build");
+        assert_eq!(
+            client.get_auth_url("ABCD1234"),
+            "https://spice.ai/auth/token?code=ABCD1234"
+        );
+    }
+
+    #[test]
+    fn auth_context_raw_flattens_nested_org_and_app() {
+        let raw = AuthContextRaw {
+            username: "ada".to_string(),
+            email: "ada@example.com".to_string(),
+            org: Some(AuthContextOrg {
+                name: Some("analytics".to_string()),
+            }),
+            app: Some(AuthContextApp {
+                name: Some("dashboard".to_string()),
+                api_key: Some("secret".to_string()),
+            }),
+        };
+        let ctx: AuthContext = raw.into();
+        assert_eq!(ctx.org_name, "analytics");
+        assert_eq!(ctx.app_name.as_deref(), Some("dashboard"));
+        assert_eq!(ctx.app_api_key.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn auth_context_raw_tolerates_missing_org_and_app() {
+        let raw: AuthContextRaw =
+            serde_json::from_str(r#"{"username":"ada","email":"ada@example.com"}"#)
+                .expect("parse minimal auth context");
+        let ctx: AuthContext = raw.into();
+        assert_eq!(ctx.username, "ada");
+        assert_eq!(ctx.org_name, "");
+        assert!(ctx.app_name.is_none());
+        assert!(ctx.app_api_key.is_none());
+    }
+
+    #[test]
+    fn auth_context_raw_parses_nested_wire_format() {
+        let body = r#"{
+            "username": "ada",
+            "email": "ada@example.com",
+            "org": {"name": "analytics"},
+            "app": {"name": "dashboard", "api_key": "secret"}
+        }"#;
+        let raw: AuthContextRaw = serde_json::from_str(body).expect("parse nested auth context");
+        let ctx: AuthContext = raw.into();
+        assert_eq!(ctx.org_name, "analytics");
+        assert_eq!(ctx.app_name.as_deref(), Some("dashboard"));
+        assert_eq!(ctx.app_api_key.as_deref(), Some("secret"));
     }
 }
