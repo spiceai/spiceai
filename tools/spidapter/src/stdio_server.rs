@@ -729,7 +729,7 @@ async fn provision_spice_cloud_app(
                 app_id,
                 &UpdateAppRequest {
                     image_tag: args.image_tag.clone(),
-                    update_channel: args.channel.clone(),
+                    update_channel: args.channel,
                     ..UpdateAppRequest::default()
                 },
             )
@@ -741,7 +741,7 @@ async fn provision_spice_cloud_app(
     }
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id, args.channel.as_deref()).await?;
+    commands::create_deployment(&cloud, app_id, args.channel.as_ref()).await?;
 
     let poll_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))

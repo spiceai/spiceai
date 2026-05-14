@@ -20,13 +20,16 @@ limitations under the License.
 //! constructor logic (base URL selection, token resolution) and converts errors
 //! into the CLI error type.
 
+use std::collections::BTreeMap;
+
 use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
 
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
-    ApiKeysResponse, App, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
-    CreateAppRequest, CreateDeploymentRequest, Deployment, LogsResponse, MetricsResponse,
-    RegenerateApiKeyResponse, RegionsResponse, Secret, UpdateAppRequest,
+    ApiKeysResponse, App, AppExecutor, AppKind, AppResourceLimits, AppResources, AuthContext,
+    AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
+    Deployment, LogsResponse, MetricsResponse, RegenerateApiKeyResponse, RegionsResponse, Secret,
+    UpdateAppRequest, UpdateChannel,
 };
 
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
@@ -156,25 +159,53 @@ impl CloudClient {
         self.inner.get_app_by_id(app_id).await.map_err(into_cli)
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub async fn create_app(
         &self,
         name: &str,
+        region: &str,
+        kind: AppKind,
         description: Option<&str>,
         visibility: &str,
+        replicas: Option<i32>,
+        cpu: Option<i32>,
+        memory: Option<NumBytes>,
+        storage_size_gb: Option<f64>,
+        executor_replicas: Option<i32>,
+        executor_cpu: Option<i32>,
+        executor_memory: Option<NumBytes>,
     ) -> Result<App> {
+        let resources = build_resources(cpu, memory);
+        let executor = build_executor(
+            executor_replicas,
+            executor_cpu,
+            executor_memory,
+            storage_size_gb,
+        );
+
+        let (tags, replicas) = match kind {
+            AppKind::Cluster => {
+                let mut t = BTreeMap::new();
+                t.insert("kind".to_string(), "cluster".to_string());
+                (Some(t), Some(1))
+            }
+            AppKind::Set => (None, replicas),
+        };
+
         let request = CreateAppRequest {
             name: name.to_string(),
             description: description.map(String::from),
             visibility: visibility.to_string(),
-            cname: None,
-            tags: None,
-            replicas: None,
-            resources: None,
-            executor: None,
+            cname: Some(region.to_string()),
+            tags,
+            replicas,
+            resources,
+            executor,
         };
         self.inner.create_app(&request).await.map_err(into_cli)
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub async fn update_app(
         &self,
         org_app: &str,
@@ -183,15 +214,30 @@ impl CloudClient {
         replicas: Option<i32>,
         image_tag: Option<&str>,
         region: Option<&str>,
+        cpu: Option<i32>,
+        memory: Option<NumBytes>,
+        storage_size_gb: Option<f64>,
+        executor_replicas: Option<i32>,
+        executor_cpu: Option<i32>,
+        executor_memory: Option<NumBytes>,
+        spicepod: Option<String>,
+        channel: Option<UpdateChannel>,
     ) -> Result<App> {
         let app = self.get_app(org_app).await?;
+        let resources = build_resources(cpu, memory);
+        let executor = build_executor(executor_replicas, executor_cpu, executor_memory, None);
+
         let request = UpdateAppRequest {
             description: description.map(String::from),
             visibility: visibility.map(String::from),
             replicas,
             image_tag: image_tag.map(String::from),
+            update_channel: channel,
             region: region.map(String::from),
-            ..Default::default()
+            resources,
+            executor,
+            storage_size_gb,
+            spicepod,
         };
         self.inner
             .update_app(app.id, &request)
@@ -411,6 +457,44 @@ pub fn parse_org_app(org_app: &str) -> (String, String) {
     } else {
         (String::new(), org_app.to_string())
     }
+}
+
+use super::bytes::NumBytes;
+
+/// Build an [`AppResources`] from optional CPU (vCPUs) and a parsed [`NumBytes`] memory value.
+///
+/// Returns `None` if neither is provided.
+fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Option<AppResources> {
+    if cpu.is_none() && memory.is_none() {
+        return None;
+    }
+    Some(AppResources {
+        limits: AppResourceLimits {
+            cpu: cpu.map(|v| v.to_string()),
+            memory: memory.map_or_else(|| "8Gi".to_string(), NumBytes::to_gi_string),
+            ephemeral_storage: None,
+        },
+        requests: None,
+    })
+}
+
+/// Build an [`AppExecutor`] from optional executor params.
+///
+/// Returns `None` if no executor-related fields are provided.
+fn build_executor(
+    replicas: Option<i32>,
+    cpu: Option<i32>,
+    memory: Option<NumBytes>,
+    storage_size_gb: Option<f64>,
+) -> Option<AppExecutor> {
+    if replicas.is_none() && cpu.is_none() && memory.is_none() && storage_size_gb.is_none() {
+        return None;
+    }
+    Some(AppExecutor {
+        replicas,
+        resources: build_resources(cpu, memory),
+        storage_size_gb,
+    })
 }
 
 /// Convert a [`spice_cloud_client::error::Error`] into the CLI error type.
