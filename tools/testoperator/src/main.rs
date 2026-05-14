@@ -24,8 +24,8 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SchemaTestArgs, TestCommands,
-    TextToSqlArgs,
+    Commands, DataConsistencyArgs, DatasetTestArgs, HtapArgs, LoadTestArgs, SchemaTestArgs,
+    TestCommands, TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -56,6 +56,10 @@ async fn main() -> anyhow::Result<()> {
             | TestCommands::TextToSql(TextToSqlArgs { common, .. })
             | TestCommands::Schema(SchemaTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
+                test_args: DatasetTestArgs { common, .. },
+                ..
+            })
+            | TestCommands::Htap(HtapArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
             }),
@@ -103,6 +107,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run(TestCommands::Schema(args)) => {
             commands::schema::run(&args).await?;
+        }
+        Commands::Run(TestCommands::Htap(args)) => {
+            commands::htap::run(&args).await?;
         }
         Commands::Export(TestCommands::StreamingDynamodbCorrectness(_)) => {
             return Err(anyhow::anyhow!(

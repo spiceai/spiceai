@@ -312,7 +312,7 @@ impl AppendableSource for FileAppendableSource {
 
                     dest_conn.execute_batch(setup_sql)?;
                 }
-                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch => unimplemented!("Appendable file source is not implemented for Scenario or Parameterized TPC-H query sets"),
+                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch | QuerySet::ChBench => anyhow::bail!("Appendable file source is not implemented for Scenario, Parameterized TPC-H, or CH-benCH query sets"),
             }
 
             drop(dest_conn);
@@ -361,8 +361,8 @@ impl AppendableSource for FileAppendableSource {
                 ),
                 QuerySet::Tpcds => generate_tpcds_sql(load_steps, load_index, &tables),
                 QuerySet::Clickbench => generate_clickbench_sql(load_steps, load_index),
-                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch => {
-                    unimplemented!("Appendable file source is not implemented for Scenario or Parameterized query sets")
+                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch | QuerySet::ChBench => {
+                    anyhow::bail!("Appendable file source is not implemented for Scenario, Parameterized, or CH-benCH query sets")
                 }
             };
 

@@ -1,0 +1,23 @@
+select
+    s_suppkey, s_name, n_name, i_id, i_name, s_address, s_phone, s_comment
+from
+    item, supplier, stock, nation, region,
+    (select s_i_id as m_i_id,
+            min(s_quantity) as m_s_quantity
+     from   stock, supplier, nation, region
+     where  mod((s_w_id*s_i_id),10000)=s_suppkey
+       and s_nationkey=n_nationkey
+       and n_regionkey=r_regionkey
+       and r_name like 'EUROP%'
+     group by s_i_id) m
+where
+    i_id = s_i_id
+    and mod((s_w_id * s_i_id), 10000) = s_suppkey
+    and s_nationkey = n_nationkey
+    and n_regionkey = r_regionkey
+    and i_data like '%b'
+    and r_name like 'EUROP%'
+    and i_id=m_i_id
+    and s_quantity = m_s_quantity
+order by
+    n_name, s_name, i_id;
