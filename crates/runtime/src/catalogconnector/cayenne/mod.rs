@@ -37,23 +37,27 @@ pub static PREFIX: &str = "cayenne";
 
 /// Parameters for configuring a Cayenne catalog.
 pub const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("cayenne_data_dir")
+    ParameterSpec::component("data_dir")
         .description("Local directory for table data files. Defaults to spice data directory."),
-    ParameterSpec::component("cayenne_metadata_dir").description(
+    ParameterSpec::component("metadata_dir").description(
         "Local directory for Cayenne SQLite metadata. Defaults to spice data directory.",
     ),
-    ParameterSpec::component("cayenne_footer_cache_mb")
+    ParameterSpec::component("footer_cache_mb")
         .description("Vortex footer cache size in MB. Default: 128.")
         .default("128"),
-    ParameterSpec::component("cayenne_segment_cache_mb")
+    ParameterSpec::component("segment_cache_mb")
         .description("Vortex segment cache size in MB. Default: 256.")
         .default("256"),
-    ParameterSpec::component("cayenne_target_file_size_mb")
+    ParameterSpec::component("target_file_size_mb")
         .description("Target Vortex file size in MB. Default: 128.")
         .default("128"),
-    ParameterSpec::component("cayenne_compression_strategy")
+    ParameterSpec::component("compression_strategy")
         .description("Compression: 'btrblocks' (default) or 'zstd'.")
         .default("btrblocks"),
+    ParameterSpec::component("upload_concurrency")
+        .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
+    ParameterSpec::component("write_concurrency")
+        .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
 ];
 
 /// A catalog connector for Cayenne lakehouse catalogs.
@@ -80,38 +84,38 @@ impl CayenneCatalogConnector {
     fn parse_provider_config(&self) -> CayenneCatalogProviderConfig {
         let data_dir = self
             .params
-            .get("cayenne_data_dir")
+            .get("data_dir")
             .expose()
             .ok()
             .map(ToOwned::to_owned);
         let metadata_dir = self
             .params
-            .get("cayenne_metadata_dir")
+            .get("metadata_dir")
             .expose()
             .ok()
             .map(ToOwned::to_owned);
 
         let footer_cache_mb = self
             .params
-            .get("cayenne_footer_cache_mb")
+            .get("footer_cache_mb")
             .expose()
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
         let segment_cache_mb = self
             .params
-            .get("cayenne_segment_cache_mb")
+            .get("segment_cache_mb")
             .expose()
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
         let target_file_size_mb = self
             .params
-            .get("cayenne_target_file_size_mb")
+            .get("target_file_size_mb")
             .expose()
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
         let compression_strategy = self
             .params
-            .get("cayenne_compression_strategy")
+            .get("compression_strategy")
             .expose()
             .ok()
             .and_then(|v| match v.to_lowercase().as_str() {
@@ -119,6 +123,20 @@ impl CayenneCatalogConnector {
                 "btrblocks" => Some(cayenne::metadata::CompressionStrategy::Btrblocks),
                 _ => None,
             });
+        let upload_concurrency = self
+            .params
+            .get("upload_concurrency")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1));
+        let write_concurrency = self
+            .params
+            .get("write_concurrency")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1));
 
         CayenneCatalogProviderConfig {
             data_dir,
@@ -128,6 +146,8 @@ impl CayenneCatalogConnector {
             segment_cache_mb,
             target_file_size_mb,
             compression_strategy,
+            upload_concurrency,
+            write_concurrency,
         }
     }
 }
@@ -177,5 +197,64 @@ impl CatalogConnector for CayenneCatalogConnector {
         })?;
 
         Ok(refreshable_provider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parameters::Parameters;
+    use runtime_secrets::Secrets;
+    use secrecy::SecretString;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn catalog_parameter_specs_render_single_cayenne_prefix() {
+        let display_names: Vec<String> = PARAMETERS
+            .iter()
+            .map(|parameter| parameter.display_name(PREFIX))
+            .collect();
+
+        assert!(display_names.contains(&"cayenne_upload_concurrency".to_string()));
+        assert!(display_names.contains(&"cayenne_write_concurrency".to_string()));
+        assert!(
+            display_names
+                .iter()
+                .all(|name| !name.starts_with("cayenne_cayenne_")),
+            "Cayenne catalog parameter specs should not include the prefix in component names"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_provider_config_uses_normalized_catalog_params() {
+        let params = Parameters::try_new(
+            "connector cayenne",
+            vec![
+                (
+                    "cayenne_data_dir".to_string(),
+                    SecretString::new("/tmp/cayenne-data".to_string().into()),
+                ),
+                (
+                    "cayenne_upload_concurrency".to_string(),
+                    SecretString::new("0".to_string().into()),
+                ),
+                (
+                    "cayenne_write_concurrency".to_string(),
+                    SecretString::new("8".to_string().into()),
+                ),
+            ],
+            PREFIX,
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("single-prefixed Cayenne catalog params should validate");
+        let connector = CayenneCatalogConnector { params };
+
+        let config = connector.parse_provider_config();
+
+        assert_eq!(config.data_dir.as_deref(), Some("/tmp/cayenne-data"));
+        assert_eq!(config.upload_concurrency, Some(1));
+        assert_eq!(config.write_concurrency, Some(8));
     }
 }
