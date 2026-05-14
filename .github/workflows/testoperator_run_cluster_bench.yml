@@ -8,6 +8,19 @@ run-name: cluster-bench - ${{ github.event.inputs.query_set }} - ${{ github.even
 # `run_spicebench.yml` plumbing in the spicebench repo.
 
 on:
+  # Temporary push trigger so this workflow exercises the cayenne distributed
+  # spicepod end-to-end on every commit to the stacked feature branch (before
+  # the change has landed on trunk). Remove this block before merging the
+  # stacked PR — workflow_dispatch is the long-term trigger.
+  push:
+    branches:
+      - phillip/testoperator-cayenne-distributed-spicepod
+    paths:
+      - '.github/workflows/testoperator_run_cluster_bench.yml'
+      - 'test/spicepods/tpch/sf1/distributed/**'
+      - 'tools/testoperator/**'
+      - 'tools/spidapter/**'
+      - 'crates/test-framework/**'
   workflow_dispatch:
     inputs:
       spicepod_path:
@@ -44,7 +57,7 @@ on:
         default: '4'
         type: string
       channel:
-        description: 'Spice runtime image channel passed to spidapter'
+        description: 'Spice runtime image channel passed to spidapter (ignored when custom_image_tag is set)'
         required: true
         default: 'nightly'
         type: choice
@@ -53,6 +66,18 @@ on:
           - 'preview'
           - 'stable'
           - 'internal'
+      custom_image_tag:
+        description: |
+          Custom runtime container image tag from `ghcr.io/spiceai/spiceai-dev`
+          (e.g. `trunk-20260514.1055`, produced by the `spiced_docker_dev`
+          workflow). When set, overrides `channel` so the bench runs against a
+          specific spiced build instead of the published channel image — match
+          how `testoperator_run_bench.yml` benchmarks a specific spiced commit.
+          Until the cluster-bench dispatch wires this in automatically, build
+          the image manually first and pass the tag here.
+        required: false
+        default: ''
+        type: string
       scale_factor:
         description: 'Scale factor for the benchmark'
         required: false
@@ -62,7 +87,7 @@ on:
         description: 'Validate query results against expected (where supported)'
         required: false
         type: boolean
-        default: false
+        default: true
       update_snapshots:
         description: |
           How to handle insta snapshot mismatches. `default` decides based on
@@ -92,22 +117,28 @@ on:
           - 'spiceai-dev-large-runners'
 
 permissions:
-  contents: read
+  # `write` on contents + pull-requests so the "Open snapshot-update PR" step
+  # can push a branch and open a PR. `packages: read` covers the spidapter
+  # GHCR image pull. Matches the implicit permissions
+  # `testoperator_run_bench.yml` inherits from the repo default.
+  contents: write
   packages: read
+  pull-requests: write
 
 # Centralized defaults so push-triggered runs (where github.event.inputs.* is
 # empty) and workflow_dispatch runs share the same fallback chain. Configured
 # for a Ballista distributed-query smoke test against the public-S3 TPC-H
 # spicepod by default.
 env:
-  CB_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path || 'federated/s3-public[parquet].yaml' }}
+  CB_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path || 'distributed/s3-public[parquet]-cayenne[file].yaml' }}
   CB_QUERY_SET: ${{ github.event.inputs.query_set || 'tpch' }}
   CB_SCENARIO_QUERY_FILE: ${{ github.event.inputs.scenario_query_file || '' }}
-  CB_QUERY_TRANSPORT: ${{ github.event.inputs.query_transport || 'v1-queries' }}
+  CB_QUERY_TRANSPORT: ${{ github.event.inputs.query_transport || 'flightsql' }}
   CB_EXECUTOR_REPLICAS: ${{ github.event.inputs.executor_replicas || '3' }}
   CB_CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
+  CB_CUSTOM_IMAGE_TAG: ${{ github.event.inputs.custom_image_tag || '' }}
   CB_SCALE_FACTOR: ${{ github.event.inputs.scale_factor || '1' }}
-  CB_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results || 'false' }}
+  CB_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results || 'true' }}
   CB_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots || 'default' }}
   CB_READY_WAIT: ${{ github.event.inputs.ready_wait || '600' }}
   CB_RUNNER_TYPE: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
@@ -217,6 +248,7 @@ jobs:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
           CHANNEL: ${{ env.CB_CHANNEL }}
+          CUSTOM_IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
           QUERY_SET: ${{ env.CB_QUERY_SET }}
           QUERY_TRANSPORT: ${{ env.CB_QUERY_TRANSPORT }}
           SCALE_FACTOR: ${{ env.CB_SCALE_FACTOR }}
@@ -249,6 +281,21 @@ jobs:
           # env block.
           export SPIDAPTER_EXECUTOR_REPLICAS="${EXECUTOR_REPLICAS}"
 
+          # When a custom image tag is provided (e.g. a `trunk-<sha>` image
+          # freshly published by `spiced_docker_dev`), pin spidapter to that
+          # tag via SPIDAPTER_IMAGE_TAG AND flip the channel to `internal` so
+          # the Spice Cloud control plane resolves the image against the dev
+          # GHCR registry (`ghcr.io/spiceai/spiceai-dev`) instead of the
+          # enterprise ECR. Matches spicebench's `run_spicebench_debug_spice_cloud.yml`
+          # pattern — `nightly` is for default channel-published runtimes;
+          # `internal` is for the per-commit images we build ourselves.
+          ADAPTER_CHANNEL="${CHANNEL}"
+          if [ -n "${CUSTOM_IMAGE_TAG}" ]; then
+            echo "Pinning spidapter to image tag: ${CUSTOM_IMAGE_TAG} (channel: internal)"
+            export SPIDAPTER_IMAGE_TAG="${CUSTOM_IMAGE_TAG}"
+            ADAPTER_CHANNEL="internal"
+          fi
+
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -p "${SPICEPOD_PATH}" \
@@ -261,7 +308,196 @@ jobs:
             ${TRANSPORT_FLAG} \
             ${SCENARIO_ARG} \
             --system-adapter-stdio-cmd spidapter \
-            --system-adapter-stdio-args "stdio --verbose --channel ${CHANNEL}" \
+            --system-adapter-stdio-args "stdio --verbose --channel ${ADAPTER_CHANNEL}" \
             --system-adapter-param channel="${CHANNEL}" \
             --system-adapter-param executor_replicas="${EXECUTOR_REPLICAS}" \
+            --system-adapter-param custom_image_tag="${CUSTOM_IMAGE_TAG}" \
             --system-adapter-param query_transport="${QUERY_TRANSPORT}"
+
+      - name: Install gh CLI
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
+        run: |
+          if command -v gh >/dev/null 2>&1; then
+            echo "gh already installed"
+            exit 0
+          fi
+          (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y))
+          sudo mkdir -p -m 755 /etc/apt/keyrings
+          out=$(mktemp)
+          wget -nv -O "$out" https://cli.github.com/packages/githubcli-archive-keyring.gpg
+          cat "$out" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh -y
+
+      - name: Open snapshot-update PR
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICEPOD_PATH_DISPLAY: ${{ env.CB_SPICEPOD_PATH }}
+          QUERY_SET: ${{ env.CB_QUERY_SET }}
+          SCALE_FACTOR: ${{ env.CB_SCALE_FACTOR }}
+          QUERY_TRANSPORT: ${{ env.CB_QUERY_TRANSPORT }}
+          EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
+          CHANNEL: ${{ env.CB_CHANNEL }}
+          CUSTOM_IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+        run: |
+          set -euo pipefail
+          git fetch --unshallow || true
+
+          # Categorize snap-file changes from the working tree. `git status -s`
+          # output starts with status codes: `??` for untracked (new baselines),
+          # `M ` for modified (drift updates), etc. Restrict to `.snap` files so
+          # we don't accidentally sweep up build artifacts.
+          mapfile -t new_files < <(git status -s -- '*.snap' | awk '/^\?\?/ { print $2 }')
+          mapfile -t modified_files < <(git status -s -- '*.snap' | awk '/^.M/ || /^M / { print $2 }')
+
+          new_count=${#new_files[@]}
+          modified_count=${#modified_files[@]}
+          total=$((new_count + modified_count))
+
+          if [ "$total" -eq 0 ]; then
+            echo "No snapshot changes; skipping PR"
+            exit 0
+          fi
+
+          # Branch name keyed on the image tag (if pinned) or the run id, so
+          # repeat runs against the same image converge on one PR.
+          if [ -n "${CUSTOM_IMAGE_TAG}" ]; then
+            BRANCH_ID="${CUSTOM_IMAGE_TAG}"
+          else
+            BRANCH_ID="${{ github.run_id }}"
+          fi
+          # Sanitize the spicepod path for use in the branch name (slashes/
+          # brackets aren't great ref characters).
+          slug="$(echo "${SPICEPOD_PATH_DISPLAY}" | sed 's#[][/]#-#g' | sed 's#--*#-#g')"
+          BRANCH_NAME="testoperator-cluster-snapshot-update/${BRANCH_ID}-${slug}"
+
+          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
+          git config --global user.email 'spiceaibot@spice.ai'
+          git checkout -b "${BRANCH_NAME}"
+          git add '*.snap'
+
+          if git diff --cached --quiet; then
+            echo "No staged changes after git add; nothing to commit"
+            exit 0
+          fi
+
+          # Short summary line for the commit message.
+          if [ "$modified_count" -eq 0 ]; then
+            commit_summary="create ${new_count} baseline$( [ "$new_count" -ne 1 ] && echo s ) for ${SPICEPOD_PATH_DISPLAY}"
+          elif [ "$new_count" -eq 0 ]; then
+            commit_summary="update ${modified_count} snapshot$( [ "$modified_count" -ne 1 ] && echo s ) for ${SPICEPOD_PATH_DISPLAY}"
+          else
+            commit_summary="${new_count} new + ${modified_count} updated snapshot$( [ "$total" -ne 1 ] && echo s ) for ${SPICEPOD_PATH_DISPLAY}"
+          fi
+
+          git commit -m "fix(cluster-bench): ${commit_summary}"
+          if git ls-remote --exit-code --heads origin "${BRANCH_NAME}" >/dev/null 2>&1; then
+            git pull --rebase origin "${BRANCH_NAME}"
+          fi
+          git push origin "${BRANCH_NAME}"
+
+          PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq '.[].url')"
+          if [ -n "${PR_URL}" ]; then
+            echo "PR already exists -> ${PR_URL}"
+            exit 0
+          fi
+
+          # Image identifier: pinned tag if the workflow was given one,
+          # otherwise the channel.
+          if [ -n "${CUSTOM_IMAGE_TAG}" ]; then
+            image_descriptor="\`ghcr.io/spiceai/spiceai-dev:${CUSTOM_IMAGE_TAG}\` (pinned)"
+          else
+            image_descriptor="channel \`${CHANNEL}\`"
+          fi
+
+          # Extract the affected `tpch_qN` / `tpcds_qN` query slugs from the
+          # snap filenames so reviewers can see which queries drifted at a
+          # glance. Snap names look like:
+          #   test_framework__snapshot__<spicepod>_<query>_<kind>_sf<N>.snap
+          extract_query() {
+            local f="$1"
+            basename "$f" .snap | grep -oE '(tp(ch|cds)_q[0-9]+)' | head -n 1
+          }
+
+          uniq_queries() {
+            local -a names=()
+            for f in "$@"; do
+              local q
+              q="$(extract_query "$f")"
+              [ -n "$q" ] && names+=("$q")
+            done
+            printf '%s\n' "${names[@]}" | sort -u | tr '\n' ' '
+          }
+
+          new_query_list="$(uniq_queries "${new_files[@]:-}")"
+          mod_query_list="$(uniq_queries "${modified_files[@]:-}")"
+
+          # Build the PR body. Use printf so heredoc indentation doesn't sneak
+          # into the rendered markdown.
+          body_file="$(mktemp)"
+          {
+            printf '**%s** by run [#%s](%s/%s/actions/runs/%s).\n\n' \
+              "${commit_summary}" \
+              "${{ github.run_id }}" \
+              "${{ github.server_url }}" \
+              "${{ github.repository }}" \
+              "${{ github.run_id }}"
+
+            printf '### Run configuration\n\n'
+            printf '| Field | Value |\n| --- | --- |\n'
+            printf '| Spicepod | `%s` |\n' "${SPICEPOD_PATH_DISPLAY}"
+            printf '| Query set | `%s` |\n' "${QUERY_SET}"
+            printf '| Scale factor | `%s` |\n' "${SCALE_FACTOR}"
+            printf '| Query transport | `%s` |\n' "${QUERY_TRANSPORT}"
+            printf '| Cluster | %s executor replica(s), %s |\n' \
+              "${EXECUTOR_REPLICAS}" "${image_descriptor}"
+            printf '\n'
+
+            if [ "$new_count" -gt 0 ]; then
+              printf '### New baselines (%s file' "${new_count}"
+              [ "$new_count" -ne 1 ] && printf 's'
+              printf ')\n\n'
+              if [ -n "${new_query_list}" ]; then
+                printf 'Queries: %s\n\n' "${new_query_list}"
+              fi
+              printf '<details><summary>Files</summary>\n\n```\n'
+              printf '%s\n' "${new_files[@]}"
+              printf '```\n\n</details>\n\n'
+            fi
+
+            if [ "$modified_count" -gt 0 ]; then
+              printf '### Updated snapshots (%s file' "${modified_count}"
+              [ "$modified_count" -ne 1 ] && printf 's'
+              printf ')\n\n'
+              if [ -n "${mod_query_list}" ]; then
+                printf 'Queries: %s\n\n' "${mod_query_list}"
+              fi
+              printf '<details><summary>Files</summary>\n\n```\n'
+              printf '%s\n' "${modified_files[@]}"
+              printf '```\n\n</details>\n\n'
+            fi
+
+            printf '### Review hints\n\n'
+            # `printf -- …` so leading `-` in the format string isn't parsed
+            # as an option flag.
+            printf -- '- **New baselines**: expected when a spicepod is added or the snapshot predicate changes — confirm the queries shown look sane (correct row count, ordered output, no transient values) before merging.\n'
+            printf -- '- **Updated snapshots**: indicate planner or execution drift. Inspect the diff and cross-reference recent trunk commits touching the runtime / federation / acceleration layer to confirm the change is intentional.\n'
+            printf -- '- The cluster-bench harness only opens this PR when `update_snapshots=always` (the default for non-`release/*` branches). To gate snapshot drift in CI, set `update_snapshots=no` on the dispatch.\n'
+          } > "${body_file}"
+
+          # Title carries the same summary that's in the commit message — short
+          # but specifies cluster-bench, file counts, spicepod, and query set
+          # so it stands apart in the auto-PR list.
+          title="snapshot(cluster-bench): ${commit_summary} (${QUERY_SET} sf${SCALE_FACTOR})"
+
+          gh pr create \
+            --title "${title}" \
+            --body-file "${body_file}" \
+            --base "${{ github.ref_name }}" \
+            --head "${BRANCH_NAME}" \
+            --label area/ci
+          gh pr merge --squash --auto "${BRANCH_NAME}" || true
