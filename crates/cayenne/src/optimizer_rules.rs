@@ -15,6 +15,54 @@ limitations under the License.
 */
 
 //! Physical optimizer rules for Cayenne execution plans.
+//!
+//! # No-spill build-side memory strategy (q21 / chbench multi-way joins)
+//!
+//! DataFusion's `HashJoinExec` build side is non-spillable. Under the runtime
+//! memory pool (`GreedyMemoryPool` wrapped in `TrackConsumersPool`), wide chbench
+//! shapes such as q21 (a 5-way join feeding a correlated `NOT EXISTS` self-join
+//! over `order_line`) exhaust the `HashJoinInput[N]` reservations because each
+//! build-side hash table independently materializes its full keyspace.
+//!
+//! The existing `CayenneJoinRewriter` only helps the **probe** side: it swaps
+//! the default in-list accumulator for [`ExactLeftAccumulator`], which produces
+//! a precise dynamic filter (or falls back to `RangeBounds` + `BloomFilter`)
+//! that DataFusion's filter-pushdown phase plants into the right-side
+//! `CayenneAccelerationExec`'s `FileSource`. It does nothing to shrink build
+//! sides, so q21 is currently excluded from
+//! `test_framework::queries::get_chbench_test_queries`.
+//!
+//! Three follow-on workstreams are tracked for the `lukim/q21` branch:
+//!
+//! 1. **Cross-scan dynamic filter sharing** (highest leverage for q21). When a
+//!    join's `Arc<DynamicFilterPhysicalExpr>` is pushed into one
+//!    `CayenneAccelerationExec`, install the *same* `Arc` (which shares its
+//!    `Arc<RwLock<Inner>>` state via `DynamicFilterPhysicalExpr` design) on
+//!    every sibling `CayenneAccelerationExec` backed by the same underlying
+//!    table. This requires:
+//!      - A stable table-identity accessor on `CayenneAccelerationExec` (walk
+//!        the inner plan to the `DataSourceExec`'s `FileSource` and hash its
+//!        object-store paths + table reference).
+//!      - A post-pushdown physical optimizer pass that walks the plan, groups
+//!        same-source Cayenne scans, and ANDs the union of in-flight dynamic
+//!        filters into each sibling's predicate.
+//!      - Column remapping when projection ordering differs between siblings.
+//!
+//! 2. **Bidirectional build-side accumulator pushdown.** Extend
+//!    `CayenneJoinRewriter` to also rewrite joins whose **build** side is a
+//!    `CayenneAccelerationExec`. The build-vs-probe asymmetry means this needs
+//!    either a precursor pass that materializes the probe's filter set first
+//!    (semantically reversing the dataflow for anti-joins) or a planner hint
+//!    that swaps build/probe when the build side is the dominant cardinality.
+//!
+//! 3. **Predicate transitive closure across equi-join keys.** Logical optimizer
+//!    rule that propagates `IN (...)` and range predicates through equi-join
+//!    chains so that a selective filter on one table reaches every transitively
+//!    equi-joined column at plan time, not just at runtime.
+//!
+//! Until at least #1 lands, q21 remains disabled in the chbench query set.
+//! See the comment in `crates/test-framework/src/queries/mod.rs` next to
+//! `get_chbench_test_queries`.
 
 use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};

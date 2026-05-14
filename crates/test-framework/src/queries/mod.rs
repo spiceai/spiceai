@@ -1217,7 +1217,12 @@ pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query>
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 22
     );
     // q15 excluded: requires a `revenue1` view
-    // q21 excluded: multi-way JOIN + anti-join exhausts HashJoin memory (can't spill)
+    // q21 excluded: a 5-way join feeding a correlated NOT EXISTS self-join over
+    // `order_line` overruns the non-spillable `HashJoinInput` reservations.
+    // Re-enable once the no-spill workstreams documented in
+    // `crates/cayenne/src/optimizer_rules.rs` (in particular cross-scan dynamic
+    // filter sharing for same-source `CayenneAccelerationExec` nodes) have
+    // landed.
 
     match overrides {
         // No engine-specific overrides yet
