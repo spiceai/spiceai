@@ -51,7 +51,6 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
-use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{ColumnStatistics, Constraints, DFSchema, Statistics};
 use datafusion_execution::cache::TableScopedPath;
@@ -5933,12 +5932,83 @@ mod tests {
     use datafusion::logical_expr::CreateExternalTable;
     use datafusion::logical_expr::dml::InsertOp;
     use datafusion::physical_plan::collect;
-    use datafusion_common::DataFusionError;
+    use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_federation::schema_cast::record_convert::try_cast_to;
     use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
     use test_framework::arrow_record_batch_gen::*;
+
+    #[test]
+    fn table_statistics_to_df_uses_persisted_vortex_stats() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            true,
+        )]));
+        let column_stats = ColumnStatistics {
+            null_count: datafusion_common::stats::Precision::Exact(1),
+            min_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(10))),
+            max_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(20))),
+            sum_value: datafusion_common::stats::Precision::Absent,
+            distinct_count: datafusion_common::stats::Precision::Absent,
+            byte_size: datafusion_common::stats::Precision::Absent,
+        };
+        let stats_set = crate::stats::column_stats_to_stats_set(&column_stats);
+        let file_stats = crate::stats::build_file_statistics(vec![stats_set], &schema);
+        let statistics_blob =
+            crate::stats::serialize_file_statistics(&file_stats).expect("stats should serialize");
+        let table_stats = TableStatistics {
+            table_id: "table_id".to_string(),
+            statistics_blob,
+            num_rows: 3,
+        };
+
+        let stats = CayenneTableProvider::table_statistics_to_df(&schema, &table_stats)
+            .expect("table stats should deserialize");
+
+        assert_eq!(
+            stats.num_rows,
+            datafusion_common::stats::Precision::Exact(3)
+        );
+        assert_eq!(stats.column_statistics[0].min_value, column_stats.min_value);
+        assert_eq!(stats.column_statistics[0].max_value, column_stats.max_value);
+        assert_eq!(
+            stats.column_statistics[0].null_count,
+            column_stats.null_count
+        );
+    }
+
+    #[test]
+    fn statistics_to_inexact_downgrades_exact_values_for_mutable_overlays() {
+        let stats = Statistics {
+            num_rows: datafusion_common::stats::Precision::Exact(3),
+            total_byte_size: datafusion_common::stats::Precision::Exact(24),
+            column_statistics: vec![ColumnStatistics {
+                null_count: datafusion_common::stats::Precision::Exact(0),
+                min_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(1))),
+                max_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(3))),
+                sum_value: datafusion_common::stats::Precision::Absent,
+                distinct_count: datafusion_common::stats::Precision::Exact(3),
+                byte_size: datafusion_common::stats::Precision::Exact(24),
+            }],
+        };
+
+        let stats = CayenneTableProvider::statistics_to_inexact(stats);
+
+        assert_eq!(
+            stats.num_rows,
+            datafusion_common::stats::Precision::Inexact(3)
+        );
+        assert_eq!(
+            stats.column_statistics[0].min_value,
+            datafusion_common::stats::Precision::Inexact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            stats.column_statistics[0].distinct_count,
+            datafusion_common::stats::Precision::Inexact(3)
+        );
+    }
 
     #[test]
     fn inline_memtable_pressure_is_absent_below_thresholds() {
