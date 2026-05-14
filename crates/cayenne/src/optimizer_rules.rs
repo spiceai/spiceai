@@ -784,7 +784,7 @@ mod tests {
             &self.metrics
         }
 
-        fn file_type(&self) -> &str {
+        fn file_type(&self) -> &'static str {
             "test"
         }
 
@@ -833,11 +833,11 @@ mod tests {
     }
 
     fn file_exec(
-        schema: Arc<Schema>,
+        schema: &Arc<Schema>,
         path: &str,
         filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Arc<dyn ExecutionPlan> {
-        let table_schema = TableSchema::new(Arc::clone(&schema), Vec::new());
+        let table_schema = TableSchema::new(Arc::clone(schema), Vec::new());
         let source = Arc::new(TestFileSource::new(table_schema, filter));
         let file = PartitionedFile::from(ObjectMeta {
             location: Path::from(path),
@@ -857,7 +857,7 @@ mod tests {
     }
 
     fn cayenne_file_exec(
-        schema: Arc<Schema>,
+        schema: &Arc<Schema>,
         path: &str,
         filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Arc<dyn ExecutionPlan> {
@@ -1095,11 +1095,11 @@ mod tests {
         let schema = order_line_schema();
         let source_filter = dynamic_filter_for("order_id", &schema);
         let left = cayenne_file_exec(
-            Arc::clone(&schema),
+            &schema,
             "order_line.vortex",
             Some(Arc::clone(&source_filter)),
         );
-        let right = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
+        let right = cayenne_file_exec(&schema, "order_line.vortex", None);
         let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
 
         let optimized = optimize_filter_sharing(join);
@@ -1123,11 +1123,11 @@ mod tests {
         let schema = order_line_schema();
         let source_filter = dynamic_filter_for("line_number", &schema);
         let left = cayenne_file_exec(
-            Arc::clone(&schema),
+            &schema,
             "order_line.vortex",
             Some(Arc::clone(&source_filter)),
         );
-        let right = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
+        let right = cayenne_file_exec(&schema, "order_line.vortex", None);
         let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
 
         let optimized = optimize_filter_sharing(join);
@@ -1147,8 +1147,8 @@ mod tests {
     #[test]
     fn rewrites_same_source_left_anti_hash_join_to_sort_merge() {
         let schema = order_line_schema();
-        let left = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
-        let right = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
+        let left = cayenne_file_exec(&schema, "order_line.vortex", None);
+        let right = cayenne_file_exec(&schema, "order_line.vortex", None);
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
@@ -1186,8 +1186,8 @@ mod tests {
     #[test]
     fn rewrites_same_source_multi_key_left_anti_hash_join_to_sort_merge() {
         let schema = order_line_schema();
-        let left = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
-        let right = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
+        let left = cayenne_file_exec(&schema, "order_line.vortex", None);
+        let right = cayenne_file_exec(&schema, "order_line.vortex", None);
         let join = Arc::new(hash_join_with_join_type_on(
             left,
             right,
@@ -1210,8 +1210,8 @@ mod tests {
     #[test]
     fn leaves_unrelated_left_anti_hash_join_unchanged() {
         let schema = order_line_schema();
-        let left = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
-        let right = cayenne_file_exec(Arc::clone(&schema), "other_order_line.vortex", None);
+        let left = cayenne_file_exec(&schema, "order_line.vortex", None);
+        let right = cayenne_file_exec(&schema, "other_order_line.vortex", None);
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
