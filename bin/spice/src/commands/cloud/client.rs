@@ -196,6 +196,8 @@ impl CloudClient {
             name: name.to_string(),
             description: description.map(String::from),
             visibility: visibility.to_string(),
+            // The Cloud create-app endpoint currently accepts the target deployment region
+            // in the legacy `cname` request field; update-app uses the newer `region` field.
             cname: Some(region.to_string()),
             tags,
             replicas,

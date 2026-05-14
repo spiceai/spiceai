@@ -114,25 +114,33 @@ impl LocalFileRegistry {
 
         // Copy all files from source to the installed dependency directory.
         // When the source path is identical to the destination (e.g. `spice add ./spicepods/<pod>`
-        // run from the app root, or re-adding an already-installed local pod), skip the copy
-        // *and* the manifest normalization to avoid mutating the user's source files in place.
+        // run from the app root, or re-adding an already-installed local pod), skip the copy but
+        // still ensure the installed dependency directory has the canonical manifest name.
         if source_path == comparable_destination_dir {
+            normalize_manifest(&source_manifest, &destination_dir, &source_pod_name)?;
             return Ok(destination_dir);
         }
 
         copy_dir_recursive(&source_path, &destination_dir)?;
-
-        let destination_manifest = destination_dir.join(GENERIC_MANIFEST);
-        if source_manifest.file_name().and_then(|name| name.to_str()) != Some(GENERIC_MANIFEST) {
-            std::fs::copy(&source_manifest, &destination_manifest).context(IoSnafu {
-                operation: "copy file",
-                path: source_manifest.display().to_string(),
-            })?;
-        }
-        remove_non_canonical_manifests(&destination_dir, &source_pod_name)?;
+        normalize_manifest(&source_manifest, &destination_dir, &source_pod_name)?;
 
         Ok(destination_dir)
     }
+}
+
+fn normalize_manifest(
+    source_manifest: &Path,
+    destination_dir: &Path,
+    pod_name: &str,
+) -> Result<()> {
+    let destination_manifest = destination_dir.join(GENERIC_MANIFEST);
+    if source_manifest.file_name().and_then(|name| name.to_str()) != Some(GENERIC_MANIFEST) {
+        std::fs::copy(source_manifest, &destination_manifest).context(IoSnafu {
+            operation: "copy file",
+            path: source_manifest.display().to_string(),
+        })?;
+    }
+    remove_non_canonical_manifests(destination_dir, pod_name)
 }
 
 fn find_manifest(source_path: &Path, pod_name: &str) -> Option<PathBuf> {
@@ -375,6 +383,35 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(installed_names, vec!["localpod".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn readding_installed_yml_pod_normalizes_manifest() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let pods_dir = temp_dir.path().join("spicepods");
+        let installed_dir = pods_dir.join("localpod");
+        std::fs::create_dir_all(&installed_dir).expect("installed directory should be created");
+        std::fs::write(
+            installed_dir.join("spicepod.yml"),
+            "version: v2\nkind: Spicepod\nname: localpod\n",
+        )
+        .expect("spicepod.yml should be written");
+
+        let installed_path = LocalFileRegistry
+            .get_pod(
+                installed_dir
+                    .to_str()
+                    .expect("installed path should be utf-8"),
+                &pods_dir,
+                &HashMap::new(),
+                &reqwest::Client::new(),
+            )
+            .await
+            .expect("installed local pod should be accepted");
+
+        assert_eq!(installed_path, installed_dir);
+        assert!(installed_dir.join("spicepod.yaml").exists());
+        assert!(!installed_dir.join("spicepod.yml").exists());
     }
 
     #[tokio::test]

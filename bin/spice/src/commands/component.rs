@@ -131,12 +131,12 @@ BODY FLAGS
   --sql <SQL> | --sql-ref <PATH>     Inline or referenced SQL (views, workers, functions)
   --cron <CRON>             Cron expression (workers)
   --body <BODY> | --body-ref <PATH>  Inline or referenced function body
-  --param KEY=VALUE         Add a `params:` entry. Stored as a YAML string by default;
-                            prefix the value with `yaml:` to parse it as a typed YAML value.
+    --param KEY=VALUE         Add a `params:` entry. Strings by default; prefix with `yaml:`
+                                                        for typed YAML or `string:` for a literal string.
   --env KEY=VALUE           Add an `env:` entry (same string-vs-yaml rules as --param)
   --depends-on NAME         Append to `dependsOn:`
-    --set PATH=VALUE          Set any schema field by dotted path. Stored as a YAML string by default;
-                                                        prefix the value with `yaml:` to parse it as a typed YAML value.
+    --set PATH=VALUE          Set any schema field by dotted path. Strings by default; prefix
+                                                        with `yaml:` for typed YAML or `string:` for a literal string.
   --enable | --disable      Set `enabled: true` / `enabled: false`
   --file <PATH> | --stdin   Read the inline body from a YAML/JSON file or stdin
   --manifest <PATH>         Edit a non-default Spicepod file
@@ -173,8 +173,8 @@ USAGE
   spice <section> configure [body flags]
 
 BODY FLAGS
-    --set PATH=VALUE          Set any schema field by dotted path (string by default; prefix `yaml:` for typed)
-  --param KEY=VALUE         Add a `params:` entry (string by default; prefix `yaml:` for typed)
+    --set PATH=VALUE          Set any schema field by dotted path (string by default; prefix `yaml:` for typed or `string:` for literal)
+    --param KEY=VALUE         Add a `params:` entry (string by default; prefix `yaml:` for typed or `string:` for literal)
   --enable | --disable      Set `enabled: true` / `enabled: false`
   --api-key <KEY>           Convenience for `management.api_key`
   --location <URI>          Convenience for `snapshots.location`
@@ -201,8 +201,8 @@ USAGE
   spice extension configure <name> [body flags]   # add or update an extension in place
 
 BODY FLAGS
-    --set PATH=VALUE          Set any schema field by dotted path (string by default; prefix `yaml:` for typed)
-  --param KEY=VALUE         Add to the extension's `params:` map
+    --set PATH=VALUE          Set any schema field by dotted path (string by default; prefix `yaml:` for typed or `string:` for literal)
+    --param KEY=VALUE         Add to the extension's `params:` map
   --enable | --disable      Set `enabled: true` / `enabled: false`
   --file <PATH> | --stdin   Replace the extension body from a YAML/JSON file or stdin
   --manifest <PATH>         Edit a non-default Spicepod file
@@ -222,7 +222,8 @@ USAGE
   spice metadata set <KEY> <VALUE>                # set exactly one entry
 
 Values are stored as YAML strings by default. Prefix the value with `yaml:` to
-parse it as a typed YAML value (numbers, booleans, lists, mappings).
+parse it as a typed YAML value (numbers, booleans, lists, mappings), or with
+`string:` to store a literal string after the prefix.
 
 EXAMPLES
   spice metadata add owner=data-team env=prod
@@ -321,7 +322,7 @@ pub struct CommonComponentOptions {
     #[arg(long = "body-ref", value_name = "PATH")]
     pub body_ref: Option<String>,
 
-    /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml:.
+    /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml: or string:.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
 
@@ -530,7 +531,7 @@ pub enum MetadataCommand {
 
 #[derive(Args, Debug, Default)]
 pub struct MetadataEditArgs {
-    /// Metadata entries as KEY=VALUE. Values are stored as strings unless prefixed with yaml:.
+    /// Metadata entries as KEY=VALUE. Values are stored as strings unless prefixed with yaml: or string:.
     #[arg(value_name = "KEY=VALUE")]
     pub entries: Vec<String>,
 
@@ -538,7 +539,7 @@ pub struct MetadataEditArgs {
     #[arg(long, value_hint = ValueHint::FilePath)]
     pub manifest: Option<PathBuf>,
 
-    /// Set metadata entries as KEY=VALUE. Values are stored as strings unless prefixed with yaml:.
+    /// Set metadata entries as KEY=VALUE. Values are stored as strings unless prefixed with yaml: or string:.
     #[arg(long = "set", value_name = "KEY=VALUE")]
     pub set: Vec<String>,
 }
@@ -548,7 +549,7 @@ pub struct MetadataSetArgs {
     /// Metadata key
     pub key: String,
 
-    /// Metadata value. Stored as a string unless prefixed with yaml:.
+    /// Metadata value. Stored as a string unless prefixed with yaml: or string:.
     pub value: String,
 
     /// Path to the Spicepod manifest to edit
@@ -616,14 +617,7 @@ pub fn execute_metadata(args: &MetadataArgs) -> Result<()> {
         MetadataCommand::Configure(edit_args) => {
             mutate_metadata(edit_args, MutationMode::Configure)
         }
-        MetadataCommand::Set(set_args) => {
-            let edit_args = MetadataEditArgs {
-                entries: vec![format!("{}={}", set_args.key, set_args.value)],
-                manifest: set_args.manifest.clone(),
-                set: Vec::new(),
-            };
-            mutate_metadata(&edit_args, MutationMode::Configure)
-        }
+        MetadataCommand::Set(set_args) => mutate_metadata_set(set_args),
     }
 }
 
@@ -988,6 +982,16 @@ fn mutate_metadata(args: &MetadataEditArgs, mode: MutationMode) -> Result<()> {
         let (key, metadata_value) = parse_string_or_yaml_prefixed_pair(pair)?;
         metadata.insert(Value::String(key), metadata_value);
     }
+
+    write_if_changed(&manifest_path, &spicepod, &before, created)
+}
+
+fn mutate_metadata_set(args: &MetadataSetArgs) -> Result<()> {
+    let (manifest_path, mut spicepod, created) = load_manifest(args.manifest.as_deref())?;
+    let before = spicepod.clone();
+    let metadata = ensure_mapping_field(&mut spicepod, "metadata")?;
+    let metadata_value = parse_string_or_yaml_prefixed_value(&args.key, &args.value)?;
+    metadata.insert(Value::String(args.key.clone()), metadata_value);
 
     write_if_changed(&manifest_path, &spicepod, &before, created)
 }
@@ -1525,5 +1529,30 @@ mod tests {
         let manifest = std::fs::read_to_string(manifest_path).expect("manifest should be readable");
         assert!(manifest.contains("owner: data-team"));
         assert!(manifest.contains("env: prod"));
+    }
+
+    #[test]
+    fn metadata_set_preserves_literal_string_prefixes() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let manifest_path = temp_dir.path().join("spicepod.yaml");
+        std::fs::write(&manifest_path, "version: v2\nkind: Spicepod\nname: test\n")
+            .expect("manifest should be written");
+        let args = MetadataSetArgs {
+            key: "api_key".to_string(),
+            value: "string:yaml:literal".to_string(),
+            manifest: Some(manifest_path.clone()),
+        };
+
+        mutate_metadata_set(&args).expect("metadata should be updated");
+
+        let manifest =
+            manifest::read_spicepod_value(&manifest_path).expect("manifest should parse");
+        assert_eq!(
+            manifest
+                .get("metadata")
+                .and_then(|metadata| metadata.get("api_key"))
+                .and_then(Value::as_str),
+            Some("yaml:literal")
+        );
     }
 }

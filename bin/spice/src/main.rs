@@ -294,14 +294,14 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
         if arg == OsStr::new("-sql") {
             normalized.push(OsString::from("sql"));
             normalized.push(OsString::from("--query"));
-            normalized.extend(args);
+            normalized.extend(normalize_cloud_region_flags(args));
             break;
         }
 
         if arg == OsStr::new("-p") || arg == OsStr::new("-chat") {
             normalized.push(OsString::from("chat"));
             normalized.push(OsString::from("--direct-prompt"));
-            normalized.extend(args);
+            normalized.extend(normalize_cloud_region_flags(args));
             break;
         }
 
@@ -345,9 +345,47 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
         }
 
         if is_subcommand {
+            normalized.extend(normalize_cloud_region_flags(args));
+            break;
+        }
+    }
+
+    normalized
+}
+
+fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut normalized = Vec::new();
+    let mut args = args.into_iter().peekable();
+
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new("--") {
+            normalized.push(arg);
             normalized.extend(args);
             break;
         }
+
+        if let Some(region) = cloud_region_from_equals(&arg) {
+            normalized.push(OsString::from("--cloud"));
+            normalized.push(OsString::from("--cloud-region"));
+            normalized.push(OsString::from(region));
+            continue;
+        }
+
+        if arg == OsStr::new("--cloud") {
+            normalized.push(arg);
+            if args
+                .peek()
+                .is_some_and(|value| is_cloud_region_os(value.as_os_str()))
+            {
+                normalized.push(OsString::from("--cloud-region"));
+                if let Some(region) = args.next() {
+                    normalized.push(region);
+                }
+            }
+            continue;
+        }
+
+        normalized.push(arg);
     }
 
     normalized
@@ -951,6 +989,18 @@ mod tests {
             "http://127.0.0.1:8090",
         ]);
         assert_eq!(cli.http_endpoint, "http://127.0.0.1:8090");
+        let Commands::Sql(args) = cli.command else {
+            panic!("expected sql command");
+        };
+        assert_eq!(args.query.as_deref(), Some("show tables"));
+    }
+
+    #[test]
+    fn direct_sql_flag_normalizes_trailing_cloud_region() {
+        let cli = parse_normalized(&["spice", "-sql", "show tables", "--cloud", "us-west-2"]);
+        assert!(cli.cloud);
+        assert_eq!(cli.cloud_region, "us-west-2");
+
         let Commands::Sql(args) = cli.command else {
             panic!("expected sql command");
         };
