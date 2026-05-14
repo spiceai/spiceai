@@ -729,7 +729,7 @@ async fn provision_spice_cloud_app(
                 app_id,
                 &UpdateAppRequest {
                     image_tag: args.image_tag.clone(),
-                    update_channel: args.channel,
+                    update_channel: args.channel.as_ref().map(ToString::to_string),
                     ..UpdateAppRequest::default()
                 },
             )

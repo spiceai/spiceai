@@ -1142,10 +1142,10 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
 /// `/v1/apps` endpoint does not currently populate `org` on each app, so the
 /// auth context provides the only source of truth for the user's org.
 fn display_app_name(app: &spice_cloud_client::types::App, context_org: &str) -> String {
-    let org = if !app.org.is_empty() {
-        app.org.as_str()
-    } else {
+    let org = if app.org.is_empty() {
         context_org
+    } else {
+        app.org.as_str()
     };
     if org.is_empty() {
         app.name.clone()
