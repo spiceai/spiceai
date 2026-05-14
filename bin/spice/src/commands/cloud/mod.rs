@@ -33,6 +33,26 @@ use spice_cloud_client::types::IngestionMetrics;
 
 /// Arguments for the cloud command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Manage Spice Cloud resources (apps, deployments, secrets, ...)",
+    long_about = r#"Manage resources on Spice Cloud: authenticate, list and inspect
+apps and deployments, manage secrets, view logs and metrics, and deploy.
+
+Most subcommands require an active Spice Cloud session. Sign in with one of:
+  spice cloud login subscription      # Browser-based subscription login
+  spice cloud login pat               # Personal access token
+  spice cloud login api               # OAuth client credentials (automation)
+
+EXAMPLES
+  spice cloud whoami                  # Show the active Spice Cloud identity
+  spice cloud apps                    # List apps
+  spice cloud link <app>              # Link the current directory to an app
+  spice cloud deploy                  # Deploy the linked app
+  spice cloud logs --tail             # Stream logs for the linked deployment
+  spice cloud secrets set MY_KEY=...  # Manage app secrets
+
+Docs: https://spiceai.org/docs/spice-cloud"#
+)]
 pub struct CloudArgs {
     #[command(subcommand)]
     pub command: CloudCommands,

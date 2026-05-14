@@ -25,8 +25,26 @@ use std::path::Path;
 
 /// Arguments for the add command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Add a Spicepod dependency to the current project",
+    long_about = r#"Add a Spicepod dependency to the current project.
+
+Fetches a Spicepod from a registry, Spice.ai Cloud, or a local path and writes
+it into `./spicepods/<name>/`, then registers it under `dependencies:` in
+`spicepod.yaml`.
+
+EXAMPLES
+  spice add spiceai/quickstart            # Add a registry Spicepod
+  spice add spiceai/quickstart@v1.0       # Pin to a specific version
+  spice add ./local/path                  # Add a Spicepod from a local directory
+
+Use `spice connect <pod>` instead if the Spicepod is hosted on Spice.ai Cloud
+and requires authentication.
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct AddArgs {
-    /// Spicepod path (e.g., spiceai/quickstart, ./local/path, or spiceai/quickstart@v1.0)
+    /// Spicepod path (e.g. `spiceai/quickstart`, `./local/path`, or `spiceai/quickstart@v1.0`).
     pub pod_path: String,
 }
 

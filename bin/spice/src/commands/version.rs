@@ -30,12 +30,26 @@ const VERSION_CACHE_DURATION: Duration = Duration::from_secs(24 * 60 * 60); // 2
 
 /// Arguments for the version command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Print the Spice CLI and runtime versions and check for updates",
+    long_about = r#"Print the installed Spice CLI version, the installed Spice runtime
+version (if any), and check whether a newer release is available on GitHub.
+
+The latest-version check is cached for 24 hours. Use `--cli-only` to skip the
+runtime version lookup, and `-o json` for machine-readable output.
+
+EXAMPLES
+  spice version
+  spice version --cli-only
+  spice version -o json
+"#
+)]
 pub struct VersionArgs {
-    /// Show only the CLI version (no runtime version)
+    /// Show only the CLI version (skip the runtime version lookup).
     #[arg(long)]
     cli_only: bool,
 
-    /// Output format
+    /// Output format.
     #[arg(long, short = 'o', default_value = "table")]
     output: OutputFormat,
 }

@@ -115,18 +115,56 @@ impl SingletonSection {
 
 #[derive(Args, Debug)]
 #[command(
-    about = "Edit a Spicepod component section",
-    long_about = r#"Edit a Spicepod component section.
+    about = "Add or configure a component entry in spicepod.yaml",
+    long_about = r#"Add or configure a component entry in `spicepod.yaml`.
 
-Examples:
-  spice model add llm --from openai:gpt-4o-mini --param openai_api_key='${ secrets:OPENAI_API_KEY }'
-  spice model configure llm --set datasets='[documents]'
-  spice catalog add tpch --from databricks --param databricks_endpoint=https://example.cloud.databricks.com
+This command is used for the model, catalog, view, embedding, reranker, tool,
+worker, function, and secret sections of a Spicepod. The component section is
+determined by the parent command (e.g. `spice model ...` edits `models:`).
+
+USAGE
+  spice <section> add <name>          [body flags]   # add a new entry; fails if it exists
+  spice <section> configure <name>    [body flags]   # add or update an entry in place
+  spice <section> add --ref <path>                   # add a Spicepod reference instead of inline
+
+BODY FLAGS
+  --from <SOURCE>           Provider/URI for an inline component (e.g. openai:gpt-4o-mini, s3://bucket/data)
+  --description <TEXT>      Human-readable description
+  --sql <SQL> | --sql-ref <PATH>     Inline or referenced SQL (views, workers, functions)
+  --cron <CRON>             Cron expression (workers)
+  --body <BODY> | --body-ref <PATH>  Inline or referenced function body
+  --param KEY=VALUE         Add a `params:` entry. Stored as a YAML string by default;
+                            prefix the value with `yaml:` to parse it as a typed YAML value.
+  --env KEY=VALUE           Add an `env:` entry (same string-vs-yaml rules as --param)
+  --depends-on NAME         Append to `dependsOn:`
+  --set PATH=VALUE          Set any schema field by dotted path; VALUE is parsed as YAML
+  --enable | --disable      Set `enabled: true` / `enabled: false`
+  --file <PATH> | --stdin   Read the inline body from a YAML/JSON file or stdin
+  --manifest <PATH>         Edit a non-default Spicepod file
+
+EXAMPLES
+  # Add an OpenAI chat model
+  spice model add llm --from openai:gpt-4o-mini \
+      --param openai_api_key='${ secrets:OPENAI_API_KEY }'
+
+  # Update a model's allowed datasets
+  spice model configure llm --set datasets='[documents, orders]'
+
+  # Add a Databricks Unity catalog
+  spice catalog add tpch --from databricks \
+      --param databricks_endpoint=https://example.cloud.databricks.com
+
+  # Add a SQL view
   spice view add recent_orders --sql "select * from orders limit 100"
-  spice tool add lookup --from mcp:server --env TOKEN='${ secrets:TOKEN }'
+
+  # Add an MCP-backed tool with a secret-bound token
+  spice tool add lookup --from mcp:server \
+      --env TOKEN='${ secrets:TOKEN }'
+
+  # Reference an external component definition file
   spice model add --ref models/llm.yaml
 
-Use --set path=value for schema fields. Values are parsed as YAML. Values passed with --param or metadata commands are stored as strings unless prefixed with yaml:."#
+Docs: https://spiceai.org/docs"#
 )]
 pub struct ComponentArgs {
     #[command(subcommand)]
@@ -278,7 +316,35 @@ impl CommonComponentOptions {
 }
 
 #[derive(Args, Debug)]
-#[command(about = "Edit a singleton Spicepod section")]
+#[command(
+    about = "Configure a singleton Spicepod section",
+    long_about = r#"Configure a singleton (one-of) section of `spicepod.yaml` such as
+`runtime:`, `management:`, or `snapshots:`.
+
+USAGE
+  spice <section> configure [body flags]
+
+BODY FLAGS
+  --set PATH=VALUE          Set any schema field by dotted path; VALUE is parsed as YAML
+  --param KEY=VALUE         Add a `params:` entry (string by default; prefix `yaml:` for typed)
+  --enable | --disable      Set `enabled: true` / `enabled: false`
+  --api-key <KEY>           Convenience for `management.api_key`
+  --location <URI>          Convenience for `snapshots.location`
+  --file <PATH> | --stdin   Replace the section body from a YAML/JSON file or stdin
+  --manifest <PATH>         Edit a non-default Spicepod file
+
+EXAMPLES
+  # Set the management API key
+  spice management configure --api-key '${ secrets:MGMT_KEY }'
+
+  # Point snapshots at an S3 location
+  spice snapshots configure --location s3://my-bucket/snapshots
+
+  # Tweak runtime parameters
+  spice runtime configure --set telemetry.enabled=true
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct SingletonArgs {
     #[command(subcommand)]
     pub command: SingletonCommand,
@@ -343,7 +409,27 @@ impl SingletonConfigureArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(about = "Edit Spicepod extension entries")]
+#[command(
+    about = "Add or configure entries under `extensions:` in spicepod.yaml",
+    long_about = r#"Add or configure entries under the `extensions:` section of `spicepod.yaml`.
+
+USAGE
+  spice extension add <name>       [body flags]   # add a new extension entry; fails if it exists
+  spice extension configure <name> [body flags]   # add or update an extension in place
+
+BODY FLAGS
+  --set PATH=VALUE          Set any schema field by dotted path; VALUE is parsed as YAML
+  --param KEY=VALUE         Add to the extension's `params:` map
+  --enable | --disable      Set `enabled: true` / `enabled: false`
+  --file <PATH> | --stdin   Replace the extension body from a YAML/JSON file or stdin
+  --manifest <PATH>         Edit a non-default Spicepod file
+
+EXAMPLES
+  spice extension add memory --param store=redis --param ttl=3600
+  spice extension configure memory --enable
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct ExtensionArgs {
     #[command(subcommand)]
     pub command: ExtensionCommand,
@@ -393,7 +479,25 @@ pub struct ExtensionEditArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(about = "Edit Spicepod metadata")]
+#[command(
+    about = "Add or configure key/value entries under `metadata:` in spicepod.yaml",
+    long_about = r#"Add, update, or set entries under the `metadata:` section of `spicepod.yaml`.
+
+USAGE
+  spice metadata add KEY=VALUE [KEY=VALUE ...]    # add entries; fails if a key already exists
+  spice metadata configure KEY=VALUE [...]        # add or overwrite entries
+  spice metadata set <KEY> <VALUE>                # set exactly one entry
+
+Values are stored as YAML strings by default. Prefix the value with `yaml:` to
+parse it as a typed YAML value (numbers, booleans, lists, mappings).
+
+EXAMPLES
+  spice metadata add owner=data-team env=prod
+  spice metadata set replicas yaml:3
+  spice metadata configure tags='yaml:[ai, search]'
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct MetadataArgs {
     #[command(subcommand)]
     pub command: MetadataCommand,

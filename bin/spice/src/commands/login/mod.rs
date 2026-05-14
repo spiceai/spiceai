@@ -46,12 +46,37 @@ impl PartialEq for LoginOutput {
 
 /// Arguments for the login command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Authenticate with Spice.ai or configure data-source credentials",
+    long_about = r#"Authenticate with Spice.ai or store credentials for a specific data source.
+
+With no subcommand, performs Spice.ai login (browser flow unless `--key` is
+provided). With a provider subcommand, walks through the credentials needed by
+that connector and stores them in the configured backend.
+
+OUTPUT BACKENDS (via `--output`)
+  env       Append to a local `.env` file (default)
+  json      Print credentials as JSON to stdout
+  keychain  Store credentials in the platform keychain (macOS Keychain, etc.)
+
+PROVIDERS
+  dremio, s3, postgres, snowflake, databricks, delta-lake, spark, sharepoint, abfs
+
+EXAMPLES
+  spice login                              # Spice.ai browser login
+  spice login --key sk_live_...            # Spice.ai login with an existing API key
+  spice login s3                           # Configure S3 credentials
+  spice login postgres -o keychain         # Store Postgres creds in the keychain
+  spice login databricks -o json | jq      # Print Databricks creds as JSON
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct LoginArgs {
-    /// API key for direct authentication (bypasses OAuth flow)
+    /// API key for direct authentication (skips the OAuth/browser flow).
     #[arg(short = 'k', long)]
     pub key: Option<String>,
 
-    /// Credential storage backend
+    /// Where to store the resulting credentials.
     #[arg(long, short = 'o', default_value = "env")]
     pub output: LoginOutput,
 

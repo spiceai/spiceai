@@ -40,6 +40,38 @@ mod data_source {
 
 /// Arguments for the dataset command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Add or configure dataset entries in spicepod.yaml",
+    long_about = r#"Add or configure dataset entries in `spicepod.yaml`.
+
+USAGE
+  spice dataset add <name>       [body flags]   # add a new dataset; fails if it exists
+  spice dataset configure <name> [body flags]   # add or update a dataset in place
+  spice dataset configure                       # interactive prompts (no flags)
+
+BODY FLAGS (same as `spice <component>` editors)
+  --from <SOURCE>           Provider/URI (e.g. `s3://bucket/key`, `databricks:catalog.schema.table`)
+  --description <TEXT>      Human-readable description
+  --param KEY=VALUE         Add a `params:` entry (string by default; prefix `yaml:` for typed)
+  --set PATH=VALUE          Set any schema field by dotted path; VALUE is parsed as YAML
+  --depends-on NAME         Append to `dependsOn:`
+  --enable | --disable      Set `enabled: true` / `enabled: false`
+  --file <PATH> | --stdin   Read the dataset body from a YAML/JSON file or stdin
+  --manifest <PATH>         Edit a non-default Spicepod file
+
+EXAMPLES
+  # Add a Parquet dataset on S3
+  spice dataset add taxi_trips --from s3://my-bucket/trips.parquet \
+      --param file_format=parquet
+
+  # Enable acceleration on an existing dataset
+  spice dataset configure taxi_trips --set acceleration.enabled=true
+
+  # Run interactive prompts (great for first-time setup)
+  spice dataset configure
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct DatasetArgs {
     #[command(subcommand)]
     pub command: DatasetCommands,

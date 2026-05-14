@@ -31,23 +31,39 @@ use std::time::Instant;
 
 /// Arguments for the `chat` command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Chat with a configured LLM through the runtime's OpenAI-compatible API",
+    long_about = r#"Chat with an LLM hosted by the Spice runtime.
+
+With no message, opens an interactive REPL. With a positional message,
+streams a single response and exits (non-interactive mode). The model must be
+registered in `spicepod.yaml` under `models:` and reported by `spice models`.
+
+EXAMPLES
+  spice chat                                    # Interactive REPL (prompts to pick a model)
+  spice chat --model llm                        # REPL with a specific model
+  spice chat --model llm "Summarize TPC-H Q1"  # One-shot non-interactive query
+  echo "What datasets are loaded?" | spice chat --model llm
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct ChatArgs {
-    /// Model to use for chat
+    /// Model id to use (must be registered under `models:` in `spicepod.yaml`).
     #[arg(long, short)]
     pub model: Option<String>,
 
-    /// Single message to send (non-interactive mode)
+    /// Single message to send (skip the REPL and exit after streaming the response).
     pub message: Option<String>,
 
-    /// Temperature for sampling (0.0 = deterministic, higher = more random)
+    /// Sampling temperature (0.0 = deterministic, higher = more random).
     #[arg(long)]
     pub temperature: Option<f32>,
 
-    /// Remote Spice instance HTTP endpoint (e.g., `http://localhost:8090`)
+    /// Override the runtime HTTP endpoint (e.g. `http://localhost:8090`).
     #[arg(long)]
     pub endpoint: Option<String>,
 
-    /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
+    /// Custom HTTP headers in `Key:Value` form (repeatable).
     #[arg(long = "headers", value_name = "KEY:VALUE")]
     pub custom_headers: Vec<String>,
 }
