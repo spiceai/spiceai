@@ -68,6 +68,14 @@ impl Runtime {
 
             if let Err(err) = Arc::clone(&self).register_catalog(catalog, connector).await {
                 tracing::error!("{err}");
+                if matches!(
+                    &err,
+                    crate::Error::UnableToInitializeCatalogConnector { source }
+                        if source.downcast_ref::<catalogconnector::Error>()
+                            .is_some_and(catalogconnector::Error::is_configuration_error)
+                ) {
+                    return Err(RetryError::permanent(err));
+                }
                 return Err(RetryError::transient(err));
             }
 

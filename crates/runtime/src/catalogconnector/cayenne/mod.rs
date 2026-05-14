@@ -143,6 +143,19 @@ impl CatalogConnector for CayenneCatalogConnector {
         runtime: Arc<Runtime>,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn data_components::RefreshableCatalogProvider>> {
+        if runtime
+            .datafusion()
+            .cluster_config
+            .effective_role()
+            .is_none()
+        {
+            return Err(super::Error::InvalidConfigurationNoSource {
+                connector: PREFIX.to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+                message: "Cayenne catalog is only supported in distributed Spice (scheduler/executor) mode. See https://spiceai.org/docs for distributed setup.".to_string(),
+            });
+        }
+
         let runtime_env = runtime.datafusion().ctx.runtime_env();
         let provider_config = self.parse_provider_config();
         let refreshable_provider = Arc::new(
