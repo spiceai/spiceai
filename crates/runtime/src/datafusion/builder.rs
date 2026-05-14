@@ -35,6 +35,8 @@ use cayenne::logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys;
 use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
 };
+#[cfg(not(windows))]
+use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -52,8 +54,6 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
-#[cfg(not(windows))]
-use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
@@ -623,9 +623,7 @@ fn with_cayenne_logical_optimizer(mut state: SessionStateBuilder) -> SessionStat
 }
 
 #[cfg(not(windows))]
-fn insert_cayenne_logical_optimizer_rule(
-    rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>,
-) {
+fn insert_cayenne_logical_optimizer_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
     if rules
         .iter()
         .any(|rule| rule.name() == "cayenne_propagate_filter_across_equi_join_keys")
