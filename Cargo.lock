@@ -15922,6 +15922,7 @@ dependencies = [
  "datafusion-datasource",
  "datafusion-federation",
  "datafusion-optimizer-rules",
+ "datafusion-pruning",
  "datafusion-table-providers",
  "futures",
  "globset",

@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Physical optimizer rules for Cayenne execution plans.
 
+use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
@@ -176,6 +177,10 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
                 return Ok(Transformed::no(node));
             }
 
+            if hash_join.null_equality() != NullEquality::NullEqualsNothing {
+                return Ok(Transformed::no(node));
+            }
+
             tracing::debug!(
                 "Replacing HashJoinExec with ExactLeftAccumulator for Cayenne acceleration"
             );
@@ -220,6 +225,22 @@ mod tests {
         left_column: &str,
         right_column: &str,
     ) -> HashJoinExec {
+        hash_join_with_null_equality(
+            left,
+            right,
+            left_column,
+            right_column,
+            NullEquality::NullEqualsNothing,
+        )
+    }
+
+    fn hash_join_with_null_equality(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        left_column: &str,
+        right_column: &str,
+        null_equality: NullEquality,
+    ) -> HashJoinExec {
         HashJoinExec::try_new(
             Arc::clone(&left),
             Arc::clone(&right),
@@ -231,7 +252,7 @@ mod tests {
             &JoinType::Inner,
             None,
             PartitionMode::Partitioned,
-            NullEquality::NullEqualsNothing,
+            null_equality,
         )
         .expect("hash join should be valid")
     }
@@ -276,6 +297,26 @@ mod tests {
         assert!(
             optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
             "Non-Cayenne joins should keep the default accumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_null_equal_hash_join_unchanged() {
+        let left = memory_exec("left_id");
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let join = Arc::new(hash_join_with_null_equality(
+            left,
+            right,
+            "left_id",
+            "right_id",
+            NullEquality::NullEqualsNull,
+        ));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Null-equal joins should keep the default accumulator to preserve probe NULL matches"
         );
     }
 

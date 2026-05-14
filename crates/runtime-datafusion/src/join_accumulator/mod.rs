@@ -15,9 +15,12 @@ limitations under the License.
 */
 
 use std::{
-    any::type_name,
+    any::{Any, type_name},
     cmp::Ordering,
     collections::HashSet,
+    fmt::{Debug, Display},
+    hash::{Hash, Hasher},
+    mem::size_of,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
@@ -26,7 +29,8 @@ use std::{
 
 use arrow::{
     array::{
-        Array, GenericStringArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringViewArray,
+        Array, ArrayRef, BooleanArray, GenericStringArray, OffsetSizeTrait, PrimitiveArray,
+        RecordBatch, StringViewArray,
     },
     compute::{max, max_string, max_string_view, min, min_string, min_string_view},
     datatypes::{
@@ -42,7 +46,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::{
     logical_expr::Operator,
     physical_plan::{
-        PhysicalExpr,
+        ColumnarValue, PhysicalExpr,
         expressions::{BinaryExpr, InListExpr, Literal},
         joins::{CollectLeftAccumulator, ColumnBounds},
     },
@@ -50,8 +54,12 @@ use datafusion::{
 };
 
 pub const DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys per partition
+const DEFAULT_MAXIMUM_BLOOM_FILTER_MEMORY_BYTES: usize = 8 * 1024 * 1024;
+const MAXIMUM_RANGE_INTERVALS: usize = 64;
+
 static MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION: AtomicUsize =
     AtomicUsize::new(DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION);
+static CURRENT_INLIST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 // bounds are calculated per-partition, so total memory usage for bounds calculation is potentially num_partitions * MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION
 // similarly, because rows are distributed across partitions the rows per partition is total_rows / num_partitions
 
@@ -64,6 +72,62 @@ pub fn set_maximum_inlist_memory_bytes_per_partition(limit: usize) {
     MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION.store(limit, AtomicOrdering::Relaxed);
 }
 
+#[derive(Debug)]
+struct InListMemoryReservation {
+    bytes: usize,
+}
+
+impl InListMemoryReservation {
+    fn try_new(bytes: usize) -> Option<Self> {
+        reserve_inlist_memory(bytes).then_some(Self { bytes })
+    }
+
+    fn try_grow(&mut self, bytes: usize) -> bool {
+        if !reserve_inlist_memory(bytes) {
+            return false;
+        }
+
+        self.bytes = self.bytes.saturating_add(bytes);
+        true
+    }
+}
+
+impl Drop for InListMemoryReservation {
+    fn drop(&mut self) {
+        CURRENT_INLIST_MEMORY_BYTES.fetch_sub(self.bytes, AtomicOrdering::Relaxed);
+    }
+}
+
+fn reserve_inlist_memory(bytes: usize) -> bool {
+    reserve_inlist_memory_with_limit(bytes, maximum_inlist_memory_bytes_per_partition())
+}
+
+fn reserve_inlist_memory_with_limit(bytes: usize, limit: usize) -> bool {
+    if bytes == 0 {
+        return true;
+    }
+
+    if limit == 0 || bytes > limit {
+        return false;
+    }
+
+    CURRENT_INLIST_MEMORY_BYTES
+        .fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| current.checked_add(bytes).filter(|next| *next <= limit),
+        )
+        .is_ok()
+}
+
+fn bloom_memory_limit(max_inlist_memory_size: usize) -> usize {
+    if max_inlist_memory_size == 0 {
+        0
+    } else {
+        (max_inlist_memory_size / 16).min(DEFAULT_MAXIMUM_BLOOM_FILTER_MEMORY_BYTES)
+    }
+}
+
 /// A simple implementation of a `CollectLeftAccumulator` that collects exact values for dynamic filtering.
 /// Performs no approximation or range merging, simply storing all values seen.
 ///
@@ -74,6 +138,8 @@ pub struct ExactLeftAccumulator {
     expr: Arc<dyn PhysicalExpr>,
     total_memory_size: usize,
     max_inlist_memory_size: usize,
+    max_bloom_filter_memory_size: usize,
+    inlist_memory_reservation: Option<InListMemoryReservation>,
     range_bounds: RangeBounds,
     exact_values_exceeded_memory_limit: bool,
 }
@@ -117,16 +183,18 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
             return Ok(());
         }
 
-        let total_memory_size = self
-            .total_memory_size
-            .saturating_add(array.get_array_memory_size());
+        let array_memory_size = array.get_array_memory_size();
+        let total_memory_size = self.total_memory_size.saturating_add(array_memory_size);
 
-        if total_memory_size > self.max_inlist_memory_size {
+        if total_memory_size > self.max_inlist_memory_size
+            || !self.try_reserve_inlist_memory(array_memory_size)
+        {
             tracing::debug!(
-                "ExactLeftAccumulator exceeded maximum in-list memory size ({} bytes > {} bytes); using range fallback.",
+                "ExactLeftAccumulator exceeded maximum in-list memory size or shared budget ({} bytes > {} bytes); using range fallback.",
                 total_memory_size,
                 self.max_inlist_memory_size
             );
+            self.inlist_memory_reservation = None;
             self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
             self.arrays.clear();
             self.total_memory_size = total_memory_size;
@@ -140,11 +208,21 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
     }
 
     fn evaluate(self) -> DataFusionResult<Arc<dyn ColumnBounds>> {
+        let Self {
+            arrays,
+            total_memory_size,
+            range_bounds,
+            exact_values_exceeded_memory_limit,
+            inlist_memory_reservation,
+            ..
+        } = self;
+
         Ok(Arc::new(ExactColumnBounds {
-            arrays: self.arrays,
-            total_memory_size: self.total_memory_size,
-            range_bounds: self.range_bounds,
-            use_range_fallback: self.exact_values_exceeded_memory_limit,
+            arrays,
+            total_memory_size,
+            range_bounds,
+            use_range_fallback: exact_values_exceeded_memory_limit,
+            _inlist_memory_reservation: inlist_memory_reservation,
         }))
     }
 }
@@ -162,8 +240,23 @@ impl ExactLeftAccumulator {
             expr,
             total_memory_size: 0,
             max_inlist_memory_size,
-            range_bounds: RangeBounds::default(),
+            max_bloom_filter_memory_size: bloom_memory_limit(max_inlist_memory_size),
+            inlist_memory_reservation: None,
+            range_bounds: RangeBounds::new(bloom_memory_limit(max_inlist_memory_size)),
             exact_values_exceeded_memory_limit: false,
+        }
+    }
+
+    fn try_reserve_inlist_memory(&mut self, bytes: usize) -> bool {
+        match &mut self.inlist_memory_reservation {
+            Some(reservation) => reservation.try_grow(bytes),
+            None => {
+                let Some(reservation) = InListMemoryReservation::try_new(bytes) else {
+                    return false;
+                };
+                self.inlist_memory_reservation = Some(reservation);
+                true
+            }
         }
     }
 
@@ -171,7 +264,7 @@ impl ExactLeftAccumulator {
         &self,
         array: &dyn Array,
     ) -> DataFusionResult<RangeBounds> {
-        let mut range_bounds = RangeBounds::default();
+        let mut range_bounds = RangeBounds::new(self.max_bloom_filter_memory_size);
         for collected_array in &self.arrays {
             range_bounds.update(collected_array.as_ref())?;
         }
@@ -186,6 +279,7 @@ pub struct ExactColumnBounds {
     total_memory_size: usize,
     range_bounds: RangeBounds,
     use_range_fallback: bool,
+    _inlist_memory_reservation: Option<InListMemoryReservation>,
 }
 
 impl ColumnBounds for ExactColumnBounds {
@@ -263,43 +357,36 @@ impl ColumnBounds for ExactColumnBounds {
 
 #[derive(Debug)]
 struct RangeBounds {
-    min_value: Option<ScalarValue>,
-    max_value: Option<ScalarValue>,
-    contains_null: bool,
+    intervals: Vec<RangeInterval>,
+    bloom_filter: Option<BloomFilter>,
     supports_range_filter: bool,
 }
 
-impl Default for RangeBounds {
-    fn default() -> Self {
+impl RangeBounds {
+    fn new(max_bloom_filter_memory_size: usize) -> Self {
         Self {
-            min_value: None,
-            max_value: None,
-            contains_null: false,
+            intervals: Vec::new(),
+            bloom_filter: BloomFilter::try_new(max_bloom_filter_memory_size),
             supports_range_filter: true,
         }
     }
-}
 
-impl RangeBounds {
     fn update(&mut self, array: &dyn Array) -> DataFusionResult<()> {
         if !self.supports_range_filter {
-            self.contains_null |= array.null_count() > 0;
             return Ok(());
         }
 
-        if array.null_count() > 0 {
-            // Short-circuit: physical_expr() returns a no-op when contains_null is true,
-            // so skip bound calculation for this and all future batches.
-            self.contains_null = true;
-            return Ok(());
-        }
+        self.update_bloom_filter(array)?;
 
+        let batch_bounds = min_max_values(array)?;
         let RangeBatchBounds::Values {
             min_value,
             max_value,
-        } = min_max_values(array)?
+        } = batch_bounds
         else {
-            self.supports_range_filter = false;
+            if matches!(batch_bounds, RangeBatchBounds::Unsupported) {
+                self.supports_range_filter = false;
+            }
             return Ok(());
         };
 
@@ -308,70 +395,309 @@ impl RangeBounds {
             return Ok(());
         }
 
-        self.update_value(min_value);
-        if self.supports_range_filter {
-            self.update_value(max_value);
+        self.add_interval(RangeInterval::new(min_value, max_value));
+
+        Ok(())
+    }
+
+    fn update_bloom_filter(&mut self, array: &dyn Array) -> DataFusionResult<()> {
+        let Some(bloom_filter) = &mut self.bloom_filter else {
+            return Ok(());
+        };
+
+        for row_index in 0..array.len() {
+            if array.is_null(row_index) {
+                continue;
+            }
+            let value = ScalarValue::try_from_array(array, row_index)?;
+            bloom_filter.insert(&value);
         }
 
         Ok(())
     }
 
-    fn update_value(&mut self, value: ScalarValue) {
-        match &self.min_value {
-            Some(min_value) => match value.partial_cmp(min_value) {
-                Some(Ordering::Less) => self.min_value = Some(value.clone()),
-                Some(_) => {}
-                None => {
-                    self.supports_range_filter = false;
-                    return;
-                }
-            },
-            None => self.min_value = Some(value.clone()),
+    fn add_interval(&mut self, interval: RangeInterval) {
+        self.intervals.push(interval);
+        self.intervals.sort_by(|left, right| {
+            left.min_value
+                .partial_cmp(&right.min_value)
+                .unwrap_or(Ordering::Equal)
+        });
+
+        let mut merged_intervals: Vec<RangeInterval> = Vec::with_capacity(self.intervals.len());
+        for interval in self.intervals.drain(..) {
+            let Some(previous) = merged_intervals.last_mut() else {
+                merged_intervals.push(interval);
+                continue;
+            };
+
+            if previous.overlaps(&interval) {
+                previous.merge(interval);
+            } else {
+                merged_intervals.push(interval);
+            }
         }
 
-        match &self.max_value {
-            Some(max_value) => match value.partial_cmp(max_value) {
-                Some(Ordering::Greater) => self.max_value = Some(value),
-                Some(_) => {}
-                None => self.supports_range_filter = false,
-            },
-            None => self.max_value = Some(value),
+        if merged_intervals.len() > MAXIMUM_RANGE_INTERVALS {
+            let Some(global_range) = merged_intervals.into_iter().reduce(|mut global, interval| {
+                global.merge(interval);
+                global
+            }) else {
+                self.intervals.clear();
+                return;
+            };
+            self.intervals.push(global_range);
+        } else {
+            self.intervals = merged_intervals;
         }
     }
 
     fn physical_expr(&self, left_expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
-        let (Some(min_value), Some(max_value)) = (&self.min_value, &self.max_value) else {
+        if self.intervals.is_empty() {
             tracing::debug!(
                 "ExactLeftAccumulator range fallback has no non-null values, returning no-op filter."
             );
             return literal_true();
-        };
+        }
 
-        if self.contains_null || !self.supports_range_filter {
+        if !self.supports_range_filter {
             tracing::debug!(
-                contains_null = self.contains_null,
                 supports_range_filter = self.supports_range_filter,
                 "ExactLeftAccumulator could not create range fallback, returning no-op filter."
             );
             return literal_true();
         }
 
+        let mut range_expr = self
+            .intervals
+            .iter()
+            .map(|interval| interval.physical_expr(Arc::clone(&left_expr)))
+            .reduce(|left, right| Arc::new(BinaryExpr::new(left, Operator::Or, right)) as _)
+            .unwrap_or_else(literal_true);
+
+        if let Some(bloom_filter) = &self.bloom_filter
+            && bloom_filter.has_values()
+        {
+            let bloom_expr = Arc::new(BloomFilterExpr::new(
+                left_expr,
+                Arc::new(bloom_filter.clone()),
+            )) as Arc<dyn PhysicalExpr>;
+            range_expr = Arc::new(BinaryExpr::new(range_expr, Operator::And, bloom_expr));
+        }
+
+        tracing::debug!(
+            interval_count = self.intervals.len(),
+            has_bloom_filter = self
+                .bloom_filter
+                .as_ref()
+                .is_some_and(BloomFilter::has_values),
+            "ExactLeftAccumulator created range fallback."
+        );
+
+        range_expr
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RangeInterval {
+    min_value: ScalarValue,
+    max_value: ScalarValue,
+}
+
+impl RangeInterval {
+    fn new(min_value: ScalarValue, max_value: ScalarValue) -> Self {
+        Self {
+            min_value,
+            max_value,
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        matches!(
+            other.min_value.partial_cmp(&self.max_value),
+            Some(Ordering::Less | Ordering::Equal)
+        )
+    }
+
+    fn merge(&mut self, other: Self) {
+        match other.min_value.partial_cmp(&self.min_value) {
+            Some(Ordering::Less) => self.min_value = other.min_value,
+            Some(_) => {}
+            None => {
+                return;
+            }
+        }
+
+        if matches!(
+            other.max_value.partial_cmp(&self.max_value),
+            Some(Ordering::Greater)
+        ) {
+            self.max_value = other.max_value;
+        }
+    }
+
+    fn physical_expr(&self, left_expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
         let lower_bound = Arc::new(BinaryExpr::new(
             Arc::clone(&left_expr),
             Operator::GtEq,
-            Arc::new(Literal::new(min_value.clone())),
+            Arc::new(Literal::new(self.min_value.clone())),
         ));
         let upper_bound = Arc::new(BinaryExpr::new(
             left_expr,
             Operator::LtEq,
-            Arc::new(Literal::new(max_value.clone())),
+            Arc::new(Literal::new(self.max_value.clone())),
         ));
 
-        tracing::debug!(
-            "ExactLeftAccumulator created range fallback from {min_value} to {max_value}."
-        );
-
         Arc::new(BinaryExpr::new(lower_bound, Operator::And, upper_bound))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BloomFilter {
+    bits: Vec<u64>,
+    bit_count: usize,
+    inserted_values: usize,
+}
+
+impl BloomFilter {
+    const HASH_COUNT: u64 = 7;
+
+    fn try_new(memory_bytes: usize) -> Option<Self> {
+        let word_count = memory_bytes / size_of::<u64>();
+        if word_count == 0 {
+            return None;
+        }
+
+        Some(Self {
+            bits: vec![0; word_count],
+            bit_count: word_count * u64::BITS as usize,
+            inserted_values: 0,
+        })
+    }
+
+    fn insert(&mut self, value: &ScalarValue) {
+        let (hash_one, hash_two) = bloom_hashes(value);
+        for hash_index in 0..Self::HASH_COUNT {
+            let bit_index = self.bit_index(hash_one, hash_two, hash_index);
+            self.bits[bit_index / u64::BITS as usize] |= 1 << (bit_index % u64::BITS as usize);
+        }
+        self.inserted_values = self.inserted_values.saturating_add(1);
+    }
+
+    fn might_contain(&self, value: &ScalarValue) -> bool {
+        let (hash_one, hash_two) = bloom_hashes(value);
+        (0..Self::HASH_COUNT).all(|hash_index| {
+            let bit_index = self.bit_index(hash_one, hash_two, hash_index);
+            let word = self.bits[bit_index / u64::BITS as usize];
+            (word & (1 << (bit_index % u64::BITS as usize))) != 0
+        })
+    }
+
+    fn has_values(&self) -> bool {
+        self.inserted_values > 0
+    }
+
+    fn bit_index(&self, hash_one: u64, hash_two: u64, hash_index: u64) -> usize {
+        let hash = hash_one.wrapping_add(hash_index.wrapping_mul(hash_two | 1));
+        usize::try_from(hash % self.bit_count as u64).unwrap_or(0)
+    }
+}
+
+fn bloom_hashes(value: &ScalarValue) -> (u64, u64) {
+    fn hash_with_salt(value: &ScalarValue, salt: u64) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        salt.hash(&mut hasher);
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    (hash_with_salt(value, 0), hash_with_salt(value, 1))
+}
+
+#[derive(Debug, Clone)]
+struct BloomFilterExpr {
+    expr: Arc<dyn PhysicalExpr>,
+    bloom_filter: Arc<BloomFilter>,
+}
+
+impl BloomFilterExpr {
+    fn new(expr: Arc<dyn PhysicalExpr>, bloom_filter: Arc<BloomFilter>) -> Self {
+        Self { expr, bloom_filter }
+    }
+}
+
+impl PartialEq for BloomFilterExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.expr.eq(&other.expr) && self.bloom_filter.eq(&other.bloom_filter)
+    }
+}
+
+impl Eq for BloomFilterExpr {}
+
+impl Hash for BloomFilterExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.expr.hash(state);
+        self.bloom_filter.hash(state);
+    }
+}
+
+impl Display for BloomFilterExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bloom_filter({})", self.expr)
+    }
+}
+
+impl PhysicalExpr for BloomFilterExpr {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn data_type(&self, _input_schema: &Schema) -> DataFusionResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn nullable(&self, _input_schema: &Schema) -> DataFusionResult<bool> {
+        Ok(false)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> DataFusionResult<ColumnarValue> {
+        let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
+        let mut values = Vec::with_capacity(array.len());
+
+        for row_index in 0..array.len() {
+            if array.is_null(row_index) {
+                values.push(false);
+                continue;
+            }
+
+            let value = ScalarValue::try_from_array(array.as_ref(), row_index)?;
+            values.push(self.bloom_filter.might_contain(&value));
+        }
+
+        Ok(ColumnarValue::Array(
+            Arc::new(BooleanArray::from(values)) as ArrayRef
+        ))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.expr]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+        let Some(expr) = children.into_iter().next() else {
+            return Err(DataFusionError::Internal(
+                "BloomFilterExpr expected one child expression".to_string(),
+            ));
+        };
+
+        Ok(Arc::new(Self::new(expr, Arc::clone(&self.bloom_filter))))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bloom_filter({})", self.expr)
     }
 }
 
@@ -380,6 +706,7 @@ enum RangeBatchBounds {
         min_value: ScalarValue,
         max_value: ScalarValue,
     },
+    NoValues,
     Unsupported,
 }
 
@@ -477,7 +804,7 @@ where
 {
     let array = downcast_array::<PrimitiveArray<T>>(array)?;
     let (Some(min_value), Some(max_value)) = (min::<T>(array), max::<T>(array)) else {
-        return Ok(RangeBatchBounds::Unsupported);
+        return Ok(RangeBatchBounds::NoValues);
     };
 
     Ok(RangeBatchBounds::Values {
@@ -493,7 +820,7 @@ where
 {
     let array = downcast_array::<GenericStringArray<T>>(array)?;
     let (Some(min_value), Some(max_value)) = (min_string(array), max_string(array)) else {
-        return Ok(RangeBatchBounds::Unsupported);
+        return Ok(RangeBatchBounds::NoValues);
     };
 
     Ok(RangeBatchBounds::Values {
@@ -506,7 +833,7 @@ fn string_view_min_max(array: &dyn Array) -> DataFusionResult<RangeBatchBounds> 
     let array = downcast_array::<StringViewArray>(array)?;
     let (Some(min_value), Some(max_value)) = (min_string_view(array), max_string_view(array))
     else {
-        return Ok(RangeBatchBounds::Unsupported);
+        return Ok(RangeBatchBounds::NoValues);
     };
 
     Ok(RangeBatchBounds::Values {
@@ -566,11 +893,14 @@ fn literal_true() -> Arc<dyn PhysicalExpr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, UInt64Array,
-    };
+    use arrow::array::{Float64Array, Int32Array, StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::Column;
     use datafusion::physical_plan::expressions::col;
+    use datafusion_pruning::{PruningPredicate, PruningStatistics};
+    use std::sync::Mutex;
+
+    static INLIST_MEMORY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn create_test_batch() -> RecordBatch {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
@@ -622,6 +952,42 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[derive(Debug)]
+    struct TestPruningStats {
+        min_values: ArrayRef,
+        max_values: ArrayRef,
+    }
+
+    impl PruningStatistics for TestPruningStats {
+        fn min_values(&self, _column: &Column) -> Option<ArrayRef> {
+            Some(Arc::clone(&self.min_values))
+        }
+
+        fn max_values(&self, _column: &Column) -> Option<ArrayRef> {
+            Some(Arc::clone(&self.max_values))
+        }
+
+        fn num_containers(&self) -> usize {
+            self.min_values.len()
+        }
+
+        fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
+            None
+        }
+
+        fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+            None
+        }
+
+        fn contained(
+            &self,
+            _column: &Column,
+            _values: &HashSet<ScalarValue>,
+        ) -> Option<BooleanArray> {
+            None
+        }
     }
 
     #[test]
@@ -771,8 +1137,7 @@ mod tests {
             .update_batch(&first_batch)
             .expect("Should update first batch");
         assert_eq!(1, accumulator.arrays.len());
-        assert!(accumulator.range_bounds.min_value.is_none());
-        assert!(accumulator.range_bounds.max_value.is_none());
+        assert!(accumulator.range_bounds.intervals.is_empty());
         assert!(!accumulator.exact_values_exceeded_memory_limit);
 
         accumulator
@@ -828,7 +1193,110 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_with_nulls_returns_noop() {
+    fn test_exact_left_accumulator_range_fallback_keeps_disjoint_intervals() {
+        let first_batch = create_uint64_batch(vec![10, 20]);
+        let second_batch = create_uint64_batch(vec![100, 110]);
+        let max_memory_size = first_batch.column(0).get_array_memory_size();
+
+        let left_expr = col("a", &first_batch.schema()).expect("Should create column expr");
+        let mut accumulator =
+            ExactLeftAccumulator::new_with_memory_limit(Arc::clone(&left_expr), max_memory_size);
+
+        accumulator
+            .update_batch(&first_batch)
+            .expect("Should update first batch");
+        accumulator
+            .update_batch(&second_batch)
+            .expect("Should update second batch");
+
+        assert_eq!(2, accumulator.range_bounds.intervals.len());
+
+        let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
+        let physical_expr = column_bounds
+            .physical_expr(left_expr)
+            .expect("Should create physical expr");
+
+        let probe_batch = create_uint64_batch(vec![15, 50, 105]);
+        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
+
+        assert_eq!(vec![Some(true), Some(false), Some(true)], actual_values);
+    }
+
+    #[test]
+    fn test_shared_inlist_budget_rejects_reservations_above_limit() {
+        let _guard = INLIST_MEMORY_TEST_LOCK
+            .lock()
+            .expect("memory budget test lock should not be poisoned");
+
+        let current_usage = CURRENT_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed);
+        let reservation_size = 16;
+        assert!(reserve_inlist_memory_with_limit(
+            reservation_size,
+            usize::MAX
+        ));
+        let reservation = InListMemoryReservation {
+            bytes: reservation_size,
+        };
+
+        let saturated_limit = CURRENT_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed);
+        assert!(saturated_limit >= current_usage + reservation_size);
+        assert!(!reserve_inlist_memory_with_limit(1, saturated_limit));
+
+        drop(reservation);
+    }
+
+    #[test]
+    fn test_bloom_filter_expression_excludes_definitely_absent_values() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::UInt64, true)]));
+        let a: ArrayRef = Arc::new(UInt64Array::from(vec![Some(1), Some(3), None, Some(5)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![a])
+            .expect("Should create probe record batch");
+        let left_expr = col("a", &schema).expect("Should create column expr");
+
+        let mut bloom_filter = BloomFilter::try_new(1_024).expect("Bloom filter should be created");
+        bloom_filter.insert(&ScalarValue::UInt64(Some(1)));
+        bloom_filter.insert(&ScalarValue::UInt64(Some(5)));
+
+        let physical_expr = Arc::new(BloomFilterExpr::new(left_expr, Arc::new(bloom_filter)))
+            as Arc<dyn PhysicalExpr>;
+        let actual_values = evaluate_boolean_expression(&physical_expr, &batch);
+
+        assert_eq!(
+            vec![Some(true), Some(false), Some(false), Some(true)],
+            actual_values
+        );
+    }
+
+    #[test]
+    fn test_range_fallback_expression_prunes_row_group_statistics() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::UInt64, false)]));
+        let left_expr = col("a", &schema).expect("Should create column expr");
+        let mut range_bounds = RangeBounds::new(1_024);
+
+        range_bounds
+            .update(create_uint64_batch(vec![10, 20]).column(0).as_ref())
+            .expect("Should update first range");
+        range_bounds
+            .update(create_uint64_batch(vec![100, 110]).column(0).as_ref())
+            .expect("Should update second range");
+
+        let physical_expr = range_bounds.physical_expr(left_expr);
+        let pruning_predicate = PruningPredicate::try_new(physical_expr, Arc::clone(&schema))
+            .expect("Range fallback should produce a pruning predicate");
+        let pruning_stats = TestPruningStats {
+            min_values: Arc::new(UInt64Array::from(vec![0, 30, 105, 200])) as ArrayRef,
+            max_values: Arc::new(UInt64Array::from(vec![5, 40, 106, 220])) as ArrayRef,
+        };
+
+        let should_keep = pruning_predicate
+            .prune(&pruning_stats)
+            .expect("Pruning predicate should evaluate");
+
+        assert_eq!(vec![false, false, true, false], should_keep);
+    }
+
+    #[test]
+    fn test_exact_left_accumulator_range_fallback_ignores_nulls() {
         let batch = create_nullable_uint64_batch(vec![Some(1), None, Some(3)]);
 
         let left_expr = col("a", &batch.schema()).expect("Should create column expr");
@@ -842,10 +1310,16 @@ mod tests {
 
         let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
         let physical_expr = column_bounds
-            .physical_expr(left_expr)
+            .physical_expr(Arc::clone(&left_expr))
             .expect("Should create physical expr");
 
-        assert_literal_true(&physical_expr);
+        let probe_batch = create_uint64_batch(vec![0, 1, 2, 3, 4]);
+        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
+
+        assert_eq!(
+            vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
+            actual_values
+        );
     }
 
     #[test]

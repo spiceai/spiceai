@@ -678,7 +678,20 @@ fn effective_query_memory_limit(memory_limit: Option<u64>) -> u64 {
     })
 }
 
-fn exact_join_filter_memory_limit_per_partition(
+fn exact_join_filter_memory_limit(effective_memory_limit: u64) -> usize {
+    let default_limit = match u64::try_from(DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION) {
+        Ok(default_limit) => default_limit,
+        Err(_) => u64::MAX,
+    };
+    let limit = effective_memory_limit.min(default_limit);
+
+    match usize::try_from(limit) {
+        Ok(limit) => limit,
+        Err(_) => usize::MAX,
+    }
+}
+
+fn hash_join_inlist_memory_limit_per_partition(
     effective_memory_limit: u64,
     target_partitions: usize,
 ) -> usize {
@@ -687,14 +700,8 @@ fn exact_join_filter_memory_limit_per_partition(
         Ok(target_partitions) => target_partitions,
         Err(_) => u64::MAX,
     };
-    let default_limit = match u64::try_from(DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION) {
-        Ok(default_limit) => default_limit,
-        Err(_) => u64::MAX,
-    };
-    let memory_per_partition = effective_memory_limit / target_partitions;
-    let limit = memory_per_partition.min(default_limit);
 
-    match usize::try_from(limit) {
+    match usize::try_from(effective_memory_limit / target_partitions) {
         Ok(limit) => limit,
         Err(_) => usize::MAX,
     }
@@ -704,16 +711,16 @@ fn configure_hash_join_memory_limits(
     config: &mut SessionConfig,
     effective_memory_limit: u64,
 ) -> usize {
-    let runtime_memory_limit_per_partition = exact_join_filter_memory_limit_per_partition(
+    let runtime_memory_limit_per_partition = hash_join_inlist_memory_limit_per_partition(
         effective_memory_limit,
         config.options().execution.target_partitions,
     );
+    let exact_join_filter_memory_limit = exact_join_filter_memory_limit(effective_memory_limit);
 
     let optimizer = &mut config.options_mut().optimizer;
-    let exact_join_filter_memory_limit = optimizer
+    optimizer.hash_join_inlist_pushdown_max_size = optimizer
         .hash_join_inlist_pushdown_max_size
         .min(runtime_memory_limit_per_partition);
-    optimizer.hash_join_inlist_pushdown_max_size = exact_join_filter_memory_limit;
 
     exact_join_filter_memory_limit
 }
@@ -793,7 +800,7 @@ mod tests {
 
     use super::{
         DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION, DataFusionBuilder,
-        configure_hash_join_memory_limits, exact_join_filter_memory_limit_per_partition,
+        configure_hash_join_memory_limits, exact_join_filter_memory_limit,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
@@ -823,19 +830,19 @@ mod tests {
     #[test]
     fn test_exact_join_filter_memory_limit_respects_runtime_query_memory_limit() {
         assert_eq!(
-            256,
-            exact_join_filter_memory_limit_per_partition(1_024, 4),
-            "Exact dynamic join filters should divide the runtime query memory limit across target partitions"
+            1_024,
+            exact_join_filter_memory_limit(1_024),
+            "Exact dynamic join filters should use one shared runtime query memory budget"
         );
         assert_eq!(
             DEFAULT_MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION,
-            exact_join_filter_memory_limit_per_partition(u64::MAX, 1),
+            exact_join_filter_memory_limit(u64::MAX),
             "Exact dynamic join filters should keep the existing hard cap when the query memory limit is larger"
         );
         assert_eq!(
-            0,
-            exact_join_filter_memory_limit_per_partition(1, 4),
-            "Very small memory limits should disable retained exact in-list arrays and force range fallback"
+            1,
+            exact_join_filter_memory_limit(1),
+            "Very small memory limits should still be represented exactly by the shared budget"
         );
     }
 
@@ -849,14 +856,14 @@ mod tests {
 
         let exact_join_filter_memory_limit = configure_hash_join_memory_limits(&mut config, 2_048);
 
-        assert_eq!(512, exact_join_filter_memory_limit);
+        assert_eq!(2_048, exact_join_filter_memory_limit);
         assert_eq!(
             512,
             config
                 .options()
                 .optimizer
                 .hash_join_inlist_pushdown_max_size,
-            "DataFusion's built-in hash join in-list pushdown should also stay within the query memory limit"
+            "DataFusion's built-in per-partition hash join in-list pushdown should stay within the query memory limit"
         );
 
         let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
@@ -869,7 +876,15 @@ mod tests {
             configure_hash_join_memory_limits(&mut config, 1_000_000);
 
         assert_eq!(
-            1_000, exact_join_filter_memory_limit,
+            1_000_000, exact_join_filter_memory_limit,
+            "A larger runtime query memory limit should be available to the shared exact join-filter budget"
+        );
+        assert_eq!(
+            1_000,
+            config
+                .options()
+                .optimizer
+                .hash_join_inlist_pushdown_max_size,
             "A larger runtime query memory limit should not raise DataFusion's configured hash join in-list cap"
         );
     }
