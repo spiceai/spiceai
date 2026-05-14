@@ -921,13 +921,37 @@ mod tests {
         join_type: JoinType,
         null_equality: NullEquality,
     ) -> HashJoinExec {
-        let left_key = col(left_column, &left.schema()).expect("left join key should exist");
-        let right_key = col(right_column, &right.schema()).expect("right join key should exist");
+        hash_join_with_join_type_on(
+            left,
+            right,
+            &[(left_column, right_column)],
+            join_type,
+            null_equality,
+        )
+    }
+
+    fn hash_join_with_join_type_on(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        columns: &[(&str, &str)],
+        join_type: JoinType,
+        null_equality: NullEquality,
+    ) -> HashJoinExec {
+        let on = columns
+            .iter()
+            .map(|(left_column, right_column)| {
+                let left_key =
+                    col(left_column, &left.schema()).expect("left join key should exist");
+                let right_key =
+                    col(right_column, &right.schema()).expect("right join key should exist");
+                (left_key, right_key)
+            })
+            .collect();
 
         HashJoinExec::try_new(
             left,
             right,
-            vec![(left_key, right_key)],
+            on,
             None,
             &join_type,
             None,
@@ -1156,6 +1180,30 @@ mod tests {
                 .downcast_ref::<SortExec>()
                 .is_some(),
             "right anti-join input should be explicitly sorted"
+        );
+    }
+
+    #[test]
+    fn rewrites_same_source_multi_key_left_anti_hash_join_to_sort_merge() {
+        let schema = order_line_schema();
+        let left = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
+        let right = cayenne_file_exec(Arc::clone(&schema), "order_line.vortex", None);
+        let join = Arc::new(hash_join_with_join_type_on(
+            left,
+            right,
+            &[("order_id", "order_id"), ("warehouse_id", "warehouse_id")],
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<SortMergeJoinExec>()
+                .is_some(),
+            "multi-key same-source Cayenne anti join should use sort-merge join"
         );
     }
 
