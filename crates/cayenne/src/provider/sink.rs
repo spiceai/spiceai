@@ -304,6 +304,8 @@ impl CayenneDataSink {
                 "Failed to clear table statistics after overwrite for table {}: {e}",
                 self.table.table_name()
             );
+        } else {
+            self.table.clear_cached_table_statistics();
         }
         self.table.persist_table_stats(&write_stats_acc).await;
 

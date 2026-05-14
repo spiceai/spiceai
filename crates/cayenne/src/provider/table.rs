@@ -51,8 +51,9 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
+use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::{Constraints, DFSchema};
+use datafusion_common::{ColumnStatistics, Constraints, DFSchema, Statistics};
 use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
@@ -261,14 +262,6 @@ impl ColumnStatsAccumulator {
         self.row_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Convert accumulated stats to a serialized Vortex `FileStatistics` blob.
-    ///
-    /// Returns `None` if no rows were accumulated or serialization fails.
-    pub(crate) fn to_file_statistics_blob(&self) -> Option<Vec<u8>> {
-        let (blob, _row_count) = self.to_file_statistics_blob_with_row_count()?;
-        Some(blob)
-    }
-
     pub(crate) fn to_file_statistics_blob_with_row_count(&self) -> Option<(Vec<u8>, i64)> {
         let row_count = self.row_count();
         if row_count == 0 {
@@ -450,6 +443,10 @@ pub struct CayenneTableProvider {
     /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
     /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    /// Table-level Vortex statistics loaded from the metastore and maintained
+    /// after writes. This gives DataFusion synchronous access to Cayenne stats
+    /// without querying the async catalog from `TableProvider::statistics`.
+    table_statistics: Arc<RwLock<Option<Statistics>>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
     /// Optional builder to construct time-based retention filter.
@@ -1663,6 +1660,7 @@ impl CayenneTableProvider {
             context.file_format(),
             &pk_deletion_strategy,
         )?;
+        let table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
 
         // Load protected snapshots from catalog.
         // Protected snapshots are those with sequence > max_delete_sequence.
@@ -1685,6 +1683,7 @@ impl CayenneTableProvider {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
+            table_statistics: Arc::new(RwLock::new(table_statistics)),
             retention_filters,
             time_retention_filter_builder,
             context,
@@ -2013,6 +2012,7 @@ impl CayenneTableProvider {
             table_metadata: self.table_metadata.clone(),
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
+            table_statistics: Arc::clone(&self.table_statistics),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
@@ -2025,6 +2025,98 @@ impl CayenneTableProvider {
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
         }
+    }
+
+    async fn load_table_statistics(
+        catalog: &Arc<dyn MetadataCatalog>,
+        table_metadata: &TableMetadata,
+    ) -> Option<Statistics> {
+        let stats = match catalog.get_table_statistics(&table_metadata.table_id).await {
+            Ok(stats) => stats?,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load table stats for {}: {e}",
+                    table_metadata.table_name
+                );
+                return None;
+            }
+        };
+
+        Self::table_statistics_to_df(&table_metadata.schema, &stats).or_else(|| {
+            tracing::warn!(
+                "Failed to deserialize table stats for {}",
+                table_metadata.table_name
+            );
+            None
+        })
+    }
+
+    fn table_statistics_to_df(
+        schema: &arrow_schema::Schema,
+        stats: &TableStatistics,
+    ) -> Option<Statistics> {
+        let file_stats = crate::stats::deserialize_file_statistics(&stats.statistics_blob, schema)
+            .map_err(|e| {
+                tracing::warn!("Failed to deserialize serialized table statistics: {e}");
+                e
+            })
+            .ok()?;
+
+        Some(crate::stats::file_statistics_to_df(
+            &file_stats,
+            stats.num_rows,
+        ))
+    }
+
+    fn cached_table_statistics_for_optimizer(&self) -> Option<Statistics> {
+        let stats = {
+            let guard = self.table_statistics.read().ok()?;
+            guard.clone()?
+        };
+
+        if self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0 {
+            Some(Self::statistics_to_inexact(stats))
+        } else {
+            Some(stats)
+        }
+    }
+
+    fn statistics_to_inexact(stats: Statistics) -> Statistics {
+        Statistics {
+            num_rows: stats.num_rows.to_inexact(),
+            total_byte_size: stats.total_byte_size.to_inexact(),
+            column_statistics: stats
+                .column_statistics
+                .into_iter()
+                .map(Self::column_statistics_to_inexact)
+                .collect(),
+        }
+    }
+
+    fn column_statistics_to_inexact(stats: ColumnStatistics) -> ColumnStatistics {
+        ColumnStatistics {
+            null_count: stats.null_count.to_inexact(),
+            max_value: stats.max_value.to_inexact(),
+            min_value: stats.min_value.to_inexact(),
+            sum_value: stats.sum_value.to_inexact(),
+            distinct_count: stats.distinct_count.to_inexact(),
+            byte_size: stats.byte_size.to_inexact(),
+        }
+    }
+
+    fn set_cached_table_statistics(&self, stats: Option<Statistics>) {
+        let Ok(mut guard) = self.table_statistics.write() else {
+            tracing::warn!(
+                "Failed to update cached table stats for {} because the lock is poisoned",
+                self.table_metadata.table_name
+            );
+            return;
+        };
+        *guard = stats;
+    }
+
+    pub(crate) fn clear_cached_table_statistics(&self) {
+        self.set_cached_table_statistics(None);
     }
 
     /// Returns the column indices for the configured primary key, if any.
@@ -3897,7 +3989,13 @@ impl CayenneTableProvider {
                 "Failed to persist table stats for {}: {e}",
                 self.table_metadata.table_name
             );
+            return;
         }
+
+        self.set_cached_table_statistics(Self::table_statistics_to_df(
+            &self.table_metadata.schema,
+            &stats,
+        ));
     }
 
     /// Write small batches directly to the metastore, optionally atomically
@@ -5390,22 +5488,14 @@ impl TableProvider for CayenneTableProvider {
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
-        // Delegate statistics tracking to the underlying Vortex ListingTable.
-        // The ListingTable aggregates statistics from all Vortex files in the table directory,
-        // providing metrics such as:
-        // - Total number of rows across all files
-        // - Total size in bytes
-        // - Column-level statistics (min, max, null count, distinct count if available)
-        //
-        // This allows the query optimizer to make informed decisions about:
-        // - Partition pruning
-        // - Join ordering
-        // - Aggregation strategies
-        //
-        // Note: Statistics are cached by the ListingTable and may not reflect
-        // very recent writes until the table metadata is refreshed.
-        //
-        // Clone Arc quickly and release lock immediately to minimize contention
+        if let Some(stats) = self.cached_table_statistics_for_optimizer() {
+            return Some(stats);
+        }
+
+        if self.inlined_row_count.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
+
         let listing_table = {
             let guard = self.listing_table.read().ok()?;
             Arc::clone(&guard)
