@@ -330,7 +330,7 @@ mod tests {
         })
     }
 
-    /// Collects the SSE response body and returns each event as a (event_name, data_json) pair.
+    /// Collects the SSE response body and returns each event as a (`event_name`, `data_json`) pair.
     async fn collect_sse_events(
         events: Vec<ResponseStreamEvent>,
     ) -> Vec<(String, serde_json::Value)> {
