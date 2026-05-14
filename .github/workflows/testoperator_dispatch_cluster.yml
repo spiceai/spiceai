@@ -1,0 +1,248 @@
+name: testoperator cluster bench dispatch
+
+# Orchestrates the cluster-bench fan-out: build a commit-pinned spiced
+# docker image (or reuse if already published), then dispatch
+# `testoperator_run_cluster_bench.yml` once per dispatch-matrix entry under
+# `tools/testoperator/dispatch/.../distributed/`. Mirrors the structure of
+# `testoperator_dispatch.yml` but with an image-build prereq instead of a
+# spiced-binary build, and a max-concurrency of 1 to keep Spice Cloud
+# resource usage bounded.
+
+on:
+  schedule:
+    # Daily at 1000 UTC (0300 PDT) — runs after the single-node dispatch so
+    # the trunk image is built with the same commit.
+    - cron: '0 10 * * *'
+
+  workflow_dispatch:
+    inputs:
+      spiced_ref:
+        description: 'Git ref to build the spiced image from. Defaults to trunk for scheduled runs.'
+        required: false
+        type: string
+        default: 'trunk'
+      force_rebuild:
+        description: 'Rebuild the spiced image even if a matching tag is already published'
+        required: false
+        type: boolean
+        default: false
+      dispatch_dir:
+        description: 'Dispatch matrix directory to fan out from (relative to tools/testoperator/dispatch/)'
+        required: false
+        type: string
+        default: 'tpch/sf1/distributed'
+
+permissions:
+  contents: read
+  packages: write    # workflow_call into spiced_docker_dev needs write
+  actions: write     # gh workflow run needs this
+
+concurrency:
+  # One cluster-bench dispatch at a time; the cluster benches themselves are
+  # gated separately to max 1 in-flight via sequential dispatch below.
+  group: testoperator-dispatch-cluster
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Resolve the desired image tag. Commit-pinned (`trunk-<sha>`) so repeat
+  #    runs on the same commit reuse the previously-built image.
+  # ---------------------------------------------------------------------------
+  resolve-image:
+    name: Resolve spiced image tag
+    runs-on: ubuntu-24.04
+    outputs:
+      spiced_ref: ${{ steps.resolve.outputs.spiced_ref }}
+      spiced_sha: ${{ steps.resolve.outputs.spiced_sha }}
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+      need_build: ${{ steps.resolve.outputs.need_build }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event.inputs.spiced_ref || 'trunk' }}
+          fetch-depth: 1
+
+      - name: Resolve commit + tag
+        id: resolve
+        env:
+          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
+        run: |
+          set -euo pipefail
+          spiced_ref="${{ github.event.inputs.spiced_ref || 'trunk' }}"
+          spiced_sha="$(git rev-parse --short=12 HEAD)"
+          image_tag="trunk-${spiced_sha}"
+
+          echo "spiced_ref=${spiced_ref}" >> "$GITHUB_OUTPUT"
+          echo "spiced_sha=${spiced_sha}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+
+          # Check whether the image already exists in GHCR. If so, skip the
+          # build job to avoid re-publishing identical bits. `force_rebuild`
+          # short-circuits the cache hit.
+          need_build="true"
+          if [ "${FORCE_REBUILD}" = "true" ]; then
+            echo "force_rebuild=true → will rebuild"
+          elif docker buildx imagetools inspect \
+              "ghcr.io/spiceai/spiceai-dev:${image_tag}" >/dev/null 2>&1; then
+            echo "Image ghcr.io/spiceai/spiceai-dev:${image_tag} already exists, skipping build"
+            need_build="false"
+          else
+            echo "Image not found; will build"
+          fi
+          echo "need_build=${need_build}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. Build + publish the spiced image (reusable workflow). Skipped on cache
+  #    hit. workflow_call inputs are fixed to amd64; cluster pods don't need
+  #    arm64.
+  # ---------------------------------------------------------------------------
+  build-image:
+    name: Build spiced image (commit-pinned)
+    needs: resolve-image
+    if: needs.resolve-image.outputs.need_build == 'true'
+    uses: ./.github/workflows/spiced_docker_dev.yml
+    with:
+      tag: ${{ needs.resolve-image.outputs.image_tag }}
+      variant: models
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # 3. Fan out to the cluster-bench workflow once per spicepod in the dispatch
+  #    matrix. Sequential (max_concurrent=1) since each run provisions a real
+  #    Spice Cloud clustered app.
+  # ---------------------------------------------------------------------------
+  dispatch-cluster-bench:
+    name: Dispatch cluster benchmarks
+    needs: [resolve-image, build-image]
+    if: |
+      always() &&
+      needs.resolve-image.result == 'success' &&
+      (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Verify dispatch directory
+        env:
+          DISPATCH_DIR: ${{ github.event.inputs.dispatch_dir || 'tpch/sf1/distributed' }}
+        run: |
+          set -euo pipefail
+          dir="tools/testoperator/dispatch/${DISPATCH_DIR}"
+          if [ ! -d "$dir" ]; then
+            echo "Error: dispatch directory not found: $dir"
+            exit 1
+          fi
+          ls -1 "$dir"
+
+      - name: Dispatch each spicepod
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISPATCH_DIR: ${{ github.event.inputs.dispatch_dir || 'tpch/sf1/distributed' }}
+          IMAGE_TAG: ${{ needs.resolve-image.outputs.image_tag }}
+          SPICED_SHA: ${{ needs.resolve-image.outputs.spiced_sha }}
+          # Each dispatch yaml entry today is a single `tests.bench` block. We
+          # read fields out of it via yq and pass them as workflow_dispatch
+          # inputs to testoperator_run_cluster_bench.yml.
+        run: |
+          set -euo pipefail
+          dir="tools/testoperator/dispatch/${DISPATCH_DIR}"
+
+          # Install yq for YAML parsing if not already on PATH.
+          if ! command -v yq >/dev/null 2>&1; then
+            sudo wget -q -O /usr/local/bin/yq \
+              https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+
+          dispatched_runs=()
+          for f in "$dir"/*.yaml; do
+            entry_name="$(basename "$f" .yaml)"
+            echo "::group::Dispatching ${entry_name}"
+
+            # Helper to default missing fields.
+            field() {
+              local key="$1" default="$2"
+              local v
+              v="$(yq -r "${key} // \"\"" "$f")"
+              if [ -z "$v" ] || [ "$v" = "null" ]; then
+                v="$default"
+              fi
+              echo "$v"
+            }
+
+            spicepod_path="$(field '.tests.bench.spicepod_path' '')"
+            if [ -z "$spicepod_path" ]; then
+              echo "skipping ${entry_name}: missing .tests.bench.spicepod_path"
+              echo "::endgroup::"
+              continue
+            fi
+
+            query_set="$(field '.tests.bench.query_set' 'tpch')"
+            scale_factor="$(field '.tests.bench.scale_factor' '1')"
+            runner_type="$(field '.tests.bench.runner_type' 'spiceai-dev-runners')"
+            validate_results="$(field '.tests.bench.validate_results' 'false')"
+            ready_wait="$(field '.tests.bench.ready_wait' '600')"
+            # Cluster-bench-specific fields (optional in the yaml; sensible defaults).
+            query_transport="$(field '.tests.bench.query_transport' 'flightsql')"
+            executor_replicas="$(field '.tests.bench.executor_replicas' '3')"
+            channel="$(field '.tests.bench.channel' 'nightly')"
+
+            echo "  spicepod_path=${spicepod_path}"
+            echo "  query_set=${query_set}  scale_factor=${scale_factor}"
+            echo "  query_transport=${query_transport}  executor_replicas=${executor_replicas}"
+            echo "  custom_image_tag=${IMAGE_TAG}"
+
+            gh workflow run testoperator_run_cluster_bench.yml \
+              --ref "${GITHUB_REF_NAME}" \
+              -f spicepod_path="${spicepod_path}" \
+              -f query_set="${query_set}" \
+              -f scale_factor="${scale_factor}" \
+              -f runner_type="${runner_type}" \
+              -f validate_results="${validate_results}" \
+              -f ready_wait="${ready_wait}" \
+              -f query_transport="${query_transport}" \
+              -f executor_replicas="${executor_replicas}" \
+              -f channel="${channel}" \
+              -f custom_image_tag="${IMAGE_TAG}"
+
+            dispatched_runs+=("${entry_name}")
+            echo "::endgroup::"
+
+            # Sequential dispatch: wait for the just-launched run to finish
+            # before starting the next one. Cluster benches each provision a
+            # real Spice Cloud app, so max_concurrent=1 keeps cloud-side load
+            # bounded.
+            echo "Waiting briefly for the run to register…"
+            sleep 15
+            run_id="$(gh run list \
+              --workflow testoperator_run_cluster_bench.yml \
+              --branch "${GITHUB_REF_NAME}" \
+              --event workflow_dispatch \
+              --limit 1 \
+              --json databaseId,createdAt \
+              --jq '.[0].databaseId')"
+
+            if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+              echo "Warning: could not resolve run id for ${entry_name}; continuing"
+              continue
+            fi
+
+            echo "Watching run ${run_id} for ${entry_name}"
+            gh run watch "${run_id}" --interval 60 || true
+          done
+
+          if [ "${#dispatched_runs[@]}" -eq 0 ]; then
+            echo "No spicepods dispatched from ${dir}"
+            exit 1
+          fi
+
+          {
+            echo "## Dispatched cluster-bench runs"
+            echo
+            echo "Image: \`ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}\`"
+            echo "Commit: \`${SPICED_SHA}\`"
+            echo
+            for r in "${dispatched_runs[@]}"; do
+              echo "- ${r}"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -8,19 +8,6 @@ run-name: cluster-bench - ${{ github.event.inputs.query_set }} - ${{ github.even
 # `run_spicebench.yml` plumbing in the spicebench repo.
 
 on:
-  # Temporary push trigger so this workflow exercises the cayenne distributed
-  # spicepod end-to-end on every commit to the stacked feature branch (before
-  # the change has landed on trunk). Remove this block before merging the
-  # stacked PR — workflow_dispatch is the long-term trigger.
-  push:
-    branches:
-      - phillip/testoperator-cayenne-distributed-spicepod
-    paths:
-      - '.github/workflows/testoperator_run_cluster_bench.yml'
-      - 'test/spicepods/tpch/sf1/distributed/**'
-      - 'tools/testoperator/**'
-      - 'tools/spidapter/**'
-      - 'crates/test-framework/**'
   workflow_dispatch:
     inputs:
       spicepod_path:
