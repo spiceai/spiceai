@@ -241,13 +241,13 @@ mod tests {
         right_column: &str,
         null_equality: NullEquality,
     ) -> HashJoinExec {
+        let left_key = col(left_column, &left.schema()).expect("left join key should exist");
+        let right_key = col(right_column, &right.schema()).expect("right join key should exist");
+
         HashJoinExec::try_new(
-            Arc::clone(&left),
-            Arc::clone(&right),
-            vec![(
-                col(left_column, &left.schema()).expect("left join key should exist"),
-                col(right_column, &right.schema()).expect("right join key should exist"),
-            )],
+            left,
+            right,
+            vec![(left_key, right_key)],
             None,
             &JoinType::Inner,
             None,
@@ -267,7 +267,7 @@ mod tests {
             .expect("optimizer should succeed")
     }
 
-    fn plan_snapshot(plan: Arc<dyn ExecutionPlan>) -> String {
+    fn plan_snapshot(plan: &Arc<dyn ExecutionPlan>) -> String {
         displayable(plan.as_ref()).indent(true).to_string()
     }
 
@@ -365,7 +365,7 @@ mod tests {
         ));
 
         let optimized = optimize(top_join);
-        let snapshot = plan_snapshot(optimized);
+        let snapshot = plan_snapshot(&optimized);
 
         assert_eq!(
             2,
@@ -383,7 +383,7 @@ mod tests {
 
         insta::assert_snapshot!(
             "cayenne_probe_join_uses_exact_accumulator_explain",
-            plan_snapshot(optimized)
+            plan_snapshot(&optimized)
         );
     }
 
@@ -408,7 +408,7 @@ mod tests {
 
         insta::assert_snapshot!(
             "nested_cayenne_probe_join_uses_exact_accumulator_explain",
-            plan_snapshot(optimized)
+            plan_snapshot(&optimized)
         );
     }
 }

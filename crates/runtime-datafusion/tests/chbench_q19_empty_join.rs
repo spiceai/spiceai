@@ -72,7 +72,7 @@ async fn chbench_q19_empty_join_does_not_error() -> datafusion::error::Result<()
 
     let result = ctx
         .sql(
-            r#"select
+            r"select
     sum(ol_amount) as revenue
 from
     order_line, item
@@ -98,7 +98,7 @@ where
         and ol_quantity <= 10
         and i_price between 1 and 400000
         and ol_w_id in (1,5,3)
-    )"#,
+    )",
         )
         .await?
         .collect()
