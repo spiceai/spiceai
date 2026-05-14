@@ -52,7 +52,6 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
-use twox_hash::XxHash3_64;
 
 pub const DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys.
 const DEFAULT_MAXIMUM_BLOOM_FILTER_MEMORY_BYTES: usize = 8 * 1024 * 1024;
@@ -865,10 +864,32 @@ impl BloomFilter {
 }
 
 fn bloom_hashes<T: Hash + ?Sized>(value: &T) -> (u64, u64) {
-    let mut hasher = XxHash3_64::default();
+    let mut hasher = Blake3Hasher(blake3::Hasher::new());
     value.hash(&mut hasher);
-    let hash_one = hasher.finish();
-    (hash_one, hash_one.rotate_left(32) ^ hash_one.reverse_bits())
+    let hash = hasher.0.finalize();
+    let bytes = hash.as_bytes();
+    let hash_one = u64_from_blake3(bytes, 0);
+    let hash_two = u64_from_blake3(bytes, 8);
+    (hash_one, hash_two)
+}
+
+struct Blake3Hasher(blake3::Hasher);
+
+impl Hasher for Blake3Hasher {
+    fn finish(&self) -> u64 {
+        let hash = self.0.clone().finalize();
+        u64_from_blake3(hash.as_bytes(), 0)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+}
+
+fn u64_from_blake3(bytes: &[u8; blake3::OUT_LEN], offset: usize) -> u64 {
+    let mut output = [0_u8; size_of::<u64>()];
+    output.copy_from_slice(&bytes[offset..offset + size_of::<u64>()]);
+    u64::from_le_bytes(output)
 }
 
 trait BloomFloatType: ArrowPrimitiveType {

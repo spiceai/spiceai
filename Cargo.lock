@@ -15914,6 +15914,7 @@ dependencies = [
  "arrow_tools",
  "async-stream",
  "async-trait",
+ "blake3",
  "chrono",
  "criterion 0.7.0",
  "dashmap",
@@ -15941,7 +15942,6 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-futures",
- "twox-hash",
  "url",
  "util",
 ]
