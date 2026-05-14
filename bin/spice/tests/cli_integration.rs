@@ -175,7 +175,7 @@ mod dataset {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Dataset"));
+            .stdout(predicate::str::contains("dataset entries"));
     }
 
     #[test]
@@ -482,7 +482,7 @@ mod manifest_editing {
         assert!(updated_manifest.contains("models:"));
         assert!(updated_manifest.contains("name: llm"));
         assert!(updated_manifest.contains("openai:gpt-4o-mini"));
-        assert!(updated_manifest.contains("temperature: 0.2"));
+        assert!(updated_manifest.contains("temperature: \"0.2\""));
         assert!(updated_manifest.contains("datasets:"));
         assert!(updated_manifest.contains("- documents"));
         assert!(
@@ -685,7 +685,9 @@ mod connect {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Connect"))
+            .stdout(predicate::str::contains(
+                "Spicepod hosted on Spice.ai Cloud",
+            ))
             .stdout(predicate::str::contains("Spice.ai Cloud"));
     }
 }
@@ -733,7 +735,7 @@ mod search {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Search"))
+            .stdout(predicate::str::contains("vector or hybrid search"))
             .stdout(predicate::str::contains("embeddings"));
     }
 
@@ -792,7 +794,7 @@ mod nsql {
             .assert()
             .success()
             .stdout(predicate::str::contains("SQL"))
-            .stdout(predicate::str::contains("natural language"));
+            .stdout(predicate::str::contains("natural-language"));
     }
 }
 
@@ -816,21 +818,21 @@ mod query {
 }
 
 // ============================================================================
-// Eval Command Tests
+// Completions Command Tests
 // ============================================================================
 
-mod eval {
+mod completions {
     use super::*;
 
     #[test]
-    fn test_eval_help() {
+    fn test_completions_help() {
         let mut cmd = spice_cmd();
-        cmd.arg("eval")
+        cmd.arg("completions")
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("eval"))
-            .stdout(predicate::str::contains("model"));
+            .stdout(predicate::str::contains("completion scripts"))
+            .stdout(predicate::str::contains("zsh"));
     }
 }
 
@@ -866,7 +868,7 @@ mod cluster {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Cluster"));
+            .stdout(predicate::str::contains("clustered mode"));
     }
 
     #[test]
@@ -1233,14 +1235,18 @@ mod mode_tests {
             .assert()
             .success()
             .stdout(predicate::str::contains("--cloud"))
-            .stdout(predicate::str::contains("Use cloud instance"));
+            .stdout(predicate::str::contains("Target Spice.ai Cloud"));
     }
 
     #[test]
     fn test_cloud_mode_with_status() {
         // Cloud mode status should fail without proper connection (no API key)
         let mut cmd = spice_cmd();
-        cmd.arg("--cloud").arg("status").assert().failure();
+        cmd.arg("--cloud")
+            .arg("us-east-1")
+            .arg("status")
+            .assert()
+            .failure();
     }
 
     #[test]
@@ -1249,6 +1255,7 @@ mod mode_tests {
         // but the command structure should be valid
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("--api-key")
             .arg("invalid-api-key")
             .arg("status")
@@ -1272,6 +1279,7 @@ mod mode_tests {
         // Cloud mode with datasets command
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("datasets")
             .arg("--help")
             .assert()
@@ -1283,6 +1291,7 @@ mod mode_tests {
         // Cloud mode with models command
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("models")
             .arg("--help")
             .assert()
@@ -1294,6 +1303,7 @@ mod mode_tests {
         // Cloud mode with search command
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("search")
             .arg("--help")
             .assert()
@@ -1305,6 +1315,7 @@ mod mode_tests {
         // Cloud mode with sql command
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("sql")
             .arg("--help")
             .assert()
@@ -1323,10 +1334,11 @@ mod mode_tests {
         // Some commands don't support cloud mode and should indicate this
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("datasets")
             .assert()
-            .success() // Currently exits 0 but prints error message
-            .stdout(predicate::str::contains("does not support"));
+            .failure()
+            .stderr(predicate::str::contains("does not support"));
     }
 
     #[test]
@@ -1347,6 +1359,7 @@ mod mode_tests {
         cmd.arg("--http-endpoint")
             .arg("http://custom:8080")
             .arg("--cloud")
+            .arg("us-east-1")
             .arg("--help")
             .assert()
             .success();
@@ -1367,6 +1380,7 @@ mod mode_tests {
         for command in &["status", "datasets", "models", "sql", "search"] {
             let mut cmd = spice_cmd();
             cmd.arg("--cloud")
+                .arg("us-east-1")
                 .arg(command)
                 .arg("--help")
                 .assert()
