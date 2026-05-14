@@ -189,8 +189,9 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+    use tempfile::TempDir;
 
-    async fn create_test_dataset(ds_name: &str) -> Dataset {
+    async fn create_test_dataset(ds_name: &str) -> (Dataset, TempDir) {
         let app = app::AppBuilder::new("test").build();
         let runtime = RuntimeBuilder::new().build().await;
 
@@ -201,16 +202,21 @@ mod tests {
             .build()
             .expect("to create dataset");
 
-        // Use a unique database file per test to avoid locking conflicts
-        let db_file = format!(".spice/data/kafka_sqlite_test_{ds_name}.db");
+        let temp_dir = TempDir::new().expect("to create temp dir");
+        let db_path = temp_dir.path().join(format!("kafka_sqlite_test_{ds_name}.db"));
         dataset.acceleration = Some(Acceleration {
             engine: Engine::Sqlite,
             mode: Mode::File,
-            params: [("sqlite_file".to_string(), db_file)].into_iter().collect(),
+            params: [(
+                "sqlite_file".to_string(),
+                db_path.to_string_lossy().to_string(),
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         });
 
-        dataset
+        (dataset, temp_dir)
     }
 
     fn create_test_metadata() -> KafkaMetadata {
@@ -233,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_roundtrip() {
-        let ds = create_test_dataset("test_sqlite_roundtrip").await;
+        let (ds, _temp_dir) = create_test_dataset("test_sqlite_roundtrip").await;
         let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
@@ -254,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_metadata_overwrite() {
-        let ds = create_test_dataset("test_sqlite_metadata_overwrite").await;
+        let (ds, _temp_dir) = create_test_dataset("test_sqlite_metadata_overwrite").await;
         let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
@@ -281,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_offsets_update() {
-        let ds = create_test_dataset("test_sqlite_offsets_update").await;
+        let (ds, _temp_dir) = create_test_dataset("test_sqlite_offsets_update").await;
         let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
@@ -308,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_get_nonexistent() {
-        let ds = create_test_dataset("test_sqlite_get_nonexistent").await;
+        let (ds, _temp_dir) = create_test_dataset("test_sqlite_get_nonexistent").await;
         let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
