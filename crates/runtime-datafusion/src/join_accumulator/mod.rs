@@ -604,14 +604,23 @@ impl BloomFilter {
 }
 
 fn bloom_hashes(value: &ScalarValue) -> (u64, u64) {
-    fn hash_with_salt(value: &ScalarValue, salt: u64) -> u64 {
+    #[derive(Hash)]
+    enum BloomHashStream {
+        Primary,
+        Secondary,
+    }
+
+    fn hash_with_stream(value: &ScalarValue, stream: BloomHashStream) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        salt.hash(&mut hasher);
+        stream.hash(&mut hasher);
         value.hash(&mut hasher);
         hasher.finish()
     }
 
-    (hash_with_salt(value, 0), hash_with_salt(value, 1))
+    (
+        hash_with_stream(value, BloomHashStream::Primary),
+        hash_with_stream(value, BloomHashStream::Secondary),
+    )
 }
 
 #[derive(Debug, Clone)]
