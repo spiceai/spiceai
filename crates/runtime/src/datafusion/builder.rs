@@ -653,20 +653,6 @@ impl Default for AnalyzerRulesBuilder {
     }
 }
 
-// This method uses unwrap_or_default, however it should never fail on the initialization. See
-// RuntimeEnv::default()
-pub(crate) fn runtime_env(
-    memory_limit: Option<u64>,
-    temp_directory: Option<String>,
-    io_runtime: Handle,
-) -> Arc<RuntimeEnv> {
-    runtime_env_with_effective_memory_limit(
-        effective_query_memory_limit(memory_limit),
-        temp_directory,
-        io_runtime,
-    )
-}
-
 fn effective_query_memory_limit(memory_limit: Option<u64>) -> u64 {
     memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
@@ -682,10 +668,8 @@ fn effective_query_memory_limit(memory_limit: Option<u64>) -> u64 {
 }
 
 fn exact_join_filter_memory_limit(effective_memory_limit: u64) -> usize {
-    let default_limit = match u64::try_from(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES) {
-        Ok(default_limit) => default_limit,
-        Err(_) => u64::MAX,
-    };
+    let default_limit =
+        u64::try_from(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES).unwrap_or(u64::MAX);
     let limit = effective_memory_limit.min(default_limit);
 
     match usize::try_from(limit) {
@@ -699,10 +683,7 @@ fn hash_join_inlist_memory_limit_per_partition(
     target_partitions: usize,
 ) -> usize {
     let target_partitions = target_partitions.max(1);
-    let target_partitions = match u64::try_from(target_partitions) {
-        Ok(target_partitions) => target_partitions,
-        Err(_) => u64::MAX,
-    };
+    let target_partitions = u64::try_from(target_partitions).unwrap_or(u64::MAX);
 
     match usize::try_from(effective_memory_limit / target_partitions) {
         Ok(limit) => limit,
