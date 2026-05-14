@@ -370,19 +370,48 @@ impl SpanExporter for TaskHistoryExporter {
         let min_plan_duration_ms = self.min_plan_duration_ms;
         let df = Arc::clone(&self.df);
 
+        // Convert first so we can look at sibling spans in the same batch to
+        // decide whether a `ballista_stage` child should be retained — see
+        // the `task_span.task == "ballista_stage"` branch below.
+        let candidates: Vec<TaskSpan> = batch
+            .into_iter()
+            .map(|span| self.span_to_task_span(span))
+            .collect();
+
+        // Build the set of parent `sql_query` span ids in this batch that
+        // pass the duration filter. Stage rows are only kept when their
+        // parent is also retained — otherwise the stage rows are orphans
+        // (their `parent_span_id` would reference a row that was never
+        // written), breaking the parent ⇒ stages tree this feature emits.
+        let included_parent_ids: std::collections::HashSet<Arc<str>> = candidates
+            .iter()
+            .filter(|task_span| {
+                task_span.task.as_ref() == "sql_query"
+                    && min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
+            })
+            .map(|task_span| Arc::clone(&task_span.span_id))
+            .collect();
+
         let should_include = |task_span: &TaskSpan| {
             // Always include plan capture spans regardless of duration since they are already
             // filtered by min_plan_duration when created.
             if task_span.labels.contains_key(PLAN_CAPTURE_LABEL) {
                 return true;
             }
+            // `ballista_stage` spans have an `execution_duration_ms` of ~0
+            // (the brief window between span creation and drop). The real
+            // duration is in the `stage_duration_ms` label. Mirror the
+            // parent's inclusion decision: keep the stage row iff its
+            // parent `sql_query` row is also being written this batch.
+            if task_span.task.as_ref() == "ballista_stage" {
+                return task_span
+                    .parent_span_id
+                    .as_ref()
+                    .is_some_and(|pid| included_parent_ids.contains(pid));
+            }
             min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
         };
-        let spans: Vec<TaskSpan> = batch
-            .into_iter()
-            .map(|span| self.span_to_task_span(span))
-            .filter(should_include)
-            .collect();
+        let spans: Vec<TaskSpan> = candidates.into_iter().filter(should_include).collect();
 
         async move {
             // Separate logic: if plan capture is disabled, write all spans directly
