@@ -2364,7 +2364,7 @@ async fn cayenne_catalog_rejected_without_distributed_mode() -> Result<(), Strin
             }
 
             // The catalog should have failed to register with a configuration error.
-            let statuses = rt.status.get_catalog_statuses();
+            let statuses = rt.status().get_catalog_statuses();
             let status = statuses
                 .get("standalone_cat")
                 .ok_or("expected catalog 'standalone_cat' in status map")?;
