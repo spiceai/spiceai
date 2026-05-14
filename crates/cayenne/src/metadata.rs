@@ -258,13 +258,21 @@ pub struct VortexConfig {
     pub compression_strategy: CompressionStrategy,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
     /// Each file uses multipart uploads internally via `object_store`.
-    /// Defaults to 4 for balanced I/O throughput vs resource usage.
+    /// Defaults to the available CPU parallelism.
     #[serde(default = "default_upload_concurrency")]
     pub upload_concurrency: usize,
+    /// Optional override for writer partitions when ingesting unsorted data into a snapshot.
+    /// When unset, writes use the current `DataFusion` session target partition count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_concurrency: Option<usize>,
 }
 
-const fn default_upload_concurrency() -> usize {
-    4
+fn default_concurrency() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+fn default_upload_concurrency() -> usize {
+    default_concurrency()
 }
 
 impl Default for VortexConfig {
@@ -278,9 +286,24 @@ impl Default for VortexConfig {
             // No sort columns by default
             sort_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
-            // 4 concurrent uploads balances throughput vs resource usage
-            upload_concurrency: 4,
+            upload_concurrency: default_upload_concurrency(),
+            write_concurrency: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VortexConfig;
+
+    #[test]
+    fn test_concurrency_defaults_use_available_parallelism_where_global() {
+        let available_parallelism =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let config = VortexConfig::default();
+
+        assert_eq!(config.upload_concurrency, available_parallelism);
+        assert_eq!(config.write_concurrency, None);
     }
 }
 

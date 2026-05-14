@@ -233,6 +233,7 @@ impl CayenneTableProvider {
                 prepared_insert.stream,
                 self.target_file_size_bytes(),
                 STAGING_DIR_NAME,
+                self.internal_target_partitions(),
             )
             .await?;
 

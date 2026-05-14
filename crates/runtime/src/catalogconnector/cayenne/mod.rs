@@ -54,6 +54,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("cayenne_compression_strategy")
         .description("Compression: 'btrblocks' (default) or 'zstd'.")
         .default("btrblocks"),
+    ParameterSpec::component("cayenne_upload_concurrency")
+        .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
+    ParameterSpec::component("cayenne_write_concurrency")
+        .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
 ];
 
 /// A catalog connector for Cayenne lakehouse catalogs.
@@ -119,6 +123,20 @@ impl CayenneCatalogConnector {
                 "btrblocks" => Some(cayenne::metadata::CompressionStrategy::Btrblocks),
                 _ => None,
             });
+        let upload_concurrency = self
+            .params
+            .get("cayenne_upload_concurrency")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1));
+        let write_concurrency = self
+            .params
+            .get("cayenne_write_concurrency")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1));
 
         CayenneCatalogProviderConfig {
             data_dir,
@@ -128,6 +146,8 @@ impl CayenneCatalogConnector {
             segment_cache_mb,
             target_file_size_mb,
             compression_strategy,
+            upload_concurrency,
+            write_concurrency,
         }
     }
 }
