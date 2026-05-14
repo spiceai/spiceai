@@ -70,14 +70,15 @@ pub fn maximum_shared_inlist_memory_bytes() -> usize {
     MAXIMUM_SHARED_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed)
 }
 
-/// Sets the process-wide exact in-list reservation budget.
+/// Conservatively clamps the process-wide exact in-list reservation budget.
 ///
 /// `DataFusion` constructs `CollectLeftAccumulator` instances without session
 /// state, so the Cayenne join rewriter cannot attach a per-session limit at
-/// accumulator construction time. Spice builds one `DataFusion` runtime for the
-/// process and configures this shared budget from `runtime.query.memory_limit`.
-pub fn set_maximum_shared_inlist_memory_bytes(limit: usize) {
-    MAXIMUM_SHARED_INLIST_MEMORY_BYTES.store(limit, AtomicOrdering::Relaxed);
+/// accumulator construction time. If multiple `DataFusion` instances are built
+/// in one process, use the strictest configured limit instead of letting the
+/// most recent builder raise the shared budget for existing instances.
+pub fn clamp_maximum_shared_inlist_memory_bytes(limit: usize) {
+    MAXIMUM_SHARED_INLIST_MEMORY_BYTES.fetch_min(limit, AtomicOrdering::Relaxed);
 }
 
 #[derive(Debug)]
@@ -250,7 +251,7 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
 }
 
 impl ExactLeftAccumulator {
-    /// Creates an accumulator with a custom per-partition in-list memory limit.
+    /// Creates an accumulator with a custom local in-list memory limit.
     #[must_use]
     pub fn new_with_memory_limit(
         expr: Arc<dyn PhysicalExpr>,

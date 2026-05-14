@@ -74,7 +74,7 @@ use datafusion_optimizer_rules::{
     },
 };
 #[cfg(not(windows))]
-use runtime_datafusion::join_accumulator::set_maximum_shared_inlist_memory_bytes;
+use runtime_datafusion::join_accumulator::clamp_maximum_shared_inlist_memory_bytes;
 use runtime_datafusion::{
     extension::{
         ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
@@ -382,7 +382,7 @@ impl DataFusionBuilder {
             // Cayenne is not built on Windows, so its exact join-filter rewrite
             // and accumulator budget are only configured for supported targets.
             // Windows keeps DataFusion's standard hash-join dynamic filters.
-            set_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
+            clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
             state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
         }
         #[cfg(windows)]
