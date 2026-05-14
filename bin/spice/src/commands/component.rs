@@ -985,9 +985,10 @@ fn parse_key_value(pair: &str) -> Result<(String, Value)> {
 fn parse_string_or_yaml_prefixed_pair(pair: &str) -> Result<(String, Value)> {
     let (key, raw_value) = split_pair(pair)?;
     if let Some(yaml_value) = raw_value.strip_prefix("yaml:") {
-        let value = yaml::from_str(yaml_value).map_err(|source| crate::error::Error::ConfigParse {
-            message: format!("Failed to parse YAML value for '{key}': {source}"),
-        })?;
+        let value =
+            yaml::from_str(yaml_value).map_err(|source| crate::error::Error::ConfigParse {
+                message: format!("Failed to parse YAML value for '{key}': {source}"),
+            })?;
         return Ok((key.to_string(), value));
     }
 

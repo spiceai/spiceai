@@ -33,9 +33,12 @@ const SCHEMA_DIRECTIVE: &str = "# yaml-language-server: $schema=https://raw.gith
 
 #[derive(Deserialize)]
 struct SpicepodManifestHeader {
-    name: String,
-    version: SpicepodVersion,
-    kind: SpicepodKind,
+    #[serde(rename = "name")]
+    _name: String,
+    #[serde(rename = "version")]
+    _version: SpicepodVersion,
+    #[serde(rename = "kind")]
+    _kind: SpicepodKind,
 }
 
 /// Returns the first existing root Spicepod manifest path, preferring `spicepod.yaml` over `spicepod.yml`.
@@ -213,16 +216,11 @@ fn ensure_sequence_field<'value>(
 
 /// Validates the root manifest header without rejecting newer fields this CLI does not edit.
 fn validate_spicepod_value(value: &Value, path: &Path) -> Result<()> {
-    let header = yaml::from_value::<SpicepodManifestHeader>(value.clone()).map_err(|source| {
+    yaml::from_value::<SpicepodManifestHeader>(value.clone()).map_err(|source| {
         crate::error::Error::ConfigParse {
             message: format!("Failed to parse {}: {source}", path.display()),
         }
     })?;
-    let SpicepodManifestHeader {
-        name: _,
-        version: _,
-        kind: _,
-    } = header;
 
     Ok(())
 }
