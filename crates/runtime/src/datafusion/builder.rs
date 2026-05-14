@@ -52,6 +52,8 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
+#[cfg(not(windows))]
+use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
@@ -387,12 +389,7 @@ impl DataFusionBuilder {
             // and accumulator budget are only configured for supported targets.
             // Windows keeps DataFusion's standard hash-join dynamic filters.
             clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
-            // Logical: plan-time predicate transitive closure across equi-join
-            // keys. Must run before `push_down_filter` (DataFusion's built-in
-            // logical pass that decorrelates `InSubquery` and pushes the
-            // derived predicate down to the fact-table scan).
-            state = state
-                .with_optimizer_rule(Arc::new(CayennePropagateFilterAcrossEquiJoinKeys::new()));
+            state = with_cayenne_logical_optimizer(state);
             state = state
                 .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
                 .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()))
@@ -610,6 +607,40 @@ impl DataFusionBuilder {
             cayenne_ddl_handler,
         }
     }
+}
+
+#[cfg(not(windows))]
+fn with_cayenne_logical_optimizer(mut state: SessionStateBuilder) -> SessionStateBuilder {
+    let trailing_rules = state.optimizer_rules().take().unwrap_or_default();
+    let mut optimizer_rules = state
+        .optimizer()
+        .take()
+        .map_or_else(|| Optimizer::new().rules, |optimizer| optimizer.rules);
+
+    insert_cayenne_logical_optimizer_rule(&mut optimizer_rules);
+    optimizer_rules.extend(trailing_rules);
+    state.with_optimizer_rules(optimizer_rules)
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_logical_optimizer_rule(
+    rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>,
+) {
+    if rules
+        .iter()
+        .any(|rule| rule.name() == "cayenne_propagate_filter_across_equi_join_keys")
+    {
+        return;
+    }
+
+    let insert_at = rules
+        .iter()
+        .position(|rule| rule.name() == "push_down_filter")
+        .unwrap_or(rules.len());
+    rules.insert(
+        insert_at,
+        Arc::new(CayennePropagateFilterAcrossEquiJoinKeys::new()),
+    );
 }
 
 pub struct AnalyzerRulesBuilder {
@@ -924,6 +955,47 @@ mod tests {
                 "spice_ddl_rewrite",
             ],
             "Analyzer rule list or ordering has changed"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cayenne_logical_rule_before_push_down_filter() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        let state = df.ctx.state();
+        let rule_names: Vec<&str> = state.optimizers().iter().map(|r| r.name()).collect();
+        let cayenne_position = rule_names
+            .iter()
+            .position(|name| *name == "cayenne_propagate_filter_across_equi_join_keys")
+            .expect("Cayenne logical filter propagation rule should be registered");
+        let push_down_position = rule_names
+            .iter()
+            .position(|name| *name == "push_down_filter")
+            .expect("DataFusion push_down_filter rule should be registered");
+
+        assert!(
+            cayenne_position < push_down_position,
+            "Cayenne logical filter propagation must run before push_down_filter so derived predicates can be pushed into scans"
+        );
+        assert_eq!(
+            rule_names
+                .iter()
+                .filter(|name| **name == "cayenne_propagate_filter_across_equi_join_keys")
+                .count(),
+            1,
+            "Cayenne logical filter propagation rule should be registered exactly once"
         );
     }
 

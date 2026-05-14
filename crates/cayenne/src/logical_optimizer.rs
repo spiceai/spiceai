@@ -34,11 +34,11 @@ limitations under the License.
 //!
 //! ## What the rule does
 //!
-//! For every `LogicalPlan::Join` with `JoinType::Inner` and at least one
-//! column-only equi-key pair `(left.a, right.b)` whose data types match, the
+//! For every `LogicalPlan::Join` with `JoinType::Inner` and one or more
+//! column-only equi-key pairs `(left.a, right.b)` whose data types match, the
 //! rule inspects each side for a non-trivial `Filter` that references at
-//! least one column other than its own join key. If one is found, it wraps
-//! the *opposite* side with
+//! least one column other than each candidate join key. If one is found, it
+//! wraps the *opposite* side with
 //!
 //! ```text
 //! Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))
@@ -58,9 +58,9 @@ limitations under the License.
 //! Each introduced subquery is wrapped in a `SubqueryAlias` whose name
 //! starts with [`PROPAGATED_FILTER_ALIAS_PREFIX`]. Before firing, the rule
 //! walks the candidate side's filter chain and refuses to re-introduce a
-//! propagated filter on a side that already contains an alias with that
-//! prefix. This prevents the rule from oscillating with itself when the
-//! optimizer iterates to fixed point.
+//! propagated filter for the same target key. This prevents the rule from
+//! oscillating with itself when the optimizer iterates to fixed point, while
+//! still allowing composite joins to receive one derived filter per key.
 //!
 //! ## Conservatism
 //!
@@ -76,10 +76,11 @@ limitations under the License.
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DataFusionError, Result, Spans, TableReference};
 use datafusion::logical_expr::{
-    Filter, Join, JoinType, LogicalPlan, LogicalPlanBuilder, Subquery, SubqueryAlias,
+    Filter, Join, JoinType, LogicalPlan, Projection, Subquery, SubqueryAlias,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion_expr::Expr;
+use datafusion_expr::ExprSchemable;
 use datafusion_expr::expr::InSubquery;
 use std::sync::Arc;
 
@@ -139,87 +140,105 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
 
-        let Some((left_col, right_col)) = pick_equijoin_columns(&join) else {
+        let equijoin_columns = matching_equijoin_columns(&join);
+        if equijoin_columns.is_empty() {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
-        };
+        }
 
         let left_is_dim = is_dim_like_subtree(&join.left);
         let right_is_dim = is_dim_like_subtree(&join.right);
-
-        let left_has_nonkey_filter =
-            left_is_dim && subtree_has_non_key_filter(&join.left, &left_col);
-        let right_has_nonkey_filter =
-            right_is_dim && subtree_has_non_key_filter(&join.right, &right_col);
-
-        let already_propagated_on_left = subtree_has_propagated_filter(&join.left);
-        let already_propagated_on_right = subtree_has_propagated_filter(&join.right);
 
         let mut new_left: Arc<LogicalPlan> = Arc::clone(&join.left);
         let mut new_right: Arc<LogicalPlan> = Arc::clone(&join.right);
         let mut changed = false;
 
-        // Propagate the LEFT-side dim filter → the RIGHT side.
-        if left_has_nonkey_filter && !already_propagated_on_right {
-            let subquery_plan = build_key_projection_subquery(
-                Arc::clone(&join.left),
-                &left_col,
-                config.alias_generator(),
-            )?;
-            let wrapped = wrap_with_in_subquery_filter(
-                Arc::clone(&join.right),
-                &right_col,
-                subquery_plan,
-            )?;
-            new_right = Arc::new(wrapped);
-            changed = true;
-        }
+        for (left_col, right_col) in &equijoin_columns {
+            // Propagate the LEFT-side filtered key domain → the RIGHT side.
+            if left_is_dim
+                && subtree_has_non_key_filter(&join.left, left_col)
+                && !subtree_has_propagated_filter_on_key(new_right.as_ref(), right_col)
+            {
+                let subquery_plan = build_key_projection_subquery(
+                    Arc::clone(&join.left),
+                    left_col,
+                    config.alias_generator(),
+                )?;
+                let wrapped = wrap_with_in_subquery_filter(
+                    Arc::clone(&new_right),
+                    right_col,
+                    subquery_plan,
+                )?;
+                new_right = Arc::new(wrapped);
+                changed = true;
+            }
 
-        // Propagate the RIGHT-side dim filter → the LEFT side.
-        if right_has_nonkey_filter && !already_propagated_on_left {
-            let subquery_plan = build_key_projection_subquery(
-                Arc::clone(&join.right),
-                &right_col,
-                config.alias_generator(),
-            )?;
-            let wrapped =
-                wrap_with_in_subquery_filter(Arc::clone(&join.left), &left_col, subquery_plan)?;
-            new_left = Arc::new(wrapped);
-            changed = true;
+            // Propagate the RIGHT-side filtered key domain → the LEFT side.
+            if right_is_dim
+                && subtree_has_non_key_filter(&join.right, right_col)
+                && !subtree_has_propagated_filter_on_key(new_left.as_ref(), left_col)
+            {
+                let subquery_plan = build_key_projection_subquery(
+                    Arc::clone(&join.right),
+                    right_col,
+                    config.alias_generator(),
+                )?;
+                let wrapped =
+                    wrap_with_in_subquery_filter(Arc::clone(&new_left), left_col, subquery_plan)?;
+                new_left = Arc::new(wrapped);
+                changed = true;
+            }
         }
 
         if !changed {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
 
-        let new_join = Join {
-            left: new_left,
-            right: new_right,
-            on: join.on,
-            filter: join.filter,
-            join_type: join.join_type,
-            join_constraint: join.join_constraint,
-            schema: join.schema,
-            null_equality: join.null_equality,
-        };
+        let new_join = Join::try_new(
+            new_left,
+            new_right,
+            join.on,
+            join.filter,
+            join.join_type,
+            join.join_constraint,
+            join.null_equality,
+        )?;
 
         Ok(Transformed::yes(LogicalPlan::Join(new_join)))
     }
 }
 
-/// Return the single column-only equi-key pair from `join.on`, or `None` when
-/// no such pair exists (e.g. expression keys, multi-key composite joins).
-///
-/// Picks the first qualifying pair; q21's nation⋈supplier join has exactly
-/// one `(n_nationkey, s_nationkey)` pair, which is the case this rule targets.
-fn pick_equijoin_columns(join: &Join) -> Option<(Column, Column)> {
-    if join.on.len() != 1 {
-        return None;
-    }
-    let (left, right) = &join.on[0];
-    match (left, right) {
-        (Expr::Column(l), Expr::Column(r)) => Some((l.clone(), r.clone())),
-        _ => None,
-    }
+/// Return the column-only equi-key pairs from `join.on` whose data types match.
+/// Expression keys and type-mismatched pairs are skipped conservatively.
+fn matching_equijoin_columns(join: &Join) -> Vec<(Column, Column)> {
+    join.on
+        .iter()
+        .filter_map(|(left, right)| {
+            if !join_key_types_match(left, right, &join.left, &join.right) {
+                return None;
+            }
+
+            match (left, right) {
+                (Expr::Column(l), Expr::Column(r)) => Some((l.clone(), r.clone())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn join_key_types_match(
+    left: &Expr,
+    right: &Expr,
+    left_plan: &LogicalPlan,
+    right_plan: &LogicalPlan,
+) -> bool {
+    let Ok(left_type) = left.get_type(left_plan.schema()) else {
+        return false;
+    };
+    let Ok(right_type) = right.get_type(right_plan.schema()) else {
+        return false;
+    };
+
+    left_type == right_type
 }
 
 /// Walks `plan` through transparent operators
@@ -316,6 +335,20 @@ fn subtree_has_propagated_filter(plan: &LogicalPlan) -> bool {
     found
 }
 
+fn subtree_has_propagated_filter_on_key(plan: &LogicalPlan, key_col: &Column) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::Filter(f) = node
+            && expr_has_propagated_filter_on_key(&f.predicate, key_col)
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
 /// Returns `true` if `expr` contains an [`InSubquery`] whose inner plan
 /// starts with a [`SubqueryAlias`] named with
 /// [`PROPAGATED_FILTER_ALIAS_PREFIX`].
@@ -335,6 +368,26 @@ pub fn expr_has_propagated_filter(expr: &Expr) -> bool {
     found
 }
 
+fn expr_has_propagated_filter_on_key(expr: &Expr, key_col: &Column) -> bool {
+    let mut found = false;
+    let _ = expr.apply(|e| {
+        if let Expr::InSubquery(InSubquery { expr, subquery, .. }) = e
+            && expr_targets_column(expr, key_col)
+            && let LogicalPlan::SubqueryAlias(alias) = subquery.subquery.as_ref()
+            && alias.alias.table().starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+fn expr_targets_column(expr: &Expr, key_col: &Column) -> bool {
+    matches!(expr, Expr::Column(column) if column.name == key_col.name)
+}
+
 /// Build a `SubqueryAlias(__cayenne_xclos__N, Projection([key_col], subtree))`
 /// suitable for use as the inner plan of a [`Subquery`] referenced by an
 /// [`InSubquery`] expression.
@@ -349,9 +402,7 @@ fn build_key_projection_subquery(
     alias_gen: &Arc<datafusion::common::alias::AliasGenerator>,
 ) -> Result<LogicalPlan> {
     let key_expr = Expr::Column(key_col.clone());
-    let projection = LogicalPlanBuilder::from(Arc::unwrap_or_clone(subtree))
-        .project(vec![key_expr])?
-        .build()?;
+    let projection = LogicalPlan::Projection(Projection::try_new(vec![key_expr], subtree)?);
     let alias_name = alias_gen.next(PROPAGATED_FILTER_ALIAS_PREFIX);
     let aliased = SubqueryAlias::try_new(Arc::new(projection), TableReference::bare(alias_name))?;
     Ok(LogicalPlan::SubqueryAlias(aliased))
@@ -435,6 +486,25 @@ mod tests {
             Ok(TreeNodeRecursion::Continue)
         });
         result
+    }
+
+    fn count_propagated_filter_exprs(plan: &LogicalPlan) -> usize {
+        let mut count = 0;
+        let _ = plan.apply(|node| {
+            if let LogicalPlan::Filter(f) = node {
+                let _ = f.predicate.apply(|expr| {
+                    if let Expr::InSubquery(InSubquery { subquery, .. }) = expr
+                        && let LogicalPlan::SubqueryAlias(alias) = subquery.subquery.as_ref()
+                        && alias.alias.table().starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
+                    {
+                        count += 1;
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                });
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        count
     }
 
     #[test]
@@ -587,6 +657,64 @@ mod tests {
         assert!(
             !changed,
             "rule must not fire when filter references only the join key; plan was:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_join_receives_one_filter_per_non_key_constrained_key() -> Result<()> {
+        use datafusion::common::NullEquality;
+        use datafusion::logical_expr::JoinConstraint;
+        use datafusion_expr::{builder::table_scan, lit};
+
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Utf8, true),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Int64, false),
+        ]));
+
+        let left_scan = table_scan(Some("l"), &left_schema, None)?.build()?;
+        let left = LogicalPlan::Filter(Filter::try_new(
+            Expr::Column(Column::new(Some("l"), "c")).eq(lit("v")),
+            Arc::new(left_scan),
+        )?);
+        let right = table_scan(Some("r"), &right_schema, None)?.build()?;
+
+        let join = LogicalPlan::Join(Join::try_new(
+            Arc::new(left),
+            Arc::new(right),
+            vec![
+                (
+                    Expr::Column(Column::new(Some("l"), "a")),
+                    Expr::Column(Column::new(Some("r"), "x")),
+                ),
+                (
+                    Expr::Column(Column::new(Some("l"), "b")),
+                    Expr::Column(Column::new(Some("r"), "y")),
+                ),
+            ],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, join, &cfg)?;
+
+        assert!(
+            changed,
+            "rule should fire on composite inner join with side-local non-key filter"
+        );
+        assert_eq!(
+            count_propagated_filter_exprs(&transformed_plan),
+            2,
+            "each matching composite key should get one propagated filter; plan was:\n{transformed_plan}"
         );
         Ok(())
     }

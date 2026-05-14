@@ -24,52 +24,40 @@ limitations under the License.
 //! over `order_line`) exhaust the `HashJoinInput[N]` reservations because each
 //! build-side hash table independently materializes its full keyspace.
 //!
-//! The existing `CayenneJoinRewriter` only helps the **probe** side: it swaps
-//! the default in-list accumulator for [`ExactLeftAccumulator`], which produces
-//! a precise dynamic filter (or falls back to `RangeBounds` + `BloomFilter`)
-//! that DataFusion's filter-pushdown phase plants into the right-side
-//! `CayenneAccelerationExec`'s `FileSource`. It does nothing to shrink build
-//! sides, so q21 is currently excluded from
-//! `test_framework::queries::get_chbench_test_queries`.
+//! The q21 fix is layered so each optimizer rule handles the part DataFusion
+//! cannot currently spill or infer on its own:
 //!
-//! Three follow-on workstreams are tracked for the `lukim/q21` branch:
+//! 1. **Logical predicate propagation.**
+//!    [`crate::logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys`]
+//!    introduces explicit `InSubquery` filters for equi-join keys when the
+//!    selective predicate is on a non-key column. DataFusion's stock
+//!    `infer_join_predicates` only fires when the predicate already references
+//!    a join key (`WHERE n_nationkey = 5` → `WHERE s_nationkey = 5`). For q21
+//!    the filter is `n_name = 'CHINA'`, so the Cayenne rule exposes the
+//!    `nation → supplier → stock/order_line` cardinality bound before
+//!    `push_down_filter` plants it into scans.
 //!
-//! 1. **Cross-scan dynamic filter sharing** (highest leverage for q21). When a
-//!    join's `Arc<DynamicFilterPhysicalExpr>` is pushed into one
-//!    `CayenneAccelerationExec`, install the *same* `Arc` (which shares its
-//!    `Arc<RwLock<Inner>>` state via `DynamicFilterPhysicalExpr` design) on
-//!    every sibling `CayenneAccelerationExec` backed by the same underlying
-//!    table. This requires:
-//!      - A stable table-identity accessor on `CayenneAccelerationExec` (walk
-//!        the inner plan to the `DataSourceExec`'s `FileSource` and hash its
-//!        object-store paths + table reference).
-//!      - A post-pushdown physical optimizer pass that walks the plan, groups
-//!        same-source Cayenne scans, and ANDs the union of in-flight dynamic
-//!        filters into each sibling's predicate.
-//!      - Column remapping when projection ordering differs between siblings.
+//! 2. **Cross-scan dynamic filter sharing.** When a join's
+//!    `Arc<DynamicFilterPhysicalExpr>` is pushed into one
+//!    `CayenneAccelerationExec`, [`CayenneDynamicFilterSharing`] installs the
+//!    same `Arc` on sibling `CayenneAccelerationExec`s backed by the same
+//!    underlying table and equi-joined column set. The shared `Arc` carries the
+//!    same `Arc<RwLock<Inner>>` state, so all sibling scans observe the exact
+//!    filter values as soon as the producing join accumulates them.
 //!
-//! 2. **Bidirectional build-side accumulator pushdown.** Extend
-//!    `CayenneJoinRewriter` to also rewrite joins whose **build** side is a
-//!    `CayenneAccelerationExec`. The build-vs-probe asymmetry means this needs
-//!    either a precursor pass that materializes the probe's filter set first
-//!    (semantically reversing the dataflow for anti-joins) or a planner hint
-//!    that swaps build/probe when the build side is the dominant cardinality.
+//! 3. **Same-source anti-join sort-merge rewrite.** DataFusion does not create
+//!    dynamic filters for anti joins, and q21's `NOT EXISTS` self-join can leave
+//!    large `HashJoinInput[N]` reservations behind. [`CayenneAntiJoinSortMergeRewriter`]
+//!    rewrites same-source Cayenne `LeftAnti` / `RightAnti` `HashJoinExec`
+//!    nodes to `SortMergeJoinExec` with explicit spillable `SortExec` inputs,
+//!    preserving anti-join semantics without materializing a full non-spillable
+//!    build hash table.
 //!
-//! 3. **Predicate transitive closure across equi-join keys.** Logical optimizer
-//!    rule that propagates `IN (...)` and range predicates through equi-join
-//!    chains so that a selective filter on one table reaches every transitively
-//!    equi-joined column at plan time, not just at runtime.
-//!
-//!    Scaffolded in [`crate::logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys`].
-//!    DataFusion's stock `infer_join_predicates` only fires when the predicate
-//!    *already* references a join-key column (`WHERE n_nationkey = 5` →
-//!    `WHERE s_nationkey = 5`). For chbench q21 the selective filter is on a
-//!    non-key column (`n_name = 'CHINA'`), so no inference happens and the
-//!    nation→supplier→stock→order_line cardinality bound never reaches the
-//!    fact-table scans. The new rule introduces explicit `InSubquery` filters
-//!    that re-project the filtered side through the join key, letting
-//!    DataFusion's existing `DecorrelatePredicateSubquery` and partition
-//!    pruning paths see the bound at plan time.
+//! [`CayenneJoinRewriter`] still handles the ordinary inner-join probe side by
+//! swapping the default in-list accumulator for [`ExactLeftAccumulator`], which
+//! produces a precise dynamic filter (or falls back to `RangeBounds` +
+//! `BloomFilter`) that DataFusion's filter-pushdown phase plants into the
+//! right-side `CayenneAccelerationExec`'s `FileSource`.
 //!
 //! ## Audit notes (verified 2026-05-14 against the q21 explain snapshot at
 //! `crates/test-framework/src/snapshot/snapshots/explain/test_framework__snapshot__file[parquet]-cayenne[file]-indexes_tpch_q21_explain.snap`)
@@ -98,9 +86,8 @@ limitations under the License.
 //!   `[l_orderkey, l_suppkey]`, etc. No additional `ProjectionExec` insertion
 //!   above the build side is required.
 //!
-//! Until at least #1 or #3 lands, q21 remains disabled in the chbench query
-//! set. See the comment in `crates/test-framework/src/queries/mod.rs` next to
-//! `get_chbench_test_queries`.
+//! With these layers active, q21 is included in
+//! `test_framework::queries::get_chbench_test_queries`.
 
 use arrow::compute::SortOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
