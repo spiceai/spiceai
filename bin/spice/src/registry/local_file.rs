@@ -18,7 +18,7 @@ limitations under the License.
 
 use super::{Error, IoSnafu, Result};
 use snafu::ResultExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const GENERIC_MANIFEST: &str = "spicepod.yaml";
@@ -70,16 +70,18 @@ impl LocalFileRegistry {
         })?;
 
         // Get pod name from directory name
-        let pod_name = source_path
+        let source_pod_name = source_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
+        let pod_name = source_pod_name.to_lowercase();
 
-        let source_manifest =
-            find_manifest(&source_path, &pod_name).ok_or_else(|| Error::InvalidSpicepod {
+        let source_manifest = find_manifest(&source_path, &source_pod_name).ok_or_else(|| {
+            Error::InvalidSpicepod {
                 path: source_path.display().to_string(),
-            })?;
+            }
+        })?;
 
         let destination_dir = pods_dir.join(&pod_name);
 
@@ -120,6 +122,7 @@ impl LocalFileRegistry {
                 path: source_manifest.display().to_string(),
             })?;
         }
+        remove_non_canonical_manifests(&destination_dir, &source_pod_name)?;
 
         Ok(destination_dir)
     }
@@ -127,6 +130,8 @@ impl LocalFileRegistry {
 
 fn find_manifest(source_path: &Path, pod_name: &str) -> Option<PathBuf> {
     let lowercase_pod_name = pod_name.to_lowercase();
+    // Preserve the previous local-pod contract: a pod-named manifest wins over a generic
+    // spicepod.yaml/spicepod.yml when both are present in the source directory.
     let mut candidate_names = vec![format!("{pod_name}.yaml"), format!("{pod_name}.yml")];
 
     if lowercase_pod_name != pod_name {
@@ -134,13 +139,52 @@ fn find_manifest(source_path: &Path, pod_name: &str) -> Option<PathBuf> {
         candidate_names.push(format!("{lowercase_pod_name}.yml"));
     }
 
-    candidate_names.push(GENERIC_MANIFEST.to_string());
-    candidate_names.push("spicepod.yml".to_string());
+    push_unique_candidate(&mut candidate_names, GENERIC_MANIFEST.to_string());
+    push_unique_candidate(&mut candidate_names, "spicepod.yml".to_string());
 
     candidate_names
         .into_iter()
         .map(|candidate_name| source_path.join(candidate_name))
         .find(|candidate_path| candidate_path.exists())
+}
+
+fn push_unique_candidate(candidate_names: &mut Vec<String>, candidate_name: String) {
+    if !candidate_names.contains(&candidate_name) {
+        candidate_names.push(candidate_name);
+    }
+}
+
+fn manifest_aliases(pod_name: &str) -> Vec<String> {
+    let lowercase_pod_name = pod_name.to_lowercase();
+    let mut aliases = Vec::new();
+    for candidate in [
+        format!("{pod_name}.yaml"),
+        format!("{pod_name}.yml"),
+        format!("{lowercase_pod_name}.yaml"),
+        format!("{lowercase_pod_name}.yml"),
+        GENERIC_MANIFEST.to_string(),
+        "spicepod.yml".to_string(),
+    ] {
+        push_unique_candidate(&mut aliases, candidate);
+    }
+    aliases
+}
+
+fn remove_non_canonical_manifests(destination_dir: &Path, pod_name: &str) -> Result<()> {
+    let aliases: HashSet<String> = manifest_aliases(pod_name).into_iter().collect();
+    for alias in aliases {
+        if alias == GENERIC_MANIFEST {
+            continue;
+        }
+        let alias_path = destination_dir.join(&alias);
+        if alias_path.exists() {
+            std::fs::remove_file(&alias_path).context(IoSnafu {
+                operation: "remove file",
+                path: alias_path.display().to_string(),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Recursively copy a directory and its contents.
@@ -216,12 +260,12 @@ mod tests {
 
         assert_eq!(installed_path, pods_dir.join("localpod"));
         assert!(
-            pods_dir.join("localpod").join("spicepod.yml").exists(),
-            "original yml manifest should be copied"
-        );
-        assert!(
             pods_dir.join("localpod").join("spicepod.yaml").exists(),
             "generic yaml manifest should be created for dependency loading"
+        );
+        assert!(
+            !pods_dir.join("localpod").join("spicepod.yml").exists(),
+            "original yml manifest should be normalized away"
         );
     }
 
@@ -287,6 +331,73 @@ mod tests {
             installed_manifest.contains("name: named"),
             "pod-named manifest should be used over generic manifest"
         );
+    }
+
+    #[tokio::test]
+    async fn local_pod_install_lowercases_destination_dir() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let source_dir = temp_dir.path().join("LocalPod");
+        let pods_dir = temp_dir.path().join("spicepods");
+        std::fs::create_dir_all(&source_dir).expect("source directory should be created");
+        std::fs::write(
+            source_dir.join("LocalPod.yaml"),
+            "version: v2\nkind: Spicepod\nname: localpod\n",
+        )
+        .expect("pod-named manifest should be written");
+
+        let installed_path = LocalFileRegistry
+            .get_pod(
+                source_dir.to_str().expect("source path should be utf-8"),
+                &pods_dir,
+                &HashMap::new(),
+                &reqwest::Client::new(),
+            )
+            .await
+            .expect("local pod should be installed");
+
+        assert_eq!(installed_path, pods_dir.join("localpod"));
+        assert!(pods_dir.join("localpod").join("spicepod.yaml").exists());
+        assert!(!pods_dir.join("LocalPod").exists());
+    }
+
+    #[tokio::test]
+    async fn install_keeps_only_canonical_manifest_when_source_has_multiple_aliases() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let source_dir = temp_dir.path().join("localpod");
+        let pods_dir = temp_dir.path().join("spicepods");
+        std::fs::create_dir_all(&source_dir).expect("source directory should be created");
+        std::fs::write(
+            source_dir.join("localpod.yaml"),
+            "version: v2\nkind: Spicepod\nname: pod_named\n",
+        )
+        .expect("pod-named manifest should be written");
+        std::fs::write(
+            source_dir.join("spicepod.yaml"),
+            "version: v2\nkind: Spicepod\nname: generic_yaml\n",
+        )
+        .expect("generic yaml manifest should be written");
+        std::fs::write(
+            source_dir.join("spicepod.yml"),
+            "version: v2\nkind: Spicepod\nname: generic_yml\n",
+        )
+        .expect("generic yml manifest should be written");
+
+        LocalFileRegistry
+            .get_pod(
+                source_dir.to_str().expect("source path should be utf-8"),
+                &pods_dir,
+                &HashMap::new(),
+                &reqwest::Client::new(),
+            )
+            .await
+            .expect("local pod should be installed");
+
+        let installed_dir = pods_dir.join("localpod");
+        let installed_manifest = std::fs::read_to_string(installed_dir.join("spicepod.yaml"))
+            .expect("installed manifest should be readable");
+        assert!(installed_manifest.contains("name: pod_named"));
+        assert!(!installed_dir.join("spicepod.yml").exists());
+        assert!(!installed_dir.join("localpod.yaml").exists());
     }
 
     #[tokio::test]

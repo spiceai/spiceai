@@ -33,12 +33,9 @@ const SCHEMA_DIRECTIVE: &str = "# yaml-language-server: $schema=https://raw.gith
 
 #[derive(Deserialize)]
 struct SpicepodManifestHeader {
-    #[serde(rename = "name")]
-    _name: String,
-    #[serde(rename = "version")]
-    _version: SpicepodVersion,
-    #[serde(rename = "kind")]
-    _kind: SpicepodKind,
+    name: String,
+    version: SpicepodVersion,
+    kind: SpicepodKind,
 }
 
 /// Returns the first existing root Spicepod manifest path, preferring `spicepod.yaml` over `spicepod.yml`.
@@ -101,16 +98,32 @@ pub fn load_or_create_spicepod_value(
 pub fn write_spicepod_value(path: &Path, value: &Value) -> Result<()> {
     validate_spicepod_value(value, path)?;
 
-    let updated_yaml =
+    let mut updated_yaml =
         yaml::to_string(value).map_err(|source| crate::error::Error::ConfigParse {
             message: format!("Failed to serialize {}: {source}", path.display()),
         })?;
+
+    if should_write_schema_directive(path)? && !updated_yaml.starts_with(SCHEMA_DIRECTIVE) {
+        updated_yaml = format!("{SCHEMA_DIRECTIVE}\n{updated_yaml}");
+    }
 
     ensure_parent_dir(path)?;
     std::fs::write(path, updated_yaml.as_bytes()).context(ConfigIoSnafu {
         operation: "write",
         path: path.to_path_buf(),
     })
+}
+
+fn should_write_schema_directive(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(true);
+    }
+
+    let content = std::fs::read_to_string(path).context(ConfigIoSnafu {
+        operation: "read",
+        path: path.to_path_buf(),
+    })?;
+    Ok(content.lines().next() == Some(SCHEMA_DIRECTIVE))
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -216,7 +229,11 @@ fn ensure_sequence_field<'value>(
 
 /// Validates the root manifest header without rejecting newer fields this CLI does not edit.
 fn validate_spicepod_value(value: &Value, path: &Path) -> Result<()> {
-    yaml::from_value::<SpicepodManifestHeader>(value.clone()).map_err(|source| {
+    let SpicepodManifestHeader {
+        name: _,
+        version: _,
+        kind: _,
+    } = yaml::from_value::<SpicepodManifestHeader>(value.clone()).map_err(|source| {
         crate::error::Error::ConfigParse {
             message: format!("Failed to parse {}: {source}", path.display()),
         }
@@ -267,6 +284,24 @@ future_primitive:
         assert_eq!(
             existing_spicepod_path(temp_dir.path()).expect("manifest should exist"),
             temp_dir.path().join(SPICEPOD_YAML)
+        );
+    }
+
+    #[test]
+    fn write_spicepod_value_preserves_schema_directive() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = temp_dir.path().join(SPICEPOD_YAML);
+        std::fs::write(&path, create_spicepod_yaml("test")).expect("spicepod should be written");
+        let mut value = read_spicepod_value(&path).expect("spicepod should parse");
+        ensure_string_sequence_item(&mut value, "dependencies", "spicepods/localpod")
+            .expect("dependency should be added");
+
+        write_spicepod_value(&path, &value).expect("spicepod should be written");
+
+        let content = std::fs::read_to_string(path).expect("spicepod should be readable");
+        assert!(
+            content.starts_with(SCHEMA_DIRECTIVE),
+            "schema directive should remain at the top of the manifest"
         );
     }
 

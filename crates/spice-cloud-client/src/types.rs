@@ -161,7 +161,8 @@ pub struct AppResources {
 pub struct AppResourceLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
-    pub memory: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
     #[serde(rename = "ephemeral-storage", skip_serializing_if = "Option::is_none")]
     pub ephemeral_storage: Option<String>,
 }
@@ -203,7 +204,7 @@ pub struct UpdateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub update_channel: Option<UpdateChannel>,
+    pub update_channel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,7 +261,7 @@ pub struct CreateDeploymentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub channel: Option<UpdateChannel>,
+    pub channel: Option<String>,
     pub debug: bool,
 }
 

@@ -107,7 +107,7 @@ pub async fn execute_add_or_connect(
         println!("\x1b[32m{} initialized!\x1b[0m", spicepod_path.display());
     }
 
-    let dependency_path = get_relative_path(ctx.pods_dir(), &download_path);
+    let dependency_path = get_relative_path(ctx.app_dir(), &download_path);
     if manifest::ensure_string_sequence_item(&mut spicepod, "dependencies", &dependency_path)? {
         manifest::write_spicepod_value(&spicepod_path, &spicepod)?;
     }

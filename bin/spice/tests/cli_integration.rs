@@ -700,7 +700,7 @@ mod add {
             "dependencies should be added"
         );
         assert!(
-            updated_manifest.contains("- localpod"),
+            updated_manifest.contains("- spicepods/localpod"),
             "dependency should reference the installed path"
         );
         assert!(

@@ -175,13 +175,13 @@ impl CloudClient {
         executor_cpu: Option<i32>,
         executor_memory: Option<NumBytes>,
     ) -> Result<App> {
-        let resources = build_resources(cpu, memory);
+        let resources = build_resources(cpu, memory)?;
         let executor = build_executor(
             executor_replicas,
             executor_cpu,
             executor_memory,
             storage_size_gb,
-        );
+        )?;
 
         let (tags, replicas) = match kind {
             AppKind::Cluster => {
@@ -224,15 +224,16 @@ impl CloudClient {
         channel: Option<UpdateChannel>,
     ) -> Result<App> {
         let app = self.get_app(org_app).await?;
-        let resources = build_resources(cpu, memory);
-        let executor = build_executor(executor_replicas, executor_cpu, executor_memory, None);
+        let resources = build_resources(cpu, memory)?;
+        // The update endpoint accepts storage size at the app level; create app nests it under executor.
+        let executor = build_executor(executor_replicas, executor_cpu, executor_memory, None)?;
 
         let request = UpdateAppRequest {
             description: description.map(String::from),
             visibility: visibility.map(String::from),
             replicas,
             image_tag: image_tag.map(String::from),
-            update_channel: channel,
+            update_channel: channel.map(|channel| channel.to_string()),
             region: region.map(String::from),
             resources,
             executor,
@@ -464,18 +465,18 @@ use super::bytes::NumBytes;
 /// Build an [`AppResources`] from optional CPU (vCPUs) and a parsed [`NumBytes`] memory value.
 ///
 /// Returns `None` if neither is provided.
-fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Option<AppResources> {
+fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Result<Option<AppResources>> {
     if cpu.is_none() && memory.is_none() {
-        return None;
+        return Ok(None);
     }
-    Some(AppResources {
+    Ok(Some(AppResources {
         limits: AppResourceLimits {
             cpu: cpu.map(|v| v.to_string()),
-            memory: memory.map_or_else(|| "8Gi".to_string(), NumBytes::to_gi_string),
+            memory: memory.map(NumBytes::to_resource_string).transpose()?,
             ephemeral_storage: None,
         },
         requests: None,
-    })
+    }))
 }
 
 /// Build an [`AppExecutor`] from optional executor params.
@@ -486,15 +487,15 @@ fn build_executor(
     cpu: Option<i32>,
     memory: Option<NumBytes>,
     storage_size_gb: Option<f64>,
-) -> Option<AppExecutor> {
+) -> Result<Option<AppExecutor>> {
     if replicas.is_none() && cpu.is_none() && memory.is_none() && storage_size_gb.is_none() {
-        return None;
+        return Ok(None);
     }
-    Some(AppExecutor {
+    Ok(Some(AppExecutor {
         replicas,
-        resources: build_resources(cpu, memory),
+        resources: build_resources(cpu, memory)?,
         storage_size_gb,
-    })
+    }))
 }
 
 /// Convert a [`spice_cloud_client::error::Error`] into the CLI error type.
@@ -520,5 +521,42 @@ fn into_cli(e: spice_cloud_client::error::Error) -> crate::error::Error {
         CloudError::JsonParse { source } => crate::error::Error::InvalidResponse {
             message: format!("Failed to parse response: {source}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_resources_does_not_default_memory() {
+        let resources = build_resources(Some(4), None)
+            .expect("resources should build")
+            .expect("cpu should create resources");
+
+        assert_eq!(resources.limits.cpu.as_deref(), Some("4"));
+        assert_eq!(resources.limits.memory, None);
+    }
+
+    #[test]
+    fn build_resources_preserves_memory_unit() {
+        let memory = NumBytes::parse("3500Mi").expect("memory should parse");
+
+        let resources = build_resources(None, Some(memory))
+            .expect("resources should build")
+            .expect("memory should create resources");
+
+        assert_eq!(resources.limits.memory.as_deref(), Some("3500Mi"));
+    }
+
+    #[test]
+    fn build_executor_does_not_default_executor_memory() {
+        let executor = build_executor(None, Some(2), None, None)
+            .expect("executor should build")
+            .expect("executor cpu should create executor");
+
+        let resources = executor.resources.expect("executor resources should exist");
+        assert_eq!(resources.limits.cpu.as_deref(), Some("2"));
+        assert_eq!(resources.limits.memory, None);
     }
 }

@@ -29,6 +29,13 @@ use spice::{Result, RuntimeContext};
 use std::ffi::{OsStr, OsString};
 use tracing_subscriber::EnvFilter;
 
+const GLOBAL_VALUE_FLAGS: &[&str] = &[
+    "--api-key",
+    "--cloud",
+    "--http-endpoint",
+    "--tls-root-certificate-file",
+];
+
 /// Spice.ai CLI - Interact with the Spice.ai runtime, edit Spicepod manifests, and manage Spice Cloud.
 #[derive(Parser)]
 #[command(
@@ -298,10 +305,7 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
         }
 
         let arg_text = arg.to_string_lossy();
-        let consumes_value = matches!(
-            arg_text.as_ref(),
-            "--api-key" | "--cloud" | "--http-endpoint" | "--tls-root-certificate-file"
-        );
+        let consumes_value = GLOBAL_VALUE_FLAGS.contains(&arg_text.as_ref());
         let is_subcommand = !arg_text.starts_with('-');
         normalized.push(arg);
 
@@ -328,14 +332,13 @@ fn raw_args_enable_machine_mode() -> bool {
         match arg.as_str() {
             "--machine" | "--programmatic" => return true,
             "--" => return false,
-            "--api-key" | "--cloud" | "--http-endpoint" | "--tls-root-certificate-file" => {
+            value if GLOBAL_VALUE_FLAGS.contains(&value) => {
                 let _ = args.next();
             }
             value
-                if value.starts_with("--api-key=")
-                    || value.starts_with("--cloud=")
-                    || value.starts_with("--http-endpoint=")
-                    || value.starts_with("--tls-root-certificate-file=") => {}
+                if GLOBAL_VALUE_FLAGS
+                    .iter()
+                    .any(|flag| value.starts_with(&format!("{flag}="))) => {}
             value if value.starts_with("--") => {}
             value if value.starts_with('-') => {}
             _ => return false,
@@ -346,6 +349,7 @@ fn raw_args_enable_machine_mode() -> bool {
 }
 
 fn apply_machine_mode(command: &mut Commands) {
+    // Keep this match explicit so adding a top-level command forces a machine-mode audit.
     match command {
         Commands::Version(args) => args.output = OutputFormat::Json,
         Commands::Status(args) => args.output = OutputFormat::Json,

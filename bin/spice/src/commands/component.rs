@@ -135,7 +135,8 @@ BODY FLAGS
                             prefix the value with `yaml:` to parse it as a typed YAML value.
   --env KEY=VALUE           Add an `env:` entry (same string-vs-yaml rules as --param)
   --depends-on NAME         Append to `dependsOn:`
-  --set PATH=VALUE          Set any schema field by dotted path; VALUE is parsed as YAML
+    --set PATH=VALUE          Set any schema field by dotted path. Stored as a YAML string by default;
+                                                        prefix the value with `yaml:` to parse it as a typed YAML value.
   --enable | --disable      Set `enabled: true` / `enabled: false`
   --file <PATH> | --stdin   Read the inline body from a YAML/JSON file or stdin
   --manifest <PATH>         Edit a non-default Spicepod file
@@ -146,7 +147,7 @@ EXAMPLES
       --param openai_api_key='${ secrets:OPENAI_API_KEY }'
 
   # Update a model's allowed datasets
-  spice model configure llm --set datasets='[documents, orders]'
+    spice model configure llm --set datasets='yaml:[documents, orders]'
 
   # Add a Databricks Unity catalog
   spice catalog add tpch --from databricks \
@@ -172,7 +173,7 @@ USAGE
   spice <section> configure [body flags]
 
 BODY FLAGS
-  --set PATH=VALUE          Set any schema field by dotted path; VALUE is parsed as YAML
+    --set PATH=VALUE          Set any schema field by dotted path (string by default; prefix `yaml:` for typed)
   --param KEY=VALUE         Add a `params:` entry (string by default; prefix `yaml:` for typed)
   --enable | --disable      Set `enabled: true` / `enabled: false`
   --api-key <KEY>           Convenience for `management.api_key`
@@ -188,7 +189,7 @@ EXAMPLES
   spice snapshots configure --location s3://my-bucket/snapshots
 
   # Tweak runtime parameters
-  spice runtime configure --set telemetry.enabled=true
+    spice runtime configure --set telemetry.enabled=yaml:true
 
 Docs: https://spiceai.org/docs";
 
@@ -200,7 +201,7 @@ USAGE
   spice extension configure <name> [body flags]   # add or update an extension in place
 
 BODY FLAGS
-  --set PATH=VALUE          Set any schema field by dotted path; VALUE is parsed as YAML
+    --set PATH=VALUE          Set any schema field by dotted path (string by default; prefix `yaml:` for typed)
   --param KEY=VALUE         Add to the extension's `params:` map
   --enable | --disable      Set `enabled: true` / `enabled: false`
   --file <PATH> | --stdin   Replace the extension body from a YAML/JSON file or stdin
@@ -320,7 +321,7 @@ pub struct CommonComponentOptions {
     #[arg(long = "body-ref", value_name = "PATH")]
     pub body_ref: Option<String>,
 
-    /// Set a schema field using a dotted path and YAML value
+    /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml:.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
 
@@ -414,7 +415,7 @@ pub struct SingletonConfigureArgs {
     #[arg(long)]
     pub stdin: bool,
 
-    /// Set a schema field using a dotted path and YAML value
+    /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml:.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
 
@@ -488,7 +489,7 @@ pub struct ExtensionEditArgs {
     #[arg(long)]
     pub stdin: bool,
 
-    /// Set a schema field using a dotted path and YAML value
+    /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml:.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
 
@@ -971,7 +972,7 @@ fn mutate_metadata(args: &MetadataEditArgs, mode: MutationMode) -> Result<()> {
     let before = spicepod.clone();
     let metadata = ensure_mapping_field(&mut spicepod, "metadata")?;
 
-    for pair in args.entries.iter().chain(args.set.iter()) {
+    for pair in &args.entries {
         let (key, metadata_value) = parse_string_or_yaml_prefixed_pair(pair)?;
         let metadata_key = Value::String(key.clone());
         if mode == MutationMode::Add {
@@ -985,6 +986,10 @@ fn mutate_metadata(args: &MetadataEditArgs, mode: MutationMode) -> Result<()> {
             );
         }
         metadata.insert(metadata_key, metadata_value);
+    }
+    for pair in &args.set {
+        let (key, metadata_value) = parse_string_or_yaml_prefixed_pair(pair)?;
+        metadata.insert(Value::String(key), metadata_value);
     }
 
     write_if_changed(&manifest_path, &spicepod, &before, created)
@@ -1000,11 +1005,13 @@ fn load_manifest(manifest_path: Option<&Path>) -> Result<(PathBuf, Value, bool)>
             ));
         }
 
-        let value: Value = yaml::from_str(&manifest::create_spicepod_yaml(&default_app_name(path)))
-            .map_err(|source| crate::error::Error::ConfigParse {
-                message: format!("Failed to create default Spicepod manifest: {source}"),
-            })?;
-        return Ok((path.to_path_buf(), value, true));
+        return InvalidArgumentSnafu {
+            message: format!(
+                "Manifest path '{}' does not exist. Create the file first or omit --manifest to edit the current app manifest.",
+                path.display()
+            ),
+        }
+        .fail();
     }
 
     let current_dir = std::env::current_dir().context(ConfigIoSnafu {
@@ -1016,22 +1023,6 @@ fn load_manifest(manifest_path: Option<&Path>) -> Result<(PathBuf, Value, bool)>
         .and_then(|name| name.to_str())
         .unwrap_or("app");
     manifest::load_or_create_spicepod_value(Path::new("."), name)
-}
-
-fn default_app_name(manifest_path: &Path) -> String {
-    manifest_path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .map(ToString::to_string)
-        .or_else(|| {
-            std::env::current_dir().ok().and_then(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .map(ToString::to_string)
-            })
-        })
-        .unwrap_or_else(|| "app".to_string())
 }
 
 fn write_if_changed(path: &Path, value: &Value, before: &Value, created: bool) -> Result<()> {
@@ -1090,25 +1081,32 @@ fn parse_document_value(content: &str) -> Result<Value> {
 
 fn parse_key_value(pair: &str) -> Result<(String, Value)> {
     let (key, raw_value) = split_pair(pair)?;
-    let value = if raw_value.is_empty() {
-        Value::String(String::new())
-    } else {
-        yaml::from_str(raw_value).unwrap_or_else(|_| Value::String(raw_value.to_string()))
-    };
-    Ok((key.to_string(), value))
+    Ok((
+        key.to_string(),
+        parse_string_or_yaml_prefixed_value(key, raw_value)?,
+    ))
 }
 
 fn parse_string_or_yaml_prefixed_pair(pair: &str) -> Result<(String, Value)> {
     let (key, raw_value) = split_pair(pair)?;
+    Ok((
+        key.to_string(),
+        parse_string_or_yaml_prefixed_value(key, raw_value)?,
+    ))
+}
+
+fn parse_string_or_yaml_prefixed_value(key: &str, raw_value: &str) -> Result<Value> {
     if let Some(yaml_value) = raw_value.strip_prefix("yaml:") {
-        let value =
-            yaml::from_str(yaml_value).map_err(|source| crate::error::Error::ConfigParse {
-                message: format!("Failed to parse YAML value for '{key}': {source}"),
-            })?;
-        return Ok((key.to_string(), value));
+        return yaml::from_str(yaml_value).map_err(|source| crate::error::Error::ConfigParse {
+            message: format!("Failed to parse YAML value for '{key}': {source}"),
+        });
     }
 
-    Ok((key.to_string(), Value::String(raw_value.to_string())))
+    if let Some(string_value) = raw_value.strip_prefix("string:") {
+        return Ok(Value::String(string_value.to_string()));
+    }
+
+    Ok(Value::String(raw_value.to_string()))
 }
 
 fn parse_string_pair(pair: &str) -> Result<(String, String)> {
@@ -1262,7 +1260,13 @@ fn set_path_segments(value: &mut Value, segments: &[&str], new_value: Value) -> 
             message: format!("Failed to create field path '{}'.", segments.join(".")),
         })?;
     if !child.is_mapping() {
-        *child = Value::Mapping(Mapping::new());
+        return Err(crate::error::Error::ConfigParse {
+            message: format!(
+                "Cannot set '{}' because '{}' is not a mapping",
+                segments.join("."),
+                segment
+            ),
+        });
     }
 
     set_path_segments(child, remaining, new_value)
@@ -1375,7 +1379,7 @@ mod tests {
         let args = ComponentConfigureArgs {
             name: Some("llm".to_string()),
             options: CommonComponentOptions {
-                set: vec!["params.top_p=0.9".to_string()],
+                set: vec!["params.top_p=yaml:0.9".to_string()],
                 ..CommonComponentOptions::default()
             },
         };
@@ -1444,5 +1448,66 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn set_values_default_to_strings() {
+        let (_, value) = parse_key_value("version=1.10").expect("pair should parse");
+
+        assert_eq!(value, Value::String("1.10".to_string()));
+    }
+
+    #[test]
+    fn set_values_accept_explicit_yaml_prefix() {
+        let (_, value) = parse_key_value("enabled=yaml:true").expect("pair should parse");
+
+        assert_eq!(value, Value::Bool(true));
+    }
+
+    #[test]
+    fn set_path_rejects_non_mapping_intermediate() {
+        let mut value: Value = yaml::from_str("params: scalar\n").expect("value should parse");
+
+        let error = set_path(&mut value, "params.foo", Value::String("bar".to_string()))
+            .expect_err("non-mapping intermediate should fail");
+
+        assert!(error.to_string().contains("params.foo"));
+        assert_eq!(value.get("params").and_then(Value::as_str), Some("scalar"));
+    }
+
+    #[test]
+    fn explicit_missing_manifest_path_fails() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = temp_dir.path().join("missing").join("spicepod.yaml");
+
+        let error = load_manifest(Some(&path)).expect_err("missing explicit manifest should fail");
+
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn metadata_set_entries_upsert_in_add_mode() {
+        let args = MetadataEditArgs {
+            entries: vec!["owner=data-team".to_string()],
+            set: vec!["env=prod".to_string()],
+            ..MetadataEditArgs::default()
+        };
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let manifest_path = temp_dir.path().join("spicepod.yaml");
+        std::fs::write(
+            &manifest_path,
+            "version: v2\nkind: Spicepod\nname: test\nmetadata:\n  env: dev\n",
+        )
+        .expect("manifest should be written");
+        let args = MetadataEditArgs {
+            manifest: Some(manifest_path.clone()),
+            ..args
+        };
+
+        mutate_metadata(&args, MutationMode::Add).expect("metadata should be updated");
+
+        let manifest = std::fs::read_to_string(manifest_path).expect("manifest should be readable");
+        assert!(manifest.contains("owner: data-team"));
+        assert!(manifest.contains("env: prod"));
     }
 }
