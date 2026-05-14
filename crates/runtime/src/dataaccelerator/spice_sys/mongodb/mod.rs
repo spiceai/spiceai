@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Durable sidecar storage for MongoDB Change Stream resume tokens.
+//! Durable sidecar storage for `MongoDB` Change Stream resume tokens.
 //!
 //! Mirrors `DynamoDBSys` and `KafkaSys`: one row per dataset in
 //! `spice_sys_mongodb`, holding the most recent resume token (canonical
