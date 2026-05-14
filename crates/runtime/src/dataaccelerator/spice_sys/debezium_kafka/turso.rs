@@ -112,12 +112,27 @@ impl DebeziumKafkaSys {
         offsets: &[KafkaOffset],
     ) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
-        let offsets_json = Self::serialize_offsets(offsets)?;
         let conn = pool.connect().await.map_err(Error::external)?;
         if self.schema_needs_ensure() {
             ensure_debezium_kafka_table(&conn).await?;
             self.mark_schema_ensured();
         }
+
+        let query =
+            format!("SELECT offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?1");
+        let mut rows = conn
+            .query(&query, turso::params![dataset_name.clone()])
+            .await
+            .map_err(Error::external)?;
+        let row = rows.next().await.map_err(Error::external)?.ok_or_else(|| {
+            Error::external(format!(
+                "Debezium Kafka sidecar metadata for dataset {} does not exist",
+                self.dataset_name
+            ))
+        })?;
+        let existing_offsets_json = row.get::<Option<String>>(0).map_err(Error::external)?;
+        let offsets_json =
+            Self::serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
 
         let update = format!(
             "UPDATE {DEBEZIUM_KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"

@@ -123,7 +123,7 @@ impl KafkaSys {
         offsets: &[KafkaOffset],
     ) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
-        let offsets_json = Self::serialize_offsets(offsets)?;
+        let new_offsets = offsets.to_vec();
         let schema_needs_ensure = self.schema_needs_ensure();
 
         let conn_sync = pool.connect_sync();
@@ -138,6 +138,17 @@ impl KafkaSys {
                 if schema_needs_ensure {
                     ensure_kafka_table(conn)?;
                 }
+                let query = format!(
+                    "SELECT offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?1"
+                );
+                let existing_offsets_json: Option<String> =
+                    conn.query_row(&query, [&dataset_name], |row| row.get(0))?;
+                let offsets_json =
+                    KafkaSys::serialize_merged_offsets(existing_offsets_json.as_deref(), &new_offsets)
+                        .map_err(|err| {
+                            tracing::warn!("Failed to merge Kafka offsets from SQLite: {err}");
+                            rusqlite::Error::InvalidQuery
+                        })?;
                 let update = format!(
                     "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"
                 );
@@ -327,7 +338,9 @@ mod tests {
             .expect("to upsert offsets");
 
         let retrieved = kafka_sys.get().await.expect("to retrieve metadata");
-        assert_eq!(retrieved.offsets, offsets);
+        let mut expected_offsets = test_metadata.offsets.clone();
+        expected_offsets.extend(offsets);
+        assert_eq!(retrieved.offsets, expected_offsets);
     }
 
     #[tokio::test]

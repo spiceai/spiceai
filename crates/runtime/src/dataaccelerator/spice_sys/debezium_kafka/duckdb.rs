@@ -125,7 +125,13 @@ impl DebeziumKafkaSys {
             self.mark_schema_ensured();
         }
 
-        let offsets_json = Self::serialize_offsets(offsets)?;
+        let query =
+            format!("SELECT offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?");
+        let existing_offsets_json: Option<String> = duckdb_conn
+            .query_row(&query, [&self.dataset_name], |row| row.get(0))
+            .map_err(Error::external)?;
+        let offsets_json =
+            Self::serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
         let update = format!(
             "UPDATE {DEBEZIUM_KAFKA_TABLE_NAME} SET offsets_json = ?, updated_at = now() WHERE dataset_name = ?"
         );

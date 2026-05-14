@@ -25,7 +25,10 @@ limitations under the License.
 //! );
 
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{
@@ -148,6 +151,42 @@ impl KafkaSys {
             || Ok(Vec::new()),
             |offsets_json| serde_json::from_str(offsets_json).map_err(Error::external),
         )
+    }
+
+    fn serialize_merged_offsets(
+        offsets_json: Option<&str>,
+        offsets: &[KafkaOffset],
+    ) -> Result<String> {
+        let existing_offsets = Self::deserialize_offsets(offsets_json)?;
+        let merged_offsets = Self::merge_offsets(existing_offsets, offsets);
+        Self::serialize_offsets(&merged_offsets)
+    }
+
+    fn merge_offsets(
+        existing_offsets: Vec<KafkaOffset>,
+        offsets: &[KafkaOffset],
+    ) -> Vec<KafkaOffset> {
+        let mut merged_offsets: HashMap<(String, i32), KafkaOffset> = existing_offsets
+            .into_iter()
+            .map(|offset| ((offset.topic.clone(), offset.partition), offset))
+            .collect();
+
+        for offset in offsets {
+            merged_offsets
+                .entry((offset.topic.clone(), offset.partition))
+                .and_modify(|existing_offset| {
+                    existing_offset.offset = existing_offset.offset.max(offset.offset);
+                })
+                .or_insert_with(|| offset.clone());
+        }
+
+        let mut offsets = merged_offsets.into_values().collect::<Vec<_>>();
+        offsets.sort_by(|left, right| {
+            left.topic
+                .cmp(&right.topic)
+                .then(left.partition.cmp(&right.partition))
+        });
+        offsets
     }
 
     fn schema_needs_ensure(&self) -> bool {

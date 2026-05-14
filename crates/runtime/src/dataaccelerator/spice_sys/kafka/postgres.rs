@@ -101,7 +101,21 @@ impl KafkaSys {
             self.mark_schema_ensured();
         }
         let conn = pool.connect_direct().await.map_err(Error::external)?;
-        let offsets_json = Self::serialize_offsets(offsets)?;
+        let query = format!("SELECT offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = $1");
+        let row = conn
+            .conn
+            .query_opt(&query, &[&self.dataset_name])
+            .await
+            .map_err(Error::external)?
+            .ok_or_else(|| {
+                Error::external(format!(
+                    "Kafka sidecar metadata for dataset {} does not exist",
+                    self.dataset_name
+                ))
+            })?;
+        let existing_offsets_json: Option<String> = row.get(0);
+        let offsets_json =
+            Self::serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
         let update = format!(
             "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = $1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = $2"
         );
