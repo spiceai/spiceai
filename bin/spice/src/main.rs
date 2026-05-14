@@ -274,10 +274,11 @@ fn raw_args_enable_programmatic_mode() -> bool {
             "--api-key" | "--cloud" | "--http-endpoint" | "--tls-root-certificate-file" => {
                 let _ = args.next();
             }
-            value if value.starts_with("--api-key=")
-                || value.starts_with("--cloud=")
-                || value.starts_with("--http-endpoint=")
-                || value.starts_with("--tls-root-certificate-file=") => {}
+            value
+                if value.starts_with("--api-key=")
+                    || value.starts_with("--cloud=")
+                    || value.starts_with("--http-endpoint=")
+                    || value.starts_with("--tls-root-certificate-file=") => {}
             value if value.starts_with("--") => {}
             value if value.starts_with('-') => {
                 if value.chars().skip(1).any(|flag| flag == 'p') {
