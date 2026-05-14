@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response};
+use async_openai::traits::EventType;
 use async_openai::types::responses::{
     CreateResponse, OutputItem, OutputMessageContent, Response as OpenAIResponse,
     ResponseCompletedEvent, ResponseIncompleteEvent, ResponseStream, ResponseStreamEvent,
@@ -234,11 +235,13 @@ async fn create_response_sse_response(
                                 _ => false,
                             };
 
-                            let event = Ok::<Event, Infallible>(Event::default().data(
-                                serde_json::to_string(&response_event).unwrap_or_else(|e| {
-                                    format!(r#"{{"error": "Serialization failed: {e}"}}"#)
-                                }),
-                            ));
+                            let event = Ok::<Event, Infallible>(
+                                Event::default().event(response_event.event_type()).data(
+                                    serde_json::to_string(&response_event).unwrap_or_else(|e| {
+                                        format!(r#"{{"error": "Serialization failed: {e}"}}"#)
+                                    }),
+                                ),
+                            );
 
                             if should_break {
                                 tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
@@ -273,4 +276,153 @@ async fn create_response_sse_response(
     Sse::new(Box::pin(sse_stream))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_INTERVAL)))
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::{
+        error::OpenAIError,
+        types::responses::{CreateResponse, Response as OpenAIResponse, ResponseStream},
+    };
+    use async_trait::async_trait;
+    use futures::stream;
+    use http_body_util::BodyExt;
+    use llms::responses::Responses;
+    use serde_json::json;
+    use tracing::Span;
+
+    struct DummyResponses {
+        events: Vec<ResponseStreamEvent>,
+    }
+
+    #[async_trait]
+    impl Responses for DummyResponses {
+        async fn health(&self) -> llms::responses::Result<()> {
+            Ok(())
+        }
+
+        async fn responses_stream(
+            &self,
+            _req: CreateResponse,
+        ) -> Result<ResponseStream, OpenAIError> {
+            let events: Vec<Result<ResponseStreamEvent, OpenAIError>> =
+                self.events.iter().cloned().map(Ok).collect();
+            Ok(Box::pin(stream::iter(events)))
+        }
+
+        async fn responses_request(
+            &self,
+            _req: CreateResponse,
+        ) -> Result<OpenAIResponse, OpenAIError> {
+            unimplemented!()
+        }
+    }
+
+    fn minimal_response_json(status: &str) -> serde_json::Value {
+        json!({
+            "created_at": 1_755_639_134,
+            "id": "resp_test",
+            "model": "test-model",
+            "object": "response",
+            "output": [],
+            "status": status
+        })
+    }
+
+    /// Collects the SSE response body and returns each event as a (event_name, data_json) pair.
+    async fn collect_sse_events(
+        events: Vec<ResponseStreamEvent>,
+    ) -> Vec<(String, serde_json::Value)> {
+        let model: Arc<dyn Responses> = Arc::new(DummyResponses { events });
+        let req: CreateResponse = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": "hello"
+        }))
+        .expect("request should deserialize");
+
+        let response = create_response_sse_response(model, req, Span::none()).await;
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect SSE response body")
+            .to_bytes();
+        let body_str = String::from_utf8(body_bytes.to_vec()).expect("body should be UTF-8");
+
+        body_str
+            .split("\n\n")
+            .filter(|block| !block.trim().is_empty())
+            .map(|block| {
+                let mut event_name = String::new();
+                let mut data_str = String::new();
+                for line in block.lines() {
+                    if let Some(name) = line.strip_prefix("event: ") {
+                        event_name = name.to_string();
+                    } else if let Some(data) = line.strip_prefix("data: ") {
+                        data_str = data.to_string();
+                    }
+                }
+                let data_json: serde_json::Value =
+                    serde_json::from_str(&data_str).unwrap_or(serde_json::Value::Null);
+                (event_name, data_json)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sse_events_include_event_name_field() {
+        let created: ResponseStreamEvent = serde_json::from_value(json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": minimal_response_json("in_progress")
+        }))
+        .expect("created event should deserialize");
+
+        let delta: ResponseStreamEvent = serde_json::from_value(json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "hi"
+        }))
+        .expect("delta event should deserialize");
+
+        let completed: ResponseStreamEvent = serde_json::from_value(json!({
+            "type": "response.completed",
+            "sequence_number": 2,
+            "response": minimal_response_json("completed")
+        }))
+        .expect("completed event should deserialize");
+
+        let events = collect_sse_events(vec![created, delta, completed]).await;
+
+        // Every SSE frame must carry an event: name
+        for (name, _) in &events {
+            assert!(!name.is_empty(), "SSE event: field must not be empty");
+        }
+
+        // The event: name must match the type field in the JSON body
+        for (name, data) in &events {
+            let json_type = data["type"]
+                .as_str()
+                .expect("data should have a type field");
+            assert_eq!(
+                name, json_type,
+                "SSE event: field '{name}' must match JSON type field '{json_type}'"
+            );
+        }
+
+        // Verify the specific event names nemoclaw probes for
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"response.output_text.delta"),
+            "stream must include a response.output_text.delta SSE event"
+        );
+        assert!(
+            names.contains(&"response.completed"),
+            "stream must include a response.completed SSE event"
+        );
+    }
 }
