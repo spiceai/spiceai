@@ -51,7 +51,7 @@ pub struct VersionArgs {
 
     /// Output format.
     #[arg(long, short = 'o', default_value = "table")]
-    output: OutputFormat,
+    pub output: OutputFormat,
 }
 
 /// Get the CLI version string.

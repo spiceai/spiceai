@@ -67,7 +67,7 @@ pub struct QueryArgs {
     pub output: OutputFormat,
 
     #[command(subcommand)]
-    command: Option<QuerySubcommand>,
+    pub command: Option<QuerySubcommand>,
 }
 
 #[derive(Subcommand, Debug)]

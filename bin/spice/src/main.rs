@@ -24,6 +24,7 @@ use spice::commands::{
     datasets, init, install, login, models, nsql, pods, query, refresh, run, search, sql, status,
     trace, upgrade, validate, version, workers,
 };
+use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;
 
@@ -61,6 +62,10 @@ struct Cli {
     /// Increase log verbosity (-v for debug, -vv for trace).
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
+
+    /// Programmatic mode for LLMs and automation: prefer JSON output and structured JSON errors.
+    #[arg(short = 'p', long)]
+    programmatic: bool,
 
     /// API key used to authenticate with the runtime or Spice.ai Cloud.
     #[arg(long, global = true, env = "SPICE_API_KEY")]
@@ -202,7 +207,21 @@ enum Commands {
 fn main() {
     use std::io::IsTerminal;
 
-    let cli = Cli::parse();
+    let mut cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if raw_args_enable_programmatic_mode() {
+                let exit_code = error.exit_code();
+                write_programmatic_clap_error(&error);
+                std::process::exit(exit_code);
+            }
+            error.exit();
+        }
+    };
+
+    if cli.programmatic {
+        apply_programmatic_mode(&mut cli.command);
+    }
 
     // Verbosity flag wins; otherwise honour RUST_LOG; otherwise default to info.
     let filter = if cli.verbose > 0 {
@@ -211,6 +230,8 @@ fn main() {
         } else {
             EnvFilter::new("trace")
         }
+    } else if cli.programmatic {
+        EnvFilter::new("off")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
@@ -224,6 +245,7 @@ fn main() {
     // Version banner: stderr-only so it doesn't foul pipes, and only for interactive stderr.
     // Suppressed for commands that produce JSON (scripting) or where it's just noise.
     if std::io::stderr().is_terminal()
+        && !cli.programmatic
         && !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
         && !is_json_output(&cli.command)
     {
@@ -231,15 +253,222 @@ fn main() {
     }
 
     // Run the CLI
+    let programmatic = cli.programmatic;
     if let Err(e) = run_cli(cli) {
-        tracing::error!("{e}");
+        if programmatic {
+            write_programmatic_error(&e);
+        } else {
+            tracing::error!("{e}");
+        }
         std::process::exit(1);
+    }
+}
+
+fn raw_args_enable_programmatic_mode() -> bool {
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-p" | "--programmatic" => return true,
+            "--" => return false,
+            "--api-key" | "--cloud" | "--http-endpoint" | "--tls-root-certificate-file" => {
+                let _ = args.next();
+            }
+            value if value.starts_with("--api-key=")
+                || value.starts_with("--cloud=")
+                || value.starts_with("--http-endpoint=")
+                || value.starts_with("--tls-root-certificate-file=") => {}
+            value if value.starts_with("--") => {}
+            value if value.starts_with('-') => {
+                if value.chars().skip(1).any(|flag| flag == 'p') {
+                    return true;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    false
+}
+
+fn apply_programmatic_mode(command: &mut Commands) {
+    match command {
+        Commands::Version(args) => args.output = OutputFormat::Json,
+        Commands::Status(args) => args.output = OutputFormat::Json,
+        Commands::Datasets(args) => args.output = OutputFormat::Json,
+        Commands::Catalogs(args) => args.output = OutputFormat::Json,
+        Commands::Models(args) => args.output = OutputFormat::Json,
+        Commands::Pods(args) => args.output = OutputFormat::Json,
+        Commands::Workers(args) => args.output = OutputFormat::Json,
+        Commands::Trace(args) => args.output = trace::OutputFormat::Json,
+        Commands::Search(args) => args.output = OutputFormat::Json,
+        Commands::Query(args) => apply_programmatic_query_mode(args),
+        Commands::Acceleration(args) => apply_programmatic_acceleration_mode(args),
+        Commands::Cloud(args) => apply_programmatic_cloud_mode(&mut args.command),
+        Commands::Init(_)
+        | Commands::Install(_)
+        | Commands::Upgrade(_)
+        | Commands::Run(_)
+        | Commands::Add(_)
+        | Commands::Connect(_)
+        | Commands::Validate(_)
+        | Commands::Dataset(_)
+        | Commands::Catalog(_)
+        | Commands::Model(_)
+        | Commands::View(_)
+        | Commands::Embedding(_)
+        | Commands::Reranker(_)
+        | Commands::Tool(_)
+        | Commands::Worker(_)
+        | Commands::Function(_)
+        | Commands::Secret(_)
+        | Commands::Runtime(_)
+        | Commands::Management(_)
+        | Commands::Snapshots(_)
+        | Commands::Extension(_)
+        | Commands::Metadata(_)
+        | Commands::Sql(_)
+        | Commands::Nsql(_)
+        | Commands::Chat(_)
+        | Commands::Refresh(_)
+        | Commands::Login(_)
+        | Commands::Cluster(_)
+        | Commands::Completions(_) => {}
+    }
+}
+
+fn apply_programmatic_query_mode(args: &mut query::QueryArgs) {
+    args.output = OutputFormat::Json;
+
+    let Some(command) = &mut args.command else {
+        return;
+    };
+
+    match command {
+        query::QuerySubcommand::List { output, .. }
+        | query::QuerySubcommand::Status { output, .. }
+        | query::QuerySubcommand::Results { output, .. } => {
+            *output = OutputFormat::Json;
+        }
+        query::QuerySubcommand::Cancel { .. } => {}
+    }
+}
+
+fn apply_programmatic_acceleration_mode(args: &mut AccelerationArgs) {
+    match &mut args.command {
+        acceleration::AccelerationCommand::Snapshots(args) => args.output = OutputFormat::Json,
+        acceleration::AccelerationCommand::Snapshot(args) => args.output = OutputFormat::Json,
+        acceleration::AccelerationCommand::SetSnapshot(_) => {}
+    }
+}
+
+fn apply_programmatic_cloud_mode(command: &mut cloud::CloudCommands) {
+    match command {
+        cloud::CloudCommands::Whoami(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Apps(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Deployments(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Regions(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Images(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Logs(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Deploy(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Inspect(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Rollback(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::ApiKeys(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Metrics(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Secrets(command) => match command {
+            cloud::SecretsCommands::List(args) => args.output = OutputFormat::Json,
+            cloud::SecretsCommands::Set(args) => args.output = OutputFormat::Json,
+            cloud::SecretsCommands::Get(args) => args.output = OutputFormat::Json,
+            cloud::SecretsCommands::Delete(args) => args.output = OutputFormat::Json,
+        },
+        cloud::CloudCommands::Create(command) => match command {
+            cloud::CreateCommands::App(args) => args.output = OutputFormat::Json,
+            cloud::CreateCommands::Deployment(args) => args.output = OutputFormat::Json,
+        },
+        cloud::CloudCommands::Get(cloud::GetCommands::App(args)) => {
+            args.output = OutputFormat::Json;
+        }
+        cloud::CloudCommands::Update(cloud::UpdateCommands::App(args)) => {
+            args.output = OutputFormat::Json;
+        }
+        cloud::CloudCommands::Delete(cloud::DeleteCommands::App(args)) => {
+            args.output = OutputFormat::Json;
+        }
+        cloud::CloudCommands::Login(_)
+        | cloud::CloudCommands::Logout
+        | cloud::CloudCommands::Link(_)
+        | cloud::CloudCommands::Unlink => {}
+    }
+}
+
+fn write_programmatic_clap_error(error: &clap::Error) {
+    let body = serde_json::json!({
+        "status": "error",
+        "error": {
+            "code": "cli_parse_error",
+            "kind": format!("{:?}", error.kind()),
+            "message": error.to_string(),
+        }
+    });
+
+    match serde_json::to_string(&body) {
+        Ok(body) => eprintln!("{body}"),
+        Err(_) => eprintln!(
+            "{}",
+            r#"{"status":"error","error":{"code":"error_serialization_failed","message":"Failed to serialize CLI error"}}"#
+        ),
+    }
+}
+
+fn write_programmatic_error(error: &spice::error::Error) {
+    let body = serde_json::json!({
+        "status": "error",
+        "error": {
+            "code": programmatic_error_code(error),
+            "message": error.to_string(),
+        }
+    });
+
+    match serde_json::to_string(&body) {
+        Ok(body) => eprintln!("{body}"),
+        Err(_) => eprintln!(
+            "{}",
+            r#"{"status":"error","error":{"code":"error_serialization_failed","message":"Failed to serialize CLI error"}}"#
+        ),
+    }
+}
+
+fn programmatic_error_code(error: &spice::error::Error) -> &'static str {
+    match error {
+        spice::error::Error::RuntimeNotInstalled => "runtime_not_installed",
+        spice::error::Error::WindowsNativeRuntimeUnsupported => {
+            "windows_native_runtime_unsupported"
+        }
+        spice::error::Error::RuntimeUnavailable { .. } => "runtime_unavailable",
+        spice::error::Error::Unauthorized => "unauthorized",
+        spice::error::Error::PermissionDenied => "permission_denied",
+        spice::error::Error::RuntimeHttp { .. } => "runtime_http_error",
+        spice::error::Error::ConnectionFailed { .. } => "connection_failed",
+        spice::error::Error::HttpRequestFailed { .. } => "http_request_failed",
+        spice::error::Error::InvalidResponse { .. } => "invalid_response",
+        spice::error::Error::ConfigIo { .. } => "config_io",
+        spice::error::Error::ConfigParse { .. } => "config_parse",
+        spice::error::Error::CreateDirectory { .. } => "create_directory",
+        spice::error::Error::RuntimeExecution { .. } => "runtime_execution",
+        spice::error::Error::RuntimeVersion { .. } => "runtime_version",
+        spice::error::Error::Environment { .. } => "environment",
+        spice::error::Error::InvalidArgument { .. } => "invalid_argument",
+        spice::error::Error::HomeDirectoryNotFound => "home_directory_not_found",
+        spice::error::Error::Repl { .. } => "repl",
+        spice::error::Error::ChildProcessId => "child_process_id",
+        spice::error::Error::SignalHandler { .. } => "signal_handler",
+        spice::error::Error::ModelNotFound { .. } => "model_not_found",
+        spice::error::Error::NoModelsConfigured => "no_models_configured",
     }
 }
 
 /// Returns true if the command will output JSON, so the banner should be suppressed.
 fn is_json_output(cmd: &Commands) -> bool {
-    use spice::output::OutputFormat;
     match cmd {
         Commands::Status(a) => a.output == OutputFormat::Json,
         Commands::Datasets(a) => a.output == OutputFormat::Json,
@@ -496,6 +725,55 @@ mod tests {
 
     fn is_json(args: &[&str]) -> bool {
         is_json_output(&parse(args).command)
+    }
+
+    fn parse_with_programmatic_mode(args: &[&str]) -> Cli {
+        let mut cli = parse(args);
+        if cli.programmatic {
+            apply_programmatic_mode(&mut cli.command);
+        }
+        cli
+    }
+
+    #[test]
+    fn programmatic_flag_defaults_version_to_json() {
+        let cli = parse_with_programmatic_mode(&["spice", "-p", "version"]);
+        assert!(cli.programmatic);
+
+        let Commands::Version(args) = cli.command else {
+            panic!("expected version command");
+        };
+        assert_eq!(args.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn programmatic_flag_defaults_nested_outputs_to_json() {
+        let cli = parse_with_programmatic_mode(&["spice", "-p", "query", "list"]);
+        let Commands::Query(args) = cli.command else {
+            panic!("expected query command");
+        };
+        let Some(query::QuerySubcommand::List { output, .. }) = args.command else {
+            panic!("expected query list command");
+        };
+        assert_eq!(output, OutputFormat::Json);
+
+        let cli = parse_with_programmatic_mode(&["spice", "-p", "cloud", "secrets", "list"]);
+        let Commands::Cloud(cloud::CloudArgs {
+            command: cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(args)),
+        }) = cli.command
+        else {
+            panic!("expected cloud secrets list command");
+        };
+        assert_eq!(args.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn programmatic_error_codes_are_stable() {
+        let error = spice::error::Error::InvalidArgument {
+            message: "bad input".to_string(),
+        };
+
+        assert_eq!(programmatic_error_code(&error), "invalid_argument");
     }
 
     #[test]
