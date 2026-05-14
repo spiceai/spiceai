@@ -163,7 +163,7 @@ impl DataSink for CayenneDataSink {
         ));
 
         if self.overwrite == InsertOp::Overwrite {
-            self.write_all_overwrite(normalized)
+            self.write_all_overwrite(normalized, context)
                 .await
                 .map_err(Into::into)
         } else {
@@ -212,7 +212,11 @@ impl CayenneDataSink {
     /// 4. Atomically updates the catalog to point to the new snapshot
     /// 5. Updates in-memory state (snapshot ID, listing table, deletion caches)
     /// 6. Triggers cleanup of old snapshots
-    async fn write_all_overwrite(&self, data: SendableRecordBatchStream) -> super::Result<u64> {
+    async fn write_all_overwrite(
+        &self,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> super::Result<u64> {
         // Generate a new UUIDv7 for the snapshot
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
 
@@ -227,9 +231,10 @@ impl CayenneDataSink {
 
         // Write data to the new snapshot.
         let target_size = self.context.target_file_size_bytes();
+        let target_partitions = context.session_config().target_partitions();
         let (total_rows, _files_written, write_stats_acc) = self
             .table
-            .write_to_snapshot(data, target_size, &new_snapshot_id)
+            .write_to_snapshot(data, target_size, &new_snapshot_id, target_partitions)
             .await?;
 
         // Sync the snapshot directory to ensure all data is durably written.
@@ -304,6 +309,8 @@ impl CayenneDataSink {
                 "Failed to clear table statistics after overwrite for table {}: {e}",
                 self.table.table_name()
             );
+        } else {
+            self.table.clear_cached_table_statistics();
         }
         self.table.persist_table_stats(&write_stats_acc).await;
 
