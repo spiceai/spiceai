@@ -1,0 +1,72 @@
+version: v1
+kind: Spicepod
+name: s3-public[parquet]-cayenne[file]-distributed
+# TPC-H SF1 served by a Cayenne file-mode acceleration that's partitioned for
+# distributed execution across cluster executors. Source data is the public
+# AWS bucket so the spicepod needs no secrets to deploy.
+#
+# Partition expressions match spicebench's `data-generation/src/dataset/tpch.rs`
+# scheme (the proven good partitioning for TPC-H tables under Ballista shuffle).
+datasets:
+  - from: s3://spiceai-public-datasets/tpch/customer/customer.parquet
+    name: customer
+    params: &s3_params
+      file_format: parquet
+      s3_auth: public
+    acceleration: &partitioned_acceleration
+      enabled: true
+      engine: cayenne
+      mode: file
+      params:
+        partition_mode: tables
+      partition_by:
+        - bucket(5, c_nationkey)
+  - from: s3://spiceai-public-datasets/tpch/lineitem/lineitem.parquet
+    name: lineitem
+    params: *s3_params
+    acceleration:
+      <<: *partitioned_acceleration
+      partition_by:
+        - bucket(10, l_linenumber)
+  - from: s3://spiceai-public-datasets/tpch/nation/nation.parquet
+    name: nation
+    params: *s3_params
+    acceleration:
+      <<: *partitioned_acceleration
+      partition_by:
+        - n_regionkey
+  - from: s3://spiceai-public-datasets/tpch/orders/orders.parquet
+    name: orders
+    params: *s3_params
+    acceleration:
+      <<: *partitioned_acceleration
+      partition_by:
+        - bucket(10, o_orderkey)
+  - from: s3://spiceai-public-datasets/tpch/part/part.parquet
+    name: part
+    params: *s3_params
+    acceleration:
+      <<: *partitioned_acceleration
+      partition_by:
+        - bucket(10, p_partkey)
+  - from: s3://spiceai-public-datasets/tpch/partsupp/partsupp.parquet
+    name: partsupp
+    params: *s3_params
+    acceleration:
+      <<: *partitioned_acceleration
+      partition_by:
+        - bucket(10, ps_partkey)
+  - from: s3://spiceai-public-datasets/tpch/region/region.parquet
+    name: region
+    params: *s3_params
+    acceleration:
+      <<: *partitioned_acceleration
+      partition_by:
+        - r_regionkey
+  - from: s3://spiceai-public-datasets/tpch/supplier/supplier.parquet
+    name: supplier
+    params: *s3_params
+    acceleration:
+      <<: *partitioned_acceleration
+      partition_by:
+        - s_nationkey
