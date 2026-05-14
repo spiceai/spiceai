@@ -127,10 +127,7 @@ impl LocalFileRegistry {
 
 fn find_manifest(source_path: &Path, pod_name: &str) -> Option<PathBuf> {
     let lowercase_pod_name = pod_name.to_lowercase();
-    let mut candidate_names = vec![
-        format!("{pod_name}.yaml"),
-        format!("{pod_name}.yml"),
-    ];
+    let mut candidate_names = vec![format!("{pod_name}.yaml"), format!("{pod_name}.yml")];
 
     if lowercase_pod_name != pod_name {
         candidate_names.push(format!("{lowercase_pod_name}.yaml"));
@@ -283,10 +280,9 @@ mod tests {
             .await
             .expect("local pod should be installed");
 
-        let installed_manifest = std::fs::read_to_string(
-            pods_dir.join("namedpod").join("spicepod.yaml"),
-        )
-        .expect("installed manifest should be readable");
+        let installed_manifest =
+            std::fs::read_to_string(pods_dir.join("namedpod").join("spicepod.yaml"))
+                .expect("installed manifest should be readable");
         assert!(
             installed_manifest.contains("name: named"),
             "pod-named manifest should be used over generic manifest"

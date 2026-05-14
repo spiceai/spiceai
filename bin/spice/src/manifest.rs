@@ -59,7 +59,7 @@ pub fn create_spicepod_yaml(name: &str) -> String {
     format!("{SCHEMA_DIRECTIVE}\nversion: v2\nkind: Spicepod\nname: {name}\n")
 }
 
-/// Reads a Spicepod manifest as YAML while validating it against `SpicepodDefinition`.
+/// Reads a Spicepod manifest as YAML while validating its root header.
 pub fn read_spicepod_value(path: &Path) -> Result<Value> {
     let content = std::fs::read_to_string(path).context(ConfigIoSnafu {
         operation: "read",

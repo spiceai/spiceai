@@ -1183,7 +1183,7 @@ mod tests {
             name: Some("llm".to_string()),
             options: CommonComponentOptions {
                 from: Some("openai:gpt-4o-mini".to_string()),
-                params: vec!["temperature=0.2".to_string()],
+                params: vec!["api_version=1.10".to_string()],
                 ..CommonComponentOptions::default()
             },
         };
@@ -1207,6 +1207,40 @@ mod tests {
             model.get("from").and_then(Value::as_str),
             Some("openai:gpt-4o-mini")
         );
+        assert_eq!(
+            model
+                .get("params")
+                .and_then(|params| params.get("api_version")),
+            Some(&Value::String("1.10".to_string()))
+        );
+    }
+
+    #[test]
+    fn param_values_accept_explicit_yaml_prefix() {
+        let mut spicepod = base_spicepod();
+        let args = ComponentAddArgs {
+            name: Some("llm".to_string()),
+            options: CommonComponentOptions {
+                from: Some("openai:gpt-4o-mini".to_string()),
+                params: vec!["temperature=yaml:0.2".to_string()],
+                ..CommonComponentOptions::default()
+            },
+        };
+
+        mutate_component(
+            &mut spicepod,
+            ComponentSection::Model,
+            args.name.as_deref(),
+            &args.options,
+            MutationMode::Add,
+        )
+        .expect("model should be added");
+
+        let model = spicepod
+            .get("models")
+            .and_then(Value::as_sequence)
+            .and_then(|models| models.first())
+            .expect("model should exist");
         assert_eq!(
             model
                 .get("params")
