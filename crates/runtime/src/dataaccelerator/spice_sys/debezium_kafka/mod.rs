@@ -20,6 +20,7 @@ limitations under the License.
 //!     `topic` TEXT,
 //!     `primary_keys` TEXT,
 //!     `schema_fields` TEXT,
+//!     `offsets_json` TEXT,
 //!     `created_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP`,
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
 //! );
@@ -29,6 +30,7 @@ use crate::{
     component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
     dataconnector::debezium::DebeziumKafkaMetadata,
 };
+use data_components::kafka::KafkaOffset;
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
 
@@ -96,5 +98,42 @@ impl DebeziumKafkaSys {
             )))]
             _ => Err(Error::NoAccelerationConnection),
         }
+    }
+
+    pub(crate) async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
+        match &self.acceleration_connection {
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::DuckDB(pool) => self.upsert_offsets_duckdb(pool, offsets),
+            #[cfg(feature = "postgres-accel")]
+            AccelerationConnection::Postgres(pool) => {
+                self.upsert_offsets_postgres(pool, offsets).await
+            }
+            #[cfg(feature = "sqlite")]
+            AccelerationConnection::SQLite(conn) => self.upsert_offsets_sqlite(conn, offsets).await,
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.upsert_offsets_turso(pool, offsets).await,
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => {
+                self.upsert_offsets_sqlite(conn, offsets).await
+            }
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres-accel",
+                feature = "turso"
+            )))]
+            _ => Err(Error::NoAccelerationConnection),
+        }
+    }
+
+    fn serialize_offsets(offsets: &[KafkaOffset]) -> Result<String> {
+        serde_json::to_string(offsets).map_err(Error::external)
+    }
+
+    fn deserialize_offsets(offsets_json: Option<&str>) -> Result<Vec<KafkaOffset>> {
+        offsets_json.map_or_else(
+            || Ok(Vec::new()),
+            |offsets_json| serde_json::from_str(offsets_json).map_err(Error::external),
+        )
     }
 }

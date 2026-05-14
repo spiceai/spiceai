@@ -61,7 +61,7 @@ struct ApplyContext<'a> {
     caching: Option<&'a Weak<Caching>>,
     ready_sender: Option<&'a Arc<Notify>>,
     initial_load_completed: &'a Arc<AtomicBool>,
-    pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
+    pending_commit: &'a mut Option<tokio::task::JoinHandle<Result<(), String>>>,
     commit_timeout: Duration,
 }
 
@@ -359,7 +359,7 @@ impl RefreshTask {
         // strict commit ordering across bursts (LSN/offsets advance
         // monotonically), while letting commit(N) overlap with apply(N+1) —
         // the actual idle window in the original serial loop.
-        let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
+        let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
 
         while let Some(first) = match carried_item.take() {
@@ -635,11 +635,14 @@ impl RefreshTask {
                         if let Err(e) = committer.commit().await
                             && !runtime_status.is_shutdown()
                         {
-                            tracing::error!(
+                            let error_message = format!(
                                 "Failed to commit CDC change envelope for {commit_dataset}: {e}"
                             );
+                            tracing::error!("{error_message}");
+                            return Err(error_message);
                         }
                     }
+                    Ok(())
                 }));
             }
             Err(e) => {
@@ -1050,7 +1053,7 @@ fn contiguous_row_span(row_indices: &[usize]) -> Option<(usize, usize)> {
 /// would leave the dataset healthy while source-side offsets stop advancing)
 /// but treats cancellation during shutdown as expected.
 async fn join_pending_commit(
-    mut handle: tokio::task::JoinHandle<()>,
+    mut handle: tokio::task::JoinHandle<Result<(), String>>,
     dataset_name: &TableReference,
     is_shutdown: bool,
     commit_timeout: Duration,
@@ -1074,7 +1077,8 @@ async fn join_pending_commit(
                     tracing::error!("{error_message}");
                     Some(error_message)
                 }
-                Ok(()) => None,
+                Ok(Ok(())) => None,
+                Ok(Err(error_message)) => Some(error_message),
             }
         }
         () = tokio::time::sleep(commit_timeout) => {
@@ -2580,7 +2584,7 @@ mod tests {
     #[tokio::test]
     async fn test_join_pending_commit_ignores_cancel_during_shutdown() {
         let dataset_name = TableReference::bare("test");
-        let handle = tokio::spawn(std::future::pending::<()>());
+        let handle = tokio::spawn(std::future::pending::<Result<(), String>>());
         handle.abort();
 
         let result = join_pending_commit(handle, &dataset_name, true, Duration::from_secs(5)).await;

@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Error, Result};
 use data_components::debezium::change_event;
+use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use std::sync::Arc;
 
@@ -30,29 +31,17 @@ impl DebeziumKafkaSys {
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {DEBEZIUM_KAFKA_TABLE_NAME} (
-                dataset_name TEXT PRIMARY KEY,
-                consumer_group_id TEXT,
-                topic TEXT,
-                primary_keys TEXT,
-                schema_fields TEXT,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP
-            )"
-        );
-        duckdb_conn
-            .execute(&create_table, [])
-            .map_err(Error::external)?;
+        ensure_debezium_kafka_table(duckdb_conn)?;
 
         let upsert = format!(
-            "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, primary_keys, schema_fields, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, now(), now())
+            "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, primary_keys, schema_fields, offsets_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, now(), now())
              ON CONFLICT (dataset_name) DO UPDATE SET
                 consumer_group_id = excluded.consumer_group_id,
                 topic = excluded.topic,
                 primary_keys = excluded.primary_keys,
                 schema_fields = excluded.schema_fields,
+                offsets_json = excluded.offsets_json,
                 updated_at = now()"
         );
 
@@ -60,6 +49,7 @@ impl DebeziumKafkaSys {
             serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
             serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
+        let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
 
         duckdb_conn
             .execute(
@@ -70,6 +60,7 @@ impl DebeziumKafkaSys {
                     &metadata.topic,
                     &primary_keys,
                     &schema_fields,
+                    &offsets_json,
                 ],
             )
             .map_err(Error::external)?;
@@ -86,8 +77,10 @@ impl DebeziumKafkaSys {
             .ok()?
             .get_underlying_conn_mut();
 
+        ensure_debezium_kafka_table(duckdb_conn).ok()?;
+
         let query = format!(
-            "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
+            "SELECT consumer_group_id, topic, primary_keys, schema_fields, offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).ok()?;
         let mut rows = stmt.query([&self.dataset_name]).ok()?;
@@ -97,6 +90,7 @@ impl DebeziumKafkaSys {
             let topic: String = row.get(1).ok()?;
             let primary_keys: String = row.get(2).ok()?;
             let schema_fields: String = row.get(3).ok()?;
+            let offsets_json: Option<String> = row.get(4).ok()?;
 
             let primary_keys: Vec<String> = serde_json::from_str(&primary_keys).ok()?;
             let schema_fields: Vec<change_event::Field> =
@@ -107,9 +101,63 @@ impl DebeziumKafkaSys {
                 topic,
                 primary_keys,
                 schema_fields,
+                offsets: DebeziumKafkaSys::deserialize_offsets(offsets_json.as_deref()).ok()?,
             })
         } else {
             None
         }
     }
+
+    pub(super) fn upsert_offsets_duckdb(
+        &self,
+        pool: &Arc<DuckDbConnectionPool>,
+        offsets: &[KafkaOffset],
+    ) -> Result<()> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(Error::external)?
+            .get_underlying_conn_mut();
+
+        ensure_debezium_kafka_table(duckdb_conn)?;
+
+        let offsets_json = Self::serialize_offsets(offsets)?;
+        let update = format!(
+            "UPDATE {DEBEZIUM_KAFKA_TABLE_NAME} SET offsets_json = ?, updated_at = now() WHERE dataset_name = ?"
+        );
+        let changed = duckdb_conn
+            .execute(&update, [&offsets_json, &self.dataset_name])
+            .map_err(Error::external)?;
+
+        if changed == 0 {
+            return Err(Error::external(format!(
+                "Debezium Kafka sidecar metadata for dataset {} does not exist",
+                self.dataset_name
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn ensure_debezium_kafka_table(conn: &mut duckdb::Connection) -> Result<()> {
+    let create_table = format!(
+        "CREATE TABLE IF NOT EXISTS {DEBEZIUM_KAFKA_TABLE_NAME} (
+            dataset_name TEXT PRIMARY KEY,
+            consumer_group_id TEXT,
+            topic TEXT,
+            primary_keys TEXT,
+            schema_fields TEXT,
+            offsets_json TEXT,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP
+        )"
+    );
+    conn.execute(&create_table, []).map_err(Error::external)?;
+
+    let add_offsets = format!(
+        "ALTER TABLE {DEBEZIUM_KAFKA_TABLE_NAME} ADD COLUMN IF NOT EXISTS offsets_json TEXT"
+    );
+    conn.execute(&add_offsets, []).map_err(Error::external)?;
+
+    Ok(())
 }

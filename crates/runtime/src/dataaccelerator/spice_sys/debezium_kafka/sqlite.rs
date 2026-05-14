@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Error, Result};
 use data_components::debezium::change_event;
+use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
 };
@@ -33,6 +34,7 @@ impl DebeziumKafkaSys {
             serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
             serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
+        let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -43,28 +45,18 @@ impl DebeziumKafkaSys {
 
         conn.conn
             .call(move |conn| {
-                let create_table = format!(
-                    "CREATE TABLE IF NOT EXISTS {DEBEZIUM_KAFKA_TABLE_NAME} (
-                    dataset_name TEXT PRIMARY KEY,
-                    consumer_group_id TEXT,
-                    topic TEXT,
-                    primary_keys TEXT,
-                    schema_fields TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )"
-                );
-                conn.execute(&create_table, [])?;
+                ensure_debezium_kafka_table(conn)?;
 
                 let upsert = format!(
                     "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME}
-                 (dataset_name, consumer_group_id, topic, primary_keys, schema_fields, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+                 (dataset_name, consumer_group_id, topic, primary_keys, schema_fields, offsets_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
                  ON CONFLICT (dataset_name) DO UPDATE SET
                     consumer_group_id = ?2,
                     topic = ?3,
                     primary_keys = ?4,
                     schema_fields = ?5,
+                    offsets_json = ?6,
                     updated_at = CURRENT_TIMESTAMP"
                 );
 
@@ -76,6 +68,7 @@ impl DebeziumKafkaSys {
                         topic,
                         primary_keys,
                         schema_fields,
+                        offsets_json,
                     ],
                 )?;
 
@@ -96,8 +89,10 @@ impl DebeziumKafkaSys {
 
         conn.conn
             .call(move |conn| {
+                ensure_debezium_kafka_table(conn)?;
+
                 let query = format!(
-                    "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
+                    "SELECT consumer_group_id, topic, primary_keys, schema_fields, offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([dataset_name])?;
@@ -107,6 +102,7 @@ impl DebeziumKafkaSys {
                     let topic: String = row.get(1)?;
                     let primary_keys: String = row.get(2)?;
                     let schema_fields: String = row.get(3)?;
+                    let offsets_json: Option<String> = row.get(4)?;
 
                     let primary_keys: Vec<String> = serde_json::from_str(&primary_keys)
                         .map_err(|err| {
@@ -124,6 +120,11 @@ impl DebeziumKafkaSys {
                         topic,
                         primary_keys,
                         schema_fields,
+                        offsets: DebeziumKafkaSys::deserialize_offsets(offsets_json.as_deref())
+                            .map_err(|err| {
+                                tracing::warn!("Failed to deserialize Debezium Kafka offsets from SQLite: {err}");
+                                rusqlite::Error::InvalidQuery
+                            })?,
                     })
                 } else {
                     Err(rusqlite::Error::QueryReturnedNoRows)
@@ -132,4 +133,70 @@ impl DebeziumKafkaSys {
             .await
             .ok()
     }
+
+    pub(super) async fn upsert_offsets_sqlite(
+        &self,
+        pool: &SqliteConnectionPool,
+        offsets: &[KafkaOffset],
+    ) -> Result<()> {
+        let dataset_name = self.dataset_name.clone();
+        let offsets_json = Self::serialize_offsets(offsets)?;
+
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
+        };
+
+        conn.conn
+            .call(move |conn| {
+                ensure_debezium_kafka_table(conn)?;
+                let update = format!(
+                    "UPDATE {DEBEZIUM_KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"
+                );
+                let changed = conn.execute(&update, [offsets_json, dataset_name])?;
+                if changed == 0 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .map_err(Error::external)
+    }
+}
+
+fn ensure_debezium_kafka_table(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let create_table = format!(
+        "CREATE TABLE IF NOT EXISTS {DEBEZIUM_KAFKA_TABLE_NAME} (
+            dataset_name TEXT PRIMARY KEY,
+            consumer_group_id TEXT,
+            topic TEXT,
+            primary_keys TEXT,
+            schema_fields TEXT,
+            offsets_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )"
+    );
+    conn.execute(&create_table, [])?;
+
+    let table_info = format!("PRAGMA table_info({DEBEZIUM_KAFKA_TABLE_NAME})");
+    let mut stmt = conn.prepare(&table_info)?;
+    let mut columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_offsets_json = false;
+    while let Some(column) = columns.next() {
+        if column? == "offsets_json" {
+            has_offsets_json = true;
+            break;
+        }
+    }
+
+    if !has_offsets_json {
+        let add_offsets =
+            format!("ALTER TABLE {DEBEZIUM_KAFKA_TABLE_NAME} ADD COLUMN offsets_json TEXT");
+        conn.execute(&add_offsets, [])?;
+    }
+
+    Ok(())
 }

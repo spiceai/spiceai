@@ -19,6 +19,7 @@ limitations under the License.
 //!     `consumer_group_id` TEXT,
 //!     `topic` TEXT,
 //!     `schema_json` TEXT,
+//!     `offsets_json` TEXT,
 //!     `created_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP`,
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
 //! );
@@ -30,6 +31,7 @@ use crate::{
     component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
     dataconnector::kafka::KafkaMetadata,
 };
+use data_components::kafka::KafkaOffset;
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
 
@@ -99,6 +101,32 @@ impl KafkaSys {
         }
     }
 
+    pub(crate) async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
+        match &self.acceleration_connection {
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::DuckDB(pool) => self.upsert_offsets_duckdb(pool, offsets),
+            #[cfg(feature = "postgres-accel")]
+            AccelerationConnection::Postgres(pool) => {
+                self.upsert_offsets_postgres(pool, offsets).await
+            }
+            #[cfg(feature = "sqlite")]
+            AccelerationConnection::SQLite(pool) => self.upsert_offsets_sqlite(pool, offsets).await,
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.upsert_offsets_turso(pool, offsets).await,
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(pool) => {
+                self.upsert_offsets_sqlite(pool, offsets).await
+            }
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres-accel",
+                feature = "turso"
+            )))]
+            _ => Err(Error::NoAccelerationConnection),
+        }
+    }
+
     fn serialize_schema(schema: &SchemaRef) -> Result<String> {
         serde_json::to_string(schema).map_err(Error::external)
     }
@@ -106,5 +134,16 @@ impl KafkaSys {
     fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
         let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
         Ok(std::sync::Arc::new(schema))
+    }
+
+    fn serialize_offsets(offsets: &[KafkaOffset]) -> Result<String> {
+        serde_json::to_string(offsets).map_err(Error::external)
+    }
+
+    fn deserialize_offsets(offsets_json: Option<&str>) -> Result<Vec<KafkaOffset>> {
+        offsets_json.map_or_else(
+            || Ok(Vec::new()),
+            |offsets_json| serde_json::from_str(offsets_json).map_err(Error::external),
+        )
     }
 }

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use super::{Error, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
+use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 
 impl KafkaSys {
@@ -25,33 +26,22 @@ impl KafkaSys {
     ) -> Result<()> {
         let conn = pool.connect_direct().await.map_err(Error::external)?;
 
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {KAFKA_TABLE_NAME} (
-                dataset_name TEXT PRIMARY KEY,
-                consumer_group_id TEXT,
-                topic TEXT,
-                schema_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
-        conn.conn
-            .execute(&create_table, &[])
-            .await
-            .map_err(Error::external)?;
+        ensure_kafka_table(pool).await?;
 
         let upsert = format!(
             "INSERT INTO {KAFKA_TABLE_NAME}
-             (dataset_name, consumer_group_id, topic, schema_json, updated_at)
-             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+             (dataset_name, consumer_group_id, topic, schema_json, offsets_json, updated_at)
+             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
              ON CONFLICT (dataset_name) DO UPDATE SET
                 consumer_group_id = EXCLUDED.consumer_group_id,
                 topic = EXCLUDED.topic,
                 schema_json = EXCLUDED.schema_json,
+                offsets_json = EXCLUDED.offsets_json,
                 updated_at = CURRENT_TIMESTAMP"
         );
 
         let schema_json = Self::serialize_schema(&metadata.schema)?;
+        let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
 
         conn.conn
             .execute(
@@ -61,6 +51,7 @@ impl KafkaSys {
                     &metadata.consumer_group_id,
                     &metadata.topic,
                     &schema_json,
+                    &offsets_json,
                 ],
             )
             .await
@@ -73,9 +64,10 @@ impl KafkaSys {
         &self,
         pool: &PostgresConnectionPool,
     ) -> Option<KafkaMetadata> {
+        ensure_kafka_table(pool).await.ok()?;
         let conn = pool.connect_direct().await.ok()?;
         let query = format!(
-            "SELECT consumer_group_id, topic, schema_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = $1"
+            "SELECT consumer_group_id, topic, schema_json, offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = $1"
         );
         let stmt = conn.conn.prepare(&query).await.ok()?;
         let row = conn
@@ -87,11 +79,69 @@ impl KafkaSys {
         let consumer_group_id: String = row.get(0);
         let topic: String = row.get(1);
         let schema_json: String = row.get(2);
+        let offsets_json: Option<String> = row.get(3);
 
         Some(KafkaMetadata {
             consumer_group_id,
             topic,
             schema: KafkaSys::deserialize_schema(&schema_json).ok()?,
+            offsets: KafkaSys::deserialize_offsets(offsets_json.as_deref()).ok()?,
         })
     }
+
+    pub(super) async fn upsert_offsets_postgres(
+        &self,
+        pool: &PostgresConnectionPool,
+        offsets: &[KafkaOffset],
+    ) -> Result<()> {
+        ensure_kafka_table(pool).await?;
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
+        let offsets_json = Self::serialize_offsets(offsets)?;
+        let update = format!(
+            "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = $1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = $2"
+        );
+        let changed = conn
+            .conn
+            .execute(&update, &[&offsets_json, &self.dataset_name])
+            .await
+            .map_err(Error::external)?;
+
+        if changed == 0 {
+            return Err(Error::external(format!(
+                "Kafka sidecar metadata for dataset {} does not exist",
+                self.dataset_name
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+async fn ensure_kafka_table(pool: &PostgresConnectionPool) -> Result<()> {
+    let conn = pool.connect_direct().await.map_err(Error::external)?;
+
+    let create_table = format!(
+        "CREATE TABLE IF NOT EXISTS {KAFKA_TABLE_NAME} (
+            dataset_name TEXT PRIMARY KEY,
+            consumer_group_id TEXT,
+            topic TEXT,
+            schema_json TEXT,
+            offsets_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )"
+    );
+    conn.conn
+        .execute(&create_table, &[])
+        .await
+        .map_err(Error::external)?;
+
+    let add_offsets =
+        format!("ALTER TABLE {KAFKA_TABLE_NAME} ADD COLUMN IF NOT EXISTS offsets_json TEXT");
+    conn.conn
+        .execute(&add_offsets, &[])
+        .await
+        .map_err(Error::external)?;
+
+    Ok(())
 }

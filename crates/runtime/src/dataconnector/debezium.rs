@@ -25,11 +25,13 @@ use crate::federated_table::FederatedTable;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{ChangesStream, CommitError};
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
-use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics};
+use data_components::kafka::{
+    KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook,
+};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -272,38 +274,52 @@ impl DataConnector for Debezium {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        ensure!(
-            dataset.is_accelerated(),
-            super::InvalidConfigurationNoSourceSnafu {
-                dataconnector: "debezium",
-                message: "The Debezium data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
-                connector_component: ConnectorComponent::from(dataset),
-            }
-        );
-        let Some(ref acceleration) = dataset.acceleration else {
-            unreachable!("Dataset acceleration already verified. This should never be None here.");
-        };
-        ensure!(
-            self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
-            super::InvalidConfigurationNoSourceSnafu {
-                dataconnector: "debezium",
-                message: "The Debezium connector is only compatible with refresh mode 'changes'. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
-                connector_component: ConnectorComponent::from(dataset),
-            }
-        );
+        let acceleration = dataset
+            .acceleration
+            .as_ref()
+            .filter(|acceleration| acceleration.enabled);
 
-        let dataset_name = dataset.name.to_string();
-
-        if !dataset.is_file_accelerated() {
-            tracing::warn!(
-                "Dataset {dataset_name} is not file accelerated, which forces full change replay on restarts. It is recommended only to use file acceleration with the Debezium connector. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+        if let Some(acceleration) = acceleration {
+            ensure!(
+                self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
+                super::InvalidConfigurationNoSourceSnafu {
+                    dataconnector: "debezium",
+                    message: "The Debezium connector is only compatible with refresh mode 'changes'. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                    connector_component: ConnectorComponent::from(dataset),
+                }
             );
         }
 
+        let dataset_name = dataset.name.to_string();
+
+        let debezium_kafka_sys = if dataset.is_file_accelerated() {
+            Some(Arc::new(
+                DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists)
+                    .await
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?,
+            ))
+        } else {
+            tracing::warn!(
+                dataset = %dataset_name,
+                "Debezium dataset is not file-accelerated. Connector state is ephemeral and the stream will restart on every runtime restart"
+            );
+            None
+        };
+
         let topic = dataset.path();
 
-        let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
-        {
+        let metadata_from_accelerator =
+            if let Some(debezium_kafka_sys) = debezium_kafka_sys.as_deref() {
+                get_metadata_from_accelerator(debezium_kafka_sys).await
+            } else {
+                None
+            };
+
+        let (kafka_consumer, metadata, schema) = match metadata_from_accelerator {
             Some(metadata) => {
                 if let Some(config_consumer_group_id) = &self.kafka_config.consumer_group_id {
                     ensure!(
@@ -341,6 +357,14 @@ impl DataConnector for Debezium {
                     }
                 );
 
+                kafka_consumer
+                    .restore_offsets(&metadata.offsets)
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?;
+
                 let schema = debezium::arrow::convert_fields_to_arrow_schema(
                     metadata.schema_fields.iter().collect(),
                 )
@@ -359,18 +383,28 @@ impl DataConnector for Debezium {
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
-            None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
+            None => {
+                get_metadata_from_kafka(
+                    dataset,
+                    topic,
+                    &self.kafka_config,
+                    debezium_kafka_sys.as_deref(),
+                )
+                .await?
+            }
         };
 
-        ensure!(
-            !metadata.primary_keys.is_empty()
-                || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
-            super::InvalidConfigurationNoSourceSnafu {
-                dataconnector: "debezium",
-                message: "The Debezium data connector requires Kafka message keys for accelerators other than Arrow. Configure a primary key or message.key.columns in Debezium, or use the Arrow acceleration engine for full-row CDC matching with full before images for keyless updates and deletes. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
-                connector_component: ConnectorComponent::from(dataset),
-            }
-        );
+        if let Some(acceleration) = acceleration {
+            ensure!(
+                !metadata.primary_keys.is_empty()
+                    || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
+                super::InvalidConfigurationNoSourceSnafu {
+                    dataconnector: "debezium",
+                    message: "The Debezium data connector requires Kafka message keys for accelerators other than Arrow. Configure a primary key or message.key.columns in Debezium, or use the Arrow acceleration engine for full-row CDC matching with full before images for keyless updates and deletes. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                    connector_component: ConnectorComponent::from(dataset),
+                }
+            );
+        }
 
         if metadata.primary_keys.is_empty() {
             tracing::warn!(
@@ -394,14 +428,20 @@ impl DataConnector for Debezium {
             schema
         };
 
-        let debezium_kafka = Arc::new(DebeziumKafka::new(
+        let mut debezium_kafka = DebeziumKafka::new(
             refresh_schema,
             metadata.primary_keys,
             kafka_consumer,
             self.batching,
-        ));
+        );
 
-        Ok(debezium_kafka)
+        if let Some(debezium_kafka_sys) = debezium_kafka_sys {
+            debezium_kafka = debezium_kafka.with_offset_commit_hook(Arc::new(
+                DebeziumKafkaSidecarOffsetCommitHook { debezium_kafka_sys },
+            ));
+        }
+
+        Ok(Arc::new(debezium_kafka))
     }
 
     fn supports_changes_stream(&self) -> bool {
@@ -447,28 +487,43 @@ pub(crate) struct DebeziumKafkaMetadata {
     pub(crate) topic: String,
     pub(crate) primary_keys: Vec<String>,
     pub(crate) schema_fields: Vec<change_event::Field>,
+    #[serde(default)]
+    pub(crate) offsets: Vec<KafkaOffset>,
 }
 
-async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
-    let debezium_kafka_sys = DebeziumKafkaSys::try_new(dataset, OpenOption::OpenExisting)
-        .await
-        .ok()?;
+async fn get_metadata_from_accelerator(
+    debezium_kafka_sys: &DebeziumKafkaSys,
+) -> Option<DebeziumKafkaMetadata> {
     debezium_kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
-    dataset: &Dataset,
+    debezium_kafka_sys: &DebeziumKafkaSys,
     metadata: &DebeziumKafkaMetadata,
 ) -> Result<(), spice_sys::Error> {
-    let debezium_kafka_sys =
-        DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
     debezium_kafka_sys.upsert(metadata).await
+}
+
+struct DebeziumKafkaSidecarOffsetCommitHook {
+    debezium_kafka_sys: Arc<DebeziumKafkaSys>,
+}
+
+#[async_trait]
+impl KafkaOffsetCommitHook for DebeziumKafkaSidecarOffsetCommitHook {
+    async fn commit_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CommitError> {
+        self.debezium_kafka_sys
+            .upsert_offsets(offsets)
+            .await
+            .boxed()
+            .map_err(|e| CommitError::UnableToCommitChange { source: e })
+    }
 }
 
 async fn get_metadata_from_kafka(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
+    debezium_kafka_sys: Option<&DebeziumKafkaSys>,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_for_dataset(
@@ -535,10 +590,11 @@ async fn get_metadata_from_kafka(
         topic: topic.to_string(),
         primary_keys,
         schema_fields: schema_fields.into_iter().cloned().collect(),
+        offsets: Vec::new(),
     };
 
-    if dataset.is_file_accelerated() {
-        set_metadata_to_accelerator(dataset, &metadata)
+    if let Some(debezium_kafka_sys) = debezium_kafka_sys {
+        set_metadata_to_accelerator(debezium_kafka_sys, &metadata)
             .await
             .boxed()
             .context(super::UnableToGetReadProviderSnafu {
