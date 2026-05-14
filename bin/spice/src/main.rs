@@ -47,7 +47,7 @@ Quick start:
   cd my_app
   spice run                  # Install (if needed) and start the runtime
     spice -sql \"show tables\"   # Run a single SQL query and exit
-    spice -p \"Summarize loaded datasets\"  # Prompt the configured LLM and exit
+    spice -chat \"Summarize loaded datasets\" # Prompt the configured LLM and exit
   spice sql                  # Open an interactive SQL REPL
 
 Common workflows:
@@ -284,7 +284,7 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
             break;
         }
 
-        if arg == OsStr::new("-p") {
+        if arg == OsStr::new("-p") || arg == OsStr::new("-chat") {
             normalized.push(OsString::from("chat"));
             normalized.push(OsString::from("--direct-prompt"));
             normalized.extend(args);
@@ -899,6 +899,33 @@ mod tests {
     }
 
     #[test]
+    fn direct_chat_flag_normalizes_to_chat_message() {
+        let cli = parse_normalized(&["spice", "-chat", "Summarize loaded datasets"]);
+        let Commands::Chat(args) = cli.command else {
+            panic!("expected chat command");
+        };
+        assert!(args.direct_prompt);
+        assert_eq!(args.message.as_deref(), Some("Summarize loaded datasets"));
+    }
+
+    #[test]
+    fn direct_chat_flag_keeps_model_option() {
+        let cli = parse_normalized(&[
+            "spice",
+            "-chat",
+            "--model",
+            "llm",
+            "Summarize loaded datasets",
+        ]);
+        let Commands::Chat(args) = cli.command else {
+            panic!("expected chat command");
+        };
+        assert!(args.direct_prompt);
+        assert_eq!(args.model.as_deref(), Some("llm"));
+        assert_eq!(args.message.as_deref(), Some("Summarize loaded datasets"));
+    }
+
+    #[test]
     fn direct_prompt_flag_is_not_normalized_inside_subcommands() {
         let args = normalize_direct_command_args(
             ["spice", "chat", "-p", "Summarize loaded datasets"]
@@ -909,6 +936,23 @@ mod tests {
         assert_eq!(
             args,
             ["spice", "chat", "-p", "Summarize loaded datasets"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn direct_chat_flag_is_not_normalized_inside_subcommands() {
+        let args = normalize_direct_command_args(
+            ["spice", "chat", "-chat", "Summarize loaded datasets"]
+                .into_iter()
+                .map(OsString::from),
+        );
+
+        assert_eq!(
+            args,
+            ["spice", "chat", "-chat", "Summarize loaded datasets"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()

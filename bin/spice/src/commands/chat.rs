@@ -40,7 +40,7 @@ streams a single response and exits (non-interactive mode). The model must be
 registered in `spicepod.yaml` under `models:` and reported by `spice models`.
 
 EXAMPLES
-    spice -p "Summarize loaded datasets"          # One-shot prompt with the only configured model
+    spice -chat "Summarize loaded datasets"       # One-shot prompt with the only configured model
     spice -p --model llm "Summarize TPC-H Q1"     # One-shot prompt with a specific model
   spice chat                                    # Interactive REPL (prompts to pick a model)
   spice chat --model llm                        # REPL with a specific model
