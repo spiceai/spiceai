@@ -24,6 +24,29 @@ on:
           - 'amd64'
           - 'arm64'
         default: 'all'
+  # Mirror the dispatch inputs so other workflows (e.g. the cluster-bench
+  # dispatch) can call this as a reusable workflow to build a commit-pinned
+  # spiced image and feed the resulting tag into downstream jobs.
+  # Architecture is fixed to amd64 for workflow_call — that's the only one
+  # the Spice Cloud cluster benches actually consume.
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Image tag. Will be published as ghcr.io/spiceai/spiceai-dev:<tag>'
+        required: true
+        type: string
+      variant:
+        description: 'Which image variant to build'
+        required: false
+        type: string
+        default: 'models'
+    outputs:
+      image:
+        description: 'Fully-qualified image reference, including tag'
+        value: ghcr.io/spiceai/spiceai-dev:${{ inputs.tag }}
+      tag:
+        description: 'The published image tag (echo of the input)'
+        value: ${{ inputs.tag }}
 
 jobs:
   setup:
@@ -53,7 +76,12 @@ jobs:
       - name: Set target architectures
         id: set_targets
         run: |
+          # When invoked via workflow_call, `inputs.target` is unset and we
+          # always build amd64 only — cluster-bench callers don't need arm.
           target="${{ inputs.target }}"
+          if [ -z "$target" ]; then
+            target="amd64"
+          fi
           case "$target" in
             all)
               echo "run_amd64=true" >> $GITHUB_OUTPUT

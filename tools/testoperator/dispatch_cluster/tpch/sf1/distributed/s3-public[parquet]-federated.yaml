@@ -1,0 +1,7 @@
+tests:
+  bench:
+    spicepod_path: federated/s3-public[parquet].yaml
+    query_set: tpch
+    query_transport: v1-queries
+    runner_type: spiceai-dev-runners
+    validate_results: false

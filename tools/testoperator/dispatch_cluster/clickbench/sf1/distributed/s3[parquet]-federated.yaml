@@ -1,0 +1,7 @@
+tests:
+  bench:
+    spicepod_path: federated/s3[parquet].yaml
+    query_set: clickbench
+    query_transport: v1-queries
+    runner_type: spiceai-dev-runners
+    validate_results: false

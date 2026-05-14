@@ -8,19 +8,6 @@ run-name: cluster-bench - ${{ github.event.inputs.query_set }} - ${{ github.even
 # `run_spicebench.yml` plumbing in the spicebench repo.
 
 on:
-  # Temporary push trigger so this workflow exercises the cayenne distributed
-  # spicepod end-to-end on every commit to the stacked feature branch (before
-  # the change has landed on trunk). Remove this block before merging the
-  # stacked PR — workflow_dispatch is the long-term trigger.
-  push:
-    branches:
-      - phillip/testoperator-cayenne-distributed-spicepod
-    paths:
-      - '.github/workflows/testoperator_run_cluster_bench.yml'
-      - 'test/spicepods/tpch/sf1/distributed/**'
-      - 'tools/testoperator/**'
-      - 'tools/spidapter/**'
-      - 'crates/test-framework/**'
   workflow_dispatch:
     inputs:
       spicepod_path:
@@ -414,13 +401,13 @@ jobs:
             image_descriptor="channel \`${CHANNEL}\`"
           fi
 
-          # Extract the affected `tpch_qN` / `tpcds_qN` query slugs from the
+          # Extract the affected `tpch_qN` / `tpcds_qN` / `clickbench_qN` query slugs from the
           # snap filenames so reviewers can see which queries drifted at a
           # glance. Snap names look like:
           #   test_framework__snapshot__<spicepod>_<query>_<kind>_sf<N>.snap
           extract_query() {
             local f="$1"
-            basename "$f" .snap | grep -oE '(tp(ch|cds)_q[0-9]+)' | head -n 1
+            basename "$f" .snap | grep -oE '(tp(ch|cds)|clickbench)_q[0-9]+' | head -n 1
           }
 
           uniq_queries() {

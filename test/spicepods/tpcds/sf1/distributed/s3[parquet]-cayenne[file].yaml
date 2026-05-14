@@ -1,0 +1,146 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-cayenne[file]-distributed
+# TPC-DS SF1 served by Cayenne file-mode accelerations partitioned across
+# cluster executors. Partitioning is concentrated on fact tables plus the
+# highest-cardinality dimensions to keep this benchmark signal focused on
+# distributed accelerated scans/joins without over-sharding every small lookup
+# table.
+datasets:
+  - from: s3://benchmarks/tpcds_sf1/catalog_sales.parquet
+    name: catalog_sales
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      <<: &distributed_acceleration
+        enabled: true
+        engine: cayenne
+        mode: file
+        params:
+          partition_mode: tables
+      partition_by:
+        - bucket(10, cs_item_sk)
+  - from: s3://benchmarks/tpcds_sf1/catalog_returns.parquet
+    name: catalog_returns
+    params: *s3_params
+    acceleration:
+      <<: *distributed_acceleration
+      partition_by:
+        - bucket(10, cr_item_sk)
+  - from: s3://benchmarks/tpcds_sf1/inventory.parquet
+    name: inventory
+    params: *s3_params
+    acceleration:
+      <<: *distributed_acceleration
+      partition_by:
+        - bucket(10, inv_item_sk)
+  - from: s3://benchmarks/tpcds_sf1/store_sales.parquet
+    name: store_sales
+    params: *s3_params
+    acceleration:
+      <<: *distributed_acceleration
+      partition_by:
+        - bucket(10, ss_item_sk)
+  - from: s3://benchmarks/tpcds_sf1/store_returns.parquet
+    name: store_returns
+    params: *s3_params
+    acceleration:
+      <<: *distributed_acceleration
+      partition_by:
+        - bucket(10, sr_item_sk)
+  - from: s3://benchmarks/tpcds_sf1/web_sales.parquet
+    name: web_sales
+    params: *s3_params
+    acceleration:
+      <<: *distributed_acceleration
+      partition_by:
+        - bucket(10, ws_item_sk)
+  - from: s3://benchmarks/tpcds_sf1/web_returns.parquet
+    name: web_returns
+    params: *s3_params
+    acceleration:
+      <<: *distributed_acceleration
+      partition_by:
+        - bucket(10, wr_item_sk)
+  - from: s3://benchmarks/tpcds_sf1/customer.parquet
+    name: customer
+    params: *s3_params
+    acceleration:
+      <<: *distributed_acceleration
+      partition_by:
+        - bucket(10, c_customer_sk)
+  - from: s3://benchmarks/tpcds_sf1/customer_address.parquet
+    name: customer_address
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/customer_demographics.parquet
+    name: customer_demographics
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/date_dim.parquet
+    name: date_dim
+    params: *s3_params
+    acceleration:
+      <<: *distributed_acceleration
+      partition_by:
+        - bucket(10, d_date_sk)
+  - from: s3://benchmarks/tpcds_sf1/household_demographics.parquet
+    name: household_demographics
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/item.parquet
+    name: item
+    params: *s3_params
+    acceleration:
+      <<: *distributed_acceleration
+      partition_by:
+        - bucket(10, i_item_sk)
+  - from: s3://benchmarks/tpcds_sf1/promotion.parquet
+    name: promotion
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/ship_mode.parquet
+    name: ship_mode
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/store.parquet
+    name: store
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/time_dim.parquet
+    name: time_dim
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/warehouse.parquet
+    name: warehouse
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/web_page.parquet
+    name: web_page
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/web_site.parquet
+    name: web_site
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/reason.parquet
+    name: reason
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/call_center.parquet
+    name: call_center
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/income_band.parquet
+    name: income_band
+    params: *s3_params
+    acceleration: *distributed_acceleration
+  - from: s3://benchmarks/tpcds_sf1/catalog_page.parquet
+    name: catalog_page
+    params: *s3_params
+    acceleration: *distributed_acceleration

@@ -1,0 +1,8 @@
+tests:
+  bench:
+    spicepod_path: distributed/s3[parquet]-cayenne[file].yaml
+    query_set: clickbench
+    query_transport: flightsql
+    runner_type: spiceai-dev-runners
+    validate_results: false
+    ready_wait: 1200
