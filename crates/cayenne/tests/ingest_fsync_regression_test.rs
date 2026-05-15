@@ -810,3 +810,90 @@ fn partition_lookup_uses_read_lock_fast_path() {
          partition would race."
     );
 }
+
+// -----------------------------------------------------------------------------
+// Position-based deletion-cache Arc-wrap regression test
+// -----------------------------------------------------------------------------
+//
+// `cached_deleted_row_ids` is published through `ArcSwap`. Every per-batch
+// position-based delete writes a fresh snapshot via
+// `cached_deleted_row_ids.store(Arc::new(updated_map))`. If the inner value
+// type is `RoaringBitmap` (NOT wrapped in `Arc`), the
+// `(*old_arc).clone()` step deep-clones every file's bitmap on every commit,
+// turning each delete into O(total deleted rows across all files) per call.
+// On long-lived tables with many files the per-batch cost grows without
+// bound.
+//
+// The fix wraps each per-file bitmap in `Arc<RoaringBitmap>` (type alias
+// `PositionBitmap`). The outer HashMap clone now only iterates `Arc`
+// pointers (O(F) cheap Arc::clones), not the bitmap data. Per-batch cost
+// becomes O(F + K_new) where K_new is the number of files actually
+// touched by THIS commit.
+
+const DELETION_STRATEGY_SRC: &str = include_str!("../src/provider/deletion_strategy.rs");
+const POSITION_BASED_SINK_SRC: &str =
+    include_str!("../src/provider/delete/sink/position_based.rs");
+
+#[test]
+fn position_bitmap_type_wraps_bitmap_in_arc() {
+    // The shared type alias MUST hold `Arc<RoaringBitmap>` as the value.
+    // Storing bare `RoaringBitmap` re-introduces the O(total deleted rows)
+    // deep-clone on every position-based delete commit.
+    let expected = "pub type PositionBitmap = HashMap<String, Arc<RoaringBitmap>>;";
+    assert!(
+        DELETION_STRATEGY_SRC.contains(expected),
+        "PositionBitmap must be `HashMap<String, Arc<RoaringBitmap>>`. The \
+         per-file bitmap wrap in `Arc` is what lets `cached_deleted_row_ids \
+         .store(Arc::new(updated_map))` publish a fresh snapshot without \
+         deep-cloning every bitmap. A bare `HashMap<String, RoaringBitmap>` \
+         re-introduces the O(total deleted rows) per-commit clone — the \
+         user-reported regression that prompted this fix."
+    );
+}
+
+#[test]
+fn position_based_sink_uses_arc_wrapped_bitmaps() {
+    // Sanity-check the writer-side updates use `Arc<RoaringBitmap>` for the
+    // cache_updates map and avoid the bare-clone pattern. Both checks are
+    // structural — the failure modes are subtle (correctness still works
+    // either way, but perf collapses).
+    assert!(
+        POSITION_BASED_SINK_SRC.contains("HashMap<String, Arc<RoaringBitmap>>"),
+        "position_based.rs must build cache_updates as \
+         `HashMap<String, Arc<RoaringBitmap>>` so the published snapshot \
+         doesn't have to wrap each entry in `Arc::new(...)` at store time. \
+         Bare `HashMap<String, RoaringBitmap>` types here force a bitmap \
+         clone at the publish step."
+    );
+
+    // The pre-fix regressed pattern: cloning the entire outer map via
+    // `(*cached_deleted_row_ids.load_full()).clone()` works equally for both
+    // value types BUT only the Arc<_> form keeps the clone cheap. Make sure
+    // the pre-fix one-line `RoaringBitmap` deref+clone is gone.
+    let bare_bitmap_clone = "let mut updated_map: HashMap<String, RoaringBitmap> =\n            (*cached_deleted_row_ids.load_full()).clone();";
+    assert!(
+        !POSITION_BASED_SINK_SRC.contains(bare_bitmap_clone),
+        "position_based.rs must NOT clone a `HashMap<String, RoaringBitmap>` \
+         from the ArcSwap snapshot — that pattern deep-clones every file's \
+         bitmap on every commit (the regression). Use the Arc-wrapped form: \
+         `HashMap<String, Arc<RoaringBitmap>>`."
+    );
+}
+
+#[test]
+fn position_based_sink_uses_try_unwrap_on_existing_bitmaps() {
+    // When rebuilding a single file's updated bitmap, try `Arc::try_unwrap`
+    // first — if the writer is the only Arc holder for that entry, we
+    // mutate in place. This is a small additional saving on top of the
+    // outer-map Arc-wrap (avoids cloning the affected bitmap when
+    // possible).
+    assert!(
+        POSITION_BASED_SINK_SRC.contains("Arc::try_unwrap(existing_bitmap_arc)"),
+        "position_based.rs should use `Arc::try_unwrap` on the
+        existing-bitmap Arc when building the updated bitmap for a file. If \
+         the writer is the sole Arc holder for that entry, this mutates in \
+         place; otherwise it falls back to a one-time clone of THAT file's \
+         bitmap only. Either way, we never touch any other file's bitmap \
+         data."
+    );
+}
