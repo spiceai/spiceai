@@ -497,15 +497,22 @@ impl FileSource for CayenneVortexFileSource {
 fn contains_decimal_to_floating_cast(expr: &dyn PhysicalExpr, schema: &Schema) -> bool {
     if let Some(cast) = expr.as_any().downcast_ref::<df_expr::CastExpr>() {
         let casts_to_floating = matches!(cast.cast_type(), DataType::Float32 | DataType::Float64);
-        let casts_from_decimal = cast.expr().data_type(schema).is_ok_and(|data_type| {
-            matches!(
+        // Resolve the input type of the cast using the provided schema.
+        // If resolution fails (e.g. Column index mismatch because the schema passed
+        // is the raw file_schema while the filter expr was built against a projected
+        // or wrapper-adjusted schema), conservatively treat it as a bad cast.
+        // This prevents accidentally pushing a decimal→float cast filter to Vortex,
+        // which can produce wrong comparison/NULL results due to precision differences.
+        let casts_from_decimal = match cast.expr().data_type(schema) {
+            Ok(data_type) => matches!(
                 data_type,
                 DataType::Decimal32(_, _)
                     | DataType::Decimal64(_, _)
                     | DataType::Decimal128(_, _)
                     | DataType::Decimal256(_, _)
-            )
-        });
+            ),
+            Err(_) => true, // cannot prove safe → skip pushdown (correctness first)
+        };
 
         if casts_to_floating && casts_from_decimal {
             return true;
