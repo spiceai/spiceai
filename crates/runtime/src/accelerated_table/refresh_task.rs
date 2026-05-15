@@ -1538,7 +1538,7 @@ impl RefreshTask {
 
         let federated_provider = self.federated.table_provider().await;
 
-        let existing_records = accelerator_df(
+        let mut existing_records = accelerator_df(
             &Arc::clone(&self.accelerator),
             &Self::create_refresh_df_context(
                 Arc::clone(&federated_provider),
@@ -1558,6 +1558,52 @@ impl RefreshTask {
         .await
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?;
+
+        // ACID fix for append dedup with nullable time_column:
+        // The > max_time query intentionally excludes older rows (including all
+        // NULL-time rows, since NULL > X is never true). To prevent duplicate
+        // appends of rows that have NULL in the time_column (a real consistency
+        // bug on retry / repeated refresh / source re-emit), we additionally
+        // collect *all* rows where the time column IS NULL. These "timeless"
+        // rows are then available to the exact-row StructArray comparator in
+        // filter_records, which treats two nulls in the same position as Equal
+        // (via make_comparator + Ordering::Equal). Exact duplicate NULL-time
+        // rows are now correctly filtered.
+        //
+        // This is the "comprehensive edge case" coverage for the recurring ACID
+        // task. We only pay the (hopefully small) cost of loading the NULL-time
+        // subset; the > max tail optimization is preserved for the non-null
+        // recent data. If the time_column is non-nullable, we skip this path.
+        if let Some(tc) = &refresh.time_column {
+            if self
+                .accelerator
+                .schema()
+                .column_with_name(tc)
+                .map_or(false, |(_, f)| f.is_nullable())
+            {
+                let null_time_rows = accelerator_df(
+                    &Arc::clone(&self.accelerator),
+                    &Self::create_refresh_df_context(
+                        Arc::clone(&federated_provider),
+                        &self.dataset_name,
+                        &self.accelerator,
+                        self.disable_federation,
+                        self.io_runtime.clone(),
+                    )
+                    .await,
+                )
+                .map_err(find_datafusion_root)
+                .context(super::UnableToScanTableProviderSnafu)?
+                .filter(col(tc).is_null())
+                .map_err(find_datafusion_root)
+                .context(super::UnableToScanTableProviderSnafu)?
+                .collect()
+                .await
+                .map_err(find_datafusion_root)
+                .context(super::UnableToScanTableProviderSnafu)?;
+                existing_records.extend(null_time_rows);
+            }
+        }
 
         // Use the update stream's schema for dedup comparison, not the full federated
         // provider schema.  When `refresh_sql` selects a column subset, the incoming
@@ -2965,17 +3011,27 @@ mod tests {
             .await
             .expect("collecting filtered data should succeed for NULL-time edge case test");
 
-        // Current behavior (documented limitation for ACID audit):
-        // The NULL-time duplicate is NOT filtered by the >max_time existing_records query,
-        // so it gets appended (2 rows total). The new high-time row is kept.
-        // This test will be updated to expect deduplication (1 row) once we extend
-        // the existing_records collection to also include `time IS NULL` rows.
-        assert_eq!(collected.data.len(), 1, "one output batch");
+        // After the ACID fix (collecting time IS NULL rows into existing_records for the
+        // StructArray comparator): the exact duplicate (ts=NULL, id=99) is now correctly
+        // filtered out because make_comparator returns Equal for two nulls in the time
+        // position + matching id. Only the genuinely new higher-time row remains.
+        // This is the comprehensive regression test for the nullable time_column edge
+        // case in append refresh dedup. Devil's advocate: we also need to consider
+        // whether large numbers of NULL-time rows could cause memory pressure — in
+        // practice the "timeless" set is expected to be small relative to the recent tail;
+        // if not, a follow-up can add a bounded collection or fall back to on-conflict upsert.
+        assert_eq!(collected.data.len(), 1, "one output batch after NULL-time dedup fix");
         assert_eq!(
             collected.data[0].num_rows(),
-            2,
-            "current append dedup with nullable time: NULL-time row (id=99) is re-appended \
-             (no dedup vs existing NULLs) while new row is kept. Edge case for recurring ACID task."
+            1,
+            "fixed append dedup with nullable time: NULL-time duplicate (id=99) is filtered; \
+             only the new higher-time row (id=2) remains. Comprehensive edge-case coverage for recurring ACID task."
         );
+        let id_col = collected.data[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be Int32 in NULL-time dedup test");
+        assert_eq!(id_col.value(0), 2, "remaining row after fix should be the new id=2 (NULL dup was filtered)");
     }
 }
