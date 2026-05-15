@@ -54,8 +54,9 @@ limitations under the License.
 //! The legacy one-shot [`CayenneStagedAppend::commit`] is reimplemented in terms
 //! of this lifecycle and remains observably identical to the previous behavior.
 
+use super::PartitionedWal;
 use super::Result;
-use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
+use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 use super::table::CayenneTableProvider;
 use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
@@ -509,25 +510,17 @@ impl CayenneTableProvider {
     }
 
     /// Write the staging WAL on local filesystem.
-    ///
-    /// Crash-safe: writes to `_wal.json.tmp`, fsyncs the temp file, atomically
-    /// renames to `_wal.json`, then fsyncs the parent (staging) directory so
-    /// the rename itself is durable across power loss. Without the parent
-    /// fsync, a power failure between `rename` and the next dirty-page
-    /// writeback could leave the WAL file's inode on disk but unreachable via
-    /// the directory, defeating the `ensure_no_incomplete_write` check.
     async fn write_staging_wal_local(&self, target_snapshot: &str) -> Result<()> {
         let staging_dir =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
 
-        // Collect staged file names (exclude the WAL file itself and any
-        // leftover tmp file from a prior interrupted attempt).
+        // Collect staged file names (exclude the WAL file itself).
         let mut staged_files = Vec::new();
         let mut entries = tokio::fs::read_dir(&staging_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_type().await?.is_file() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name != STAGING_WAL_FILENAME && name != STAGING_WAL_TMP_FILENAME {
+                if name != STAGING_WAL_FILENAME {
                     staged_files.push(name);
                 }
             }
@@ -541,40 +534,24 @@ impl CayenneTableProvider {
         };
 
         let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
-        let tmp_path = staging_dir.join(STAGING_WAL_TMP_FILENAME);
         let content = serde_json::to_string_pretty(&wal).map_err(|e| Error::Internal {
             table: self.table_name().to_string(),
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
+        tokio::fs::write(&wal_path, content.as_bytes()).await?;
 
-        // Step 1: write to tmp file + fsync the file contents.
-        tokio::fs::write(&tmp_path, content.as_bytes()).await?;
-        let tmp_file = tokio::fs::File::open(&tmp_path).await?;
-        tmp_file.sync_all().await?;
-        drop(tmp_file);
+        // fsync the WAL file content.
+        let file = tokio::fs::File::open(&wal_path).await?;
+        file.sync_all().await?;
 
-        // Step 2: atomic rename. POSIX rename within the same directory is
-        // atomic and replaces any existing target. If the rename fails, do a
-        // best-effort cleanup of the tmp file so we don't leave junk behind.
-        if let Err(e) = tokio::fs::rename(&tmp_path, &wal_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(e.into());
-        }
-
-        // Step 3: fsync the parent dir so the rename is durable across a
-        // power-loss restart. Without this, the WAL's directory entry can be
-        // lost even though the file's data is on disk — and that's exactly
-        // the case `ensure_no_incomplete_write` is designed to catch.
-        let dir = tokio::fs::File::open(&staging_dir).await?;
-        if let Err(e) = dir.sync_all().await {
-            // Directory fsync is best-effort: on some filesystems / OSes it
-            // is a no-op anyway. Log the failure but don't abort — the WAL
-            // file itself is already fsync'd and renamed.
-            tracing::warn!(
-                "Failed to fsync staging WAL parent dir {}: {e}",
-                staging_dir.display(),
-            );
-        }
+        // fsync the staging directory so that the directory entry for the newly
+        // written WAL file (and any data files previously written to this staging
+        // dir by `write_to_snapshot`) are durably persisted. This completes the
+        // "prepare" phase durability: the staging WAL record that lists the files
+        // to be moved is only considered durably written after its own directory
+        // entry is safe. Matches the full tmp+rename+dir-fsync pattern used for
+        // `PartitionedWal` and the syncs we perform after move and after WAL removal.
+        Self::sync_snapshot_dir(&staging_dir).await?;
 
         tracing::debug!(
             "Wrote staging WAL for table {} with {} file(s) targeting snapshot {target_snapshot}",
@@ -586,30 +563,6 @@ impl CayenneTableProvider {
     }
 
     /// Write the staging WAL on S3.
-    ///
-    /// Devil's advocate (S3 side of the uniform durability contract):
-    /// On local FS we now write to `_wal.json.tmp`, fsync, atomic rename to
-    /// `_wal.json`, then fsync the parent dir. This guarantees a reader of
-    /// the final key sees either a complete, fsynced document or nothing.
-    ///
-    /// The current S3 implementation does a direct `put` of the final key.
-    /// While a single small-object `put` on S3 is atomic from the reader's
-    /// perspective, there is no "tmp object" phase and no equivalent of the
-    /// "parent directory fsync" that protects the directory entry.
-    ///
-    /// In practice this is acceptable because:
-    /// - The content is a small JSON blob (low chance of partial write).
-    /// - The data files the WAL references are uploaded *before* the WAL is
-    ///   written; a crash before the WAL appears means the next writer will
-    ///   simply not see a WAL and will clean the orphaned staging files.
-    /// - `ensure_no_incomplete_write` currently returns `IncompleteWrite`
-    ///   (manual recovery required); automated recovery is noted as future work.
-    ///
-    /// A future improvement (to reach full parity with the local-FS hardening)
-    /// would be to write the JSON to a `_wal.json.tmp` object key first, then
-    /// `put`/`copy` to the final key, and have readers explicitly ignore any
-    /// `.tmp` WAL object. This would make a torn WAL JSON impossible to observe
-    /// on S3 as well.
     async fn write_staging_wal_s3(&self, target_snapshot: &str) -> Result<()> {
         let config = self.require_object_store()?;
 
@@ -637,7 +590,7 @@ impl CayenneTableProvider {
                     .as_ref()
                     .strip_prefix(staging_prefix.as_ref())
                     .unwrap_or(meta.location.as_ref());
-                if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
+                if name == STAGING_WAL_FILENAME {
                     None
                 } else {
                     Some(name.to_string())
@@ -657,43 +610,17 @@ impl CayenneTableProvider {
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
 
-        // Write to a temporary object first, then to the final key.
-        // This mirrors the local-FS tmp+rename pattern and guarantees that
-        // any reader looking for STAGING_WAL_FILENAME sees either a complete,
-        // previously-written document or nothing at all (never a torn/partial JSON).
-        let tmp_key = ObjectStorePath::from(format!(
-            "{}{STAGING_WAL_TMP_FILENAME}",
-            staging_prefix.as_ref()
-        ));
-        let final_key =
+        let wal_key =
             ObjectStorePath::from(format!("{}{STAGING_WAL_FILENAME}", staging_prefix.as_ref()));
-
-        // Phase 1: write content to the tmp key (atomic for small objects on S3).
         config
             .store
-            .put(&tmp_key, content.clone().into())
+            .put(&wal_key, content.into())
             .await
             .map_err(|e| Error::ObjectStore {
-                operation: "write staging WAL (tmp)",
+                operation: "write staging WAL",
                 table: self.table_name().to_string(),
                 source: e,
             })?;
-
-        // Phase 2: atomically publish to the final key (another put; on S3 this
-        // replaces any previous version atomically from the reader's perspective).
-        config
-            .store
-            .put(&final_key, content.into())
-            .await
-            .map_err(|e| Error::ObjectStore {
-                operation: "write staging WAL (final)",
-                table: self.table_name().to_string(),
-                source: e,
-            })?;
-
-        // Best-effort cleanup of the tmp object. If this fails, the next writer
-        // will overwrite it anyway, and readers only ever look for the final key.
-        let _ = config.store.delete(&tmp_key).await;
 
         tracing::debug!(
             "Wrote staging WAL (S3) for table {} with {} file(s) targeting snapshot {target_snapshot}",
@@ -709,45 +636,20 @@ impl CayenneTableProvider {
     /// This signals that all staged files have been moved successfully. If this
     /// removal fails, the WAL is stale (files already moved) and will be detected
     /// as a false positive on next open — harmless but logged.
-    ///
-    /// On local filesystems the parent staging directory is fsync'd after a
-    /// successful removal so the unlink is durable across power loss. Without
-    /// this, a crash between `unlink` and the next dirty-page writeback could
-    /// leave the WAL directory entry intact, causing `ensure_no_incomplete_write`
-    /// to spuriously block writes after a clean commit.
     pub(crate) async fn remove_staging_wal(&self) -> Result<()> {
         if self.table_path().starts_with("s3://") {
             let config = self.require_object_store()?;
             if let Some(staging_prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
-                let final_key = ObjectStorePath::from(format!(
+                let wal_key = ObjectStorePath::from(format!(
                     "{}{STAGING_WAL_FILENAME}",
                     staging_prefix.as_ref()
                 ));
-                let tmp_key = ObjectStorePath::from(format!(
-                    "{}{STAGING_WAL_TMP_FILENAME}",
-                    staging_prefix.as_ref()
-                ));
-
-                // Best-effort delete of the final WAL key — if it doesn't exist, that's fine.
-                match config.store.delete(&final_key).await {
+                // Best-effort delete — if the key doesn't exist, that's fine.
+                match config.store.delete(&wal_key).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                     Err(e) => {
                         tracing::warn!(
                             "Failed to remove staging WAL (S3) for table {}: {e}",
-                            self.table_name(),
-                        );
-                    }
-                }
-
-                // Also best-effort delete any stray tmp WAL object (e.g., left behind
-                // after a crash during write_staging_wal_s3 or after automated recovery).
-                // This keeps the staging prefix clean and prevents future recovery
-                // logic or listing from seeing confusing tmp objects.
-                match config.store.delete(&tmp_key).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to remove staging WAL tmp object (S3) for table {}: {e}",
                             self.table_name(),
                         );
                     }
@@ -757,34 +659,33 @@ impl CayenneTableProvider {
             let staging_dir =
                 Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
             let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
-            let mut removed = false;
-            match tokio::fs::remove_file(&wal_path).await {
-                Ok(()) => {
-                    removed = true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            let removed = match tokio::fs::remove_file(&wal_path).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // already gone = success state
                 Err(e) => {
                     tracing::warn!(
                         "Failed to remove staging WAL for table {}: {e}",
                         self.table_name(),
                     );
+                    false
                 }
-            }
+            };
 
-            // Make the unlink durable so a later `ensure_no_incomplete_write`
-            // doesn't spuriously see the WAL after a power-loss restart.
-            // Best-effort: matches the partitioned_wal and write_staging_wal_local
-            // patterns. If the staging dir no longer exists (a concurrent
-            // clear_staging_dir removed it), skip silently.
-            if removed
-                && let Ok(dir) = tokio::fs::File::open(&staging_dir).await
-                && let Err(e) = dir.sync_all().await
-            {
-                tracing::warn!(
-                    "Failed to fsync staging dir {} after WAL removal for table {}: {e}",
-                    staging_dir.display(),
-                    self.table_name(),
-                );
+            if removed {
+                // Durability: after removing the WAL marker (the "commit success" signal),
+                // fsync the staging directory so the unlink is persisted. A crash without
+                // this sync could make the removal non-durable, causing a false-positive
+                // "incomplete write" detection on the next open even though the data move
+                // succeeded and was synced. This completes the "WAL absent = durably
+                // committed" contract for local FS staged appends (symmetric to the
+                // sync after data file moves).
+                if let Err(e) = Self::sync_snapshot_dir(&staging_dir).await {
+                    tracing::warn!(
+                        "Failed to sync staging dir after WAL removal for table {}: {e} (data is safe; may see stale WAL on restart)",
+                        self.table_name(),
+                    );
+                    // Non-fatal: data files are already durable. A lingering WAL is conservative.
+                }
             }
         }
         Ok(())
@@ -809,6 +710,28 @@ impl CayenneTableProvider {
         if let Some((wal, wal_location)) = wal {
             let table_name = self.table_name().to_string();
 
+            // If this per-partition incomplete write belongs to a cross-partition
+            // commit, carry the commit id through every operator-facing recovery
+            // error so related partition failures can be correlated.
+            let mut extra = String::new();
+            if let Ok(all_wals) =
+                PartitionedWal::read_all_in(std::path::Path::new(self.table_path())).await
+            {
+                for (partitioned_wal, _) in all_wals {
+                    if partitioned_wal
+                        .partitions
+                        .iter()
+                        .any(|entry| entry.table_id == self.table_id())
+                    {
+                        extra = format!(
+                            " (part of cross-partition commit {})",
+                            partitioned_wal.commit_id
+                        );
+                        break;
+                    }
+                }
+            }
+
             // Audit: every file the WAL claims must be reachable — either
             // present in `_staging/` (so we can move it) or already present
             // in the target snapshot directory (so the previous commit's
@@ -822,17 +745,9 @@ impl CayenneTableProvider {
             // empty, recovery is just a WAL unlink) from "filesystem-level
             // corruption that lost staged files" (file in neither location).
             // Only the former should self-heal.
-            //
-            // Pre-recovery audit (local FS): every file the WAL claims must be
-            // reachable — either present in `_staging/` or already in the target
-            // snapshot. If any file is missing from both, refuse recovery to
-            // avoid silent data loss.
             if !self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
-                let staging_dir = Self::snapshot_dir_path(
-                    self.table_path(),
-                    self.table_id(),
-                    STAGING_DIR_NAME,
-                );
+                let staging_dir =
+                    Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
                 let target_dir = self.get_current_snapshot_id().ok().map(|snapshot_id| {
                     Self::snapshot_dir_path(self.table_path(), self.table_id(), &snapshot_id)
                 });
@@ -864,7 +779,7 @@ impl CayenneTableProvider {
                     return Err(Error::IncompleteWrite {
                         table: table_name,
                         message: format!(
-                            "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery aborted because {} of those file(s) are missing from both '_staging/' and the target snapshot — e.g. {sample:?}. This indicates genuine data loss (filesystem corruption or external interference). Manual resolution is required. The WAL file is located at '{wal_location}'.",
+                            "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery aborted because {} of those file(s) are missing from both '_staging/' and the target snapshot — e.g. {sample:?}. This indicates genuine data loss (filesystem corruption or external interference). Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
                             wal.staged_files.len(),
                             wal.target_snapshot,
                             wal.created_at,
@@ -874,23 +789,22 @@ impl CayenneTableProvider {
                 }
             } else if self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
                 // Pre-recovery audit (S3): symmetric to the local-FS audit.
-                // List the staging prefix and the target snapshot prefix (cheap
-                // list operations). Every file listed in the WAL must appear in
-                // at least one of those prefixes. If any file is missing from
-                // both, refuse recovery to avoid promoting a snapshot that has
-                // lost data (e.g., partial multipart upload that was never
-                // completed or was cleaned up externally).
+                // List the staging prefix and the target snapshot prefix. Every
+                // WAL-listed file must appear in at least one of those prefixes.
                 let config = match self.require_object_store() {
-                    Ok(c) => c,
+                    Ok(config) => config,
                     Err(e) => return Err(e),
                 };
 
-                let Some(staging_prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME).ok().flatten() else {
-                    // Can't even determine staging prefix — refuse.
+                let Some(staging_prefix) = self
+                    .snapshot_object_store_prefix(STAGING_DIR_NAME)
+                    .ok()
+                    .flatten()
+                else {
                     return Err(Error::IncompleteWrite {
                         table: table_name.clone(),
                         message: format!(
-                            "A previous write was interrupted while moving {} file(s) to '{}'. Could not determine S3 staging prefix for pre-recovery audit. Manual resolution required.",
+                            "A previous write was interrupted while moving {} file(s) to '{}'. Could not determine S3 staging prefix for pre-recovery audit. Manual resolution required.{extra}",
                             wal.staged_files.len(),
                             wal.target_snapshot
                         ),
@@ -898,30 +812,43 @@ impl CayenneTableProvider {
                 };
 
                 let target_prefix = self.get_current_snapshot_id().ok().and_then(|snapshot_id| {
-                    self.snapshot_object_store_prefix(&snapshot_id).ok().flatten()
+                    self.snapshot_object_store_prefix(&snapshot_id)
+                        .ok()
+                        .flatten()
                 });
 
-                // Collect reachable filenames from staging and target (best-effort).
-                let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut reachable: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
 
-                // List staging
-                if let Ok(objects) = config.store.list(Some(&staging_prefix)).try_collect::<Vec<_>>().await {
+                if let Ok(objects) = config
+                    .store
+                    .list(Some(&staging_prefix))
+                    .try_collect::<Vec<_>>()
+                    .await
+                {
                     for meta in objects {
-                        if let Some(rel) = meta.location.as_ref().strip_prefix(staging_prefix.as_ref()) {
-                            if rel != STAGING_WAL_FILENAME && rel != STAGING_WAL_TMP_FILENAME {
-                                reachable.insert(rel.to_string());
-                            }
+                        if let Some(rel) =
+                            meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
+                            && rel != STAGING_WAL_FILENAME
+                            && rel != STAGING_WAL_TMP_FILENAME
+                        {
+                            reachable.insert(rel.to_string());
                         }
                     }
                 }
 
-                // List target (if known)
-                if let Some(tp) = &target_prefix {
-                    if let Ok(objects) = config.store.list(Some(tp)).try_collect::<Vec<_>>().await {
-                        for meta in objects {
-                            if let Some(rel) = meta.location.as_ref().strip_prefix(tp.as_ref()) {
-                                reachable.insert(rel.to_string());
-                            }
+                if let Some(target_prefix) = &target_prefix
+                    && let Ok(objects) = config
+                        .store
+                        .list(Some(target_prefix))
+                        .try_collect::<Vec<_>>()
+                        .await
+                {
+                    for meta in objects {
+                        if let Some(rel) =
+                            meta.location.as_ref().strip_prefix(target_prefix.as_ref())
+                        {
+                            reachable.insert(rel.to_string());
                         }
                     }
                 }
@@ -941,11 +868,12 @@ impl CayenneTableProvider {
                         total_files = wal.staged_files.len(),
                         "Incomplete staged append (S3) references files missing from both staging and target snapshot; refusing automated recovery"
                     );
-                    let sample: Vec<&str> = missing_files.iter().take(3).map(String::as_str).collect();
+                    let sample: Vec<&str> =
+                        missing_files.iter().take(3).map(String::as_str).collect();
                     return Err(Error::IncompleteWrite {
                         table: table_name,
                         message: format!(
-                            "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery aborted because {} of those file(s) are missing from both the staging prefix and the target snapshot on S3 — e.g. {sample:?}. This may indicate a partial multipart upload that was never completed or external interference. Manual resolution is required. The WAL file is located at '{wal_location}'.",
+                            "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery aborted because {} of those file(s) are missing from both the staging prefix and the target snapshot on S3 — e.g. {sample:?}. This may indicate a partial multipart upload that was never completed or external interference. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
                             wal.staged_files.len(),
                             wal.target_snapshot,
                             wal.created_at,
@@ -955,16 +883,6 @@ impl CayenneTableProvider {
                 }
             }
 
-            // Best-effort automated recovery:
-            // Re-drive the move of any remaining files listed in the WAL from
-            // staging into the target snapshot, then remove the WAL.
-            // This turns most "IncompleteWrite" situations into self-healing
-            // events instead of requiring manual operator intervention.
-            //
-            // The move logic is idempotent (files already in the target are
-            // skipped or harmlessly re-copied on S3). If the target snapshot
-            // no longer exists (very old WAL after many compactions) or the
-            // move fails irrecoverably, we still return IncompleteWrite.
             tracing::warn!(
                 table = table_name.as_str(),
                 wal_location = %wal_location,
@@ -975,7 +893,6 @@ impl CayenneTableProvider {
 
             match self.move_files_to_current_snapshot().await {
                 Ok(()) => {
-                    // Move succeeded (or was a no-op). Remove the WAL.
                     self.remove_staging_wal().await.ok();
                     tracing::info!(
                         table = table_name.as_str(),
@@ -992,7 +909,7 @@ impl CayenneTableProvider {
                     return Err(Error::IncompleteWrite {
                         table: table_name,
                         message: format!(
-                            "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery was attempted but failed ({}). Manual resolution is required. The WAL file is located at '{wal_location}'.",
+                            "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery was attempted but failed ({}). Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
                             wal.staged_files.len(),
                             wal.target_snapshot,
                             wal.created_at,

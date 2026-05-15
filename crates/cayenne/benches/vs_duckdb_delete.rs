@@ -148,8 +148,7 @@ fn bench_delete(c: &mut Criterion) {
             |b, &_| {
                 b.iter(|| {
                     rt.block_on(async {
-                        let batches =
-                            cayenne_query(&cf.table, "SELECT SUM(value) FROM t").await;
+                        let batches = cayenne_query(&cf.table, "SELECT SUM(value) FROM t").await;
                         black_box(batches);
                     });
                 });

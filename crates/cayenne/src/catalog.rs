@@ -358,8 +358,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
-    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str)
-    -> CatalogResult<()>;
+    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
     /// Add a partition to a table.
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String>;

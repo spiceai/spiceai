@@ -1248,8 +1248,14 @@ async fn test_concurrent_table_creation_writes_restart_impl(
     let t1 = catalog_restart.get_table("concurrent_t1").await;
     let t2 = catalog_restart.get_table("concurrent_t2").await;
 
-    assert!(t1.is_ok(), "table concurrent_t1 must survive restart after concurrent creation + write path");
-    assert!(t2.is_ok(), "table concurrent_t2 must survive restart after concurrent creation + write path");
+    assert!(
+        t1.is_ok(),
+        "table concurrent_t1 must survive restart after concurrent creation + write path"
+    );
+    assert!(
+        t2.is_ok(),
+        "table concurrent_t2 must survive restart after concurrent creation + write path"
+    );
 
     Ok(())
 }

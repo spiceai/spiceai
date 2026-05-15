@@ -35,10 +35,24 @@ use crate::metadata::{
 use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
-use arrow::array::Array;
+use arrow::array::{
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::compute::kernels::aggregate;
+use arrow::datatypes::{
+    Date32Type, Date64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type,
+    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
 use datafusion::datasource::file_format::FileFormat;
@@ -52,7 +66,7 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::{ColumnStatistics, Constraints, DFSchema, Statistics};
+use datafusion_common::{ColumnStatistics, Constraints, DFSchema, ScalarValue, Statistics};
 use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
@@ -206,6 +220,22 @@ impl ColumnStatsAccumulator {
             };
         }
 
+        let (batch_min, batch_max) =
+            Self::fast_column_min_max(col).unwrap_or_else(|| Self::scalar_column_min_max(col));
+
+        datafusion_common::ColumnStatistics {
+            null_count,
+            min_value: batch_min.map_or(Precision::Absent, Precision::Exact),
+            max_value: batch_max.map_or(Precision::Absent, Precision::Exact),
+            sum_value: Precision::Absent,
+            distinct_count: Precision::Absent,
+            byte_size: Precision::Absent,
+        }
+    }
+
+    fn scalar_column_min_max(
+        col: &dyn arrow::array::Array,
+    ) -> (Option<ScalarValue>, Option<ScalarValue>) {
         // O(n) linear scan to find min/max using `ScalarValue` comparison.
         // NaN values are skipped entirely so stats remain deterministic.
         let mut batch_min: Option<datafusion_common::ScalarValue> = None;
@@ -246,14 +276,205 @@ impl ColumnStatsAccumulator {
             });
         }
 
-        datafusion_common::ColumnStatistics {
-            null_count,
-            min_value: batch_min.map_or(Precision::Absent, Precision::Exact),
-            max_value: batch_max.map_or(Precision::Absent, Precision::Exact),
-            sum_value: Precision::Absent,
-            distinct_count: Precision::Absent,
-            byte_size: Precision::Absent,
+        (batch_min, batch_max)
+    }
+
+    fn fast_column_min_max(
+        col: &dyn arrow::array::Array,
+    ) -> Option<(Option<ScalarValue>, Option<ScalarValue>)> {
+        macro_rules! primitive_min_max {
+            ($array_ty:ty, $arrow_ty:ty, |$value:ident| $scalar:expr) => {{
+                let array = col.as_any().downcast_ref::<$array_ty>()?;
+                let min_value = aggregate::min::<$arrow_ty>(array).map(|$value| $scalar);
+                let max_value = aggregate::max::<$arrow_ty>(array).map(|$value| $scalar);
+                Some((min_value, max_value))
+            }};
         }
+
+        macro_rules! byte_min_max {
+            ($array_ty:ty, $min_fn:ident, $max_fn:ident, |$value:ident| $scalar:expr) => {{
+                let array = col.as_any().downcast_ref::<$array_ty>()?;
+                let min_value = aggregate::$min_fn(array).map(|$value| $scalar);
+                let max_value = aggregate::$max_fn(array).map(|$value| $scalar);
+                Some((min_value, max_value))
+            }};
+        }
+
+        match col.data_type() {
+            DataType::Boolean => {
+                let array = col.as_any().downcast_ref::<BooleanArray>()?;
+                Some((
+                    aggregate::min_boolean(array).map(|value| ScalarValue::Boolean(Some(value))),
+                    aggregate::max_boolean(array).map(|value| ScalarValue::Boolean(Some(value))),
+                ))
+            }
+            DataType::Int8 => primitive_min_max!(Int8Array, Int8Type, |value| {
+                ScalarValue::Int8(Some(value))
+            }),
+            DataType::Int16 => primitive_min_max!(Int16Array, Int16Type, |value| {
+                ScalarValue::Int16(Some(value))
+            }),
+            DataType::Int32 => primitive_min_max!(Int32Array, Int32Type, |value| {
+                ScalarValue::Int32(Some(value))
+            }),
+            DataType::Int64 => primitive_min_max!(Int64Array, Int64Type, |value| {
+                ScalarValue::Int64(Some(value))
+            }),
+            DataType::UInt8 => primitive_min_max!(UInt8Array, UInt8Type, |value| {
+                ScalarValue::UInt8(Some(value))
+            }),
+            DataType::UInt16 => primitive_min_max!(UInt16Array, UInt16Type, |value| {
+                ScalarValue::UInt16(Some(value))
+            }),
+            DataType::UInt32 => primitive_min_max!(UInt32Array, UInt32Type, |value| {
+                ScalarValue::UInt32(Some(value))
+            }),
+            DataType::UInt64 => primitive_min_max!(UInt64Array, UInt64Type, |value| {
+                ScalarValue::UInt64(Some(value))
+            }),
+            DataType::Float32 => {
+                let array = col.as_any().downcast_ref::<Float32Array>()?;
+                let (min_value, max_value) = Self::float32_min_max(array);
+                Some((
+                    min_value.map(|value| ScalarValue::Float32(Some(value))),
+                    max_value.map(|value| ScalarValue::Float32(Some(value))),
+                ))
+            }
+            DataType::Float64 => {
+                let array = col.as_any().downcast_ref::<Float64Array>()?;
+                let (min_value, max_value) = Self::float64_min_max(array);
+                Some((
+                    min_value.map(|value| ScalarValue::Float64(Some(value))),
+                    max_value.map(|value| ScalarValue::Float64(Some(value))),
+                ))
+            }
+            DataType::Decimal128(precision, scale) => {
+                primitive_min_max!(Decimal128Array, Decimal128Type, |value| {
+                    ScalarValue::Decimal128(Some(value), *precision, *scale)
+                })
+            }
+            DataType::Utf8 => byte_min_max!(StringArray, min_string, max_string, |value| {
+                ScalarValue::Utf8(Some(value.to_string()))
+            }),
+            DataType::LargeUtf8 => {
+                byte_min_max!(LargeStringArray, min_string, max_string, |value| {
+                    ScalarValue::LargeUtf8(Some(value.to_string()))
+                })
+            }
+            DataType::Utf8View => {
+                byte_min_max!(StringViewArray, min_string_view, max_string_view, |value| {
+                    ScalarValue::Utf8View(Some(value.to_string()))
+                })
+            }
+            DataType::Binary => byte_min_max!(BinaryArray, min_binary, max_binary, |value| {
+                ScalarValue::Binary(Some(value.to_vec()))
+            }),
+            DataType::LargeBinary => {
+                byte_min_max!(LargeBinaryArray, min_binary, max_binary, |value| {
+                    ScalarValue::LargeBinary(Some(value.to_vec()))
+                })
+            }
+            DataType::BinaryView => {
+                byte_min_max!(BinaryViewArray, min_binary_view, max_binary_view, |value| {
+                    ScalarValue::BinaryView(Some(value.to_vec()))
+                })
+            }
+            DataType::FixedSizeBinary(size) => byte_min_max!(
+                FixedSizeBinaryArray,
+                min_fixed_size_binary,
+                max_fixed_size_binary,
+                |value| { ScalarValue::FixedSizeBinary(*size, Some(value.to_vec())) }
+            ),
+            DataType::Date32 => primitive_min_max!(Date32Array, Date32Type, |value| {
+                ScalarValue::Date32(Some(value))
+            }),
+            DataType::Date64 => primitive_min_max!(Date64Array, Date64Type, |value| {
+                ScalarValue::Date64(Some(value))
+            }),
+            DataType::Time32(TimeUnit::Second) => {
+                primitive_min_max!(Time32SecondArray, Time32SecondType, |value| {
+                    ScalarValue::Time32Second(Some(value))
+                })
+            }
+            DataType::Time32(TimeUnit::Millisecond) => {
+                primitive_min_max!(Time32MillisecondArray, Time32MillisecondType, |value| {
+                    ScalarValue::Time32Millisecond(Some(value))
+                })
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                primitive_min_max!(Time64MicrosecondArray, Time64MicrosecondType, |value| {
+                    ScalarValue::Time64Microsecond(Some(value))
+                })
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                primitive_min_max!(Time64NanosecondArray, Time64NanosecondType, |value| {
+                    ScalarValue::Time64Nanosecond(Some(value))
+                })
+            }
+            DataType::Timestamp(TimeUnit::Second, tz) => {
+                primitive_min_max!(TimestampSecondArray, TimestampSecondType, |value| {
+                    ScalarValue::TimestampSecond(Some(value), tz.clone())
+                })
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => primitive_min_max!(
+                TimestampMillisecondArray,
+                TimestampMillisecondType,
+                |value| { ScalarValue::TimestampMillisecond(Some(value), tz.clone()) }
+            ),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => primitive_min_max!(
+                TimestampMicrosecondArray,
+                TimestampMicrosecondType,
+                |value| { ScalarValue::TimestampMicrosecond(Some(value), tz.clone()) }
+            ),
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                primitive_min_max!(TimestampNanosecondArray, TimestampNanosecondType, |value| {
+                    ScalarValue::TimestampNanosecond(Some(value), tz.clone())
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn float32_min_max(array: &Float32Array) -> (Option<f32>, Option<f32>) {
+        let mut min_value: Option<f32> = None;
+        let mut max_value: Option<f32> = None;
+
+        for value in array.iter().flatten() {
+            if value.is_nan() {
+                continue;
+            }
+            min_value = Some(match min_value {
+                Some(current) if current <= value => current,
+                _ => value,
+            });
+            max_value = Some(match max_value {
+                Some(current) if current >= value => current,
+                _ => value,
+            });
+        }
+
+        (min_value, max_value)
+    }
+
+    fn float64_min_max(array: &Float64Array) -> (Option<f64>, Option<f64>) {
+        let mut min_value: Option<f64> = None;
+        let mut max_value: Option<f64> = None;
+
+        for value in array.iter().flatten() {
+            if value.is_nan() {
+                continue;
+            }
+            min_value = Some(match min_value {
+                Some(current) if current <= value => current,
+                _ => value,
+            });
+            max_value = Some(match max_value {
+                Some(current) if current >= value => current,
+                _ => value,
+            });
+        }
+
+        (min_value, max_value)
     }
 
     /// Get the total accumulated row count.
@@ -1223,9 +1444,11 @@ impl CayenneTableProvider {
 
     // Create listing options for Vortex format.
     ///
-    /// Only wraps the `VortexFormat` with `DeletionFilteringVortexFormat` for
-    /// `PositionBased` strategy. PK-based strategies (`Int64Pk`, `RowConverterBased`)
-    /// filter at the `ExecutionPlan` level, not during file reading.
+    /// Always wraps the `VortexFormat` so Cayenne-specific Vortex predicate
+    /// pushdown guards apply to every scan. `PositionBased` additionally
+    /// attaches deletion vectors during file reading; PK-based strategies
+    /// (`Int64Pk`, `RowConverterBased`) still filter at the `ExecutionPlan`
+    /// level.
     fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
@@ -1239,9 +1462,9 @@ impl CayenneTableProvider {
                 Arc::clone(cached_deleted_row_ids),
             )),
             PkDeletionStrategyWithCache::Int64Pk { .. }
-            | PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                Arc::clone(vortex_format) as Arc<dyn FileFormat>
-            }
+            | PkDeletionStrategyWithCache::RowConverterBased { .. } => Arc::new(
+                DeletionFilteringVortexFormat::without_deletion_vectors(Arc::clone(vortex_format)),
+            ),
         };
         ListingOptions::new(file_format).with_session_config_options(session_config)
     }
@@ -1277,7 +1500,25 @@ impl CayenneTableProvider {
         snapshot_dir: &std::path::Path,
     ) -> std::io::Result<()> {
         if !snapshot_dir.exists() {
+            // Capture the parent before creation so we can sync it afterwards.
+            let parent = snapshot_dir.parent().map(std::path::Path::to_path_buf);
             tokio::fs::create_dir_all(snapshot_dir).await?;
+
+            // Make the *creation of the new snapshot directory itself* durable.
+            // On POSIX, creating a subdirectory updates the parent's directory
+            // metadata. Without syncing the parent, a crash can make the new
+            // snapshot directory "disappear" from the filesystem even though
+            // we later write files into it and commit the catalog to point at it.
+            // This is the same durability requirement we enforce for file
+            // creation, renames, and WAL marker removal elsewhere in the code.
+            if let Some(parent) = parent {
+                tokio::task::spawn_blocking(move || {
+                    let f = std::fs::File::open(&parent)?;
+                    f.sync_all()
+                })
+                .await
+                .map_err(std::io::Error::other)??;
+            }
         }
         Ok(())
     }
@@ -1406,6 +1647,13 @@ impl CayenneTableProvider {
             "Moved {moved_count} file(s) from staging to snapshot {current_snapshot} for table {table_name}",
             table_name = self.table_metadata.table_name,
         );
+
+        // Durability: fsync the target snapshot directory so that the rename operations
+        // are persisted before the caller removes the staging WAL. This ensures that
+        // "WAL absent" truly means the data files are durable on disk (ACID Durability
+        // for the staged append path on local filesystems). Matches the sync performed
+        // in the sort-rewrite / compaction path before metadata commit.
+        Self::sync_snapshot_dir(&target_dir).await?;
 
         Ok(())
     }
@@ -1906,6 +2154,17 @@ impl CayenneTableProvider {
                 target_partitions,
             )
             .await?;
+
+        // Sync the new snapshot directory for durability before recording the
+        // sequence number in the catalog. This is required for the same reason
+        // as in the sort-rewrite and normal append paths: the Vortex files must
+        // be durably present before the catalog metadata that makes them
+        // visible (via sequence number / protected snapshot) is committed.
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        }
 
         tracing::debug!(
             "Insert to new snapshot {} completed, wrote {} rows to Vortex in {} chunk(s)",
@@ -3706,9 +3965,7 @@ impl CayenneTableProvider {
         use super::compaction::{FileEntry, pick_candidates};
 
         let snapshot_id = self.get_current_snapshot_id()?;
-        let files = self
-            .list_snapshot_files_with_sizes(&snapshot_id)
-            .await?;
+        let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
 
         if files.len() < 2 {
             return Ok(false);
@@ -3816,19 +4073,13 @@ impl CayenneTableProvider {
         // `(name, size)` pairs the picker needs are retained.
         let mut stream = config.store.list(Some(&prefix));
         let mut files = Vec::new();
-        while let Some(meta) = stream
-            .try_next()
-            .await
-            .map_err(|e| Error::ObjectStore {
-                operation: "list snapshot objects for compaction",
-                table: self.table_metadata.table_name.clone(),
-                source: e,
-            })?
-        {
+        while let Some(meta) = stream.try_next().await.map_err(|e| Error::ObjectStore {
+            operation: "list snapshot objects for compaction",
+            table: self.table_metadata.table_name.clone(),
+            source: e,
+        })? {
             let path_str = meta.location.as_ref();
-            let name = path_str
-                .rsplit_once('/')
-                .map_or(path_str, |(_, name)| name);
+            let name = path_str.rsplit_once('/').map_or(path_str, |(_, name)| name);
 
             if !Self::is_compactable_data_file(name) {
                 continue;
@@ -6673,6 +6924,70 @@ mod tests {
         assert_eq!(
             stats.column_statistics[0].null_count,
             column_stats.null_count
+        );
+    }
+
+    #[test]
+    fn compute_column_stats_uses_typed_min_max_for_int64() {
+        let array = Int64Array::from(vec![Some(10), None, Some(-4), Some(7)]);
+
+        let stats = ColumnStatsAccumulator::compute_column_stats(&array);
+
+        assert_eq!(
+            stats.null_count,
+            datafusion_common::stats::Precision::Exact(1)
+        );
+        assert_eq!(
+            stats.min_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(-4)))
+        );
+        assert_eq!(
+            stats.max_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(10)))
+        );
+    }
+
+    #[test]
+    fn compute_column_stats_skips_float_nan_values() {
+        let array = Float64Array::from(vec![Some(f64::NAN), Some(5.0), None, Some(-2.0)]);
+
+        let stats = ColumnStatsAccumulator::compute_column_stats(&array);
+
+        assert_eq!(
+            stats.null_count,
+            datafusion_common::stats::Precision::Exact(1)
+        );
+        assert_eq!(
+            stats.min_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Float64(Some(-2.0)))
+        );
+        assert_eq!(
+            stats.max_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Float64(Some(5.0)))
+        );
+    }
+
+    #[test]
+    fn compute_column_stats_uses_typed_min_max_for_utf8_view() {
+        let array = StringViewArray::from(vec![Some("beta"), Some("alpha"), None]);
+
+        let stats = ColumnStatsAccumulator::compute_column_stats(&array);
+
+        assert_eq!(
+            stats.null_count,
+            datafusion_common::stats::Precision::Exact(1)
+        );
+        assert_eq!(
+            stats.min_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Utf8View(Some(
+                "alpha".to_string()
+            )))
+        );
+        assert_eq!(
+            stats.max_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Utf8View(Some(
+                "beta".to_string()
+            )))
         );
     }
 

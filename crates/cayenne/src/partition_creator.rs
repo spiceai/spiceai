@@ -210,30 +210,34 @@ impl PartitionCreator for CayennePartitionCreator {
         }
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
-        std::fs::create_dir_all(&partition_dir)
+        tokio::fs::create_dir_all(&partition_dir)
+            .await
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
-        // Durability: fsync the parent table directory after creating a new
-        // partition subdir. Without this, a crash after mkdir but before the
-        // directory entry is on disk can make the partition path unreachable
-        // even though catalog metadata was written and data files may have
-        // been created inside it. This is the last create_dir_all + catalog
-        // metadata record site in the Cayenne write surface; it completes the
-        // uniform durability contract (matching snapshot dirs, staging/,
-        // deletions/, _partitioned_wal/, catalog DB dir, etc.).
-        //
-        // Only relevant for local FS; on object stores (S3) directories are
-        // virtual and the "create" is a no-op.
-        if self.object_store_config.is_none() {
-            let parent = self.base_path.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(dir) = std::fs::File::open(&parent) {
-                    let _ = dir.sync_all();
-                }
+        // For local FS, sync the parent (table base_path) after creating a new
+        // partition sub-directory so its directory entry is durable before we
+        // record the partition in the catalog via add_partition. This follows
+        // the same uniform contract as snapshot directories, _partitioned_wal/,
+        // deletions/ subdirs, and initial table creation.
+        if self.object_store_config.is_none()
+            && let Some(parent) = partition_dir.parent()
+        {
+            let parent = parent.to_path_buf();
+            let parent_display = parent.display().to_string();
+            match tokio::task::spawn_blocking(move || {
+                std::fs::File::open(&parent).and_then(|f| f.sync_all())
             })
             .await
-            .ok();
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    "Failed to sync Cayenne partition parent directory {parent_display}: {error}"
+                ),
+                Err(error) => tracing::warn!(
+                    "Failed to join Cayenne partition parent directory sync task for {parent_display}: {error}"
+                ),
+            }
         }
 
         let partition_column_names = self.partition_column_labels();

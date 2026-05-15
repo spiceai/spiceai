@@ -502,7 +502,8 @@ mod tests {
             calls: Arc::clone(&calls),
         });
 
-        let weak: Weak<dyn CompactionRunner> = Arc::downgrade(&runner) as Weak<dyn CompactionRunner>;
+        let weak: Weak<dyn CompactionRunner> =
+            Arc::downgrade(&runner) as Weak<dyn CompactionRunner>;
         let semaphore = Arc::new(Semaphore::new(1));
         let compactor = BackgroundCompactor::spawn(weak, Duration::from_secs(1), semaphore)
             .expect("scheduler should spawn with non-zero interval");
@@ -530,7 +531,8 @@ mod tests {
             name: "test_table".to_string(),
             calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
-        let weak: Weak<dyn CompactionRunner> = Arc::downgrade(&runner) as Weak<dyn CompactionRunner>;
+        let weak: Weak<dyn CompactionRunner> =
+            Arc::downgrade(&runner) as Weak<dyn CompactionRunner>;
         let semaphore = Arc::new(Semaphore::new(1));
         assert!(BackgroundCompactor::spawn(weak, Duration::ZERO, semaphore).is_none());
     }

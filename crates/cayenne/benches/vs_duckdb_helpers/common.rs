@@ -76,8 +76,7 @@ pub fn make_batch(schema: Arc<Schema>, start_id: i64, rows: usize) -> RecordBatc
 pub fn write_parquet(batch: &RecordBatch, path: &Path) {
     let file = std::fs::File::create(path).expect("create parquet");
     let props = WriterProperties::builder().build();
-    let mut writer =
-        ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
     writer.write(batch).expect("write");
     writer.close().expect("close");
 }
@@ -260,10 +259,7 @@ pub async fn cayenne_insert_from_parquet(
 }
 
 /// Run a SQL query through Cayenne and return the collected batches.
-pub async fn cayenne_query(
-    table: &Arc<CayenneTableProvider>,
-    sql: &str,
-) -> Vec<RecordBatch> {
+pub async fn cayenne_query(table: &Arc<CayenneTableProvider>, sql: &str) -> Vec<RecordBatch> {
     use datafusion::datasource::TableProvider;
     use datafusion::prelude::SessionContext;
 

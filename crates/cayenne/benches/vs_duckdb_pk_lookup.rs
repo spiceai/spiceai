@@ -137,12 +137,10 @@ fn bench_pk_lookup(c: &mut Criterion) {
         );
 
         // --- PK range scan ---
-        let cayenne_sql = format!(
-            "SELECT SUM(value) FROM t WHERE id BETWEEN {target_lo} AND {target_hi}"
-        );
-        let duckdb_sql = format!(
-            "SELECT SUM(value) FROM pk_bench WHERE id BETWEEN {target_lo} AND {target_hi}"
-        );
+        let cayenne_sql =
+            format!("SELECT SUM(value) FROM t WHERE id BETWEEN {target_lo} AND {target_hi}");
+        let duckdb_sql =
+            format!("SELECT SUM(value) FROM pk_bench WHERE id BETWEEN {target_lo} AND {target_hi}");
 
         let cf = Arc::clone(&cayenne_fixture);
         let s = cayenne_sql.clone();

@@ -609,10 +609,7 @@ async fn test_leftover_tmp_does_not_block_writes_impl(
         .await?;
 
     let rows = query_all(&ctx, "wal_tmp_only").await;
-    assert_eq!(
-        rows,
-        vec![(1, "Alice".to_string()), (2, "Bob".to_string())]
-    );
+    assert_eq!(rows, vec![(1, "Alice".to_string()), (2, "Bob".to_string())]);
 
     Ok(())
 }
@@ -640,10 +637,7 @@ async fn test_leftover_tmp_not_moved_to_snapshot_impl(
     // the staging dir. The tmp is junk that must be excluded from the move.
     let staged = begin_staged_append_with_rows(&table, &[(2, "Bob")]).await?;
     let staging = staging_dir(&table);
-    std::fs::write(
-        staging.join(STAGING_WAL_TMP_FILENAME),
-        b"prior crashed tmp",
-    )?;
+    std::fs::write(staging.join(STAGING_WAL_TMP_FILENAME), b"prior crashed tmp")?;
     staged.commit().await?;
 
     // Snapshot dir must NOT contain the tmp.
@@ -681,20 +675,19 @@ async fn test_leftover_tmp_excluded_from_staged_files_impl(
     let (table, _ctx) = setup_table(&fixture, "wal_tmp_excluded").await;
 
     // Stage some data, then plant a stray tmp before prepare()
-    let staged = begin_staged_append_with_rows(
-        &table,
-        &[(1, "Alice"), (2, "Bob"), (3, "Carol")],
-    )
-    .await?;
+    let staged =
+        begin_staged_append_with_rows(&table, &[(1, "Alice"), (2, "Bob"), (3, "Carol")]).await?;
     let staging = staging_dir(&table);
     std::fs::write(staging.join(STAGING_WAL_TMP_FILENAME), b"junk")?;
 
     let prepared = staged.prepare().await?;
 
-    let content = std::fs::read_to_string(staging.join(STAGING_WAL_FILENAME))
-        .expect("read final WAL");
+    let content =
+        std::fs::read_to_string(staging.join(STAGING_WAL_FILENAME)).expect("read final WAL");
     let parsed: serde_json::Value = serde_json::from_str(&content).expect("WAL must parse");
-    let files = parsed["staged_files"].as_array().expect("staged_files array");
+    let files = parsed["staged_files"]
+        .as_array()
+        .expect("staged_files array");
     for file in files {
         let file_str = file.as_str().expect("string filename");
         assert_ne!(
@@ -751,8 +744,7 @@ async fn test_repeated_wal_writes_are_atomic_impl(
     let prepared = staged.prepare().await?;
     let second_content =
         std::fs::read_to_string(staging.join(STAGING_WAL_FILENAME)).expect("read 2nd WAL");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&second_content).expect("2nd WAL parses");
+    let parsed: serde_json::Value = serde_json::from_str(&second_content).expect("2nd WAL parses");
     assert_eq!(parsed["table_name"], "wal_atomic_replace");
     assert!(
         !staging.join(STAGING_WAL_TMP_FILENAME).exists(),

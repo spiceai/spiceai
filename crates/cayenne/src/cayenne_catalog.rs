@@ -444,6 +444,39 @@ impl MetadataCatalog for CayenneCatalog {
 
         if !db_dir.exists() {
             tokio::fs::create_dir_all(db_dir).await?;
+
+            // Best-effort sync of the parent directory so the db_dir entry
+            // itself is durable on local FS before we proceed to create the
+            // catalog DB file and initialize its schema.
+            //
+            // We keep this best-effort (with warning on failure) rather than
+            // fatal because:
+            // - Catalog DB directory creation is a one-time initialization
+            //   event (not a hot write path).
+            // - It is immediately followed by DB file creation and schema
+            //   initialization, which provide strong content durability.
+            // - The parent directory is frequently a stable, operator-
+            //   managed volume root (e.g., K8s PersistentVolume) where
+            //   directory entry durability is already handled at a higher
+            //   level.
+            //
+            // This is still the right thing to do for consistency with the
+            // uniform durability contract used for all per-table mutable
+            // data paths, and it gives operators a clear warning if
+            // something unusual happens on a fresh deployment.
+            if let Some(parent) = db_dir.parent() {
+                let parent = parent.to_path_buf();
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&parent).and_then(|f| f.sync_all())
+                })
+                .await
+                {
+                    tracing::warn!(
+                        "Failed to sync parent of catalog DB directory {} (subsequent DB writes will still be durable; directory entry may not survive crash): {e}",
+                        db_dir.display()
+                    );
+                }
+            }
         }
 
         // Initialize schema using the appropriate metastore backend
@@ -541,6 +574,35 @@ impl MetadataCatalog for CayenneCatalog {
         // Generate initial snapshot UUID
         let initial_snapshot_id = uuid::Uuid::now_v7().to_string();
 
+        // Create the initial snapshot directory *before* inserting the table
+        // row into the metastore. This ensures the directory entry is durable
+        // (with parent sync of the table root) before the catalog "commits"
+        // the existence of a table pointing at this snapshot_id. This is the
+        // final piece of the uniform local-FS durability contract (snapshot
+        // dirs, _partitioned_wal/, deletions/, and now initial table creation).
+        // Matches the contract we enforce everywhere else in the write path.
+        if !base_path.starts_with("s3://") {
+            let table_root = std::path::PathBuf::from(&base_path).join(&table_id);
+            let snapshot_dir = table_root.join(&initial_snapshot_id);
+
+            if !snapshot_dir.exists() {
+                tokio::fs::create_dir_all(&snapshot_dir)
+                    .await
+                    .map_err(|e| CatalogError::Io { source: e })?;
+
+                // Sync the table root (parent of the new snapshot dir) so the
+                // subdir entry is durable on local FS. Best-effort on the sync
+                // itself (creation failure is already fatal above); this is
+                // the same pattern used for the first _partitioned_wal/ and
+                // first deletions/ subdirs.
+                let table_root_for_sync = table_root.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::File::open(&table_root_for_sync).and_then(|f| f.sync_all());
+                })
+                .await;
+            }
+        }
+
         // Serialize Vortex config to JSON
         let vortex_config_json = serde_json::to_string(&options.vortex_config).map_err(|e| {
             CatalogError::InvalidOperation {
@@ -599,18 +661,9 @@ impl MetadataCatalog for CayenneCatalog {
             Err(e) => return Err(e),
         }
 
-        // Create the initial snapshot directory (only for local paths)
-        // Directory structure: [base_path]/[table_id]/[snapshot_id]/
-        // For S3 paths, directories are virtual and created when files are written
-        if !base_path.starts_with("s3://") {
-            let snapshot_dir = std::path::PathBuf::from(&base_path)
-                .join(&table_id)
-                .join(&initial_snapshot_id);
-
-            tokio::fs::create_dir_all(&snapshot_dir)
-                .await
-                .map_err(|e| CatalogError::Io { source: e })?;
-        }
+        // The initial snapshot directory was already created (with parent
+        // sync) before the metastore INSERT, so the catalog row now points
+        // at a durable directory. Nothing more to do here for local FS.
 
         Ok(table_id)
     }
@@ -1257,11 +1310,7 @@ impl MetadataCatalog for CayenneCatalog {
         })
     }
 
-    async fn commit_overwrite(
-        &self,
-        table_id: &str,
-        new_snapshot_id: &str,
-    ) -> CatalogResult<()> {
+    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
         // commit_overwrite_in_txn below.
@@ -2106,13 +2155,39 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
         return Ok(());
     }
 
-    let snapshot_dir = std::path::PathBuf::from(&table.path)
-        .join(&table.table_id)
-        .join(&table.current_snapshot_id);
+    let table_root = std::path::PathBuf::from(&table.path).join(&table.table_id);
+    let snapshot_dir = table_root.join(&table.current_snapshot_id);
+
+    match tokio::fs::metadata(&snapshot_dir).await {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(CatalogError::Io {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "snapshot path '{}' exists but is not a directory",
+                        snapshot_dir.display()
+                    ),
+                ),
+            });
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(CatalogError::Io { source }),
+    }
 
     tokio::fs::create_dir_all(&snapshot_dir)
         .await
-        .map_err(|e| CatalogError::Io { source: e })
+        .map_err(|source| CatalogError::Io { source })?;
+
+    // Sync parent (table root) for the same durability reason as the
+    // initial creation path above and all other new subdir creations.
+    let table_root_for_sync = table_root;
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::File::open(&table_root_for_sync).and_then(|f| f.sync_all());
+    })
+    .await;
+
+    Ok(())
 }
 
 /// Checks if the existing stored configuration matches the new [`CreateTableOptions`].

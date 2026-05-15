@@ -38,7 +38,9 @@ use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::prelude::SessionContext;
-use datafusion_table_providers::util::{column_reference::ColumnReference, on_conflict::OnConflict};
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, on_conflict::OnConflict,
+};
 
 /// Build a tiny test schema with an i64 PK column.
 fn pk_schema() -> Arc<Schema> {
@@ -126,7 +128,8 @@ async fn build_table(
     pk: Option<&str>,
     vortex_config: VortexConfig,
 ) -> (Arc<CayenneTableProvider>, SessionContext, String) {
-    let on_conflict = pk.map(|pk_col| OnConflict::Upsert(ColumnReference::new(vec![pk_col.to_string()])));
+    let on_conflict =
+        pk.map(|pk_col| OnConflict::Upsert(ColumnReference::new(vec![pk_col.to_string()])));
     let primary_key = pk.map_or_else(Vec::new, |pk_col| vec![pk_col.to_string()]);
 
     let options = CreateTableOptions {
@@ -141,12 +144,16 @@ async fn build_table(
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, options, ctx.runtime_env())
-            .await
-            .expect("create_table");
+    let table = CayenneTableProvider::create_table(catalog_arc, options, ctx.runtime_env())
+        .await
+        .expect("create_table");
     let table = Arc::new(table);
-    let table_id = fixture.catalog.get_table(name).await.expect("get_table").table_id;
+    let table_id = fixture
+        .catalog
+        .get_table(name)
+        .await
+        .expect("get_table")
+        .table_id;
     ctx.register_table(
         name,
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -316,9 +323,11 @@ async fn compaction_idempotent_when_no_candidates(
     // Second call also a no-op.
     assert!(!run_compaction(&table).await);
 
-    let file_count =
-        count_vortex_files(&fixture.data_path, &table_id, &snapshot_after_first).await;
-    assert_eq!(file_count, 1, "snapshot should still hold the original file");
+    let file_count = count_vortex_files(&fixture.data_path, &table_id, &snapshot_after_first).await;
+    assert_eq!(
+        file_count, 1,
+        "snapshot should still hold the original file"
+    );
 
     Ok(())
 }

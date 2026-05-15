@@ -61,8 +61,7 @@ fn bench_bulk_ingest(c: &mut Criterion) {
                 || rt.block_on(setup_cayenne("ingest_bench")),
                 |fixture| {
                     rt.block_on(async {
-                        let written =
-                            cayenne_insert_from_parquet(&fixture.table, &path).await;
+                        let written = cayenne_insert_from_parquet(&fixture.table, &path).await;
                         black_box((fixture, written));
                     });
                 },
@@ -102,11 +101,7 @@ fn bench_incremental_append(c: &mut Criterion) {
     let parquet_dir = tempfile::tempdir().expect("parquet dir");
     let mut parquet_paths = Vec::with_capacity(batches_count);
     for i in 0..batches_count {
-        let batch = make_batch(
-            schema(),
-            (i * per_batch_rows) as i64,
-            per_batch_rows,
-        );
+        let batch = make_batch(schema(), (i * per_batch_rows) as i64, per_batch_rows);
         let path = parquet_dir.path().join(format!("batch_{i}.parquet"));
         write_parquet(&batch, &path);
         parquet_paths.push(path);
