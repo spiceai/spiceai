@@ -915,7 +915,7 @@ mod tests {
     }
 
     /// Cayenne rewrites `HashJoinExec` to use a custom accumulator type, so it
-    /// must run after DataFusion's built-in physical optimizer rules that
+    /// must run after `DataFusion`'s built-in physical optimizer rules that
     /// downcast to the default `HashJoinExec` type.
     #[test]
     #[cfg(not(windows))]
