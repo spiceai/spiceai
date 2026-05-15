@@ -46,7 +46,8 @@ You may obtain a copy of the License at
 //! staged-append restart, acid_compliance, data_inlining, catalog
 //! concurrency with partitions, and shared_metastore_concurrency_test
 //! which exercises fresh catalog DB directory creation in both
-//! CayenneCatalog::init and the SQLite/Turso metastore backends),
+//! CayenneCatalog::init and the SQLite/Turso metastore backends with
+//! best-effort parent sync + warning),
 //! provide comprehensive regression coverage for this property,
 //! including the edge cases of the very first cross-partition write on a
 //! brand-new table (first creation of the _partitioned_wal/ directory),
