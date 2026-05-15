@@ -379,6 +379,20 @@ impl MetadataCatalog for CayenneCatalog {
 
         if !db_dir.exists() {
             tokio::fs::create_dir_all(db_dir).await?;
+
+            // Best-effort sync of the parent directory so the db_dir entry
+            // itself is durable on local FS before we proceed to create the
+            // catalog DB file and initialize its schema. This follows the
+            // uniform durability contract applied to all other directory
+            // creations (snapshot dirs, _partitioned_wal/, deletions/,
+            // partition subdirs, initial table creation).
+            if let Some(parent) = db_dir.parent() {
+                let parent = parent.to_path_buf();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::File::open(&parent).and_then(|f| f.sync_all());
+                })
+                .await;
+            }
         }
 
         // Initialize schema using the appropriate metastore backend

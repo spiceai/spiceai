@@ -1286,6 +1286,110 @@ mod tests {
     }
 
     #[test]
+    fn subtree_upper_bound_rows_sums_stats_across_dim_subtree() -> Result<()> {
+        use datafusion::catalog::{Session, TableProvider};
+        use datafusion::common::stats::Precision;
+        use datafusion::datasource::DefaultTableSource;
+        use datafusion::logical_expr::{TableType, dml::InsertOp};
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion_common::Statistics;
+        use datafusion_expr::Expr as ExprAlias;
+        use datafusion_expr::LogicalPlanBuilder;
+
+        /// `TableProvider` that returns a constant row count from `statistics()`.
+        #[derive(Debug)]
+        struct FixedStatsProvider {
+            schema: arrow::datatypes::SchemaRef,
+            num_rows: usize,
+        }
+
+        #[async_trait::async_trait]
+        impl TableProvider for FixedStatsProvider {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn schema(&self) -> arrow::datatypes::SchemaRef {
+                Arc::clone(&self.schema)
+            }
+            fn table_type(&self) -> TableType {
+                TableType::Base
+            }
+            async fn scan(
+                &self,
+                _state: &dyn Session,
+                _projection: Option<&Vec<usize>>,
+                _filters: &[ExprAlias],
+                _limit: Option<usize>,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                Err(datafusion::common::DataFusionError::NotImplemented(
+                    "FixedStatsProvider scan not used in this test".to_string(),
+                ))
+            }
+            fn statistics(&self) -> Option<Statistics> {
+                let mut stats = Statistics::new_unknown(self.schema.as_ref());
+                stats.num_rows = Precision::Exact(self.num_rows);
+                Some(stats)
+            }
+            async fn insert_into(
+                &self,
+                _state: &dyn Session,
+                _input: Arc<dyn ExecutionPlan>,
+                _insert_op: InsertOp,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                Err(datafusion::common::DataFusionError::NotImplemented(
+                    "FixedStatsProvider insert not used".to_string(),
+                ))
+            }
+        }
+
+        fn fixed_table_scan(rows: usize) -> Result<LogicalPlan> {
+            let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+            let provider = Arc::new(FixedStatsProvider {
+                schema: Arc::clone(&schema),
+                num_rows: rows,
+            });
+            let source = Arc::new(DefaultTableSource::new(provider));
+            LogicalPlanBuilder::scan("t", source, None)?.build()
+        }
+
+        // Single scan: row count is reported directly.
+        let small = fixed_table_scan(500)?;
+        assert_eq!(subtree_upper_bound_rows(&small), Some(500));
+
+        // Below the dim threshold → gate fires (skip propagation).
+        let fact = fixed_table_scan(1_000_000)?;
+        assert!(skip_propagation_by_cardinality(&small, &fact));
+
+        // Above the dim threshold + above the fact threshold → gate is silent.
+        let big_dim = fixed_table_scan(5_000)?;
+        assert!(!skip_propagation_by_cardinality(&big_dim, &fact));
+
+        // Below the fact threshold → gate fires from the fact side.
+        let tiny_fact = fixed_table_scan(50_000)?;
+        assert!(skip_propagation_by_cardinality(&big_dim, &tiny_fact));
+
+        Ok(())
+    }
+
+    #[test]
+    fn skip_propagation_by_cardinality_silent_when_stats_absent() -> Result<()> {
+        // MemTable doesn't expose row counts via `TableProvider::statistics()`,
+        // so the gate must fall back to the structural behavior (no skip).
+        use datafusion::catalog::MemTable;
+        use datafusion::datasource::DefaultTableSource;
+        use datafusion_expr::LogicalPlanBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let provider = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]])?);
+        let source = Arc::new(DefaultTableSource::new(provider));
+        let scan = LogicalPlanBuilder::scan("t", source, None)?.build()?;
+
+        assert_eq!(subtree_upper_bound_rows(&scan), None);
+        assert!(!skip_propagation_by_cardinality(&scan, &scan));
+        Ok(())
+    }
+
+    #[test]
     fn key_preserved_through_summaries_rejects_same_name_different_relation() -> Result<()> {
         use datafusion::logical_expr::{Aggregate, Distinct, DistinctOn};
         use datafusion_expr::builder::table_scan;
