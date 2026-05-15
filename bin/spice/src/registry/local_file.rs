@@ -98,7 +98,8 @@ impl LocalFileRegistry {
         let comparable_destination_dir = canonical_pods_dir.join(&pod_name);
 
         if source_path != comparable_destination_dir
-            && comparable_destination_dir.starts_with(&source_path)
+            && (comparable_destination_dir.starts_with(&source_path)
+                || source_path.starts_with(&canonical_pods_dir))
         {
             return Err(Error::NestedLocalInstall {
                 source_path: source_path.display().to_string(),
@@ -482,6 +483,38 @@ mod tests {
         );
         assert!(
             !pods_dir.join("app").exists(),
+            "destination directory should not be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_source_nested_under_pods_dir_when_destination_differs() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let pods_dir = temp_dir.path().join("spicepods");
+        let source_dir = pods_dir.join("nested").join("localpod");
+        std::fs::create_dir_all(&source_dir).expect("source directory should be created");
+        std::fs::write(
+            source_dir.join("spicepod.yaml"),
+            "version: v2\nkind: Spicepod\nname: localpod\n",
+        )
+        .expect("spicepod.yaml should be written");
+
+        let error = LocalFileRegistry
+            .get_pod(
+                source_dir.to_str().expect("source path should be utf-8"),
+                &pods_dir,
+                &HashMap::new(),
+                &reqwest::Client::new(),
+            )
+            .await
+            .expect_err("source nested under pods dir should be rejected");
+
+        assert!(
+            matches!(error, Error::NestedLocalInstall { .. }),
+            "expected nested local install error"
+        );
+        assert!(
+            !pods_dir.join("localpod").exists(),
             "destination directory should not be created"
         );
     }

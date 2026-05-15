@@ -495,10 +495,10 @@ fn apply_machine_query_mode(args: &mut query::QueryArgs) {
     match command {
         query::QuerySubcommand::List { output, .. }
         | query::QuerySubcommand::Status { output, .. }
-        | query::QuerySubcommand::Results { output, .. } => {
+        | query::QuerySubcommand::Results { output, .. }
+        | query::QuerySubcommand::Cancel { output, .. } => {
             *output = OutputFormat::Json;
         }
-        query::QuerySubcommand::Cancel { .. } => {}
     }
 }
 
@@ -506,7 +506,7 @@ fn apply_machine_acceleration_mode(args: &mut AccelerationArgs) {
     match &mut args.command {
         acceleration::AccelerationCommand::Snapshots(args) => args.output = OutputFormat::Json,
         acceleration::AccelerationCommand::Snapshot(args) => args.output = OutputFormat::Json,
-        acceleration::AccelerationCommand::SetSnapshot(_) => {}
+        acceleration::AccelerationCommand::SetSnapshot(args) => args.output = OutputFormat::Json,
     }
 }
 
@@ -624,7 +624,11 @@ fn is_json_output(cmd: &Commands) -> bool {
         Commands::Acceleration(AccelerationArgs {
             command:
                 acceleration::AccelerationCommand::Snapshots(SnapshotsArgs { output, .. })
-                | acceleration::AccelerationCommand::Snapshot(SnapshotArgs { output, .. }),
+                | acceleration::AccelerationCommand::Snapshot(SnapshotArgs { output, .. })
+                | acceleration::AccelerationCommand::SetSnapshot(acceleration::SetSnapshotArgs {
+                    output,
+                    ..
+                }),
         }) => *output == OutputFormat::Json,
         Commands::Cloud(a) => match &a.command {
             cloud::CloudCommands::Whoami(x) => x.output == OutputFormat::Json,
@@ -916,6 +920,34 @@ mod tests {
         }) = cli.command
         else {
             panic!("expected cloud secrets list command");
+        };
+        assert_eq!(args.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn machine_flag_defaults_mutating_subcommands_to_json_when_supported() {
+        let cli = parse_with_machine_mode(&["spice", "--machine", "query", "cancel", "query-1"]);
+        let Commands::Query(args) = cli.command else {
+            panic!("expected query command");
+        };
+        let Some(query::QuerySubcommand::Cancel { output, .. }) = args.command else {
+            panic!("expected query cancel command");
+        };
+        assert_eq!(output, OutputFormat::Json);
+
+        let cli = parse_with_machine_mode(&[
+            "spice",
+            "--machine",
+            "acceleration",
+            "set-snapshot",
+            "taxi_trips",
+            "42",
+        ]);
+        let Commands::Acceleration(AccelerationArgs {
+            command: acceleration::AccelerationCommand::SetSnapshot(args),
+        }) = cli.command
+        else {
+            panic!("expected acceleration set-snapshot command");
         };
         assert_eq!(args.output, OutputFormat::Json);
     }
