@@ -34,11 +34,11 @@ limitations under the License.
 //!
 //! ## What the rule does
 //!
-//! For every `LogicalPlan::Join` with `JoinType::Inner` and one or more
-//! column-only equi-key pairs `(left.a, right.b)` whose data types match, the
-//! rule inspects each side for a non-trivial `Filter` that references at
-//! least one column other than each candidate join key. If one is found, it
-//! wraps the *opposite* side with
+//! For every `LogicalPlan::Join` with `JoinType::Inner`, default SQL NULL
+//! equality (`NULL != NULL`), and one or more column-only equi-key pairs
+//! `(left.a, right.b)` whose data types match, the rule inspects each side for a
+//! non-trivial `Filter` that references at least one column other than each
+//! candidate join key. If one is found, it wraps the *opposite* side with
 //!
 //! ```text
 //! Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))
@@ -74,7 +74,7 @@ limitations under the License.
 //! cheap to re-execute.
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DataFusionError, Result, Spans, TableReference};
+use datafusion::common::{Column, DataFusionError, NullEquality, Result, Spans, TableReference};
 use datafusion::logical_expr::{
     Filter, Join, JoinType, LogicalPlan, Projection, Subquery, SubqueryAlias,
 };
@@ -92,8 +92,8 @@ use std::{collections::BTreeSet, sync::Arc};
 /// a marker in explain output so the rewrite is recognizable when reading plans.
 pub const PROPAGATED_FILTER_ALIAS_PREFIX: &str = "__cayenne_xclos__";
 
-/// Logical optimizer rule that, for each Inner Join with a simple equi-key
-/// `(left.a = right.b)`, introduces
+/// Logical optimizer rule that, for each Inner Join with default SQL NULL
+/// equality and a simple equi-key `(left.a = right.b)`, introduces
 /// `Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))`
 /// on the side opposite a non-key filter.
 ///
@@ -137,6 +137,9 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
             other => return Ok(Transformed::no(other)),
         };
         if join.join_type != JoinType::Inner {
+            return Ok(Transformed::no(LogicalPlan::Join(join)));
+        }
+        if join.null_equality != NullEquality::NullEqualsNothing {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
 
@@ -364,7 +367,8 @@ fn subtree_has_propagated_filter(plan: &LogicalPlan) -> bool {
 /// starts with a [`SubqueryAlias`] named with
 /// [`PROPAGATED_FILTER_ALIAS_PREFIX`].
 #[must_use]
-pub fn expr_has_propagated_filter(expr: &Expr) -> bool {
+#[cfg(test)]
+fn expr_has_propagated_filter(expr: &Expr) -> bool {
     let mut found = false;
     let _ = expr.apply(|e| {
         if let Expr::InSubquery(InSubquery { subquery, .. }) = e
@@ -389,7 +393,7 @@ pub fn expr_has_propagated_filter(expr: &Expr) -> bool {
 /// The alias name uses [`PROPAGATED_FILTER_ALIAS_PREFIX`] plus a unique id
 /// from [`OptimizerConfig::alias_generator`], so each invocation produces a
 /// distinct marker. The marker doubles as the cycle-detection sentinel
-/// scanned by [`analyze_logical_side`] / [`expr_has_propagated_filter`].
+/// scanned by [`analyze_logical_side`].
 fn build_key_projection_subquery(
     subtree: Arc<LogicalPlan>,
     key_col: &Column,
@@ -653,6 +657,48 @@ mod tests {
         assert!(
             !changed,
             "rule must not fire when filter references only the join key; plan was:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn null_equal_inner_join_is_noop() -> Result<()> {
+        use datafusion::logical_expr::JoinConstraint;
+        use datafusion_expr::{builder::table_scan, lit};
+
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("c", DataType::Utf8, true),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+
+        let left_scan = table_scan(Some("l"), &left_schema, None)?.build()?;
+        let left = LogicalPlan::Filter(Filter::try_new(
+            Expr::Column(Column::new(Some("l"), "c")).eq(lit("v")),
+            Arc::new(left_scan),
+        )?);
+        let right = table_scan(Some("r"), &right_schema, None)?.build()?;
+
+        let join = LogicalPlan::Join(Join::try_new(
+            Arc::new(left),
+            Arc::new(right),
+            vec![(
+                Expr::Column(Column::new(Some("l"), "a")),
+                Expr::Column(Column::new(Some("r"), "x")),
+            )],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNull,
+        )?);
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (_, changed) = apply_rule_to_all_joins(&r, join, &cfg)?;
+
+        assert!(
+            !changed,
+            "rule must not introduce SQL IN filters for null-equal joins"
         );
         Ok(())
     }

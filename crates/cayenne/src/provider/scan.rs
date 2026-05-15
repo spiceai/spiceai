@@ -82,7 +82,7 @@ impl CayenneAccelerationExec {
     /// buckets both with `part-000.vortex`). Without it the identity would
     /// silently collide when paths are stored as relative locations.
     #[must_use]
-    pub fn scan_identity(&self) -> Option<Arc<ScanIdentity>> {
+    pub(crate) fn scan_identity(&self) -> Option<Arc<ScanIdentity>> {
         self.scan_identity
             .get_or_init(|| compute_scan_identity(&self.inner))
             .as_ref()
@@ -95,7 +95,7 @@ impl CayenneAccelerationExec {
     /// pass. They are safe to share only when an optimizer has proven the target
     /// scan is equi-joined on every referenced column.
     #[must_use]
-    pub fn dynamic_filters(&self) -> Vec<ScanDynamicFilter> {
+    pub(crate) fn dynamic_filters(&self) -> Vec<ScanDynamicFilter> {
         let Some(file_scan_config) = find_file_scan_config(&self.inner) else {
             return Vec::new();
         };
@@ -108,19 +108,6 @@ impl CayenneAccelerationExec {
         filters
     }
 
-    /// Returns true if this scan already has the specified dynamic filter.
-    #[must_use]
-    pub fn has_dynamic_filter(&self, filter: &Arc<dyn PhysicalExpr>) -> bool {
-        let Some(file_scan_config) = find_file_scan_config(&self.inner) else {
-            return false;
-        };
-        let Some(scan_filter) = file_scan_config.file_source().filter() else {
-            return false;
-        };
-
-        expr_has_dynamic_filter(&scan_filter, filter)
-    }
-
     /// Push additional dynamic filters into the underlying file source.
     ///
     /// Returns `Ok(None)` when the scan source declined all filters or the inner
@@ -130,7 +117,7 @@ impl CayenneAccelerationExec {
     ///
     /// Returns an error when rebuilding the underlying `DataSourceExec` with the
     /// additional filters fails.
-    pub fn with_additional_dynamic_filters(
+    pub(crate) fn with_additional_dynamic_filters(
         &self,
         filters: &[Arc<dyn PhysicalExpr>],
         config: &ConfigOptions,
@@ -179,30 +166,15 @@ fn compute_scan_identity(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<ScanIdenti
 /// do *not* collide. The path set is reference-counted so copying a scan
 /// identity during optimizer rewrites does not clone every file path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ScanIdentity {
+pub(crate) struct ScanIdentity {
     object_store_url: Arc<str>,
     paths: Arc<[String]>,
-}
-
-impl ScanIdentity {
-    /// Returns the `object_store_url` (e.g. `s3://bucket/`, `file:///`) that
-    /// scopes the file paths.
-    #[must_use]
-    pub fn object_store_url(&self) -> &str {
-        &self.object_store_url
-    }
-
-    /// Returns the sorted, deduplicated file paths that define this identity.
-    #[must_use]
-    pub fn paths(&self) -> &[String] {
-        &self.paths
-    }
 }
 
 /// A dynamic filter currently attached to a Cayenne scan, plus the scan-local
 /// column names the filter references.
 #[derive(Clone)]
-pub struct ScanDynamicFilter {
+pub(crate) struct ScanDynamicFilter {
     filter: Arc<dyn PhysicalExpr>,
     columns: BTreeSet<String>,
 }
@@ -210,13 +182,13 @@ pub struct ScanDynamicFilter {
 impl ScanDynamicFilter {
     /// Returns the shared dynamic filter expression.
     #[must_use]
-    pub fn filter(&self) -> &Arc<dyn PhysicalExpr> {
+    pub(crate) fn filter(&self) -> &Arc<dyn PhysicalExpr> {
         &self.filter
     }
 
     /// Returns the scan-local column names referenced by this filter.
     #[must_use]
-    pub fn columns(&self) -> &BTreeSet<String> {
+    pub(crate) fn columns(&self) -> &BTreeSet<String> {
         &self.columns
     }
 }
@@ -306,16 +278,6 @@ fn collect_dynamic_filters(expr: &Arc<dyn PhysicalExpr>, filters: &mut Vec<ScanD
     for child in expr.children() {
         collect_dynamic_filters(child, filters);
     }
-}
-
-fn expr_has_dynamic_filter(expr: &Arc<dyn PhysicalExpr>, target: &Arc<dyn PhysicalExpr>) -> bool {
-    if expr.as_any().is::<DynamicFilterPhysicalExpr>() && Arc::ptr_eq(expr, target) {
-        return true;
-    }
-
-    expr.children()
-        .into_iter()
-        .any(|child| expr_has_dynamic_filter(child, target))
 }
 
 fn dynamic_filter_column_names(
@@ -748,8 +710,8 @@ mod tests {
         // same content; the trait must be derivable from the inner fields).
         let _ = (ha.finish(), hb.finish());
 
-        assert_eq!(a.object_store_url(), "s3://bucket/");
-        assert_eq!(a.paths(), &["a.parquet", "b.parquet"]);
+        assert_eq!(a.object_store_url.as_ref(), "s3://bucket/");
+        assert_eq!(a.paths.as_ref(), &["a.parquet", "b.parquet"]);
     }
 
     #[test]
