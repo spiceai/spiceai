@@ -527,6 +527,255 @@ async fn test_prepared_rollback_clears_staging_impl(
 }
 
 // ============================================================================
+// Test 11: WAL appears atomically at the final path (no `_wal.json.tmp` left
+// behind after a successful prepare). Regression: prior to the atomic
+// rename + parent-dir fsync fix the WAL was written directly to its final
+// path and a torn write would have left a partial `_wal.json`; we now write
+// to `_wal.json.tmp` and rename, so the final path is either absent or a
+// complete WAL document.
+// ============================================================================
+
+test_with_backends!(test_wal_atomic_appearance_impl);
+
+async fn test_wal_atomic_appearance_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, _ctx) = setup_table(&fixture, "wal_atomic").await;
+
+    let staged = begin_staged_append_with_rows(&table, &[(1, "Alice")]).await?;
+    let prepared = staged.prepare().await?;
+
+    let staging = staging_dir(&table);
+    let final_path = staging.join(STAGING_WAL_FILENAME);
+    let tmp_path = staging.join(STAGING_WAL_TMP_FILENAME);
+
+    assert!(
+        final_path.exists(),
+        "prepare() must publish the WAL at its final path"
+    );
+    assert!(
+        !tmp_path.exists(),
+        "prepare() must rename the tmp WAL away; a lingering `_wal.json.tmp` \
+         indicates the atomic rename never ran"
+    );
+
+    // The published WAL must parse — never observe a partial document.
+    let content = std::fs::read_to_string(&final_path).expect("read WAL");
+    let parsed: serde_json::Value = serde_json::from_str(&content).expect("WAL must be valid JSON");
+    assert_eq!(parsed["table_name"], "wal_atomic");
+    assert!(
+        parsed["staged_files"].as_array().is_some(),
+        "WAL must contain staged_files: {parsed:?}"
+    );
+
+    prepared.rollback().await?;
+    Ok(())
+}
+
+// ============================================================================
+// Test 12: A bare `_wal.json.tmp` (no committed `_wal.json`) does NOT block
+// new writes. The tmp is bookkeeping; only the renamed final file represents
+// committed intent. Without this, a process killed between writing the tmp
+// and the rename would leave the table permanently unwritable.
+// ============================================================================
+
+test_with_backends!(test_leftover_tmp_does_not_block_writes_impl);
+
+async fn test_leftover_tmp_does_not_block_writes_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "wal_tmp_only").await;
+
+    ctx.sql("INSERT INTO wal_tmp_only VALUES (1, 'Alice')")
+        .await?
+        .collect()
+        .await?;
+
+    // Plant ONLY the tmp — never the committed WAL.
+    let staging = staging_dir(&table);
+    std::fs::create_dir_all(&staging)?;
+    std::fs::write(
+        staging.join(STAGING_WAL_TMP_FILENAME),
+        b"{\"this\": \"is a partial write that crashed mid-fsync\"}",
+    )?;
+    assert!(staging.join(STAGING_WAL_TMP_FILENAME).exists());
+    assert!(!staging.join(STAGING_WAL_FILENAME).exists());
+
+    // The next write must succeed — the tmp was never promoted, so no
+    // committed intent exists.
+    ctx.sql("INSERT INTO wal_tmp_only VALUES (2, 'Bob')")
+        .await?
+        .collect()
+        .await?;
+
+    let rows = query_all(&ctx, "wal_tmp_only").await;
+    assert_eq!(
+        rows,
+        vec![(1, "Alice".to_string()), (2, "Bob".to_string())]
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Test 13: A leftover `_wal.json.tmp` is never promoted into the snapshot.
+// Without this guarantee, a crashed prior write could leave a non-vortex
+// scratch file that move_files_to_current_snapshot would rename into the
+// snapshot directory, corrupting the listing table's view of the snapshot.
+// ============================================================================
+
+test_with_backends!(test_leftover_tmp_not_moved_to_snapshot_impl);
+
+async fn test_leftover_tmp_not_moved_to_snapshot_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "wal_tmp_skip").await;
+
+    ctx.sql("INSERT INTO wal_tmp_skip VALUES (1, 'Alice')")
+        .await?
+        .collect()
+        .await?;
+
+    // Begin a staged append, then plant a tmp before the commit phase walks
+    // the staging dir. The tmp is junk that must be excluded from the move.
+    let staged = begin_staged_append_with_rows(&table, &[(2, "Bob")]).await?;
+    let staging = staging_dir(&table);
+    std::fs::write(
+        staging.join(STAGING_WAL_TMP_FILENAME),
+        b"prior crashed tmp",
+    )?;
+    staged.commit().await?;
+
+    // Snapshot dir must NOT contain the tmp.
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    let snapshot_entries: Vec<String> = std::fs::read_dir(&snapshot_dir)
+        .expect("read snapshot dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    assert!(
+        !snapshot_entries.contains(&STAGING_WAL_TMP_FILENAME.to_string()),
+        "Leftover `_wal.json.tmp` was promoted into the snapshot dir: {snapshot_entries:?}"
+    );
+
+    let rows = query_all(&ctx, "wal_tmp_skip").await;
+    assert_eq!(rows, vec![(1, "Alice".to_string()), (2, "Bob".to_string())]);
+
+    Ok(())
+}
+
+// ============================================================================
+// Test 14: A leftover `_wal.json.tmp` is not listed in the next WAL's
+// `staged_files`. Otherwise we would record a non-data file as part of the
+// commit intent, and a partial-recovery tool walking `staged_files` would
+// trip over a path that doesn't exist (because move skips the tmp).
+// ============================================================================
+
+test_with_backends!(test_leftover_tmp_excluded_from_staged_files_impl);
+
+async fn test_leftover_tmp_excluded_from_staged_files_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, _ctx) = setup_table(&fixture, "wal_tmp_excluded").await;
+
+    // Stage some data, then plant a stray tmp before prepare()
+    let staged = begin_staged_append_with_rows(
+        &table,
+        &[(1, "Alice"), (2, "Bob"), (3, "Carol")],
+    )
+    .await?;
+    let staging = staging_dir(&table);
+    std::fs::write(staging.join(STAGING_WAL_TMP_FILENAME), b"junk")?;
+
+    let prepared = staged.prepare().await?;
+
+    let content = std::fs::read_to_string(staging.join(STAGING_WAL_FILENAME))
+        .expect("read final WAL");
+    let parsed: serde_json::Value = serde_json::from_str(&content).expect("WAL must parse");
+    let files = parsed["staged_files"].as_array().expect("staged_files array");
+    for file in files {
+        let file_str = file.as_str().expect("string filename");
+        assert_ne!(
+            file_str, STAGING_WAL_TMP_FILENAME,
+            "WAL's staged_files must not include `_wal.json.tmp`: {files:?}"
+        );
+        assert_ne!(
+            file_str, STAGING_WAL_FILENAME,
+            "WAL's staged_files must not include the WAL itself"
+        );
+    }
+
+    prepared.rollback().await?;
+    Ok(())
+}
+
+// ============================================================================
+// Test 15: Repeated `write_staging_wal` calls atomically replace the prior
+// WAL — no partial document is ever observable. Ensures the rename pattern
+// upholds the "WAL is either absent or fully valid" invariant under repeated
+// commit attempts.
+// ============================================================================
+
+test_with_backends!(test_repeated_wal_writes_are_atomic_impl);
+
+async fn test_repeated_wal_writes_are_atomic_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "wal_atomic_replace").await;
+
+    // First insert — leaves no WAL behind.
+    ctx.sql("INSERT INTO wal_atomic_replace VALUES (1, 'A')")
+        .await?
+        .collect()
+        .await?;
+
+    let staging = staging_dir(&table);
+    assert!(
+        !staging.join(STAGING_WAL_FILENAME).exists(),
+        "WAL must not persist after a successful commit"
+    );
+
+    // Drive a second insert; after the prepare() the WAL exists and parses.
+    let staged = begin_staged_append_with_rows(&table, &[(2, "B")]).await?;
+    let prepared = staged.prepare().await?;
+    let first_content =
+        std::fs::read_to_string(staging.join(STAGING_WAL_FILENAME)).expect("read 1st WAL");
+    serde_json::from_str::<serde_json::Value>(&first_content).expect("1st WAL parses");
+    prepared.rollback().await?;
+
+    // Drive a third staged append from scratch — the WAL must be a fresh,
+    // valid document, not a half-overwritten remnant of the previous one.
+    let staged = begin_staged_append_with_rows(&table, &[(3, "C"), (4, "D")]).await?;
+    let prepared = staged.prepare().await?;
+    let second_content =
+        std::fs::read_to_string(staging.join(STAGING_WAL_FILENAME)).expect("read 2nd WAL");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&second_content).expect("2nd WAL parses");
+    assert_eq!(parsed["table_name"], "wal_atomic_replace");
+    assert!(
+        !staging.join(STAGING_WAL_TMP_FILENAME).exists(),
+        "Tmp file must be renamed away by prepare()"
+    );
+
+    prepared.apply_under_barrier().await?;
+    prepared.finish().await?;
+
+    let rows = query_all(&ctx, "wal_atomic_replace").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "A".to_string()),
+            (3, "C".to_string()),
+            (4, "D".to_string()),
+        ]
+    );
+
+    Ok(())
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
