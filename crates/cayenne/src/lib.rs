@@ -74,7 +74,7 @@ pub use catalog::{CatalogError, CatalogResult};
 pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
-pub use cayenne_catalog::CayenneCatalog;
+pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
 pub use metadata::{
     DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete, ObjectStoreConfig,
     PartitionMetadata, TableMetadata, TableStatistics,
@@ -82,6 +82,7 @@ pub use metadata::{
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 pub use provider::{
     CayenneContext, CayenneStagedAppend, CayenneTableProvider, CayenneTableProviderBuilder,
-    TimeRetentionFilterBuilder,
+    PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry, PreparedOverwrite,
+    PreparedStagedAppend, TimeRetentionFilterBuilder,
 };
 pub use schema::transform_schema_for_vortex;
