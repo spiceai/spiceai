@@ -1982,14 +1982,27 @@ async fn executor_bind_app(
 /// statements are skipped because later DDL may depend on earlier ones
 /// (e.g. `CREATE TABLE` depends on `CREATE SCHEMA`).
 ///
+/// Uses the Spice `QueryBuilder` path (not `ctx.sql()` directly) so that
+/// `DdlAnalyzerRule` runs — routing DDL through the correct Cayenne/Iceberg
+/// physical-plan handlers rather than DataFusion's built-in DDL handlers,
+/// which don't know about custom catalogs and would fail with errors like
+/// "failed to resolve schema" or "Registering new schemas is not supported".
+///
 /// Returns the number of successfully replayed statements.
 async fn replay_ddl_statements(rt: &Runtime, statements: &[String]) -> usize {
+    use futures::TryStreamExt as _;
+    let df = rt.datafusion();
     for (i, sql) in statements.iter().enumerate() {
-        let result = match rt.datafusion().ctx.sql(sql).await {
-            Ok(df) => df.collect().await.map(|_| ()),
-            Err(e) => Err(e),
+        let error: Option<String> = match df.query_builder(sql).build().run().await {
+            Err(e) => Some(e.to_string()),
+            Ok(query_result) => query_result
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .err()
+                .map(|e| e.to_string()),
         };
-        if let Err(e) = result {
+        if let Some(e) = error {
             tracing::warn!(
                 "Failed to replay DDL statement ({}/{}) — skipping remaining: {e}\n  SQL: {sql}",
                 i + 1,

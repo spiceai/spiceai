@@ -356,6 +356,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
                      \"{catalog_name}\".\"{schema_name}\".\"{table_name}\" ({})",
                     table_elements.join(", ")
                 );
+
                 executor_registry.append_ddl(ddl_sql.clone()).await;
                 forward_ddl_to_executors(&executor_registry, &ddl_sql).await?;
             }

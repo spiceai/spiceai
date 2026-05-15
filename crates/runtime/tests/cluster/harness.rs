@@ -233,16 +233,12 @@ impl ClusterHarness {
     ///
     /// This is used to test late-join scenarios (e.g. DDL replay on join).
     /// The executor is added to `self.executors` and its server handle to `self.handles`.
-    pub async fn add_executor(
-        &mut self,
-        app: Option<App>,
-    ) -> Result<(), anyhow::Error> {
+    pub async fn add_executor(&mut self, app: Option<App>) -> Result<(), anyhow::Error> {
         let i = self.next_executor_index;
         self.next_executor_index += 1;
         let label = format!("executor{i}");
 
-        let executor_app =
-            app.unwrap_or_else(|| AppBuilder::new(format!("test_{label}")).build());
+        let executor_app = app.unwrap_or_else(|| AppBuilder::new(format!("test_{label}")).build());
 
         let (executor_rt, executor_handle) = start_executor(
             &label,
@@ -450,9 +446,7 @@ async fn start_executor(
     scheduler_cluster_addr: &str,
 ) -> Result<(Arc<Runtime>, JoinHandle<RuntimeResult<()>>), anyhow::Error> {
     let executor_ports = NodePorts::allocate();
-    let executor_cert = pki
-        .create_client_cert(label)
-        .map_err(anyhow::Error::msg)?;
+    let executor_cert = pki.create_client_cert(label).map_err(anyhow::Error::msg)?;
 
     tracing::warn!("{label}: Ports: {executor_ports:?}. Scheduler: {scheduler_cluster_addr}");
     let executor_config = Config {
@@ -463,12 +457,8 @@ async fn start_executor(
             node_bind_address: executor_ports.cluster_addr(),
             scheduler_address: Some(scheduler_cluster_addr.to_string()),
             node_advertise_address: Some("127.0.0.1".to_string()),
-            node_mtls_ca_certificate_file: Some(
-                pki.ca_cert_path.to_string_lossy().to_string(),
-            ),
-            node_mtls_certificate_file: Some(
-                executor_cert.cert_path.to_string_lossy().to_string(),
-            ),
+            node_mtls_ca_certificate_file: Some(pki.ca_cert_path.to_string_lossy().to_string()),
+            node_mtls_certificate_file: Some(executor_cert.cert_path.to_string_lossy().to_string()),
             node_mtls_key_file: Some(executor_cert.key_path.to_string_lossy().to_string()),
             ..Default::default()
         },

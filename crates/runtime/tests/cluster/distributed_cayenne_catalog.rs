@@ -2106,9 +2106,7 @@ async fn test_distributed_cayenne_late_join_ddl_replay() -> Result<(), anyhow::E
 
             // Insert data so we can verify the table is queryable.
             harness
-                .query(
-                    "INSERT INTO ljcat.ljs.items VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
-                )
+                .query("INSERT INTO ljcat.ljs.items VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')")
                 .await?;
             wait_for_row_count(&harness, "ljcat.ljs.items", 3, Duration::from_secs(30)).await?;
 
