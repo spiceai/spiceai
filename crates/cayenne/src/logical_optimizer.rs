@@ -35,11 +35,12 @@ limitations under the License.
 //! ## What the rule does
 //!
 //! For every `LogicalPlan::Join` with `JoinType::Inner`, `JoinType::LeftSemi`,
-//! or `JoinType::RightSemi`, default SQL NULL equality (`NULL != NULL`), and one
-//! or more equi-key pairs whose data types match, the rule inspects each side
-//! for a non-trivial `Filter` that references at least one column other than
-//! each candidate join key. If one side is dim-like and has a projectable column
-//! key, it wraps the *opposite* side with
+//! `JoinType::RightSemi`, `JoinType::Left`, or `JoinType::Right`, default SQL
+//! NULL equality (`NULL != NULL`), and one or more equi-key pairs whose data
+//! types match, the rule inspects each side for a non-trivial `Filter` that
+//! references at least one column other than each candidate join key. If one
+//! side is dim-like and has a projectable column key, it wraps the *opposite*
+//! side with
 //!
 //! ```text
 //! Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))
@@ -62,6 +63,14 @@ limitations under the License.
 //! `LeftSemi`/`RightSemi` follows from the join's existing key-domain
 //! semantics: wrapping either input with `IN (SELECT key FROM other_side)`
 //! produces a subset of rows that the semi-join would already retain.
+//!
+//! For outer joins (`Left`, `Right`) the rule fires *only* in the
+//! preserved-side → lookup-side direction. Filtering the lookup side narrows
+//! matches the outer join would already drop (and substitute `NULL` for);
+//! filtering the preserved side would silently delete rows the outer join is
+//! supposed to emit as `NULL`-padded, which would change the output.
+//! `FullOuter` is excluded — both sides are preserved, so neither direction is
+//! safe.
 //!
 //! ## Termination
 //!
@@ -149,13 +158,30 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
         };
         if !matches!(
             join.join_type,
-            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi,
+            JoinType::Inner
+                | JoinType::LeftSemi
+                | JoinType::RightSemi
+                | JoinType::Left
+                | JoinType::Right,
         ) {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
         if join.null_equality != NullEquality::NullEqualsNothing {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
+        // For outer joins, propagation is only safe in the *preserved-side →
+        // lookup-side* direction. Filtering the lookup side can only narrow
+        // matches that the join would already drop; filtering the preserved
+        // side would drop output rows that the outer join would have emitted
+        // as `NULL`-padded. Inner and semi joins are unrestricted.
+        let allow_left_to_right = matches!(
+            join.join_type,
+            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi | JoinType::Left,
+        );
+        let allow_right_to_left = matches!(
+            join.join_type,
+            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi | JoinType::Right,
+        );
 
         let equijoin_keys = matching_equijoin_keys(&join);
         if equijoin_keys.is_empty() {
@@ -173,7 +199,8 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
             match key {
                 EquiKey::BothColumns { left, right } => {
                     // Propagate the LEFT-side filtered key domain → the RIGHT side.
-                    if left_analysis.is_dim_like
+                    if allow_left_to_right
+                        && left_analysis.is_dim_like
                         && left_analysis.has_non_key_filter(&left.name)
                         && key_preserved_through_summaries(&join.left, left)
                         && !right_analysis.has_propagated_filter_target(&column_expr(right))
@@ -195,7 +222,8 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                     }
 
                     // Propagate the RIGHT-side filtered key domain → the LEFT side.
-                    if right_analysis.is_dim_like
+                    if allow_right_to_left
+                        && right_analysis.is_dim_like
                         && right_analysis.has_non_key_filter(&right.name)
                         && key_preserved_through_summaries(&join.right, right)
                         && !left_analysis.has_propagated_filter_target(&column_expr(left))
@@ -226,7 +254,8 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                     // direction would require projecting an expression
                     // (potentially referencing fact-side rows) inside the dim
                     // subquery, which would no longer be a cheap re-execution.
-                    if left_analysis.is_dim_like
+                    if allow_left_to_right
+                        && left_analysis.is_dim_like
                         && left_analysis.has_non_key_filter(&left_col.name)
                         && key_preserved_through_summaries(&join.left, left_col)
                         && !right_analysis.has_propagated_filter_target(right_expr)
@@ -251,7 +280,8 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                     right_col,
                 } => {
                     // Symmetric: only RIGHT-dim → LEFT-expr direction.
-                    if right_analysis.is_dim_like
+                    if allow_right_to_left
+                        && right_analysis.is_dim_like
                         && right_analysis.has_non_key_filter(&right_col.name)
                         && key_preserved_through_summaries(&join.right, right_col)
                         && !left_analysis.has_propagated_filter_target(left_expr)
@@ -912,6 +942,71 @@ mod tests {
         assert!(
             find_propagated_side(&transformed_plan).is_some(),
             "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn left_outer_join_propagates_only_left_to_right() -> Result<()> {
+        // `supplier LEFT JOIN nation ON s_nationkey = n_nationkey WHERE
+        // s_name = 'X'`. The LEFT side (supplier) has a non-key filter; it is
+        // the preserved side. Propagating to the lookup side (nation) is safe.
+        //
+        // Note: `eliminate_outer_join` will rewrite the LEFT JOIN to an INNER
+        // JOIN only if the WHERE clause forces the right side to be non-null
+        // — using a filter on the LEFT side instead preserves the outer
+        // semantics, which is what we want for this test.
+        let ctx = make_ctx()?;
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier LEFT JOIN nation \
+                 ON s_nationkey = n_nationkey WHERE s_suppkey > 5",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        // The supplier-side filter (`s_suppkey > 5`) is a non-key filter on
+        // the LEFT/preserved side. Direction LEFT→RIGHT is allowed; the rule
+        // should propagate `n_nationkey IN (SELECT s_nationkey FROM filtered_supplier)`
+        // onto nation.
+        assert!(
+            changed,
+            "rule should fire LEFT→RIGHT for LEFT OUTER; plan was:\n{plan}"
+        );
+        assert!(
+            find_propagated_side(&transformed_plan).is_some(),
+            "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn left_outer_join_blocks_right_to_left_propagation() -> Result<()> {
+        // Filter on the RIGHT (lookup) side of a LEFT OUTER must NOT cause
+        // propagation onto the LEFT (preserved) side: doing so would drop
+        // left rows the outer join should emit as `(left, NULL...)`.
+        let ctx = make_ctx()?;
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier LEFT JOIN nation \
+                 ON s_nationkey = n_nationkey \
+                 WHERE n_name = 'CHINA' OR n_name IS NULL",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (_, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        // The filter is on the RIGHT side. RIGHT→LEFT propagation is forbidden
+        // for LEFT OUTER. LEFT→RIGHT is allowed but there's no LEFT-side filter
+        // to propagate. So the rule must be a no-op here.
+        assert!(
+            !changed,
+            "RIGHT→LEFT propagation must not fire on LEFT OUTER; plan was:\n{plan}"
         );
         Ok(())
     }

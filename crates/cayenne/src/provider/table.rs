@@ -1489,7 +1489,6 @@ impl CayenneTableProvider {
             // This is the same durability requirement we enforce for file
             // creation, renames, and WAL marker removal elsewhere in the code.
             if let Some(parent) = parent {
-                let parent = parent;
                 tokio::task::spawn_blocking(move || {
                     let f = std::fs::File::open(&parent)?;
                     f.sync_all()
