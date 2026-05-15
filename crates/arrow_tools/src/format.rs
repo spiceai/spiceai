@@ -15,8 +15,11 @@ limitations under the License.
 */
 
 use crate::schema::to_source_native_type_name;
-use arrow::array::{Array, ArrayRef, FixedSizeListArray, ListArray, RecordBatch, StructArray};
-use arrow::buffer::OffsetBuffer;
+use arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, LargeListArray, LargeListViewArray, ListArray,
+    ListViewArray, RecordBatch, StructArray,
+};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::concat;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
@@ -52,6 +55,19 @@ pub(crate) fn format_column_data(
                     "Failed to downcast to StringViewArray".into(),
                 ))?;
 
+            // Fast path: zero-copy when no string requires character truncation.
+            // Cheap byte-length filter first (char count only on candidates).
+            if !string_array.iter().any(|opt| {
+                opt.is_some_and(|s| {
+                    // Short-circuit at the (max_characters)th boundary so we
+                    // stop walking pathologically long strings as soon as we
+                    // know they'll need truncation.
+                    s.len() > max_characters && s.chars().nth(max_characters).is_some()
+                })
+            }) {
+                return Ok(Arc::clone(&column));
+            }
+
             let truncated = string_array
                 .iter()
                 .map(|x| truncate_str(x, max_characters))
@@ -64,8 +80,21 @@ pub(crate) fn format_column_data(
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
                 .ok_or(ArrowError::CastError(
-                    "Failed to downcast to ListArray".into(),
+                    "Failed to downcast to StringArray".into(),
                 ))?;
+
+            // Fast path: zero-copy when no string requires character truncation.
+            // Cheap byte-length filter first (char count only on candidates).
+            if !string_array.iter().any(|opt| {
+                opt.is_some_and(|s| {
+                    // Short-circuit at the (max_characters)th boundary so we
+                    // stop walking pathologically long strings as soon as we
+                    // know they'll need truncation.
+                    s.len() > max_characters && s.chars().nth(max_characters).is_some()
+                })
+            }) {
+                return Ok(Arc::clone(&column));
+            }
 
             let truncated = string_array
                 .iter()
@@ -80,36 +109,66 @@ pub(crate) fn format_column_data(
                 DataType::List(_)
                 | DataType::LargeList(_)
                 | DataType::FixedSizeList(_, _)
-                | DataType::ListView(_),
+                | DataType::ListView(_)
+                | DataType::LargeListView(_),
                 Some(_),
             ),
         ) => {
-            let array_ref = if let DataType::FixedSizeList(_, _) = column.data_type() {
-                let fixed_list_array = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::FixedSizeListArray>()
-                    .ok_or_else(|| {
-                        ArrowError::CastError("Failed to downcast to FixedSizeListArray".into())
-                    })?;
-                Arc::new(truncate_fixed_size_list_array(
-                    fixed_list_array,
-                    num_elements,
-                )?) as ArrayRef
-            } else {
-                let list_array = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::ListArray>()
-                    .ok_or_else(|| {
-                        ArrowError::CastError("Failed to downcast to ListArray".into())
-                    })?;
-                Arc::new(truncate_list_array(list_array, num_elements)?) as ArrayRef
+            let array_ref = match column.data_type() {
+                DataType::FixedSizeList(_, _) => {
+                    let fixed_list_array = column
+                        .as_any()
+                        .downcast_ref::<FixedSizeListArray>()
+                        .ok_or_else(|| {
+                            ArrowError::CastError("Failed to downcast to FixedSizeListArray".into())
+                        })?;
+                    Arc::new(truncate_fixed_size_list_array(
+                        fixed_list_array,
+                        num_elements,
+                    )?) as ArrayRef
+                }
+                DataType::LargeList(_) => {
+                    let list_array = column
+                        .as_any()
+                        .downcast_ref::<LargeListArray>()
+                        .ok_or_else(|| {
+                            ArrowError::CastError("Failed to downcast to LargeListArray".into())
+                        })?;
+                    Arc::new(truncate_large_list_array(list_array, num_elements)?) as ArrayRef
+                }
+                DataType::ListView(_) => {
+                    let list_array =
+                        column
+                            .as_any()
+                            .downcast_ref::<ListViewArray>()
+                            .ok_or_else(|| {
+                                ArrowError::CastError("Failed to downcast to ListViewArray".into())
+                            })?;
+                    Arc::new(truncate_list_view_array(list_array, num_elements)?) as ArrayRef
+                }
+                DataType::LargeListView(_) => {
+                    let list_array = column
+                        .as_any()
+                        .downcast_ref::<LargeListViewArray>()
+                        .ok_or_else(|| {
+                            ArrowError::CastError("Failed to downcast to LargeListViewArray".into())
+                        })?;
+                    Arc::new(truncate_large_list_view_array(list_array, num_elements)?) as ArrayRef
+                }
+                _ => {
+                    let list_array =
+                        column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                            ArrowError::CastError("Failed to downcast to ListArray".into())
+                        })?;
+                    Arc::new(truncate_list_array(list_array, num_elements)?) as ArrayRef
+                }
             };
             Ok(array_ref)
         }
         (FormatOperation::TruncateUtf8Length(max_characters), (DataType::List(field), _)) => {
             let list_array = column
                 .as_any()
-                .downcast_ref::<arrow::array::ListArray>()
+                .downcast_ref::<ListArray>()
                 .ok_or_else(|| ArrowError::CastError("Failed to downcast to ListArray".into()))?;
 
             let truncated_values = format_column_data(
@@ -118,16 +177,142 @@ pub(crate) fn format_column_data(
                 FormatOperation::TruncateUtf8Length(max_characters),
             )?;
 
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
+
             let list = ListArray::new(
                 Arc::clone(&field),
-                arrow::buffer::OffsetBuffer::new(
-                    arrow::buffer::Buffer::from_slice_ref(list_array.value_offsets()).into(),
-                ),
+                list_array.offsets().clone(),
                 truncated_values,
-                list_array.logical_nulls(),
+                list_array.nulls().cloned(),
             );
 
             Ok(Arc::new(list) as ArrayRef)
+        }
+        (FormatOperation::TruncateUtf8Length(max_characters), (DataType::LargeList(field), _)) => {
+            let list_array = column
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| {
+                    ArrowError::CastError("Failed to downcast to LargeListArray".into())
+                })?;
+
+            let truncated_values = format_column_data(
+                Arc::clone(list_array.values()),
+                &field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )?;
+
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
+
+            let list = LargeListArray::new(
+                Arc::clone(&field),
+                list_array.offsets().clone(),
+                truncated_values,
+                list_array.nulls().cloned(),
+            );
+
+            Ok(Arc::new(list) as ArrayRef)
+        }
+        (
+            FormatOperation::TruncateUtf8Length(max_characters),
+            (DataType::FixedSizeList(field, size), _),
+        ) => {
+            let list_array = column
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    ArrowError::CastError("Failed to downcast to FixedSizeListArray".into())
+                })?;
+
+            let truncated_values = format_column_data(
+                Arc::clone(list_array.values()),
+                &field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )?;
+
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
+
+            let list = FixedSizeListArray::new(
+                Arc::clone(&field),
+                size,
+                truncated_values,
+                list_array.nulls().cloned(),
+            );
+
+            Ok(Arc::new(list) as ArrayRef)
+        }
+        (FormatOperation::TruncateUtf8Length(max_characters), (DataType::ListView(field), _)) => {
+            let list_array = column
+                .as_any()
+                .downcast_ref::<ListViewArray>()
+                .ok_or_else(|| {
+                    ArrowError::CastError("Failed to downcast to ListViewArray".into())
+                })?;
+
+            let truncated_values = format_column_data(
+                Arc::clone(list_array.values()),
+                &field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )?;
+
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
+
+            ListViewArray::try_new(
+                Arc::clone(&field),
+                list_array.offsets().clone(),
+                list_array.sizes().clone(),
+                truncated_values,
+                list_array.nulls().cloned(),
+            )
+            .map(|list| Arc::new(list) as ArrayRef)
+        }
+        (
+            FormatOperation::TruncateUtf8Length(max_characters),
+            (DataType::LargeListView(field), _),
+        ) => {
+            let list_array = column
+                .as_any()
+                .downcast_ref::<LargeListViewArray>()
+                .ok_or_else(|| {
+                    ArrowError::CastError("Failed to downcast to LargeListViewArray".into())
+                })?;
+
+            let truncated_values = format_column_data(
+                Arc::clone(list_array.values()),
+                &field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )?;
+
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
+
+            LargeListViewArray::try_new(
+                Arc::clone(&field),
+                list_array.offsets().clone(),
+                list_array.sizes().clone(),
+                truncated_values,
+                list_array.nulls().cloned(),
+            )
+            .map(|list| Arc::new(list) as ArrayRef)
         }
         (FormatOperation::TruncateUtf8Length(max_characters), (DataType::Struct(fields), _)) => {
             let struct_array = column
@@ -135,7 +320,7 @@ pub(crate) fn format_column_data(
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| ArrowError::CastError("Failed to downcast to StructArray".into()))?;
 
-            let columns = fields
+            let columns: Vec<_> = fields
                 .iter()
                 .enumerate()
                 .map(|(i, field)| {
@@ -147,6 +332,15 @@ pub(crate) fn format_column_data(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+
+            // Zero-copy fast path for the whole struct when no field was modified.
+            let all_unchanged = columns
+                .iter()
+                .enumerate()
+                .all(|(i, c)| Arc::ptr_eq(c, struct_array.column(i)));
+            if all_unchanged {
+                return Ok(Arc::clone(&column));
+            }
 
             let truncated_struct =
                 StructArray::from(fields.iter().cloned().zip(columns).collect::<Vec<_>>());
@@ -161,9 +355,11 @@ fn get_possible_nested_list_datatype(f: &Arc<Field>) -> (DataType, Option<DataTy
     (
         f.data_type().clone(),
         match f.data_type() {
-            DataType::List(f) | DataType::FixedSizeList(f, _) | DataType::LargeList(f) => {
-                Some(f.data_type().clone())
-            }
+            DataType::List(f)
+            | DataType::FixedSizeList(f, _)
+            | DataType::LargeList(f)
+            | DataType::ListView(f)
+            | DataType::LargeListView(f) => Some(f.data_type().clone()),
             _ => None,
         },
     )
@@ -184,18 +380,78 @@ fn truncate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
     })
 }
 
-#[expect(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
+fn value_to_usize<T>(value: T, value_name: &str) -> Result<usize, ArrowError>
+where
+    T: TryInto<usize> + std::fmt::Display + Copy,
+{
+    value.try_into().map_err(|_| {
+        ArrowError::InvalidArgumentError(format!(
+            "{value_name} {value} cannot be represented as usize"
+        ))
+    })
+}
+
+fn value_to_i32(value: usize, value_name: &str) -> Result<i32, ArrowError> {
+    i32::try_from(value).map_err(|_| {
+        ArrowError::InvalidArgumentError(format!(
+            "{value_name} {value} cannot be represented as i32"
+        ))
+    })
+}
+
+fn list_slice_range<T>(
+    start_offset: T,
+    end_offset: T,
+    array_name: &str,
+    start_offset_name: &str,
+    end_offset_name: &str,
+) -> Result<(usize, usize), ArrowError>
+where
+    T: TryInto<usize> + std::fmt::Display + Copy,
+{
+    let start = value_to_usize(start_offset, start_offset_name)?;
+    let end = value_to_usize(end_offset, end_offset_name)?;
+    let len = end.checked_sub(start).ok_or_else(|| {
+        ArrowError::InvalidArgumentError(format!(
+            "{array_name} end offset {end} is before start offset {start}"
+        ))
+    })?;
+
+    Ok((start, len))
+}
+
+fn list_element_field(data_type: &DataType, array_name: &str) -> Result<Arc<Field>, ArrowError> {
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) => Ok(Arc::clone(field)),
+        _ => Err(ArrowError::InvalidArgumentError(format!(
+            "{array_name} data type is not a list type: {data_type}"
+        ))),
+    }
+}
+
 fn truncate_fixed_size_list_array(
     list_array: &FixedSizeListArray,
     max_len: usize,
 ) -> Result<FixedSizeListArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
     let child_array = list_array.values();
-    let original_size = list_array.value_length() as usize;
-    let truncated_size = max_len.min(original_size);
+    let original_size =
+        value_to_usize(list_array.value_length(), "FixedSizeListArray value length")?;
+    // Fast path: zero-copy clone when truncation would be a no-op. This is the
+    // common case for display formatting (generous max_len, small actual lists)
+    // and avoids per-row slice + concat allocation/copy entirely.
+    if max_len >= original_size {
+        return Ok(list_array.clone());
+    }
+    let truncated_size = max_len; // known to be < original_size
+    let truncated_size_i32 = value_to_i32(truncated_size, "FixedSizeListArray truncated size")?;
+    let element_field = list_element_field(list_array.data_type(), "FixedSizeListArray")?;
 
     let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
         .map(|i| child_array.slice(i * original_size, truncated_size))
@@ -204,52 +460,267 @@ fn truncate_fixed_size_list_array(
     let new_child_array = Arc::new(concat(
         &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
     )?);
-    let nulls = new_child_array.nulls().cloned();
+    // Parent list-level nulls (which slots are NULL lists) are preserved as-is;
+    // they live separately from the child array's element-level null bitmap.
+    let nulls = list_array.nulls().cloned();
 
-    FixedSizeListArray::try_new(
-        Arc::new(Field::new(
-            "item",
-            child_array.data_type().clone(),
-            child_array.is_nullable(),
-        )),
-        truncated_size as i32,
-        new_child_array,
-        nulls,
-    )
+    FixedSizeListArray::try_new(element_field, truncated_size_i32, new_child_array, nulls)
 }
 
-#[expect(clippy::cast_sign_loss)]
 fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
+    // Fast path: zero-copy clone when no list element exceeds max_len.
+    let mut needs_trunc = false;
+    for i in 0..list_array.len() {
+        let (_, len) = list_slice_range(
+            offsets[i],
+            offsets[i + 1],
+            "ListArray",
+            "ListArray start offset",
+            "ListArray end offset",
+        )?;
+        if len > max_len {
+            needs_trunc = true;
+            break;
+        }
+    }
+    if !needs_trunc {
+        return Ok(list_array.clone());
+    }
+    let element_field = list_element_field(list_array.data_type(), "ListArray")?;
 
-    let new_lengths: Vec<usize> = (0..list_array.len())
+    let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
         .map(|i| {
-            let start = offsets[i] as usize;
-            let end = offsets[i + 1] as usize;
-            max_len.min(end - start)
+            list_slice_range(
+                offsets[i],
+                offsets[i + 1],
+                "ListArray",
+                "ListArray start offset",
+                "ListArray end offset",
+            )
+            .map(|(start, len)| (start, max_len.min(len)))
         })
-        .collect();
+        .collect::<Result<_, ArrowError>>()?;
+    let new_lengths: Vec<usize> = slice_ranges.iter().map(|&(_, len)| len).collect();
 
     let sliced_arrays: Vec<Arc<dyn Array>> = new_lengths
         .iter()
-        .enumerate()
-        .map(|(i, &len)| child_array.slice(offsets[i] as usize, len))
+        .zip(slice_ranges.iter())
+        .map(|(&len, &(start, _))| child_array.slice(start, len))
         .collect();
 
     let new_child_array = Arc::new(concat(
         &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
     )?);
 
-    let nulls = new_child_array.nulls().cloned();
+    let nulls = list_array.nulls().cloned();
 
     ListArray::try_new(
-        Arc::new(Field::new(
-            "item",
-            child_array.data_type().clone(),
-            child_array.is_nullable(),
-        )),
+        element_field,
         OffsetBuffer::from_lengths(new_lengths),
+        new_child_array,
+        nulls,
+    )
+}
+
+fn truncate_large_list_array(
+    list_array: &LargeListArray,
+    max_len: usize,
+) -> Result<LargeListArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
+    let child_array = list_array.values();
+    let offsets = list_array.value_offsets();
+    // Fast path: zero-copy clone when truncation is unnecessary (common for
+    // result formatting). LargeList uses i64 offsets, so validate conversion
+    // before deciding whether the slow path is needed.
+    let mut needs_trunc = false;
+    for i in 0..list_array.len() {
+        let (_, len) = list_slice_range(
+            offsets[i],
+            offsets[i + 1],
+            "LargeListArray",
+            "LargeListArray start offset",
+            "LargeListArray end offset",
+        )?;
+        if len > max_len {
+            needs_trunc = true;
+            break;
+        }
+    }
+    if !needs_trunc {
+        return Ok(list_array.clone());
+    }
+    let element_field = list_element_field(list_array.data_type(), "LargeListArray")?;
+
+    let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
+        .map(|i| {
+            list_slice_range(
+                offsets[i],
+                offsets[i + 1],
+                "LargeListArray",
+                "LargeListArray start offset",
+                "LargeListArray end offset",
+            )
+            .map(|(start, len)| (start, max_len.min(len)))
+        })
+        .collect::<Result<_, ArrowError>>()?;
+    let new_lengths: Vec<usize> = slice_ranges.iter().map(|&(_, len)| len).collect();
+
+    let sliced_arrays: Vec<Arc<dyn Array>> = new_lengths
+        .iter()
+        .zip(slice_ranges.iter())
+        .map(|(&len, &(start, _))| child_array.slice(start, len))
+        .collect();
+
+    let new_child_array = Arc::new(concat(
+        &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+    )?);
+
+    let nulls = list_array.nulls().cloned();
+
+    LargeListArray::try_new(
+        element_field,
+        OffsetBuffer::from_lengths(new_lengths),
+        new_child_array,
+        nulls,
+    )
+}
+
+fn truncate_list_view_array(
+    list_array: &ListViewArray,
+    max_len: usize,
+) -> Result<ListViewArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
+    let child_array = list_array.values();
+    let sizes = list_array.value_sizes();
+    // Fast path for ListView: sizes are stored explicitly, cheap scan.
+    // When no element exceeds the limit we return the original (preserving
+    // whatever non-contiguous view layout the caller had).
+    let mut needs_trunc = false;
+    for &size in sizes {
+        if value_to_usize(size, "ListViewArray size")? > max_len {
+            needs_trunc = true;
+            break;
+        }
+    }
+    if !needs_trunc {
+        return Ok(list_array.clone());
+    }
+    let offsets = list_array.value_offsets();
+    let element_field = list_element_field(list_array.data_type(), "ListViewArray")?;
+
+    let slice_ranges: Vec<(usize, usize, i32)> = (0..list_array.len())
+        .map(|i| {
+            let start = value_to_usize(offsets[i], "ListViewArray offset")?;
+            let original_size = value_to_usize(sizes[i], "ListViewArray size")?;
+            let truncated_size = max_len.min(original_size);
+            let truncated_size_i32 = value_to_i32(truncated_size, "ListViewArray truncated size")?;
+
+            Ok((start, truncated_size, truncated_size_i32))
+        })
+        .collect::<Result<_, ArrowError>>()?;
+    let new_sizes: Vec<i32> = slice_ranges
+        .iter()
+        .map(|&(_, _, truncated_size_i32)| truncated_size_i32)
+        .collect();
+
+    let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
+        .map(|i| child_array.slice(slice_ranges[i].0, slice_ranges[i].1))
+        .collect();
+
+    let new_child_array = Arc::new(concat(
+        &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+    )?);
+
+    let nulls = list_array.nulls().cloned();
+
+    // After concat, the new values buffer is laid out contiguously, so we
+    // re-derive offsets from the truncated sizes. Bail on overflow rather
+    // than silently producing misaligned offsets.
+    let mut new_offsets: Vec<i32> = Vec::with_capacity(new_sizes.len());
+    let mut running: i32 = 0;
+    for &s in &new_sizes {
+        new_offsets.push(running);
+        running = running.checked_add(s).ok_or_else(|| {
+            ArrowError::InvalidArgumentError("ListViewArray cumulative size overflowed i32".into())
+        })?;
+    }
+
+    ListViewArray::try_new(
+        element_field,
+        ScalarBuffer::from(new_offsets),
+        ScalarBuffer::from(new_sizes),
+        new_child_array,
+        nulls,
+    )
+}
+
+fn truncate_large_list_view_array(
+    list_array: &LargeListViewArray,
+    max_len: usize,
+) -> Result<LargeListViewArray, ArrowError> {
+    if list_array.is_empty() {
+        return Ok(list_array.clone());
+    }
+    let child_array = list_array.values();
+    let sizes = list_array.value_sizes();
+    // Fast path for LargeListView (i64 sizes): cheap scan over the sizes buffer.
+    // When nothing needs truncation we avoid the expensive concat + offset rebuild.
+    let max_len_i64 = i64::try_from(max_len).map_err(|_| {
+        ArrowError::InvalidArgumentError(format!("max_len {max_len} cannot be represented as i64"))
+    })?;
+    if !sizes.iter().any(|&s| s > max_len_i64) {
+        return Ok(list_array.clone());
+    }
+    let offsets = list_array.value_offsets();
+    let element_field = list_element_field(list_array.data_type(), "LargeListViewArray")?;
+
+    let new_sizes: Vec<i64> = (0..list_array.len())
+        .map(|i| sizes[i].min(max_len_i64))
+        .collect();
+
+    let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
+        .map(|i| {
+            let start = value_to_usize(offsets[i], "LargeListViewArray offset")?;
+            let len = value_to_usize(new_sizes[i], "LargeListViewArray size")?;
+
+            Ok((start, len))
+        })
+        .collect::<Result<_, ArrowError>>()?;
+
+    let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
+        .map(|i| child_array.slice(slice_ranges[i].0, slice_ranges[i].1))
+        .collect();
+
+    let new_child_array = Arc::new(concat(
+        &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+    )?);
+
+    let nulls = list_array.nulls().cloned();
+
+    let mut new_offsets: Vec<i64> = Vec::with_capacity(new_sizes.len());
+    let mut running: i64 = 0;
+    for &s in &new_sizes {
+        new_offsets.push(running);
+        running = running.checked_add(s).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(
+                "LargeListViewArray cumulative size overflowed i64".into(),
+            )
+        })?;
+    }
+
+    LargeListViewArray::try_new(
+        element_field,
+        ScalarBuffer::from(new_offsets),
+        ScalarBuffer::from(new_sizes),
         new_child_array,
         nulls,
     )
@@ -410,6 +881,26 @@ pub fn pretty_print_schema(
             }
             DataType::LargeList(field) => {
                 w.write_str("large_list<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                w.write_char('>')
+            }
+            DataType::FixedSizeList(field, size) => {
+                w.write_str("fixed_size_list<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                write!(w, ">[{size}]")
+            }
+            DataType::ListView(field) => {
+                w.write_str("list_view<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                w.write_char('>')
+            }
+            DataType::LargeListView(field) => {
+                w.write_str("large_list_view<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                w.write_char('>')
+            }
+            DataType::Map(field, _) => {
+                w.write_str("map<")?;
                 write_data_type(field.data_type(), w)?;
                 w.write_char('>')
             }
@@ -635,6 +1126,519 @@ Cras venenatis euismod malesuada.",
     }
 
     #[test]
+    fn test_truncate_large_list_array() {
+        use arrow::array::{Int32Array, LargeListArray as LargeListArrayAlias};
+        use arrow::buffer::OffsetBuffer;
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let offsets = OffsetBuffer::<i64>::new(vec![0_i64, 3, 6, 8].into());
+        let input = LargeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            Arc::new(values),
+            None,
+        );
+
+        let output =
+            truncate_large_list_array(&input, 2).expect("truncate_large_list_array failed");
+
+        assert_eq!(output.len(), 3);
+        // Each sublist should now have at most 2 elements.
+        let observed_lengths: Vec<usize> = (0..output.len())
+            .map(|i| {
+                let start =
+                    usize::try_from(output.value_offsets()[i]).expect("offset should fit in usize");
+                let end = usize::try_from(output.value_offsets()[i + 1])
+                    .expect("offset should fit in usize");
+                end - start
+            })
+            .collect();
+        assert_eq!(observed_lengths, vec![2, 2, 2]);
+    }
+
+    /// Parent list-level nulls (which slots are NULL lists) must survive
+    /// truncation. The bug we're guarding against: pulling the child array's
+    /// null bitmap and stuffing it into the parent's `nulls` slot, which can
+    /// flip valid slots to NULL or vice versa.
+    #[test]
+    fn test_truncate_list_array_preserves_parent_nulls() {
+        let input = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(0), Some(1), Some(2), Some(3)]),
+            None,
+            Some(vec![Some(4), Some(5)]),
+        ]);
+        let parent_nulls_before: Vec<bool> = (0..input.len()).map(|i| input.is_null(i)).collect();
+
+        let output = truncate_list_array(&input, 2).expect("truncate_list_array failed");
+        let parent_nulls_after: Vec<bool> = (0..output.len()).map(|i| output.is_null(i)).collect();
+
+        assert_eq!(parent_nulls_before, parent_nulls_after);
+        assert_eq!(parent_nulls_after, vec![false, true, false]);
+    }
+
+    #[test]
+    fn test_truncate_large_list_array_preserves_parent_nulls() {
+        use arrow::array::{Int32Array, LargeListArray as LargeListArrayAlias};
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5]);
+        let offsets = OffsetBuffer::<i64>::new(vec![0_i64, 3, 3, 6].into());
+        // Mark the middle slot as a NULL list.
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let input = LargeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            Arc::new(values),
+            Some(nulls),
+        );
+
+        let output =
+            truncate_large_list_array(&input, 2).expect("truncate_large_list_array failed");
+
+        assert!(!output.is_null(0));
+        assert!(output.is_null(1));
+        assert!(!output.is_null(2));
+    }
+
+    /// Truncation must carry the original element `Field` through unchanged.
+    /// Building a fresh field with a hardcoded name ("item") and
+    /// `child_array.is_nullable()` (which reflects the *data*, not the
+    /// declared schema) would silently rewrite the resulting `DataType` and
+    /// drop any field-level metadata.
+    #[test]
+    fn test_truncate_helpers_preserve_element_field() {
+        use arrow::array::{
+            FixedSizeListArray as FixedSizeListArrayAlias, Int32Array,
+            LargeListArray as LargeListArrayAlias, LargeListViewArray as LargeListViewArrayAlias,
+            ListViewArray as ListViewArrayAlias,
+        };
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+
+        let metadata: HashMap<String, String> = [("origin".to_string(), "audit_test".to_string())]
+            .into_iter()
+            .collect();
+        // Original field has a custom name, declared-nullable=false, and metadata;
+        // none of which the truncation helper should be free to discard.
+        let element_field =
+            Arc::new(Field::new("value", DataType::Int32, false).with_metadata(metadata.clone()));
+
+        let values = || Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let assert_field_preserved = |actual: &Arc<Field>| {
+            assert_eq!(actual.name(), "value");
+            assert!(!actual.is_nullable());
+            assert_eq!(actual.metadata(), &metadata);
+        };
+
+        // List
+        let list = ListArray::new(
+            Arc::clone(&element_field),
+            OffsetBuffer::<i32>::new(vec![0_i32, 3, 6, 8].into()),
+            Arc::new(values()),
+            None,
+        );
+        let output = truncate_list_array(&list, 2).expect("truncate List");
+        match output.data_type() {
+            DataType::List(field) => assert_field_preserved(field),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // LargeList
+        let large_list = LargeListArrayAlias::new(
+            Arc::clone(&element_field),
+            OffsetBuffer::<i64>::new(vec![0_i64, 3, 6, 8].into()),
+            Arc::new(values()),
+            None,
+        );
+        let output = truncate_large_list_array(&large_list, 2).expect("truncate LargeList");
+        match output.data_type() {
+            DataType::LargeList(field) => assert_field_preserved(field),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // FixedSizeList
+        let fixed_size_list = FixedSizeListArrayAlias::new(
+            Arc::clone(&element_field),
+            4,
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7])),
+            None,
+        );
+        let output =
+            truncate_fixed_size_list_array(&fixed_size_list, 2).expect("truncate FixedSizeList");
+        match output.data_type() {
+            DataType::FixedSizeList(field, _) => assert_field_preserved(field),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // ListView
+        let list_view = ListViewArrayAlias::try_new(
+            Arc::clone(&element_field),
+            ScalarBuffer::<i32>::from(vec![0_i32, 3, 6]),
+            ScalarBuffer::<i32>::from(vec![3_i32, 3, 2]),
+            Arc::new(values()),
+            None,
+        )
+        .expect("ListViewArray construction");
+        let output = truncate_list_view_array(&list_view, 2).expect("truncate ListView");
+        match output.data_type() {
+            DataType::ListView(field) => assert_field_preserved(field),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // LargeListView
+        let large_list_view = LargeListViewArrayAlias::try_new(
+            Arc::clone(&element_field),
+            ScalarBuffer::<i64>::from(vec![0_i64, 3, 6]),
+            ScalarBuffer::<i64>::from(vec![3_i64, 3, 2]),
+            Arc::new(values()),
+            None,
+        )
+        .expect("LargeListViewArray construction");
+        let output =
+            truncate_large_list_view_array(&large_list_view, 2).expect("truncate LargeListView");
+        match output.data_type() {
+            DataType::LargeListView(field) => assert_field_preserved(field),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// `TruncateUtf8Length` must recurse into every list-like variant, not
+    /// just `List`. Otherwise strings nested under `LargeList` /
+    /// `FixedSizeList` / `ListView` / `LargeListView` silently skip
+    /// truncation when callers run `truncate_string_columns` over a record
+    /// batch.
+    #[test]
+    fn test_truncate_utf8_recurses_into_all_list_variants() {
+        use arrow::array::{
+            FixedSizeListArray as FixedSizeListArrayAlias, LargeListArray as LargeListArrayAlias,
+            LargeListViewArray as LargeListViewArrayAlias, ListViewArray as ListViewArrayAlias,
+            StringArray,
+        };
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+
+        fn assert_first_string_truncated(arr: &ArrayRef, expected_first_char: &str) {
+            // Each variant stores its UTF8 elements contiguously in the child
+            // array; inspecting element 0 is enough to prove truncation ran.
+            let dt = arr.data_type().clone();
+            let child: ArrayRef = match &dt {
+                DataType::List(_) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<ListArray>()
+                        .expect("ListArray")
+                        .values(),
+                ),
+                DataType::LargeList(_) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<LargeListArrayAlias>()
+                        .expect("LargeListArray")
+                        .values(),
+                ),
+                DataType::FixedSizeList(_, _) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<FixedSizeListArrayAlias>()
+                        .expect("FixedSizeListArray")
+                        .values(),
+                ),
+                DataType::ListView(_) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<ListViewArrayAlias>()
+                        .expect("ListViewArray")
+                        .values(),
+                ),
+                DataType::LargeListView(_) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<LargeListViewArrayAlias>()
+                        .expect("LargeListViewArray")
+                        .values(),
+                ),
+                other => panic!("unexpected outer type {other:?}"),
+            };
+            let strings = child
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("StringArray child");
+            assert_eq!(strings.value(0), expected_first_char);
+        }
+
+        let inner_field = Arc::new(Field::new("item", DataType::Utf8, true));
+        let strings = || StringArray::from(vec!["abcdef", "ghijkl"]);
+
+        // List<Utf8>
+        let list = ListArray::new(
+            Arc::clone(&inner_field),
+            OffsetBuffer::<i32>::new(vec![0_i32, 1, 2].into()),
+            Arc::new(strings()),
+            None,
+        );
+        let truncated = format_column_data(
+            Arc::new(list) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::List(Arc::clone(&inner_field)),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("List Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
+
+        // LargeList<Utf8>
+        let large_list = LargeListArrayAlias::new(
+            Arc::clone(&inner_field),
+            OffsetBuffer::<i64>::new(vec![0_i64, 1, 2].into()),
+            Arc::new(strings()),
+            None,
+        );
+        let truncated = format_column_data(
+            Arc::new(large_list) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::LargeList(Arc::clone(&inner_field)),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("LargeList Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
+
+        // FixedSizeList<Utf8>[1]
+        let fsl =
+            FixedSizeListArrayAlias::new(Arc::clone(&inner_field), 1, Arc::new(strings()), None);
+        let truncated = format_column_data(
+            Arc::new(fsl) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::FixedSizeList(Arc::clone(&inner_field), 1),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("FixedSizeList Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
+
+        // ListView<Utf8>
+        let list_view = ListViewArrayAlias::try_new(
+            Arc::clone(&inner_field),
+            ScalarBuffer::<i32>::from(vec![0_i32, 1]),
+            ScalarBuffer::<i32>::from(vec![1_i32, 1]),
+            Arc::new(strings()),
+            None,
+        )
+        .expect("ListViewArray construction");
+        let truncated = format_column_data(
+            Arc::new(list_view) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::ListView(Arc::clone(&inner_field)),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("ListView Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
+
+        // LargeListView<Utf8>
+        let large_list_view = LargeListViewArrayAlias::try_new(
+            Arc::clone(&inner_field),
+            ScalarBuffer::<i64>::from(vec![0_i64, 1]),
+            ScalarBuffer::<i64>::from(vec![1_i64, 1]),
+            Arc::new(strings()),
+            None,
+        )
+        .expect("LargeListViewArray construction");
+        let truncated = format_column_data(
+            Arc::new(large_list_view) as ArrayRef,
+            &Arc::new(Field::new(
+                "col",
+                DataType::LargeListView(Arc::clone(&inner_field)),
+                true,
+            )),
+            FormatOperation::TruncateUtf8Length(1),
+        )
+        .expect("LargeListView Utf8 truncate");
+        assert_first_string_truncated(&truncated, "a");
+    }
+
+    /// `arrow::compute::concat` errors when given an empty slice of arrays.
+    /// 0-row record batches are a realistic input (e.g. a sample query that
+    /// returns no rows), so each list truncation helper must short-circuit
+    /// before reaching `concat`.
+    #[test]
+    fn test_truncate_helpers_handle_empty_arrays() {
+        use arrow::array::{
+            FixedSizeListArray as FixedSizeListArrayAlias, Int32Array,
+            LargeListArray as LargeListArrayAlias, LargeListViewArray as LargeListViewArrayAlias,
+            ListViewArray as ListViewArrayAlias,
+        };
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+
+        // Empty ListArray
+        let empty_list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::<i32>::new(vec![0_i32].into()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        );
+        assert_eq!(
+            truncate_list_array(&empty_list, 4)
+                .expect("empty ListArray must round-trip")
+                .len(),
+            0
+        );
+
+        // Empty LargeListArray
+        let empty_large_list = LargeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::<i64>::new(vec![0_i64].into()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        );
+        assert_eq!(
+            truncate_large_list_array(&empty_large_list, 4)
+                .expect("empty LargeListArray must round-trip")
+                .len(),
+            0
+        );
+
+        // Empty FixedSizeListArray
+        let empty_fsl = FixedSizeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            3,
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        );
+        assert_eq!(
+            truncate_fixed_size_list_array(&empty_fsl, 2)
+                .expect("empty FixedSizeListArray must round-trip")
+                .len(),
+            0
+        );
+
+        // Empty ListViewArray
+        let empty_list_view = ListViewArrayAlias::try_new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            ScalarBuffer::<i32>::from(Vec::<i32>::new()),
+            ScalarBuffer::<i32>::from(Vec::<i32>::new()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        )
+        .expect("empty ListViewArray construction");
+        assert_eq!(
+            truncate_list_view_array(&empty_list_view, 4)
+                .expect("empty ListViewArray must round-trip")
+                .len(),
+            0
+        );
+
+        // Empty LargeListViewArray
+        let empty_large_list_view = LargeListViewArrayAlias::try_new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            ScalarBuffer::<i64>::from(Vec::<i64>::new()),
+            ScalarBuffer::<i64>::from(Vec::<i64>::new()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        )
+        .expect("empty LargeListViewArray construction");
+        assert_eq!(
+            truncate_large_list_view_array(&empty_large_list_view, 4)
+                .expect("empty LargeListViewArray must round-trip")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_truncate_fixed_size_list_array_preserves_parent_nulls() {
+        use arrow::array::{FixedSizeListArray as FixedSizeListArrayAlias, Int32Array};
+        use arrow::buffer::NullBuffer;
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let input = FixedSizeListArrayAlias::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            3,
+            Arc::new(values),
+            Some(nulls),
+        );
+
+        let output = truncate_fixed_size_list_array(&input, 2)
+            .expect("truncate_fixed_size_list_array failed");
+
+        assert!(!output.is_null(0));
+        assert!(output.is_null(1));
+        assert!(!output.is_null(2));
+    }
+
+    #[test]
+    fn test_truncate_list_view_array() {
+        use arrow::array::{Int32Array, ListViewArray as ListViewArrayAlias};
+        use arrow::buffer::ScalarBuffer;
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0_i32, 3, 6]);
+        let sizes = ScalarBuffer::<i32>::from(vec![3_i32, 3, 2]);
+        let input = ListViewArrayAlias::try_new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            sizes,
+            Arc::new(values),
+            None,
+        )
+        .expect("ListViewArray::try_new");
+
+        let output = truncate_list_view_array(&input, 2).expect("truncate_list_view_array failed");
+
+        assert_eq!(output.len(), 3);
+        // After truncation each entry has at most 2 elements.
+        for size in output.value_sizes() {
+            assert!(*size <= 2, "size {size} exceeded max_len");
+        }
+    }
+
+    #[test]
+    fn test_truncate_large_list_view_array() {
+        use arrow::array::{Int32Array, LargeListViewArray as LargeListViewArrayAlias};
+        use arrow::buffer::ScalarBuffer;
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let offsets = ScalarBuffer::<i64>::from(vec![0_i64, 3, 6]);
+        let sizes = ScalarBuffer::<i64>::from(vec![3_i64, 3, 2]);
+        let input = LargeListViewArrayAlias::try_new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            sizes,
+            Arc::new(values),
+            None,
+        )
+        .expect("LargeListViewArray::try_new");
+
+        let output = truncate_large_list_view_array(&input, 2)
+            .expect("truncate_large_list_view_array failed");
+
+        assert_eq!(output.len(), 3);
+        for size in output.value_sizes() {
+            assert!(*size <= 2, "size {size} exceeded max_len");
+        }
+    }
+
+    #[test]
+    fn test_get_possible_nested_list_datatype_view_variants() {
+        let inner = DataType::Int32;
+        let cases = vec![
+            DataType::List(Arc::new(Field::new("item", inner.clone(), true))),
+            DataType::LargeList(Arc::new(Field::new("item", inner.clone(), true))),
+            DataType::FixedSizeList(Arc::new(Field::new("item", inner.clone(), true)), 4),
+            DataType::ListView(Arc::new(Field::new("item", inner.clone(), true))),
+            DataType::LargeListView(Arc::new(Field::new("item", inner.clone(), true))),
+        ];
+        for dt in cases {
+            let f = Arc::new(Field::new("col", dt, true));
+            let (_, inner_dt) = get_possible_nested_list_datatype(&f);
+            assert_eq!(inner_dt.as_ref(), Some(&inner), "field {f:?}");
+        }
+    }
+
+    #[test]
     fn test_truncate_fixed_size_list_array() {
         let test_cases: Vec<(&str, usize, FixedSizeListArray)> = vec![
             (
@@ -750,5 +1754,197 @@ Cras venenatis euismod malesuada.",
         scores: list<item: float32> (nullable)
         metadata: struct<key utf8, value utf8> (nullable)
         ");
+    }
+
+    /// `max_len = 0` is a valid (if unusual) truncation request: every list
+    /// must become a 0-element list while parent nulls and the element Field
+    /// (including metadata/nullable) are preserved exactly.
+    #[test]
+    fn test_truncate_list_to_zero_elements() {
+        use arrow::array::{Int32Array, ListArray as ListArrayAlias};
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+
+        let element_field = Arc::new(
+            Field::new("value", DataType::Int32, false)
+                .with_metadata([("audit".to_string(), "zero_len".to_string())].into()),
+        );
+
+        // List<i32> with mixed lengths + one parent NULL
+        // lists: [0,1,2], [], [3,4,5], [6]  (values 0..6)
+        let list = ListArrayAlias::new(
+            Arc::clone(&element_field),
+            OffsetBuffer::<i32>::new(vec![0_i32, 3, 3, 6, 7].into()),
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7])),
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        );
+        let out = truncate_list_array(&list, 0).expect("truncate to 0");
+        assert_eq!(out.len(), 4);
+        assert!(out.is_null(1));
+        assert!(!out.is_null(0));
+        // All non-null lists must report length 0
+        for i in [0, 2, 3] {
+            assert!(!out.is_null(i));
+            assert_eq!(out.value(i).len(), 0);
+        }
+        // Element field preserved
+        if let DataType::List(f) = out.data_type() {
+            assert_eq!(f.name(), "value");
+            assert!(!f.is_nullable());
+            assert_eq!(f.metadata().get("audit"), Some(&"zero_len".to_string()));
+        } else {
+            panic!("expected List");
+        }
+    }
+
+    /// Fast-path + `max_len=0` for `ListView` (non-contiguous layout).
+    #[test]
+    fn test_truncate_list_view_to_zero_and_fast_path() {
+        use arrow::array::{Int32Array, ListViewArray as ListViewArrayAlias};
+        use arrow::buffer::{NullBuffer, ScalarBuffer};
+
+        let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let values = Int32Array::from(vec![10, 20, 30, 40]);
+        // Two lists: [10,20,30] at offset 0 size 3, and a NULL list, and [40]
+        let offsets = ScalarBuffer::<i32>::from(vec![0_i32, 0, 3]);
+        let sizes = ScalarBuffer::<i32>::from(vec![3_i32, 0, 1]);
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let input = ListViewArrayAlias::try_new(
+            Arc::clone(&element_field),
+            offsets,
+            sizes,
+            Arc::new(values),
+            Some(nulls),
+        )
+        .expect("ListView construction");
+
+        // Fast path: max_len larger than any size (including the 0-size one)
+        let out_fast = truncate_list_view_array(&input, 100).expect("fast path");
+        assert_eq!(out_fast.len(), 3);
+        assert!(out_fast.is_null(1));
+        assert_eq!(out_fast.value_sizes(), &[3, 0, 1]); // unchanged layout
+
+        // max_len=0 path
+        let out_zero = truncate_list_view_array(&input, 0).expect("zero len view");
+        assert_eq!(out_zero.len(), 3);
+        assert!(out_zero.is_null(1));
+        for i in [0, 2] {
+            assert!(!out_zero.is_null(i));
+            assert_eq!(out_zero.value(i).len(), 0);
+        }
+    }
+
+    /// Using the public `truncate_numeric_column_length` API with a `RecordBatch`
+    /// that contains a mix of list columns that do and do not need truncation.
+    /// When the fast path triggers for some columns, the original column Arc
+    /// should be reused (identity) for those that didn't change.
+    #[test]
+    fn test_truncate_numeric_column_length_fast_path_and_mixed() {
+        use arrow::array::{Int32Array, ListArray as ListArrayAlias};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Field as ArrowField;
+
+        use crate::record_batch::truncate_numeric_column_length;
+
+        let schema = Arc::new(Schema::new(vec![
+            ArrowField::new(
+                "short_lists",
+                DataType::List(Arc::new(Field::new("v", DataType::Int32, true))),
+                true,
+            ),
+            ArrowField::new(
+                "long_lists",
+                DataType::List(Arc::new(Field::new("v", DataType::Int32, true))),
+                true,
+            ),
+        ]));
+
+        let short = ListArrayAlias::new(
+            Arc::new(Field::new("v", DataType::Int32, true)),
+            OffsetBuffer::<i32>::new(vec![0_i32, 1, 2].into()),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
+        );
+        let long = ListArrayAlias::new(
+            Arc::new(Field::new("v", DataType::Int32, true)),
+            OffsetBuffer::<i32>::new(vec![0_i32, 5, 10].into()),
+            Arc::new(Int32Array::from((0..10).collect::<Vec<_>>())),
+            None,
+        );
+
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(short), Arc::new(long)])
+                .expect("batch");
+
+        // max_elements=3 : short_lists hits fast path (no change), long_lists truncated
+        let processed =
+            truncate_numeric_column_length(&batch, 3).expect("truncate_numeric_column_length");
+
+        assert_eq!(processed.num_columns(), 2);
+        // First column should be the exact same Arc (fast path clone in practice
+        // returns the input, but RecordBatch construction may not dedup Arcs;
+        // we at least verify logical identity of data).
+        let short_in = batch.column(0);
+        let short_out = processed.column(0);
+        assert_eq!(short_in.data_type(), short_out.data_type());
+        assert_eq!(short_in.len(), short_out.len());
+        // Second column must have been truncated (lengths now <=3)
+        let long_out = processed
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArrayAlias>()
+            .expect("ListArray");
+        for i in 0..long_out.len() {
+            assert!(long_out.value(i).len() <= 3);
+        }
+    }
+
+    /// `max_len = 0` must work correctly for `ListView` (non-contiguous layout).
+    /// This exercises the `ListView` truncation path with the most aggressive
+    /// truncation limit, ensuring parent nulls and element Field are preserved
+    /// even when every list is reduced to zero elements.
+    #[test]
+    fn test_truncate_list_view_to_zero_elements() {
+        use arrow::array::{Int32Array, ListViewArray as ListViewArrayAlias};
+        use arrow::buffer::{NullBuffer, ScalarBuffer};
+
+        let element_field = Arc::new(
+            Field::new("value", DataType::Int32, false)
+                .with_metadata([("audit".to_string(), "zero_len_view".to_string())].into()),
+        );
+
+        // ListView with mixed lengths + one parent NULL (3 lists)
+        let values = Int32Array::from(vec![1, 2, 3, 4, 5, 6]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0_i32, 3, 3]); // 3 lists
+        let sizes = ScalarBuffer::<i32>::from(vec![3_i32, 0, 3]);
+        let nulls = NullBuffer::from(vec![true, false, true]); // 3 entries
+        let input = ListViewArrayAlias::try_new(
+            Arc::clone(&element_field),
+            offsets,
+            sizes,
+            Arc::new(values),
+            Some(nulls),
+        )
+        .expect("ListView construction");
+
+        let out = truncate_list_view_array(&input, 0).expect("truncate ListView to 0");
+
+        assert_eq!(out.len(), 3);
+        assert!(out.is_null(1));
+        assert!(!out.is_null(0));
+        assert!(!out.is_null(2));
+        assert_eq!(out.value(0).len(), 0);
+        assert_eq!(out.value(2).len(), 0);
+
+        // Element field preserved
+        if let DataType::ListView(f) = out.data_type() {
+            assert_eq!(f.name(), "value");
+            assert!(!f.is_nullable());
+            assert_eq!(
+                f.metadata().get("audit"),
+                Some(&"zero_len_view".to_string())
+            );
+        } else {
+            panic!("expected ListView");
+        }
     }
 }

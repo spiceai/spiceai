@@ -220,23 +220,23 @@ impl PartitionCreator for CayennePartitionCreator {
         // record the partition in the catalog via add_partition. This follows
         // the same uniform contract as snapshot directories, _partitioned_wal/,
         // deletions/ subdirs, and initial table creation.
-        if self.object_store_config.is_none() {
-            if let Some(parent) = partition_dir.parent() {
-                let parent = parent.to_path_buf();
-                let parent_display = parent.display().to_string();
-                match tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&parent).and_then(|f| f.sync_all())
-                })
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::warn!(
-                        "Failed to sync Cayenne partition parent directory {parent_display}: {error}"
-                    ),
-                    Err(error) => tracing::warn!(
-                        "Failed to join Cayenne partition parent directory sync task for {parent_display}: {error}"
-                    ),
-                }
+        if self.object_store_config.is_none()
+            && let Some(parent) = partition_dir.parent()
+        {
+            let parent = parent.to_path_buf();
+            let parent_display = parent.display().to_string();
+            match tokio::task::spawn_blocking(move || {
+                std::fs::File::open(&parent).and_then(|f| f.sync_all())
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    "Failed to sync Cayenne partition parent directory {parent_display}: {error}"
+                ),
+                Err(error) => tracing::warn!(
+                    "Failed to join Cayenne partition parent directory sync task for {parent_display}: {error}"
+                ),
             }
         }
 
