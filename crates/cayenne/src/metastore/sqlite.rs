@@ -131,16 +131,23 @@ impl SqliteMetastore {
                     // initialization, followed by DB file + schema creation,
                     // and the parent is often a stable operator-managed
                     // volume root.
-                    let db_dir_for_sync = db_dir.to_path_buf();
-                    if let Err(e) = tokio::task::spawn_blocking(move || {
-                        std::fs::File::open(&db_dir_for_sync).and_then(|f| f.sync_all())
-                    })
-                    .await
-                    {
-                        tracing::warn!(
-                            "Failed to sync parent of SQLite catalog DB directory {} (subsequent DB writes will still be durable): {e}",
-                            db_dir.display()
-                        );
+                    if let Some(parent) = db_dir.parent() {
+                        let parent_for_sync = parent.to_path_buf();
+                        let parent_display = parent_for_sync.display().to_string();
+                        let db_dir_display = db_dir.display().to_string();
+                        match tokio::task::spawn_blocking(move || {
+                            std::fs::File::open(&parent_for_sync).and_then(|f| f.sync_all())
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => tracing::warn!(
+                                "Failed to sync parent directory {parent_display} after creating SQLite catalog DB directory {db_dir_display} (subsequent DB writes will still be durable): {error}"
+                            ),
+                            Err(error) => tracing::warn!(
+                                "Failed to join SQLite catalog DB parent directory sync task for {parent_display}: {error}"
+                            ),
+                        }
                     }
                 }
 

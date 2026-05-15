@@ -1083,6 +1083,86 @@ mod tests {
         });
     }
 
+    /// Regression test for the post-decorrelation re-propagation bug
+    /// (`cayenne::logical_optimizer`): after the rule wraps a Filter with
+    /// `InSubquery` and DataFusion decorrelates it to `LeftSemi`, the
+    /// optimizer iterates the rule pipeline to fixed point. Without the
+    /// cycle-detection fix in `analyze_logical_side`, the rule would re-fire
+    /// each pass and stack one redundant `LeftSemi` per iteration up to
+    /// `max_passes`. This integration test runs the full optimizer pipeline
+    /// and asserts the final plan has at most one `LeftSemi` for the q21
+    /// shape — proving the cycle guard holds across decorrelation.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_does_not_stack_redundant_left_semi_after_decorrelation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        rt.block_on(async {
+            let nation_schema = Arc::new(Schema::new(vec![
+                Field::new("n_nationkey", DataType::Int64, false),
+                Field::new("n_name", DataType::Utf8, true),
+            ]));
+            let supplier_schema = Arc::new(Schema::new(vec![
+                Field::new("s_suppkey", DataType::Int64, false),
+                Field::new("s_nationkey", DataType::Int64, false),
+            ]));
+
+            df.ctx
+                .register_table(
+                    "nation",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&nation_schema), vec![vec![]])
+                            .expect("nation mem table should be valid"),
+                    ),
+                )
+                .expect("nation table should register");
+            df.ctx
+                .register_table(
+                    "supplier",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&supplier_schema), vec![vec![]])
+                            .expect("supplier mem table should be valid"),
+                    ),
+                )
+                .expect("supplier table should register");
+
+            let dataframe = df
+                .ctx
+                .sql(
+                    "SELECT s_suppkey FROM supplier, nation \
+                     WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+                )
+                .await
+                .expect("q21-shaped query should create a dataframe");
+            let optimized_plan = dataframe
+                .into_optimized_plan()
+                .expect("q21-shaped query should optimize");
+            let plan_text = optimized_plan.to_string();
+
+            // The optimizer iterates rules to fixed point. Before the cycle
+            // guard, every iteration would add another `LeftSemi Join` on the
+            // fact side. With the guard in place we expect exactly one (the
+            // single decorrelated propagation).
+            let left_semi_count = plan_text.matches("LeftSemi Join").count();
+            assert!(
+                left_semi_count <= 1,
+                "post-decorrelation re-propagation is stacking redundant LeftSemi joins \
+                 (count={left_semi_count}); plan was:\n{plan_text}"
+            );
+        });
+    }
+
     /// Cayenne rewrites `HashJoinExec` to use a custom accumulator type, so it
     /// must run after `DataFusion`'s built-in physical optimizer rules that
     /// downcast to the default `HashJoinExec` type.
