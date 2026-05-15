@@ -44,8 +44,8 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 
 const TABLE_SRC: &str = include_str!("../src/provider/table.rs");
-const DELETE_VECTOR_IO_SRC: &str =
-    include_str!("../src/provider/delete/vector_io.rs");
+const DELETE_VECTOR_IO_SRC: &str = include_str!("../src/provider/delete/vector_io.rs");
+const STREAMING_SRC: &str = include_str!("../src/provider/streaming.rs");
 
 /// Extract the body of a named `async fn`/`fn` from a Rust source file.
 ///
@@ -282,3 +282,161 @@ fn write_deletion_file_still_fsyncs_parent_dir() {
 // preserving the exact safety properties for the pre-WAL orphan crash case
 // and all recovery paths. The existing staged_append_test scenarios plus
 // high-iteration tiny-append benchmarks now exercise and protect this path.
+
+// -----------------------------------------------------------------------------
+// StreamingExec lock-discipline regression tests
+// -----------------------------------------------------------------------------
+//
+// StreamingExec wraps the input RecordBatch stream that feeds the Vortex writer
+// during every Cayenne append. A previous revision stored the stream behind a
+// `tokio::sync::Mutex<Option<DFStream>>` and, inside the per-batch generator,
+// did:
+//
+//     let mut stream = stream_mutex.lock().await;
+//     while let Some(batch) = stream.next().await { yield batch; }
+//
+// That held the MutexGuard across every `.await` for the entire write (often
+// many seconds across hundreds of batches), violating the project rule
+// "Never hold locks across `.await`" and adding per-batch acquisition cost
+// plus Tokio scheduler convoying during mixed read+ingest workloads.
+//
+// The fix replaces the inner lock with a `parking_lot::Mutex` whose only role
+// is a one-time synchronous take in `execute(...)` — released before any
+// await — and forwards batches with an owning unfold state machine. These
+// structural assertions ensure the lock-across-await regression cannot quietly
+// reappear.
+
+#[test]
+fn streaming_exec_does_not_use_async_mutex_for_inner_stream() {
+    // The bug we're guarding against: `tokio::sync::Mutex` over the inner
+    // `DFStream`. That type's `lock().await` returns a `MutexGuard` that
+    // implements `Drop` (releases on drop), so the guard naturally lives
+    // across the subsequent `.await` points unless the author very carefully
+    // scopes it — which the original code did NOT do.
+    //
+    // `parking_lot::Mutex` is fine here because the lock is taken
+    // *synchronously* and released before any await; the project guideline
+    // explicitly prefers parking_lot for this case (fast, no poisoning).
+    let banned_field = "stream: tokio::sync::Mutex<";
+    assert!(
+        !STREAMING_SRC.contains(banned_field),
+        "streaming.rs must NOT wrap the inner stream in `tokio::sync::Mutex`. \
+         The previous revision did, and the lock was held across `.await` for \
+         the entire write — convoying the Tokio scheduler under mixed \
+         read+ingest workloads. Use a synchronous `parking_lot::Mutex` (taken \
+         once in `execute(...)` and released before any await) instead."
+    );
+}
+
+#[test]
+fn streaming_exec_takes_inner_stream_synchronously() {
+    // The fix transfers ownership of the inner stream out of the mutex with a
+    // single synchronous `lock()` (parking_lot) followed by `take()`. The
+    // structural marker for that pattern is the parking_lot Mutex import
+    // (or a fully-qualified reference) and the absence of a `.lock().await`
+    // call on `self.stream` inside `execute`.
+    //
+    // Use `extract_fn_body` to scope the search to the `execute` method
+    // (parking_lot may be imported even if execute itself reverts to a bad
+    // pattern).
+    let execute_body = extract_fn_body(STREAMING_SRC, "execute")
+        .expect("execute method not found in streaming.rs");
+
+    // Forbid awaiting on the stream mutex acquisition. This is the bright-line
+    // structural marker for the old `tokio::sync::Mutex` regression — that
+    // type's `lock()` returns a future you must `.await`, so any callsite
+    // with `.await` on the lock acquisition is using the wrong mutex.
+    assert!(
+        !execute_body.contains("self.stream.lock().await")
+            && !execute_body.contains("self.stream.try_lock().await"),
+        "StreamingExec::execute must not call `self.stream.lock().await` or \
+         `self.stream.try_lock().await`. Awaiting on the lock acquisition is \
+         the structural marker for the old `tokio::sync::Mutex` regression \
+         that held the guard across every subsequent `.await` for the entire \
+         write. Use a synchronous parking_lot lock and release the guard \
+         before any await."
+    );
+
+    // Affirmatively assert: some form of `self.stream.{lock,try_lock}()` is
+    // taken, and `take()` is called somewhere in the body to consume the
+    // Option<DFStream>. Both `lock()` and `try_lock()` are synchronous on
+    // `parking_lot::Mutex` — only the *awaited* form is banned.
+    let acquires_sync_lock = execute_body.contains("self.stream.lock()")
+        || execute_body.contains("self.stream.try_lock()");
+    let calls_take =
+        execute_body.contains(".take()") || execute_body.contains("guard.take()");
+    assert!(
+        acquires_sync_lock && calls_take,
+        "StreamingExec::execute must take ownership of the inner stream with \
+         a synchronous `self.stream.lock()` (or `try_lock()`) + `take()` \
+         before forwarding (found acquires_sync_lock={acquires_sync_lock}, \
+         calls_take={calls_take}). If the implementation moved to a different \
+         structural pattern (e.g. OnceLock or a Mutex<Option<_>> alternative), \
+         update this assertion."
+    );
+}
+
+#[test]
+fn streaming_exec_does_not_hold_lock_across_await_in_execute() {
+    // Defense in depth for the lock-discipline rule. Even with parking_lot,
+    // it is technically possible to write `let g = self.stream.lock(); ...await...`
+    // and have the MutexGuard live across the await (parking_lot guards are
+    // `!Send`, so this typically fails to compile under multi-thread runtimes,
+    // but on single-thread runtimes it would compile and silently re-introduce
+    // convoying).
+    //
+    // The committed pattern explicitly scopes the lock and `take()`s the
+    // Option in a single expression so the guard is dropped immediately. We
+    // assert the structural marker: there is no `let mut <name> = self.stream.lock();`
+    // followed by an `await` later in the same function body.
+    let execute_body = extract_fn_body(STREAMING_SRC, "execute")
+        .expect("execute method not found in streaming.rs");
+
+    // Find the first line that acquires the stream lock (lock() or try_lock()).
+    let lines: Vec<&str> = execute_body.lines().collect();
+    let lock_idx = lines.iter().position(|line| {
+        let line = line.trim();
+        line.contains("self.stream.lock()") || line.contains("self.stream.try_lock()")
+    });
+
+    let Some(lock_idx) = lock_idx else {
+        panic!(
+            "StreamingExec::execute does not acquire the stream lock at all — \
+             this is unexpected; the function must take ownership of the \
+             stream via `self.stream.lock()` or `self.stream.try_lock()`."
+        );
+    };
+
+    // Within the next 10 lines after the lock acquisition, a `.take()` must
+    // appear AND no `.await` must precede it. The window is generous enough
+    // for the typical multi-line `try_lock().ok_or_else(|| { ... })?;` +
+    // separate `take()` statement (~6 lines total) and tight enough to
+    // prevent an `.await` from sneaking between the lock and the take
+    // (which would hold the MutexGuard across the await).
+    let window_end = (lock_idx + 10).min(lines.len());
+    let mut take_found = false;
+    for line in &lines[lock_idx..window_end] {
+        if line.contains(".take()") {
+            take_found = true;
+            break;
+        }
+        assert!(
+            !line.contains(".await"),
+            "StreamingExec::execute contains an `.await` between the stream \
+             lock acquisition and the `.take()` that consumes the Option. \
+             Offending line (trimmed): `{}`. Holding the MutexGuard across \
+             an `.await` re-introduces the convoying regression.",
+            line.trim()
+        );
+    }
+
+    assert!(
+        take_found,
+        "StreamingExec::execute acquires the stream lock at line {lock_idx} \
+         of its body, but no `.take()` appears within the next 10 lines. This \
+         risks the MutexGuard living past a subsequent `.await`, \
+         re-introducing the lock-across-await regression. Drop the guard \
+         immediately by chaining `.take()` after the lock or binding both on \
+         adjacent lines."
+    );
+}
