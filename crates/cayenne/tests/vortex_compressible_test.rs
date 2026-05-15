@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+#![allow(clippy::clone_on_ref_ptr)]
+
 //! Test for Cayenne support of highly compressed Vortex data.
 //!
 //! Validates that Cayenne correctly handles Vortex files whose compressed size
