@@ -478,9 +478,11 @@ impl MetadataCatalog for CayenneCatalog {
 
         // Create the initial snapshot directory *before* inserting the table
         // row into the metastore. This ensures the directory entry is durable
-        // (with parent sync) before the catalog "commits" the existence of a
-        // table pointing at this snapshot_id. Matches the contract we enforce
-        // everywhere else in the write path.
+        // (with parent sync of the table root) before the catalog "commits"
+        // the existence of a table pointing at this snapshot_id. This is the
+        // final piece of the uniform local-FS durability contract (snapshot
+        // dirs, _partitioned_wal/, deletions/, and now initial table creation).
+        // Matches the contract we enforce everywhere else in the write path.
         if !base_path.starts_with("s3://") {
             let table_root = std::path::PathBuf::from(&base_path).join(&table_id);
             let snapshot_dir = table_root.join(&initial_snapshot_id);
