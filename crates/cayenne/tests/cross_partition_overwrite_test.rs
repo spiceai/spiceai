@@ -44,11 +44,14 @@ You may obtain a copy of the License at
 //! The existing fault-injection and restart tests in this file, together
 //! with the per-partition durability tests (deletion vector restart,
 //! staged-append restart, acid_compliance, data_inlining, catalog
-//! concurrency with partitions), provide comprehensive regression coverage
-//! for this property, including the edge cases of the very first
-//! cross-partition write on a brand-new table (first creation of the
-//! _partitioned_wal/ directory), the first deletion vector written to a
-//! snapshot, and the first discovery of a new partition value.
+//! concurrency with partitions, and shared_metastore_concurrency_test
+//! which exercises fresh catalog DB directory creation), provide
+//! comprehensive regression coverage for this property, including the
+//! edge cases of the very first cross-partition write on a brand-new
+//! table (first creation of the _partitioned_wal/ directory), the first
+//! deletion vector written to a snapshot, the first discovery of a new
+//! partition value, and first-time catalog initialization on a brand-new
+//! data directory.
 
 #![expect(
     clippy::expect_used,
