@@ -188,7 +188,13 @@ impl PartitionedWal {
         let wal_path = wal_dir.join(format!("{}.json", self.commit_id));
         let tmp_path = wal_dir.join(format!("{}.json.tmp", self.commit_id));
 
-        let content = serde_json::to_string_pretty(self).map_err(|e| Error::Internal {
+        // Compact serialization: this WAL is a machine-only coordination
+        // marker written on every cross-partition commit. Pretty-printing
+        // ~doubles the byte size and adds CPU time for whitespace formatting
+        // — both pure overhead on the ingestion hot path. The JSON parser is
+        // whitespace-tolerant, so any legacy pretty-printed WALs from older
+        // builds still load correctly. Inspect with `jq` if needed.
+        let content = serde_json::to_string(self).map_err(|e| Error::Internal {
             table: self.table_root.clone(),
             message: format!("Failed to serialize partitioned WAL: {e}"),
         })?;
@@ -232,7 +238,7 @@ impl PartitionedWal {
 
     /// S3/object-store equivalent of `write_to`.
     ///
-    /// Writes the PartitionedWal JSON to a temporary object key first
+    /// Writes the `PartitionedWal` JSON to a temporary object key first
     /// (`<prefix>/_partitioned_wal/<commit_id>.json.tmp`), then to the final
     /// key. This guarantees that any reader looking for the final key sees
     /// either a complete, previously-written document or nothing at all
@@ -241,6 +247,12 @@ impl PartitionedWal {
     ///
     /// Best-effort cleanup of the tmp object is performed after the final
     /// key is visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL cannot be serialized, uploaded to the
+    /// temporary key, copied to the final key, or deleted from the temporary
+    /// key during cleanup.
     pub async fn write_to_object_store(
         &self,
         store: &dyn ObjectStore,
@@ -250,7 +262,10 @@ impl PartitionedWal {
         let final_key = wal_dir.child(format!("{}.json", self.commit_id));
         let tmp_key = wal_dir.child(format!("{}.json.tmp", self.commit_id));
 
-        let content = serde_json::to_string_pretty(self).map_err(|e| Error::Internal {
+        // Compact serialization: see comment in `write_to` for the local-FS
+        // path; the S3 case has the same trade-offs plus a smaller PUT payload
+        // and fewer bytes billed.
+        let content = serde_json::to_string(self).map_err(|e| Error::Internal {
             table: self.table_root.clone(),
             message: format!("Failed to serialize partitioned WAL: {e}"),
         })?;

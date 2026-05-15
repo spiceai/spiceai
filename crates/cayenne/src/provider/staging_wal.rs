@@ -537,7 +537,12 @@ impl CayenneTableProvider {
         };
 
         let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
-        let content = serde_json::to_string_pretty(&wal).map_err(|e| Error::Internal {
+        // Compact serialization: this WAL is a machine-only marker written on
+        // every staged append. Pretty-printing roughly doubles the byte size
+        // and adds CPU time for whitespace formatting — both pure overhead on
+        // the ingestion hot path. The JSON parser is whitespace-tolerant, so
+        // legacy pretty-printed WALs from older builds still load correctly.
+        let content = serde_json::to_string(&wal).map_err(|e| Error::Internal {
             table: self.table_name().to_string(),
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
@@ -610,7 +615,10 @@ impl CayenneTableProvider {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        let content = serde_json::to_string_pretty(&wal).map_err(|e| Error::Internal {
+        // Compact serialization: see `write_staging_wal_local` for the
+        // rationale; the S3 case has the same trade-offs plus a smaller PUT
+        // payload (fewer bytes billed) and faster network upload.
+        let content = serde_json::to_string(&wal).map_err(|e| Error::Internal {
             table: self.table_name().to_string(),
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
@@ -653,7 +661,8 @@ impl CayenneTableProvider {
                 match config.store.delete(&wal_key).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                         self.staging_wal_present().store(false, Ordering::Release);
-                        self.staging_may_have_files().store(false, Ordering::Release);
+                        self.staging_may_have_files()
+                            .store(false, Ordering::Release);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -682,7 +691,8 @@ impl CayenneTableProvider {
 
             if removed {
                 self.staging_wal_present().store(false, Ordering::Release);
-                self.staging_may_have_files().store(false, Ordering::Release);
+                self.staging_may_have_files()
+                    .store(false, Ordering::Release);
                 // Durability: after removing the WAL marker (the "commit success" signal),
                 // fsync the staging directory so the unlink is persisted. A crash without
                 // this sync could make the removal non-durable, causing a false-positive
