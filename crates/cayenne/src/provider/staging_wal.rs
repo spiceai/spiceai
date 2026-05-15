@@ -56,7 +56,7 @@ limitations under the License.
 
 use super::PartitionedWal;
 use super::Result;
-use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
+use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::table::CayenneTableProvider;
 use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
@@ -549,8 +549,10 @@ impl CayenneTableProvider {
         // dir by `write_to_snapshot`) are durably persisted. This completes the
         // "prepare" phase durability: the staging WAL record that lists the files
         // to be moved is only considered durably written after its own directory
-        // entry is safe. Matches the full tmp+rename+dir-fsync pattern used for
-        // `PartitionedWal` and the syncs we perform after move and after WAL removal.
+        // entry is safe. Unlike `PartitionedWal`, this local WAL path writes the
+        // final file directly; the read path treats an unparseable WAL as absent,
+        // so a future tmp+rename hardening pass would need to preserve that
+        // fail-safe behavior.
         Self::sync_snapshot_dir(&staging_dir).await?;
 
         tracing::debug!(
@@ -732,6 +734,20 @@ impl CayenneTableProvider {
                 }
             }
 
+            let current_snapshot = self.get_current_snapshot_id()?;
+            if current_snapshot != wal.target_snapshot {
+                return Err(Error::IncompleteWrite {
+                    table: table_name,
+                    message: format!(
+                        "A previous write was interrupted while moving {} file(s) to '{}' (started at {}), but the current snapshot is now '{}'. Automated recovery refused to avoid moving staged files into the wrong snapshot. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                        wal.staged_files.len(),
+                        wal.target_snapshot,
+                        wal.created_at,
+                        current_snapshot,
+                    ),
+                });
+            }
+
             // Audit: every file the WAL claims must be reachable — either
             // present in `_staging/` (so we can move it) or already present
             // in the target snapshot directory (so the previous commit's
@@ -748,19 +764,20 @@ impl CayenneTableProvider {
             if !self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
                 let staging_dir =
                     Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
-                let target_dir = self.get_current_snapshot_id().ok().map(|snapshot_id| {
-                    Self::snapshot_dir_path(self.table_path(), self.table_id(), &snapshot_id)
-                });
+                let target_dir = Self::snapshot_dir_path(
+                    self.table_path(),
+                    self.table_id(),
+                    &wal.target_snapshot,
+                );
 
                 let mut missing_files: Vec<String> = Vec::new();
                 for staged_file in &wal.staged_files {
                     let in_staging = tokio::fs::metadata(staging_dir.join(staged_file))
                         .await
                         .is_ok();
-                    let in_target = match &target_dir {
-                        Some(dir) => tokio::fs::metadata(dir.join(staged_file)).await.is_ok(),
-                        None => false,
-                    };
+                    let in_target = tokio::fs::metadata(target_dir.join(staged_file))
+                        .await
+                        .is_ok();
                     if !in_staging && !in_target {
                         missing_files.push(staged_file.clone());
                     }
@@ -811,11 +828,10 @@ impl CayenneTableProvider {
                     });
                 };
 
-                let target_prefix = self.get_current_snapshot_id().ok().and_then(|snapshot_id| {
-                    self.snapshot_object_store_prefix(&snapshot_id)
-                        .ok()
-                        .flatten()
-                });
+                let target_prefix = self
+                    .snapshot_object_store_prefix(&wal.target_snapshot)
+                    .ok()
+                    .flatten();
 
                 let mut reachable: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
