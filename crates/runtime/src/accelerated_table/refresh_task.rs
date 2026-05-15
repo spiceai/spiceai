@@ -2865,4 +2865,117 @@ mod tests {
         ) as Arc<dyn TableProvider>;
         assert_eq!(collect_numeric_from_max_df(&mem, "t").await, None);
     }
+
+    /// Regression test for ACID consistency edge case in append refresh dedup:
+    /// When the time_column is nullable and contains NULL values, the current
+    /// `except_existing_records_from` implementation (which only loads rows where
+    /// time > max_timestamp for the anti-join) will *not* include NULL-time rows
+    /// in the "existing" set. Consequently, an incoming row with NULL time that
+    /// exactly matches an already-accelerated NULL-time row will *not* be filtered
+    /// and will be appended again.
+    ///
+    /// This can cause duplicate rows (violating "exactly the data from source")
+    /// on repeated refresh or after partial failure recovery for datasets that
+    /// legitimately have NULLs in their time_column.
+    ///
+    /// The all-null max case is already tested above (correctly appends everything).
+    /// This test exercises the mixed case (max exists + NULL time rows in both
+    /// accelerator and update stream) and asserts the current behavior so that
+    /// when we enhance the logic to also collect `time IS NULL` rows for dedup
+    /// comparison, this test can be updated to expect proper deduplication.
+    ///
+    /// Part of recurring scheduled ACID correctness audit (play devil's advocate
+    /// on append mode assumptions for nullable columns).
+    #[tokio::test]
+    async fn test_except_existing_records_from_nullable_time_column_with_nulls() {
+        // Schema with nullable timestamp (the append time_column) + id
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true, // nullable
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        // Accelerator "existing" data: one row with concrete time, one with NULL time
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(1_000_000_000i64),
+                    None,
+                ])),
+                Arc::new(Int32Array::from(vec![1, 99])),
+            ],
+        )
+        .expect("existing batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![existing_batch]])
+                .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        // Mirror the construction from the "column subset" test in this module for compatibility.
+        let federated = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_null_time"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        // The refresh must have a time_column so the dedup path is entered.
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .append_overlap(Duration::from_secs(1));
+
+        // Incoming update: (ts=NULL, id=99) is exact duplicate of existing NULL-time row;
+        // (ts=2s, id=2) is new.
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    None,
+                    Some(2_000_000_000i64),
+                ])),
+                Arc::new(Int32Array::from(vec![99, 2])),
+            ],
+        )
+        .expect("update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&schema), None)
+                .expect("update stream"),
+        );
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
+
+        let result = task
+            .except_existing_records_from(&refresh, update)
+            .await
+            .expect("except_existing_records_from should succeed with nullable time column");
+
+        let collected = result
+            .collect_data()
+            .await
+            .expect("collecting filtered data should succeed for NULL-time edge case test");
+
+        // Current behavior (documented limitation for ACID audit):
+        // The NULL-time duplicate is NOT filtered by the >max_time existing_records query,
+        // so it gets appended (2 rows total). The new high-time row is kept.
+        // This test will be updated to expect deduplication (1 row) once we extend
+        // the existing_records collection to also include `time IS NULL` rows.
+        assert_eq!(collected.data.len(), 1, "one output batch");
+        assert_eq!(
+            collected.data[0].num_rows(),
+            2,
+            "current append dedup with nullable time: NULL-time row (id=99) is re-appended \
+             (no dedup vs existing NULLs) while new row is kept. Edge case for recurring ACID task."
+        );
+    }
 }
