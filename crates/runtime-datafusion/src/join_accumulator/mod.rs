@@ -196,10 +196,12 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
         let total_memory_size = self.total_memory_size.saturating_add(array_memory_size);
 
         if total_memory_size > self.max_inlist_memory_size {
-            tracing::debug!(
+            tracing::warn!(
                 total_memory_size,
                 max_inlist_memory_size = self.max_inlist_memory_size,
-                "ExactLeftAccumulator exceeded its local in-list memory limit; using range fallback."
+                "ExactLeftAccumulator exceeded its local in-list memory limit and fell back to a range pre-filter. \
+                 For anti-join / LeftAnti / NOT IN / NOT EXISTS patterns this approximation can silently drop rows that should have survived the anti-condition (false negatives). \
+                 This is a known correctness trade-off under memory pressure. Consider increasing memory limits or reducing cardinality of the build side."
             );
             self.inlist_memory_reservation = None;
             self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
@@ -210,12 +212,14 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
         }
 
         if !self.try_reserve_inlist_memory(array_memory_size) {
-            tracing::debug!(
+            tracing::warn!(
                 requested_bytes = array_memory_size,
                 current_shared_inlist_memory_bytes =
                     CURRENT_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed),
                 maximum_shared_inlist_memory_bytes = maximum_shared_inlist_memory_bytes(),
-                "ExactLeftAccumulator shared in-list memory budget is exhausted; using range fallback."
+                "ExactLeftAccumulator shared in-list memory budget is exhausted and fell back to a range pre-filter. \
+                 For anti-join / LeftAnti / NOT IN / NOT EXISTS patterns this approximation can silently drop rows that should have survived the anti-condition (false negatives). \
+                 This is a known correctness trade-off under memory pressure. Consider increasing memory limits or reducing cardinality of the build side."
             );
             self.inlist_memory_reservation = None;
             self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
@@ -315,12 +319,13 @@ impl ColumnBounds for ExactColumnBounds {
     /// the join result remains correct because the build side still filters).
     ///
     /// For LeftAnti (and similar "not exists" / "not in" patterns pushed to
-    /// Cayenne via ExactLeftAccumulator), a range-based "NOT BETWEEN" filter is
-    /// an approximation. It may incorrectly exclude probe rows that are outside
-    /// the min/max range but still not present in the exact collected set
-    /// (false positive for the anti-condition). This is accepted as a
-    /// performance trade-off when memory is exhausted; the alternative would be
-    /// to spill or OOM.
+    /// Cayenne via ExactLeftAccumulator), the inclusive range pre-filter
+    /// (`col BETWEEN min AND max`) is an approximation. Probe rows outside the
+    /// min/max range that are not present in the exact collected set should
+    /// survive the anti-join, but the scanner can skip them, producing false
+    /// negatives (missing result rows). This is accepted as a performance
+    /// trade-off when memory is exhausted; the alternative would be to spill or
+    /// OOM.
     ///
     /// The CoalescePartitionsExec + iterative flatten wrapper detection added
     /// in the optimizer ensures more plans (including those with partition
