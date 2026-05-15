@@ -823,9 +823,10 @@ impl CayenneTableProvider {
             // corruption that lost staged files" (file in neither location).
             // Only the former should self-heal.
             //
-            // Local-FS only: on S3 we don't audit because verifying every
-            // staged file would require a HEAD per file and the typical S3
-            // fault model favors retry over reconciliation.
+            // Pre-recovery audit (local FS): every file the WAL claims must be
+            // reachable — either present in `_staging/` or already in the target
+            // snapshot. If any file is missing from both, refuse recovery to
+            // avoid silent data loss.
             if !self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
                 let staging_dir = Self::snapshot_dir_path(
                     self.table_path(),
@@ -864,6 +865,87 @@ impl CayenneTableProvider {
                         table: table_name,
                         message: format!(
                             "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery aborted because {} of those file(s) are missing from both '_staging/' and the target snapshot — e.g. {sample:?}. This indicates genuine data loss (filesystem corruption or external interference). Manual resolution is required. The WAL file is located at '{wal_location}'.",
+                            wal.staged_files.len(),
+                            wal.target_snapshot,
+                            wal.created_at,
+                            missing_files.len(),
+                        ),
+                    });
+                }
+            } else if self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
+                // Pre-recovery audit (S3): symmetric to the local-FS audit.
+                // List the staging prefix and the target snapshot prefix (cheap
+                // list operations). Every file listed in the WAL must appear in
+                // at least one of those prefixes. If any file is missing from
+                // both, refuse recovery to avoid promoting a snapshot that has
+                // lost data (e.g., partial multipart upload that was never
+                // completed or was cleaned up externally).
+                let config = match self.require_object_store() {
+                    Ok(c) => c,
+                    Err(e) => return Err(e),
+                };
+
+                let Some(staging_prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME).ok().flatten() else {
+                    // Can't even determine staging prefix — refuse.
+                    return Err(Error::IncompleteWrite {
+                        table: table_name.clone(),
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}'. Could not determine S3 staging prefix for pre-recovery audit. Manual resolution required.",
+                            wal.staged_files.len(),
+                            wal.target_snapshot
+                        ),
+                    });
+                };
+
+                let target_prefix = self.get_current_snapshot_id().ok().and_then(|snapshot_id| {
+                    self.snapshot_object_store_prefix(&snapshot_id).ok().flatten()
+                });
+
+                // Collect reachable filenames from staging and target (best-effort).
+                let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+                // List staging
+                if let Ok(objects) = config.store.list(Some(&staging_prefix)).try_collect::<Vec<_>>().await {
+                    for meta in objects {
+                        if let Some(rel) = meta.location.as_ref().strip_prefix(staging_prefix.as_ref()) {
+                            if rel != STAGING_WAL_FILENAME && rel != STAGING_WAL_TMP_FILENAME {
+                                reachable.insert(rel.to_string());
+                            }
+                        }
+                    }
+                }
+
+                // List target (if known)
+                if let Some(tp) = &target_prefix {
+                    if let Ok(objects) = config.store.list(Some(tp)).try_collect::<Vec<_>>().await {
+                        for meta in objects {
+                            if let Some(rel) = meta.location.as_ref().strip_prefix(tp.as_ref()) {
+                                reachable.insert(rel.to_string());
+                            }
+                        }
+                    }
+                }
+
+                let mut missing_files: Vec<String> = Vec::new();
+                for staged_file in &wal.staged_files {
+                    if !reachable.contains(staged_file) {
+                        missing_files.push(staged_file.clone());
+                    }
+                }
+
+                if !missing_files.is_empty() {
+                    tracing::error!(
+                        table = table_name.as_str(),
+                        wal_location = %wal_location,
+                        missing_count = missing_files.len(),
+                        total_files = wal.staged_files.len(),
+                        "Incomplete staged append (S3) references files missing from both staging and target snapshot; refusing automated recovery"
+                    );
+                    let sample: Vec<&str> = missing_files.iter().take(3).map(String::as_str).collect();
+                    return Err(Error::IncompleteWrite {
+                        table: table_name,
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery aborted because {} of those file(s) are missing from both the staging prefix and the target snapshot on S3 — e.g. {sample:?}. This may indicate a partial multipart upload that was never completed or external interference. Manual resolution is required. The WAL file is located at '{wal_location}'.",
                             wal.staged_files.len(),
                             wal.target_snapshot,
                             wal.created_at,
