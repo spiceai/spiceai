@@ -186,6 +186,11 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
         if join.null_equality != NullEquality::NullEqualsNothing {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
+        if matches!(join.join_type, JoinType::LeftSemi)
+            && right_side_carries_propagation_marker(&join.right)
+        {
+            return Ok(Transformed::no(LogicalPlan::Join(join)));
+        }
         // For outer joins, propagation is only safe in the *preserved-side →
         // lookup-side* direction. Filtering the lookup side can only narrow
         // matches that the join would already drop; filtering the preserved
@@ -387,11 +392,47 @@ fn analyze_logical_side(plan: &LogicalPlan) -> SideAnalysis {
                 &mut analysis.propagated_filter_targets,
             );
         }
+        // Post-decorrelation cycle detection: `decorrelate_predicate_subquery`
+        // rewrites our propagated `InSubquery` into a `LeftSemi` join with the
+        // marker `SubqueryAlias` as its right child. Without this branch the
+        // rule's cycle guard misses the marker (it only walked Filter
+        // predicates), and the optimizer would re-propagate on every iteration
+        // until hitting `max_passes`, stacking redundant `LeftSemi` layers.
+        if let LogicalPlan::Join(join) = node
+            && matches!(join.join_type, JoinType::LeftSemi)
+            && right_side_carries_propagation_marker(&join.right)
+        {
+            for (left_expr, _) in &join.on {
+                analysis
+                    .propagated_filter_targets
+                    .insert(left_expr.to_string());
+            }
+        }
 
         Ok(TreeNodeRecursion::Continue)
     });
 
     analysis
+}
+
+/// Returns `true` if `plan` is — possibly behind a chain of `Projection` or
+/// `SubqueryAlias` wrappers added by later optimizer rules — a `SubqueryAlias`
+/// whose name starts with [`PROPAGATED_FILTER_ALIAS_PREFIX`].
+fn right_side_carries_propagation_marker(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::SubqueryAlias(alias) => {
+            if alias
+                .alias
+                .table()
+                .starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
+            {
+                return true;
+            }
+            right_side_carries_propagation_marker(&alias.input)
+        }
+        LogicalPlan::Projection(p) => right_side_carries_propagation_marker(&p.input),
+        _ => false,
+    }
 }
 
 /// An equi-join key from `Join::on`, classified by which sides are pure
@@ -1099,6 +1140,267 @@ mod tests {
         assert!(
             !changed,
             "RIGHT→LEFT propagation must not fire on LEFT OUTER; plan was:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rule_does_not_re_fire_on_post_decorrelation_left_semi() -> Result<()> {
+        // Regression test for the cycle-detection bug across optimizer
+        // iterations: after Pass 1 wraps the receiving side with an
+        // `InSubquery`, `decorrelate_predicate_subquery` rewrites that into a
+        // `LeftSemi` join with the marker `SubqueryAlias` as its right child.
+        // If the rule's cycle detection only sees `InSubquery` markers (and
+        // not the structural `LeftSemi`-with-marker shape), Pass 2 sees no
+        // marker on the receiving side and re-propagates, producing nested
+        // LeftSemi joins on every subsequent optimizer pass.
+        //
+        // The fix detects the post-decorrelation shape and records the
+        // already-propagated target so the rule's cycle guard short-circuits
+        // on subsequent passes.
+        use datafusion::common::NullEquality;
+        use datafusion::logical_expr::JoinConstraint;
+        use datafusion_expr::{LogicalPlanBuilder, builder::table_scan, lit};
+
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("n_nationkey", DataType::Int64, false),
+            Field::new("n_name", DataType::Utf8, true),
+        ]));
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]));
+
+        // Build the dim subquery: `Filter(n_name='CHINA') → TableScan(nation)`
+        // wrapped in the propagated-filter alias the rule would have produced.
+        let nation_scan = table_scan(Some("nation"), &dim_schema, None)?.build()?;
+        let nation_filter = LogicalPlan::Filter(Filter::try_new(
+            Expr::Column(Column::new(Some("nation"), "n_name")).eq(lit("CHINA")),
+            Arc::new(nation_scan),
+        )?);
+        let nation_projection = LogicalPlan::Projection(Projection::try_new(
+            vec![Expr::Column(Column::new(Some("nation"), "n_nationkey"))],
+            Arc::new(nation_filter),
+        )?);
+        let dim_subquery_alias = format!("{PROPAGATED_FILTER_ALIAS_PREFIX}1");
+        let dim_subquery = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            Arc::new(nation_projection),
+            TableReference::bare(dim_subquery_alias),
+        )?);
+
+        // Build supplier scan (the receiving fact side).
+        let supplier_scan = table_scan(Some("supplier"), &fact_schema, None)?.build()?;
+
+        // Compose the post-decorrelation shape: `LeftSemi(supplier, dim_subquery)`
+        // on `s_nationkey = n_nationkey`.
+        let semi_join_input = LogicalPlanBuilder::from(supplier_scan)
+            .join_with_expr_keys(
+                dim_subquery,
+                JoinType::LeftSemi,
+                (
+                    vec![Expr::Column(Column::new(Some("supplier"), "s_nationkey"))],
+                    vec![Expr::Column(Column::new(
+                        Some(format!("{PROPAGATED_FILTER_ALIAS_PREFIX}1")),
+                        "n_nationkey",
+                    ))],
+                ),
+                None,
+            )?
+            .build()?;
+
+        // Now build an outer `Inner Join` between the *original* nation_filtered
+        // and this `LeftSemi` subtree on the same equi-key — the exact shape an
+        // optimizer pass would see after the rule already fired + decorrelated.
+        let dim_filter_again_scan = table_scan(Some("nation_outer"), &dim_schema, None)?.build()?;
+        let dim_filter_again = LogicalPlan::Filter(Filter::try_new(
+            Expr::Column(Column::new(Some("nation_outer"), "n_name")).eq(lit("CHINA")),
+            Arc::new(dim_filter_again_scan),
+        )?);
+
+        let outer_join = LogicalPlan::Join(Join::try_new(
+            Arc::new(dim_filter_again),
+            Arc::new(semi_join_input),
+            vec![(
+                Expr::Column(Column::new(Some("nation_outer"), "n_nationkey")),
+                Expr::Column(Column::new(Some("supplier"), "s_nationkey")),
+            )],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (_, changed) = apply_rule_to_all_joins(&r, outer_join.clone(), &cfg)?;
+        assert!(
+            !changed,
+            "rule must not re-fire when the receiving side already contains a \
+             post-decorrelation LeftSemi propagation marker; plan was:\n{outer_join}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rule_re_fires_when_receiving_side_has_non_marker_subquery_alias() -> Result<()> {
+        // Devil's-advocate edge case: a `LeftSemi` whose right side is a
+        // `SubqueryAlias` with a *non-marker* name should NOT block
+        // propagation (the marker prefix is the unique signal that this rule
+        // already fired). Guards against the cycle guard being too aggressive.
+        use datafusion::common::NullEquality;
+        use datafusion::logical_expr::JoinConstraint;
+        use datafusion_expr::{LogicalPlanBuilder, builder::table_scan, lit};
+
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("n_nationkey", DataType::Int64, false),
+            Field::new("n_name", DataType::Utf8, true),
+        ]));
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]));
+
+        let nation_scan = table_scan(Some("nation"), &dim_schema, None)?.build()?;
+        let nation_filter = LogicalPlan::Filter(Filter::try_new(
+            Expr::Column(Column::new(Some("nation"), "n_name")).eq(lit("CHINA")),
+            Arc::new(nation_scan),
+        )?);
+        let nation_projection = LogicalPlan::Projection(Projection::try_new(
+            vec![Expr::Column(Column::new(Some("nation"), "n_nationkey"))],
+            Arc::new(nation_filter),
+        )?);
+        let user_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            Arc::new(nation_projection),
+            TableReference::bare("some_user_alias"),
+        )?);
+
+        let supplier_scan = table_scan(Some("supplier"), &fact_schema, None)?.build()?;
+        let semi_join_input = LogicalPlanBuilder::from(supplier_scan)
+            .join_with_expr_keys(
+                user_alias,
+                JoinType::LeftSemi,
+                (
+                    vec![Expr::Column(Column::new(Some("supplier"), "s_nationkey"))],
+                    vec![Expr::Column(Column::new(
+                        Some("some_user_alias".to_string()),
+                        "n_nationkey",
+                    ))],
+                ),
+                None,
+            )?
+            .build()?;
+
+        let outer_dim_scan = table_scan(Some("nation_outer"), &dim_schema, None)?.build()?;
+        let outer_dim_filter = LogicalPlan::Filter(Filter::try_new(
+            Expr::Column(Column::new(Some("nation_outer"), "n_name")).eq(lit("CHINA")),
+            Arc::new(outer_dim_scan),
+        )?);
+
+        let outer_join = LogicalPlan::Join(Join::try_new(
+            Arc::new(outer_dim_filter),
+            Arc::new(semi_join_input),
+            vec![(
+                Expr::Column(Column::new(Some("nation_outer"), "n_nationkey")),
+                Expr::Column(Column::new(Some("supplier"), "s_nationkey")),
+            )],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (_, changed) = apply_rule_to_all_joins(&r, outer_join.clone(), &cfg)?;
+        assert!(
+            changed,
+            "rule should still fire when the receiving LeftSemi's alias is \
+             user-supplied (not the propagation marker); plan was:\n{outer_join}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rule_detects_marker_through_projection_wrapper() -> Result<()> {
+        // Subsequent optimizer rules (`MergeProjection`, etc.) may wrap the
+        // marker `SubqueryAlias` in a `Projection`. The cycle guard must still
+        // detect the marker through this wrapping.
+        use datafusion::common::NullEquality;
+        use datafusion::logical_expr::JoinConstraint;
+        use datafusion_expr::{LogicalPlanBuilder, builder::table_scan, lit};
+
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("n_nationkey", DataType::Int64, false),
+            Field::new("n_name", DataType::Utf8, true),
+        ]));
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]));
+
+        let nation_scan = table_scan(Some("nation"), &dim_schema, None)?.build()?;
+        let nation_filter = LogicalPlan::Filter(Filter::try_new(
+            Expr::Column(Column::new(Some("nation"), "n_name")).eq(lit("CHINA")),
+            Arc::new(nation_scan),
+        )?);
+        let inner_projection = LogicalPlan::Projection(Projection::try_new(
+            vec![Expr::Column(Column::new(Some("nation"), "n_nationkey"))],
+            Arc::new(nation_filter),
+        )?);
+        let marker_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            Arc::new(inner_projection),
+            TableReference::bare(format!("{PROPAGATED_FILTER_ALIAS_PREFIX}1")),
+        )?);
+        let wrapped_marker = LogicalPlan::Projection(Projection::try_new(
+            vec![Expr::Column(Column::new(
+                Some(format!("{PROPAGATED_FILTER_ALIAS_PREFIX}1")),
+                "n_nationkey",
+            ))],
+            Arc::new(marker_alias),
+        )?);
+
+        let supplier_scan = table_scan(Some("supplier"), &fact_schema, None)?.build()?;
+        let semi_join_input = LogicalPlanBuilder::from(supplier_scan)
+            .join_with_expr_keys(
+                wrapped_marker,
+                JoinType::LeftSemi,
+                (
+                    vec![Expr::Column(Column::new(Some("supplier"), "s_nationkey"))],
+                    vec![Expr::Column(Column::new(
+                        Some(format!("{PROPAGATED_FILTER_ALIAS_PREFIX}1")),
+                        "n_nationkey",
+                    ))],
+                ),
+                None,
+            )?
+            .build()?;
+
+        let outer_dim_scan = table_scan(Some("nation_outer"), &dim_schema, None)?.build()?;
+        let outer_dim_filter = LogicalPlan::Filter(Filter::try_new(
+            Expr::Column(Column::new(Some("nation_outer"), "n_name")).eq(lit("CHINA")),
+            Arc::new(outer_dim_scan),
+        )?);
+
+        let outer_join = LogicalPlan::Join(Join::try_new(
+            Arc::new(outer_dim_filter),
+            Arc::new(semi_join_input),
+            vec![(
+                Expr::Column(Column::new(Some("nation_outer"), "n_nationkey")),
+                Expr::Column(Column::new(Some("supplier"), "s_nationkey")),
+            )],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (_, changed) = apply_rule_to_all_joins(&r, outer_join.clone(), &cfg)?;
+        assert!(
+            !changed,
+            "cycle guard must detect a marker wrapped in an outer Projection; \
+             plan was:\n{outer_join}"
         );
         Ok(())
     }

@@ -82,6 +82,22 @@ impl TursoMetastore {
 
                 if !db_dir.exists() {
                     tokio::fs::create_dir_all(db_dir).await?;
+
+                    // Best-effort parent directory sync (defense-in-depth with
+                    // the sync already performed in CayenneCatalog::init).
+                    // Ensures the db_dir entry is durable before opening the
+                    // Turso connection and initializing the schema.
+                    let db_dir_for_sync = db_dir.to_path_buf();
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        std::fs::File::open(&db_dir_for_sync).and_then(|f| f.sync_all())
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to sync parent of Turso catalog DB directory {} (subsequent DB writes will still be durable): {e}",
+                            db_dir.display()
+                        );
+                    }
                 }
 
                 let db = Builder::new_local(db_path).build().await.map_err(|e| {

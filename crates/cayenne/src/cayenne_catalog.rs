@@ -2009,22 +2009,34 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
     let table_root = std::path::PathBuf::from(&table.path).join(&table.table_id);
     let snapshot_dir = table_root.join(&table.current_snapshot_id);
 
-    if !snapshot_dir.exists() {
-        tokio::fs::create_dir_all(&snapshot_dir)
-            .await
-            .map_err(|e| CatalogError::Io { source: e })?;
-
-        // Sync parent (table root) for the same durability reason as the
-        // initial creation path above and all other new subdir creations.
-        let table_root_for_sync = table_root;
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::fs::File::open(&table_root_for_sync).and_then(|f| f.sync_all());
-        })
-        .await;
-    } else {
-        // Idempotent ensure
-        let _ = tokio::fs::create_dir_all(&snapshot_dir).await;
+    match tokio::fs::metadata(&snapshot_dir).await {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(CatalogError::Io {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "snapshot path '{}' exists but is not a directory",
+                        snapshot_dir.display()
+                    ),
+                ),
+            });
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(CatalogError::Io { source }),
     }
+
+    tokio::fs::create_dir_all(&snapshot_dir)
+        .await
+        .map_err(|source| CatalogError::Io { source })?;
+
+    // Sync parent (table root) for the same durability reason as the
+    // initial creation path above and all other new subdir creations.
+    let table_root_for_sync = table_root;
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::File::open(&table_root_for_sync).and_then(|f| f.sync_all());
+    })
+    .await;
 
     Ok(())
 }
