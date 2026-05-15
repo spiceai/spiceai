@@ -1,0 +1,9 @@
+version: v1
+kind: Spicepod
+name: s3-public[parquet]-federated
+datasets:
+  - from: s3://spiceai-public-datasets/clickbench/hits.parquet
+    name: hits
+    params:
+      file_format: parquet
+      s3_auth: public
