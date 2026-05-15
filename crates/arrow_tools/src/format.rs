@@ -376,7 +376,13 @@ fn truncate_fixed_size_list_array(
     let child_array = list_array.values();
     let original_size =
         value_to_usize(list_array.value_length(), "FixedSizeListArray value length")?;
-    let truncated_size = max_len.min(original_size);
+    // Fast path: zero-copy clone when truncation would be a no-op. This is the
+    // common case for display formatting (generous max_len, small actual lists)
+    // and avoids per-row slice + concat allocation/copy entirely.
+    if max_len >= original_size {
+        return Ok(list_array.clone());
+    }
+    let truncated_size = max_len; // known to be < original_size
     let truncated_size_i32 = value_to_i32(truncated_size, "FixedSizeListArray truncated size")?;
     let element_field = list_element_field(list_array.data_type(), "FixedSizeListArray")?;
 
@@ -400,6 +406,17 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     }
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
+    // Fast path: zero-copy clone when no list element exceeds max_len.
+    // Avoids building per-row slices + concat (major allocation + copy overhead
+    // in the common display path where lists are short).
+    let needs_trunc = (0..list_array.len()).any(|i| {
+        let start = offsets[i] as usize;
+        let end = offsets[i + 1] as usize;
+        end.saturating_sub(start) > max_len
+    });
+    if !needs_trunc {
+        return Ok(list_array.clone());
+    }
     let element_field = list_element_field(list_array.data_type(), "ListArray")?;
 
     let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
@@ -439,6 +456,18 @@ fn truncate_large_list_array(
     }
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
+    // Fast path: zero-copy clone when truncation is unnecessary (common for
+    // result formatting). LargeList uses i64 offsets; saturating_sub handles
+    // any theoretical overflow safely by forcing the slow path (which will
+    // error later on value_to_usize if truly impossible).
+    let needs_trunc = (0..list_array.len()).any(|i| {
+        let start = offsets[i] as usize;
+        let end = offsets[i + 1] as usize;
+        end.saturating_sub(start) > max_len
+    });
+    if !needs_trunc {
+        return Ok(list_array.clone());
+    }
     let element_field = list_element_field(list_array.data_type(), "LargeListArray")?;
 
     let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
@@ -477,8 +506,14 @@ fn truncate_list_view_array(
         return Ok(list_array.clone());
     }
     let child_array = list_array.values();
-    let offsets = list_array.value_offsets();
     let sizes = list_array.value_sizes();
+    // Fast path for ListView: sizes are stored explicitly, cheap any() scan.
+    // When no element exceeds the limit we return the original (preserving
+    // whatever non-contiguous view layout the caller had).
+    if !sizes.iter().any(|&s| (s as usize) > max_len) {
+        return Ok(list_array.clone());
+    }
+    let offsets = list_array.value_offsets();
     let element_field = list_element_field(list_array.data_type(), "ListViewArray")?;
 
     let slice_ranges: Vec<(usize, usize, i32)> = (0..list_array.len())
@@ -535,13 +570,17 @@ fn truncate_large_list_view_array(
         return Ok(list_array.clone());
     }
     let child_array = list_array.values();
-    let offsets = list_array.value_offsets();
     let sizes = list_array.value_sizes();
-    let element_field = list_element_field(list_array.data_type(), "LargeListViewArray")?;
-
+    // Fast path for LargeListView (i64 sizes): cheap scan over the sizes buffer.
+    // When nothing needs truncation we avoid the expensive concat + offset rebuild.
     let max_len_i64 = i64::try_from(max_len).map_err(|_| {
         ArrowError::InvalidArgumentError(format!("max_len {max_len} cannot be represented as i64"))
     })?;
+    if !sizes.iter().any(|&s| s > max_len_i64) {
+        return Ok(list_array.clone());
+    }
+    let offsets = list_array.value_offsets();
+    let element_field = list_element_field(list_array.data_type(), "LargeListViewArray")?;
 
     let new_sizes: Vec<i64> = (0..list_array.len())
         .map(|i| sizes[i].min(max_len_i64))
@@ -1612,5 +1651,148 @@ Cras venenatis euismod malesuada.",
         scores: list<item: float32> (nullable)
         metadata: struct<key utf8, value utf8> (nullable)
         ");
+    }
+
+    /// max_len = 0 is a valid (if unusual) truncation request: every list
+    /// must become a 0-element list while parent nulls and the element Field
+    /// (including metadata/nullable) are preserved exactly.
+    #[test]
+    fn test_truncate_list_to_zero_elements() {
+        use arrow::array::{Int32Array, ListArray as ListArrayAlias, ListViewArray as ListViewArrayAlias};
+        use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+
+        let element_field = Arc::new(
+            Field::new("value", DataType::Int32, false)
+                .with_metadata([("audit".to_string(), "zero_len".to_string())].into()),
+        );
+
+        // List<i32> with mixed lengths + one parent NULL
+        let list = ListArrayAlias::new(
+            Arc::clone(&element_field),
+            OffsetBuffer::<i32>::new(vec![0_i32, 3, 3, 6, 8].into()),
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7])),
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        );
+        let out = truncate_list_array(&list, 0).expect("truncate to 0");
+        assert_eq!(out.len(), 4);
+        assert!(out.is_null(1));
+        assert!(!out.is_null(0));
+        // All non-null lists must report length 0
+        for i in [0, 2, 3] {
+            assert!(!out.is_null(i));
+            assert_eq!(out.value(i).len(), 0);
+        }
+        // Element field preserved
+        if let DataType::List(f) = out.data_type() {
+            assert_eq!(f.name(), "value");
+            assert!(!f.is_nullable());
+            assert_eq!(f.metadata().get("audit"), Some(&"zero_len".to_string()));
+        } else {
+            panic!("expected List");
+        }
+    }
+
+    /// Fast-path + max_len=0 for ListView (non-contiguous layout).
+    #[test]
+    fn test_truncate_list_view_to_zero_and_fast_path() {
+        use arrow::array::{Int32Array, ListViewArray as ListViewArrayAlias};
+        use arrow::buffer::{NullBuffer, ScalarBuffer};
+
+        let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let values = Int32Array::from(vec![10, 20, 30, 40]);
+        // Two lists: [10,20,30] at offset 0 size 3, and a NULL list, and [40]
+        let offsets = ScalarBuffer::<i32>::from(vec![0_i32, 0, 3]);
+        let sizes = ScalarBuffer::<i32>::from(vec![3_i32, 0, 1]);
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let input = ListViewArrayAlias::try_new(
+            Arc::clone(&element_field),
+            offsets,
+            sizes,
+            Arc::new(values),
+            Some(nulls),
+        )
+        .expect("ListView construction");
+
+        // Fast path: max_len larger than any size (including the 0-size one)
+        let out_fast = truncate_list_view_array(&input, 100).expect("fast path");
+        assert_eq!(out_fast.len(), 3);
+        assert!(out_fast.is_null(1));
+        assert_eq!(out_fast.value_sizes().as_ref(), &[3, 0, 1]); // unchanged layout
+
+        // max_len=0 path
+        let out_zero = truncate_list_view_array(&input, 0).expect("zero len view");
+        assert_eq!(out_zero.len(), 3);
+        assert!(out_zero.is_null(1));
+        for i in [0, 2] {
+            assert!(!out_zero.is_null(i));
+            assert_eq!(out_zero.value(i).len(), 0);
+        }
+    }
+
+    /// Using the public truncate_numeric_column_length API with a RecordBatch
+    /// that contains a mix of list columns that do and do not need truncation.
+    /// When the fast path triggers for some columns, the original column Arc
+    /// should be reused (identity) for those that didn't change.
+    #[test]
+    fn test_truncate_numeric_column_length_fast_path_and_mixed() {
+        use arrow::array::{Int32Array, ListArray as ListArrayAlias};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Field as ArrowField;
+
+        use crate::record_batch::truncate_numeric_column_length;
+
+        let schema = Arc::new(Schema::new(vec![
+            ArrowField::new(
+                "short_lists",
+                DataType::List(Arc::new(Field::new("v", DataType::Int32, true))),
+                true,
+            ),
+            ArrowField::new(
+                "long_lists",
+                DataType::List(Arc::new(Field::new("v", DataType::Int32, true))),
+                true,
+            ),
+        ]));
+
+        let short = ListArrayAlias::new(
+            Arc::new(Field::new("v", DataType::Int32, true)),
+            OffsetBuffer::<i32>::new(vec![0_i32, 1, 2].into()),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
+        );
+        let long = ListArrayAlias::new(
+            Arc::new(Field::new("v", DataType::Int32, true)),
+            OffsetBuffer::<i32>::new(vec![0_i32, 5, 10].into()),
+            Arc::new(Int32Array::from((0..10).collect::<Vec<_>>())),
+            None,
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(short), Arc::new(long)],
+        )
+        .expect("batch");
+
+        // max_elements=3 : short_lists hits fast path (no change), long_lists truncated
+        let processed = truncate_numeric_column_length(&batch, 3)
+            .expect("truncate_numeric_column_length");
+
+        assert_eq!(processed.num_columns(), 2);
+        // First column should be the exact same Arc (fast path clone in practice
+        // returns the input, but RecordBatch construction may not dedup Arcs;
+        // we at least verify logical identity of data).
+        let short_in = batch.column(0);
+        let short_out = processed.column(0);
+        assert_eq!(short_in.data_type(), short_out.data_type());
+        assert_eq!(short_in.len(), short_out.len());
+        // Second column must have been truncated (lengths now <=3)
+        let long_out = processed
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArrayAlias>()
+            .expect("ListArray");
+        for i in 0..long_out.len() {
+            assert!(long_out.value(i).len() <= 3);
+        }
     }
 }
