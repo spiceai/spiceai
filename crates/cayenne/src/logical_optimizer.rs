@@ -479,19 +479,35 @@ fn distinct_input(distinct: &datafusion::logical_expr::Distinct) -> &LogicalPlan
 /// the same shape `is_dim_like_subtree` accepts. Anything outside that vocab
 /// (`Sort`, `Window`, etc.) is conservatively rejected by returning `false`.
 fn key_preserved_through_summaries(plan: &LogicalPlan, key: &Column) -> bool {
+    fn key_for_input_schema(input: &LogicalPlan, key: &Column) -> Option<Column> {
+        input
+            .schema()
+            .qualified_field_with_unqualified_name(&key.name)
+            .ok()
+            .map(|(qualifier, field)| Column::new(qualifier.cloned(), field.name().clone()))
+    }
+
     fn walk(plan: &LogicalPlan, key: &Column) -> bool {
         match plan {
-            LogicalPlan::TableScan(_) => true,
-            LogicalPlan::Projection(p) => walk(&p.input, key),
-            LogicalPlan::SubqueryAlias(a) => walk(&a.input, key),
-            LogicalPlan::Filter(f) => walk(&f.input, key),
-            LogicalPlan::Limit(l) => walk(&l.input, key),
+            LogicalPlan::TableScan(_) => plan.schema().has_column(key),
+            LogicalPlan::Projection(p) => plan.schema().has_column(key) && walk(&p.input, key),
+            LogicalPlan::SubqueryAlias(a) => {
+                let relation_matches_alias = match key.relation.as_ref() {
+                    Some(relation) => relation == &a.alias,
+                    None => true,
+                };
+                relation_matches_alias
+                    && key_for_input_schema(&a.input, key)
+                        .is_some_and(|input_key| walk(&a.input, &input_key))
+            }
+            LogicalPlan::Filter(f) => plan.schema().has_column(key) && walk(&f.input, key),
+            LogicalPlan::Limit(l) => plan.schema().has_column(key) && walk(&l.input, key),
             LogicalPlan::Aggregate(a) => {
                 let key_in_group = a
                     .group_expr
                     .iter()
                     .any(|expr| matches!(expr, Expr::Column(column) if column == key));
-                key_in_group && walk(&a.input, key)
+                key_in_group && plan.schema().has_column(key) && walk(&a.input, key)
             }
             LogicalPlan::Distinct(distinct) => {
                 use datafusion::logical_expr::Distinct;
@@ -502,13 +518,13 @@ fn key_preserved_through_summaries(plan: &LogicalPlan, key: &Column) -> bool {
                         .iter()
                         .any(|expr| matches!(expr, Expr::Column(column) if column == key)),
                 };
-                key_kept && walk(distinct_input(distinct), key)
+                key_kept && plan.schema().has_column(key) && walk(distinct_input(distinct), key)
             }
             LogicalPlan::Join(j)
                 if j.join_type == JoinType::Inner
                     && j.null_equality == NullEquality::NullEqualsNothing =>
             {
-                walk(&j.left, key) || walk(&j.right, key)
+                plan.schema().has_column(key) && (walk(&j.left, key) || walk(&j.right, key))
             }
             _ => false,
         }
