@@ -32,7 +32,9 @@ use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresC
 use globset::GlobSet;
 use snafu::prelude::*;
 
-use crate::{Read, RefreshableCatalogProvider};
+use crate::{
+    FOREIGN_KEYS_METADATA_KEY, MetadataEnrichedTableProvider, Read, RefreshableCatalogProvider,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -53,6 +55,18 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// System schemas to exclude from discovery.
 const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"];
+
+/// A single foreign key constraint discovered from `information_schema`.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ForeignKeyConstraint {
+    columns: Vec<String>,
+    referenced_schema: String,
+    referenced_table: String,
+    referenced_columns: Vec<String>,
+}
+
+/// FK constraints grouped by source table name within a schema.
+type ForeignKeyMap = HashMap<String, Vec<ForeignKeyConstraint>>;
 
 /// A catalog provider for `PostgreSQL` that discovers schemas and tables
 /// by querying `information_schema`.
@@ -89,15 +103,27 @@ impl PostgresCatalogProvider {
         let schema_names = self.list_schemas().await?;
 
         let mut schemas = HashMap::new();
-        for schema_name in schema_names {
+        for schema_name in &schema_names {
+            let foreign_keys = match self.list_foreign_keys(schema_name).await {
+                Ok(fks) => fks,
+                Err(e) => {
+                    tracing::warn!(
+                        schema = %schema_name,
+                        error = %e,
+                        "Failed to query foreign keys for schema, continuing without FK metadata"
+                    );
+                    HashMap::new()
+                }
+            };
+
             let schema_provider = PostgresSchemaProvider::new(
                 Arc::clone(&self.pool),
                 schema_name.clone(),
                 Arc::clone(&self.table_creator),
                 self.include.clone(),
             );
-            schema_provider.refresh_tables().await?;
-            schemas.insert(schema_name, Arc::new(schema_provider));
+            schema_provider.refresh_tables(&foreign_keys).await?;
+            schemas.insert(schema_name.clone(), Arc::new(schema_provider));
         }
 
         {
@@ -109,6 +135,81 @@ impl PostgresCatalogProvider {
         }
 
         Ok(())
+    }
+
+    /// Query all foreign key constraints for tables in the given schema.
+    ///
+    /// Returns a map from source table name to its FK constraints.
+    async fn list_foreign_keys(&self, schema_name: &str) -> Result<ForeignKeyMap> {
+        let conn = self
+            .pool
+            .connect_direct()
+            .await
+            .context(ConnectionFailedSnafu)?;
+
+        // Use referential_constraints to link FK -> referenced PK/unique constraint,
+        // then join key_column_usage on both sides matched by ordinal_position.
+        // This avoids the cross-product issue with constraint_column_usage on composite FKs.
+        let rows = conn
+            .conn
+            .query(
+                "SELECT \
+                     kcu1.table_name, \
+                     kcu1.column_name, \
+                     kcu2.table_schema AS referenced_schema, \
+                     kcu2.table_name AS referenced_table, \
+                     kcu2.column_name AS referenced_column, \
+                     rc.constraint_name \
+                 FROM information_schema.referential_constraints rc \
+                 JOIN information_schema.key_column_usage kcu1 \
+                     ON kcu1.constraint_name = rc.constraint_name \
+                     AND kcu1.constraint_schema = rc.constraint_schema \
+                 JOIN information_schema.key_column_usage kcu2 \
+                     ON kcu2.constraint_name = rc.unique_constraint_name \
+                     AND kcu2.constraint_schema = rc.unique_constraint_schema \
+                     AND kcu2.ordinal_position = kcu1.ordinal_position \
+                 WHERE rc.constraint_schema = $1 \
+                 ORDER BY kcu1.table_name, rc.constraint_name, kcu1.ordinal_position",
+                &[&schema_name],
+            )
+            .await
+            .context(QueryFailedSnafu)?;
+
+        // Group rows by (table_name, constraint_name) to build composite FK constraints.
+        let mut constraints_by_table: HashMap<String, HashMap<String, ForeignKeyConstraint>> =
+            HashMap::new();
+
+        for row in &rows {
+            let table_name: String = row.get(0);
+            let column_name: String = row.get(1);
+            let referenced_schema: String = row.get(2);
+            let referenced_table: String = row.get(3);
+            let referenced_column: String = row.get(4);
+            let constraint_name: String = row.get(5);
+
+            let table_constraints = constraints_by_table.entry(table_name).or_default();
+
+            let fk =
+                table_constraints
+                    .entry(constraint_name)
+                    .or_insert_with(|| ForeignKeyConstraint {
+                        columns: Vec::new(),
+                        referenced_schema,
+                        referenced_table,
+                        referenced_columns: Vec::new(),
+                    });
+
+            fk.columns.push(column_name);
+            fk.referenced_columns.push(referenced_column);
+        }
+
+        // Flatten: HashMap<table, HashMap<constraint, FK>> -> HashMap<table, Vec<FK>>
+        let fk_map = constraints_by_table
+            .into_iter()
+            .map(|(table, constraints)| (table, constraints.into_values().collect()))
+            .collect();
+
+        Ok(fk_map)
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
@@ -209,7 +310,7 @@ impl PostgresSchemaProvider {
         }
     }
 
-    async fn refresh_tables(&self) -> Result<()> {
+    async fn refresh_tables(&self, foreign_keys: &ForeignKeyMap) -> Result<()> {
         let table_names = self.list_tables().await?;
 
         let tables = build_table_providers_for_schema(
@@ -217,6 +318,7 @@ impl PostgresSchemaProvider {
             table_names,
             &self.table_creator,
             self.include.as_deref(),
+            foreign_keys,
         )
         .await;
 
@@ -265,6 +367,7 @@ async fn build_table_providers_for_schema(
     table_names: Vec<String>,
     table_creator: &Arc<dyn Read>,
     include: Option<&GlobSet>,
+    foreign_keys: &ForeignKeyMap,
 ) -> HashMap<String, Arc<dyn TableProvider>> {
     let mut tables = HashMap::new();
 
@@ -279,6 +382,18 @@ async fn build_table_providers_for_schema(
 
         match table_creator.table_provider(table_ref).await {
             Ok(provider) => {
+                let provider = if let Some(fks) = foreign_keys.get(&table_name) {
+                    if let Ok(fk_json) = serde_json::to_string(fks) {
+                        let extra =
+                            HashMap::from([(FOREIGN_KEYS_METADATA_KEY.to_string(), fk_json)]);
+                        Arc::new(MetadataEnrichedTableProvider::new(provider, extra))
+                            as Arc<dyn TableProvider>
+                    } else {
+                        provider
+                    }
+                } else {
+                    provider
+                };
                 tables.insert(table_name, provider);
             }
             Err(e) => {
@@ -328,8 +443,10 @@ impl SchemaProvider for PostgresSchemaProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_table_providers_for_schema, is_table_included};
-    use crate::Read;
+    use super::{
+        ForeignKeyConstraint, ForeignKeyMap, build_table_providers_for_schema, is_table_included,
+    };
+    use crate::{FOREIGN_KEYS_METADATA_KEY, Read};
     use async_trait::async_trait;
     use datafusion::catalog::Session;
     use datafusion::datasource::{TableProvider, TableType};
@@ -440,12 +557,14 @@ mod tests {
         let read = Arc::new(MockRead::new(HashSet::new()));
         let include = make_include(&["public.orders"]);
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+        let no_fks: ForeignKeyMap = HashMap::new();
 
         let tables = build_table_providers_for_schema(
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             Some(&include),
+            &no_fks,
         )
         .await;
 
@@ -460,12 +579,14 @@ mod tests {
         fail_tables.insert("public.orders".to_string());
         let read = Arc::new(MockRead::new(fail_tables));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+        let no_fks: ForeignKeyMap = HashMap::new();
 
         let tables = build_table_providers_for_schema(
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             None,
+            &no_fks,
         )
         .await;
 
@@ -485,15 +606,114 @@ mod tests {
             HashSet::from(["public.orders".to_string(), "public.lineitem".to_string()]);
         let read = Arc::new(MockRead::new(fail_tables));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+        let no_fks: ForeignKeyMap = HashMap::new();
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = build_table_providers_for_schema(
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             None,
+            &no_fks,
         )
         .await;
 
         assert!(tables.is_empty(), "all failing tables should be skipped");
+    }
+
+    #[tokio::test]
+    async fn test_build_table_providers_injects_foreign_key_metadata() {
+        let read = Arc::new(MockRead::new(HashSet::new()));
+        let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+
+        let mut fk_map: ForeignKeyMap = HashMap::new();
+        fk_map.insert(
+            "orders".to_string(),
+            vec![ForeignKeyConstraint {
+                columns: vec!["customer_id".to_string()],
+                referenced_schema: "public".to_string(),
+                referenced_table: "customers".to_string(),
+                referenced_columns: vec!["id".to_string()],
+            }],
+        );
+
+        let tables = build_table_providers_for_schema(
+            "public",
+            vec!["orders".to_string(), "lineitem".to_string()],
+            &table_creator,
+            None,
+            &fk_map,
+        )
+        .await;
+
+        // orders should have FK metadata
+        let orders_provider = tables.get("orders").expect("orders table should exist");
+        let orders_metadata = orders_provider.schema().metadata().clone();
+        let fk_json = orders_metadata
+            .get(FOREIGN_KEYS_METADATA_KEY)
+            .expect("orders should have foreign_keys metadata");
+        let fks: Vec<serde_json::Value> =
+            serde_json::from_str(fk_json).expect("FK metadata should be valid JSON");
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0]["columns"], serde_json::json!(["customer_id"]));
+        assert_eq!(fks[0]["referenced_schema"], "public");
+        assert_eq!(fks[0]["referenced_table"], "customers");
+        assert_eq!(fks[0]["referenced_columns"], serde_json::json!(["id"]));
+
+        // lineitem should have no FK metadata
+        let lineitem_provider = tables.get("lineitem").expect("lineitem table should exist");
+        let lineitem_schema = lineitem_provider.schema();
+        assert!(
+            lineitem_schema
+                .metadata()
+                .get(FOREIGN_KEYS_METADATA_KEY)
+                .is_none(),
+            "lineitem should not have foreign_keys metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_table_providers_injects_composite_foreign_key() {
+        let read = Arc::new(MockRead::new(HashSet::new()));
+        let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+
+        let mut fk_map: ForeignKeyMap = HashMap::new();
+        fk_map.insert(
+            "order_lines".to_string(),
+            vec![ForeignKeyConstraint {
+                columns: vec!["order_id".to_string(), "line_id".to_string()],
+                referenced_schema: "public".to_string(),
+                referenced_table: "orders".to_string(),
+                referenced_columns: vec!["id".to_string(), "line_num".to_string()],
+            }],
+        );
+
+        let tables = build_table_providers_for_schema(
+            "public",
+            vec!["order_lines".to_string()],
+            &table_creator,
+            None,
+            &fk_map,
+        )
+        .await;
+
+        let provider = tables
+            .get("order_lines")
+            .expect("order_lines table should exist");
+        let schema = provider.schema();
+        let fk_json = schema
+            .metadata()
+            .get(FOREIGN_KEYS_METADATA_KEY)
+            .expect("should have foreign_keys metadata");
+        let fks: Vec<serde_json::Value> =
+            serde_json::from_str(fk_json).expect("FK metadata should be valid JSON");
+        assert_eq!(fks.len(), 1);
+        assert_eq!(
+            fks[0]["columns"],
+            serde_json::json!(["order_id", "line_id"])
+        );
+        assert_eq!(
+            fks[0]["referenced_columns"],
+            serde_json::json!(["id", "line_num"])
+        );
     }
 }
