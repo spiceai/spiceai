@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use super::super::offsets::{deserialize_offsets, serialize_merged_offsets, serialize_offsets};
 use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Error, Result};
 use crate::dataaccelerator::turso::TursoConnectionPool;
 use data_components::kafka::KafkaOffset;
@@ -33,12 +34,12 @@ impl DebeziumKafkaSys {
             serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
             serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
-        let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
+        let offsets_json = serialize_offsets(&metadata.offsets)?;
 
         let conn = pool.connect().await.map_err(Error::external)?;
 
         ensure_debezium_kafka_table(&conn).await?;
-        self.mark_schema_ensured();
+        self.schema_ensured.mark_ensured();
 
         let upsert = format!(
             "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME}
@@ -73,11 +74,11 @@ impl DebeziumKafkaSys {
     pub(super) async fn get_turso(
         &self,
         pool: &Arc<TursoConnectionPool>,
-    ) -> Option<DebeziumKafkaMetadata> {
+    ) -> Result<Option<DebeziumKafkaMetadata>> {
         let dataset_name = self.dataset_name.clone();
-        let conn = pool.connect().await.ok()?;
-        ensure_debezium_kafka_table(&conn).await.ok()?;
-        self.mark_schema_ensured();
+        let conn = pool.connect().await.map_err(Error::external)?;
+        ensure_debezium_kafka_table(&conn).await?;
+        self.schema_ensured.mark_ensured();
         let query = format!(
             "SELECT consumer_group_id, topic, primary_keys, schema_fields, offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
@@ -85,25 +86,27 @@ impl DebeziumKafkaSys {
         let mut rows = conn
             .query(&query, turso::params![dataset_name])
             .await
-            .ok()?;
-        let row = rows.next().await.ok()??;
+            .map_err(Error::external)?;
+        let Some(row) = rows.next().await.map_err(Error::external)? else {
+            return Ok(None);
+        };
 
-        let consumer_group_id = row.get::<String>(0).ok()?;
-        let topic = row.get::<String>(1).ok()?;
-        let primary_keys_json = row.get::<String>(2).ok()?;
-        let schema_fields_json = row.get::<String>(3).ok()?;
-        let offsets_json = row.get::<Option<String>>(4).ok()?;
+        let consumer_group_id = row.get::<String>(0).map_err(Error::external)?;
+        let topic = row.get::<String>(1).map_err(Error::external)?;
+        let primary_keys_json = row.get::<String>(2).map_err(Error::external)?;
+        let schema_fields_json = row.get::<String>(3).map_err(Error::external)?;
+        let offsets_json = row.get::<Option<String>>(4).map_err(Error::external)?;
 
-        let primary_keys = serde_json::from_str(&primary_keys_json).ok()?;
-        let schema_fields = serde_json::from_str(&schema_fields_json).ok()?;
+        let primary_keys = serde_json::from_str(&primary_keys_json).map_err(Error::external)?;
+        let schema_fields = serde_json::from_str(&schema_fields_json).map_err(Error::external)?;
 
-        Some(DebeziumKafkaMetadata {
+        Ok(Some(DebeziumKafkaMetadata {
             consumer_group_id,
             topic,
             primary_keys,
             schema_fields,
-            offsets: Self::deserialize_offsets(offsets_json.as_deref()).ok()?,
-        })
+            offsets: deserialize_offsets(offsets_json.as_deref())?,
+        }))
     }
 
     pub(super) async fn upsert_offsets_turso(
@@ -113,9 +116,9 @@ impl DebeziumKafkaSys {
     ) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
         let conn = pool.connect().await.map_err(Error::external)?;
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             ensure_debezium_kafka_table(&conn).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         let query =
@@ -131,8 +134,7 @@ impl DebeziumKafkaSys {
             ))
         })?;
         let existing_offsets_json = row.get::<Option<String>>(0).map_err(Error::external)?;
-        let offsets_json =
-            Self::serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
+        let offsets_json = serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
 
         let update = format!(
             "UPDATE {DEBEZIUM_KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"

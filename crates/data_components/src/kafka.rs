@@ -117,6 +117,9 @@ impl KafkaOffset {
 
 #[async_trait]
 pub trait KafkaOffsetCommitHook: Send + Sync {
+    /// Runs after the refresh task has written a batch but before Kafka offsets are committed.
+    /// If this hook fails, Kafka is left uncommitted; plain append accelerations may replay the
+    /// batch after restart and should be treated as at-least-once.
     async fn commit_offsets(&self, offsets: &[KafkaOffset])
     -> std::result::Result<(), CommitError>;
 }

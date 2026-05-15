@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::super::offsets::{deserialize_offsets, serialize_merged_offsets, serialize_offsets};
 use super::{Error, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
 use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
@@ -27,7 +28,7 @@ impl KafkaSys {
         let conn = pool.connect_direct().await.map_err(Error::external)?;
 
         ensure_kafka_table(pool).await?;
-        self.mark_schema_ensured();
+        self.schema_ensured.mark_ensured();
 
         let upsert = format!(
             "INSERT INTO {KAFKA_TABLE_NAME}
@@ -42,7 +43,7 @@ impl KafkaSys {
         );
 
         let schema_json = Self::serialize_schema(&metadata.schema)?;
-        let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
+        let offsets_json = serialize_offsets(&metadata.offsets)?;
 
         conn.conn
             .execute(
@@ -64,31 +65,34 @@ impl KafkaSys {
     pub(super) async fn get_postgres(
         &self,
         pool: &PostgresConnectionPool,
-    ) -> Option<KafkaMetadata> {
-        ensure_kafka_table(pool).await.ok()?;
-        self.mark_schema_ensured();
-        let conn = pool.connect_direct().await.ok()?;
+    ) -> Result<Option<KafkaMetadata>> {
+        ensure_kafka_table(pool).await?;
+        self.schema_ensured.mark_ensured();
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
         let query = format!(
             "SELECT consumer_group_id, topic, schema_json, offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = $1"
         );
-        let stmt = conn.conn.prepare(&query).await.ok()?;
-        let row = conn
+        let stmt = conn.conn.prepare(&query).await.map_err(Error::external)?;
+        let Some(row) = conn
             .conn
             .query_opt(&stmt, &[&self.dataset_name])
             .await
-            .ok()??;
+            .map_err(Error::external)?
+        else {
+            return Ok(None);
+        };
 
         let consumer_group_id: String = row.get(0);
         let topic: String = row.get(1);
         let schema_json: String = row.get(2);
         let offsets_json: Option<String> = row.get(3);
 
-        Some(KafkaMetadata {
+        Ok(Some(KafkaMetadata {
             consumer_group_id,
             topic,
-            schema: KafkaSys::deserialize_schema(&schema_json).ok()?,
-            offsets: KafkaSys::deserialize_offsets(offsets_json.as_deref()).ok()?,
-        })
+            schema: KafkaSys::deserialize_schema(&schema_json)?,
+            offsets: deserialize_offsets(offsets_json.as_deref())?,
+        }))
     }
 
     pub(super) async fn upsert_offsets_postgres(
@@ -96,9 +100,9 @@ impl KafkaSys {
         pool: &PostgresConnectionPool,
         offsets: &[KafkaOffset],
     ) -> Result<()> {
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             ensure_kafka_table(pool).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
         let conn = pool.connect_direct().await.map_err(Error::external)?;
         let query = format!("SELECT offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = $1");
@@ -114,8 +118,7 @@ impl KafkaSys {
                 ))
             })?;
         let existing_offsets_json: Option<String> = row.get(0);
-        let offsets_json =
-            Self::serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
+        let offsets_json = serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
         let update = format!(
             "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = $1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = $2"
         );

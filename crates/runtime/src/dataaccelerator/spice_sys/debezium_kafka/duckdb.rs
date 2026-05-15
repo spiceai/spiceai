@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::super::offsets::{deserialize_offsets, serialize_merged_offsets, serialize_offsets};
 use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Error, Result};
 use data_components::debezium::change_event;
 use data_components::kafka::KafkaOffset;
@@ -32,7 +33,7 @@ impl DebeziumKafkaSys {
             .get_underlying_conn_mut();
 
         ensure_debezium_kafka_table(duckdb_conn)?;
-        self.mark_schema_ensured();
+        self.schema_ensured.mark_ensured();
 
         let upsert = format!(
             "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, primary_keys, schema_fields, offsets_json, created_at, updated_at)
@@ -50,7 +51,7 @@ impl DebeziumKafkaSys {
             serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
             serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
-        let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
+        let offsets_json = serialize_offsets(&metadata.offsets)?;
 
         duckdb_conn
             .execute(
@@ -72,41 +73,42 @@ impl DebeziumKafkaSys {
     pub(super) fn get_duckdb(
         &self,
         pool: &Arc<DuckDbConnectionPool>,
-    ) -> Option<DebeziumKafkaMetadata> {
-        let mut db_conn = Arc::clone(pool).connect_sync().ok()?;
+    ) -> Result<Option<DebeziumKafkaMetadata>> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .ok()?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        ensure_debezium_kafka_table(duckdb_conn).ok()?;
-        self.mark_schema_ensured();
+        ensure_debezium_kafka_table(duckdb_conn)?;
+        self.schema_ensured.mark_ensured();
 
         let query = format!(
             "SELECT consumer_group_id, topic, primary_keys, schema_fields, offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
-        let mut stmt = duckdb_conn.prepare(&query).ok()?;
-        let mut rows = stmt.query([&self.dataset_name]).ok()?;
+        let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
+        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
 
-        if let Some(row) = rows.next().ok()? {
-            let consumer_group_id: String = row.get(0).ok()?;
-            let topic: String = row.get(1).ok()?;
-            let primary_keys: String = row.get(2).ok()?;
-            let schema_fields: String = row.get(3).ok()?;
-            let offsets_json: Option<String> = row.get(4).ok()?;
+        if let Some(row) = rows.next().map_err(Error::external)? {
+            let consumer_group_id: String = row.get(0).map_err(Error::external)?;
+            let topic: String = row.get(1).map_err(Error::external)?;
+            let primary_keys: String = row.get(2).map_err(Error::external)?;
+            let schema_fields: String = row.get(3).map_err(Error::external)?;
+            let offsets_json: Option<String> = row.get(4).map_err(Error::external)?;
 
-            let primary_keys: Vec<String> = serde_json::from_str(&primary_keys).ok()?;
+            let primary_keys: Vec<String> =
+                serde_json::from_str(&primary_keys).map_err(Error::external)?;
             let schema_fields: Vec<change_event::Field> =
-                serde_json::from_str(&schema_fields).ok()?;
+                serde_json::from_str(&schema_fields).map_err(Error::external)?;
 
-            Some(DebeziumKafkaMetadata {
+            Ok(Some(DebeziumKafkaMetadata {
                 consumer_group_id,
                 topic,
                 primary_keys,
                 schema_fields,
-                offsets: DebeziumKafkaSys::deserialize_offsets(offsets_json.as_deref()).ok()?,
-            })
+                offsets: deserialize_offsets(offsets_json.as_deref())?,
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -120,9 +122,9 @@ impl DebeziumKafkaSys {
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             ensure_debezium_kafka_table(duckdb_conn)?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         let query =
@@ -130,8 +132,7 @@ impl DebeziumKafkaSys {
         let existing_offsets_json: Option<String> = duckdb_conn
             .query_row(&query, [&self.dataset_name], |row| row.get(0))
             .map_err(Error::external)?;
-        let offsets_json =
-            Self::serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
+        let offsets_json = serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
         let update = format!(
             "UPDATE {DEBEZIUM_KAFKA_TABLE_NAME} SET offsets_json = ?, updated_at = now() WHERE dataset_name = ?"
         );

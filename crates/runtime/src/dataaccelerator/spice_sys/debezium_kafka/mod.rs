@@ -25,16 +25,14 @@ limitations under the License.
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
 //! );
 
-use super::{AccelerationConnection, Error, Result, acceleration_connection};
+use super::{
+    AccelerationConnection, Error, Result, acceleration_connection, offsets::OffsetSchemaState,
+};
 use crate::{
     component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
     dataconnector::debezium::DebeziumKafkaMetadata,
 };
 use data_components::kafka::KafkaOffset;
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicBool, Ordering},
-};
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
 
@@ -50,7 +48,7 @@ mod turso;
 pub struct DebeziumKafkaSys {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
-    schema_ensured: AtomicBool,
+    schema_ensured: OffsetSchemaState,
 }
 
 impl DebeziumKafkaSys {
@@ -58,11 +56,11 @@ impl DebeziumKafkaSys {
         Ok(Self {
             dataset_name: dataset.name.to_string(),
             acceleration_connection: acceleration_connection(dataset, open_option).await?,
-            schema_ensured: AtomicBool::new(false),
+            schema_ensured: OffsetSchemaState::default(),
         })
     }
 
-    pub(crate) async fn get(&self) -> Option<DebeziumKafkaMetadata> {
+    pub(crate) async fn get(&self) -> Result<Option<DebeziumKafkaMetadata>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
@@ -80,7 +78,7 @@ impl DebeziumKafkaSys {
                 feature = "postgres-accel",
                 feature = "turso"
             )))]
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -130,60 +128,5 @@ impl DebeziumKafkaSys {
             )))]
             _ => Err(Error::NoAccelerationConnection),
         }
-    }
-
-    fn serialize_offsets(offsets: &[KafkaOffset]) -> Result<String> {
-        serde_json::to_string(offsets).map_err(Error::external)
-    }
-
-    fn deserialize_offsets(offsets_json: Option<&str>) -> Result<Vec<KafkaOffset>> {
-        offsets_json.map_or_else(
-            || Ok(Vec::new()),
-            |offsets_json| serde_json::from_str(offsets_json).map_err(Error::external),
-        )
-    }
-
-    fn serialize_merged_offsets(
-        offsets_json: Option<&str>,
-        offsets: &[KafkaOffset],
-    ) -> Result<String> {
-        let existing_offsets = Self::deserialize_offsets(offsets_json)?;
-        let merged_offsets = Self::merge_offsets(existing_offsets, offsets);
-        Self::serialize_offsets(&merged_offsets)
-    }
-
-    fn merge_offsets(
-        existing_offsets: Vec<KafkaOffset>,
-        offsets: &[KafkaOffset],
-    ) -> Vec<KafkaOffset> {
-        let mut merged_offsets: HashMap<(String, i32), KafkaOffset> = existing_offsets
-            .into_iter()
-            .map(|offset| ((offset.topic.clone(), offset.partition), offset))
-            .collect();
-
-        for offset in offsets {
-            merged_offsets
-                .entry((offset.topic.clone(), offset.partition))
-                .and_modify(|existing_offset| {
-                    existing_offset.offset = existing_offset.offset.max(offset.offset);
-                })
-                .or_insert_with(|| offset.clone());
-        }
-
-        let mut offsets = merged_offsets.into_values().collect::<Vec<_>>();
-        offsets.sort_by(|left, right| {
-            left.topic
-                .cmp(&right.topic)
-                .then(left.partition.cmp(&right.partition))
-        });
-        offsets
-    }
-
-    fn schema_needs_ensure(&self) -> bool {
-        !self.schema_ensured.load(Ordering::Acquire)
-    }
-
-    fn mark_schema_ensured(&self) {
-        self.schema_ensured.store(true, Ordering::Release);
     }
 }

@@ -19,19 +19,20 @@ use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::metrics::MetricsProvider;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
-use crate::dataconnector::ConnectorComponent;
+use crate::dataconnector::{
+    ConnectorComponent,
+    kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
+};
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cdc::{ChangesStream, CommitError};
+use data_components::cdc::ChangesStream;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
-use data_components::kafka::{
-    KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook,
-};
+use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -334,7 +335,13 @@ impl DataConnector for Debezium {
 
         let metadata_from_accelerator =
             if let Some(debezium_kafka_sys) = debezium_kafka_sys.as_deref() {
-                get_metadata_from_accelerator(debezium_kafka_sys).await
+                get_metadata_from_accelerator(debezium_kafka_sys)
+                    .await
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?
             } else {
                 None
             };
@@ -468,7 +475,7 @@ impl DataConnector for Debezium {
 
         if let Some(debezium_kafka_sys) = debezium_kafka_sys {
             debezium_kafka = debezium_kafka.with_offset_commit_hook(Arc::new(
-                DebeziumKafkaSidecarOffsetCommitHook { debezium_kafka_sys },
+                SidecarOffsetCommitHook::new(debezium_kafka_sys),
             ));
         }
 
@@ -524,7 +531,7 @@ pub(crate) struct DebeziumKafkaMetadata {
 
 async fn get_metadata_from_accelerator(
     debezium_kafka_sys: &DebeziumKafkaSys,
-) -> Option<DebeziumKafkaMetadata> {
+) -> Result<Option<DebeziumKafkaMetadata>, spice_sys::Error> {
     debezium_kafka_sys.get().await
 }
 
@@ -535,18 +542,10 @@ async fn set_metadata_to_accelerator(
     debezium_kafka_sys.upsert(metadata).await
 }
 
-struct DebeziumKafkaSidecarOffsetCommitHook {
-    debezium_kafka_sys: Arc<DebeziumKafkaSys>,
-}
-
 #[async_trait]
-impl KafkaOffsetCommitHook for DebeziumKafkaSidecarOffsetCommitHook {
-    async fn commit_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CommitError> {
-        self.debezium_kafka_sys
-            .upsert_offsets(offsets)
-            .await
-            .boxed()
-            .map_err(|e| CommitError::UnableToCommitChange { source: e })
+impl SidecarOffsetStore for DebeziumKafkaSys {
+    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
+        DebeziumKafkaSys::upsert_offsets(self, offsets).await
     }
 }
 

@@ -375,7 +375,7 @@ impl DataConnector for Kafka {
 
         if let Some(kafka_sys) = kafka_sys {
             kafka =
-                kafka.with_offset_commit_hook(Arc::new(KafkaSidecarOffsetCommitHook { kafka_sys }));
+                kafka.with_offset_commit_hook(Arc::new(SidecarOffsetCommitHook::new(kafka_sys)));
         }
 
         Ok(Arc::new(kafka))
@@ -453,7 +453,13 @@ async fn init_kafka_consumer(
     kafka_sys: Option<&KafkaSys>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let metadata = if let Some(kafka_sys) = kafka_sys {
-        get_metadata_from_accelerator(kafka_sys).await
+        get_metadata_from_accelerator(kafka_sys)
+            .await
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "kafka",
+                connector_component: ConnectorComponent::from(dataset),
+            })?
     } else {
         None
     };
@@ -525,7 +531,9 @@ pub(crate) struct KafkaMetadata {
     pub(crate) offsets: Vec<KafkaOffset>,
 }
 
-async fn get_metadata_from_accelerator(kafka_sys: &KafkaSys) -> Option<KafkaMetadata> {
+async fn get_metadata_from_accelerator(
+    kafka_sys: &KafkaSys,
+) -> Result<Option<KafkaMetadata>, spice_sys::Error> {
     kafka_sys.get().await
 }
 
@@ -536,14 +544,35 @@ async fn set_metadata_to_accelerator(
     kafka_sys.upsert(metadata).await
 }
 
-struct KafkaSidecarOffsetCommitHook {
-    kafka_sys: Arc<KafkaSys>,
+#[async_trait]
+pub(crate) trait SidecarOffsetStore: Send + Sync {
+    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()>;
 }
 
 #[async_trait]
-impl KafkaOffsetCommitHook for KafkaSidecarOffsetCommitHook {
+impl SidecarOffsetStore for KafkaSys {
+    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
+        KafkaSys::upsert_offsets(self, offsets).await
+    }
+}
+
+pub(crate) struct SidecarOffsetCommitHook<T> {
+    store: Arc<T>,
+}
+
+impl<T> SidecarOffsetCommitHook<T> {
+    pub(crate) fn new(store: Arc<T>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl<T> KafkaOffsetCommitHook for SidecarOffsetCommitHook<T>
+where
+    T: SidecarOffsetStore,
+{
     async fn commit_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CommitError> {
-        self.kafka_sys
+        self.store
             .upsert_offsets(offsets)
             .await
             .boxed()

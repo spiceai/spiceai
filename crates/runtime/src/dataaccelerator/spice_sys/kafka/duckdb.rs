@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::super::offsets::{deserialize_offsets, serialize_merged_offsets, serialize_offsets};
 use super::{Error, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
 use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -31,10 +32,10 @@ impl KafkaSys {
             .get_underlying_conn_mut();
 
         ensure_kafka_table(duckdb_conn)?;
-        self.mark_schema_ensured();
+        self.schema_ensured.mark_ensured();
 
         let schema_json = Self::serialize_schema(&metadata.schema)?;
-        let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
+        let offsets_json = serialize_offsets(&metadata.offsets)?;
 
         let upsert = format!(
             "INSERT INTO {KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, schema_json, offsets_json, created_at, updated_at)
@@ -63,35 +64,38 @@ impl KafkaSys {
         Ok(())
     }
 
-    pub(super) fn get_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Option<KafkaMetadata> {
-        let mut db_conn = Arc::clone(pool).connect_sync().ok()?;
+    pub(super) fn get_duckdb(
+        &self,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<Option<KafkaMetadata>> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .ok()?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        ensure_kafka_table(duckdb_conn).ok()?;
-        self.mark_schema_ensured();
+        ensure_kafka_table(duckdb_conn)?;
+        self.schema_ensured.mark_ensured();
 
         let query = format!(
             "SELECT consumer_group_id, topic, schema_json, offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
-        let mut stmt = duckdb_conn.prepare(&query).ok()?;
-        let mut rows = stmt.query([&self.dataset_name]).ok()?;
+        let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
+        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
 
-        if let Some(row) = rows.next().ok()? {
-            let consumer_group_id: String = row.get(0).ok()?;
-            let topic: String = row.get(1).ok()?;
-            let schema_json: String = row.get(2).ok()?;
-            let offsets_json: Option<String> = row.get(3).ok()?;
+        if let Some(row) = rows.next().map_err(Error::external)? {
+            let consumer_group_id: String = row.get(0).map_err(Error::external)?;
+            let topic: String = row.get(1).map_err(Error::external)?;
+            let schema_json: String = row.get(2).map_err(Error::external)?;
+            let offsets_json: Option<String> = row.get(3).map_err(Error::external)?;
 
-            Some(KafkaMetadata {
+            Ok(Some(KafkaMetadata {
                 consumer_group_id,
                 topic,
-                schema: KafkaSys::deserialize_schema(&schema_json).ok()?,
-                offsets: KafkaSys::deserialize_offsets(offsets_json.as_deref()).ok()?,
-            })
+                schema: KafkaSys::deserialize_schema(&schema_json)?,
+                offsets: deserialize_offsets(offsets_json.as_deref())?,
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -105,17 +109,16 @@ impl KafkaSys {
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             ensure_kafka_table(duckdb_conn)?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         let query = format!("SELECT offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?");
         let existing_offsets_json: Option<String> = duckdb_conn
             .query_row(&query, [&self.dataset_name], |row| row.get(0))
             .map_err(Error::external)?;
-        let offsets_json =
-            Self::serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
+        let offsets_json = serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
         let update = format!(
             "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?, updated_at = now() WHERE dataset_name = ?"
         );
@@ -232,7 +235,11 @@ mod tests {
             .upsert(&test_metadata)
             .await
             .expect("to upsert metadata");
-        let retrieved = kafka_sys.get().await.expect("to retrieve metadata");
+        let retrieved = kafka_sys
+            .get()
+            .await
+            .expect("to retrieve metadata")
+            .expect("metadata to exist");
 
         assert_eq!(retrieved.consumer_group_id, test_metadata.consumer_group_id);
         assert_eq!(retrieved.topic, test_metadata.topic);
@@ -260,7 +267,11 @@ mod tests {
             .await
             .expect("to overwrite metadata");
 
-        let retrieved = kafka_sys.get().await.expect("to retrieve metadata");
+        let retrieved = kafka_sys
+            .get()
+            .await
+            .expect("to retrieve metadata")
+            .expect("metadata to exist");
         assert_eq!(retrieved.consumer_group_id, "updated-group-456");
         assert_eq!(retrieved.topic, "updated-topic");
         assert_eq!(retrieved.schema, test_metadata.schema);
@@ -290,7 +301,11 @@ mod tests {
             .await
             .expect("to upsert offsets");
 
-        let retrieved = kafka_sys.get().await.expect("to retrieve metadata");
+        let retrieved = kafka_sys
+            .get()
+            .await
+            .expect("to retrieve metadata")
+            .expect("metadata to exist");
         let mut expected_offsets = test_metadata.offsets.clone();
         expected_offsets.extend(offsets);
         assert_eq!(retrieved.offsets, expected_offsets);
@@ -305,7 +320,7 @@ mod tests {
 
         let result = kafka_sys.get().await;
         assert!(
-            result.is_none(),
+            result.expect("to get empty metadata").is_none(),
             "Should return None for nonexistent dataset"
         );
     }

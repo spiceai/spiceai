@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::super::offsets::{deserialize_offsets, serialize_merged_offsets, serialize_offsets};
 use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Error, Result};
 use data_components::debezium::change_event;
 use data_components::kafka::KafkaOffset;
@@ -34,7 +35,7 @@ impl DebeziumKafkaSys {
             serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
             serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
-        let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
+        let offsets_json = serialize_offsets(&metadata.offsets)?;
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -77,18 +78,22 @@ impl DebeziumKafkaSys {
             .await
             .map_err(Error::external)?;
 
-        self.mark_schema_ensured();
+        self.schema_ensured.mark_ensured();
         Ok(())
     }
 
     pub(super) async fn get_sqlite(
         &self,
         pool: &SqliteConnectionPool,
-    ) -> Option<DebeziumKafkaMetadata> {
+    ) -> Result<Option<DebeziumKafkaMetadata>> {
         let dataset_name = self.dataset_name.clone();
 
         let conn_sync = pool.connect_sync();
-        let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
+        };
 
         let metadata = conn
             .conn
@@ -119,26 +124,26 @@ impl DebeziumKafkaSys {
                             rusqlite::Error::InvalidQuery
                         })?;
 
-                    Ok(DebeziumKafkaMetadata {
+                    Ok(Some(DebeziumKafkaMetadata {
                         consumer_group_id,
                         topic,
                         primary_keys,
                         schema_fields,
-                        offsets: DebeziumKafkaSys::deserialize_offsets(offsets_json.as_deref())
+                        offsets: deserialize_offsets(offsets_json.as_deref())
                             .map_err(|err| {
                                 tracing::warn!("Failed to deserialize Debezium Kafka offsets from SQLite: {err}");
                                 rusqlite::Error::InvalidQuery
                             })?,
-                    })
+                    }))
                 } else {
-                    Err(rusqlite::Error::QueryReturnedNoRows)
+                    Ok(None)
                 }
             })
             .await
-            .ok()?;
+            .map_err(Error::external)?;
 
-        self.mark_schema_ensured();
-        Some(metadata)
+        self.schema_ensured.mark_ensured();
+        Ok(metadata)
     }
 
     pub(super) async fn upsert_offsets_sqlite(
@@ -148,7 +153,7 @@ impl DebeziumKafkaSys {
     ) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
         let new_offsets = offsets.to_vec();
-        let schema_needs_ensure = self.schema_needs_ensure();
+        let schema_needs_ensure = self.schema_ensured.needs_ensure();
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -167,7 +172,7 @@ impl DebeziumKafkaSys {
                 );
                 let existing_offsets_json: Option<String> =
                     conn.query_row(&query, [&dataset_name], |row| row.get(0))?;
-                let offsets_json = DebeziumKafkaSys::serialize_merged_offsets(
+                let offsets_json = serialize_merged_offsets(
                     existing_offsets_json.as_deref(),
                     &new_offsets,
                 )
@@ -188,7 +193,7 @@ impl DebeziumKafkaSys {
             .map_err(Error::external)?;
 
         if schema_needs_ensure {
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         Ok(())

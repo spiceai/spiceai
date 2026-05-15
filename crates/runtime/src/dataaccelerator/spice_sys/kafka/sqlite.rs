@@ -18,6 +18,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
 };
 
+use super::super::offsets::{deserialize_offsets, serialize_merged_offsets, serialize_offsets};
 use super::{Error, KAFKA_TABLE_NAME, KafkaSys, Result};
 use crate::dataconnector::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
@@ -29,7 +30,7 @@ impl KafkaSys {
         metadata: &KafkaMetadata,
     ) -> Result<()> {
         let schema_json = Self::serialize_schema(&metadata.schema)?;
-        let offsets_json = Self::serialize_offsets(&metadata.offsets)?;
+        let offsets_json = serialize_offsets(&metadata.offsets)?;
         let dataset_name = self.dataset_name.clone();
         let consumer_group_id = metadata.consumer_group_id.clone();
         let topic = metadata.topic.clone();
@@ -65,15 +66,22 @@ impl KafkaSys {
             .await
             .map_err(Error::external)?;
 
-        self.mark_schema_ensured();
+        self.schema_ensured.mark_ensured();
         Ok(())
     }
 
-    pub(super) async fn get_sqlite(&self, pool: &SqliteConnectionPool) -> Option<KafkaMetadata> {
+    pub(super) async fn get_sqlite(
+        &self,
+        pool: &SqliteConnectionPool,
+    ) -> Result<Option<KafkaMetadata>> {
         let dataset_name = self.dataset_name.clone();
 
         let conn_sync = pool.connect_sync();
-        let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
+        };
 
         let metadata = conn
             .conn
@@ -92,7 +100,7 @@ impl KafkaSys {
                     let schema_json: String = row.get(2)?;
                     let offsets_json: Option<String> = row.get(3)?;
 
-                    Ok(KafkaMetadata {
+                    Ok(Some(KafkaMetadata {
                         consumer_group_id,
                         topic,
                         schema: KafkaSys::deserialize_schema(&schema_json)
@@ -100,21 +108,21 @@ impl KafkaSys {
                                 tracing::warn!("Failed to deserialize Kafka schema from SQLite: {err}");
                                 rusqlite::Error::InvalidQuery
                             })?,
-                        offsets: KafkaSys::deserialize_offsets(offsets_json.as_deref())
+                        offsets: deserialize_offsets(offsets_json.as_deref())
                             .map_err(|err| {
                                 tracing::warn!("Failed to deserialize Kafka offsets from SQLite: {err}");
                                 rusqlite::Error::InvalidQuery
                             })?,
-                    })
+                    }))
                 } else {
-                    Err(rusqlite::Error::QueryReturnedNoRows)
+                    Ok(None)
                 }
             })
             .await
-            .ok()?;
+            .map_err(Error::external)?;
 
-        self.mark_schema_ensured();
-        Some(metadata)
+        self.schema_ensured.mark_ensured();
+        Ok(metadata)
     }
 
     pub(super) async fn upsert_offsets_sqlite(
@@ -124,7 +132,7 @@ impl KafkaSys {
     ) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
         let new_offsets = offsets.to_vec();
-        let schema_needs_ensure = self.schema_needs_ensure();
+        let schema_needs_ensure = self.schema_ensured.needs_ensure();
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -143,12 +151,11 @@ impl KafkaSys {
                 );
                 let existing_offsets_json: Option<String> =
                     conn.query_row(&query, [&dataset_name], |row| row.get(0))?;
-                let offsets_json =
-                    KafkaSys::serialize_merged_offsets(existing_offsets_json.as_deref(), &new_offsets)
-                        .map_err(|err| {
-                            tracing::warn!("Failed to merge Kafka offsets from SQLite: {err}");
-                            rusqlite::Error::InvalidQuery
-                        })?;
+                let offsets_json = serialize_merged_offsets(existing_offsets_json.as_deref(), &new_offsets)
+                    .map_err(|err| {
+                        tracing::warn!("Failed to merge Kafka offsets from SQLite: {err}");
+                        rusqlite::Error::InvalidQuery
+                    })?;
                 let update = format!(
                     "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"
                 );
@@ -162,7 +169,7 @@ impl KafkaSys {
             .map_err(Error::external)?;
 
         if schema_needs_ensure {
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         Ok(())
@@ -288,7 +295,11 @@ mod tests {
             .upsert(&test_metadata)
             .await
             .expect("to upsert metadata");
-        let retrieved = kafka_sys.get().await.expect("to retrieve metadata");
+        let retrieved = kafka_sys
+            .get()
+            .await
+            .expect("to retrieve metadata")
+            .expect("metadata to exist");
 
         assert_eq!(retrieved.consumer_group_id, test_metadata.consumer_group_id);
         assert_eq!(retrieved.topic, test_metadata.topic);
@@ -316,7 +327,11 @@ mod tests {
             .await
             .expect("to overwrite metadata");
 
-        let retrieved = kafka_sys.get().await.expect("to retrieve metadata");
+        let retrieved = kafka_sys
+            .get()
+            .await
+            .expect("to retrieve metadata")
+            .expect("metadata to exist");
         assert_eq!(retrieved.consumer_group_id, "updated-group-456");
         assert_eq!(retrieved.topic, "updated-topic");
         assert_eq!(retrieved.schema, test_metadata.schema);
@@ -346,7 +361,11 @@ mod tests {
             .await
             .expect("to upsert offsets");
 
-        let retrieved = kafka_sys.get().await.expect("to retrieve metadata");
+        let retrieved = kafka_sys
+            .get()
+            .await
+            .expect("to retrieve metadata")
+            .expect("metadata to exist");
         let mut expected_offsets = test_metadata.offsets.clone();
         expected_offsets.extend(offsets);
         assert_eq!(retrieved.offsets, expected_offsets);
@@ -361,8 +380,56 @@ mod tests {
 
         let result = kafka_sys.get().await;
         assert!(
-            result.is_none(),
+            result.expect("to get empty metadata").is_none(),
             "Should return None for nonexistent dataset"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_offsets_update_missing_row() {
+        let (ds, _temp_dir) = create_test_dataset("test_sqlite_offsets_update_missing_row").await;
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
+            .await
+            .expect("to create KafkaSys");
+
+        let offsets = vec![KafkaOffset {
+            topic: "test-topic".to_string(),
+            partition: 0,
+            offset: 42,
+        }];
+
+        kafka_sys
+            .upsert_offsets(&offsets)
+            .await
+            .expect_err("offset update should fail when sidecar row is missing");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_get_corrupt_offsets_errors() {
+        let ds_name = "test_sqlite_get_corrupt_offsets_errors";
+        let (ds, temp_dir) = create_test_dataset(ds_name).await;
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
+            .await
+            .expect("to create KafkaSys");
+        let test_metadata = create_test_metadata();
+
+        kafka_sys
+            .upsert(&test_metadata)
+            .await
+            .expect("to upsert metadata");
+
+        let db_path = temp_dir
+            .path()
+            .join(format!("kafka_sqlite_test_{ds_name}.db"));
+        let conn = rusqlite::Connection::open(db_path).expect("to open sqlite test db");
+        let update =
+            format!("UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?1 WHERE dataset_name = ?2");
+        conn.execute(&update, ["not-json", ds.name.as_ref()])
+            .expect("to corrupt offsets_json");
+
+        kafka_sys
+            .get()
+            .await
+            .expect_err("corrupt offsets should fail instead of returning no metadata");
     }
 }
