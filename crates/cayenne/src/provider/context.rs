@@ -129,6 +129,34 @@ impl CayenneContext {
         self.config.write_concurrency.map(|v| v.max(1))
     }
 
+    /// Build the compaction picker config from the underlying `VortexConfig`.
+    #[must_use]
+    pub(crate) fn compaction_picker_config(&self) -> super::compaction::CompactionPickerConfig {
+        super::compaction::CompactionPickerConfig::new(
+            self.config.compaction_trigger_files,
+            self.config.compaction_max_files_per_pick,
+            self.target_file_size_bytes() as u64,
+        )
+    }
+
+    /// Maximum number of consecutive compaction passes per trigger.
+    #[must_use]
+    pub(crate) fn compaction_max_levels(&self) -> usize {
+        self.config.compaction_max_levels.max(1)
+    }
+
+    /// Background compaction interval. Returns `None` when disabled (interval = 0).
+    #[must_use]
+    pub(crate) fn compaction_background_interval(&self) -> Option<std::time::Duration> {
+        if self.config.compaction_background_interval_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(
+                self.config.compaction_background_interval_ms,
+            ))
+        }
+    }
+
     /// Get the shared semaphore for limiting concurrent file writes / uploads.
     #[must_use]
     pub fn upload_semaphore(&self) -> &Arc<Semaphore> {

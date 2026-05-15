@@ -101,3 +101,7 @@ name = "mutation_writer"
 [[bench]]
 harness = false
 name = "listing_fence_overhead"
+
+[[bench]]
+harness = false
+name = "compaction_picker"
