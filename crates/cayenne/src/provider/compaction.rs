@@ -275,21 +275,12 @@ impl BackgroundCompactor {
             shutdown,
         })
     }
-
-    /// Signal the background task to exit on its next loop iteration.
-    pub(crate) fn shutdown(&self) {
-        self.shutdown.notify_one();
-    }
-
-    /// Wait for the background task to exit. Idempotent — calling twice is
-    /// safe but the second call returns immediately.
-    pub(crate) async fn join(mut self) {
-        self.shutdown.notify_one();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
-        }
-    }
 }
+
+// Cleanup happens entirely in `Drop`: the shutdown signal is fired and the
+// JoinHandle is aborted. Callers don't need explicit `shutdown` / `join`
+// methods — when the provider's last `Arc` drops, the `OnceLock<BackgroundCompactor>`
+// inside drops too, which runs the impl below.
 
 impl Drop for BackgroundCompactor {
     fn drop(&mut self) {
@@ -500,7 +491,8 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        compactor.join().await;
+        // Dropping the compactor signals shutdown and aborts the task.
+        drop(compactor);
 
         let observed = calls.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
