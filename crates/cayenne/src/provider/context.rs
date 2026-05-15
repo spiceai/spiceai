@@ -132,10 +132,15 @@ impl CayenneContext {
     /// Build the compaction picker config from the underlying `VortexConfig`.
     #[must_use]
     pub(crate) fn compaction_picker_config(&self) -> super::compaction::CompactionPickerConfig {
+        // `target_file_size_bytes` returns `usize`; widen via checked
+        // conversion so a future 128-bit `usize` couldn't silently truncate
+        // the tier thresholds. `u64::MAX` is a safe fallback because the
+        // picker only ever asks "is bucket size < threshold".
+        let target_bytes = u64::try_from(self.target_file_size_bytes()).unwrap_or(u64::MAX);
         super::compaction::CompactionPickerConfig::new(
             self.config.compaction_trigger_files,
             self.config.compaction_max_files_per_pick,
-            self.target_file_size_bytes() as u64,
+            target_bytes,
         )
     }
 

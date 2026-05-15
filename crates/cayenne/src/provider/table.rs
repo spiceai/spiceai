@@ -3630,8 +3630,16 @@ impl CayenneTableProvider {
     /// pass is already in flight (inline or background), we skip this trigger
     /// rather than queueing more work.
     ///
+    /// **Callers are responsible for write-lock coordination.** Inline callers
+    /// (in `mutation_writer`) hold `write_lock` already, so they call this
+    /// directly. The background scheduler's [`super::compaction::CompactionRunner`]
+    /// adapter `try_lock`s `write_lock` before delegating here. Tests use the
+    /// `#[doc(hidden)] pub` exposure for direct access — no concurrent writers
+    /// in single-table test setups.
+    ///
     /// Returns `Ok(true)` if at least one snapshot rewrite occurred.
-    pub(crate) async fn maybe_compact_small_files(&self) -> Result<bool> {
+    #[doc(hidden)]
+    pub async fn maybe_compact_small_files(&self) -> Result<bool> {
         let Ok(_guard) = self.compaction_lock.try_lock() else {
             tracing::trace!(
                 table = self.table_metadata.table_name.as_str(),
@@ -3705,7 +3713,10 @@ impl CayenneTableProvider {
     /// the file naming used by [`Self::write_to_snapshot`]. Hidden files
     /// (those starting with `.`) and the staging WAL are filtered out.
     ///
-    /// `pub` so integration tests can assert on file counts after compaction.
+    /// Exposed as `#[doc(hidden)] pub` so the crate's integration tests can
+    /// assert on file counts after compaction without forcing this internal
+    /// diagnostic helper into the documented public surface area.
+    #[doc(hidden)]
     pub async fn list_snapshot_files_with_sizes(
         &self,
         snapshot_id: &str,
@@ -3783,7 +3794,11 @@ impl CayenneTableProvider {
             if !Self::is_compactable_data_file(name) {
                 continue;
             }
-            files.push((name.to_string(), meta.size as u64));
+            // `object_store::ObjectMeta::size` is `usize`; widen via checked
+            // conversion so a future 128-bit target would not silently
+            // misclassify file sizes for the picker.
+            let size_bytes = u64::try_from(meta.size).unwrap_or(u64::MAX);
+            files.push((name.to_string(), size_bytes));
         }
 
         Ok(files)
@@ -6448,6 +6463,25 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 #[async_trait::async_trait]
 impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
+        // Background scheduler path: serialize with the per-table `write_lock`
+        // so concurrent appends (which write to the current snapshot dir under
+        // `write_lock`) cannot land between this pass reading the current
+        // snapshot and the `commit_overwrite` advancing the pointer.
+        //
+        // Using `try_lock` keeps the background loop non-blocking from a
+        // writer's perspective — if a writer is active we skip this tick and
+        // re-evaluate on the next interval. The inline trigger paths in
+        // `mutation_writer.rs` call `maybe_compact_small_files` directly while
+        // the caller already holds `write_lock`, so they bypass this guard
+        // (tokio mutexes are not re-entrant, so we must not re-acquire there).
+        let Ok(_write_guard) = self.write_lock.try_lock() else {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping background compaction: write_lock held by another writer",
+            );
+            return Ok(false);
+        };
         self.maybe_compact_small_files()
             .await
             .map_err(|e| e.to_string())

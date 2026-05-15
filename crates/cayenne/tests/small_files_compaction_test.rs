@@ -411,12 +411,16 @@ async fn compaction_handles_concurrent_compaction_triggers(
     Ok(())
 }
 
-/// Helper that calls into the public-but-internal `maybe_compact_small_files`
-/// API on the provider. Returns true if a rewrite happened.
+/// Helper that calls into the `#[doc(hidden)] pub` `maybe_compact_small_files`
+/// trigger directly. Returns true if a rewrite happened.
+///
+/// Tests don't go through the [`cayenne::provider::compaction::CompactionRunner`]
+/// adapter the background scheduler uses, because that adapter `try_lock`s
+/// `write_lock` to serialize with appends. Single-table integration tests have
+/// no concurrent writers, so calling the trigger directly is correct.
 async fn run_compaction(table: &Arc<CayenneTableProvider>) -> bool {
-    use cayenne::provider::compaction::CompactionRunner;
     table
-        .run_compaction_trigger()
+        .maybe_compact_small_files()
         .await
         .expect("compaction must succeed in tests")
 }

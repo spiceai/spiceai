@@ -41,7 +41,7 @@ limitations under the License.
 //! - [`constants`]: Shared constants
 //! - [`context`]: Shared context for Cayenne operations
 //! - [`staging_wal`]: Staging WAL for crash-safe staged appends
-pub mod compaction;
+pub(crate) mod compaction;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
@@ -60,7 +60,6 @@ pub(crate) mod utils;
 pub(crate) mod vortex_format;
 
 // Re-export the main type at the module level for convenience
-pub use compaction::{BackgroundCompactor, CompactionRunner};
 pub use context::CayenneContext;
 pub use deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
 pub use overwrite::PreparedOverwrite;

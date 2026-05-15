@@ -190,7 +190,7 @@ pub(crate) fn pick_candidates<P: Clone>(
 /// Implemented by `CayenneTableProvider`. Decouples the scheduler from the
 /// provider so we can unit-test the scheduler with a stub.
 #[async_trait::async_trait]
-pub trait CompactionRunner: Send + Sync {
+pub(crate) trait CompactionRunner: Send + Sync {
     /// Run one compaction trigger. Returns `Ok(true)` if any compaction
     /// occurred. Errors are reported via the return value; the scheduler logs
     /// and continues on Err.
@@ -208,7 +208,7 @@ pub trait CompactionRunner: Send + Sync {
 ///
 /// The runner is held via `Weak` so the task does not keep the
 /// `CayenneTableProvider` alive past its caller's `Arc` lifetime.
-pub struct BackgroundCompactor {
+pub(crate) struct BackgroundCompactor {
     handle: Option<tokio::task::JoinHandle<()>>,
     shutdown: Arc<Notify>,
 }
@@ -216,7 +216,7 @@ pub struct BackgroundCompactor {
 impl BackgroundCompactor {
     /// Spawn a background compaction task. Returns `None` if `interval` is
     /// zero, indicating the task is disabled.
-    pub fn spawn(
+    pub(crate) fn spawn(
         runner: Weak<dyn CompactionRunner>,
         interval: Duration,
         semaphore: Arc<Semaphore>,
@@ -277,13 +277,13 @@ impl BackgroundCompactor {
     }
 
     /// Signal the background task to exit on its next loop iteration.
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.shutdown.notify_one();
     }
 
     /// Wait for the background task to exit. Idempotent — calling twice is
     /// safe but the second call returns immediately.
-    pub async fn join(mut self) {
+    pub(crate) async fn join(mut self) {
         self.shutdown.notify_one();
         if let Some(handle) = self.handle.take() {
             let _ = handle.await;
