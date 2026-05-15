@@ -982,18 +982,14 @@ mod tests {
     fn test_unsigned_long_decodes_to_uint64() {
         use arrow::array::UInt64Array;
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "big",
-            DataType::UInt64,
-            true,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("big", DataType::UInt64, true)]));
         // u64::MAX would silently lose the high bit if we routed through i64;
         // include it explicitly to lock in the as_u64 decoding path.
         let max = u64::MAX;
         let hits = vec![
             make_hit(json!({"big": 0_u64})),
             make_hit(json!({"big": max})),
-            make_hit(json!({})), // missing → null
+            make_hit(json!({})),              // missing → null
             make_hit(json!({"big": -1_i64})), // negative → null (out of u64 range)
             // JS-style stringified large values land in _source as strings.
             make_hit(json!({"big": "18446744073709551614"})),

@@ -281,8 +281,14 @@ fn make_all_short_large_list_view_batch(n: usize, max_elems: usize) -> RecordBat
             .map(|v| i32::try_from(v).expect("value fits in i32"))
             .collect::<Vec<i32>>(),
     );
-    let offsets: Vec<i64> = (0..n).map(|i| (i * per_list as i64)).collect();
-    let sizes: Vec<i64> = (0..n).map(|_| per_list as i64).collect();
+    let offsets: Vec<i64> = (0..n)
+        .map(|i| {
+            let offset = i.checked_mul(per_list).expect("offset fits in usize");
+            i64::try_from(offset).expect("offset fits in i64")
+        })
+        .collect();
+    let per_list_i64 = i64::try_from(per_list).expect("list size fits in i64");
+    let sizes: Vec<i64> = std::iter::repeat_n(per_list_i64, n).collect();
     let list_view = LargeListViewArray::try_new(
         Arc::new(Field::new("item", DataType::Int32, true)),
         ScalarBuffer::<i64>::from(offsets),
@@ -307,8 +313,14 @@ fn make_long_large_list_view_batch(n: usize, truncate_to: usize) -> RecordBatch 
             .map(|v| i32::try_from(v).expect("value fits in i32"))
             .collect::<Vec<i32>>(),
     );
-    let offsets: Vec<i64> = (0..n).map(|i| (i * per_list as i64)).collect();
-    let sizes: Vec<i64> = (0..n).map(|_| per_list as i64).collect();
+    let offsets: Vec<i64> = (0..n)
+        .map(|i| {
+            let offset = i.checked_mul(per_list).expect("offset fits in usize");
+            i64::try_from(offset).expect("offset fits in i64")
+        })
+        .collect();
+    let per_list_i64 = i64::try_from(per_list).expect("list size fits in i64");
+    let sizes: Vec<i64> = std::iter::repeat_n(per_list_i64, n).collect();
     let list_view = LargeListViewArray::try_new(
         Arc::new(Field::new("item", DataType::Int32, true)),
         ScalarBuffer::<i64>::from(offsets),
@@ -327,48 +339,51 @@ pub fn bench_truncate(c: &mut Criterion) {
     let short_strings = make_all_short_string_batch(2000, 50);
     group.bench_function("string_fast_path_2000_rows_all_short", |b| {
         b.iter(|| {
-            truncate_string_columns(black_box(&short_strings), 50).unwrap();
-        })
+            truncate_string_columns(black_box(&short_strings), 50).expect("truncate short strings");
+        });
     });
 
     // String (Utf8) actual work
     let long_strings = make_many_long_string_batch(2000, 50);
     group.bench_function("string_with_truncation_2000_rows_mixed", |b| {
         b.iter(|| {
-            truncate_string_columns(black_box(&long_strings), 50).unwrap();
-        })
+            truncate_string_columns(black_box(&long_strings), 50).expect("truncate long strings");
+        });
     });
 
     // StringView fast path (exercises the specific Utf8View arm + is_some_and decision)
     let short_views = make_all_short_string_view_batch(2000, 50);
     group.bench_function("stringview_fast_path_2000_rows_all_short", |b| {
         b.iter(|| {
-            truncate_string_columns(black_box(&short_views), 50).unwrap();
-        })
+            truncate_string_columns(black_box(&short_views), 50)
+                .expect("truncate short string views");
+        });
     });
 
     // StringView actual truncation
     let long_views = make_many_long_string_view_batch(2000, 50);
     group.bench_function("stringview_with_truncation_2000_rows_mixed", |b| {
         b.iter(|| {
-            truncate_string_columns(black_box(&long_views), 50).unwrap();
-        })
+            truncate_string_columns(black_box(&long_views), 50)
+                .expect("truncate long string views");
+        });
     });
 
     // List (regular List) fast path
     let short_lists = make_all_short_list_batch(800, 5);
     group.bench_function("list_fast_path_800_rows_all_short", |b| {
         b.iter(|| {
-            truncate_numeric_column_length(black_box(&short_lists), 5).unwrap();
-        })
+            truncate_numeric_column_length(black_box(&short_lists), 5)
+                .expect("truncate short lists");
+        });
     });
 
     // List (regular List) actual truncation work
     let long_lists = make_long_list_batch(800, 5);
     group.bench_function("list_with_truncation_800_rows", |b| {
         b.iter(|| {
-            truncate_numeric_column_length(black_box(&long_lists), 5).unwrap();
-        })
+            truncate_numeric_column_length(black_box(&long_lists), 5).expect("truncate long lists");
+        });
     });
 
     // ListView fast path (exercises the sizes-based decision + clone)
@@ -378,18 +393,20 @@ pub fn bench_truncate(c: &mut Criterion) {
         b.iter_batched(
             || make_all_short_list_view_batch(800, 5),
             |batch| {
-                truncate_numeric_column_length(black_box(&batch), 5).unwrap();
+                truncate_numeric_column_length(black_box(&batch), 5)
+                    .expect("truncate short list views");
             },
             BatchSize::SmallInput,
-        )
+        );
     });
 
     // ListView actual truncation work (exercises the more complex offset/size rebuild)
     let long_list_views = make_long_list_view_batch(800, 5);
     group.bench_function("listview_with_truncation_800_rows", |b| {
         b.iter(|| {
-            truncate_numeric_column_length(black_box(&long_list_views), 5).unwrap();
-        })
+            truncate_numeric_column_length(black_box(&long_list_views), 5)
+                .expect("truncate long list views");
+        });
     });
 
     // FixedSizeList fast path (cheapest decision: uniform size comparison).
@@ -399,18 +416,20 @@ pub fn bench_truncate(c: &mut Criterion) {
         b.iter_batched(
             || make_all_short_fixed_size_list_batch(800, 5),
             |batch| {
-                truncate_numeric_column_length(black_box(&batch), 5).unwrap();
+                truncate_numeric_column_length(black_box(&batch), 5)
+                    .expect("truncate short fixed-size lists");
             },
             BatchSize::SmallInput,
-        )
+        );
     });
 
     // FixedSizeList actual truncation work (stride-based slicing + concat)
     let long_fsl = make_long_fixed_size_list_batch(800, 5);
     group.bench_function("fixed_size_list_with_truncation_800_rows", |b| {
         b.iter(|| {
-            truncate_numeric_column_length(black_box(&long_fsl), 5).unwrap();
-        })
+            truncate_numeric_column_length(black_box(&long_fsl), 5)
+                .expect("truncate long fixed-size lists");
+        });
     });
 
     // LargeListView fast path (completes the five-variant benchmark coverage;
@@ -420,18 +439,20 @@ pub fn bench_truncate(c: &mut Criterion) {
         b.iter_batched(
             || make_all_short_large_list_view_batch(800, 5),
             |batch| {
-                truncate_numeric_column_length(black_box(&batch), 5).unwrap();
+                truncate_numeric_column_length(black_box(&batch), 5)
+                    .expect("truncate short large list views");
             },
             BatchSize::SmallInput,
-        )
+        );
     });
 
     // LargeListView actual truncation work (i64 offset/size rebuild path)
     let long_large_list_views = make_long_large_list_view_batch(800, 5);
     group.bench_function("large_listview_with_truncation_800_rows", |b| {
         b.iter(|| {
-            truncate_numeric_column_length(black_box(&long_large_list_views), 5).unwrap();
-        })
+            truncate_numeric_column_length(black_box(&long_large_list_views), 5)
+                .expect("truncate long large list views");
+        });
     });
 
     group.finish();
