@@ -567,11 +567,11 @@ mod tests {
         let tmp_key = base
             .child(PARTITIONED_WAL_DIR)
             .child(format!("{}.json.tmp", wal.commit_id));
-        let tmp_exists = store.get(&tmp_key).await.is_ok();
         // We only assert that the final key is the authoritative one; the tmp
         // may or may not be cleaned up depending on the exact put/delete order,
         // but the important invariant (reader sees complete document or nothing)
         // is upheld by the final key.
+        let _ = store.get(&tmp_key).await;
         assert!(store.get(&final_key).await.is_ok());
     }
 }

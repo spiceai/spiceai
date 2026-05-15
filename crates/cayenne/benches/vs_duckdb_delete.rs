@@ -38,8 +38,9 @@ use datafusion_expr::{col, lit};
 use tokio::runtime::Runtime;
 
 use common::{
-    CayenneFixture, DuckDbFixture, cayenne_insert, cayenne_query, duckdb_insert_parquet,
-    duckdb_query_scalar, make_batch, schema, setup_cayenne_pk, setup_duckdb_pk, write_parquet,
+    CayenneFixture, DuckDbFixture, capture_comparison_plans, cayenne_insert, cayenne_query,
+    duckdb_insert_parquet, duckdb_query_scalar, make_batch, schema, setup_cayenne_pk,
+    setup_duckdb_pk, write_parquet,
 };
 
 const TABLE_SIZES: &[usize] = &[16_384, 131_072, 1_048_576];
@@ -102,6 +103,18 @@ fn bench_delete(c: &mut Criterion) {
         // Delete the middle ~10% of rows; both engines see the same range.
         let lo = (rows as i64) * 45 / 100;
         let hi = (rows as i64) * 55 / 100;
+        let cayenne_delete_sql = format!("DELETE FROM t WHERE id BETWEEN {lo} AND {hi}");
+        let duckdb_delete_sql = format!("DELETE FROM del_bench WHERE id BETWEEN {lo} AND {hi}");
+
+        let plan_cayenne_fixture = rt.block_on(load_cayenne(rows));
+        let plan_duckdb_fixture = load_duckdb(&parquet_path);
+        rt.block_on(capture_comparison_plans(
+            &format!("delete/{rows}/delete"),
+            &plan_cayenne_fixture.table,
+            &plan_duckdb_fixture.conn,
+            &cayenne_delete_sql,
+            &duckdb_delete_sql,
+        ));
 
         // --- delete (timed; setup is re-run per iteration to keep state clean) ---
         group.bench_with_input(BenchmarkId::new("cayenne/delete", rows), &rows, |b, &_| {
@@ -140,6 +153,14 @@ fn bench_delete(c: &mut Criterion) {
             duckdb_delete_range(&fixture, "del_bench", lo, hi);
             fixture
         });
+
+        rt.block_on(capture_comparison_plans(
+            &format!("delete/{rows}/scan_after_delete"),
+            &cayenne_fixture.table,
+            &duckdb_fixture.conn,
+            "SELECT SUM(value) FROM t",
+            "SELECT SUM(value) FROM del_bench",
+        ));
 
         let cf = Arc::clone(&cayenne_fixture);
         group.bench_with_input(

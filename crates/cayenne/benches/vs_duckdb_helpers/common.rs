@@ -23,11 +23,13 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_sign_loss)]
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::util::pretty::pretty_format_batches;
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -268,6 +270,183 @@ pub async fn cayenne_query(table: &Arc<CayenneTableProvider>, sql: &str) -> Vec<
         .expect("register table");
     let df = ctx.sql(sql).await.expect("cayenne sql");
     df.collect().await.expect("cayenne collect")
+}
+
+/// Capture optimized and executed plans for a Cayenne/DuckDB query pair.
+///
+/// Files are written to `target/cayenne_vs_duckdb_plans/<label>.md` by default.
+/// Set `CAYENNE_DUCKDB_PLAN_DIR` to choose a different output directory.
+pub async fn capture_comparison_plans(
+    label: &str,
+    cayenne_table: &Arc<CayenneTableProvider>,
+    duckdb_conn: &Connection,
+    cayenne_sql: &str,
+    duckdb_sql: &str,
+) {
+    let cayenne_explain = cayenne_plan_text(cayenne_table, "EXPLAIN", cayenne_sql).await;
+    let cayenne_analyze = cayenne_plan_text(cayenne_table, "EXPLAIN ANALYZE", cayenne_sql).await;
+    let duckdb_explain = duckdb_plan_text(duckdb_conn, "EXPLAIN", duckdb_sql);
+    let duckdb_analyze = duckdb_plan_text(duckdb_conn, "EXPLAIN ANALYZE", duckdb_sql);
+
+    let mut content = String::new();
+    content.push_str("# Cayenne vs DuckDB Plans\n\n");
+    content.push_str(&format!("## {label}\n\n"));
+    content.push_str("### Cayenne SQL\n\n```sql\n");
+    content.push_str(cayenne_sql);
+    content.push_str("\n```\n\n### DuckDB SQL\n\n```sql\n");
+    content.push_str(duckdb_sql);
+    content.push_str("\n```\n\n### Cayenne EXPLAIN\n\n```text\n");
+    content.push_str(&cayenne_explain);
+    content.push_str("\n```\n\n### Cayenne EXPLAIN ANALYZE\n\n```text\n");
+    content.push_str(&cayenne_analyze);
+    content.push_str("\n```\n\n### DuckDB EXPLAIN\n\n```text\n");
+    content.push_str(&duckdb_explain);
+    content.push_str("\n```\n\n### DuckDB EXPLAIN ANALYZE\n\n```text\n");
+    content.push_str(&duckdb_analyze);
+    content.push_str("\n```\n");
+
+    let output_path = plan_output_dir().join(format!("{}.md", sanitize_plan_label(label)));
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).expect("create plan output directory");
+    }
+    fs::write(&output_path, content).expect("write plan capture");
+    eprintln!("captured Cayenne/DuckDB plans: {}", output_path.display());
+}
+
+/// Capture optimized and executed plans for the parquet-ingest path used by
+/// the ingestion comparison benchmarks.
+pub async fn capture_parquet_ingest_plans(
+    label: &str,
+    cayenne_table: &Arc<CayenneTableProvider>,
+    duckdb_conn: &Connection,
+    duckdb_table_name: &str,
+    parquet_path: &Path,
+) {
+    let cayenne_explain =
+        cayenne_parquet_insert_plan_text(cayenne_table, parquet_path, false).await;
+    let cayenne_analyze = cayenne_parquet_insert_plan_text(cayenne_table, parquet_path, true).await;
+    let duckdb_sql = format!(
+        "INSERT INTO {duckdb_table_name} SELECT * FROM read_parquet('{}')",
+        parquet_path.display()
+    );
+    let duckdb_explain = duckdb_plan_text(duckdb_conn, "EXPLAIN", &duckdb_sql);
+    let duckdb_analyze = duckdb_plan_text(duckdb_conn, "EXPLAIN ANALYZE", &duckdb_sql);
+
+    let mut content = String::new();
+    content.push_str("# Cayenne vs DuckDB Plans\n\n");
+    content.push_str(&format!("## {label}\n\n"));
+    content.push_str("### Cayenne Operation\n\n```text\n");
+    content.push_str("CayenneTableProvider::insert_into(ctx.read_parquet(...))");
+    content.push_str("\n```\n\n### DuckDB SQL\n\n```sql\n");
+    content.push_str(&duckdb_sql);
+    content.push_str("\n```\n\n### Cayenne EXPLAIN\n\n```text\n");
+    content.push_str(&cayenne_explain);
+    content.push_str("\n```\n\n### Cayenne EXPLAIN ANALYZE\n\n```text\n");
+    content.push_str(&cayenne_analyze);
+    content.push_str("\n```\n\n### DuckDB EXPLAIN\n\n```text\n");
+    content.push_str(&duckdb_explain);
+    content.push_str("\n```\n\n### DuckDB EXPLAIN ANALYZE\n\n```text\n");
+    content.push_str(&duckdb_analyze);
+    content.push_str("\n```\n");
+
+    let output_path = plan_output_dir().join(format!("{}.md", sanitize_plan_label(label)));
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).expect("create plan output directory");
+    }
+    fs::write(&output_path, content).expect("write plan capture");
+    eprintln!("captured Cayenne/DuckDB plans: {}", output_path.display());
+}
+
+async fn cayenne_plan_text(
+    table: &Arc<CayenneTableProvider>,
+    plan_kind: &str,
+    sql: &str,
+) -> String {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::SessionContext;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
+        .expect("register cayenne table for plan capture");
+    let df = ctx
+        .sql(&format!("{plan_kind} {sql}"))
+        .await
+        .expect("cayenne explain sql");
+    let batches = df.collect().await.expect("cayenne explain collect");
+    pretty_format_batches(&batches)
+        .expect("format cayenne explain")
+        .to_string()
+}
+
+fn duckdb_plan_text(conn: &Connection, plan_kind: &str, sql: &str) -> String {
+    let explain_sql = format!("{plan_kind} {sql}");
+    let mut stmt = conn.prepare(&explain_sql).expect("duckdb explain prepare");
+    let batches: Vec<RecordBatch> = stmt
+        .query_arrow([])
+        .expect("duckdb explain query")
+        .collect();
+    pretty_format_batches(&batches)
+        .expect("format duckdb explain")
+        .to_string()
+}
+
+async fn cayenne_parquet_insert_plan_text(
+    table: &Arc<CayenneTableProvider>,
+    parquet_path: &Path,
+    execute: bool,
+) -> String {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::{ParquetReadOptions, SessionContext};
+    use datafusion_expr::dml::InsertOp;
+
+    let parquet_path = parquet_path.to_string_lossy().into_owned();
+    let ctx = SessionContext::new();
+    let df = ctx
+        .read_parquet::<&str>(parquet_path.as_str(), ParquetReadOptions::default())
+        .await
+        .expect("cayenne read_parquet for plan capture");
+    let input_exec = df
+        .create_physical_plan()
+        .await
+        .expect("cayenne parquet physical plan for capture");
+    let insert_plan = table
+        .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+        .await
+        .expect("cayenne insert plan for capture");
+
+    if execute {
+        let results = datafusion_physical_plan::collect(Arc::clone(&insert_plan), ctx.task_ctx())
+            .await
+            .expect("cayenne insert collect for plan capture");
+        let output = pretty_format_batches(&results)
+            .expect("format cayenne insert output")
+            .to_string();
+        format!(
+            "{}\n\nOutput:\n{}",
+            datafusion::physical_plan::displayable(insert_plan.as_ref()).indent(true),
+            output,
+        )
+    } else {
+        datafusion::physical_plan::displayable(insert_plan.as_ref())
+            .indent(true)
+            .to_string()
+    }
+}
+
+fn plan_output_dir() -> PathBuf {
+    std::env::var_os("CAYENNE_DUCKDB_PLAN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/cayenne_vs_duckdb_plans"))
+}
+
+fn sanitize_plan_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect()
 }
 
 /// Run a SQL query through DuckDB and return the number of rows in the

@@ -1140,10 +1140,14 @@ impl CayenneTableProvider {
         )
     }
 
-    /// Atomically commit an overwrite operation to the catalog.
+    /// Atomically commit a snapshot rewrite to the catalog.
     ///
-    /// This clears any existing delete files since overwrite replaces all data.
-    pub(crate) async fn commit_overwrite(&self, new_snapshot_id: &str) -> CatalogResult<()> {
+    /// Delegates to [`MetadataCatalog::commit_compaction`], which advances the
+    /// snapshot pointer and clears file-level delete/insert tracking while
+    /// preserving inlined rows. This is the correct commit primitive for sort
+    /// rewrites and file compaction; true overwrite operations use the catalog's
+    /// overwrite path directly.
+    pub(crate) async fn commit_snapshot_rewrite(&self, new_snapshot_id: &str) -> CatalogResult<()> {
         self.catalog
             .commit_compaction(&self.table_metadata.table_id, new_snapshot_id)
             .await
@@ -3877,7 +3881,7 @@ impl CayenneTableProvider {
         // Atomically update the catalog to point to the new sorted snapshot.
         // commit_compaction clears delete files and insert records, which is
         // correct here since the sort rewrites all live data into the new snapshot.
-        if let Err(e) = self.commit_overwrite(&new_snapshot_id).await {
+        if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id).await {
             cleanup_failed_snapshot.await;
             return Err(Error::Catalog { source: e });
         }
@@ -3995,6 +3999,10 @@ impl CayenneTableProvider {
             "Running tiered compaction pass"
         );
 
+        // `candidate.paths` identifies the files that triggered this pass and
+        // is used for tracing/metrics. The rewrite intentionally consolidates
+        // the full current snapshot so compaction preserves a single coherent
+        // snapshot boundary instead of mixing old and newly written file sets.
         self.rewrite_current_snapshot_for_compaction().await?;
         Ok(true)
     }
@@ -4006,7 +4014,7 @@ impl CayenneTableProvider {
     ///
     /// Only entries whose name ends in `.vortex` are returned, which matches
     /// the file naming used by [`Self::write_to_snapshot`]. Hidden files
-    /// (those starting with `.`) and the staging WAL are filtered out.
+    /// (those starting with `.`) and staging WAL artifacts are filtered out.
     ///
     /// Exposed as `#[doc(hidden)] pub` so the crate's integration tests can
     /// assert on file counts after compaction without forcing this internal
@@ -4100,7 +4108,7 @@ impl CayenneTableProvider {
         if name.starts_with('.') {
             return false;
         }
-        if name == STAGING_WAL_FILENAME {
+        if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
             return false;
         }
         name.ends_with(".vortex")
@@ -4180,7 +4188,7 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
-        if let Err(e) = self.commit_overwrite(&new_snapshot_id).await {
+        if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id).await {
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
             return Err(Error::Catalog { source: e });

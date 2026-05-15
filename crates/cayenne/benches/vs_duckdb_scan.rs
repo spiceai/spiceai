@@ -31,8 +31,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use tokio::runtime::Runtime;
 
 use common::{
-    CayenneFixture, DuckDbFixture, cayenne_insert, cayenne_query, duckdb_insert_parquet,
-    duckdb_query_scalar, make_batch, schema, setup_cayenne, setup_duckdb, write_parquet,
+    CayenneFixture, DuckDbFixture, capture_comparison_plans, cayenne_insert, cayenne_query,
+    duckdb_insert_parquet, duckdb_query_scalar, make_batch, schema, setup_cayenne, setup_duckdb,
+    write_parquet,
 };
 
 const ROW_COUNTS: &[usize] = &[16_384, 131_072, 1_048_576];
@@ -67,6 +68,22 @@ fn bench_scan(c: &mut Criterion) {
         // Load once, query many times — match the steady-state read pattern.
         let cayenne_fixture = Arc::new(rt.block_on(load_cayenne(rows)));
         let duckdb_fixture = Arc::new(load_duckdb(&parquet_path));
+
+        rt.block_on(capture_comparison_plans(
+            &format!("scan/{rows}/count_star"),
+            &cayenne_fixture.table,
+            &duckdb_fixture.conn,
+            "SELECT COUNT(*) FROM t",
+            "SELECT COUNT(*) FROM scan_bench",
+        ));
+
+        rt.block_on(capture_comparison_plans(
+            &format!("scan/{rows}/sum_value"),
+            &cayenne_fixture.table,
+            &duckdb_fixture.conn,
+            "SELECT SUM(value) FROM t",
+            "SELECT SUM(value) FROM scan_bench",
+        ));
 
         // --- count_star ---
         let cf = Arc::clone(&cayenne_fixture);
@@ -126,6 +143,14 @@ fn bench_scan(c: &mut Criterion) {
         let cayenne_sql = format!("SELECT SUM(value) FROM t WHERE id BETWEEN {lo} AND {hi}");
         let duckdb_sql =
             format!("SELECT SUM(value) FROM scan_bench WHERE id BETWEEN {lo} AND {hi}");
+
+        rt.block_on(capture_comparison_plans(
+            &format!("scan/{rows}/filter_sum"),
+            &cayenne_fixture.table,
+            &duckdb_fixture.conn,
+            &cayenne_sql,
+            &duckdb_sql,
+        ));
 
         let cf = Arc::clone(&cayenne_fixture);
         let cayenne_sql_owned = cayenne_sql.clone();

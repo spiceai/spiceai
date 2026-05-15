@@ -32,8 +32,9 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use common::{
-    CayenneFixture, DuckDbFixture, cayenne_insert, cayenne_query, duckdb_insert_parquet,
-    duckdb_query_scalar, make_batch, schema, setup_cayenne_pk, setup_duckdb_pk, write_parquet,
+    CayenneFixture, DuckDbFixture, capture_comparison_plans, cayenne_insert, cayenne_query,
+    duckdb_insert_parquet, duckdb_query_scalar, make_batch, schema, setup_cayenne_pk,
+    setup_duckdb_pk, write_parquet,
 };
 
 const TABLE_SIZES: &[usize] = &[16_384, 131_072, 1_048_576];
@@ -76,6 +77,14 @@ fn bench_pk_lookup(c: &mut Criterion) {
         // --- single PK lookup ---
         let cayenne_sql = format!("SELECT value FROM t WHERE id = {target_id}");
         let duckdb_sql = format!("SELECT value FROM pk_bench WHERE id = {target_id}");
+        rt.block_on(capture_comparison_plans(
+            &format!("pk_lookup/{rows}/single_pk"),
+            &cayenne_fixture.table,
+            &duckdb_fixture.conn,
+            &cayenne_sql,
+            &duckdb_sql,
+        ));
+
         let cf = Arc::clone(&cayenne_fixture);
         let s = cayenne_sql.clone();
         group.bench_with_input(
@@ -108,6 +117,13 @@ fn bench_pk_lookup(c: &mut Criterion) {
         let in_list = ids.join(",");
         let cayenne_sql = format!("SELECT SUM(value) FROM t WHERE id IN ({in_list})");
         let duckdb_sql = format!("SELECT SUM(value) FROM pk_bench WHERE id IN ({in_list})");
+        rt.block_on(capture_comparison_plans(
+            &format!("pk_lookup/{rows}/pk_in_list"),
+            &cayenne_fixture.table,
+            &duckdb_fixture.conn,
+            &cayenne_sql,
+            &duckdb_sql,
+        ));
 
         let cf = Arc::clone(&cayenne_fixture);
         let s = cayenne_sql.clone();
@@ -141,6 +157,13 @@ fn bench_pk_lookup(c: &mut Criterion) {
             format!("SELECT SUM(value) FROM t WHERE id BETWEEN {target_lo} AND {target_hi}");
         let duckdb_sql =
             format!("SELECT SUM(value) FROM pk_bench WHERE id BETWEEN {target_lo} AND {target_hi}");
+        rt.block_on(capture_comparison_plans(
+            &format!("pk_lookup/{rows}/pk_range"),
+            &cayenne_fixture.table,
+            &duckdb_fixture.conn,
+            &cayenne_sql,
+            &duckdb_sql,
+        ));
 
         let cf = Arc::clone(&cayenne_fixture);
         let s = cayenne_sql.clone();

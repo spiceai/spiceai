@@ -1146,7 +1146,7 @@ async fn test_multiple_concurrent_overwrites(backend: BackendType) -> TestResult
 /// This is a comprehensive regression for the catalog DB first-creation edge case
 /// under load (as referenced in the durability audit), combined with the now-hardened
 /// data durability contract (WAL, pre-recovery audit, compaction).
-test_with_backends!(test_concurrent_table_creation_writes_restart_impl);
+test_with_backends_multithreaded!(test_concurrent_table_creation_writes_restart_impl);
 
 async fn test_concurrent_table_creation_writes_restart_impl(
     backend: BackendType,
