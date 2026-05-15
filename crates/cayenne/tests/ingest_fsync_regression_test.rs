@@ -270,3 +270,15 @@ fn write_deletion_file_still_fsyncs_parent_dir() {
 // If a future refactor moves the fsync sites or changes the clear/ensure
 // call sites, update both the structural assertions *and* the bench
 // single/duplicate quantification so the regression signal remains loud.
+//
+// Additional hot-path optimization (fourth iteration of the recurring task):
+// clear_staging_dir (the S3 List+DeletePrefix or local remove_dir_all+create
+// that was performed on *every* append, even pure-inline tiny ones) was given
+// the same AtomicBool fast-path treatment as the WAL presence check
+// (staging_may_have_files flag, init true, set true before any write into
+// staging, set false on successful clear or on successful remove after move).
+// This removes the last unconditional per-write I/O tax on the hottest
+// ingestion path (small appends that stay in the inline memtable tier) while
+// preserving the exact safety properties for the pre-WAL orphan crash case
+// and all recovery paths. The existing staged_append_test scenarios plus
+// high-iteration tiny-append benchmarks now exercise and protect this path.
