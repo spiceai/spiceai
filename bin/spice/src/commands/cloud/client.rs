@@ -193,12 +193,7 @@ impl CloudClient {
         executor_memory: Option<NumBytes>,
     ) -> Result<App> {
         let resources = build_resources(cpu, memory);
-        let executor = build_executor(
-            executor_replicas,
-            executor_cpu,
-            executor_memory,
-            storage_size_gb,
-        );
+        let executor = build_executor(executor_replicas, executor_cpu, executor_memory, None);
 
         let (tags, replicas) = match kind {
             AppKind::Cluster => {
@@ -220,6 +215,7 @@ impl CloudClient {
             replicas,
             resources,
             executor,
+            storage_size_gb,
         };
         self.inner.create_app(&request).await.map_err(into_cli)
     }

@@ -1335,11 +1335,7 @@ async fn execute_logs(args: &LogsArgs) -> Result<()> {
 async fn execute_create(cmd: &CreateCommands) -> Result<()> {
     match cmd {
         CreateCommands::App(args) => {
-            if args.kind == AppKind::Cluster && args.replicas.is_some_and(|r| r != 1) {
-                return Err(crate::error::Error::InvalidArgument {
-                    message: "SpicepodCluster requires --replicas 1".to_string(),
-                });
-            }
+            validate_create_app_args(args)?;
 
             let client = CloudClient::new()?;
             let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
@@ -1418,6 +1414,16 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn validate_create_app_args(args: &CreateAppArgs) -> Result<()> {
+    if args.kind == AppKind::Cluster && args.replicas != Some(1) {
+        return Err(crate::error::Error::InvalidArgument {
+            message: "SpicepodCluster requires --replicas 1".to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -1871,6 +1877,43 @@ mod tests {
         unsafe { std::env::remove_var(env_var) };
 
         assert_eq!(value, "from-env");
+    }
+
+    fn create_app_args(kind: AppKind, replicas: Option<i32>) -> CreateAppArgs {
+        CreateAppArgs {
+            name: "app".to_string(),
+            region: "us-east-1-prod-aws-data".to_string(),
+            kind,
+            description: None,
+            visibility: "private".to_string(),
+            replicas,
+            cpu: None,
+            memory: None,
+            storage_size_gb: None,
+            executor_replicas: None,
+            executor_cpu: None,
+            executor_memory: None,
+            spicepod: None,
+            channel: None,
+            output: OutputFormat::Table,
+        }
+    }
+
+    #[test]
+    fn create_cluster_requires_explicit_single_replica() {
+        let err = validate_create_app_args(&create_app_args(AppKind::Cluster, None))
+            .expect_err("cluster without replicas should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: SpicepodCluster requires --replicas 1"
+        );
+    }
+
+    #[test]
+    fn create_cluster_accepts_one_replica() {
+        validate_create_app_args(&create_app_args(AppKind::Cluster, Some(1)))
+            .expect("cluster with one scheduler replica should pass");
     }
 
     fn test_app(org: &str, name: &str) -> spice_cloud_client::types::App {

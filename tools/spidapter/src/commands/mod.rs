@@ -191,6 +191,7 @@ pub(crate) async fn ensure_spice_cloud_app(
             replicas: config.app_replicas,
             resources: Some(resources),
             executor,
+            storage_size_gb: None,
         })
         .await;
 

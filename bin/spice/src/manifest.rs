@@ -95,8 +95,12 @@ pub fn write_spicepod_value(path: &Path, value: &Value) -> Result<()> {
             message: format!("Failed to serialize {}: {source}", path.display()),
         })?;
 
-    if should_write_schema_directive(path)? && !updated_yaml.starts_with(SCHEMA_DIRECTIVE) {
-        updated_yaml = format!("{SCHEMA_DIRECTIVE}\n{updated_yaml}");
+    let leading_comments = leading_manifest_comments(path)?;
+    if !leading_comments.is_empty() {
+        let prefix = leading_comments.join("\n");
+        if !updated_yaml.starts_with(&prefix) {
+            updated_yaml = format!("{prefix}\n{updated_yaml}");
+        }
     }
 
     ensure_parent_dir(path)?;
@@ -106,16 +110,26 @@ pub fn write_spicepod_value(path: &Path, value: &Value) -> Result<()> {
     })
 }
 
-fn should_write_schema_directive(path: &Path) -> Result<bool> {
+fn leading_manifest_comments(path: &Path) -> Result<Vec<String>> {
     if !path.exists() {
-        return Ok(true);
+        return Ok(vec![SCHEMA_DIRECTIVE.to_string()]);
     }
 
     let content = std::fs::read_to_string(path).context(ConfigIoSnafu {
         operation: "read",
         path: path.to_path_buf(),
     })?;
-    Ok(content.lines().next() == Some(SCHEMA_DIRECTIVE))
+
+    let mut comments = Vec::new();
+    for line in content.lines() {
+        if line.trim_start().starts_with('#') || (!comments.is_empty() && line.trim().is_empty()) {
+            comments.push(line.to_string());
+            continue;
+        }
+        break;
+    }
+
+    Ok(comments)
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -331,6 +345,28 @@ future_primitive:
         assert!(
             content.starts_with(SCHEMA_DIRECTIVE),
             "schema directive should remain at the top of the manifest"
+        );
+    }
+
+    #[test]
+    fn write_spicepod_value_preserves_leading_comments() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = temp_dir.path().join(SPICEPOD_YAML);
+        std::fs::write(
+            &path,
+            "# managed by tests\n# keep this note\nversion: v2\nkind: Spicepod\nname: comments\n",
+        )
+        .expect("spicepod should be written");
+        let mut value = read_spicepod_value(&path).expect("spicepod should parse");
+        ensure_string_sequence_item(&mut value, "dependencies", "spicepods/localpod")
+            .expect("dependency should be added");
+
+        write_spicepod_value(&path, &value).expect("spicepod should be written");
+
+        let content = std::fs::read_to_string(path).expect("spicepod should be readable");
+        assert!(
+            content.starts_with("# managed by tests\n# keep this note\n"),
+            "leading comments should remain at the top of the manifest"
         );
     }
 

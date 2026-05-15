@@ -191,6 +191,8 @@ pub struct CreateAppRequest {
     pub resources: Option<AppResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor: Option<AppExecutor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_size_gb: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Default)]

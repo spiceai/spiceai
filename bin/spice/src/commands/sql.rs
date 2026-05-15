@@ -18,6 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
+use crate::output::OutputFormat;
 use clap::Args;
 use spice_cloud_client::endpoints::flight_endpoint as spice_cloud_flight_endpoint;
 
@@ -90,17 +91,29 @@ pub struct SqlArgs {
     /// per record. Useful for wide tables; can be toggled at runtime with `.expanded`.
     #[arg(long, short = 'x')]
     expanded: bool,
+
+    /// Output format for direct query mode
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Execute the sql command.
 pub async fn execute(ctx: &RuntimeContext, args: &SqlArgs) -> Result<()> {
     let repl_config = build_repl_config(ctx, args);
     if let Some(query) = &args.query {
-        repl::run_query(repl_config, query)
-            .await
-            .map_err(|e| crate::error::Error::Repl {
-                message: e.to_string(),
-            })?;
+        if args.output == OutputFormat::Json {
+            repl::run_query_json(repl_config, query)
+                .await
+                .map_err(|e| crate::error::Error::Repl {
+                    message: e.to_string(),
+                })?;
+        } else {
+            repl::run_query(repl_config, query)
+                .await
+                .map_err(|e| crate::error::Error::Repl {
+                    message: e.to_string(),
+                })?;
+        }
         return Ok(());
     }
 

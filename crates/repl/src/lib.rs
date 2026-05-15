@@ -722,6 +722,50 @@ pub async fn run_query(
     }
 }
 
+/// Run one SQL query through the Flight SQL client and print the result as JSON.
+///
+/// # Errors
+///
+/// Returns an error if the Flight connection, query execution, or JSON serialization fails.
+pub async fn run_query_json(
+    repl_config: ReplConfig,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
+
+    match get_records(
+        client,
+        sql,
+        repl_config.api_key.as_ref(),
+        &user_agent,
+        repl_config.cache_control,
+    )
+    .await
+    {
+        Ok((records, _total_rows, _from_cache)) => write_records_json(&records),
+        Err(FlightError::Tonic(status)) => {
+            Err(Box::<dyn Error>::from(format_flight_sql_status(&status)))
+        }
+        Err(error) => Err(Box::<dyn Error>::from(format!(
+            "Unexpected Flight error: {error}. Check connection or query syntax."
+        ))),
+    }
+}
+
+fn write_records_json(records: &[RecordBatch]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+        writer.write_batches(&records.iter().collect::<Vec<_>>())?;
+        writer.finish()?;
+    }
+    let json = String::from_utf8(buf)?;
+    println!("{json}");
+    Ok(())
+}
+
 fn warn_if_custom_headers_are_unsupported(repl_config: &ReplConfig) {
     if !repl_config.custom_headers.is_empty() {
         tracing::warn!(

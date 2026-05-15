@@ -21,6 +21,7 @@ use crate::error::{
     ConnectionFailedSnafu, InvalidArgumentSnafu, InvalidResponseSnafu, ModelNotFoundSnafu,
     NoModelsConfiguredSnafu, Result,
 };
+use crate::output::{OutputFormat, write_json};
 use clap::Args;
 use futures::StreamExt;
 use repl::util::{Spinner, create_editor_with_history, save_history};
@@ -75,6 +76,10 @@ pub struct ChatArgs {
     /// Custom HTTP headers in `Key:Value` form (repeatable).
     #[arg(long = "headers", value_name = "KEY:VALUE")]
     pub custom_headers: Vec<String>,
+
+    /// Output format for one-shot responses
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Configuration for chat operations.
@@ -137,12 +142,11 @@ struct Delta {
 }
 
 /// Token usage statistics.
-#[derive(Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 #[expect(clippy::struct_field_names)]
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
-    #[expect(dead_code)]
     total_tokens: u32,
 }
 
@@ -152,6 +156,29 @@ struct ChatResponse {
     total_duration: std::time::Duration,
     first_token_duration: Option<std::time::Duration>,
     usage: Option<Usage>,
+}
+
+#[derive(Serialize)]
+struct ChatJsonResponse<'a> {
+    model: &'a str,
+    content: &'a str,
+    duration_ms: u128,
+    first_token_ms: Option<u128>,
+    usage: Option<&'a Usage>,
+}
+
+impl<'a> ChatJsonResponse<'a> {
+    fn from_response(model: &'a str, response: &'a ChatResponse) -> Self {
+        Self {
+            model,
+            content: &response.content,
+            duration_ms: response.total_duration.as_millis(),
+            first_token_ms: response
+                .first_token_duration
+                .map(|duration| duration.as_millis()),
+            usage: response.usage.as_ref(),
+        }
+    }
 }
 
 impl ChatResponse {
@@ -329,7 +356,17 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
             role: "user".to_string(),
             content: message,
         }];
-        let response = send_chat_streaming(ctx, &config, &messages, false).await?;
+        let response = send_chat_streaming(
+            ctx,
+            &config,
+            &messages,
+            false,
+            args.output != OutputFormat::Json,
+        )
+        .await?;
+        if args.output == OutputFormat::Json {
+            return write_json(&ChatJsonResponse::from_response(&model, &response));
+        }
         // Only show stats if running in a terminal
         if is_terminal && !args.direct_prompt {
             println!("\n\n{}\n", response.format_stats());
@@ -421,7 +458,7 @@ async fn run_repl(ctx: &RuntimeContext, config: &ChatConfig<'_>) -> Result<()> {
         });
 
         // Send and stream response
-        match send_chat_streaming(ctx, config, &messages, true).await {
+        match send_chat_streaming(ctx, config, &messages, true, true).await {
             Ok(response) => {
                 // Print stats first before consuming content
                 println!("\n\n{}\n", response.format_stats());
@@ -453,6 +490,7 @@ async fn send_chat_streaming(
     config: &ChatConfig<'_>,
     messages: &[Message],
     interactive: bool,
+    emit_tokens: bool,
 ) -> Result<ChatResponse> {
     let start_time = Instant::now();
     let base_endpoint = config.endpoint.unwrap_or_else(|| ctx.http_endpoint());
@@ -551,8 +589,10 @@ async fn send_chat_streaming(
                                     s.stop().await;
                                 }
                             }
-                            print!("{content}");
-                            let _ = io::stdout().flush();
+                            if emit_tokens {
+                                print!("{content}");
+                                let _ = io::stdout().flush();
+                            }
                             full_response.push_str(content);
                         }
                     }

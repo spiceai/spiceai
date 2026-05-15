@@ -25,6 +25,9 @@ use crate::error::{InvalidArgumentSnafu, Result};
 const KIB: u64 = 1024;
 const MIB: u64 = KIB * 1024;
 const GIB: u64 = MIB * 1024;
+const KB: u64 = 1000;
+const MB: u64 = KB * 1000;
+const GB: u64 = MB * 1000;
 
 /// A validated byte quantity.
 ///
@@ -39,49 +42,52 @@ impl NumBytes {
         Self(bytes)
     }
 
-    /// Parse a human-readable byte string (e.g. `"16Gi"`, `"32GiB"`, or raw bytes like `"512"`).
+    /// Parse a human-readable byte string (e.g. `"16Gi"`, `"1.5GiB"`, `"16GB"`, or raw bytes like `"512"`).
     ///
-    /// Accepted suffixes (case-insensitive): `Gi`, `GiB`, `Mi`, `MiB`, `Ki`, `KiB`, or no suffix for bytes.
+    /// Accepted suffixes (case-insensitive): `Gi`, `GiB`, `Mi`, `MiB`, `Ki`, `KiB`, `G`, `GB`, `M`, `MB`, `K`, `KB`, `B`, or no suffix for bytes.
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
-        let digits_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-        if digits_end == 0 {
-            return InvalidArgumentSnafu {
-                message: format!(
-                    "Invalid byte value '{s}'. Expected format: <number><unit> (e.g. 16Gi, 32GiB, 512Mi)"
-                ),
-            }
-            .fail();
-        }
+        let suffix_start = s
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(s.len());
+        let (numerator, scale) = parse_decimal_number(&s[..suffix_start], s)?;
 
-        let num: u64 =
-            s[..digits_end]
-                .parse()
-                .map_err(|_| crate::error::Error::InvalidArgument {
-                    message: format!("Byte value too large: '{}'", &s[..digits_end]),
-                })?;
-
-        let suffix = &s[digits_end..];
+        let suffix = &s[suffix_start..];
         let multiplier = match suffix.to_ascii_lowercase().as_str() {
-            "" => 1,
+            "" | "b" => 1,
             "gi" | "gib" => GIB,
             "mi" | "mib" => MIB,
             "ki" | "kib" => KIB,
+            "g" | "gb" => GB,
+            "m" | "mb" => MB,
+            "k" | "kb" => KB,
             _ => {
                 return InvalidArgumentSnafu {
                     message: format!(
-                        "Invalid byte suffix '{suffix}'. Expected one of: Gi, GiB, Mi, MiB, Ki, KiB, or no suffix for bytes"
+                        "Invalid byte suffix '{suffix}'. Expected one of: Gi, GiB, Mi, MiB, Ki, KiB, G, GB, M, MB, K, KB, B, or no suffix for bytes"
                     ),
                 }
                 .fail();
             }
         };
 
-        let bytes =
-            num.checked_mul(multiplier)
-                .ok_or_else(|| crate::error::Error::InvalidArgument {
-                    message: format!("Byte value '{s}' is too large"),
-                })?;
+        let scaled_bytes = numerator
+            .checked_mul(u128::from(multiplier))
+            .ok_or_else(|| crate::error::Error::InvalidArgument {
+                message: format!("Byte value '{s}' is too large"),
+            })?;
+        if scaled_bytes % scale != 0 {
+            return InvalidArgumentSnafu {
+                message: format!("Byte value '{s}' resolves to a fractional number of bytes"),
+            }
+            .fail();
+        }
+
+        let bytes = u64::try_from(scaled_bytes / scale).map_err(|_| {
+            crate::error::Error::InvalidArgument {
+                message: format!("Byte value '{s}' is too large"),
+            }
+        })?;
 
         Ok(Self(bytes))
     }
@@ -112,6 +118,68 @@ impl NumBytes {
             self.0.to_string()
         }
     }
+}
+
+fn parse_decimal_number(value: &str, original: &str) -> Result<(u128, u128)> {
+    if value.is_empty() {
+        return invalid_byte_value(original);
+    }
+
+    let Some((whole, fraction)) = value.split_once('.') else {
+        let numerator =
+            value
+                .parse::<u128>()
+                .map_err(|_| crate::error::Error::InvalidArgument {
+                    message: format!("Byte value too large: '{value}'"),
+                })?;
+        return Ok((numerator, 1));
+    };
+
+    if whole.is_empty()
+        || fraction.is_empty()
+        || !whole.chars().all(|c| c.is_ascii_digit())
+        || !fraction.chars().all(|c| c.is_ascii_digit())
+    {
+        return invalid_byte_value(original);
+    }
+
+    let fraction_len = fraction.len();
+    let whole = whole
+        .parse::<u128>()
+        .map_err(|_| crate::error::Error::InvalidArgument {
+            message: format!("Byte value too large: '{value}'"),
+        })?;
+    let fraction = fraction
+        .parse::<u128>()
+        .map_err(|_| crate::error::Error::InvalidArgument {
+            message: format!("Byte value too large: '{value}'"),
+        })?;
+    let scale = 10_u128
+        .checked_pow(u32::try_from(fraction_len).map_err(|_| {
+            crate::error::Error::InvalidArgument {
+                message: format!("Byte value '{original}' is too precise"),
+            }
+        })?)
+        .ok_or_else(|| crate::error::Error::InvalidArgument {
+            message: format!("Byte value '{original}' is too precise"),
+        })?;
+    let numerator = whole
+        .checked_mul(scale)
+        .and_then(|whole| whole.checked_add(fraction))
+        .ok_or_else(|| crate::error::Error::InvalidArgument {
+            message: format!("Byte value '{original}' is too large"),
+        })?;
+
+    Ok((numerator, scale))
+}
+
+fn invalid_byte_value<T>(value: &str) -> Result<T> {
+    InvalidArgumentSnafu {
+        message: format!(
+            "Invalid byte value '{value}'. Expected format: <number><unit> (e.g. 16Gi, 1.5GiB, 512Mi)"
+        ),
+    }
+    .fail()
 }
 
 impl std::str::FromStr for NumBytes {
@@ -208,8 +276,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_gb_suffix() {
+        let nb = NumBytes::parse("16GB").expect("GB suffix should parse");
+        assert_eq!(nb.as_bytes(), 16 * GB);
+        assert_eq!(nb.to_resource_string(), "15625000Ki");
+    }
+
+    #[test]
+    fn parse_fractional_gi_suffix() {
+        let nb = NumBytes::parse("1.5Gi").expect("fractional Gi suffix should parse");
+        assert_eq!(nb.as_bytes(), GIB + (GIB / 2));
+        assert_eq!(nb.to_resource_string(), "1536Mi");
+    }
+
+    #[test]
+    fn parse_rejects_fractional_bytes() {
+        NumBytes::parse("1.5").expect_err("fractional bytes should be rejected");
+    }
+
+    #[test]
+    fn parse_rejects_fractional_sub_byte_value() {
+        NumBytes::parse("0.1Ki").expect_err("fractional byte result should be rejected");
+    }
+
+    #[test]
     fn parse_rejects_bad_suffix() {
-        NumBytes::parse("16GB").expect_err("GB suffix should be rejected");
+        NumBytes::parse("16gibb").expect_err("unknown suffix should be rejected");
     }
 
     #[test]
@@ -295,7 +387,7 @@ mod tests {
 
     #[test]
     fn serde_deserialize_rejects_invalid() {
-        serde_json::from_str::<NumBytes>(r#""16GB""#)
+        serde_json::from_str::<NumBytes>(r#""16gibb""#)
             .expect_err("invalid NumBytes JSON should be rejected");
     }
 }

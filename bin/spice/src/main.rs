@@ -28,6 +28,7 @@ use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};
 use spice_cloud_client::endpoints::is_valid_region as is_valid_cloud_region;
 use std::ffi::{OsStr, OsString};
+use std::sync::LazyLock;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CLOUD_REGION: &str = "us-east-1";
@@ -38,6 +39,14 @@ const GLOBAL_VALUE_FLAGS: &[&str] = &[
     "--http-endpoint",
     "--tls-root-certificate-file",
 ];
+static TOP_LEVEL_COMMANDS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut commands = Vec::new();
+    for command in Cli::command().get_subcommands() {
+        commands.push(command.get_name().to_string());
+        commands.extend(command.get_all_aliases().map(ToString::to_string));
+    }
+    commands
+});
 
 /// Spice.ai CLI - Interact with the Spice.ai runtime, edit Spicepod manifests, and manage Spice Cloud.
 #[derive(Parser)]
@@ -80,7 +89,7 @@ struct Cli {
     verbose: u8,
 
     /// Machine-readable mode for LLMs and automation: prefer JSON output where supported and always emit structured JSON errors.
-    #[arg(long, alias = "programmatic")]
+    #[arg(long, alias = "programmatic", global = true)]
     machine: bool,
 
     /// API key used to authenticate with the runtime or Spice.ai Cloud.
@@ -416,9 +425,7 @@ fn cloud_region_from_equals(value: &OsStr) -> Option<&str> {
 }
 
 fn is_top_level_command(value: &str) -> bool {
-    Cli::command().get_subcommands().any(|command| {
-        command.get_name() == value || command.get_all_aliases().any(|alias| alias == value)
-    })
+    TOP_LEVEL_COMMANDS.iter().any(|command| command == value)
 }
 
 fn raw_args_enable_machine_mode() -> bool {
@@ -450,8 +457,11 @@ fn apply_machine_mode(command: &mut Commands) {
         Commands::Workers(args) => args.output = OutputFormat::Json,
         Commands::Trace(args) => args.output = trace::OutputFormat::Json,
         Commands::Search(args) => args.output = OutputFormat::Json,
+        Commands::Sql(args) => args.output = OutputFormat::Json,
         Commands::Query(args) => apply_machine_query_mode(args),
         Commands::Acceleration(args) => apply_machine_acceleration_mode(args),
+        Commands::Chat(args) => args.output = OutputFormat::Json,
+        Commands::Refresh(args) => args.output = OutputFormat::Json,
         Commands::Cloud(args) => apply_machine_cloud_mode(&mut args.command),
         Commands::Init(_)
         | Commands::Install(_)
@@ -475,10 +485,7 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Snapshots(_)
         | Commands::Extension(_)
         | Commands::Metadata(_)
-        | Commands::Sql(_)
         | Commands::Nsql(_)
-        | Commands::Chat(_)
-        | Commands::Refresh(_)
         | Commands::Login(_)
         | Commands::Cluster(_)
         | Commands::Completions(_) => {}
@@ -620,7 +627,10 @@ fn is_json_output(cmd: &Commands) -> bool {
         Commands::Workers(a) => a.output == OutputFormat::Json,
         Commands::Trace(a) => matches!(a.output, trace::OutputFormat::Json),
         Commands::Search(a) => a.output == OutputFormat::Json,
+        Commands::Sql(a) => a.output == OutputFormat::Json,
         Commands::Query(a) => a.output == OutputFormat::Json,
+        Commands::Chat(a) => a.output == OutputFormat::Json,
+        Commands::Refresh(a) => a.output == OutputFormat::Json,
         Commands::Acceleration(AccelerationArgs {
             command:
                 acceleration::AccelerationCommand::Snapshots(SnapshotsArgs { output, .. })
@@ -948,6 +958,49 @@ mod tests {
         }) = cli.command
         else {
             panic!("expected acceleration set-snapshot command");
+        };
+        assert_eq!(args.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn machine_flag_is_global_after_subcommands() {
+        let cli = parse_with_machine_mode(&["spice", "status", "--machine"]);
+        assert!(cli.machine);
+
+        let Commands::Status(args) = cli.command else {
+            panic!("expected status command");
+        };
+        assert_eq!(args.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn machine_flag_defaults_direct_automation_outputs_to_json() {
+        let cli = parse_with_machine_mode(&["spice", "--machine", "sql", "--query", "select 1"]);
+        let Commands::Sql(args) = cli.command else {
+            panic!("expected sql command");
+        };
+        assert_eq!(args.output, OutputFormat::Json);
+
+        let cli = parse_with_machine_mode(&["spice", "--machine", "chat", "hello"]);
+        let Commands::Chat(args) = cli.command else {
+            panic!("expected chat command");
+        };
+        assert_eq!(args.output, OutputFormat::Json);
+
+        let cli = parse_with_machine_mode(&["spice", "--machine", "refresh", "taxi_trips"]);
+        let Commands::Refresh(args) = cli.command else {
+            panic!("expected refresh command");
+        };
+        assert_eq!(args.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn machine_flag_after_direct_shortcut_sets_json_output() {
+        let mut cli = parse_normalized(&["spice", "-sql", "select 1", "--machine"]);
+        assert!(cli.machine);
+        apply_machine_mode(&mut cli.command);
+        let Commands::Sql(args) = cli.command else {
+            panic!("expected sql command");
         };
         assert_eq!(args.output, OutputFormat::Json);
     }
