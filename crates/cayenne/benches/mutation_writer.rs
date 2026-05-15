@@ -330,6 +330,75 @@ fn bench_directory_durability_primitives(c: &mut Criterion) {
         );
     });
 
+    // Quantifies the cost a "duplicate directory fsync" regression imposes on
+    // the staged-append commit path. The two benchmarks below replicate the
+    // exact post-rename pattern used in `move_staging_files_local` (open the
+    // directory + `sync_all` on the inode). The duplicate variant calls it
+    // back-to-back without any filesystem mutation in between — semantically
+    // identical to a single fsync on the same on-disk state, but pays the
+    // syscall and journal cost twice.
+    //
+    // Concretely: a previous revision of `move_staging_files_local`
+    // accidentally fsynced `target_dir` twice in a row. This is the cost it
+    // added per staged-append commit on local FS. If anyone reintroduces a
+    // duplicate fsync on this hot path, the `duplicate_dir_fsync` line of
+    // this group will be ~2× the `single_dir_fsync` line in the criterion
+    // report, making the regression obvious.
+    group.bench_function("single_dir_fsync", |b| {
+        b.iter_batched(
+            || {
+                let temp = tempfile::tempdir().expect("tempdir for bench");
+                let dir = temp.path().join("target_snapshot");
+                std::fs::create_dir_all(&dir).expect("create snapshot dir");
+                (temp, dir)
+            },
+            |(_keep_alive, dir)| {
+                rt.block_on(async {
+                    let path = dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let f = std::fs::File::open(&path).expect("open dir");
+                        f.sync_all().expect("fsync dir");
+                    })
+                    .await
+                    .expect("join");
+                    black_box(dir);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("duplicate_dir_fsync", |b| {
+        b.iter_batched(
+            || {
+                let temp = tempfile::tempdir().expect("tempdir for bench");
+                let dir = temp.path().join("target_snapshot");
+                std::fs::create_dir_all(&dir).expect("create snapshot dir");
+                (temp, dir)
+            },
+            |(_keep_alive, dir)| {
+                rt.block_on(async {
+                    let path1 = dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let f = std::fs::File::open(&path1).expect("open dir");
+                        f.sync_all().expect("fsync dir");
+                    })
+                    .await
+                    .expect("join1");
+                    let path2 = dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let f = std::fs::File::open(&path2).expect("open dir");
+                        f.sync_all().expect("fsync dir");
+                    })
+                    .await
+                    .expect("join2");
+                    black_box(dir);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
