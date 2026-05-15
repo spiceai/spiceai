@@ -935,6 +935,96 @@ async fn test_wal_with_files_in_snapshot_self_heals_impl(
 }
 
 // ============================================================================
+// Test 18: Writer with pending staging WAL while inline compaction runs.
+// This exercises the mutation writer + compaction interaction under the
+// new pre-recovery audit. A writer that has written its WAL but not yet
+// moved the files must not lose data when compaction commits a new snapshot
+// and potentially triggers old snapshot cleanup.
+// ============================================================================
+
+test_with_backends!(test_writer_wal_survives_inline_compaction_impl);
+
+async fn test_writer_wal_survives_inline_compaction_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Use aggressive compaction config so a moderate write triggers compaction.
+    let (table, ctx) = setup_table_with_compaction(&fixture, "writer_compact").await;
+
+    // Large write that goes through staging + WAL (bypasses inline memtable).
+    let large_rows: i64 = 5000;
+    let ids: Vec<i64> = (1..=large_rows).collect();
+    let names: Vec<String> = ids.iter().map(|i| format!("n_{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let schema = table.schema();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(name_refs)),
+        ],
+    )?;
+
+    // Begin staged append (writes the WAL) but do not commit yet.
+    let staged = common::begin_staged_append_with_batch(&table, batch).await?;
+
+    // While the WAL is pending, explicitly trigger compaction.
+    // This may create a new snapshot and schedule old snapshot cleanup.
+    let _compacted = table.maybe_compact_small_files().await?;
+
+    // Now let the writer finish (move files + remove WAL).
+    // The move should target the *current* live snapshot (whatever compaction left),
+    // and the pre-recovery audit (if the WAL is seen as stale) must not
+    // refuse a benign pending writer.
+    staged.commit().await?;
+
+    // Data must be present after the writer completes.
+    let total = row_count(&ctx, "writer_compact").await;
+    assert_eq!(total, usize::try_from(large_rows).expect("row count fits"));
+
+    // No leftover WAL.
+    let staging = staging_dir(&table);
+    assert!(
+        !staging.join(STAGING_WAL_FILENAME).exists(),
+        "writer's WAL must be removed after successful commit across compaction boundary"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Test 18: Writer with pending staging WAL while compaction is triggered.
+// Verifies that a writer that has written its WAL can still successfully
+// commit after compaction has run (the move targets the live snapshot and
+// the pre-recovery audit does not incorrectly refuse a benign pending WAL).
+// ============================================================================
+
+test_with_backends!(test_pending_writer_wal_survives_compaction_trigger_impl);
+
+async fn test_pending_writer_wal_survives_compaction_trigger_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "writer_compact_race").await;
+
+    // Perform a staged append (writes a WAL). Use enough rows to ensure
+    // the write goes through the staging path.
+    let staged = begin_staged_append_with_rows(&table, &[(1, "A"), (2, "B"), (3, "C")]).await?;
+
+    // Explicitly trigger compaction while the writer's WAL is pending.
+    // This exercises the writer + compaction interaction and ensures the
+    // pre-recovery audit / move logic does not break a benign pending writer
+    // when the snapshot pointer moves.
+    let _ = table.maybe_compact_small_files().await?;
+
+    // The writer must still be able to commit successfully.
+    staged.commit().await?;
+
+    let total = row_count(&ctx, "writer_compact_race").await;
+    assert_eq!(total, 3);
+
+    Ok(())
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
