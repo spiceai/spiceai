@@ -353,6 +353,19 @@ where
     Ok((start, len))
 }
 
+fn list_element_field(data_type: &DataType, array_name: &str) -> Result<Arc<Field>, ArrowError> {
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) => Ok(Arc::clone(field)),
+        _ => Err(ArrowError::InvalidArgumentError(format!(
+            "{array_name} data type is not a list type: {data_type}"
+        ))),
+    }
+}
+
 fn truncate_fixed_size_list_array(
     list_array: &FixedSizeListArray,
     max_len: usize,
@@ -366,6 +379,7 @@ fn truncate_fixed_size_list_array(
         value_to_usize(list_array.value_length(), "FixedSizeListArray value length")?;
     let truncated_size = max_len.min(original_size);
     let truncated_size_i32 = value_to_i32(truncated_size, "FixedSizeListArray truncated size")?;
+    let element_field = list_element_field(list_array.data_type(), "FixedSizeListArray")?;
 
     let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
         .map(|i| child_array.slice(i * original_size, truncated_size))
@@ -388,6 +402,7 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     let element_field = list_element_field(list_array.data_type());
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
+    let element_field = list_element_field(list_array.data_type(), "ListArray")?;
 
     let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
         .map(|i| {
@@ -427,6 +442,7 @@ fn truncate_large_list_array(
     let element_field = list_element_field(list_array.data_type());
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
+    let element_field = list_element_field(list_array.data_type(), "LargeListArray")?;
 
     let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
         .map(|i| {
@@ -467,6 +483,7 @@ fn truncate_list_view_array(
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
     let sizes = list_array.value_sizes();
+    let element_field = list_element_field(list_array.data_type(), "ListViewArray")?;
 
     let slice_ranges: Vec<(usize, usize, i32)> = (0..list_array.len())
         .map(|i| {
@@ -525,6 +542,7 @@ fn truncate_large_list_view_array(
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
     let sizes = list_array.value_sizes();
+    let element_field = list_element_field(list_array.data_type(), "LargeListViewArray")?;
 
     let max_len_i64 = i64::try_from(max_len).map_err(|_| {
         ArrowError::InvalidArgumentError(format!("max_len {max_len} cannot be represented as i64"))
@@ -1406,6 +1424,89 @@ Cras venenatis euismod malesuada.",
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn test_truncate_helpers_preserve_element_field() {
+        use arrow::array::{
+            FixedSizeListArray as FixedSizeListArrayAlias, Int32Array,
+            LargeListArray as LargeListArrayAlias, LargeListViewArray as LargeListViewArrayAlias,
+            ListViewArray as ListViewArrayAlias,
+        };
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+
+        fn assert_element_field_preserved(data_type: &DataType, expected_field: &Field) {
+            let actual_field = match data_type {
+                DataType::List(field)
+                | DataType::LargeList(field)
+                | DataType::ListView(field)
+                | DataType::LargeListView(field)
+                | DataType::FixedSizeList(field, _) => field,
+                other => panic!("unexpected list data type {other:?}"),
+            };
+
+            assert_eq!(actual_field.as_ref(), expected_field);
+        }
+
+        let element_field = Arc::new(
+            Field::new("source_item", DataType::Int32, true).with_metadata(HashMap::from([(
+                "field_metadata".to_string(),
+                "must_survive_truncation".to_string(),
+            )])),
+        );
+
+        let list = ListArray::new(
+            Arc::clone(&element_field),
+            OffsetBuffer::<i32>::new(vec![0_i32, 3].into()),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            None,
+        );
+        let list_output = truncate_list_array(&list, 2).expect("truncate_list_array failed");
+        assert_element_field_preserved(list_output.data_type(), element_field.as_ref());
+
+        let large_list = LargeListArrayAlias::new(
+            Arc::clone(&element_field),
+            OffsetBuffer::<i64>::new(vec![0_i64, 3].into()),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            None,
+        );
+        let large_list_output =
+            truncate_large_list_array(&large_list, 2).expect("truncate_large_list_array failed");
+        assert_element_field_preserved(large_list_output.data_type(), element_field.as_ref());
+
+        let fixed_size_list = FixedSizeListArrayAlias::new(
+            Arc::clone(&element_field),
+            3,
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            None,
+        );
+        let fixed_size_list_output = truncate_fixed_size_list_array(&fixed_size_list, 2)
+            .expect("truncate_fixed_size_list_array failed");
+        assert_element_field_preserved(fixed_size_list_output.data_type(), element_field.as_ref());
+
+        let list_view = ListViewArrayAlias::try_new(
+            Arc::clone(&element_field),
+            ScalarBuffer::<i32>::from(vec![0_i32]),
+            ScalarBuffer::<i32>::from(vec![3_i32]),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            None,
+        )
+        .expect("ListViewArray::try_new");
+        let list_view_output =
+            truncate_list_view_array(&list_view, 2).expect("truncate_list_view_array failed");
+        assert_element_field_preserved(list_view_output.data_type(), element_field.as_ref());
+
+        let large_list_view = LargeListViewArrayAlias::try_new(
+            Arc::clone(&element_field),
+            ScalarBuffer::<i64>::from(vec![0_i64]),
+            ScalarBuffer::<i64>::from(vec![3_i64]),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            None,
+        )
+        .expect("LargeListViewArray::try_new");
+        let large_list_view_output = truncate_large_list_view_array(&large_list_view, 2)
+            .expect("truncate_large_list_view_array failed");
+        assert_element_field_preserved(large_list_view_output.data_type(), element_field.as_ref());
     }
 
     #[test]
