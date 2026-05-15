@@ -106,8 +106,12 @@ limitations under the License.
 //!   there isn't enough probe-side cardinality for the filter to save
 //!   meaningful work, and the plain hash join wins.
 //!
-//! Both gates only fire when stats are present (`Precision::Exact` or
-//! `Precision::Inexact`); missing stats fall back to the structural behavior.
+//! The dim-side gate requires stats to be present: if the dim side has no
+//! statistics the rule skips propagation entirely. Acceleration engines
+//! (`DuckDB`, Arrow, Cayenne, etc.) always expose row counts via
+//! `TableProvider::statistics`, so this gate is transparent for accelerated
+//! tables. Data sources without statistics (e.g. HTTP virtual tables) are
+//! excluded.
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DataFusionError, NullEquality, Result, Spans, TableReference};
@@ -606,22 +610,43 @@ fn subtree_upper_bound_rows(plan: &LogicalPlan) -> Option<usize> {
     if any_unknown { None } else { Some(total) }
 }
 
-/// `true` when stats prove the dim side is below
-/// [`MIN_DIM_ROWS_FOR_PROPAGATION`] *or* the fact side is below
-/// [`MIN_FACT_ROWS_FOR_PROPAGATION`]. Missing stats on either side fall back
-/// to the structural gates: this function returns `false` (allow propagation),
-/// matching the rule's behavior before the cardinality gates were added.
+/// `true` when propagation should be skipped based on cardinality.
+///
+/// Skips when:
+/// * The dim side has **no statistics** — data sources that don't expose row
+///   counts are excluded because the rule cannot gauge
+///   whether the subquery re-execution cost is justified.
+///   Acceleration engines (`DuckDB`, Arrow, Cayenne, etc.) always provide
+///   `Exact` or `Inexact` row counts via `TableProvider::statistics`.
+/// * The dim side's known upper-bound row count is below
+///   [`MIN_DIM_ROWS_FOR_PROPAGATION`].
+/// * The fact side's known upper-bound row count is below
+///   [`MIN_FACT_ROWS_FOR_PROPAGATION`] (missing fact-side stats fall back
+///   to allowing propagation — over-filtering the fact side is safe).
 fn skip_propagation_by_cardinality(dim_side: &LogicalPlan, fact_side: &LogicalPlan) -> bool {
-    if matches!(
-        subtree_upper_bound_rows(dim_side),
-        Some(n) if n < MIN_DIM_ROWS_FOR_PROPAGATION
-    ) {
-        return true;
+    let dim_rows = subtree_upper_bound_rows(dim_side);
+
+    tracing::debug!(
+        dim_rows = ?dim_rows,
+        "CayennePropagateFilterAcrossEquiJoinKeys: dim-side cardinality"
+    );
+
+    match dim_rows {
+        None => return true,
+        Some(n) if n < MIN_DIM_ROWS_FOR_PROPAGATION => return true,
+        Some(_) => {}
     }
-    if matches!(
-        subtree_upper_bound_rows(fact_side),
-        Some(n) if n < MIN_FACT_ROWS_FOR_PROPAGATION
-    ) {
+
+    let fact_rows = subtree_upper_bound_rows(fact_side);
+
+    tracing::debug!(
+        fact_rows = ?fact_rows,
+        "CayennePropagateFilterAcrossEquiJoinKeys: fact-side cardinality"
+    );
+
+    if let Some(n) = fact_rows
+        && n < MIN_FACT_ROWS_FOR_PROPAGATION
+    {
         return true;
     }
     false
@@ -823,17 +848,93 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::MemTable;
+    use datafusion::common::stats::Precision;
+    use datafusion::datasource::{DefaultTableSource, TableProvider};
     use datafusion::prelude::SessionContext;
+    use datafusion_common::Statistics;
+    use datafusion_expr::LogicalPlanBuilder;
     use std::sync::Arc;
+
+    /// Wrapper around [`MemTable`] that exposes a fixed row count via
+    /// [`TableProvider::statistics`]. The cardinality gates in
+    /// [`skip_propagation_by_cardinality`] require stats to be present on the
+    /// dim side; without this wrapper, test tables backed by `MemTable` would
+    /// report `None` and propagation would be skipped.
+    #[derive(Debug)]
+    struct StatMemTable {
+        inner: MemTable,
+        num_rows: usize,
+    }
+
+    impl StatMemTable {
+        fn try_new(
+            schema: Arc<Schema>,
+            batches: Vec<Vec<arrow::array::RecordBatch>>,
+            num_rows: usize,
+        ) -> Result<Self> {
+            Ok(Self {
+                inner: MemTable::try_new(schema, batches)?,
+                num_rows,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TableProvider for StatMemTable {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> Arc<Schema> {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        fn statistics(&self) -> Option<Statistics> {
+            Some(Statistics {
+                num_rows: Precision::Exact(self.num_rows),
+                total_byte_size: Precision::Absent,
+                column_statistics: vec![],
+            })
+        }
+    }
 
     fn rule() -> CayennePropagateFilterAcrossEquiJoinKeys {
         CayennePropagateFilterAcrossEquiJoinKeys::new()
+    }
+
+    /// Build a [`LogicalPlan::TableScan`] backed by a [`StatMemTable`] that
+    /// reports `num_rows` via `TableProvider::statistics()`. Use this instead
+    /// of `datafusion_expr::builder::table_scan` in tests that need the
+    /// cardinality gates in [`skip_propagation_by_cardinality`] to pass.
+    fn stat_table_scan(name: &str, schema: &Arc<Schema>, num_rows: usize) -> Result<LogicalPlan> {
+        let provider = Arc::new(StatMemTable::try_new(
+            Arc::clone(schema),
+            vec![vec![]],
+            num_rows,
+        )?);
+        let source = Arc::new(DefaultTableSource::new(provider));
+        LogicalPlanBuilder::scan(name, source, None)?.build()
     }
 
     fn make_ctx() -> Result<SessionContext> {
         let ctx = SessionContext::new();
         // dim-like nation table — gains an `n_regionkey` so the multi-hop
         // `region ⋈ nation` propagation tests can join through it.
+        // Row count ≥ MIN_DIM_ROWS_FOR_PROPAGATION so the cardinality gate allows propagation.
         let nation_schema = Arc::new(Schema::new(vec![
             Field::new("n_nationkey", DataType::Int64, false),
             Field::new("n_name", DataType::Utf8, true),
@@ -855,26 +956,38 @@ mod tests {
             Field::new("c_id", DataType::Int64, false),
             Field::new("c_state", DataType::Utf8, true),
         ]));
+        // Dim tables: row count above MIN_DIM_ROWS_FOR_PROPAGATION (1_000).
+        // Fact tables: row count above MIN_FACT_ROWS_FOR_PROPAGATION (100_000).
         ctx.register_table(
             "nation",
-            Arc::new(MemTable::try_new(Arc::clone(&nation_schema), vec![vec![]])?),
+            Arc::new(StatMemTable::try_new(
+                Arc::clone(&nation_schema),
+                vec![vec![]],
+                100_000,
+            )?),
         )?;
         ctx.register_table(
             "region",
-            Arc::new(MemTable::try_new(Arc::clone(&region_schema), vec![vec![]])?),
+            Arc::new(StatMemTable::try_new(
+                Arc::clone(&region_schema),
+                vec![vec![]],
+                100_000,
+            )?),
         )?;
         ctx.register_table(
             "supplier",
-            Arc::new(MemTable::try_new(
+            Arc::new(StatMemTable::try_new(
                 Arc::clone(&supplier_schema),
                 vec![vec![]],
+                500_000,
             )?),
         )?;
         ctx.register_table(
             "customer",
-            Arc::new(MemTable::try_new(
+            Arc::new(StatMemTable::try_new(
                 Arc::clone(&customer_schema),
                 vec![vec![]],
+                500_000,
             )?),
         )?;
         Ok(ctx)
@@ -1248,7 +1361,7 @@ mod tests {
         // already fired). Guards against the cycle guard being too aggressive.
         use datafusion::common::NullEquality;
         use datafusion::logical_expr::JoinConstraint;
-        use datafusion_expr::{LogicalPlanBuilder, builder::table_scan, lit};
+        use datafusion_expr::{LogicalPlanBuilder, lit};
 
         let dim_schema = Arc::new(Schema::new(vec![
             Field::new("n_nationkey", DataType::Int64, false),
@@ -1259,7 +1372,7 @@ mod tests {
             Field::new("s_nationkey", DataType::Int64, false),
         ]));
 
-        let nation_scan = table_scan(Some("nation"), &dim_schema, None)?.build()?;
+        let nation_scan = stat_table_scan("nation", &dim_schema, 5_000)?;
         let nation_filter = LogicalPlan::Filter(Filter::try_new(
             Expr::Column(Column::new(Some("nation"), "n_name")).eq(lit("CHINA")),
             Arc::new(nation_scan),
@@ -1273,7 +1386,7 @@ mod tests {
             TableReference::bare("some_user_alias"),
         )?);
 
-        let supplier_scan = table_scan(Some("supplier"), &fact_schema, None)?.build()?;
+        let supplier_scan = stat_table_scan("supplier", &fact_schema, 500_000)?;
         let semi_join_input = LogicalPlanBuilder::from(supplier_scan)
             .join_with_expr_keys(
                 user_alias,
@@ -1289,7 +1402,7 @@ mod tests {
             )?
             .build()?;
 
-        let outer_dim_scan = table_scan(Some("nation_outer"), &dim_schema, None)?.build()?;
+        let outer_dim_scan = stat_table_scan("nation_outer", &dim_schema, 5_000)?;
         let outer_dim_filter = LogicalPlan::Filter(Filter::try_new(
             Expr::Column(Column::new(Some("nation_outer"), "n_name")).eq(lit("CHINA")),
             Arc::new(outer_dim_scan),
@@ -1458,7 +1571,7 @@ mod tests {
         // Cycle prevention: running the rule a second time must be a no-op
         // (the unified Display-keyed cycle guard tracks the InSubquery target
         // expression, not just column targets).
-        let (_, changed2) = apply_rule_to_all_joins(&r, transformed_plan.clone(), &cfg)?;
+        let (_, changed2) = apply_rule_to_all_joins(&r, transformed_plan, &cfg)?;
         assert!(
             !changed2,
             "second pass must not re-propagate (cycle guard) on expression target"
@@ -1588,105 +1701,41 @@ mod tests {
 
     #[test]
     fn subtree_upper_bound_rows_sums_stats_across_dim_subtree() -> Result<()> {
-        use datafusion::catalog::{Session, TableProvider};
-        use datafusion::common::stats::Precision;
-        use datafusion::datasource::DefaultTableSource;
-        use datafusion::logical_expr::{TableType, dml::InsertOp};
-        use datafusion::physical_plan::ExecutionPlan;
-        use datafusion_common::Statistics;
-        use datafusion_expr::Expr as ExprAlias;
-        use datafusion_expr::LogicalPlanBuilder;
-
-        /// `TableProvider` that returns a constant row count from `statistics()`.
-        #[derive(Debug)]
-        struct FixedStatsProvider {
-            schema: arrow::datatypes::SchemaRef,
-            num_rows: usize,
-        }
-
-        #[async_trait::async_trait]
-        impl TableProvider for FixedStatsProvider {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-            fn schema(&self) -> arrow::datatypes::SchemaRef {
-                Arc::clone(&self.schema)
-            }
-            fn table_type(&self) -> TableType {
-                TableType::Base
-            }
-            async fn scan(
-                &self,
-                _state: &dyn Session,
-                _projection: Option<&Vec<usize>>,
-                _filters: &[ExprAlias],
-                _limit: Option<usize>,
-            ) -> Result<Arc<dyn ExecutionPlan>> {
-                Err(datafusion::common::DataFusionError::NotImplemented(
-                    "FixedStatsProvider scan not used in this test".to_string(),
-                ))
-            }
-            fn statistics(&self) -> Option<Statistics> {
-                let mut stats = Statistics::new_unknown(self.schema.as_ref());
-                stats.num_rows = Precision::Exact(self.num_rows);
-                Some(stats)
-            }
-            async fn insert_into(
-                &self,
-                _state: &dyn Session,
-                _input: Arc<dyn ExecutionPlan>,
-                _insert_op: InsertOp,
-            ) -> Result<Arc<dyn ExecutionPlan>> {
-                Err(datafusion::common::DataFusionError::NotImplemented(
-                    "FixedStatsProvider insert not used".to_string(),
-                ))
-            }
-        }
-
-        fn fixed_table_scan(rows: usize) -> Result<LogicalPlan> {
-            let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-            let provider = Arc::new(FixedStatsProvider {
-                schema: Arc::clone(&schema),
-                num_rows: rows,
-            });
-            let source = Arc::new(DefaultTableSource::new(provider));
-            LogicalPlanBuilder::scan("t", source, None)?.build()
-        }
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
 
         // Single scan: row count is reported directly.
-        let small = fixed_table_scan(500)?;
+        let small = stat_table_scan("t", &schema, 500)?;
         assert_eq!(subtree_upper_bound_rows(&small), Some(500));
 
         // Below the dim threshold → gate fires (skip propagation).
-        let fact = fixed_table_scan(1_000_000)?;
+        let fact = stat_table_scan("t", &schema, 1_000_000)?;
         assert!(skip_propagation_by_cardinality(&small, &fact));
 
         // Above the dim threshold + above the fact threshold → gate is silent.
-        let big_dim = fixed_table_scan(5_000)?;
+        let big_dim = stat_table_scan("t", &schema, 5_000)?;
         assert!(!skip_propagation_by_cardinality(&big_dim, &fact));
 
         // Below the fact threshold → gate fires from the fact side.
-        let tiny_fact = fixed_table_scan(50_000)?;
+        let tiny_fact = stat_table_scan("t", &schema, 50_000)?;
         assert!(skip_propagation_by_cardinality(&big_dim, &tiny_fact));
 
         Ok(())
     }
 
     #[test]
-    fn skip_propagation_by_cardinality_silent_when_stats_absent() -> Result<()> {
+    fn skip_propagation_by_cardinality_skips_when_dim_stats_absent() -> Result<()> {
         // MemTable doesn't expose row counts via `TableProvider::statistics()`,
-        // so the gate must fall back to the structural behavior (no skip).
-        use datafusion::catalog::MemTable;
-        use datafusion::datasource::DefaultTableSource;
-        use datafusion_expr::LogicalPlanBuilder;
-
+        // so the gate must skip propagation
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         let provider = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]])?);
         let source = Arc::new(DefaultTableSource::new(provider));
         let scan = LogicalPlanBuilder::scan("t", source, None)?.build()?;
 
         assert_eq!(subtree_upper_bound_rows(&scan), None);
-        assert!(!skip_propagation_by_cardinality(&scan, &scan));
+        assert!(
+            skip_propagation_by_cardinality(&scan, &scan),
+            "absent dim-side stats must trigger skip"
+        );
         Ok(())
     }
 
@@ -1794,7 +1843,7 @@ mod tests {
     fn composite_join_receives_one_filter_per_non_key_constrained_key() -> Result<()> {
         use datafusion::common::NullEquality;
         use datafusion::logical_expr::JoinConstraint;
-        use datafusion_expr::{builder::table_scan, lit};
+        use datafusion_expr::lit;
 
         let left_schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
@@ -1806,12 +1855,12 @@ mod tests {
             Field::new("y", DataType::Int64, false),
         ]));
 
-        let left_scan = table_scan(Some("l"), &left_schema, None)?.build()?;
+        let left_scan = stat_table_scan("l", &left_schema, 5_000)?;
         let left = LogicalPlan::Filter(Filter::try_new(
             Expr::Column(Column::new(Some("l"), "c")).eq(lit("v")),
             Arc::new(left_scan),
         )?);
-        let right = table_scan(Some("r"), &right_schema, None)?.build()?;
+        let right = stat_table_scan("r", &right_schema, 500_000)?;
 
         let join = LogicalPlan::Join(Join::try_new(
             Arc::new(left),

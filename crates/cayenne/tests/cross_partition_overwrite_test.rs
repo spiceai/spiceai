@@ -29,28 +29,28 @@ You may obtain a copy of the License at
 //! crash-recovery infrastructure now perform the required parent-directory
 //! sync after `create_dir_all` (snapshot directories via
 //! `ensure_snapshot_dir_exists` (including initial table creation before
-//! metastore INSERT), the _partitioned_wal/ coordination directory via the
+//! metastore INSERT), the `_partitioned_wal/` coordination directory via the
 //! helper in `PartitionedWal::write_to`, `deletions/` subdirectories under
-//! snapshots via DeletionVectorWriter, and partition value subdirectories
-//! via CayennePartitionCreator before `add_partition`).
+//! snapshots via `DeletionVectorWriter`, and partition value subdirectories
+//! via `CayennePartitionCreator` before `add_partition`).
 //! The catalog DB directory creation in `CayenneCatalog::init` also
 //! receives a best-effort parent sync for completeness of the system
 //! initialization path.
 //! Combined with the per-partition staging WAL, deletion vector file
-//! sync_all, and directory syncs in the delete sinks, a successful
+//! `sync_all`, and directory syncs in the delete sinks, a successful
 //! cross-partition operation (append or overwrite, including any
 //! concurrent or pending deletions or new partitions) leaves a fully
 //! durable set of coordination records and data files on local FS.
 //! The existing fault-injection and restart tests in this file, together
 //! with the per-partition durability tests (deletion vector restart,
-//! staged-append restart, acid_compliance, data_inlining, catalog
-//! concurrency with partitions, and shared_metastore_concurrency_test
+//! staged-append restart, `acid_compliance`, `data_inlining`, catalog
+//! concurrency with partitions, and `shared_metastore_concurrency_test`
 //! which exercises fresh catalog DB directory creation in both
-//! CayenneCatalog::init and the SQLite/Turso metastore backends with
+//! `CayenneCatalog::init` and the SQLite/Turso metastore backends with
 //! best-effort parent sync + warning),
 //! provide comprehensive regression coverage for this property,
 //! including the edge cases of the very first cross-partition write on a
-//! brand-new table (first creation of the _partitioned_wal/ directory),
+//! brand-new table (first creation of the `_partitioned_wal/` directory),
 //! the first deletion vector written to a snapshot, the first discovery
 //! of a new partition value, and first-time catalog initialization on a
 //! brand-new data directory (including defense-in-depth in the
