@@ -522,8 +522,11 @@ pub struct CayenneTableProvider {
     inlined_row_count: Arc<AtomicI64>,
     /// Serializes concurrent compaction passes on this table so a write-driven
     /// inline trigger and the background scheduler can't both rewrite the
-    /// current snapshot at the same time. Held only for the duration of one
-    /// pass; the per-table write lock continues to serialize ordinary inserts
+    /// current snapshot at the same time. Held across the *entire* trigger
+    /// sequence — up to `compaction_max_levels` consecutive snapshot rewrites
+    /// per call to [`Self::maybe_compact_small_files`] — so that competing
+    /// triggers no-op via `try_lock` rather than chaining onto a backlog. The
+    /// per-table write lock continues to serialize ordinary inserts
     /// independently.
     compaction_lock: Arc<tokio::sync::Mutex<()>>,
     /// Per-table background compaction task, populated by
@@ -3773,19 +3776,20 @@ impl CayenneTableProvider {
         };
 
         let config = self.require_object_store()?;
-        let objects: Vec<_> = config
-            .store
-            .list(Some(&prefix))
-            .try_collect()
+        // Stream-iterate so a large snapshot directory doesn't materialize the
+        // full `ObjectMeta` list in memory on the write path — only the small
+        // `(name, size)` pairs the picker needs are retained.
+        let mut stream = config.store.list(Some(&prefix));
+        let mut files = Vec::new();
+        while let Some(meta) = stream
+            .try_next()
             .await
             .map_err(|e| Error::ObjectStore {
                 operation: "list snapshot objects for compaction",
                 table: self.table_metadata.table_name.clone(),
                 source: e,
-            })?;
-
-        let mut files = Vec::new();
-        for meta in objects {
+            })?
+        {
             let path_str = meta.location.as_ref();
             let name = path_str
                 .rsplit_once('/')

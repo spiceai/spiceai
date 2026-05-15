@@ -25,8 +25,10 @@ limitations under the License.
 //! a [`CompactionCandidate`] when the smallest non-empty tier has enough files
 //! whose combined size is worth a rewrite. The runner (in
 //! [`crate::provider::table`]) consumes the candidate and atomically swaps the
-//! current snapshot for a freshly written one containing one merged Vortex file
-//! per pass.
+//! current snapshot for a freshly written one. The rewrite goes through
+//! `write_to_snapshot`, which honors `target_partitions` and the configured
+//! target file size, so a pass typically produces one or a small number of
+//! consolidated Vortex files rather than guaranteeing exactly one.
 //!
 //! The module also owns [`BackgroundCompactor`], a per-table tokio task that
 //! periodically invokes the runner. The task is `Semaphore`-gated so a fleet of
@@ -162,23 +164,25 @@ pub(crate) fn pick_candidates<P: Clone>(
             continue;
         }
 
-        bucket.sort_by_key(|entry| entry.size_bytes);
-
-        let max_pick = cfg.max_files_per_pick.min(bucket.len());
-        let picked = &bucket[..max_pick];
-        let total_bytes: u64 = picked.iter().map(|entry| entry.size_bytes).sum();
-
-        if total_bytes < cfg.tiers.mid_max_bytes {
-            // Files are small but don't add up to enough work — skip and try
-            // the next tier.
+        // Threshold check uses the WHOLE tier's bytes. A bucket of e.g. 100
+        // files at 2 MiB each (200 MiB total) should compact even when the
+        // smallest 32 only sum to 64 MiB — the goal is to relieve file-count
+        // pressure on the snapshot, not to wait until a single pass can write
+        // an entire target file.
+        let tier_total_bytes: u64 = bucket.iter().map(|entry| entry.size_bytes).sum();
+        if tier_total_bytes < cfg.tiers.mid_max_bytes {
             continue;
         }
 
+        bucket.sort_by_key(|entry| entry.size_bytes);
+        let max_pick = cfg.max_files_per_pick.min(bucket.len());
+        let picked = &bucket[..max_pick];
+        let picked_bytes: u64 = picked.iter().map(|entry| entry.size_bytes).sum();
         let paths = picked.iter().map(|entry| entry.path.clone()).collect();
         return Some(CompactionCandidate {
             tier,
             paths,
-            total_bytes,
+            total_bytes: picked_bytes,
         });
     }
 
@@ -204,7 +208,8 @@ pub(crate) trait CompactionRunner: Send + Sync {
 ///
 /// Owns a tokio task that wakes every `interval`, acquires a permit from the
 /// shared semaphore, and calls `runner.run_compaction_trigger()`. Cancellation
-/// is via `shutdown.notify_one()` from `BackgroundCompactor::shutdown()`.
+/// happens via [`Drop`]: dropping the `BackgroundCompactor` fires the shutdown
+/// `Notify` and aborts the task's `JoinHandle`.
 ///
 /// The runner is held via `Weak` so the task does not keep the
 /// `CayenneTableProvider` alive past its caller's `Arc` lifetime.
@@ -432,6 +437,24 @@ mod tests {
         // All files at exactly target size — none are candidates.
         let files = entries(&[128 * 1024 * 1024; 16]);
         assert!(pick_candidates(&files, &cfg).is_none());
+    }
+
+    #[test]
+    fn picker_threshold_uses_tier_total_not_picked_subset() {
+        // Regression: 100 files of 2 MiB each (200 MiB tier total) used to be
+        // skipped because the smallest 32 only sum to 64 MiB. The eligibility
+        // check should consider the whole tier's bytes, not just the picked
+        // subset — otherwise tiny-but-numerous files would never trigger
+        // compaction.
+        let cfg = CompactionPickerConfig::new(8, 32, 128 * 1024 * 1024);
+        let files = entries(&[2 * 1024 * 1024; 100]);
+        let candidate =
+            pick_candidates(&files, &cfg).expect("expected a candidate from 100 small files");
+        assert_eq!(candidate.tier, Tier::Small);
+        assert_eq!(candidate.paths.len(), 32);
+        // `total_bytes` on the candidate reports the picked subset, not the
+        // whole tier — 32 * 2 MiB.
+        assert_eq!(candidate.total_bytes, 32 * 2 * 1024 * 1024);
     }
 
     #[test]
