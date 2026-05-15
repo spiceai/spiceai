@@ -586,6 +586,30 @@ impl CayenneTableProvider {
     }
 
     /// Write the staging WAL on S3.
+    ///
+    /// Devil's advocate (S3 side of the uniform durability contract):
+    /// On local FS we now write to `_wal.json.tmp`, fsync, atomic rename to
+    /// `_wal.json`, then fsync the parent dir. This guarantees a reader of
+    /// the final key sees either a complete, fsynced document or nothing.
+    ///
+    /// The current S3 implementation does a direct `put` of the final key.
+    /// While a single small-object `put` on S3 is atomic from the reader's
+    /// perspective, there is no "tmp object" phase and no equivalent of the
+    /// "parent directory fsync" that protects the directory entry.
+    ///
+    /// In practice this is acceptable because:
+    /// - The content is a small JSON blob (low chance of partial write).
+    /// - The data files the WAL references are uploaded *before* the WAL is
+    ///   written; a crash before the WAL appears means the next writer will
+    ///   simply not see a WAL and will clean the orphaned staging files.
+    /// - `ensure_no_incomplete_write` currently returns `IncompleteWrite`
+    ///   (manual recovery required); automated recovery is noted as future work.
+    ///
+    /// A future improvement (to reach full parity with the local-FS hardening)
+    /// would be to write the JSON to a `_wal.json.tmp` object key first, then
+    /// `put`/`copy` to the final key, and have readers explicitly ignore any
+    /// `.tmp` WAL object. This would make a torn WAL JSON impossible to observe
+    /// on S3 as well.
     async fn write_staging_wal_s3(&self, target_snapshot: &str) -> Result<()> {
         let config = self.require_object_store()?;
 
@@ -764,7 +788,16 @@ impl CayenneTableProvider {
         };
 
         if let Some((wal, wal_location)) = wal {
-            // Automated recovery attempt will be implemented in the future — for now we just error with details to help the operator resolve the issue.
+            // Automated recovery (finish the move, remove the WAL, or clean up
+            // orphaned staging files) is not yet implemented — we error to force
+            // operator intervention and prevent silent data loss or corruption.
+            //
+            // On local FS the recent tmp+atomic-rename+parent-fsync hardening
+            // makes it very unlikely that a torn WAL is ever written.
+            // On S3 the equivalent "tmp object + final key" discipline for the
+            // WAL JSON has not yet been applied (see write_staging_wal_s3).
+            // Therefore the S3 path currently has a slightly larger (but still
+            // bounded) window in which `ensure_no_incomplete_write` can fire.
 
             return Err(Error::IncompleteWrite {
                 table: self.table_name().to_string(),
