@@ -1,19 +1,15 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-cayenne[file]-distributed
+name: s3-public[parquet]-cayenne[file]-distributed
 # ClickBench SF1 served by a single Cayenne file-mode acceleration partitioned
 # by UserID. This complements TPCH/TPCDS by exercising the distributed
 # acceleration path on a wide single-table analytical workload.
 datasets:
-  - from: s3://benchmarks/clickbench/hits.parquet
+  - from: s3://spiceai-public-datasets/clickbench/hits.parquet
     name: hits
     params:
       file_format: parquet
-      allow_http: true
-      s3_auth: key
-      s3_endpoint: ${secrets:S3_ENDPOINT}
-      s3_key: ${secrets:S3_KEY}
-      s3_secret: ${secrets:S3_SECRET}
+      s3_auth: public
     acceleration:
       enabled: true
       engine: cayenne
