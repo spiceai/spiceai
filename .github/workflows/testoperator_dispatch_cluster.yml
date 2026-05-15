@@ -166,9 +166,9 @@ jobs:
 
           # Install yq for YAML parsing if not already on PATH.
           if ! command -v yq >/dev/null 2>&1; then
-            sudo wget -q -O /usr/local/bin/yq \
+            curl -fsSL -o /tmp/yq \
               https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-            sudo chmod +x /usr/local/bin/yq
+            sudo install -m 0755 /tmp/yq /usr/local/bin/yq
           fi
 
           dispatched_runs=()
