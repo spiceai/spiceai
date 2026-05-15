@@ -106,14 +106,14 @@ impl PartitionedWal {
         }
     }
 
-    /// Ensure the _partitioned_wal/ subdirectory exists.
+    /// Ensure the `_partitioned_wal/` subdirectory exists.
     /// If we just created it, sync its parent (the table root) so the
     /// subdirectory entry itself is durable on local FS.
     ///
     /// This is required for the same reason as the parent-directory sync
     /// in `ensure_snapshot_dir_exists`: on POSIX, creating a subdirectory
     /// updates the parent's directory metadata. Without the parent sync,
-    /// a crash can make the _partitioned_wal/ directory "disappear" even
+    /// a crash can make the `_partitioned_wal/` directory "disappear" even
     /// though we are about to write a coordination record inside it.
     ///
     /// This is the last piece of the local-FS durability puzzle for the
@@ -121,8 +121,8 @@ impl PartitionedWal {
     /// `PartitionedWal` now has the same treatment as the removal side
     /// and as all snapshot directory creation paths).
     ///
-    /// Note for S3 tables: the _partitioned_wal/ directory and the
-    /// PartitionedWal JSON file are still local files on the writer's
+    /// Note for S3 tables: the `_partitioned_wal/` directory and the
+    /// `PartitionedWal` JSON file are still local files on the writer's
     /// machine (coordination is local to the writer process). The per-
     /// partition "staging WAL" on S3 is an object in the staging prefix,
     /// and its removal is a best-effort object delete. The local FS

@@ -594,12 +594,11 @@ fn subtree_upper_bound_rows(plan: &LogicalPlan) -> Option<usize> {
                     Precision::Exact(n) | Precision::Inexact(n) => Some(n),
                     Precision::Absent => None,
                 });
-            match rows {
-                Some(n) => total = total.saturating_add(n),
-                None => {
-                    any_unknown = true;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
+            if let Some(n) = rows {
+                total = total.saturating_add(n);
+            } else {
+                any_unknown = true;
+                return Ok(TreeNodeRecursion::Stop);
             }
         }
         Ok(TreeNodeRecursion::Continue)

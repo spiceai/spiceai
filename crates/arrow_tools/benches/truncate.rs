@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Criterion benchmarks for the truncation fast-paths and formatting helpers
-//! in arrow_tools.
-//!
-//! Run with: cargo bench -p arrow_tools --bench truncate
-//!
-//! The benchmarks deliberately separate "fast path" (no actual work needed,
-//! exercises the zero-copy clone() paths added in the audit) from
-//! "actual truncation" (exercises the slice+concat / collect paths).
+// Criterion benchmarks for the truncation fast-paths and formatting helpers
+// in arrow_tools.
+//
+// Run with: cargo bench -p arrow_tools --bench truncate
+//
+// The benchmarks deliberately separate "fast path" (no actual work needed,
+// exercises the zero-copy `clone()` paths added in the audit) from
+// "actual truncation" (exercises the slice+concat / collect paths).
 
 use arrow::array::{
     FixedSizeListArray, Int32Array, LargeListViewArray, ListArray, ListViewArray, StringArray,
@@ -35,8 +35,8 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 
-/// Creates a batch where *no* string needs truncation at the given limit.
-/// This exercises the new UTF8 fast-path (cheap any() + early Arc::clone).
+// Creates a batch where *no* string needs truncation at the given limit.
+// This exercises the new UTF8 fast-path (cheap any() + early Arc::clone).
 fn make_all_short_string_batch(n: usize, _max_chars: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
     // All strings are ASCII and well under the limit
@@ -46,8 +46,8 @@ fn make_all_short_string_batch(n: usize, _max_chars: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("valid batch")
 }
 
-/// Creates a batch where a significant fraction of strings *do* need
-/// character truncation. Exercises the collect + truncation path.
+// Creates a batch where a significant fraction of strings *do* need
+// character truncation. Exercises the collect + truncation path.
 fn make_many_long_string_batch(n: usize, max_chars: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
     let long = "x".repeat(max_chars + 20); // will need truncation
@@ -65,8 +65,8 @@ fn make_many_long_string_batch(n: usize, max_chars: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("valid batch")
 }
 
-/// StringViewArray versions of the above (exercises the specific fast-path
-/// arm for DataType::Utf8View that was added during the audit).
+// StringViewArray versions of the above (exercises the specific fast-path
+// arm for DataType::Utf8View that was added during the audit).
 fn make_all_short_string_view_batch(n: usize, _max_chars: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "text",
@@ -102,8 +102,8 @@ fn make_many_long_string_view_batch(n: usize, max_chars: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("valid batch")
 }
 
-/// Creates a List<i32> batch where no list exceeds the element limit.
-/// Exercises the list fast-path (try_fold + clone).
+// Creates a List<i32> batch where no list exceeds the element limit.
+// Exercises the list fast-path (try_fold + clone).
 fn make_all_short_list_batch(n: usize, max_elems: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "nums",
@@ -129,7 +129,7 @@ fn make_all_short_list_batch(n: usize, max_elems: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(list)]).expect("valid batch")
 }
 
-/// Creates a List<i32> batch where truncation is required for every list.
+// Creates a List<i32> batch where truncation is required for every list.
 fn make_long_list_batch(n: usize, truncate_to: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "nums",
@@ -155,9 +155,9 @@ fn make_long_list_batch(n: usize, truncate_to: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(list)]).expect("valid batch")
 }
 
-/// ListView<i32> versions (exercises the ListView truncation path, which has
-/// more complex offset + size handling and a different fast-path decision
-/// based on the explicit sizes buffer).
+// ListView<i32> versions (exercises the ListView truncation path, which has
+// more complex offset + size handling and a different fast-path decision
+// based on the explicit sizes buffer).
 fn make_all_short_list_view_batch(n: usize, max_elems: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "nums",
@@ -216,9 +216,9 @@ fn make_long_list_view_batch(n: usize, truncate_to: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(list_view)]).expect("valid batch")
 }
 
-/// FixedSizeList<i32> versions (exercises the FixedSizeList fast-path, which is
-/// the cheapest of all — just a uniform size comparison — plus the stride-based
-/// slicing + concat work path).
+// FixedSizeList<i32> versions (exercises the FixedSizeList fast-path, which is
+// the cheapest of all — just a uniform size comparison — plus the stride-based
+// slicing + concat work path).
 fn make_all_short_fixed_size_list_batch(n: usize, _max_elems: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "nums",
@@ -265,9 +265,9 @@ fn make_long_fixed_size_list_batch(n: usize, _truncate_to: usize) -> RecordBatch
     RecordBatch::try_new(schema, vec![Arc::new(list)]).expect("valid batch")
 }
 
-/// LargeListView<i32> versions (completes benchmark coverage for all five list
-/// variants that received full support during the type audit; i64 offsets/sizes
-/// + more complex offset rebuild in the work path).
+// LargeListView<i32> versions (completes benchmark coverage for all five list
+// variants that received full support during the type audit; i64 offsets/sizes
+// + more complex offset rebuild in the work path).
 fn make_all_short_large_list_view_batch(n: usize, max_elems: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "nums",
@@ -332,7 +332,7 @@ fn make_long_large_list_view_batch(n: usize, truncate_to: usize) -> RecordBatch 
     RecordBatch::try_new(schema, vec![Arc::new(list_view)]).expect("valid batch")
 }
 
-pub fn bench_truncate(c: &mut Criterion) {
+fn bench_truncate(c: &mut Criterion) {
     let mut group = c.benchmark_group("arrow_tools_truncate");
 
     // String (Utf8) fast path
