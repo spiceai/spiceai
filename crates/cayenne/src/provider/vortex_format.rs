@@ -488,10 +488,25 @@ impl FileSource for CayenneVortexFileSource {
         &self,
         projection: &ProjectionExprs,
     ) -> DFResult<Option<Arc<dyn FileSource>>> {
+        let schema = self.inner.table_schema().file_schema();
+        if contains_decimal_to_floating_projection(projection, schema) {
+            tracing::debug!(
+                %projection,
+                "Skipping Vortex projection pushdown for decimal-to-floating cast"
+            );
+            return Ok(None);
+        }
+
         self.inner
             .try_pushdown_projection(projection)
             .map(|source| source.map(|source| Arc::new(Self::new(source)) as _))
     }
+}
+
+fn contains_decimal_to_floating_projection(projection: &ProjectionExprs, schema: &Schema) -> bool {
+    projection
+        .iter()
+        .any(|expr| contains_decimal_to_floating_cast(expr.expr.as_ref(), schema))
 }
 
 fn contains_decimal_to_floating_cast(expr: &dyn PhysicalExpr, schema: &Schema) -> bool {
@@ -668,6 +683,7 @@ mod tests {
         BinaryExpr, CastExpr, Column, DynamicFilterPhysicalExpr, Literal,
     };
     use datafusion_physical_expr::expressions::{col, lit};
+    use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 
     #[test]
     fn detects_decimal_to_floating_cast_predicate() {
@@ -726,5 +742,44 @@ mod tests {
         );
 
         assert!(contains_decimal_to_floating_cast(&dynamic_filter, &schema));
+    }
+
+    #[test]
+    fn detects_decimal_to_floating_cast_projection() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let cast = Arc::new(CastExpr::new(amount, DataType::Float64, None));
+        let projection = ProjectionExprs::new([ProjectionExpr {
+            expr: cast,
+            alias: "amount_f64".to_string(),
+        }]);
+
+        assert!(contains_decimal_to_floating_projection(
+            &projection,
+            &schema
+        ));
+    }
+
+    #[test]
+    fn allows_plain_decimal_projection() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let projection = ProjectionExprs::new([ProjectionExpr {
+            expr: amount,
+            alias: "amount".to_string(),
+        }]);
+
+        assert!(!contains_decimal_to_floating_projection(
+            &projection,
+            &schema
+        ));
     }
 }
