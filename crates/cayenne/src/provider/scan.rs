@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::BTreeSet, sync::Arc};
+use std::{
+    any::Any,
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+};
 
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
@@ -46,13 +50,17 @@ use datafusion_physical_plan::{
 #[derive(Debug)]
 pub struct CayenneAccelerationExec {
     inner: Arc<dyn ExecutionPlan>,
+    scan_identity: OnceLock<Option<Arc<ScanIdentity>>>,
 }
 
 impl CayenneAccelerationExec {
     /// Creates a new `CayenneAccelerationExec` wrapping the given execution plan.
     #[must_use]
     pub fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+        }
     }
 
     /// Returns a stable identity for the underlying scan source, derived from
@@ -75,25 +83,10 @@ impl CayenneAccelerationExec {
     /// silently collide when paths are stored as relative locations.
     #[must_use]
     pub fn scan_identity(&self) -> Option<Arc<ScanIdentity>> {
-        let file_scan_config = find_file_scan_config(&self.inner)?;
-
-        let mut paths: Vec<String> = file_scan_config
-            .file_groups
-            .iter()
-            .flat_map(datafusion_datasource::file_groups::FileGroup::iter)
-            .map(|pf| pf.object_meta.location.to_string())
-            .collect();
-
-        if paths.is_empty() {
-            return None;
-        }
-
-        paths.sort();
-        paths.dedup();
-        Some(Arc::new(ScanIdentity {
-            object_store_url: Arc::from(file_scan_config.object_store_url.as_str()),
-            paths: Arc::from(paths),
-        }))
+        self.scan_identity
+            .get_or_init(|| compute_scan_identity(&self.inner))
+            .as_ref()
+            .map(Arc::clone)
     }
 
     /// Returns the dynamic filters currently pushed into this Cayenne scan.
@@ -118,9 +111,14 @@ impl CayenneAccelerationExec {
     /// Returns true if this scan already has the specified dynamic filter.
     #[must_use]
     pub fn has_dynamic_filter(&self, filter: &Arc<dyn PhysicalExpr>) -> bool {
-        self.dynamic_filters()
-            .iter()
-            .any(|candidate| Arc::ptr_eq(candidate.filter(), filter))
+        let Some(file_scan_config) = find_file_scan_config(&self.inner) else {
+            return false;
+        };
+        let Some(scan_filter) = file_scan_config.file_source().filter() else {
+            return false;
+        };
+
+        expr_has_dynamic_filter(&scan_filter, filter)
     }
 
     /// Push additional dynamic filters into the underlying file source.
@@ -145,6 +143,28 @@ impl CayenneAccelerationExec {
 
         Ok(Some(Arc::new(Self::new(inner))))
     }
+}
+
+fn compute_scan_identity(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<ScanIdentity>> {
+    let file_scan_config = find_file_scan_config(plan)?;
+
+    let mut paths: Vec<String> = file_scan_config
+        .file_groups
+        .iter()
+        .flat_map(datafusion_datasource::file_groups::FileGroup::iter)
+        .map(|pf| pf.object_meta.location.to_string())
+        .collect();
+
+    if paths.is_empty() {
+        return None;
+    }
+
+    paths.sort();
+    paths.dedup();
+    Some(Arc::new(ScanIdentity {
+        object_store_url: Arc::from(file_scan_config.object_store_url.as_str()),
+        paths: Arc::from(paths),
+    }))
 }
 
 /// Stable identifier for a Cayenne scan source, derived from the
@@ -286,6 +306,16 @@ fn collect_dynamic_filters(expr: &Arc<dyn PhysicalExpr>, filters: &mut Vec<ScanD
     for child in expr.children() {
         collect_dynamic_filters(child, filters);
     }
+}
+
+fn expr_has_dynamic_filter(expr: &Arc<dyn PhysicalExpr>, target: &Arc<dyn PhysicalExpr>) -> bool {
+    if expr.as_any().is::<DynamicFilterPhysicalExpr>() && Arc::ptr_eq(expr, target) {
+        return true;
+    }
+
+    expr.children()
+        .into_iter()
+        .any(|child| expr_has_dynamic_filter(child, target))
 }
 
 fn dynamic_filter_column_names(

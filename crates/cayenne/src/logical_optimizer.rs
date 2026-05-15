@@ -82,7 +82,7 @@ use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion_expr::Expr;
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::expr::InSubquery;
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 /// Prefix for [`SubqueryAlias`] names introduced by
 /// [`CayennePropagateFilterAcrossEquiJoinKeys`].
@@ -145,8 +145,8 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
 
-        let left_is_dim = is_dim_like_subtree(&join.left);
-        let right_is_dim = is_dim_like_subtree(&join.right);
+        let mut left_analysis = analyze_logical_side(&join.left);
+        let mut right_analysis = analyze_logical_side(&join.right);
 
         let mut new_left: Arc<LogicalPlan> = Arc::clone(&join.left);
         let mut new_right: Arc<LogicalPlan> = Arc::clone(&join.right);
@@ -154,9 +154,9 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
 
         for (left_col, right_col) in &equijoin_columns {
             // Propagate the LEFT-side filtered key domain → the RIGHT side.
-            if left_is_dim
-                && subtree_has_non_key_filter(&join.left, left_col)
-                && !subtree_has_propagated_filter_on_key(new_right.as_ref(), right_col)
+            if left_analysis.is_dim_like
+                && left_analysis.has_non_key_filter(left_col)
+                && !right_analysis.has_propagated_filter_on_key(right_col)
             {
                 let subquery_plan = build_key_projection_subquery(
                     Arc::clone(&join.left),
@@ -166,13 +166,14 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                 let wrapped =
                     wrap_with_in_subquery_filter(Arc::clone(&new_right), right_col, subquery_plan)?;
                 new_right = Arc::new(wrapped);
+                right_analysis.add_propagated_filter_key(right_col);
                 changed = true;
             }
 
             // Propagate the RIGHT-side filtered key domain → the LEFT side.
-            if right_is_dim
-                && subtree_has_non_key_filter(&join.right, right_col)
-                && !subtree_has_propagated_filter_on_key(new_left.as_ref(), left_col)
+            if right_analysis.is_dim_like
+                && right_analysis.has_non_key_filter(right_col)
+                && !left_analysis.has_propagated_filter_on_key(left_col)
             {
                 let subquery_plan = build_key_projection_subquery(
                     Arc::clone(&join.right),
@@ -182,6 +183,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                 let wrapped =
                     wrap_with_in_subquery_filter(Arc::clone(&new_left), left_col, subquery_plan)?;
                 new_left = Arc::new(wrapped);
+                left_analysis.add_propagated_filter_key(left_col);
                 changed = true;
             }
         }
@@ -202,6 +204,47 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
 
         Ok(Transformed::yes(LogicalPlan::Join(new_join)))
     }
+}
+
+#[derive(Default)]
+struct SideAnalysis {
+    is_dim_like: bool,
+    filter_columns: BTreeSet<String>,
+    propagated_filter_keys: BTreeSet<String>,
+}
+
+impl SideAnalysis {
+    fn has_non_key_filter(&self, key_col: &Column) -> bool {
+        self.filter_columns
+            .iter()
+            .any(|column| column != &key_col.name)
+    }
+
+    fn has_propagated_filter_on_key(&self, key_col: &Column) -> bool {
+        self.propagated_filter_keys.contains(&key_col.name)
+    }
+
+    fn add_propagated_filter_key(&mut self, key_col: &Column) {
+        self.propagated_filter_keys.insert(key_col.name.clone());
+    }
+}
+
+fn analyze_logical_side(plan: &LogicalPlan) -> SideAnalysis {
+    let mut analysis = SideAnalysis {
+        is_dim_like: is_dim_like_subtree(plan),
+        ..SideAnalysis::default()
+    };
+
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::Filter(filter) = node {
+            collect_filter_column_names(&filter.predicate, &mut analysis.filter_columns);
+            collect_propagated_filter_keys(&filter.predicate, &mut analysis.propagated_filter_keys);
+        }
+
+        Ok(TreeNodeRecursion::Continue)
+    });
+
+    analysis
 }
 
 /// Return the column-only equi-key pairs from `join.on` whose data types match.
@@ -260,50 +303,36 @@ fn is_dim_like_subtree(plan: &LogicalPlan) -> bool {
     }
 }
 
-/// Returns `true` if any `LogicalPlan::Filter` reachable through
-/// transparent operators in `plan` has a predicate that references at least
-/// one column whose name is not `key_col.name()`.
-///
-/// We compare on column *name* rather than the fully qualified `Column` so a
-/// `Filter(n_name = 'CHINA') → TableScan(nation [n_nationkey, n_name])` test
-/// fires regardless of whether the column is qualified as
-/// `nation.n_name` or bare `n_name`.
-fn subtree_has_non_key_filter(plan: &LogicalPlan, key_col: &Column) -> bool {
-    let mut found = false;
-    let _ = plan.apply(|node| match node {
-        LogicalPlan::Filter(f) => {
-            if filter_references_non_key_column(&f.predicate, key_col) {
-                found = true;
-                Ok(TreeNodeRecursion::Stop)
-            } else {
-                Ok(TreeNodeRecursion::Continue)
-            }
+fn collect_filter_column_names(expr: &Expr, columns: &mut BTreeSet<String>) {
+    let _ = expr.apply(|e| {
+        if let Expr::Column(column) = e {
+            columns.insert(column.name.clone());
         }
-        // Don't descend into joins, aggregates, etc. — they break the
-        // "dim-like" invariant and we shouldn't honor filters under them
-        // anyway (already accounted for via `is_dim_like_subtree`).
-        LogicalPlan::Join(_)
-        | LogicalPlan::Aggregate(_)
-        | LogicalPlan::Distinct(_)
-        | LogicalPlan::Union(_)
-        | LogicalPlan::Window(_) => Ok(TreeNodeRecursion::Jump),
-        _ => Ok(TreeNodeRecursion::Continue),
-    });
-    found
-}
 
-fn filter_references_non_key_column(predicate: &Expr, key_col: &Column) -> bool {
-    let mut others = false;
-    let _ = predicate.apply(|e| {
-        if let Expr::Column(c) = e
-            && c.name != key_col.name
-        {
-            others = true;
-            return Ok(TreeNodeRecursion::Stop);
-        }
         Ok(TreeNodeRecursion::Continue)
     });
-    others
+}
+
+fn collect_propagated_filter_keys(expr: &Expr, keys: &mut BTreeSet<String>) {
+    let _ = expr.apply(|e| {
+        if let Expr::InSubquery(InSubquery {
+            expr: target_expr,
+            subquery,
+            ..
+        }) = e
+            && let Expr::Column(column) = target_expr.as_ref()
+            && let LogicalPlan::SubqueryAlias(alias) = subquery.subquery.as_ref()
+            && alias
+                .alias
+                .table()
+                .starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
+        {
+            keys.insert(column.name.clone());
+            return Ok(TreeNodeRecursion::Jump);
+        }
+
+        Ok(TreeNodeRecursion::Continue)
+    });
 }
 
 /// Returns `true` if `plan` already contains a propagated-filter marker.
@@ -322,20 +351,6 @@ fn subtree_has_propagated_filter(plan: &LogicalPlan) -> bool {
         }
         if let LogicalPlan::Filter(f) = node
             && expr_has_propagated_filter(&f.predicate)
-        {
-            found = true;
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    found
-}
-
-fn subtree_has_propagated_filter_on_key(plan: &LogicalPlan, key_col: &Column) -> bool {
-    let mut found = false;
-    let _ = plan.apply(|node| {
-        if let LogicalPlan::Filter(f) = node
-            && expr_has_propagated_filter_on_key(&f.predicate, key_col)
         {
             found = true;
             return Ok(TreeNodeRecursion::Stop);
@@ -367,29 +382,6 @@ pub fn expr_has_propagated_filter(expr: &Expr) -> bool {
     found
 }
 
-fn expr_has_propagated_filter_on_key(expr: &Expr, key_col: &Column) -> bool {
-    let mut found = false;
-    let _ = expr.apply(|e| {
-        if let Expr::InSubquery(InSubquery { expr, subquery, .. }) = e
-            && expr_targets_column(expr, key_col)
-            && let LogicalPlan::SubqueryAlias(alias) = subquery.subquery.as_ref()
-            && alias
-                .alias
-                .table()
-                .starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
-        {
-            found = true;
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    found
-}
-
-fn expr_targets_column(expr: &Expr, key_col: &Column) -> bool {
-    matches!(expr, Expr::Column(column) if column.name == key_col.name)
-}
-
 /// Build a `SubqueryAlias(__cayenne_xclos__N, Projection([key_col], subtree))`
 /// suitable for use as the inner plan of a [`Subquery`] referenced by an
 /// [`InSubquery`] expression.
@@ -397,7 +389,7 @@ fn expr_targets_column(expr: &Expr, key_col: &Column) -> bool {
 /// The alias name uses [`PROPAGATED_FILTER_ALIAS_PREFIX`] plus a unique id
 /// from [`OptimizerConfig::alias_generator`], so each invocation produces a
 /// distinct marker. The marker doubles as the cycle-detection sentinel
-/// scanned by [`subtree_has_propagated_filter_on_key`] / [`expr_has_propagated_filter`].
+/// scanned by [`analyze_logical_side`] / [`expr_has_propagated_filter`].
 fn build_key_projection_subquery(
     subtree: Arc<LogicalPlan>,
     key_col: &Column,
