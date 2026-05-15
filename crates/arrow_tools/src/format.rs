@@ -1877,11 +1877,11 @@ Cras venenatis euismod malesuada.",
                 .with_metadata([("audit".to_string(), "zero_len_view".to_string())].into()),
         );
 
-        // ListView with mixed lengths + one parent NULL
+        // ListView with mixed lengths + one parent NULL (3 lists)
         let values = Int32Array::from(vec![1, 2, 3, 4, 5, 6]);
-        let offsets = ScalarBuffer::<i32>::from(vec![0_i32, 3, 3, 6]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0_i32, 3, 3]); // 3 lists
         let sizes = ScalarBuffer::<i32>::from(vec![3_i32, 0, 3]);
-        let nulls = NullBuffer::from(vec![true, false, true]);
+        let nulls = NullBuffer::from(vec![true, false, true]); // 3 entries
         let input = ListViewArrayAlias::try_new(
             Arc::clone(&element_field),
             offsets,
