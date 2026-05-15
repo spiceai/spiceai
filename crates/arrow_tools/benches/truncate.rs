@@ -23,7 +23,9 @@ limitations under the License.
 //! exercises the zero-copy clone() paths added in the audit) from
 //! "actual truncation" (exercises the slice+concat / collect paths).
 
-use arrow::array::{Int32Array, ListArray, ListViewArray, StringArray, StringViewArray, StringViewBuilder};
+use arrow::array::{
+    Int32Array, ListArray, ListViewArray, StringArray, StringViewArray, StringViewBuilder,
+};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;

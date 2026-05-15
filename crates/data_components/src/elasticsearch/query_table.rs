@@ -430,6 +430,10 @@ fn build_array_from_hits(
                 .collect();
             Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
         }
+        // ES `unsigned_long` maps to Arrow `UInt64` in schema.rs. Decode using
+        // `as_u64` so values up to u64::MAX round-trip without being clipped
+        // through i64. Values outside u64 range (incl. negative numerics) yield
+        // NULL.
         DataType::UInt64 => {
             let values: Vec<Option<u64>> = hits
                 .iter()
@@ -961,6 +965,43 @@ mod tests {
         assert_eq!(closed.as_slice(), ["pit-1"]);
     }
 
+    // ── UInt64 (ES `unsigned_long`) ────────────────────────────────────────────
+
+    /// schema.rs maps ES `unsigned_long` to Arrow `UInt64`. Without a dedicated
+    /// decoder arm, the schema would say UInt64 while the decoder fell into
+    /// the JSON-string fallback, blowing up at RecordBatch construction with a
+    /// schema/data type mismatch.
+    #[test]
+    fn test_unsigned_long_decodes_to_uint64() {
+        use arrow::array::UInt64Array;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "big",
+            DataType::UInt64,
+            true,
+        )]));
+        // u64::MAX would silently lose the high bit if we routed through i64;
+        // include it explicitly to lock in the as_u64 decoding path.
+        let max = u64::MAX;
+        let hits = vec![
+            make_hit(json!({"big": 0_u64})),
+            make_hit(json!({"big": max})),
+            make_hit(json!({})), // missing → null
+            make_hit(json!({"big": -1_i64})), // negative → null (out of u64 range)
+        ];
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("column 0 should be UInt64Array");
+
+        assert_eq!(col.value(0), 0);
+        assert_eq!(col.value(1), max);
+        assert!(col.is_null(2));
+        assert!(col.is_null(3));
+    }
+
     // ── Timestamp ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -1006,26 +1047,6 @@ mod tests {
             .expect("column 0 should be TimestampMicrosecondArray");
 
         assert_eq!(col.value(0), epoch_ms * 1_000);
-    }
-
-    #[test]
-    fn test_uint64_builds_correct_array() {
-        let schema = Arc::new(Schema::new(vec![Field::new("big", DataType::UInt64, true)]));
-        let hits = vec![
-            make_hit(json!({"big": u64::MAX})),
-            make_hit(json!({})),
-            make_hit(json!({"big": -1})),
-        ];
-        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
-        let col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("column 0 should be UInt64Array");
-
-        assert_eq!(col.value(0), u64::MAX);
-        assert!(col.is_null(1));
-        assert!(col.is_null(2));
     }
 
     // ── List<LargeUtf8> ────────────────────────────────────────────────────────
