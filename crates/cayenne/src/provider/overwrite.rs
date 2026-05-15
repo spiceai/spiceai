@@ -159,22 +159,26 @@ impl PreparedOverwrite {
     /// Publish the new snapshot in memory after the caller's transaction has
     /// committed.
     ///
-    /// Performs the bookkeeping that `CayenneDataSink::write_all_overwrite`
-    /// did inline before this lifecycle existed:
+    /// The catalog-side clears (inlined data, inlined deletes, table stats,
+    /// delete files, insert records, snapshot sequences) happen ATOMICALLY
+    /// with the snapshot pointer flip inside `apply_in_txn` / `apply_owned_txn`
+    /// — see [`crate::CayenneCatalog::commit_overwrite_in_txn`]. This method
+    /// only has to sync the in-memory state to match what the catalog now
+    /// reflects:
     ///
-    /// - Update the in-memory `current_snapshot_id` to match the catalog.
+    /// - Update the in-memory `current_snapshot_id`.
     /// - Clear all deletion caches (the new snapshot has no pending deletions).
     /// - Atomically swap the in-memory `ListingTable` to the new snapshot
     ///   (under [`CayenneTableProvider::listing_fence`] write — §6.4).
-    /// - Trigger background cleanup of old snapshot directories.
-    /// - Clear inlined data, inlined deletes, and table-level statistics that
-    ///   were tied to the old snapshot.
+    /// - Invalidate the in-memory optimizer cache (the catalog stats row was
+    ///   already dropped by `commit_overwrite_in_txn`).
     /// - Persist the new statistics accumulator.
+    /// - Trigger background cleanup of old snapshot directories.
     ///
-    /// Failures inside the bookkeeping steps are logged as warnings; the
-    /// visibility flip itself has already been observed by readers via the
-    /// catalog pointer, so the return value reflects success of the whole
-    /// commit.
+    /// If `finish` itself fails or the process crashes between
+    /// `apply_*_txn` and `finish`, the next `CayenneTableProviderBuilder::open`
+    /// will reconstruct the same in-memory state from the catalog (which
+    /// already reflects the new snapshot), so durability is preserved.
     ///
     /// # Errors
     ///
@@ -199,50 +203,11 @@ impl PreparedOverwrite {
             .trigger_old_snapshot_cleanup(&self.new_snapshot_id)
             .await;
 
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_inlined_data(self.table.table_id())
-            .await
-        {
-            tracing::warn!(
-                "Failed to clear inlined data after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_inlined_deletes(self.table.table_id())
-            .await
-        {
-            tracing::warn!(
-                "Failed to clear inlined deletes after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
-        // Clear the prior statistics row before upserting so a zero-row
-        // overwrite leaves no stats at all (rather than stale stats that
-        // describe rows the overwrite just deleted). `persist_table_stats`
-        // is a no-op when the accumulator is empty, so the clear is what
-        // actually removes the stale row in that case.
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_table_statistics(self.table.table_id())
-            .await
-        {
-            tracing::warn!(
-                "Failed to clear table statistics after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        } else {
-            // Invalidate the in-memory optimizer cache before persisting new
-            // stats so a zero-row overwrite leaves the cache empty rather
-            // than stale; `persist_table_stats` repopulates it when the
-            // accumulator has rows.
-            self.table.clear_cached_table_statistics();
-        }
+        // Invalidate the in-memory optimizer cache so a zero-row overwrite
+        // leaves the cache empty rather than stale; `persist_table_stats`
+        // repopulates it when the accumulator has rows. The catalog row was
+        // already cleared atomically with the snapshot pointer flip.
+        self.table.clear_cached_table_statistics();
         self.table.persist_table_stats(&self.write_stats_acc).await;
 
         // Drop the write guard last so all visibility-related updates happen
