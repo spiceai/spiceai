@@ -346,6 +346,22 @@ impl TableProvider for LocationPruningListingTable {
     ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         self.inner.delete_from(state, filters).await
     }
+
+    async fn update(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        assignments: Vec<(String, datafusion_expr::Expr)>,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    async fn truncate(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.truncate(state).await
+    }
 }
 
 /// Extracts literal locations from `location = 'literal'` and `location IN (...)`
