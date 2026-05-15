@@ -102,17 +102,22 @@ pub(crate) fn format_column_data(
                     )?) as ArrayRef
                 }
                 DataType::LargeList(_) => {
-                    let list_array =
-                        column.as_any().downcast_ref::<LargeListArray>().ok_or_else(|| {
+                    let list_array = column
+                        .as_any()
+                        .downcast_ref::<LargeListArray>()
+                        .ok_or_else(|| {
                             ArrowError::CastError("Failed to downcast to LargeListArray".into())
                         })?;
                     Arc::new(truncate_large_list_array(list_array, num_elements)?) as ArrayRef
                 }
                 DataType::ListView(_) => {
                     let list_array =
-                        column.as_any().downcast_ref::<ListViewArray>().ok_or_else(|| {
-                            ArrowError::CastError("Failed to downcast to ListViewArray".into())
-                        })?;
+                        column
+                            .as_any()
+                            .downcast_ref::<ListViewArray>()
+                            .ok_or_else(|| {
+                                ArrowError::CastError("Failed to downcast to ListViewArray".into())
+                            })?;
                     Arc::new(truncate_list_view_array(list_array, num_elements)?) as ArrayRef
                 }
                 DataType::LargeListView(_) => {
@@ -120,16 +125,15 @@ pub(crate) fn format_column_data(
                         .as_any()
                         .downcast_ref::<LargeListViewArray>()
                         .ok_or_else(|| {
-                            ArrowError::CastError(
-                                "Failed to downcast to LargeListViewArray".into(),
-                            )
+                            ArrowError::CastError("Failed to downcast to LargeListViewArray".into())
                         })?;
                     Arc::new(truncate_large_list_view_array(list_array, num_elements)?) as ArrayRef
                 }
                 _ => {
-                    let list_array = column.as_any().downcast_ref::<ListArray>().ok_or_else(
-                        || ArrowError::CastError("Failed to downcast to ListArray".into()),
-                    )?;
+                    let list_array =
+                        column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                            ArrowError::CastError("Failed to downcast to ListArray".into())
+                        })?;
                     Arc::new(truncate_list_array(list_array, num_elements)?) as ArrayRef
                 }
             };
@@ -157,8 +161,10 @@ pub(crate) fn format_column_data(
             Ok(Arc::new(list) as ArrayRef)
         }
         (FormatOperation::TruncateUtf8Length(max_characters), (DataType::LargeList(field), _)) => {
-            let list_array =
-                column.as_any().downcast_ref::<LargeListArray>().ok_or_else(|| {
+            let list_array = column
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| {
                     ArrowError::CastError("Failed to downcast to LargeListArray".into())
                 })?;
 
@@ -181,8 +187,10 @@ pub(crate) fn format_column_data(
             FormatOperation::TruncateUtf8Length(max_characters),
             (DataType::FixedSizeList(field, size), _),
         ) => {
-            let list_array =
-                column.as_any().downcast_ref::<FixedSizeListArray>().ok_or_else(|| {
+            let list_array = column
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
                     ArrowError::CastError("Failed to downcast to FixedSizeListArray".into())
                 })?;
 
@@ -202,8 +210,10 @@ pub(crate) fn format_column_data(
             Ok(Arc::new(list) as ArrayRef)
         }
         (FormatOperation::TruncateUtf8Length(max_characters), (DataType::ListView(field), _)) => {
-            let list_array =
-                column.as_any().downcast_ref::<ListViewArray>().ok_or_else(|| {
+            let list_array = column
+                .as_any()
+                .downcast_ref::<ListViewArray>()
+                .ok_or_else(|| {
                     ArrowError::CastError("Failed to downcast to ListViewArray".into())
                 })?;
 
@@ -305,11 +315,44 @@ fn truncate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
     })
 }
 
-#[expect(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
+fn value_to_usize<T>(value: T, value_name: &str) -> Result<usize, ArrowError>
+where
+    T: TryInto<usize> + std::fmt::Display + Copy,
+{
+    value.try_into().map_err(|_| {
+        ArrowError::InvalidArgumentError(format!(
+            "{value_name} {value} cannot be represented as usize"
+        ))
+    })
+}
+
+fn value_to_i32(value: usize, value_name: &str) -> Result<i32, ArrowError> {
+    i32::try_from(value).map_err(|_| {
+        ArrowError::InvalidArgumentError(format!(
+            "{value_name} {value} cannot be represented as i32"
+        ))
+    })
+}
+
+fn list_slice_range<T>(
+    start_offset: T,
+    end_offset: T,
+    array_name: &str,
+) -> Result<(usize, usize), ArrowError>
+where
+    T: TryInto<usize> + std::fmt::Display + Copy,
+{
+    let start = value_to_usize(start_offset, array_name)?;
+    let end = value_to_usize(end_offset, array_name)?;
+    let len = end.checked_sub(start).ok_or_else(|| {
+        ArrowError::InvalidArgumentError(format!(
+            "{array_name} end offset {end} is before start offset {start}"
+        ))
+    })?;
+
+    Ok((start, len))
+}
+
 fn truncate_fixed_size_list_array(
     list_array: &FixedSizeListArray,
     max_len: usize,
@@ -318,8 +361,10 @@ fn truncate_fixed_size_list_array(
         return Ok(list_array.clone());
     }
     let child_array = list_array.values();
-    let original_size = list_array.value_length() as usize;
+    let original_size =
+        value_to_usize(list_array.value_length(), "FixedSizeListArray value length")?;
     let truncated_size = max_len.min(original_size);
+    let truncated_size_i32 = value_to_i32(truncated_size, "FixedSizeListArray truncated size")?;
 
     let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
         .map(|i| child_array.slice(i * original_size, truncated_size))
@@ -338,13 +383,12 @@ fn truncate_fixed_size_list_array(
             child_array.data_type().clone(),
             child_array.is_nullable(),
         )),
-        truncated_size as i32,
+        truncated_size_i32,
         new_child_array,
         nulls,
     )
 }
 
-#[expect(clippy::cast_sign_loss)]
 fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArray, ArrowError> {
     if list_array.is_empty() {
         return Ok(list_array.clone());
@@ -352,18 +396,18 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
 
-    let new_lengths: Vec<usize> = (0..list_array.len())
+    let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
         .map(|i| {
-            let start = offsets[i] as usize;
-            let end = offsets[i + 1] as usize;
-            max_len.min(end - start)
+            list_slice_range(offsets[i], offsets[i + 1], "ListArray")
+                .map(|(start, len)| (start, max_len.min(len)))
         })
-        .collect();
+        .collect::<Result<_, ArrowError>>()?;
+    let new_lengths: Vec<usize> = slice_ranges.iter().map(|&(_, len)| len).collect();
 
     let sliced_arrays: Vec<Arc<dyn Array>> = new_lengths
         .iter()
-        .enumerate()
-        .map(|(i, &len)| child_array.slice(offsets[i] as usize, len))
+        .zip(slice_ranges.iter())
+        .map(|(&len, &(start, _))| child_array.slice(start, len))
         .collect();
 
     let new_child_array = Arc::new(concat(
@@ -384,7 +428,6 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     )
 }
 
-#[expect(clippy::cast_sign_loss)]
 fn truncate_large_list_array(
     list_array: &LargeListArray,
     max_len: usize,
@@ -395,18 +438,18 @@ fn truncate_large_list_array(
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
 
-    let new_lengths: Vec<usize> = (0..list_array.len())
+    let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
         .map(|i| {
-            let start = offsets[i] as usize;
-            let end = offsets[i + 1] as usize;
-            max_len.min(end - start)
+            list_slice_range(offsets[i], offsets[i + 1], "LargeListArray")
+                .map(|(start, len)| (start, max_len.min(len)))
         })
-        .collect();
+        .collect::<Result<_, ArrowError>>()?;
+    let new_lengths: Vec<usize> = slice_ranges.iter().map(|&(_, len)| len).collect();
 
     let sliced_arrays: Vec<Arc<dyn Array>> = new_lengths
         .iter()
-        .enumerate()
-        .map(|(i, &len)| child_array.slice(offsets[i] as usize, len))
+        .zip(slice_ranges.iter())
+        .map(|(&len, &(start, _))| child_array.slice(start, len))
         .collect();
 
     let new_child_array = Arc::new(concat(
@@ -427,11 +470,6 @@ fn truncate_large_list_array(
     )
 }
 
-#[expect(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
 fn truncate_list_view_array(
     list_array: &ListViewArray,
     max_len: usize,
@@ -443,12 +481,23 @@ fn truncate_list_view_array(
     let offsets = list_array.value_offsets();
     let sizes = list_array.value_sizes();
 
-    let new_sizes: Vec<i32> = (0..list_array.len())
-        .map(|i| (sizes[i] as usize).min(max_len) as i32)
+    let slice_ranges: Vec<(usize, usize, i32)> = (0..list_array.len())
+        .map(|i| {
+            let start = value_to_usize(offsets[i], "ListViewArray offset")?;
+            let original_size = value_to_usize(sizes[i], "ListViewArray size")?;
+            let truncated_size = max_len.min(original_size);
+            let truncated_size_i32 = value_to_i32(truncated_size, "ListViewArray truncated size")?;
+
+            Ok((start, truncated_size, truncated_size_i32))
+        })
+        .collect::<Result<_, ArrowError>>()?;
+    let new_sizes: Vec<i32> = slice_ranges
+        .iter()
+        .map(|&(_, _, truncated_size_i32)| truncated_size_i32)
         .collect();
 
     let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
-        .map(|i| child_array.slice(offsets[i] as usize, new_sizes[i] as usize))
+        .map(|i| child_array.slice(slice_ranges[i].0, slice_ranges[i].1))
         .collect();
 
     let new_child_array = Arc::new(concat(
@@ -465,9 +514,7 @@ fn truncate_list_view_array(
     for &s in &new_sizes {
         new_offsets.push(running);
         running = running.checked_add(s).ok_or_else(|| {
-            ArrowError::InvalidArgumentError(
-                "ListViewArray cumulative size overflowed i32".into(),
-            )
+            ArrowError::InvalidArgumentError("ListViewArray cumulative size overflowed i32".into())
         })?;
     }
 
@@ -484,7 +531,6 @@ fn truncate_list_view_array(
     )
 }
 
-#[expect(clippy::cast_sign_loss)]
 fn truncate_large_list_view_array(
     list_array: &LargeListViewArray,
     max_len: usize,
@@ -497,17 +543,24 @@ fn truncate_large_list_view_array(
     let sizes = list_array.value_sizes();
 
     let max_len_i64 = i64::try_from(max_len).map_err(|_| {
-        ArrowError::InvalidArgumentError(format!(
-            "max_len {max_len} cannot be represented as i64"
-        ))
+        ArrowError::InvalidArgumentError(format!("max_len {max_len} cannot be represented as i64"))
     })?;
 
     let new_sizes: Vec<i64> = (0..list_array.len())
         .map(|i| sizes[i].min(max_len_i64))
         .collect();
 
+    let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
+        .map(|i| {
+            let start = value_to_usize(offsets[i], "LargeListViewArray offset")?;
+            let len = value_to_usize(new_sizes[i], "LargeListViewArray size")?;
+
+            Ok((start, len))
+        })
+        .collect::<Result<_, ArrowError>>()?;
+
     let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
-        .map(|i| child_array.slice(offsets[i] as usize, new_sizes[i] as usize))
+        .map(|i| child_array.slice(slice_ranges[i].0, slice_ranges[i].1))
         .collect();
 
     let new_child_array = Arc::new(concat(
@@ -953,8 +1006,8 @@ Cras venenatis euismod malesuada.",
             None,
         );
 
-        let output = truncate_large_list_array(&input, 2)
-            .expect("truncate_large_list_array failed");
+        let output =
+            truncate_large_list_array(&input, 2).expect("truncate_large_list_array failed");
 
         assert_eq!(output.len(), 3);
         // Each sublist should now have at most 2 elements.
@@ -979,13 +1032,10 @@ Cras venenatis euismod malesuada.",
             None,
             Some(vec![Some(4), Some(5)]),
         ]);
-        let parent_nulls_before: Vec<bool> =
-            (0..input.len()).map(|i| input.is_null(i)).collect();
+        let parent_nulls_before: Vec<bool> = (0..input.len()).map(|i| input.is_null(i)).collect();
 
-        let output =
-            truncate_list_array(&input, 2).expect("truncate_list_array failed");
-        let parent_nulls_after: Vec<bool> =
-            (0..output.len()).map(|i| output.is_null(i)).collect();
+        let output = truncate_list_array(&input, 2).expect("truncate_list_array failed");
+        let parent_nulls_after: Vec<bool> = (0..output.len()).map(|i| output.is_null(i)).collect();
 
         assert_eq!(parent_nulls_before, parent_nulls_after);
         assert_eq!(parent_nulls_after, vec![false, true, false]);
@@ -1007,8 +1057,8 @@ Cras venenatis euismod malesuada.",
             Some(nulls),
         );
 
-        let output = truncate_large_list_array(&input, 2)
-            .expect("truncate_large_list_array failed");
+        let output =
+            truncate_large_list_array(&input, 2).expect("truncate_large_list_array failed");
 
         assert!(!output.is_null(0));
         assert!(output.is_null(1));
@@ -1023,10 +1073,9 @@ Cras venenatis euismod malesuada.",
     #[test]
     fn test_truncate_utf8_recurses_into_all_list_variants() {
         use arrow::array::{
-            FixedSizeListArray as FixedSizeListArrayAlias,
-            LargeListArray as LargeListArrayAlias,
-            LargeListViewArray as LargeListViewArrayAlias,
-            ListViewArray as ListViewArrayAlias, StringArray,
+            FixedSizeListArray as FixedSizeListArrayAlias, LargeListArray as LargeListArrayAlias,
+            LargeListViewArray as LargeListViewArrayAlias, ListViewArray as ListViewArrayAlias,
+            StringArray,
         };
         use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 
@@ -1116,12 +1165,8 @@ Cras venenatis euismod malesuada.",
         assert_first_string_truncated(&truncated, "a");
 
         // FixedSizeList<Utf8>[1]
-        let fsl = FixedSizeListArrayAlias::new(
-            Arc::clone(&inner_field),
-            1,
-            Arc::new(strings()),
-            None,
-        );
+        let fsl =
+            FixedSizeListArrayAlias::new(Arc::clone(&inner_field), 1, Arc::new(strings()), None);
         let truncated = format_column_data(
             Arc::new(fsl) as ArrayRef,
             &Arc::new(Field::new(
@@ -1185,8 +1230,7 @@ Cras venenatis euismod malesuada.",
     fn test_truncate_helpers_handle_empty_arrays() {
         use arrow::array::{
             FixedSizeListArray as FixedSizeListArrayAlias, Int32Array,
-            LargeListArray as LargeListArrayAlias,
-            LargeListViewArray as LargeListViewArrayAlias,
+            LargeListArray as LargeListArrayAlias, LargeListViewArray as LargeListViewArrayAlias,
             ListViewArray as ListViewArrayAlias,
         };
         use arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -1305,8 +1349,7 @@ Cras venenatis euismod malesuada.",
         )
         .expect("ListViewArray::try_new");
 
-        let output =
-            truncate_list_view_array(&input, 2).expect("truncate_list_view_array failed");
+        let output = truncate_list_view_array(&input, 2).expect("truncate_list_view_array failed");
 
         assert_eq!(output.len(), 3);
         // After truncation each entry has at most 2 elements.
