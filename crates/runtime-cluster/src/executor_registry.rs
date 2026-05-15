@@ -355,14 +355,8 @@ impl ExecutorRegistry {
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(connections) = self.connections.try_read() else {
-            tracing::warn!("Failed to acquire read lock on connections");
-            return Vec::new();
-        };
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
-        };
+        let connections = self.connections.blocking_read();
+        let flight_sql_clients = self.flight_sql_clients.blocking_read();
 
         let executors = ready_executors(&connections, &flight_sql_clients);
 
@@ -407,8 +401,9 @@ pub(crate) fn flight_sql_table_provider(
 
 /// Shared logic for `get_partitions` across accelerated and federated partition providers.
 ///
-/// Uses the given [`PartitionStore`] to look up partition metadata, validates liveness against
-/// `connections`, selects a minimal executor set, and returns `(FlightSQL provider, partition values)` pairs.
+/// Uses the given [`PartitionStore`] to look up partition metadata, checks readiness (both an
+/// active connection and a `FlightSQL` client) via the `executors` map, selects a minimal
+/// executor set, and returns `(FlightSQL provider, partition values)` pairs.
 pub(crate) fn get_partitions_from_store(
     partition_store: &PartitionStore,
     executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
@@ -537,14 +532,8 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(connections) = self.connections.try_read() else {
-            tracing::warn!("Failed to acquire read lock on connections");
-            return Vec::new();
-        };
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
-        };
+        let connections = self.connections.blocking_read();
+        let flight_sql_clients = self.flight_sql_clients.blocking_read();
 
         let executors = ready_executors(&connections, &flight_sql_clients);
 
@@ -683,8 +672,8 @@ mod tests {
     }
 
     /// Verify `ready_executors` includes executors present in both maps.
-    #[test]
-    fn ready_executors_includes_fully_registered() {
+    #[tokio::test]
+    async fn ready_executors_includes_fully_registered() {
         let (tx, _rx) = mpsc::channel(1);
         let conn = ExecutorConnection::new(tx);
 
@@ -700,8 +689,8 @@ mod tests {
     }
 
     /// Verify only the intersection is returned when maps partially overlap.
-    #[test]
-    fn ready_executors_returns_intersection() {
+    #[tokio::test]
+    async fn ready_executors_returns_intersection() {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
 
