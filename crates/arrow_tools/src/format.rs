@@ -1113,8 +1113,10 @@ Cras venenatis euismod malesuada.",
         // Each sublist should now have at most 2 elements.
         let observed_lengths: Vec<usize> = (0..output.len())
             .map(|i| {
-                let start = output.value_offsets()[i] as usize;
-                let end = output.value_offsets()[i + 1] as usize;
+                let start =
+                    usize::try_from(output.value_offsets()[i]).expect("offset should fit in usize");
+                let end = usize::try_from(output.value_offsets()[i + 1])
+                    .expect("offset should fit in usize");
                 end - start
             })
             .collect();
@@ -1286,36 +1288,36 @@ Cras venenatis euismod malesuada.",
             // array; inspecting element 0 is enough to prove truncation ran.
             let dt = arr.data_type().clone();
             let child: ArrayRef = match &dt {
-                DataType::List(_) => arr
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .expect("ListArray")
-                    .values()
-                    .clone(),
-                DataType::LargeList(_) => arr
-                    .as_any()
-                    .downcast_ref::<LargeListArrayAlias>()
-                    .expect("LargeListArray")
-                    .values()
-                    .clone(),
-                DataType::FixedSizeList(_, _) => arr
-                    .as_any()
-                    .downcast_ref::<FixedSizeListArrayAlias>()
-                    .expect("FixedSizeListArray")
-                    .values()
-                    .clone(),
-                DataType::ListView(_) => arr
-                    .as_any()
-                    .downcast_ref::<ListViewArrayAlias>()
-                    .expect("ListViewArray")
-                    .values()
-                    .clone(),
-                DataType::LargeListView(_) => arr
-                    .as_any()
-                    .downcast_ref::<LargeListViewArrayAlias>()
-                    .expect("LargeListViewArray")
-                    .values()
-                    .clone(),
+                DataType::List(_) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<ListArray>()
+                        .expect("ListArray")
+                        .values(),
+                ),
+                DataType::LargeList(_) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<LargeListArrayAlias>()
+                        .expect("LargeListArray")
+                        .values(),
+                ),
+                DataType::FixedSizeList(_, _) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<FixedSizeListArrayAlias>()
+                        .expect("FixedSizeListArray")
+                        .values(),
+                ),
+                DataType::ListView(_) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<ListViewArrayAlias>()
+                        .expect("ListViewArray")
+                        .values(),
+                ),
+                DataType::LargeListView(_) => Arc::clone(
+                    arr.as_any()
+                        .downcast_ref::<LargeListViewArrayAlias>()
+                        .expect("LargeListViewArray")
+                        .values(),
+                ),
                 other => panic!("unexpected outer type {other:?}"),
             };
             let strings = child
@@ -1555,7 +1557,7 @@ Cras venenatis euismod malesuada.",
 
         assert_eq!(output.len(), 3);
         // After truncation each entry has at most 2 elements.
-        for size in output.value_sizes().iter() {
+        for size in output.value_sizes() {
             assert!(*size <= 2, "size {size} exceeded max_len");
         }
     }
@@ -1581,7 +1583,7 @@ Cras venenatis euismod malesuada.",
             .expect("truncate_large_list_view_array failed");
 
         assert_eq!(output.len(), 3);
-        for size in output.value_sizes().iter() {
+        for size in output.value_sizes() {
             assert!(*size <= 2, "size {size} exceeded max_len");
         }
     }
@@ -1721,7 +1723,7 @@ Cras venenatis euismod malesuada.",
         ");
     }
 
-    /// max_len = 0 is a valid (if unusual) truncation request: every list
+    /// `max_len = 0` is a valid (if unusual) truncation request: every list
     /// must become a 0-element list while parent nulls and the element Field
     /// (including metadata/nullable) are preserved exactly.
     #[test]
@@ -1761,7 +1763,7 @@ Cras venenatis euismod malesuada.",
         }
     }
 
-    /// Fast-path + max_len=0 for ListView (non-contiguous layout).
+    /// Fast-path + `max_len=0` for `ListView` (non-contiguous layout).
     #[test]
     fn test_truncate_list_view_to_zero_and_fast_path() {
         use arrow::array::{Int32Array, ListViewArray as ListViewArrayAlias};
@@ -1798,7 +1800,7 @@ Cras venenatis euismod malesuada.",
         }
     }
 
-    /// Using the public truncate_numeric_column_length API with a RecordBatch
+    /// Using the public `truncate_numeric_column_length` API with a `RecordBatch`
     /// that contains a mix of list columns that do and do not need truncation.
     /// When the fast path triggers for some columns, the original column Arc
     /// should be reused (identity) for those that didn't change.
@@ -1863,8 +1865,8 @@ Cras venenatis euismod malesuada.",
         }
     }
 
-    /// `max_len = 0` must work correctly for ListView (non-contiguous layout).
-    /// This exercises the ListView truncation path with the most aggressive
+    /// `max_len = 0` must work correctly for `ListView` (non-contiguous layout).
+    /// This exercises the `ListView` truncation path with the most aggressive
     /// truncation limit, ensuring parent nulls and element Field are preserved
     /// even when every list is reduced to zero elements.
     #[test]

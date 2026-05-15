@@ -31,7 +31,7 @@ use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -371,12 +371,17 @@ pub fn bench_truncate(c: &mut Criterion) {
         })
     });
 
-    // ListView fast path (exercises the sizes-based try_fold decision + clone)
-    let short_list_views = make_all_short_list_view_batch(800, 5);
+    // ListView fast path (exercises the sizes-based decision + clone)
+    // Use iter_batched to isolate setup cost (creating the ListView batch
+    // with non-contiguous offsets/sizes is non-trivial).
     group.bench_function("listview_fast_path_800_rows_all_short", |b| {
-        b.iter(|| {
-            truncate_numeric_column_length(black_box(&short_list_views), 5).unwrap();
-        })
+        b.iter_batched(
+            || make_all_short_list_view_batch(800, 5),
+            |batch| {
+                truncate_numeric_column_length(black_box(&batch), 5).unwrap();
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // ListView actual truncation work (exercises the more complex offset/size rebuild)
