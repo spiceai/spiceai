@@ -25,6 +25,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::{error::Result, physical_plan::projection::ProjectionExec};
 use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
@@ -53,41 +54,96 @@ impl std::fmt::Debug for CayenneJoinRewriter {
     }
 }
 
-/// Flatten transparent nodes (like `ProjectionExec` that just pass through columns)
+/// Flatten transparent nodes (like `ProjectionExec` that just pass through columns,
+/// `CoalescePartitionsExec` for merging partitions without altering columns, etc.)
 /// to find the underlying plan node.
+///
+/// This is used by the Cayenne join rewriter to reliably detect whether a join's
+/// probe (or nested build) side is ultimately backed by a `CayenneAccelerationExec`,
+/// even when DataFusion or the runtime inserts transparent wrapper nodes for
+/// batch coalescing, repartitioning, schema casting, bytes tracking, or partition
+/// coalescing.
+///
+/// # Correctness (ACID Consistency for Cayenne-backed queries)
+///
+/// The `CayenneJoinRewriter` *only* rewrites a `HashJoinExec` to use
+/// `ExactLeftAccumulator` (enabling precise dynamic filter pushdown into Cayenne
+/// scans) when this function successfully uncovers a `CayenneAccelerationExec`.
+///
+/// If a transparent wrapper is missed:
+/// - The rewriter silently skips the rewrite.
+/// - Default DataFusion accumulator (range/bloom approx) is used instead.
+/// - For join types that rely on exact "not in" / "in" sets from the build side
+///   (LeftAnti, LeftSemi, RightAnti, and Q21-style "suppliers with no lineitems"
+///   anti-join patterns), this can produce **incorrect query results** (missing or
+///   extraneous rows) or at minimum non-exact filters that violate the "exact"
+///   contract the Cayenne probe expects.
+///
+/// **Devil's advocate review**: One could argue "our plans never insert unknown
+/// wrappers today, and recursion is fine because plan trees have no cycles."
+/// Counter-argument (to be *really sure*): 
+/// - DataFusion versions or future runtime extensions *can* insert additional
+///   passthrough nodes (e.g. new Coalesce*Exec, SortPreservingMerge in some paths,
+///   custom telemetry wrappers).
+/// - A single missed wrapper = silent correctness regression for any user query
+///   that happens to hit that plan shape with Cayenne + qualifying join.
+/// - Deep wrapper nesting (possible via generated SQL or many optimizer rules)
+///   could in theory exhaust recursion stack; iterative loop removes that risk.
+///
+/// Therefore the list of handled wrappers **must** be extended when new transparent
+/// execs are added anywhere in the physical plan pipeline. This function is a
+/// critical correctness gate, not just a perf heuristic.
+///
+/// The implementation uses an iterative loop (not recursion) for robustness.
 fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
-    // ProjectionExec is transparent if it just passes through columns
-    if let Some(projection) = plan.as_any().downcast_ref::<ProjectionExec>() {
-        return flatten_transparent_nodes(projection.input());
+    let mut current = plan;
+    loop {
+        // ProjectionExec is transparent if it just passes through columns
+        if let Some(projection) = current.as_any().downcast_ref::<ProjectionExec>() {
+            current = projection.input();
+            continue;
+        }
+
+        if let Some(bytes_processed_exec) = current.as_any().downcast_ref::<BytesProcessedExec>() {
+            let children = bytes_processed_exec.children();
+            let Some(input) = children.first() else {
+                return current;
+            };
+            current = input;
+            continue;
+        }
+
+        if let Some(repartitioned) = current.as_any().downcast_ref::<RepartitionExec>() {
+            current = repartitioned.input();
+            continue;
+        }
+
+        if let Some(coalesce) = current.as_any().downcast_ref::<CoalesceBatchesExec>() {
+            current = coalesce.input();
+            continue;
+        }
+
+        if let Some(schema_cast_scan) = current.as_any().downcast_ref::<SchemaCastScanExec>() {
+            let children = schema_cast_scan.children();
+            let Some(input) = children.first() else {
+                return current;
+            };
+            current = input;
+            continue;
+        }
+
+        if let Some(coalesce_parts) = current.as_any().downcast_ref::<CoalescePartitionsExec>() {
+            let children = coalesce_parts.children();
+            let Some(input) = children.first() else {
+                return current;
+            };
+            current = input;
+            continue;
+        }
+
+        break;
     }
-
-    if let Some(bytes_processed_exec) = plan.as_any().downcast_ref::<BytesProcessedExec>() {
-        let children = bytes_processed_exec.children();
-        let Some(input) = children.first() else {
-            return plan;
-        };
-
-        return flatten_transparent_nodes(input);
-    }
-
-    if let Some(repartitioned) = plan.as_any().downcast_ref::<RepartitionExec>() {
-        return flatten_transparent_nodes(repartitioned.input());
-    }
-
-    if let Some(coalesce) = plan.as_any().downcast_ref::<CoalesceBatchesExec>() {
-        return flatten_transparent_nodes(coalesce.input());
-    }
-
-    if let Some(schema_cast_scan) = plan.as_any().downcast_ref::<SchemaCastScanExec>() {
-        let children = schema_cast_scan.children();
-        let Some(input) = children.first() else {
-            return plan;
-        };
-
-        return flatten_transparent_nodes(input);
-    }
-
-    plan
+    current
 }
 
 fn hash_join_build_side_is_cayenne(join: &HashJoinExec) -> bool {
@@ -344,6 +400,58 @@ mod tests {
                 .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
                 .is_some(),
             "Transparent wrappers over Cayenne scans should still use ExactLeftAccumulator"
+        );
+    }
+
+    #[test]
+    fn rewrites_hash_join_through_coalesce_partitions() {
+        // CoalescePartitionsExec is a transparent wrapper (used in Cayenne scan paths
+        // for local limit + global limit plans) that must be stripped for correct
+        // detection of Cayenne-backed probe sides. Missing it would silently skip
+        // ExactLeftAccumulator rewrite for any plan containing a coalesced probe join,
+        // risking inexact filters and incorrect results on LeftAnti / anti-join queries.
+        let right_input = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let right = Arc::new(CoalescePartitionsExec::new(right_input));
+        let join = Arc::new(join_with_right(right));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
+                .is_some(),
+            "CoalescePartitionsExec over Cayenne must still trigger ExactLeftAccumulator (ACID consistency gate)"
+        );
+    }
+
+    #[test]
+    fn rewrites_hash_join_through_stacked_transparent_wrappers() {
+        // Edge case: multiple stacked transparent nodes (projection + coalesce partitions)
+        // as can occur in real plans with limits, projections, and partition-aware scans.
+        let right_input = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let right_schema = right_input.schema();
+        let projected = Arc::new(
+            ProjectionExec::try_new(
+                vec![(
+                    col("right_id", &right_schema).expect("projection column should exist"),
+                    "right_id".to_string(),
+                )],
+                right_input,
+            )
+            .expect("projection should be valid"),
+        );
+        let coalesced = Arc::new(CoalescePartitionsExec::new(projected));
+        let join = Arc::new(join_with_right(coalesced));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
+                .is_some(),
+            "Stacked transparent wrappers (Projection + CoalescePartitions) over Cayenne must be fully flattened"
         );
     }
 
