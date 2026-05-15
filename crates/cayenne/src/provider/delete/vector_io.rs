@@ -176,8 +176,14 @@ impl<'a> DeletionVectorWriter<'a> {
             let deletion_dir = self.table_snapshot_deletion_dir();
             let snapshot_dir = deletion_dir
                 .parent()
-                .expect("deletions dir always has a snapshot parent")
-                .to_path_buf();
+                .map(Path::to_path_buf)
+                .ok_or_else(|| Error::Internal {
+                    table: self.table.path.clone(),
+                    message: format!(
+                        "Deletion vector directory '{}' has no snapshot parent",
+                        deletion_dir.display()
+                    ),
+                })?;
 
             // Ensure the deletions/ subdirectory exists.
             // If we just created it, sync its parent (the snapshot directory)
@@ -194,15 +200,17 @@ impl<'a> DeletionVectorWriter<'a> {
             //
             // The sync is one-time per snapshot (first deletion vector
             // written to it). Subsequent deletions reuse the directory.
-            if !deletion_dir.exists() {
-                tokio::fs::create_dir_all(&deletion_dir).await?;
-
-                let table = self.table.path.clone();
-                tokio::task::spawn_blocking(move || std::fs::File::open(&snapshot_dir)?.sync_all())
+            match tokio::fs::create_dir(&deletion_dir).await {
+                Ok(()) => {
+                    let table = self.table.path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        std::fs::File::open(&snapshot_dir)?.sync_all()
+                    })
                     .await
                     .map_err(|source| Error::TaskPanicked { table, source })??;
-            } else {
-                tokio::fs::create_dir_all(&deletion_dir).await?;
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(Error::IoError { source }),
             }
 
             let file_path = Self::deletion_file_path(&deletion_dir);

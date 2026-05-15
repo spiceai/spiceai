@@ -214,6 +214,17 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
+        // For local FS, sync the parent (table base_path) after creating a new
+        // partition sub-directory so its directory entry is durable before we
+        // record the partition in the catalog via add_partition. This follows
+        // the same uniform contract as snapshot directories, _partitioned_wal/,
+        // deletions/ subdirs, and initial table creation.
+        if self.object_store_config.is_none() {
+            if let Some(parent) = partition_dir.parent() {
+                let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+            }
+        }
+
         let partition_column_names = self.partition_column_labels();
         let partition_key = partition_value_strings.join("/");
 

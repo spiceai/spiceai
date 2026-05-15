@@ -499,8 +499,7 @@ impl MetadataCatalog for CayenneCatalog {
                 // first deletions/ subdirs.
                 let table_root_for_sync = table_root.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _ = std::fs::File::open(&table_root_for_sync)
-                        .and_then(|f| f.sync_all());
+                    let _ = std::fs::File::open(&table_root_for_sync).and_then(|f| f.sync_all());
                 })
                 .await;
             }
@@ -1999,8 +1998,7 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
         // initial creation path above and all other new subdir creations.
         let table_root_for_sync = table_root;
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::fs::File::open(&table_root_for_sync)
-                .and_then(|f| f.sync_all());
+            let _ = std::fs::File::open(&table_root_for_sync).and_then(|f| f.sync_all());
         })
         .await;
     } else {

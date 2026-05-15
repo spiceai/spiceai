@@ -290,7 +290,9 @@ fn bench_directory_durability_primitives(c: &mut Criterion) {
                     // ensure_snapshot_dir_exists, ensure_partitioned_wal_dir_and_sync_parent,
                     // and the deletions/ subdir creation in DeletionVectorWriter.
                     if !child.exists() {
-                        tokio::fs::create_dir_all(&child).await.expect("create_dir_all");
+                        tokio::fs::create_dir_all(&child)
+                            .await
+                            .expect("create_dir_all");
                         let p = parent.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             std::fs::File::open(&p).and_then(|f| f.sync_all())
@@ -317,7 +319,9 @@ fn bench_directory_durability_primitives(c: &mut Criterion) {
             |(_keep_alive, _parent, child)| {
                 rt.block_on(async {
                     if !child.exists() {
-                        tokio::fs::create_dir_all(&child).await.expect("create_dir_all");
+                        tokio::fs::create_dir_all(&child)
+                            .await
+                            .expect("create_dir_all");
                     }
                     black_box(child);
                 });
