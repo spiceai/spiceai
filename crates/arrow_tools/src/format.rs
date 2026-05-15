@@ -409,11 +409,13 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     // Fast path: zero-copy clone when no list element exceeds max_len.
     // Avoids building per-row slices + concat (major allocation + copy overhead
     // in the common display path where lists are short).
-    let needs_trunc = (0..list_array.len()).any(|i| {
-        let start = offsets[i] as usize;
-        let end = offsets[i + 1] as usize;
-        end.saturating_sub(start) > max_len
-    });
+    let needs_trunc = (0..list_array.len()).try_fold(false, |needs_trunc, i| {
+        if needs_trunc {
+            return Ok::<_, ArrowError>(true);
+        }
+
+        list_slice_range(offsets[i], offsets[i + 1], "ListArray").map(|(_, len)| len > max_len)
+    })?;
     if !needs_trunc {
         return Ok(list_array.clone());
     }
@@ -457,14 +459,15 @@ fn truncate_large_list_array(
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
     // Fast path: zero-copy clone when truncation is unnecessary (common for
-    // result formatting). LargeList uses i64 offsets; saturating_sub handles
-    // any theoretical overflow safely by forcing the slow path (which will
-    // error later on value_to_usize if truly impossible).
-    let needs_trunc = (0..list_array.len()).any(|i| {
-        let start = offsets[i] as usize;
-        let end = offsets[i + 1] as usize;
-        end.saturating_sub(start) > max_len
-    });
+    // result formatting). LargeList uses i64 offsets, so validate conversion
+    // before deciding whether the slow path is needed.
+    let needs_trunc = (0..list_array.len()).try_fold(false, |needs_trunc, i| {
+        if needs_trunc {
+            return Ok::<_, ArrowError>(true);
+        }
+
+        list_slice_range(offsets[i], offsets[i + 1], "LargeListArray").map(|(_, len)| len > max_len)
+    })?;
     if !needs_trunc {
         return Ok(list_array.clone());
     }
@@ -510,7 +513,14 @@ fn truncate_list_view_array(
     // Fast path for ListView: sizes are stored explicitly, cheap any() scan.
     // When no element exceeds the limit we return the original (preserving
     // whatever non-contiguous view layout the caller had).
-    if !sizes.iter().any(|&s| (s as usize) > max_len) {
+    let needs_trunc = sizes.iter().try_fold(false, |needs_trunc, &size| {
+        if needs_trunc {
+            return Ok::<_, ArrowError>(true);
+        }
+
+        value_to_usize(size, "ListViewArray size").map(|size| size > max_len)
+    })?;
+    if !needs_trunc {
         return Ok(list_array.clone());
     }
     let offsets = list_array.value_offsets();
