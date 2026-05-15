@@ -346,12 +346,12 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "4c63970cf1d78c71eb69e2f4346d5d4795631b47" } # branch: trunk
@@ -469,9 +469,9 @@ parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "96190c47f7a1
 
 object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "2e80208295bcea99c532b5bc1d55fbaa7e26fb1d" } # spiceai-52.5
