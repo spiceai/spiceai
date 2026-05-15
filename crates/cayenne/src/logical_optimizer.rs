@@ -490,16 +490,17 @@ fn key_preserved_through_summaries(plan: &LogicalPlan, key: &Column) -> bool {
                 let key_in_group = a
                     .group_expr
                     .iter()
-                    .any(|expr| matches!(expr, Expr::Column(column) if column.name == key.name));
+                    .any(|expr| matches!(expr, Expr::Column(column) if column == key));
                 key_in_group && walk(&a.input, key)
             }
             LogicalPlan::Distinct(distinct) => {
                 use datafusion::logical_expr::Distinct;
                 let key_kept = match distinct {
                     Distinct::All(_) => true,
-                    Distinct::On(on) => on.on_expr.iter().any(
-                        |expr| matches!(expr, Expr::Column(column) if column.name == key.name),
-                    ),
+                    Distinct::On(on) => on
+                        .on_expr
+                        .iter()
+                        .any(|expr| matches!(expr, Expr::Column(column) if column == key)),
                 };
                 key_kept && walk(distinct_input(distinct), key)
             }
@@ -1078,6 +1079,40 @@ mod tests {
             key_preserved_through_summaries(&agg, &key_b),
             "`b` is in GROUP BY, must be preserved"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn key_preserved_through_summaries_rejects_same_name_different_relation() -> Result<()> {
+        use datafusion::logical_expr::{Aggregate, Distinct, DistinctOn};
+        use datafusion_expr::builder::table_scan;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let scan = table_scan(Some("t2"), &schema, None)?.build()?;
+        let t1_key = Column::new(Some("t1"), "a");
+        let t2_key = Column::new(Some("t2"), "a");
+
+        let aggregate = LogicalPlan::Aggregate(Aggregate::try_new(
+            Arc::new(scan.clone()),
+            vec![Expr::Column(t2_key.clone())],
+            vec![],
+        )?);
+        assert!(
+            !key_preserved_through_summaries(&aggregate, &t1_key),
+            "same-name GROUP BY columns from a different relation must not preserve the key"
+        );
+
+        let distinct_on = LogicalPlan::Distinct(Distinct::On(DistinctOn::try_new(
+            vec![Expr::Column(t2_key.clone())],
+            vec![Expr::Column(t2_key)],
+            None,
+            Arc::new(scan),
+        )?));
+        assert!(
+            !key_preserved_through_summaries(&distinct_on, &t1_key),
+            "same-name DISTINCT ON columns from a different relation must not preserve the key"
+        );
+
         Ok(())
     }
 

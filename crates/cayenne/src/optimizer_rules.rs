@@ -43,15 +43,20 @@ limitations under the License.
 //!    same `Arc` on sibling `CayenneAccelerationExec`s backed by the same
 //!    underlying table and equi-joined column set. The shared `Arc` carries the
 //!    same `Arc<RwLock<Inner>>` state, so all sibling scans observe the exact
-//!    filter values as soon as the producing join accumulates them.
+//!    filter values as soon as the producing join accumulates them. Applies to
+//!    `Inner`, `LeftSemi`, and `RightSemi` parent joins (anti joins are
+//!    excluded — their semantics require the *absence* of a match, so sharing
+//!    the filter would drop rows the anti-join is supposed to preserve).
 //!
-//! 3. **Same-source anti-join sort-merge rewrite.** `DataFusion` does not create
-//!    dynamic filters for anti joins, and q21's `NOT EXISTS` self-join can leave
-//!    large `HashJoinInput[N]` reservations behind. [`CayenneAntiJoinSortMergeRewriter`]
-//!    rewrites same-source Cayenne `LeftAnti` / `RightAnti` `HashJoinExec`
-//!    nodes to `SortMergeJoinExec` with explicit spillable `SortExec` inputs,
-//!    preserving anti-join semantics without materializing a full non-spillable
-//!    build hash table.
+//! 3. **Same-source anti / semi-join sort-merge rewrite.** `DataFusion` does not
+//!    create dynamic filters for anti joins, and q21's `NOT EXISTS` self-join
+//!    can leave large `HashJoinInput[N]` reservations behind.
+//!    [`CayenneAntiJoinSortMergeRewriter`] rewrites same-source Cayenne
+//!    `LeftAnti` / `RightAnti` / `LeftSemi` / `RightSemi` `HashJoinExec` nodes
+//!    to `SortMergeJoinExec` with explicit spillable `SortExec` inputs above a
+//!    10M-row build-side threshold. Sort-merge preserves the join semantics for
+//!    each of these types without materializing a full non-spillable hash table
+//!    on the LEFT input (`HashJoinExec`'s build side, regardless of join type).
 //!
 //! [`CayenneJoinRewriter`] still handles the ordinary inner-join probe side by
 //! swapping the default in-list accumulator for [`ExactLeftAccumulator`], which
