@@ -409,12 +409,16 @@ pub fn bench_truncate(c: &mut Criterion) {
     });
 
     // LargeListView fast path (completes the five-variant benchmark coverage;
-    // i64 sizes scan + zero-copy clone)
-    let short_large_list_views = make_all_short_large_list_view_batch(800, 5);
+    // i64 sizes scan + zero-copy clone).
+    // Use iter_batched to isolate setup cost (i64 ScalarBuffer creation).
     group.bench_function("large_listview_fast_path_800_rows_all_short", |b| {
-        b.iter(|| {
-            truncate_numeric_column_length(black_box(&short_large_list_views), 5).unwrap();
-        })
+        b.iter_batched(
+            || make_all_short_large_list_view_batch(800, 5),
+            |batch| {
+                truncate_numeric_column_length(black_box(&batch), 5).unwrap();
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // LargeListView actual truncation work (i64 offset/size rebuild path)
