@@ -52,3 +52,12 @@ pub const STAGING_DIR_NAME: &str = "_staging";
 /// If this file exists on table open, or before new writes, the previous staged append was
 /// interrupted mid-move and the table may be in an inconsistent state.
 pub const STAGING_WAL_FILENAME: &str = "_wal.json";
+
+/// Temporary filename used during atomic staging WAL writes.
+///
+/// The local-FS WAL writer writes content here first, fsyncs, and then renames
+/// to [`STAGING_WAL_FILENAME`] to make the WAL appear atomically. A leftover
+/// `_wal.json.tmp` from a process killed mid-write is ignored by recovery
+/// (only [`STAGING_WAL_FILENAME`] is consulted) and overwritten on the next
+/// staging attempt.
+pub const STAGING_WAL_TMP_FILENAME: &str = "_wal.json.tmp";

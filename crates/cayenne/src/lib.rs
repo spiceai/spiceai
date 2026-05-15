@@ -79,7 +79,7 @@ pub use metadata::{
     DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete, ObjectStoreConfig,
     PartitionMetadata, TableMetadata, TableStatistics,
 };
-pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
+pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
     CayenneContext, CayenneStagedAppend, CayenneTableProvider, CayenneTableProviderBuilder,
     PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry, PreparedOverwrite,

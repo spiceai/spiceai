@@ -55,7 +55,7 @@ limitations under the License.
 //! of this lifecycle and remains observably identical to the previous behavior.
 
 use super::Result;
-use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
+use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::table::CayenneTableProvider;
 use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
@@ -509,17 +509,25 @@ impl CayenneTableProvider {
     }
 
     /// Write the staging WAL on local filesystem.
+    ///
+    /// Crash-safe: writes to `_wal.json.tmp`, fsyncs the temp file, atomically
+    /// renames to `_wal.json`, then fsyncs the parent (staging) directory so
+    /// the rename itself is durable across power loss. Without the parent
+    /// fsync, a power failure between `rename` and the next dirty-page
+    /// writeback could leave the WAL file's inode on disk but unreachable via
+    /// the directory, defeating the `ensure_no_incomplete_write` check.
     async fn write_staging_wal_local(&self, target_snapshot: &str) -> Result<()> {
         let staging_dir =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
 
-        // Collect staged file names (exclude the WAL file itself).
+        // Collect staged file names (exclude the WAL file itself and any
+        // leftover tmp file from a prior interrupted attempt).
         let mut staged_files = Vec::new();
         let mut entries = tokio::fs::read_dir(&staging_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_type().await?.is_file() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name != STAGING_WAL_FILENAME {
+                if name != STAGING_WAL_FILENAME && name != STAGING_WAL_TMP_FILENAME {
                     staged_files.push(name);
                 }
             }
@@ -533,15 +541,40 @@ impl CayenneTableProvider {
         };
 
         let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
+        let tmp_path = staging_dir.join(STAGING_WAL_TMP_FILENAME);
         let content = serde_json::to_string_pretty(&wal).map_err(|e| Error::Internal {
             table: self.table_name().to_string(),
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
-        tokio::fs::write(&wal_path, content.as_bytes()).await?;
 
-        // fsync the WAL file to ensure it is durable before we begin moving files.
-        let file = tokio::fs::File::open(&wal_path).await?;
-        file.sync_all().await?;
+        // Step 1: write to tmp file + fsync the file contents.
+        tokio::fs::write(&tmp_path, content.as_bytes()).await?;
+        let tmp_file = tokio::fs::File::open(&tmp_path).await?;
+        tmp_file.sync_all().await?;
+        drop(tmp_file);
+
+        // Step 2: atomic rename. POSIX rename within the same directory is
+        // atomic and replaces any existing target. If the rename fails, do a
+        // best-effort cleanup of the tmp file so we don't leave junk behind.
+        if let Err(e) = tokio::fs::rename(&tmp_path, &wal_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
+
+        // Step 3: fsync the parent dir so the rename is durable across a
+        // power-loss restart. Without this, the WAL's directory entry can be
+        // lost even though the file's data is on disk — and that's exactly
+        // the case `ensure_no_incomplete_write` is designed to catch.
+        let dir = tokio::fs::File::open(&staging_dir).await?;
+        if let Err(e) = dir.sync_all().await {
+            // Directory fsync is best-effort: on some filesystems / OSes it
+            // is a no-op anyway. Log the failure but don't abort — the WAL
+            // file itself is already fsync'd and renamed.
+            tracing::warn!(
+                "Failed to fsync staging WAL parent dir {}: {e}",
+                staging_dir.display(),
+            );
+        }
 
         tracing::debug!(
             "Wrote staging WAL for table {} with {} file(s) targeting snapshot {target_snapshot}",

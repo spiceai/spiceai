@@ -33,7 +33,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{
     CayenneStagedAppend, CayenneTableProvider, MetadataCatalog, PreparedStagedAppend,
-    STAGING_DIR_NAME, STAGING_WAL_FILENAME,
+    STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 
 use datafusion::datasource::TableProvider;

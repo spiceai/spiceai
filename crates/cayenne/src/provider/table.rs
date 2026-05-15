@@ -21,7 +21,7 @@ limitations under the License.
 
 use super::constants::{
     DEFAULT_DATA_FILE_ID, LISTING_TABLE_LOCK_POISONED, PROTECTED_SNAPSHOTS_LOCK_POISONED,
-    STAGING_DIR_NAME, STAGING_WAL_FILENAME,
+    STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -1362,9 +1362,14 @@ impl CayenneTableProvider {
 
             let file_name = entry.file_name();
 
-            // Skip the WAL file — it is managed separately (removed after
-            // all data files have been successfully moved).
-            if file_name == STAGING_WAL_FILENAME {
+            // Skip WAL bookkeeping files. The committed WAL (`_wal.json`) is
+            // managed separately (removed after all data files have been
+            // successfully moved). A leftover tmp (`_wal.json.tmp`) can be
+            // present if a prior process crashed between writing the tmp and
+            // renaming it into place — it never contained committed intent,
+            // so just leave it for the next clear_staging_dir cycle rather
+            // than promoting it into the snapshot.
+            if file_name == STAGING_WAL_FILENAME || file_name == STAGING_WAL_TMP_FILENAME {
                 continue;
             }
 
@@ -1434,9 +1439,11 @@ impl CayenneTableProvider {
                     ),
                 })?;
 
-            // Skip the WAL file — it is managed separately (removed after
-            // all data files have been successfully copied/deleted).
-            if relative == STAGING_WAL_FILENAME {
+            // Skip the WAL bookkeeping files — they are managed separately
+            // (the committed WAL is removed after all data files have been
+            // successfully copied/deleted; a leftover tmp from a prior
+            // crashed write is ignored and overwritten on the next attempt).
+            if relative == STAGING_WAL_FILENAME || relative == STAGING_WAL_TMP_FILENAME {
                 continue;
             }
             let target_path =
