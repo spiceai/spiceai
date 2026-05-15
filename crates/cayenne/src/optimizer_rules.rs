@@ -251,7 +251,7 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
 
 #[cfg(test)]
 mod tests {
-    use super::CayenneJoinRewriter;
+    use super::{CayenneJoinRewriter, CoalescePartitionsExec};
     use crate::provider::CayenneAccelerationExec;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::{JoinType, NullEquality};
