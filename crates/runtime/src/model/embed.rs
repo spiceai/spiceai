@@ -235,7 +235,7 @@ fn google(
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
             source: Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "`google_api_key` is required.",
+                "`google_api_key` (or `api_key`) is required.",
             )),
         });
     };
