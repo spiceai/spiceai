@@ -54,7 +54,13 @@ fn bench_pick_candidates(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &files, |b, files| {
             b.iter(|| {
-                let candidate = pick_candidates(black_box(files), black_box(&cfg));
+                let candidate = pick_candidates(
+                    black_box(files).iter().map(|entry| FileEntry {
+                        path: entry.path.as_str(),
+                        size_bytes: entry.size_bytes,
+                    }),
+                    black_box(&cfg),
+                );
                 black_box(candidate);
             });
         });

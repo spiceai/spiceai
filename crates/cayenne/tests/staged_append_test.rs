@@ -957,7 +957,7 @@ async fn test_writer_wal_survives_inline_compaction_impl(
     )?;
 
     // Begin staged append (writes the WAL) but do not commit yet.
-    let staged = common::begin_staged_append_with_batch(&table, batch).await?;
+    let staged = begin_staged_append_with_batch(&table, batch).await?;
 
     // While the WAL is pending, explicitly trigger compaction.
     // This may create a new snapshot and schedule old snapshot cleanup.
@@ -984,7 +984,7 @@ async fn test_writer_wal_survives_inline_compaction_impl(
 }
 
 // ============================================================================
-// Test 18: Writer with pending staging WAL while compaction is triggered.
+// Test 19: Writer with pending staging WAL while compaction is triggered.
 // Verifies that a writer that has written its WAL can still successfully
 // commit after compaction has run (the move targets the live snapshot and
 // the pre-recovery audit does not incorrectly refuse a benign pending WAL).
@@ -1201,6 +1201,31 @@ async fn setup_table(
     fixture: &common::TestFixture,
     table_name: &str,
 ) -> (Arc<CayenneTableProvider>, SessionContext) {
+    setup_table_with_vortex_config(
+        fixture,
+        table_name,
+        cayenne::metadata::VortexConfig::default(),
+    )
+    .await
+}
+
+async fn setup_table_with_compaction(
+    fixture: &common::TestFixture,
+    table_name: &str,
+) -> (Arc<CayenneTableProvider>, SessionContext) {
+    let mut vortex_config = cayenne::metadata::VortexConfig::default();
+    vortex_config.compaction_trigger_files = 2;
+    vortex_config.compaction_max_levels = 1;
+    vortex_config.compaction_max_files_per_pick = 2;
+    vortex_config.compaction_background_interval_ms = 0;
+    setup_table_with_vortex_config(fixture, table_name, vortex_config).await
+}
+
+async fn setup_table_with_vortex_config(
+    fixture: &common::TestFixture,
+    table_name: &str,
+    vortex_config: cayenne::metadata::VortexConfig,
+) -> (Arc<CayenneTableProvider>, SessionContext) {
     let table_options = CreateTableOptions {
         table_name: table_name.to_string(),
         schema: test_schema(),
@@ -1208,7 +1233,7 @@ async fn setup_table(
         on_conflict: None,
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
-        vortex_config: cayenne::metadata::VortexConfig::default(),
+        vortex_config,
     };
 
     let catalog: Arc<dyn MetadataCatalog> =
@@ -1223,6 +1248,18 @@ async fn setup_table(
         .expect("register");
 
     (table, ctx)
+}
+
+async fn begin_staged_append_with_batch(
+    table: &CayenneTableProvider,
+    batch: RecordBatch,
+) -> Result<CayenneStagedAppend, Box<dyn std::error::Error>> {
+    let schema = batch.schema();
+    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+    ));
+    Ok(table.begin_staged_append(stream, 1).await?)
 }
 
 /// Drive `CayenneTableProvider::begin_staged_append` with a fixed-shape batch

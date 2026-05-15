@@ -268,8 +268,9 @@ pub struct VortexConfig {
     /// Minimum number of "small" Vortex files that must accumulate in the current
     /// snapshot before tiered compaction is eligible to run. Files are classified
     /// as "small" when their size is below `target_vortex_file_size_mb / 4`. The
-    /// compactor also requires that the picked files' total size meets the
-    /// per-tier target before rewriting (see [`crate::provider::compaction`]).
+    /// compactor also requires that the eligible tier's total size meets the
+    /// per-tier target before rewriting the current snapshot (see
+    /// [`crate::provider::compaction`]).
     ///
     /// Defaults to 8.
     #[serde(default = "default_compaction_trigger_files")]
@@ -282,8 +283,10 @@ pub struct VortexConfig {
     /// Defaults to 3.
     #[serde(default = "default_compaction_max_levels")]
     pub compaction_max_levels: usize,
-    /// Maximum number of files the picker will combine in a single compaction
-    /// pass. Keeps individual passes bounded in IO and memory.
+    /// Maximum number of eligible file paths the picker retains in a single
+    /// compaction candidate. The current runner uses the candidate as a trigger
+    /// and observability signal, then rewrites the whole current snapshot; this
+    /// setting does not bound rewrite IO or memory.
     ///
     /// Defaults to 32.
     #[serde(default = "default_compaction_max_files_per_pick")]
@@ -292,7 +295,7 @@ pub struct VortexConfig {
     /// per-table background task that calls the compactor every interval. Set to
     /// 0 to disable the background task — inline compaction on writes still runs.
     ///
-    /// Defaults to 30_000 ms.
+    /// Defaults to `30_000` ms.
     #[serde(default = "default_compaction_background_interval_ms")]
     pub compaction_background_interval_ms: u64,
 }

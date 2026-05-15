@@ -23,12 +23,13 @@ limitations under the License.
 //!
 //! The picker buckets files by size into tiers — small, mid, large — and emits
 //! a [`CompactionCandidate`] when the smallest non-empty tier has enough files
-//! whose combined size is worth a rewrite. The runner (in
-//! [`crate::provider::table`]) consumes the candidate and atomically swaps the
-//! current snapshot for a freshly written one. The rewrite goes through
-//! `write_to_snapshot`, which honors `target_partitions` and the configured
-//! target file size, so a pass typically produces one or a small number of
-//! consolidated Vortex files rather than guaranteeing exactly one.
+//! whose combined size is worth a rewrite. The current runner (in
+//! [`crate::provider::table`]) uses that candidate as an eligibility and
+//! observability signal, then atomically rewrites the entire current snapshot.
+//! The rewrite goes through `write_to_snapshot`, which honors `target_partitions`
+//! and the configured target file size, so a pass typically produces one or a
+//! small number of consolidated Vortex files rather than guaranteeing exactly
+//! one.
 //!
 //! The module also owns [`BackgroundCompactor`], a per-table tokio task that
 //! periodically invokes the runner. The task is `Semaphore`-gated so a fleet of
@@ -96,7 +97,9 @@ impl Tier {
 pub(crate) struct CompactionPickerConfig {
     /// Minimum number of files in a tier required to consider compaction.
     pub trigger_files: usize,
-    /// Maximum number of files a single pass will combine.
+    /// Maximum number of file paths retained in the candidate for tracing and
+    /// selection. The current runner still rewrites the whole snapshot once a
+    /// candidate is found.
     pub max_files_per_pick: usize,
     /// Tier thresholds derived from `target_vortex_file_size_mb`.
     pub tiers: CompactionTiers,
@@ -143,50 +146,58 @@ pub(crate) struct CompactionCandidate<P> {
 ///      them as the candidate.
 /// 3. Otherwise return `None`.
 ///
-/// Picking the smallest files first preserves write amplification budget for
-/// where it matters most (many tiny files into one larger file).
+/// Picking the smallest files first keeps the candidate focused on the tier
+/// with the most file-count pressure; the current runner still performs a
+/// whole-snapshot rewrite after the candidate is selected.
 #[must_use]
 pub(crate) fn pick_candidates<P: Clone>(
-    files: &[FileEntry<P>],
+    files: impl IntoIterator<Item = FileEntry<P>>,
     cfg: &CompactionPickerConfig,
 ) -> Option<CompactionCandidate<P>> {
-    if files.is_empty() {
+    let mut small = Vec::new();
+    let mut mid = Vec::new();
+
+    for entry in files {
+        match Tier::classify(entry.size_bytes, &cfg.tiers) {
+            Some(Tier::Small) => small.push(entry),
+            Some(Tier::Mid) => mid.push(entry),
+            None => {}
+        }
+    }
+
+    pick_from_bucket(Tier::Small, &mut small, cfg)
+        .or_else(|| pick_from_bucket(Tier::Mid, &mut mid, cfg))
+}
+
+fn pick_from_bucket<P: Clone>(
+    tier: Tier,
+    bucket: &mut [FileEntry<P>],
+    cfg: &CompactionPickerConfig,
+) -> Option<CompactionCandidate<P>> {
+    if bucket.len() < cfg.trigger_files {
         return None;
     }
 
-    for tier in [Tier::Small, Tier::Mid] {
-        let mut bucket: Vec<&FileEntry<P>> = files
-            .iter()
-            .filter(|entry| Tier::classify(entry.size_bytes, &cfg.tiers) == Some(tier))
-            .collect();
-
-        if bucket.len() < cfg.trigger_files {
-            continue;
-        }
-
-        // Threshold check uses the WHOLE tier's bytes. A bucket of e.g. 100
-        // files at 2 MiB each (200 MiB total) should compact even when the
-        // smallest 32 only sum to 64 MiB — the goal is to relieve file-count
-        // pressure on the snapshot, not to wait until a single pass can write
-        // an entire target file.
-        let tier_total_bytes: u64 = bucket.iter().map(|entry| entry.size_bytes).sum();
-        if tier_total_bytes < cfg.tiers.mid_max_bytes {
-            continue;
-        }
-
-        bucket.sort_by_key(|entry| entry.size_bytes);
-        let max_pick = cfg.max_files_per_pick.min(bucket.len());
-        let picked = &bucket[..max_pick];
-        let picked_bytes: u64 = picked.iter().map(|entry| entry.size_bytes).sum();
-        let paths = picked.iter().map(|entry| entry.path.clone()).collect();
-        return Some(CompactionCandidate {
-            tier,
-            paths,
-            total_bytes: picked_bytes,
-        });
+    // Threshold check uses the WHOLE tier's bytes. A bucket of e.g. 100
+    // files at 2 MiB each (200 MiB total) should compact even when the
+    // smallest 32 only sum to 64 MiB — the goal is to relieve file-count
+    // pressure on the snapshot, not to wait until a single pass can write
+    // an entire target file.
+    let tier_total_bytes: u64 = bucket.iter().map(|entry| entry.size_bytes).sum();
+    if tier_total_bytes < cfg.tiers.mid_max_bytes {
+        return None;
     }
 
-    None
+    bucket.sort_by_key(|entry| entry.size_bytes);
+    let max_pick = cfg.max_files_per_pick.min(bucket.len());
+    let picked = &bucket[..max_pick];
+    let picked_bytes: u64 = picked.iter().map(|entry| entry.size_bytes).sum();
+    let paths = picked.iter().map(|entry| entry.path.clone()).collect();
+    Some(CompactionCandidate {
+        tier,
+        paths,
+        total_bytes: picked_bytes,
+    })
 }
 
 /// Trait the background compactor uses to invoke a per-table compaction pass.
@@ -247,12 +258,9 @@ impl BackgroundCompactor {
 
                 // Acquire a permit, gating concurrent background compactions
                 // across all tables sharing the semaphore.
-                let _permit = match semaphore.clone().acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        // Semaphore closed — provider tree shutting down.
-                        break;
-                    }
+                let Ok(_permit) = Arc::clone(&semaphore).acquire_owned().await else {
+                    // Semaphore closed — provider tree shutting down.
+                    break;
                 };
 
                 match runner.run_compaction_trigger().await {
@@ -343,7 +351,7 @@ mod tests {
     #[test]
     fn picker_handles_empty_input() {
         let cfg = default_cfg();
-        assert!(pick_candidates::<String>(&[], &cfg).is_none());
+        assert!(pick_candidates(std::iter::empty::<FileEntry<String>>(), &cfg).is_none());
     }
 
     #[test]
@@ -351,7 +359,7 @@ mod tests {
         let cfg = default_cfg();
         // 7 small files of 5 MiB each — below trigger_files = 8.
         let files = entries(&[5 * 1024 * 1024; 7]);
-        assert!(pick_candidates(&files, &cfg).is_none());
+        assert!(pick_candidates(files.iter().cloned(), &cfg).is_none());
     }
 
     #[test]
@@ -360,7 +368,7 @@ mod tests {
         // 8 small files of 1 MiB each — meets trigger_files but total = 8 MiB,
         // way below the 128 MiB tier target.
         let files = entries(&[1024 * 1024; 8]);
-        assert!(pick_candidates(&files, &cfg).is_none());
+        assert!(pick_candidates(files.iter().cloned(), &cfg).is_none());
     }
 
     #[test]
@@ -372,7 +380,7 @@ mod tests {
         let mut sizes = vec![16 * 1024 * 1024; 8];
         sizes.extend(vec![64 * 1024 * 1024; 8]);
         let files = entries(&sizes);
-        let candidate = pick_candidates(&files, &cfg).expect("expected a candidate");
+        let candidate = pick_candidates(files.iter().cloned(), &cfg).expect("expected a candidate");
         assert_eq!(candidate.tier, Tier::Small);
         assert_eq!(candidate.paths.len(), 8);
         assert_eq!(candidate.total_bytes, 8 * 16 * 1024 * 1024);
@@ -385,7 +393,7 @@ mod tests {
         // would skip), so we widen the cap enough that the picker has work.
         let cfg = CompactionPickerConfig::new(2, 8, 64 * 1024 * 1024);
         let files = entries(&[10 * 1024 * 1024; 10]);
-        let candidate = pick_candidates(&files, &cfg).expect("expected a candidate");
+        let candidate = pick_candidates(files.iter().cloned(), &cfg).expect("expected a candidate");
         assert_eq!(
             candidate.paths.len(),
             8,
@@ -398,7 +406,7 @@ mod tests {
     fn picker_returns_none_when_only_one_file_above_target() {
         let cfg = default_cfg();
         let files = entries(&[256 * 1024 * 1024]);
-        assert!(pick_candidates(&files, &cfg).is_none());
+        assert!(pick_candidates(files.iter().cloned(), &cfg).is_none());
     }
 
     #[test]
@@ -412,7 +420,7 @@ mod tests {
         let sizes_mib: [u64; 12] = [25, 17, 27, 19, 28, 21, 23, 18, 26, 20, 22, 24];
         let sizes: Vec<u64> = sizes_mib.iter().map(|m| m * 1024 * 1024).collect();
         let files = entries(&sizes);
-        let candidate = pick_candidates(&files, &cfg).expect("expected a candidate");
+        let candidate = pick_candidates(files.iter().cloned(), &cfg).expect("expected a candidate");
         assert_eq!(candidate.tier, Tier::Small);
         assert_eq!(candidate.paths.len(), 8);
 
@@ -427,7 +435,7 @@ mod tests {
         // Simulate post-merge state: small tier is empty, mid tier has 8 files
         // totaling > 128 MiB.
         let files = entries(&[64 * 1024 * 1024; 8]);
-        let candidate = pick_candidates(&files, &cfg).expect("expected a candidate");
+        let candidate = pick_candidates(files.iter().cloned(), &cfg).expect("expected a candidate");
         assert_eq!(candidate.tier, Tier::Mid);
     }
 
@@ -436,7 +444,7 @@ mod tests {
         let cfg = default_cfg();
         // All files at exactly target size — none are candidates.
         let files = entries(&[128 * 1024 * 1024; 16]);
-        assert!(pick_candidates(&files, &cfg).is_none());
+        assert!(pick_candidates(files.iter().cloned(), &cfg).is_none());
     }
 
     #[test]
@@ -448,8 +456,8 @@ mod tests {
         // compaction.
         let cfg = CompactionPickerConfig::new(8, 32, 128 * 1024 * 1024);
         let files = entries(&[2 * 1024 * 1024; 100]);
-        let candidate =
-            pick_candidates(&files, &cfg).expect("expected a candidate from 100 small files");
+        let candidate = pick_candidates(files.iter().cloned(), &cfg)
+            .expect("expected a candidate from 100 small files");
         assert_eq!(candidate.tier, Tier::Small);
         assert_eq!(candidate.paths.len(), 32);
         // `total_bytes` on the candidate reports the picked subset, not the
