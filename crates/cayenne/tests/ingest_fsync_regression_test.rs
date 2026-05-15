@@ -692,3 +692,121 @@ fn partitioned_wal_local_writer_uses_single_open_for_tmp_file() {
          uses a different single-open primitive, update this assertion."
     );
 }
+
+// -----------------------------------------------------------------------------
+// DeletionIndex incremental-bloom regression tests
+// -----------------------------------------------------------------------------
+//
+// `DeletionIndex::extend_max` is called on every PK-aware upsert/delete to
+// merge new (pk → delete_seq) entries into the cached deletion snapshot.
+// A previous revision rebuilt the bloom filter from scratch on every call,
+// turning each per-row update into O(N) work where N is the cumulative
+// cache size. The cumulative cost across M writes was O(M·N), the root
+// cause of the ~200% ingestion regression on upsert-heavy workloads with
+// growing deletion sets (fix landed in commit e8abb4cac4).
+
+const DELETION_INDEX_SRC: &str = include_str!("../src/provider/deletion_index.rs");
+
+#[test]
+fn deletion_index_extend_max_tracks_new_keys_for_incremental_bloom() {
+    let body = extract_fn_body(DELETION_INDEX_SRC, "extend_max")
+        .expect("extend_max function not found in deletion_index.rs");
+
+    assert!(
+        body.contains("new_keys"),
+        "DeletionIndex::extend_max must track newly-inserted keys (typical \
+         pattern: `let mut new_keys: Vec<_> = Vec::new();`) so the bloom \
+         can be updated incrementally for the K new keys instead of being \
+         rebuilt from scratch over all N entries. This turns the per-call \
+         cost from O(N) to O(K) amortized."
+    );
+
+    assert!(
+        body.contains("Vacant") && body.contains("Occupied"),
+        "DeletionIndex::extend_max must use explicit `Entry::Occupied` / \
+         `Entry::Vacant` matching so only newly-inserted keys are recorded \
+         for incremental bloom insertion."
+    );
+}
+
+#[test]
+fn deletion_index_extend_max_has_amortized_rebuild_trigger() {
+    let body = extract_fn_body(DELETION_INDEX_SRC, "extend_max")
+        .expect("extend_max function not found in deletion_index.rs");
+
+    assert!(
+        body.contains("bloom_capacity.saturating_mul(2)") || body.contains("bloom_capacity * 2"),
+        "DeletionIndex::extend_max must compare the new entry count against \
+         `2 * bloom_capacity` to decide when to rebuild. The doubling \
+         threshold amortizes the rebuild cost to O(K) per call (geometric \
+         series). A tighter threshold would re-introduce the regression; a \
+         looser threshold would leak false-positive budget."
+    );
+}
+
+#[test]
+fn deletion_index_does_not_unconditionally_rebuild_bloom() {
+    let body = extract_fn_body(DELETION_INDEX_SRC, "extend_max")
+        .expect("extend_max function not found in deletion_index.rs");
+
+    // The pre-fix implementation ended every extend_max call with
+    // `Self::from_map(entries)`, which unconditionally walks every entry
+    // to rebuild the bloom. Forbid the bare trailing-rebuild pattern.
+    let regressed_tail = "        Self::from_map(entries)\n    }";
+    assert!(
+        !body.contains(regressed_tail),
+        "DeletionIndex::extend_max must NOT end with `Self::from_map(entries)` \
+         as its unconditional tail. That pattern walks every entry to rebuild \
+         the bloom on every call, producing O(N²) cumulative work on upsert \
+         workloads."
+    );
+}
+
+#[test]
+fn deletion_index_tracks_bloom_capacity_field() {
+    assert!(
+        DELETION_INDEX_SRC.contains("bloom_capacity: usize"),
+        "DeletionIndex / KeyDeletionIndex must carry a `bloom_capacity: usize` \
+         field so `extend_max` can decide when to rebuild."
+    );
+
+    let occurrences = DELETION_INDEX_SRC.matches("bloom_capacity:").count();
+    assert!(
+        occurrences >= 2,
+        "Both DeletionIndex and KeyDeletionIndex must declare `bloom_capacity`. \
+         Found {occurrences}; expected at least 2 (Int64Pk + composite-PK)."
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Partition lookup read-lock fast-path regression test
+// -----------------------------------------------------------------------------
+//
+// `CayennePartitionedInsertStrategy::get_or_create_partition_provider` is
+// called once per row group on partitioned ingestion. A previous revision
+// unconditionally acquired `partitions.write().await`, serializing all
+// writers through a single exclusive lock — a global write barrier across
+// the table. Fix: read-lock fast path + double-checked write-lock slow
+// path (commit cc953f0262).
+
+const PARTITIONED_INSERT_STRATEGY_SRC: &str =
+    include_str!("../../runtime/src/dataaccelerator/cayenne/partitioned_insert_strategy.rs");
+
+#[test]
+fn partition_lookup_uses_read_lock_fast_path() {
+    assert!(
+        PARTITIONED_INSERT_STRATEGY_SRC.contains("self.partitions.read().await"),
+        "get_or_create_partition_provider must include a `self.partitions.read().await` \
+         fast-path BEFORE acquiring the write lock. Without it, every per-row \
+         partition lookup goes through the exclusive write lock, serializing \
+         all writers across the partitioned table."
+    );
+
+    assert!(
+        PARTITIONED_INSERT_STRATEGY_SRC.contains("self.partitions.write().await"),
+        "get_or_create_partition_provider must still acquire \
+         `self.partitions.write().await` on the slow path (partition not yet \
+         created). Without it, two concurrent writers creating the same new \
+         partition would race."
+    );
+}
