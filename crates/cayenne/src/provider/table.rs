@@ -1477,7 +1477,25 @@ impl CayenneTableProvider {
         snapshot_dir: &std::path::Path,
     ) -> std::io::Result<()> {
         if !snapshot_dir.exists() {
+            // Capture the parent before creation so we can sync it afterwards.
+            let parent = snapshot_dir.parent().map(|p| p.to_path_buf());
             tokio::fs::create_dir_all(snapshot_dir).await?;
+
+            // Make the *creation of the new snapshot directory itself* durable.
+            // On POSIX, creating a subdirectory updates the parent's directory
+            // metadata. Without syncing the parent, a crash can make the new
+            // snapshot directory "disappear" from the filesystem even though
+            // we later write files into it and commit the catalog to point at it.
+            // This is the same durability requirement we enforce for file
+            // creation, renames, and WAL marker removal elsewhere in the code.
+            if let Some(parent) = parent {
+                let parent = parent;
+                tokio::task::spawn_blocking(move || {
+                    let f = std::fs::File::open(&parent)?;
+                    f.sync_all()
+                })
+                .await??;
+            }
         }
         Ok(())
     }
