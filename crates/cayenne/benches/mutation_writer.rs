@@ -304,6 +304,28 @@ fn bench_directory_durability_primitives(c: &mut Criterion) {
         );
     });
 
+    // For comparison: the cost of create_dir_all *without* the parent sync.
+    // This shows the incremental cost of the durability guarantee.
+    group.bench_function("create_dir_all_without_sync", |b| {
+        b.iter_batched(
+            || {
+                let temp = tempfile::tempdir().expect("tempdir for bench");
+                let parent = temp.path().to_path_buf();
+                let child = parent.join("new_snapshot_without_sync");
+                (temp, parent, child)
+            },
+            |(_keep_alive, _parent, child)| {
+                rt.block_on(async {
+                    if !child.exists() {
+                        tokio::fs::create_dir_all(&child).await.expect("create_dir_all");
+                    }
+                    black_box(child);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
