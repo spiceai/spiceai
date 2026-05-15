@@ -307,6 +307,32 @@ pub struct ExactColumnBounds {
 impl ColumnBounds for ExactColumnBounds {
     /// Converts the collected arrays into an `InListExpr` for use in dynamic filtering.
     /// This builds an IN expression with all collected values.
+    ///
+    /// Devil's advocate (ACID Consistency for anti-join / LeftAnti / Q21 patterns):
+    /// When `use_range_fallback` is true (memory limit hit), we produce a range
+    /// filter instead of an exact InList. For inner/semi joins this is a safe
+    /// over-filter (some rows may be unnecessarily excluded from the probe, but
+    /// the join result remains correct because the build side still filters).
+    ///
+    /// For LeftAnti (and similar "not exists" / "not in" patterns pushed to
+    /// Cayenne via ExactLeftAccumulator), a range-based "NOT BETWEEN" filter is
+    /// an approximation. It may incorrectly exclude probe rows that are outside
+    /// the min/max range but still not present in the exact collected set
+    /// (false positive for the anti-condition). This is accepted as a
+    /// performance trade-off when memory is exhausted; the alternative would be
+    /// to spill or OOM.
+    ///
+    /// The CoalescePartitionsExec + iterative flatten wrapper detection added
+    /// in the optimizer ensures more plans (including those with partition
+    /// coalescing between join and Cayenne scan) now correctly route through
+    /// ExactLeftAccumulator, increasing the importance of these edge cases
+    /// being well understood and tested.
+    ///
+    /// NULL handling: In the exact path, NULLs from the build side are collected
+    /// as ScalarValue::Null. An InList containing NULL never matches (SQL
+    /// three-valued logic), which is the correct "not in" behavior for anti-joins.
+    /// The range fallback may treat NULLs differently depending on RangeBounds
+    /// implementation.
     fn physical_expr(
         &self,
         left_expr: Arc<dyn PhysicalExpr>,
