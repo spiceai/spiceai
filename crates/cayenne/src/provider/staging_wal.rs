@@ -788,26 +788,52 @@ impl CayenneTableProvider {
         };
 
         if let Some((wal, wal_location)) = wal {
-            // Automated recovery (finish the move, remove the WAL, or clean up
-            // orphaned staging files) is not yet implemented — we error to force
-            // operator intervention and prevent silent data loss or corruption.
+            // Best-effort automated recovery:
+            // Re-drive the move of any remaining files listed in the WAL from
+            // staging into the target snapshot, then remove the WAL.
+            // This turns most "IncompleteWrite" situations into self-healing
+            // events instead of requiring manual operator intervention.
             //
-            // On local FS the recent tmp+atomic-rename+parent-fsync hardening
-            // makes it very unlikely that a torn WAL is ever written.
-            // On S3 the equivalent "tmp object + final key" discipline for the
-            // WAL JSON has not yet been applied (see write_staging_wal_s3).
-            // Therefore the S3 path currently has a slightly larger (but still
-            // bounded) window in which `ensure_no_incomplete_write` can fire.
+            // The move logic is idempotent (files already in the target are
+            // skipped or harmlessly re-copied on S3). If the target snapshot
+            // no longer exists (very old WAL after many compactions) or the
+            // move fails irrecoverably, we still return IncompleteWrite.
+            tracing::warn!(
+                table = %self.table_name(),
+                wal_location = %wal_location,
+                target_snapshot = %wal.target_snapshot,
+                staged_files = wal.staged_files.len(),
+                "Incomplete staged append detected — attempting automated recovery"
+            );
 
-            return Err(Error::IncompleteWrite {
-                table: self.table_name().to_string(),
-                message: format!(
-                    "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Some files may have been partially written and require manual resolution. The WAL file is located at '{wal_location}'.",
-                    wal.staged_files.len(),
-                    wal.target_snapshot,
-                    wal.created_at,
-                ),
-            });
+            match self.move_files_to_current_snapshot().await {
+                Ok(()) => {
+                    // Move succeeded (or was a no-op). Remove the WAL.
+                    self.remove_staging_wal().await.ok();
+                    tracing::info!(
+                        table = %self.table_name(),
+                        "Automated recovery from incomplete write succeeded; table is now writable"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::error!(
+                        table = %self.table_name(),
+                        error = %e,
+                        "Automated recovery from incomplete write failed — manual intervention required"
+                    );
+                    return Err(Error::IncompleteWrite {
+                        table: self.table_name().to_string(),
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery was attempted but failed ({}). Manual resolution is required. The WAL file is located at '{wal_location}'.",
+                            wal.staged_files.len(),
+                            wal.target_snapshot,
+                            wal.created_at,
+                            e
+                        ),
+                    });
+                }
+            }
         }
 
         Ok(())
