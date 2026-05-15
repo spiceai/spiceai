@@ -407,8 +407,8 @@ fn list_slice_range<T>(
 where
     T: TryInto<usize> + std::fmt::Display + Copy,
 {
-    let start = value_to_usize(start_offset, array_name)?;
-    let end = value_to_usize(end_offset, array_name)?;
+    let start = value_to_usize(start_offset, &format!("{array_name} start offset"))?;
+    let end = value_to_usize(end_offset, &format!("{array_name} end offset"))?;
     let len = end.checked_sub(start).ok_or_else(|| {
         ArrowError::InvalidArgumentError(format!(
             "{array_name} end offset {end} is before start offset {start}"
