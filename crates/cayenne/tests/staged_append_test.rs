@@ -776,6 +776,165 @@ async fn test_repeated_wal_writes_are_atomic_impl(
 }
 
 // ============================================================================
+// Test 16: ensure_no_incomplete_write audits WAL-listed files before
+// auto-recovery. A WAL that names files which exist in neither `_staging/`
+// nor the current snapshot directory indicates genuine data loss
+// (filesystem corruption or external interference); the recovery code MUST
+// refuse to swallow the WAL silently, since doing so would allow writes to
+// resume against a snapshot state that has lost rows the user once
+// committed.
+//
+// Regression: an earlier iteration of automated recovery would call
+// `move_files_to_current_snapshot()` regardless of what the WAL listed,
+// treat a no-op move as success, and unlink the WAL — turning genuine
+// corruption into a silent loss event. The audit re-establishes the
+// "WAL exists ⇒ writes block ⇒ operator investigates" contract for the
+// corruption case, while still self-healing the benign "crash between
+// rename and WAL removal" case (covered by other tests).
+// ============================================================================
+
+test_with_backends!(test_wal_with_missing_files_blocks_recovery_impl);
+
+async fn test_wal_with_missing_files_blocks_recovery_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "wal_corrupt").await;
+
+    // Establish a snapshot directory by performing a clean insert.
+    ctx.sql("INSERT INTO wal_corrupt VALUES (1, 'Alice')")
+        .await?
+        .collect()
+        .await?;
+
+    // Plant a WAL that references files that exist nowhere on disk —
+    // simulates the "filesystem corruption that lost staged files" scenario.
+    let staging = staging_dir(&table);
+    std::fs::create_dir_all(&staging)?;
+    let wal_content = serde_json::json!({
+        "table_name": "wal_corrupt",
+        "target_snapshot": "missing_snapshot_id",
+        "staged_files": ["part-000.vortex", "part-001.vortex"],
+        "created_at": "2026-03-01T12:00:00Z"
+    });
+    std::fs::write(
+        staging.join(STAGING_WAL_FILENAME),
+        serde_json::to_string_pretty(&wal_content)?,
+    )?;
+
+    // Attempt a fresh write — the audit must refuse to silently recover
+    // the corrupt WAL, so the write fails.
+    let result = ctx
+        .sql("INSERT INTO wal_corrupt VALUES (2, 'Bob')")
+        .await?
+        .collect()
+        .await;
+    assert!(
+        result.is_err(),
+        "audit must refuse silent recovery when the WAL references files \
+         missing from both staging and the current snapshot — otherwise we \
+         lose the previously-committed contents of those files"
+    );
+
+    // The original row must still be visible — the audit must not have
+    // disturbed live data, only blocked the corrupt-WAL recovery.
+    let rows = query_all(&ctx, "wal_corrupt").await;
+    assert_eq!(rows, vec![(1, "Alice".to_string())]);
+
+    Ok(())
+}
+
+// ============================================================================
+// Test 17: Auto-recovery proceeds (does not error) when the WAL lists
+// files that are all already in the current snapshot — i.e., the prior
+// commit's move loop completed but the WAL removal step did not. The
+// audit must recognise this benign case and let recovery unlink the WAL.
+// ============================================================================
+
+test_with_backends!(test_wal_with_files_in_snapshot_self_heals_impl);
+
+async fn test_wal_with_files_in_snapshot_self_heals_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "wal_benign").await;
+
+    // Force the write through the Vortex-file path (bypassing the inline
+    // memtable's <INLINE_MAX_ROWS fast path) by inserting a large batch
+    // directly. After this, the current snapshot directory holds real
+    // `.vortex` files we can reference in a stale WAL.
+    let large_rows: i64 = 2000;
+    let ids: Vec<i64> = (1..=large_rows).collect();
+    let names: Vec<String> = ids.iter().map(|i| format!("n_{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let schema = table.schema();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(name_refs)),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    let vortex_files: Vec<String> = std::fs::read_dir(&snapshot_dir)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".vortex") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !vortex_files.is_empty(),
+        "test setup requires at least one Vortex file in the snapshot \
+         after the large batch insert; got an inline-only write instead"
+    );
+
+    // Plant a WAL referencing those (already-moved) files. Staging is
+    // empty — the audit should still recognise the files in the snapshot
+    // and let recovery unlink the stale WAL.
+    let staging = staging_dir(&table);
+    std::fs::create_dir_all(&staging)?;
+    let wal_content = serde_json::json!({
+        "table_name": "wal_benign",
+        "target_snapshot": &meta.current_snapshot_id,
+        "staged_files": &vortex_files,
+        "created_at": "2026-03-01T12:00:00Z"
+    });
+    std::fs::write(
+        staging.join(STAGING_WAL_FILENAME),
+        serde_json::to_string_pretty(&wal_content)?,
+    )?;
+
+    // A subsequent staged write must succeed — recovery removes the stale
+    // WAL because the audit verifies every WAL-listed file is reachable in
+    // the snapshot directory. Use begin_staged_append to drive through the
+    // ensure_no_incomplete_write path on the staging side.
+    let staged = begin_staged_append_with_rows(&table, &[(9001, "Z")]).await?;
+    staged.commit().await?;
+
+    assert!(
+        !staging.join(STAGING_WAL_FILENAME).exists(),
+        "auto-recovery must unlink the stale WAL once it has verified that \
+         all listed files are accounted for in the snapshot"
+    );
+
+    let total = row_count(&ctx, "wal_benign").await;
+    assert_eq!(
+        total,
+        usize::try_from(large_rows).expect("row count fits") + 1
+    );
+
+    Ok(())
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
