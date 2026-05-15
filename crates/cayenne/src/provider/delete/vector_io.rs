@@ -174,7 +174,38 @@ impl<'a> DeletionVectorWriter<'a> {
             }
 
             let deletion_dir = self.table_snapshot_deletion_dir();
-            tokio::fs::create_dir_all(&deletion_dir).await?;
+            let snapshot_dir = deletion_dir
+                .parent()
+                .expect("deletions dir always has a snapshot parent")
+                .to_path_buf();
+
+            // Ensure the deletions/ subdirectory exists.
+            // If we just created it, sync its parent (the snapshot directory)
+            // so the subdir entry is durable on local FS.
+            //
+            // This is required for the same contract we now enforce for
+            // snapshot directories themselves (ensure_snapshot_dir_exists)
+            // and for the _partitioned_wal/ coordination directory:
+            // on POSIX, mkdir in a directory updates the parent's metadata.
+            // A crash immediately after this create_dir_all but before the
+            // subsequent file write + file fsync + catalog record could
+            // otherwise leave a catalog entry pointing at a deletions/
+            // directory whose creation was lost.
+            //
+            // The sync is one-time per snapshot (first deletion vector
+            // written to it). Subsequent deletions reuse the directory.
+            if !deletion_dir.exists() {
+                tokio::fs::create_dir_all(&deletion_dir).await?;
+
+                let table = self.table.path.clone();
+                tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&snapshot_dir)?.sync_all()
+                })
+                .await
+                .map_err(|source| Error::TaskPanicked { table, source })??;
+            } else {
+                tokio::fs::create_dir_all(&deletion_dir).await?;
+            }
 
             let file_path = Self::deletion_file_path(&deletion_dir);
 
