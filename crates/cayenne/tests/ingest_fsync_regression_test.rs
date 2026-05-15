@@ -940,20 +940,31 @@ fn checkpoint_inlined_pressure_has_cached_fast_path() {
     );
 
     // The early-return must happen BEFORE the catalog call. We check
-    // ordering by string position.
+    // ordering by string position — but the function body's doc comments
+    // may mention `get_inlined_data_stats` by name (e.g. to explain why
+    // the fast path matters), so we search for the actual CALL prefix
+    // `self.catalog` immediately followed by the method, not the bare
+    // function name (which appears in comments).
     let load_idx = body
-        .find("inlined_row_count.load")
+        .find("self.inlined_row_count.load")
+        .or_else(|| body.find("inlined_row_count.load"))
         .expect("cached load not found");
+    // Look for the actual catalog call. The lib uses `self.catalog` then
+    // a builder-style chain ending in `.get_inlined_data_stats(...)`. The
+    // call is uniquely identified by the `.get_inlined_data_stats(` token
+    // — the doc comment, by contrast, references the function by its bare
+    // identifier `get_inlined_data_stats` with no preceding period.
     let catalog_idx = body
-        .find("get_inlined_data_stats")
-        .expect("catalog call not found");
+        .find(".get_inlined_data_stats(")
+        .expect("catalog call .get_inlined_data_stats(...) not found");
     assert!(
         load_idx < catalog_idx,
         "checkpoint_inlined_data_if_memtable_pressure_exceeded must check \
-         the cached row count BEFORE the `get_inlined_data_stats` SQL call. \
+         the cached row count BEFORE the `.get_inlined_data_stats(...)` \
+         SQL call (load_idx={load_idx}, catalog_idx={catalog_idx}). \
          Loading the atomic AFTER the catalog round trip defeats the \
-         purpose — the SQL query has already happened. Reorder so the fast \
-         path returns before any catalog work."
+         purpose — the SQL query has already happened. Reorder so the \
+         fast path returns before any catalog work."
     );
 
     // The fast-path threshold should reference at least one memtable-pressure
