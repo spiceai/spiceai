@@ -353,10 +353,10 @@ fn try_rewrite_same_source_anti_join(
         return Ok(None);
     }
 
-    let Some(preserved_row_count) = anti_join_preserved_input_exact_rows(hash_join) else {
+    let Some(build_row_count) = anti_join_build_input_exact_rows(hash_join) else {
         return Ok(None);
     };
-    if preserved_row_count <= ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS {
+    if build_row_count <= ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS {
         return Ok(None);
     }
 
@@ -397,7 +397,7 @@ fn try_rewrite_same_source_anti_join(
 
     tracing::debug!(
         join_type = ?hash_join.join_type(),
-        preserved_row_count,
+        build_row_count,
         threshold = ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS,
         "Replacing same-source Cayenne anti HashJoinExec with SortMergeJoinExec"
     );
@@ -405,14 +405,13 @@ fn try_rewrite_same_source_anti_join(
     Ok(Some(Arc::new(join)))
 }
 
-fn anti_join_preserved_input_exact_rows(hash_join: &HashJoinExec) -> Option<usize> {
-    let preserved_input = match hash_join.join_type() {
-        JoinType::LeftAnti => hash_join.left(),
-        JoinType::RightAnti => hash_join.right(),
+fn anti_join_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<usize> {
+    let build_input = match hash_join.join_type() {
+        JoinType::LeftAnti | JoinType::RightAnti => hash_join.left(),
         _ => return None,
     };
 
-    match preserved_input.partition_statistics(None).ok()?.num_rows {
+    match build_input.partition_statistics(None).ok()?.num_rows {
         Precision::Exact(row_count) => Some(row_count),
         Precision::Inexact(_) | Precision::Absent => None,
     }
@@ -1554,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_right_anti_hash_join_when_preserved_side_stats_are_unknown() {
+    fn rewrites_right_anti_hash_join_when_build_side_stats_are_exact_large() {
         let schema = order_line_schema();
         let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
         let right = cayenne_file_exec(&schema, "order_line.vortex", None);
@@ -1570,8 +1569,33 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<SortMergeJoinExec>()
+                .is_some(),
+            "RightAnti should gate on the left build side, not the right preserved side"
+        );
+    }
+
+    #[test]
+    fn leaves_right_anti_hash_join_when_build_side_stats_are_unknown() {
+        let schema = order_line_schema();
+        let left = cayenne_file_exec(&schema, "order_line.vortex", None);
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::RightAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+
+        assert!(
             optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
-            "RightAnti should gate on the right preserved side, not the left input"
+            "RightAnti should stay hash join when the left build side has unknown stats"
         );
     }
 
