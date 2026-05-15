@@ -87,9 +87,9 @@ use std::sync::Arc;
 /// Prefix for [`SubqueryAlias`] names introduced by
 /// [`CayennePropagateFilterAcrossEquiJoinKeys`].
 ///
-/// Used both as a sentinel for cycle detection (the rule refuses to fire on a
-/// subtree that already contains an alias starting with this prefix) and as a
-/// marker in explain output so the rewrite is recognizable when reading plans.
+/// Used both as a sentinel for key-scoped cycle detection (the rule refuses to
+/// add another propagated filter for a target key that already has one) and as
+/// a marker in explain output so the rewrite is recognizable when reading plans.
 pub const PROPAGATED_FILTER_ALIAS_PREFIX: &str = "__cayenne_xclos__";
 
 /// Logical optimizer rule that, for each Inner Join with a simple equi-key

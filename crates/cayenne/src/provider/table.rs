@@ -1184,9 +1184,11 @@ impl CayenneTableProvider {
 
     // Create listing options for Vortex format.
     ///
-    /// Only wraps the `VortexFormat` with `DeletionFilteringVortexFormat` for
-    /// `PositionBased` strategy. PK-based strategies (`Int64Pk`, `RowConverterBased`)
-    /// filter at the `ExecutionPlan` level, not during file reading.
+    /// Always wraps the `VortexFormat` so Cayenne-specific Vortex predicate
+    /// pushdown guards apply to every scan. `PositionBased` additionally
+    /// attaches deletion vectors during file reading; PK-based strategies
+    /// (`Int64Pk`, `RowConverterBased`) still filter at the `ExecutionPlan`
+    /// level.
     fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
@@ -1200,9 +1202,9 @@ impl CayenneTableProvider {
                 Arc::clone(cached_deleted_row_ids),
             )),
             PkDeletionStrategyWithCache::Int64Pk { .. }
-            | PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                Arc::clone(vortex_format) as Arc<dyn FileFormat>
-            }
+            | PkDeletionStrategyWithCache::RowConverterBased { .. } => Arc::new(
+                DeletionFilteringVortexFormat::without_deletion_vectors(Arc::clone(vortex_format)),
+            ),
         };
         ListingOptions::new(file_format).with_session_config_options(session_config)
     }

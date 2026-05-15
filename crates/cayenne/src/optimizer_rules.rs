@@ -239,14 +239,15 @@ impl PhysicalOptimizerRule for CayenneDynamicFilterSharing {
 
 #[derive(Clone)]
 struct CayenneScanSummary {
-    identity: ScanIdentity,
+    identity: Arc<ScanIdentity>,
     columns: BTreeSet<String>,
+    schema_columns: Vec<String>,
     dynamic_filters: Vec<ScanDynamicFilter>,
 }
 
 #[derive(Clone)]
 struct FilterAddition {
-    identity: ScanIdentity,
+    identity: Arc<ScanIdentity>,
     filter: Arc<dyn PhysicalExpr>,
 }
 
@@ -277,6 +278,9 @@ fn filter_additions_for_join(
         let [(left_index, right_index)] = matching_pairs.as_slice() else {
             continue;
         };
+        if left_scans[*left_index].schema_columns != right_scans[*right_index].schema_columns {
+            continue;
+        }
 
         pair_columns
             .entry((*left_index, *right_index))
@@ -434,15 +438,17 @@ fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<Ca
     if let Some(cayenne) = plan.as_any().downcast_ref::<CayenneAccelerationExec>()
         && let Some(identity) = cayenne.scan_identity()
     {
-        let columns = cayenne
+        let schema_columns = cayenne
             .schema()
             .fields()
             .iter()
             .map(|field| field.name().clone())
-            .collect();
+            .collect::<Vec<_>>();
+        let columns = schema_columns.iter().cloned().collect();
         scans.push(CayenneScanSummary {
             identity,
             columns,
+            schema_columns,
             dynamic_filters: cayenne.dynamic_filters(),
         });
         return;
@@ -484,7 +490,7 @@ fn same_source_pairs_for_column(
 
 fn push_filter_addition(
     additions: &mut Vec<FilterAddition>,
-    identity: ScanIdentity,
+    identity: Arc<ScanIdentity>,
     filter: Arc<dyn PhysicalExpr>,
 ) {
     if additions
@@ -874,6 +880,14 @@ mod tests {
         ]))
     }
 
+    fn reordered_order_line_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("warehouse_id", DataType::Int64, false),
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("line_number", DataType::Int64, false),
+        ]))
+    }
+
     fn dynamic_filter_for(column_name: &str, schema: &Schema) -> Arc<dyn PhysicalExpr> {
         Arc::new(DynamicFilterPhysicalExpr::new(
             vec![col(column_name, schema).expect("filter column should exist")],
@@ -1128,6 +1142,33 @@ mod tests {
             Some(Arc::clone(&source_filter)),
         );
         let right = cayenne_file_exec(&schema, "order_line.vortex", None);
+        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
+
+        let optimized = optimize_filter_sharing(join);
+        let join = optimized
+            .as_any()
+            .downcast_ref::<HashJoinExec>()
+            .expect("optimized plan should remain a hash join");
+        let right = join
+            .right()
+            .as_any()
+            .downcast_ref::<CayenneAccelerationExec>()
+            .expect("right side should remain Cayenne");
+
+        assert!(right.dynamic_filters().is_empty());
+    }
+
+    #[test]
+    fn does_not_share_dynamic_filter_across_different_projection_order() {
+        let left_schema = order_line_schema();
+        let right_schema = reordered_order_line_schema();
+        let source_filter = dynamic_filter_for("order_id", &left_schema);
+        let left = cayenne_file_exec(
+            &left_schema,
+            "order_line.vortex",
+            Some(Arc::clone(&source_filter)),
+        );
+        let right = cayenne_file_exec(&right_schema, "order_line.vortex", None);
         let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
 
         let optimized = optimize_filter_sharing(join);

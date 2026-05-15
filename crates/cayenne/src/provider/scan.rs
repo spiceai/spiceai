@@ -74,7 +74,7 @@ impl CayenneAccelerationExec {
     /// buckets both with `part-000.vortex`). Without it the identity would
     /// silently collide when paths are stored as relative locations.
     #[must_use]
-    pub fn scan_identity(&self) -> Option<ScanIdentity> {
+    pub fn scan_identity(&self) -> Option<Arc<ScanIdentity>> {
         let file_scan_config = find_file_scan_config(&self.inner)?;
 
         let mut paths: Vec<String> = file_scan_config
@@ -90,10 +90,10 @@ impl CayenneAccelerationExec {
 
         paths.sort();
         paths.dedup();
-        Some(ScanIdentity {
-            object_store_url: file_scan_config.object_store_url.as_str().to_string(),
-            paths,
-        })
+        Some(Arc::new(ScanIdentity {
+            object_store_url: Arc::from(file_scan_config.object_store_url.as_str()),
+            paths: Arc::from(paths),
+        }))
     }
 
     /// Returns the dynamic filters currently pushed into this Cayenne scan.
@@ -156,11 +156,12 @@ impl CayenneAccelerationExec {
 /// logical table compare equal regardless of projection, partitioning, or
 /// wrapper-plan differences — and two scans over different stores that happen
 /// to share a relative path (e.g. two S3 buckets each with `part-000.vortex`)
-/// do *not* collide.
+/// do *not* collide. The path set is reference-counted so copying a scan
+/// identity during optimizer rewrites does not clone every file path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScanIdentity {
-    object_store_url: String,
-    paths: Vec<String>,
+    object_store_url: Arc<str>,
+    paths: Arc<[String]>,
 }
 
 impl ScanIdentity {
@@ -693,16 +694,16 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let a = ScanIdentity {
-            object_store_url: "s3://bucket/".to_string(),
-            paths: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+            object_store_url: Arc::from("s3://bucket/"),
+            paths: Arc::from(vec!["a.parquet".to_string(), "b.parquet".to_string()]),
         };
         let b = ScanIdentity {
-            object_store_url: "s3://bucket/".to_string(),
-            paths: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+            object_store_url: Arc::from("s3://bucket/"),
+            paths: Arc::from(vec!["a.parquet".to_string(), "b.parquet".to_string()]),
         };
         let c = ScanIdentity {
-            object_store_url: "s3://bucket/".to_string(),
-            paths: vec!["a.parquet".to_string()],
+            object_store_url: Arc::from("s3://bucket/"),
+            paths: Arc::from(vec!["a.parquet".to_string()]),
         };
 
         assert_eq!(a, b, "same path set must compare equal");
@@ -727,12 +728,12 @@ mod tests {
         // distinct identities — otherwise cross-scan dynamic filters could
         // mistakenly share state across unrelated tables.
         let bucket_a = ScanIdentity {
-            object_store_url: "s3://bucket-a/".to_string(),
-            paths: vec!["part-000.vortex".to_string()],
+            object_store_url: Arc::from("s3://bucket-a/"),
+            paths: Arc::from(vec!["part-000.vortex".to_string()]),
         };
         let bucket_b = ScanIdentity {
-            object_store_url: "s3://bucket-b/".to_string(),
-            paths: vec!["part-000.vortex".to_string()],
+            object_store_url: Arc::from("s3://bucket-b/"),
+            paths: Arc::from(vec!["part-000.vortex".to_string()]),
         };
         assert_ne!(bucket_a, bucket_b);
     }

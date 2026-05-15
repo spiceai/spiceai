@@ -198,6 +198,13 @@ impl DeletionFilteringVortexFormat {
         }
     }
 
+    /// Create a wrapper that installs Cayenne Vortex predicate-pushdown guards
+    /// without applying any deletion vectors.
+    #[must_use]
+    pub fn without_deletion_vectors(inner: Arc<VortexFormat>) -> Self {
+        Self::new(inner, Arc::new(ArcSwap::from_pointee(HashMap::new())))
+    }
+
     /// Attach `VortexAccessPlan` extensions to files with deletion vectors.
     ///
     /// This is a convenience method that delegates to [`attach_deletion_vectors_to_config`].
