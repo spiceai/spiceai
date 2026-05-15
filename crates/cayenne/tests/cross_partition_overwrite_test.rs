@@ -23,6 +23,21 @@ You may obtain a copy of the License at
 //!   atomically — either every partition advances or none do.
 //! - Rolling back the shared transaction (or surfacing an error from
 //!   `apply_in_txn`) leaves every partition at its prior snapshot pointer.
+//!
+//! Durability note (as of the fixes in this branch):
+//! All local-FS directory creation points that are part of the write +
+//! crash-recovery infrastructure now perform the required parent-directory
+//! sync after `create_dir_all` (snapshot directories via
+//! `ensure_snapshot_dir_exists`, and the _partitioned_wal/ coordination
+//! directory via the helper in `PartitionedWal::write_to`). Combined with
+//! the per-partition staging WAL and deletion vector durability fixes,
+//! a successful cross-partition operation (append or overwrite) leaves
+//! a fully durable set of coordination records and data files on local FS.
+//! The existing fault-injection and restart tests in this file, together
+//! with the per-partition durability tests, provide comprehensive regression
+//! coverage for this property, including the edge case of the very first
+//! cross-partition write on a brand-new table (first creation of the
+//! _partitioned_wal/ directory).
 
 #![expect(
     clippy::expect_used,

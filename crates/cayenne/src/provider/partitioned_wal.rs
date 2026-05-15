@@ -106,6 +106,37 @@ impl PartitionedWal {
         }
     }
 
+    /// Ensure the _partitioned_wal/ subdirectory exists.
+    /// If we just created it, sync its parent (the table root) so the
+    /// subdirectory entry itself is durable on local FS.
+    ///
+    /// This is required for the same reason as the parent-directory sync
+    /// in `ensure_snapshot_dir_exists`: on POSIX, creating a subdirectory
+    /// updates the parent's directory metadata. Without the parent sync,
+    /// a crash can make the _partitioned_wal/ directory "disappear" even
+    /// though we are about to write a coordination record inside it.
+    ///
+    /// This is the last piece of the local-FS durability puzzle for the
+    /// cross-partition coordination infrastructure (the write side of
+    /// `PartitionedWal` now has the same treatment as the removal side
+    /// and as all snapshot directory creation paths).
+    async fn ensure_partitioned_wal_dir_and_sync_parent(
+        table_root: &Path,
+        wal_dir: &Path,
+    ) -> Result<()> {
+        if !wal_dir.exists() {
+            let parent = table_root.to_path_buf(); // the table root
+            let table = table_root.display().to_string();
+            tokio::fs::create_dir_all(wal_dir).await?;
+
+            // Sync the table root so the _partitioned_wal/ subdir entry is durable.
+            tokio::task::spawn_blocking(move || std::fs::File::open(&parent)?.sync_all())
+                .await
+                .map_err(|source| Error::TaskPanicked { table, source })??;
+        }
+        Ok(())
+    }
+
     /// Return the on-disk path for this WAL under the given table root.
     #[must_use]
     pub fn path_under(&self, table_root: &Path) -> PathBuf {
@@ -133,7 +164,12 @@ impl PartitionedWal {
     /// be written, serialization fails, or the atomic rename / fsync fails.
     pub async fn write_to(&self, table_root: &Path) -> Result<PathBuf> {
         let wal_dir = table_root.join(PARTITIONED_WAL_DIR);
-        tokio::fs::create_dir_all(&wal_dir).await?;
+
+        // Ensure the _partitioned_wal/ subdirectory exists and, if we just
+        // created it, sync its parent (the table root) so the subdirectory
+        // entry itself is durable. This is the same durability requirement we
+        // now enforce for new snapshot directories in ensure_snapshot_dir_exists.
+        Self::ensure_partitioned_wal_dir_and_sync_parent(table_root, &wal_dir).await?;
 
         let wal_path = wal_dir.join(format!("{}.json", self.commit_id));
         let tmp_path = wal_dir.join(format!("{}.json.tmp", self.commit_id));
