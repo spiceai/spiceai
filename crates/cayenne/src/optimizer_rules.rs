@@ -780,6 +780,7 @@ mod tests {
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
     use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
     use datafusion_common::stats::Precision;
     use datafusion_common::{DataFusionError, Result as DFResult, Statistics};
@@ -945,6 +946,22 @@ mod tests {
         Arc::new(CayenneAccelerationExec::new(file_exec(
             schema, path, filter,
         )))
+    }
+
+    fn inlined_exec(schema: &Arc<Schema>) -> Arc<dyn ExecutionPlan> {
+        MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(schema), None)
+            .expect("inlined memory exec should be valid")
+    }
+
+    fn cayenne_file_with_inlined_exec(
+        schema: &Arc<Schema>,
+        path: &str,
+        filter: Option<Arc<dyn PhysicalExpr>>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(CayenneAccelerationExec::new(
+            UnionExec::try_new(vec![file_exec(schema, path, filter), inlined_exec(schema)])
+                .expect("mixed file and inlined union should be valid"),
+        ))
     }
 
     fn cayenne_file_exec_with_num_rows(
@@ -1218,6 +1235,34 @@ mod tests {
             Some(Arc::clone(&source_filter)),
         );
         let right = cayenne_file_exec(&schema, "order_line.vortex", None);
+        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
+
+        let optimized = optimize_filter_sharing(join);
+        let join = optimized
+            .as_any()
+            .downcast_ref::<HashJoinExec>()
+            .expect("optimized plan should remain a hash join");
+        let right = join
+            .right()
+            .as_any()
+            .downcast_ref::<CayenneAccelerationExec>()
+            .expect("right side should remain Cayenne");
+        let filters = right.dynamic_filters();
+
+        assert_eq!(1, filters.len());
+        assert!(Arc::ptr_eq(filters[0].filter(), &source_filter));
+    }
+
+    #[test]
+    fn shares_dynamic_filter_with_vortex_branch_of_mixed_inlined_scan() {
+        let schema = order_line_schema();
+        let source_filter = dynamic_filter_for("order_id", &schema);
+        let left = cayenne_file_with_inlined_exec(
+            &schema,
+            "order_line.vortex",
+            Some(Arc::clone(&source_filter)),
+        );
+        let right = cayenne_file_with_inlined_exec(&schema, "order_line.vortex", None);
         let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
 
         let optimized = optimize_filter_sharing(join);
