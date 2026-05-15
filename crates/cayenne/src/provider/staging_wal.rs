@@ -809,6 +809,70 @@ impl CayenneTableProvider {
         if let Some((wal, wal_location)) = wal {
             let table_name = self.table_name().to_string();
 
+            // Audit: every file the WAL claims must be reachable — either
+            // present in `_staging/` (so we can move it) or already present
+            // in the target snapshot directory (so the previous commit's
+            // move loop got that far before the crash). If any WAL-listed
+            // file is missing from BOTH locations, automated recovery would
+            // silently lose data, so refuse and require manual operator
+            // intervention.
+            //
+            // This separates the benign "crash between rename and WAL
+            // removal" (every file already in target snapshot, staging is
+            // empty, recovery is just a WAL unlink) from "filesystem-level
+            // corruption that lost staged files" (file in neither location).
+            // Only the former should self-heal.
+            //
+            // Local-FS only: on S3 we don't audit because verifying every
+            // staged file would require a HEAD per file and the typical S3
+            // fault model favors retry over reconciliation.
+            if !self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
+                let staging_dir = Self::snapshot_dir_path(
+                    self.table_path(),
+                    self.table_id(),
+                    STAGING_DIR_NAME,
+                );
+                let target_dir = self.get_current_snapshot_id().ok().map(|snapshot_id| {
+                    Self::snapshot_dir_path(self.table_path(), self.table_id(), &snapshot_id)
+                });
+
+                let mut missing_files: Vec<String> = Vec::new();
+                for staged_file in &wal.staged_files {
+                    let in_staging = tokio::fs::metadata(staging_dir.join(staged_file))
+                        .await
+                        .is_ok();
+                    let in_target = match &target_dir {
+                        Some(dir) => tokio::fs::metadata(dir.join(staged_file)).await.is_ok(),
+                        None => false,
+                    };
+                    if !in_staging && !in_target {
+                        missing_files.push(staged_file.clone());
+                    }
+                }
+
+                if !missing_files.is_empty() {
+                    tracing::error!(
+                        table = table_name.as_str(),
+                        wal_location = %wal_location,
+                        missing_count = missing_files.len(),
+                        total_files = wal.staged_files.len(),
+                        "Incomplete staged append references files missing from both staging and target snapshot; refusing automated recovery"
+                    );
+                    let sample: Vec<&str> =
+                        missing_files.iter().take(3).map(String::as_str).collect();
+                    return Err(Error::IncompleteWrite {
+                        table: table_name,
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery aborted because {} of those file(s) are missing from both '_staging/' and the target snapshot — e.g. {sample:?}. This indicates genuine data loss (filesystem corruption or external interference). Manual resolution is required. The WAL file is located at '{wal_location}'.",
+                            wal.staged_files.len(),
+                            wal.target_snapshot,
+                            wal.created_at,
+                            missing_files.len(),
+                        ),
+                    });
+                }
+            }
+
             // Best-effort automated recovery:
             // Re-drive the move of any remaining files listed in the WAL from
             // staging into the target snapshot, then remove the WAL.
