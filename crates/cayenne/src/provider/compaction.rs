@@ -178,13 +178,24 @@ fn pick_from_bucket<P: Clone>(
         return None;
     }
 
-    // Threshold check uses the WHOLE tier's bytes. A bucket of e.g. 100
-    // files at 2 MiB each (200 MiB total) should compact even when the
-    // smallest 32 only sum to 64 MiB — the goal is to relieve file-count
-    // pressure on the snapshot, not to wait until a single pass can write
-    // an entire target file.
+    // Threshold check uses the WHOLE tier's bytes.
+    //
+    // For the Small tier the primary goal (as documented) is to relieve
+    // *file-count* pressure (many tiny objects hurt LIST performance, scan
+    // overhead, and S3 costs). We therefore trigger on count (`>= trigger_files`)
+    // as long as the tier has accumulated at least one "full small file" worth
+    // of data (`>= small_max_bytes`). This is much more responsive to file
+    // count than requiring `small_max * trigger_files` total bytes.
+    //
+    // For Mid we keep the higher `mid_max_bytes` threshold because those
+    // files are already closer to the target size and the goal is more about
+    // reaching good file sizes.
     let tier_total_bytes: u64 = bucket.iter().map(|entry| entry.size_bytes).sum();
-    if tier_total_bytes < cfg.tiers.mid_max_bytes {
+    let byte_threshold = match tier {
+        Tier::Small => cfg.tiers.small_max_bytes,
+        Tier::Mid => cfg.tiers.mid_max_bytes,
+    };
+    if tier_total_bytes < byte_threshold {
         return None;
     }
 
