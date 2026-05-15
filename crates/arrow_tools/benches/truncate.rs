@@ -392,12 +392,17 @@ pub fn bench_truncate(c: &mut Criterion) {
         })
     });
 
-    // FixedSizeList fast path (cheapest decision: uniform size comparison)
-    let short_fsl = make_all_short_fixed_size_list_batch(800, 5);
+    // FixedSizeList fast path (cheapest decision: uniform size comparison).
+    // Use iter_batched for consistency with the view variants (even though
+    // setup is simpler, it keeps the benchmark structure uniform).
     group.bench_function("fixed_size_list_fast_path_800_rows_all_short", |b| {
-        b.iter(|| {
-            truncate_numeric_column_length(black_box(&short_fsl), 5).unwrap();
-        })
+        b.iter_batched(
+            || make_all_short_fixed_size_list_batch(800, 5),
+            |batch| {
+                truncate_numeric_column_length(black_box(&batch), 5).unwrap();
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // FixedSizeList actual truncation work (stride-based slicing + concat)
