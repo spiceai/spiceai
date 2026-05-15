@@ -388,10 +388,16 @@ impl MetadataCatalog for CayenneCatalog {
             // partition subdirs, initial table creation).
             if let Some(parent) = db_dir.parent() {
                 let parent = parent.to_path_buf();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = std::fs::File::open(&parent).and_then(|f| f.sync_all());
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&parent).and_then(|f| f.sync_all())
                 })
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        "Failed to sync parent of catalog DB directory {} (subsequent DB writes will still be durable; directory entry may not survive crash): {e}",
+                        db_dir.display()
+                    );
+                }
             }
         }
 
