@@ -5259,6 +5259,45 @@ impl CayenneTableProvider {
     /// Flush the inline level-0 memtable when accumulated entries would make reads or
     /// rewrites too expensive.
     pub(crate) async fn checkpoint_inlined_data_if_memtable_pressure_exceeded(&self) -> Result<()> {
+        // Fast path: skip the catalog round trip when the cached row count
+        // is provably below every memtable-pressure threshold. The pre-fix
+        // implementation issued a `get_inlined_data_stats` SQL query on
+        // every inline-write commit just to read three integer counters
+        // that we already maintain in-process. On network catalogs (Turso,
+        // PostgreSQL metastore) each round trip costs 10-50 ms — orders of
+        // magnitude more than the rest of the per-row write — and
+        // dominated throughput on small-batch CDC ingestion. This is the
+        // same shape of fast path the parallel agents added for
+        // `clear_staging_dir`, `ensure_no_incomplete_write`, and the
+        // compaction trigger.
+        //
+        // Why the threshold is `INLINE_MEMTABLE_MAX_BYTES / INLINE_MAX_BYTES`:
+        // every `commit_inlined_data_mutation` call from the inline-write
+        // path adds at most 1 inline entry, with at most `INLINE_MAX_BYTES`
+        // (1 MiB) of IPC payload and at most `INLINE_MAX_ROWS` (1024) rows.
+        // Cached `inlined_row_count` ≥ number of commits (each commit
+        // contributes ≥ 1 row). So:
+        //   - commits ≤ cached_rows
+        //   - entries  ≤ commits          ≤ cached_rows < INLINE_MEMTABLE_MAX_SEGMENTS
+        //   - bytes    ≤ commits·1MiB     ≤ cached_rows·1MiB < INLINE_MEMTABLE_MAX_BYTES
+        // when `cached_rows < INLINE_MEMTABLE_MAX_BYTES / INLINE_MAX_BYTES`
+        // (currently 8). The row threshold is the loosest of the three (10K
+        // vs 8 vs 64 in commit units), so the bytes bound dominates the
+        // safe-skip region.
+        //
+        // For workloads with many small rows per commit (typical CDC: a
+        // single row per envelope) this skips the catalog for the entire
+        // first 8 commits. For larger commits (each near `INLINE_MAX_BYTES`)
+        // the safe-skip ends sooner — correctly — because we are closer to
+        // the bytes threshold. After the fast path stops, we fall through
+        // to the catalog for accurate stats including bytes.
+        let cached_rows = self.inlined_row_count.load(Ordering::Relaxed);
+        let safe_skip_threshold: i64 =
+            (INLINE_MEMTABLE_MAX_BYTES / INLINE_MAX_BYTES as i64).max(1);
+        if cached_rows < safe_skip_threshold {
+            return Ok(());
+        }
+
         let stats = self
             .catalog
             .get_inlined_data_stats(&self.table_metadata.table_id)

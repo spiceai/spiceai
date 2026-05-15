@@ -831,8 +831,7 @@ fn partition_lookup_uses_read_lock_fast_path() {
 // touched by THIS commit.
 
 const DELETION_STRATEGY_SRC: &str = include_str!("../src/provider/deletion_strategy.rs");
-const POSITION_BASED_SINK_SRC: &str =
-    include_str!("../src/provider/delete/sink/position_based.rs");
+const POSITION_BASED_SINK_SRC: &str = include_str!("../src/provider/delete/sink/position_based.rs");
 
 #[test]
 fn position_bitmap_type_wraps_bitmap_in_arc() {
@@ -895,5 +894,82 @@ fn position_based_sink_uses_try_unwrap_on_existing_bitmaps() {
          place; otherwise it falls back to a one-time clone of THAT file's \
          bitmap only. Either way, we never touch any other file's bitmap \
          data."
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Inline-memtable pressure check fast-path regression test
+// -----------------------------------------------------------------------------
+//
+// `checkpoint_inlined_data_if_memtable_pressure_exceeded` is called after
+// every inline-write commit to decide whether to flush the level-0 inline
+// memtable to Vortex. The pre-fix implementation unconditionally issued a
+// `get_inlined_data_stats` SQL query (per-write catalog round trip) just to
+// read three integer counters that the in-process atomic
+// `inlined_row_count` already tracks accurately. On network catalogs
+// (Turso, PostgreSQL metastore) each round trip costs 10-50 ms, dominating
+// the small-batch CDC ingestion path.
+//
+// The fix consults the cached `inlined_row_count` first: when far below the
+// segments-threshold-implied row count, neither the segments threshold nor
+// the bytes threshold can have been crossed (each commit adds at most one
+// inline entry, and INLINE_MAX_BYTES caps per-write payload), so the SQL
+// query is unnecessary. This is the same fast-path treatment the parallel
+// agents already applied to `clear_staging_dir`,
+// `ensure_no_incomplete_write`, and the compaction trigger.
+
+#[test]
+fn checkpoint_inlined_pressure_has_cached_fast_path() {
+    let body = extract_fn_body(
+        TABLE_SRC,
+        "checkpoint_inlined_data_if_memtable_pressure_exceeded",
+    )
+    .expect(
+        "checkpoint_inlined_data_if_memtable_pressure_exceeded function not found in table.rs",
+    );
+
+    // The fast path must use the cached atomic before the catalog call.
+    assert!(
+        body.contains("inlined_row_count.load"),
+        "checkpoint_inlined_data_if_memtable_pressure_exceeded must consult \
+         `self.inlined_row_count.load(...)` BEFORE the catalog round trip. \
+         Without the cached-atomic fast path, every inline write pays a \
+         `get_inlined_data_stats` SQL query — ~ms on SQLite and 10-50 ms on \
+         network catalogs — even though the in-process atomic counter is \
+         accurate within a single Cayenne writer."
+    );
+
+    // The early-return must happen BEFORE the catalog call. We check
+    // ordering by string position.
+    let load_idx = body
+        .find("inlined_row_count.load")
+        .expect("cached load not found");
+    let catalog_idx = body
+        .find("get_inlined_data_stats")
+        .expect("catalog call not found");
+    assert!(
+        load_idx < catalog_idx,
+        "checkpoint_inlined_data_if_memtable_pressure_exceeded must check \
+         the cached row count BEFORE the `get_inlined_data_stats` SQL call. \
+         Loading the atomic AFTER the catalog round trip defeats the \
+         purpose — the SQL query has already happened. Reorder so the fast \
+         path returns before any catalog work."
+    );
+
+    // The fast-path threshold should reference at least one memtable-pressure
+    // threshold constant. The current implementation uses
+    // `INLINE_MEMTABLE_MAX_BYTES / INLINE_MAX_BYTES` since this is the
+    // tightest of the three (bytes, entries, rows) thresholds when reasoning
+    // about an upper bound from cached_rows alone.
+    assert!(
+        body.contains("INLINE_MEMTABLE_MAX_BYTES")
+            || body.contains("INLINE_MEMTABLE_MAX_SEGMENTS")
+            || body.contains("INLINE_MEMTABLE_MAX_ROWS"),
+        "checkpoint_inlined_data_if_memtable_pressure_exceeded must compare \
+         the cached row count against a meaningful threshold constant \
+         (INLINE_MEMTABLE_MAX_BYTES / INLINE_MEMTABLE_MAX_SEGMENTS / \
+         INLINE_MEMTABLE_MAX_ROWS) for the fast path to be a load-bearing \
+         invariant. A bare numeric literal decouples the fast path from \
+         the threshold definitions and risks silent drift."
     );
 }
