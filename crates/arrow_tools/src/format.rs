@@ -403,12 +403,14 @@ fn list_slice_range<T>(
     start_offset: T,
     end_offset: T,
     array_name: &str,
+    start_offset_name: &str,
+    end_offset_name: &str,
 ) -> Result<(usize, usize), ArrowError>
 where
     T: TryInto<usize> + std::fmt::Display + Copy,
 {
-    let start = value_to_usize(start_offset, &format!("{array_name} start offset"))?;
-    let end = value_to_usize(end_offset, &format!("{array_name} end offset"))?;
+    let start = value_to_usize(start_offset, start_offset_name)?;
+    let end = value_to_usize(end_offset, end_offset_name)?;
     let len = end.checked_sub(start).ok_or_else(|| {
         ArrowError::InvalidArgumentError(format!(
             "{array_name} end offset {end} is before start offset {start}"
@@ -472,13 +474,20 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
     // Fast path: zero-copy clone when no list element exceeds max_len.
-    let needs_trunc = (0..list_array.len()).try_fold(false, |needs_trunc, i| {
-        if needs_trunc {
-            return Ok::<_, ArrowError>(true);
+    let mut needs_trunc = false;
+    for i in 0..list_array.len() {
+        let (_, len) = list_slice_range(
+            offsets[i],
+            offsets[i + 1],
+            "ListArray",
+            "ListArray start offset",
+            "ListArray end offset",
+        )?;
+        if len > max_len {
+            needs_trunc = true;
+            break;
         }
-
-        list_slice_range(offsets[i], offsets[i + 1], "ListArray").map(|(_, len)| len > max_len)
-    })?;
+    }
     if !needs_trunc {
         return Ok(list_array.clone());
     }
@@ -486,8 +495,14 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
 
     let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
         .map(|i| {
-            list_slice_range(offsets[i], offsets[i + 1], "ListArray")
-                .map(|(start, len)| (start, max_len.min(len)))
+            list_slice_range(
+                offsets[i],
+                offsets[i + 1],
+                "ListArray",
+                "ListArray start offset",
+                "ListArray end offset",
+            )
+            .map(|(start, len)| (start, max_len.min(len)))
         })
         .collect::<Result<_, ArrowError>>()?;
     let new_lengths: Vec<usize> = slice_ranges.iter().map(|&(_, len)| len).collect();
@@ -524,13 +539,20 @@ fn truncate_large_list_array(
     // Fast path: zero-copy clone when truncation is unnecessary (common for
     // result formatting). LargeList uses i64 offsets, so validate conversion
     // before deciding whether the slow path is needed.
-    let needs_trunc = (0..list_array.len()).try_fold(false, |needs_trunc, i| {
-        if needs_trunc {
-            return Ok::<_, ArrowError>(true);
+    let mut needs_trunc = false;
+    for i in 0..list_array.len() {
+        let (_, len) = list_slice_range(
+            offsets[i],
+            offsets[i + 1],
+            "LargeListArray",
+            "LargeListArray start offset",
+            "LargeListArray end offset",
+        )?;
+        if len > max_len {
+            needs_trunc = true;
+            break;
         }
-
-        list_slice_range(offsets[i], offsets[i + 1], "LargeListArray").map(|(_, len)| len > max_len)
-    })?;
+    }
     if !needs_trunc {
         return Ok(list_array.clone());
     }
@@ -538,8 +560,14 @@ fn truncate_large_list_array(
 
     let slice_ranges: Vec<(usize, usize)> = (0..list_array.len())
         .map(|i| {
-            list_slice_range(offsets[i], offsets[i + 1], "LargeListArray")
-                .map(|(start, len)| (start, max_len.min(len)))
+            list_slice_range(
+                offsets[i],
+                offsets[i + 1],
+                "LargeListArray",
+                "LargeListArray start offset",
+                "LargeListArray end offset",
+            )
+            .map(|(start, len)| (start, max_len.min(len)))
         })
         .collect::<Result<_, ArrowError>>()?;
     let new_lengths: Vec<usize> = slice_ranges.iter().map(|&(_, len)| len).collect();
@@ -576,13 +604,13 @@ fn truncate_list_view_array(
     // Fast path for ListView: sizes are stored explicitly, cheap scan.
     // When no element exceeds the limit we return the original (preserving
     // whatever non-contiguous view layout the caller had).
-    let needs_trunc = sizes.iter().try_fold(false, |needs_trunc, &size| {
-        if needs_trunc {
-            return Ok::<_, ArrowError>(true);
+    let mut needs_trunc = false;
+    for &size in sizes {
+        if value_to_usize(size, "ListViewArray size")? > max_len {
+            needs_trunc = true;
+            break;
         }
-
-        value_to_usize(size, "ListViewArray size").map(|size| size > max_len)
-    })?;
+    }
     if !needs_trunc {
         return Ok(list_array.clone());
     }
