@@ -1117,9 +1117,27 @@ impl MetadataCatalog for CayenneCatalog {
         //    after compaction since all data is merged into the new snapshot
         // 4. Update snapshot pointer - commits the new snapshot as active
         //
-        // If interrupted between these, the old snapshot remains active with
-        // no delete files, which is safe (just loses the pending deletions,
-        // but data is not corrupted).
+        // Devil's advocate (to be really sure): one could worry that clearing the
+        // delete files *before* advancing the snapshot pointer opens a window where
+        // a concurrent query on the old snapshot would lose its deletion vectors.
+        // This is prevented by the `listing_fence` + `protected_snapshots` mechanism
+        // (queries that started on the old snapshot hold a protected entry, so the
+        // old snapshot directory is not cleaned until they finish, and they captured
+        // the delete files at scan start time).
+        //
+        // If the process crashes anywhere in the batch or before the background
+        // cleanup runs, the worst observable state is "old snapshot still current,
+        // but its delete files are gone from the catalog". This means any deletions
+        // that were pending at compaction time are lost (the rows that should have
+        // been deleted are still visible until the next successful compaction),
+        // but **no deleted row is ever resurrected after it was once successfully
+        // deleted in a prior snapshot**, and no data file is ever lost. This is an
+        // acceptable "at-least-once deletion" anomaly for a best-effort compaction
+        // system, and is the documented tradeoff.
+        //
+        // The new snapshot is always written + fsynced *before* this catalog
+        // transaction is even attempted, so a crash before the pointer move leaves
+        // an orphaned (but harmless) new snapshot directory.
         //
         // The transaction may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at
         // commit time (especially with Turso's BEGIN CONCURRENT). Retry a few
