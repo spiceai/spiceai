@@ -613,7 +613,7 @@ impl CayenneTableProvider {
                     .as_ref()
                     .strip_prefix(staging_prefix.as_ref())
                     .unwrap_or(meta.location.as_ref());
-                if name == STAGING_WAL_FILENAME {
+                if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
                     None
                 } else {
                     Some(name.to_string())
@@ -633,17 +633,43 @@ impl CayenneTableProvider {
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
 
-        let wal_key =
+        // Write to a temporary object first, then to the final key.
+        // This mirrors the local-FS tmp+rename pattern and guarantees that
+        // any reader looking for STAGING_WAL_FILENAME sees either a complete,
+        // previously-written document or nothing at all (never a torn/partial JSON).
+        let tmp_key = ObjectStorePath::from(format!(
+            "{}{STAGING_WAL_TMP_FILENAME}",
+            staging_prefix.as_ref()
+        ));
+        let final_key =
             ObjectStorePath::from(format!("{}{STAGING_WAL_FILENAME}", staging_prefix.as_ref()));
+
+        // Phase 1: write content to the tmp key (atomic for small objects on S3).
         config
             .store
-            .put(&wal_key, content.into())
+            .put(&tmp_key, content.clone().into())
             .await
             .map_err(|e| Error::ObjectStore {
-                operation: "write staging WAL",
+                operation: "write staging WAL (tmp)",
                 table: self.table_name().to_string(),
                 source: e,
             })?;
+
+        // Phase 2: atomically publish to the final key (another put; on S3 this
+        // replaces any previous version atomically from the reader's perspective).
+        config
+            .store
+            .put(&final_key, content.into())
+            .await
+            .map_err(|e| Error::ObjectStore {
+                operation: "write staging WAL (final)",
+                table: self.table_name().to_string(),
+                source: e,
+            })?;
+
+        // Best-effort cleanup of the tmp object. If this fails, the next writer
+        // will overwrite it anyway, and readers only ever look for the final key.
+        let _ = config.store.delete(&tmp_key).await;
 
         tracing::debug!(
             "Wrote staging WAL (S3) for table {} with {} file(s) targeting snapshot {target_snapshot}",
@@ -659,6 +685,12 @@ impl CayenneTableProvider {
     /// This signals that all staged files have been moved successfully. If this
     /// removal fails, the WAL is stale (files already moved) and will be detected
     /// as a false positive on next open — harmless but logged.
+    ///
+    /// On local filesystems the parent staging directory is fsync'd after a
+    /// successful removal so the unlink is durable across power loss. Without
+    /// this, a crash between `unlink` and the next dirty-page writeback could
+    /// leave the WAL directory entry intact, causing `ensure_no_incomplete_write`
+    /// to spuriously block writes after a clean commit.
     pub(crate) async fn remove_staging_wal(&self) -> Result<()> {
         if self.table_path().starts_with("s3://") {
             let config = self.require_object_store()?;
@@ -682,8 +714,11 @@ impl CayenneTableProvider {
             let staging_dir =
                 Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
             let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
+            let mut removed = false;
             match tokio::fs::remove_file(&wal_path).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    removed = true;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     tracing::warn!(
@@ -691,6 +726,22 @@ impl CayenneTableProvider {
                         self.table_name(),
                     );
                 }
+            }
+
+            // Make the unlink durable so a later `ensure_no_incomplete_write`
+            // doesn't spuriously see the WAL after a power-loss restart.
+            // Best-effort: matches the partitioned_wal and write_staging_wal_local
+            // patterns. If the staging dir no longer exists (a concurrent
+            // clear_staging_dir removed it), skip silently.
+            if removed
+                && let Ok(dir) = tokio::fs::File::open(&staging_dir).await
+                && let Err(e) = dir.sync_all().await
+            {
+                tracing::warn!(
+                    "Failed to fsync staging dir {} after WAL removal for table {}: {e}",
+                    staging_dir.display(),
+                    self.table_name(),
+                );
             }
         }
         Ok(())

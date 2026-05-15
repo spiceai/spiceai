@@ -1336,6 +1336,13 @@ impl CayenneTableProvider {
     }
 
     /// Move staging files to the current snapshot on local filesystem.
+    ///
+    /// After all renames complete, the target snapshot directory is fsync'd so
+    /// the rename operations are durable across a power-loss restart. Without
+    /// this, the staging WAL could be removed (in the caller's next step)
+    /// while individual renames are still only in the page cache — a crash
+    /// would then leave the catalog blind to staged files that "should" be in
+    /// the snapshot.
     async fn move_staging_files_local(&self, current_snapshot: &str) -> Result<()> {
         let staging_dir = Self::snapshot_dir_path(
             &self.table_metadata.path,
@@ -1378,6 +1385,21 @@ impl CayenneTableProvider {
 
             tokio::fs::rename(&src, &dst).await?;
             moved_count += 1;
+        }
+
+        // Make the renames durable before the caller proceeds to remove the
+        // WAL. The dir fsync flushes the inode/directory entry updates produced
+        // by each rename — without it, a power loss after WAL removal could
+        // leave the snapshot directory missing files that were "moved" in the
+        // page cache but never written through to disk.
+        if moved_count > 0
+            && let Err(e) = Self::sync_snapshot_dir(&target_dir).await
+        {
+            tracing::warn!(
+                "Failed to fsync target snapshot dir {} after move for table {}: {e}",
+                target_dir.display(),
+                self.table_metadata.table_name,
+            );
         }
 
         tracing::debug!(
