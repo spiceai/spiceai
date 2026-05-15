@@ -23,8 +23,8 @@ limitations under the License.
 //! exercises the zero-copy clone() paths added in the audit) from
 //! "actual truncation" (exercises the slice+concat / collect paths).
 
-use arrow::array::{Int32Array, ListArray, StringArray, StringViewArray, StringViewBuilder};
-use arrow::buffer::OffsetBuffer;
+use arrow::array::{Int32Array, ListArray, ListViewArray, StringArray, StringViewArray, StringViewBuilder};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
@@ -139,6 +139,53 @@ fn make_long_list_batch(n: usize, truncate_to: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(list)]).expect("valid batch")
 }
 
+/// ListView<i32> versions (exercises the ListView truncation path, which has
+/// more complex offset + size handling and a different fast-path decision
+/// based on the explicit sizes buffer).
+fn make_all_short_list_view_batch(n: usize, max_elems: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nums",
+        DataType::ListView(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    )]));
+    let per_list = max_elems.min(5);
+    let total_values = n * per_list;
+    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
+    let offsets: Vec<i32> = (0..n).map(|i| (i * per_list as i32)).collect();
+    let sizes: Vec<i32> = (0..n).map(|_| per_list as i32).collect();
+    let list_view = ListViewArray::try_new(
+        Arc::new(Field::new("item", DataType::Int32, true)),
+        ScalarBuffer::<i32>::from(offsets),
+        ScalarBuffer::<i32>::from(sizes),
+        Arc::new(values),
+        None,
+    )
+    .expect("ListViewArray construction for benchmark");
+    RecordBatch::try_new(schema, vec![Arc::new(list_view)]).expect("valid batch")
+}
+
+fn make_long_list_view_batch(n: usize, truncate_to: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nums",
+        DataType::ListView(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    )]));
+    let per_list = truncate_to + 15;
+    let total_values = n * per_list;
+    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
+    let offsets: Vec<i32> = (0..n).map(|i| (i * per_list as i32)).collect();
+    let sizes: Vec<i32> = (0..n).map(|_| per_list as i32).collect();
+    let list_view = ListViewArray::try_new(
+        Arc::new(Field::new("item", DataType::Int32, true)),
+        ScalarBuffer::<i32>::from(offsets),
+        ScalarBuffer::<i32>::from(sizes),
+        Arc::new(values),
+        None,
+    )
+    .expect("ListViewArray construction for benchmark");
+    RecordBatch::try_new(schema, vec![Arc::new(list_view)]).expect("valid batch")
+}
+
 pub fn bench_truncate(c: &mut Criterion) {
     let mut group = c.benchmark_group("arrow_tools_truncate");
 
@@ -174,7 +221,7 @@ pub fn bench_truncate(c: &mut Criterion) {
         })
     });
 
-    // List fast path (the try_fold + clone path)
+    // List (regular List) fast path
     let short_lists = make_all_short_list_batch(800, 5);
     group.bench_function("list_fast_path_800_rows_all_short", |b| {
         b.iter(|| {
@@ -182,11 +229,27 @@ pub fn bench_truncate(c: &mut Criterion) {
         })
     });
 
-    // List actual truncation work
+    // List (regular List) actual truncation work
     let long_lists = make_long_list_batch(800, 5);
     group.bench_function("list_with_truncation_800_rows", |b| {
         b.iter(|| {
             truncate_numeric_column_length(black_box(&long_lists), 5).unwrap();
+        })
+    });
+
+    // ListView fast path (exercises the sizes-based try_fold decision + clone)
+    let short_list_views = make_all_short_list_view_batch(800, 5);
+    group.bench_function("listview_fast_path_800_rows_all_short", |b| {
+        b.iter(|| {
+            truncate_numeric_column_length(black_box(&short_list_views), 5).unwrap();
+        })
+    });
+
+    // ListView actual truncation work (exercises the more complex offset/size rebuild)
+    let long_list_views = make_long_list_view_batch(800, 5);
+    group.bench_function("listview_with_truncation_800_rows", |b| {
+        b.iter(|| {
+            truncate_numeric_column_length(black_box(&long_list_views), 5).unwrap();
         })
     });
 

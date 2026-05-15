@@ -27,7 +27,7 @@ use chrono::DateTime;
 use arrow::array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, LargeStringBuilder, ListBuilder, RecordBatch, StringArray, StringBuilder,
-    TimestampMicrosecondArray,
+    TimestampMicrosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
@@ -429,6 +429,13 @@ fn build_array_from_hits(
                 .map(|h| extract_field(&h.source, field_name).and_then(serde_json::Value::as_i64))
                 .collect();
             Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+        }
+        DataType::UInt64 => {
+            let values: Vec<Option<u64>> = hits
+                .iter()
+                .map(|h| extract_field(&h.source, field_name).and_then(serde_json::Value::as_u64))
+                .collect();
+            Ok(Arc::new(UInt64Array::from(values)) as ArrayRef)
         }
         DataType::Int32 => {
             let values: Vec<Option<i32>> = hits
@@ -999,6 +1006,26 @@ mod tests {
             .expect("column 0 should be TimestampMicrosecondArray");
 
         assert_eq!(col.value(0), epoch_ms * 1_000);
+    }
+
+    #[test]
+    fn test_uint64_builds_correct_array() {
+        let schema = Arc::new(Schema::new(vec![Field::new("big", DataType::UInt64, true)]));
+        let hits = vec![
+            make_hit(json!({"big": u64::MAX})),
+            make_hit(json!({})),
+            make_hit(json!({"big": -1})),
+        ];
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("column 0 should be UInt64Array");
+
+        assert_eq!(col.value(0), u64::MAX);
+        assert!(col.is_null(1));
+        assert!(col.is_null(2));
     }
 
     // ── List<LargeUtf8> ────────────────────────────────────────────────────────
