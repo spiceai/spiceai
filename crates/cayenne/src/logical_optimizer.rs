@@ -39,8 +39,8 @@ limitations under the License.
 //! NULL equality (`NULL != NULL`), and one or more equi-key pairs whose data
 //! types match, the rule inspects each side for a non-trivial `Filter` that
 //! references at least one column other than each candidate join key. If one
-//! side is dim-like and has a projectable column key, it wraps the *opposite*
-//! side with
+//! side is dim-like, has a projectable column key, and the opposite side is a
+//! Cayenne-backed scan subtree, it wraps that opposite side with
 //!
 //! ```text
 //! Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))
@@ -109,16 +109,20 @@ limitations under the License.
 //! Both gates only fire when stats are present (`Precision::Exact` or
 //! `Precision::Inexact`); missing stats fall back to the structural behavior.
 
+use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DataFusionError, NullEquality, Result, Spans, TableReference};
+use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::{
     Filter, Join, JoinType, LogicalPlan, Projection, Subquery, SubqueryAlias,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
-use datafusion_expr::Expr;
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::expr::InSubquery;
+use datafusion_expr::{Expr, TableSource};
 use std::{collections::BTreeSet, sync::Arc};
+
+use crate::provider::CayenneTableProvider;
 
 /// Prefix for [`SubqueryAlias`] names introduced by
 /// [`CayennePropagateFilterAcrossEquiJoinKeys`].
@@ -128,21 +132,61 @@ use std::{collections::BTreeSet, sync::Arc};
 /// a marker in explain output so the rewrite is recognizable when reading plans.
 pub const PROPAGATED_FILTER_ALIAS_PREFIX: &str = "__cayenne_xclos__";
 
+type TableProviderPredicate = Arc<dyn Fn(&dyn TableProvider) -> bool + Send + Sync>;
+type TableSourcePredicate = Arc<dyn Fn(&dyn TableSource) -> bool + Send + Sync>;
+
 /// Logical optimizer rule that, for each `Inner`, `LeftSemi`, or `RightSemi`
 /// join with default SQL NULL equality and a simple equi-key
 /// `(left.a = right.b)`, introduces
 /// `Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))`
-/// on the side opposite a non-key filter.
+/// on the Cayenne-backed side opposite a non-key filter.
 ///
 /// See the module-level docs for the full design and the q21 motivation.
-#[derive(Default)]
-pub struct CayennePropagateFilterAcrossEquiJoinKeys;
+pub struct CayennePropagateFilterAcrossEquiJoinKeys {
+    is_cayenne_table_source: TableSourcePredicate,
+}
+
+impl Default for CayennePropagateFilterAcrossEquiJoinKeys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CayennePropagateFilterAcrossEquiJoinKeys {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::new_with_table_provider_predicate(|provider| {
+            provider.as_any().is::<CayenneTableProvider>()
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-provider predicate.
+    ///
+    /// Runtime registration uses this to recognize `AcceleratedTable`s whose
+    /// inner accelerator is Cayenne, while this crate's default stays scoped to
+    /// direct [`CayenneTableProvider`] scans.
+    #[must_use]
+    pub fn new_with_table_provider_predicate(
+        is_cayenne_table_provider: impl Fn(&dyn TableProvider) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
+        Self::new_with_table_source_predicate(move |source| {
+            source
+                .as_any()
+                .downcast_ref::<DefaultTableSource>()
+                .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-source predicate.
+    #[must_use]
+    pub fn new_with_table_source_predicate(
+        is_cayenne_table_source: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            is_cayenne_table_source: Arc::new(is_cayenne_table_source),
+        }
     }
 }
 
@@ -212,6 +256,10 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
 
         let mut left_analysis = analyze_logical_side(&join.left);
         let mut right_analysis = analyze_logical_side(&join.right);
+        let left_contains_cayenne =
+            contains_cayenne_table_scan(&join.left, &self.is_cayenne_table_source);
+        let right_contains_cayenne =
+            contains_cayenne_table_scan(&join.right, &self.is_cayenne_table_source);
 
         let mut new_left: Arc<LogicalPlan> = Arc::clone(&join.left);
         let mut new_right: Arc<LogicalPlan> = Arc::clone(&join.right);
@@ -222,6 +270,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                 EquiKey::BothColumns { left, right } => {
                     // Propagate the LEFT-side filtered key domain → the RIGHT side.
                     if allow_left_to_right
+                        && right_contains_cayenne
                         && left_analysis.is_dim_like
                         && left_analysis.has_non_key_filter(&left.name)
                         && key_preserved_through_summaries(&join.left, left)
@@ -246,6 +295,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
 
                     // Propagate the RIGHT-side filtered key domain → the LEFT side.
                     if allow_right_to_left
+                        && left_contains_cayenne
                         && right_analysis.is_dim_like
                         && right_analysis.has_non_key_filter(&right.name)
                         && key_preserved_through_summaries(&join.right, right)
@@ -279,6 +329,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                     // (potentially referencing fact-side rows) inside the dim
                     // subquery, which would no longer be a cheap re-execution.
                     if allow_left_to_right
+                        && right_contains_cayenne
                         && left_analysis.is_dim_like
                         && left_analysis.has_non_key_filter(&left_col.name)
                         && key_preserved_through_summaries(&join.left, left_col)
@@ -306,6 +357,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                 } => {
                     // Symmetric: only RIGHT-dim → LEFT-expr direction.
                     if allow_right_to_left
+                        && left_contains_cayenne
                         && right_analysis.is_dim_like
                         && right_analysis.has_non_key_filter(&right_col.name)
                         && key_preserved_through_summaries(&join.right, right_col)
@@ -413,6 +465,24 @@ fn analyze_logical_side(plan: &LogicalPlan) -> SideAnalysis {
     });
 
     analysis
+}
+
+fn contains_cayenne_table_scan(
+    plan: &LogicalPlan,
+    is_cayenne_table_source: &TableSourcePredicate,
+) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && is_cayenne_table_source(scan.source.as_ref())
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 /// Returns `true` if `plan` is — possibly behind a chain of `Projection` or
@@ -579,7 +649,6 @@ fn distinct_input(distinct: &datafusion::logical_expr::Distinct) -> &LogicalPlan
 /// bound below the threshold guarantees the subtree is actually small).
 fn subtree_upper_bound_rows(plan: &LogicalPlan) -> Option<usize> {
     use datafusion::common::stats::Precision;
-    use datafusion::datasource::DefaultTableSource;
 
     let mut total: usize = 0;
     let mut any_unknown = false;
@@ -827,7 +896,7 @@ mod tests {
     use std::sync::Arc;
 
     fn rule() -> CayennePropagateFilterAcrossEquiJoinKeys {
-        CayennePropagateFilterAcrossEquiJoinKeys::new()
+        CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_source_predicate(|_| true)
     }
 
     fn make_ctx() -> Result<SessionContext> {
@@ -930,6 +999,27 @@ mod tests {
             "cayenne_propagate_filter_across_equi_join_keys"
         );
         assert_eq!(rule().apply_order(), Some(ApplyOrder::TopDown));
+    }
+
+    #[tokio::test]
+    async fn default_rule_skips_non_cayenne_table_scans() -> Result<()> {
+        let ctx = make_ctx()?;
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier, nation \
+                 WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = CayennePropagateFilterAcrossEquiJoinKeys::new();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (_, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        assert!(
+            !changed,
+            "default rule must not rewrite non-Cayenne scans; plan was:\n{plan}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

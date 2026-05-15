@@ -68,7 +68,7 @@ pub struct DeletionFilteringVortexFormat {
     inner: Arc<VortexFormat>,
     /// Per-file deletion cache. Key is the file path, value is the bitmap of deleted row indices.
     /// Uses `Arc<ArcSwap<...>>` so readers always see a wait-free immutable snapshot.
-    deletion_cache: Arc<ArcSwap<HashMap<String, RoaringBitmap>>>,
+    deletion_cache: Arc<ArcSwap<HashMap<String, Arc<RoaringBitmap>>>>,
 }
 
 impl std::fmt::Debug for DeletionFilteringVortexFormat {
@@ -99,7 +99,7 @@ impl std::fmt::Debug for DeletionFilteringVortexFormat {
 #[expect(clippy::implicit_hasher)]
 pub fn attach_deletion_vectors_to_config(
     mut config: FileScanConfig,
-    deletion_cache: &ArcSwap<HashMap<String, RoaringBitmap>>,
+    deletion_cache: &ArcSwap<HashMap<String, Arc<RoaringBitmap>>>,
 ) -> (FileScanConfig, bool) {
     // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `deletion_map`.
     let deletion_map = deletion_cache.load_full();
@@ -150,7 +150,7 @@ pub fn attach_deletion_vectors_to_config(
 /// A tuple of the (potentially modified) file and a boolean indicating if deletions were attached.
 fn attach_access_plan_to_file(
     mut file: PartitionedFile,
-    deletion_map: &HashMap<String, RoaringBitmap>,
+    deletion_map: &HashMap<String, Arc<RoaringBitmap>>,
 ) -> (PartitionedFile, bool) {
     // Extract the file path from the PartitionedFile
     let file_path = file.object_meta.location.to_string();
@@ -190,7 +190,7 @@ impl DeletionFilteringVortexFormat {
     /// * `deletion_cache` - Shared cache of per-file deletion vectors.
     pub fn new(
         inner: Arc<VortexFormat>,
-        deletion_cache: Arc<ArcSwap<HashMap<String, RoaringBitmap>>>,
+        deletion_cache: Arc<ArcSwap<HashMap<String, Arc<RoaringBitmap>>>>,
     ) -> Self {
         Self {
             inner,

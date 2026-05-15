@@ -5691,8 +5691,17 @@ impl CayenneTableProvider {
                     total_deletions,
                     per_file_row_ids.len(),
                 );
+                // Wrap each per-file bitmap in an Arc so future snapshot
+                // publishes only have to clone the small outer
+                // `HashMap<String, Arc<RoaringBitmap>>` (string keys + 8-byte
+                // pointers) instead of every file's full bitmap data. See
+                // `PositionBitmap`'s docstring for the perf rationale.
+                let cached_map: HashMap<String, Arc<RoaringBitmap>> = per_file_row_ids
+                    .into_iter()
+                    .map(|(path, bitmap)| (path, Arc::new(bitmap)))
+                    .collect();
                 PkDeletionStrategyWithCache::PositionBased {
-                    cached_deleted_row_ids: Arc::new(ArcSwap::from_pointee(per_file_row_ids)),
+                    cached_deleted_row_ids: Arc::new(ArcSwap::from_pointee(cached_map)),
                 }
             }
             PkDeletionStrategy::Int64Pk => {

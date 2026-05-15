@@ -24,17 +24,21 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
+#[cfg(not(windows))]
+use crate::accelerated_table::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 #[cfg(not(windows))]
-use cayenne::logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys;
-#[cfg(not(windows))]
 use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
 };
+#[cfg(not(windows))]
+use cayenne::{CayenneTableProvider, logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys};
+#[cfg(not(windows))]
+use datafusion::catalog::TableProvider;
 #[cfg(not(windows))]
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
@@ -642,8 +646,29 @@ fn insert_cayenne_logical_optimizer_rule(rules: &mut Vec<Arc<dyn OptimizerRule +
         });
     rules.insert(
         insert_at,
-        Arc::new(CayennePropagateFilterAcrossEquiJoinKeys::new()),
+        Arc::new(
+            CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_provider_predicate(
+                is_cayenne_accelerated_table_provider,
+            ),
+        ),
     );
+}
+
+#[cfg(not(windows))]
+fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
+    if provider.as_any().is::<CayenneTableProvider>() {
+        return true;
+    }
+
+    provider
+        .as_any()
+        .downcast_ref::<AcceleratedTable>()
+        .is_some_and(|table| {
+            table
+                .get_accelerator()
+                .as_any()
+                .is::<CayenneTableProvider>()
+        })
 }
 
 pub struct AnalyzerRulesBuilder {

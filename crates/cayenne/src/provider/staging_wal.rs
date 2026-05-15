@@ -962,7 +962,23 @@ impl CayenneTableProvider {
             // so this helper's current-snapshot destination is the WAL target.
             match self.move_files_to_current_snapshot().await {
                 Ok(()) => {
-                    self.remove_staging_wal().await.ok();
+                    if let Err(e) = self.remove_staging_wal().await {
+                        tracing::error!(
+                            table = table_name.as_str(),
+                            error = %e,
+                            "Automated recovery moved staged files but failed to remove the staging WAL"
+                        );
+                        return Err(Error::IncompleteWrite {
+                            table: table_name,
+                            message: format!(
+                                "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery moved the staged files, but failed to remove the WAL ({}). Refusing writes until the stale WAL is removed manually. The WAL file is located at '{wal_location}'.{extra}",
+                                wal.staged_files.len(),
+                                wal.target_snapshot,
+                                wal.created_at,
+                                e
+                            ),
+                        });
+                    }
                     tracing::info!(
                         table = table_name.as_str(),
                         "Automated recovery from incomplete write succeeded; table is now writable"

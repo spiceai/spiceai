@@ -31,7 +31,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Position-based deletion bitmap keyed by data file path.
-pub type PositionBitmap = HashMap<String, RoaringBitmap>;
+///
+/// The per-file `RoaringBitmap` is `Arc`-wrapped so that publishing a fresh
+/// snapshot through `ArcSwap` only clones a `HashMap<String, Arc<…>>`
+/// (cheap — small string keys + 8-byte Arc pointers), not the bitmap data
+/// itself. Without the inner `Arc`, every per-batch delete on a
+/// position-based table cloned every file's full bitmap on each commit,
+/// turning the write into O(total deleted rows) per call. The shared inner
+/// type lets readers and writers share unchanged bitmaps for free; only
+/// entries that the writer actually updates allocate a new `Arc`.
+pub type PositionBitmap = HashMap<String, Arc<RoaringBitmap>>;
 
 /// Strategy for primary key-based deletion filtering.
 ///

@@ -469,7 +469,7 @@ impl CayenneDeletionSink {
         let table_name = &self.table_metadata.table_name;
 
         // Snapshot already-deleted positions for this file from the cache.
-        let already_deleted_bitmap: Option<RoaringBitmap> = {
+        let already_deleted_bitmap: Option<Arc<RoaringBitmap>> = {
             let cache = self
                 .pk_deletion_strategy
                 .position_based_cache()
@@ -622,7 +622,10 @@ impl CayenneDeletionSink {
             })?;
 
         // Read existing deletions to merge with new ones (wait-free).
-        let existing_deletions: Arc<HashMap<String, RoaringBitmap>> =
+        // The cache value type is `Arc<RoaringBitmap>` so a clone of the
+        // outer map only clones small string keys + 8-byte Arc pointers,
+        // not the deleted-position bitmaps themselves.
+        let existing_deletions: Arc<HashMap<String, Arc<RoaringBitmap>>> =
             cached_deleted_row_ids.load_full();
 
         let writer = DeletionVectorWriter::new(&self.table_metadata);
@@ -631,13 +634,16 @@ impl CayenneDeletionSink {
         // (set difference between incoming row_ids and existing cache per file).
         let mut new_deletion_count: usize = 0;
         let mut specs: Vec<DeletionVectorWriteSpec> = Vec::new();
-        let mut cache_updates: HashMap<String, RoaringBitmap> = HashMap::new();
+        let mut cache_updates: HashMap<String, Arc<RoaringBitmap>> = HashMap::new();
 
         for (file_path, incoming_row_ids) in row_ids.iter().filter(|(_, ids)| !ids.is_empty()) {
-            let existing_bitmap = existing_deletions
+            // Take an immutable snapshot of the existing bitmap (Arc clone is
+            // O(1)) so we can read existing positions for the "is this new?"
+            // check and combined-IDs build without cloning the bitmap data.
+            // If absent, work against an empty placeholder.
+            let existing_bitmap_arc: Arc<RoaringBitmap> = existing_deletions
                 .get(file_path)
-                .cloned()
-                .unwrap_or_default();
+                .map_or_else(|| Arc::new(RoaringBitmap::new()), Arc::clone);
 
             // Deduplicate incoming row IDs first to avoid over-counting and redundant writes.
             let mut unique_new_row_ids = incoming_row_ids.clone();
@@ -649,13 +655,13 @@ impl CayenneDeletionSink {
                 .filter(|&&id| {
                     u32::try_from(id)
                         .ok()
-                        .is_none_or(|id32| !existing_bitmap.contains(id32))
+                        .is_none_or(|id32| !existing_bitmap_arc.contains(id32))
                 })
                 .count();
             new_deletion_count += newly_added_for_file;
 
             // Deletion vector must contain ALL deleted positions (existing + new).
-            let mut combined_ids: Vec<u64> = existing_bitmap.iter().map(u64::from).collect();
+            let mut combined_ids: Vec<u64> = existing_bitmap_arc.iter().map(u64::from).collect();
             combined_ids.extend(unique_new_row_ids.iter().copied());
             combined_ids.sort_unstable();
             combined_ids.dedup();
@@ -665,13 +671,18 @@ impl CayenneDeletionSink {
             ));
 
             // Pre-build updated cache bitmap (u32 representable positions only).
-            let mut updated_bitmap = existing_bitmap;
+            // Use `Arc::try_unwrap` to mutate in place when this writer holds
+            // the only ref (no readers active on this entry); otherwise fall
+            // back to a one-time clone of THIS file's bitmap. Either way, we
+            // never touch any other file's bitmap data.
+            let mut updated_bitmap =
+                Arc::try_unwrap(existing_bitmap_arc).unwrap_or_else(|shared| (*shared).clone());
             updated_bitmap.extend(
                 unique_new_row_ids
                     .iter()
                     .filter_map(|&id| u32::try_from(id).ok()),
             );
-            cache_updates.insert(file_path.clone(), updated_bitmap);
+            cache_updates.insert(file_path.clone(), Arc::new(updated_bitmap));
         }
 
         if specs.is_empty() {
@@ -692,10 +703,17 @@ impl CayenneDeletionSink {
             }
         }
 
-        // Build a fresh snapshot with the new per-file bitmaps and publish atomically.
-        // Writers are serialised by the per-table write lock so the load+rebuild+store
-        // sequence is race-free.
-        let mut updated_map: HashMap<String, RoaringBitmap> =
+        // Build a fresh snapshot. Cloning the outer HashMap now only clones
+        // small (String, Arc<RoaringBitmap>) entries — the actual bitmap
+        // data for unchanged files is shared with the previous snapshot
+        // through the inner Arc. Then overlay the cache_updates entries
+        // (each carrying a fresh `Arc::new(updated_bitmap)` for files that
+        // changed in THIS commit). The pre-`Arc::new`-bitmap revision
+        // unconditionally cloned every file's full bitmap on every commit,
+        // turning the write into O(total deleted rows across all files)
+        // per call — a per-batch cost that scaled linearly with how much
+        // data the table had ever deleted.
+        let mut updated_map: HashMap<String, Arc<RoaringBitmap>> =
             (*cached_deleted_row_ids.load_full()).clone();
         updated_map.extend(cache_updates);
         cached_deleted_row_ids.store(Arc::new(updated_map));
