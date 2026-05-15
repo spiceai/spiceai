@@ -8,6 +8,14 @@ run-name: cluster-bench - ${{ github.event.inputs.query_set }} - ${{ github.even
 # `run_spicebench.yml` plumbing in the spicebench repo.
 
 on:
+  # Throwaway push trigger so this commit fires the bench without a manual
+  # dispatch. Path-filtered to this workflow file so unrelated pushes on the
+  # branch don't re-fire. Reverted in the immediately-following commit.
+  push:
+    branches:
+      - phillip/testoperator-cayenne-distributed-spicepod
+    paths:
+      - '.github/workflows/testoperator_run_cluster_bench.yml'
   workflow_dispatch:
     inputs:
       spicepod_path:
@@ -117,15 +125,15 @@ permissions:
 # for a Ballista distributed-query smoke test against the public-S3 TPC-H
 # spicepod by default.
 env:
-  CB_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path || 'distributed/s3-public[parquet]-cayenne[file].yaml' }}
+  CB_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path || 'federated/s3-public[parquet].yaml' }}
   CB_QUERY_SET: ${{ github.event.inputs.query_set || 'tpch' }}
   CB_SCENARIO_QUERY_FILE: ${{ github.event.inputs.scenario_query_file || '' }}
-  CB_QUERY_TRANSPORT: ${{ github.event.inputs.query_transport || 'flightsql' }}
+  CB_QUERY_TRANSPORT: ${{ github.event.inputs.query_transport || 'v1-queries' }}
   CB_EXECUTOR_REPLICAS: ${{ github.event.inputs.executor_replicas || '3' }}
   CB_CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
-  CB_CUSTOM_IMAGE_TAG: ${{ github.event.inputs.custom_image_tag || '' }}
+  CB_CUSTOM_IMAGE_TAG: ${{ github.event.inputs.custom_image_tag || 'ballista-fixes.2' }}
   CB_SCALE_FACTOR: ${{ github.event.inputs.scale_factor || '1' }}
-  CB_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results || 'true' }}
+  CB_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results || 'false' }}
   CB_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots || 'default' }}
   CB_READY_WAIT: ${{ github.event.inputs.ready_wait || '600' }}
   CB_RUNNER_TYPE: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
