@@ -52,7 +52,7 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions as df_expr;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use object_store::{ObjectMeta, ObjectStore};
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -611,6 +611,46 @@ impl ExecutionPlan for InexactStatsExec {
             total_byte_size: stats.total_byte_size,
             column_statistics: stats.column_statistics,
         })
+    }
+
+    #[expect(deprecated)]
+    fn statistics(&self) -> DFResult<Statistics> {
+        // Delegate and then force inexact row count for safety, in case any code path
+        // still uses the deprecated statistics() method.
+        let stats = self.inner.statistics()?;
+        Ok(Statistics {
+            num_rows: stats.num_rows.to_inexact(),
+            total_byte_size: stats.total_byte_size,
+            column_statistics: stats.column_statistics,
+        })
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.inner.metrics()
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        self.inner.supports_limit_pushdown()
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.inner.fetch()
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        self.inner
+            .with_fetch(limit)
+            .map(|plan| Arc::new(Self::new(plan)) as Arc<dyn ExecutionPlan>)
+    }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        config: &ConfigOptions,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        self.inner
+            .repartitioned(target_partitions, config)
+            .map(|plan| plan.map(|plan| Arc::new(Self::new(plan)) as Arc<dyn ExecutionPlan>))
     }
 
     fn try_swapping_with_projection(
