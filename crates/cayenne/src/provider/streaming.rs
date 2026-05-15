@@ -26,7 +26,9 @@ use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::PlanProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
+use futures::stream::unfold;
 use futures::StreamExt;
+use parking_lot::Mutex;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -37,8 +39,11 @@ use std::sync::Arc;
 pub struct StreamingExec {
     /// Arrow schema for the data
     pub schema: SchemaRef,
-    /// The input stream wrapped in a mutex for async access
-    pub stream: tokio::sync::Mutex<Option<DFStream>>,
+    /// The input stream wrapped in a (sync) mutex solely for one-time ownership
+    /// transfer in `execute`. The mutex is *never* held across an `.await` point.
+    /// We use `parking_lot::Mutex` (fast, no poisoning) because the take is a
+    /// short synchronous operation at the start of plan execution.
+    pub stream: Mutex<Option<DFStream>>,
     /// Plan properties
     pub properties: PlanProperties,
 }
@@ -59,7 +64,7 @@ impl StreamingExec {
 
         Self {
             schema,
-            stream: tokio::sync::Mutex::new(Some(stream)),
+            stream: Mutex::new(Some(stream)),
             properties,
         }
     }
@@ -112,34 +117,36 @@ impl ExecutionPlan for StreamingExec {
     ) -> datafusion_common::Result<DFStream> {
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 
-        // Use async-aware RecordBatchStreamAdapter to properly forward the stream
+        // Take ownership of the inner stream under a *synchronous* lock
+        // (parking_lot). The lock is released immediately after the take;
+        // it is **never** held across an `.await`. This satisfies the project
+        // rule "Never hold locks across `.await`" and removes per-batch lock
+        // acquisition + potential scheduler convoying during high-throughput
+        // or mixed read/write ingestion.
         let schema = Arc::clone(&self.schema);
-        let stream_mutex = Arc::new(tokio::sync::Mutex::new(
-            self.stream
-                .try_lock()
-                .map_err(|_| {
-                    datafusion_common::DataFusionError::Execution(
-                        "Stream is locked (concurrent access detected)".to_string(),
-                    )
-                })?
-                .take()
-                .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(
-                        "Stream already consumed".to_string(),
-                    )
-                })?,
-        ));
+        let mut guard = self.stream.try_lock().ok_or_else(|| {
+            datafusion_common::DataFusionError::Execution(
+                "Stream is locked (concurrent access detected)".to_string(),
+            )
+        })?;
 
-        let adapter = RecordBatchStreamAdapter::new(
-            schema,
-            async_stream::stream! {
-                let mut stream = stream_mutex.lock().await;
-                while let Some(batch) = stream.next().await {
-                    yield batch;
-                }
-            },
-        );
+        let inner_stream = guard.take().ok_or_else(|| {
+            datafusion_common::DataFusionError::Execution(
+                "Stream already consumed".to_string(),
+            )
+        })?;
 
+        // Forward using `futures::stream::unfold`. The inner
+        // `SendableRecordBatchStream` is owned directly by the state machine.
+        // No mutex of any kind is involved in the per-batch `poll` path.
+        // We avoid the `async_stream::stream!` macro (project guideline:
+        // breaks rust-analyzer, harder to debug).
+        let forward = unfold(inner_stream, |mut s: DFStream| async move {
+            // next() -> Option<DFResult<RecordBatch>>
+            s.next().await.map(|item| (item, s))
+        });
+
+        let adapter = RecordBatchStreamAdapter::new(schema, Box::pin(forward));
         Ok(Box::pin(adapter))
     }
 }
