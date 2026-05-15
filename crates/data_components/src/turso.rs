@@ -2384,6 +2384,21 @@ mod tests {
         values
     }
 
+    async fn query_ordered_ids(conn: &Connection, sql: &str) -> Vec<i64> {
+        let mut rows = conn.query(sql, ()).await.expect("query should execute");
+
+        let mut values = Vec::new();
+        while let Some(row) = rows.next().await.expect("row should be read") {
+            let id = match row.get_value(0).expect("id should be present") {
+                TursoValue::Integer(id) => id,
+                other => panic!("expected integer id, got {other:?}"),
+            };
+            values.push(id);
+        }
+
+        values
+    }
+
     fn rewrite_between(sql: &str) -> String {
         let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
         let mut stmts = Parser::parse_sql(&dialect, sql).expect("valid SQL");
@@ -2445,6 +2460,47 @@ mod tests {
             query_rows(&pool, table_name).await,
             Vec::<(i64, String)>::new(),
             "the first batch must roll back when a later batch in the same stream fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_turso_nulls_first_last_ordering() {
+        let pool = TursoConnectionPool::new(":memory:")
+            .await
+            .expect("in-memory Turso pool should be created");
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+
+        conn.execute(
+            "CREATE TABLE null_sort_test (id INTEGER PRIMARY KEY, sort_value INTEGER)",
+            (),
+        )
+        .await
+        .expect("test table should be created");
+        conn.execute(
+            "INSERT INTO null_sort_test (id, sort_value) VALUES (1, 20), (2, NULL), (3, 10), (4, NULL)",
+            (),
+        )
+        .await
+        .expect("test rows should be inserted");
+
+        assert_eq!(
+            query_ordered_ids(
+                &conn,
+                "SELECT id FROM null_sort_test ORDER BY sort_value ASC NULLS FIRST, id ASC",
+            )
+            .await,
+            vec![2, 4, 3, 1]
+        );
+        assert_eq!(
+            query_ordered_ids(
+                &conn,
+                "SELECT id FROM null_sort_test ORDER BY sort_value ASC NULLS LAST, id ASC",
+            )
+            .await,
+            vec![3, 1, 2, 4]
         );
     }
 
