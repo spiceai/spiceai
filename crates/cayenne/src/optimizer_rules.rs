@@ -510,7 +510,7 @@ fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<Ca
     if let Some(cayenne) = plan.as_any().downcast_ref::<CayenneAccelerationExec>()
         && let Some(identity) = cayenne.scan_identity()
     {
-        let schema_fields = plan_schema_fields(cayenne.schema());
+        let schema_fields = plan_schema_fields(&cayenne.schema());
         let columns = schema_fields.iter().map(|(name, _)| name.clone()).collect();
         scans.push(CayenneScanSummary {
             identity,
@@ -590,7 +590,7 @@ fn push_filter_addition(
     });
 }
 
-fn plan_schema_fields(schema: SchemaRef) -> Vec<(String, DataType)> {
+fn plan_schema_fields(schema: &SchemaRef) -> Vec<(String, DataType)> {
     schema
         .fields()
         .iter()
@@ -611,7 +611,7 @@ fn apply_filter_additions(
         let Some(identity) = cayenne.scan_identity() else {
             return Ok((plan, false));
         };
-        let schema_fields = plan_schema_fields(cayenne.schema());
+        let schema_fields = plan_schema_fields(&cayenne.schema());
         let existing = cayenne.dynamic_filters();
         let filters = additions
             .iter()
@@ -1419,7 +1419,7 @@ mod tests {
             identity: source
                 .scan_identity()
                 .expect("source scan should have file identity"),
-            schema_fields: plan_schema_fields(source.schema()),
+            schema_fields: plan_schema_fields(&source.schema()),
             filter: Arc::clone(&source_filter),
         };
         let target = cayenne_file_exec(&target_schema, "order_line.vortex", None);

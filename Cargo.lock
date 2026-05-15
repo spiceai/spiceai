@@ -744,6 +744,7 @@ dependencies = [
  "arrow-cast",
  "arrow-json",
  "arrow-schema",
+ "criterion 0.7.0",
  "datafusion",
  "insta",
  "serde_json",

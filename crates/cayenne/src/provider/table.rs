@@ -1478,7 +1478,7 @@ impl CayenneTableProvider {
     ) -> std::io::Result<()> {
         if !snapshot_dir.exists() {
             // Capture the parent before creation so we can sync it afterwards.
-            let parent = snapshot_dir.parent().map(|p| p.to_path_buf());
+            let parent = snapshot_dir.parent().map(std::path::Path::to_path_buf);
             tokio::fs::create_dir_all(snapshot_dir).await?;
 
             // Make the *creation of the new snapshot directory itself* durable.
